@@ -19,4 +19,4 @@ HTTP/3 implementation written in Zig.
 
 ## License
 
-Apache License 2.0, as found in the [LICENSE](LICENSE) file.
+© 2022 Endel Dreyer. Apache License 2.0.
