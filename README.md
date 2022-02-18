@@ -15,7 +15,12 @@ HTTP/3 implementation written in Zig.
 - https://en.wikipedia.org/wiki/HTTP/3#Libraries
 - https://github.com/facebookincubator/mvfst
 - https://github.com/microsoft/msquic
+- https://github.com/aws/s2n-quic
 - https://github.com/lucas-clemente/quic-go
+
+**More**
+
+- https://www.chromium.org/quic/playing-with-quic/
 
 ## License
 
