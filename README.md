@@ -2,7 +2,7 @@
 
 HTTP/3 implementation written in Zig.
 
-## Reference
+## References
 
 **Specifications**
 
@@ -21,6 +21,12 @@ HTTP/3 implementation written in Zig.
 **More**
 
 - https://www.chromium.org/quic/playing-with-quic/
+
+---
+
+## Interesting ZIG code for reference:
+
+- zig-network: https://github.com/MasterQ32/zig-network/blob/master/network.zig
 
 ## License
 
