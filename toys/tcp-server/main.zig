@@ -7,7 +7,8 @@ pub const io_mode = .evented;
 
 pub fn main() anyerror!void {
     var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = &general_purpose_allocator.allocator;
+
+    const allocator = general_purpose_allocator.allocator();
 
     var server = net.StreamServer.init(.{});
     defer server.deinit();
@@ -15,8 +16,8 @@ pub fn main() anyerror!void {
     // TODO handle concurrent accesses to this hash map
     var room = Room{ .clients = std.AutoHashMap(*Client, void).init(allocator) };
 
-    try server.listen(net.Address.parseIp("127.0.0.1", 0) catch unreachable);
-    std.debug.warn("listening at {}\n", .{server.listen_address});
+    try server.listen(net.Address.parseIp("127.0.0.1", 8001) catch unreachable);
+    std.log.info("listening at {}\n", .{server.listen_address});
 
     while (true) {
         const client = try allocator.create(Client);
@@ -25,8 +26,12 @@ pub fn main() anyerror!void {
             .handle_frame = async client.handle(&room),
         };
         try room.clients.putNoClobber(client, {});
+
+        std.log.info("client accepted => {}", .{ client.conn.address.getPort() });
+        std.log.info("num clients => {}", .{ room.clients.count() });
     }
 }
+
 const Client = struct {
     conn: net.StreamServer.Connection,
     handle_frame: @Frame(handle),
@@ -41,6 +46,7 @@ const Client = struct {
         }
     }
 };
+
 const Room = struct {
     clients: std.AutoHashMap(*Client, void),
 
@@ -49,7 +55,7 @@ const Room = struct {
         while (it.next()) |key_ptr| {
             const client = key_ptr.*;
             if (client == sender) continue;
-            _ = client.conn.stream.write(msg) catch |e| std.debug.warn("unable to send: {}\n", .{e});
+            _ = client.conn.stream.write(msg) catch |e| std.log.warn("unable to send: {}\n", .{e});
         }
     }
 };

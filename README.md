@@ -27,6 +27,7 @@ HTTP/3 implementation written in Zig.
 ## Interesting ZIG code for reference:
 
 - zig-network: https://github.com/MasterQ32/zig-network/blob/master/network.zig
+- statsd-zig: https://github.com/remeh/statsd-zig/blob/master/src/main.zig
 
 ## License
 
