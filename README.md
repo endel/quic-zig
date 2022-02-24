@@ -12,6 +12,7 @@ HTTP/3 implementation written in Zig.
 
 **Implementations**
 
+- https://github.com/private-octopus/picoquic
 - https://en.wikipedia.org/wiki/HTTP/3#Libraries
 - https://github.com/facebookincubator/mvfst
 - https://github.com/microsoft/msquic
@@ -20,6 +21,7 @@ HTTP/3 implementation written in Zig.
 
 **More**
 
+- (Empirical study on QUIC implementations) https://qlog.edm.uhasselt.be/epiq/
 - https://www.chromium.org/quic/playing-with-quic/
 
 ---
