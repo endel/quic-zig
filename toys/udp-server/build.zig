@@ -6,7 +6,8 @@ const print = std.debug.print;
 pub fn build(b: *Builder) void {
   const mode = b.standardReleaseOptions();
 
-  const exe = b.addExecutable("main", "src/main.zig");
+//   const exe = b.addExecutable("main", "src/threading.zig");
+  const exe = b.addExecutable("main", "src/udp.zig");
   exe.setBuildMode(mode);
 
   exe.valgrind_support = true;
