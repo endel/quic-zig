@@ -4,8 +4,6 @@ const fs = std.fs;
 const os = std.os;
 const Queue = std.atomic.Queue;
 
-const socket = @import("lib/socket.zig");
-
 pub const io_mode = .evented;
 
 pub const Packet = struct {
