@@ -90,11 +90,4 @@ pub fn main() anyerror!void {
         }
     }
 
-    // // const allocator = gpa.allocator();
-
-    // var server = net.StreamServer.init(.{});
-    // defer server.deinit();
-
-    // try server.listen(net.Address.parseIp("127.0.0.1", 8001) catch unreachable);
-    // std.log.info("listening at {}\n", .{server.listen_address});
 }
