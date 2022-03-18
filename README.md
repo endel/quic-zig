@@ -20,11 +20,11 @@ HTTP/3 implementation written in Zig.
 
 **Implementations**
 
+- https://github.com/aws/s2n-quic
 - https://github.com/private-octopus/picoquic
 - https://en.wikipedia.org/wiki/HTTP/3#Libraries
 - https://github.com/facebookincubator/mvfst
 - https://github.com/microsoft/msquic
-- https://github.com/aws/s2n-quic
 - https://github.com/lucas-clemente/quic-go
 - https://github.com/Vect0rZ/Quic.NET
 
