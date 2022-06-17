@@ -6,9 +6,11 @@ HTTP/3 implementation written in Zig.
 
 **Specifications**
 
-- QUIC: https://w3c.github.io/webtransport/
-- HTTP/3: https://datatracker.ietf.org/doc/html/draft-ietf-quic-http
-- WebTransport: https://w3c.github.io/webtransport/
+- [ ] QUIC: https://w3c.github.io/webtransport/
+  - [ ] TLS 1.3: https://tools.ietf.org/html/draft-ietf-tls-tls13-14
+  - [ ] TLS + QUIC: https://datatracker.ietf.org/doc/html/rfc9001
+- [ ] HTTP/3: https://datatracker.ietf.org/doc/html/draft-ietf-quic-http
+- [ ] WebTransport: https://w3c.github.io/webtransport/
 
 ---
 
