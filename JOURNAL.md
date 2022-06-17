@@ -3,28 +3,31 @@
 ## June 2022
 
 **17/06/2022:**
-Started reading WebTransport's W3C Meeting Notes from https://www.w3.org/wiki/WebTransport/Meetings#WebTransport_Bi-weekly_Virtual_Meeting_.2339_late_-_May_24th.2C_2022
-Discovered that [Justin Uberti](https://github.com/juberti) is the author of the first WebRTC specs, same person who worked in Google Due, and Stadia. (https://drive.google.com/file/d/1U_arWk-uOqdb8uCWvceUQdX5atf_6Xi2/view)
+- Started reading WebTransport's W3C Meeting Notes from https://www.w3.org/wiki/WebTransport/Meetings#WebTransport_Bi-weekly_Virtual_Meeting_.2339_late_-_May_24th.2C_2022
+- Discovered that [Justin Uberti](https://github.com/juberti) is the author of the first WebRTC specs, same person who worked in Google Due, and Stadia. (https://drive.google.com/file/d/1U_arWk-uOqdb8uCWvceUQdX5atf_6Xi2/view)
+- Found an initial Zig implementation for TLS 1.3 (https://github.com/Luukdegram/feilich), which may not be 100% finished. The author [Luuk de Gram](https://github.com/Luukdegram) is also member of the Zig Core Team.
 
 **16/06/2022:**
-TLS 1.3 is going to be a major requirement. The BearSSL project (which currently only supports TLS 1.2) has documented their status to support TLS 1.3 in their [documentation](https://bearssl.org/tls13.html).
+- TLS 1.3 is going to be a major requirement.
+- The BearSSL project (which currently only supports TLS 1.2) has documented their status to support TLS 1.3 in their [documentation](https://bearssl.org/tls13.html).
 
 **15/06/2022:**
-Found a proper MsQuic C# implementation https://github.com/StirlingLabs/MsQuic.Net, but it doesn't currently work on Mac arm64 (https://github.com/StirlingLabs/MsQuic.Net/issues/3).
+- Found a proper MsQuic C# implementation https://github.com/StirlingLabs/MsQuic.Net, but it doesn't currently work on Mac arm64 (https://github.com/StirlingLabs/MsQuic.Net/issues/3).
 
 (💭 _"Should I re-write/port an entire HTTP/3 implementation in ZIG?"_)
 
 **14/06/2022:**
-Found a C# implementation of WebTransport in the wild, which uses msquic bindings. https://github.com/wegylexy/webtransport
+
+- Found a C# implementation of WebTransport in the wild, which uses msquic bindings. https://github.com/wegylexy/webtransport
 
 ## March 2022
 
 **06/03/2022**:
-I need to understand how to import and use [quictls/openssl](https://github.com/quictls/openssl/tree/OpenSSL_1_1_1m+quic) from Zig.
+- I need to understand how to import and use [quictls/openssl](https://github.com/quictls/openssl/tree/OpenSSL_1_1_1m+quic) from Zig.
 
-Found [ziget](https://github.com/marler8997/ziget) - a project that consumes a few TLS implementations in order request network assets. TLS implementations include `openssl`, `iguana` and `schannel`.
+- Found [ziget](https://github.com/marler8997/ziget) - a project that consumes a few TLS implementations in order request network assets. TLS implementations include `openssl`, `iguana` and `schannel`.
 
-If I can get `ziget` to compile, I can adapt it to use `quictls/openssl` instead of `openssl`.
+- If I can get `ziget` to compile, I can adapt it to use `quictls/openssl` instead of `openssl`.
 
 ---
 
