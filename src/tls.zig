@@ -1,0 +1,36 @@
+const std = @import("std");
+
+pub const TLS_VERSION = enum(i32) {
+    TLS_1_2 = 0x0303,
+    TLS_1_3 = 0x0304,
+    TLS_1_3_DRAFT_28 = 0x7F1C,
+    TLS_1_3_DRAFT_27 = 0x7F1B,
+    TLS_1_3_DRAFT_26 = 0x7F1A,
+};
+
+const Direction = enum (i32) {
+    DECRYPT = 0,
+    ENCRYPT = 1,
+};
+
+const Epoch = enum (i32) {
+    INITIAL = 0,
+    ZERO_RTT = 1,
+    HANDSHAKE = 2,
+    ONE_RTT = 3,
+};
+
+const State = enum (i32) {
+    CLIENT_HANDSHAKE_START = 0,
+    CLIENT_EXPECT_SERVER_HELLO = 1,
+    CLIENT_EXPECT_ENCRYPTED_EXTENSIONS = 2,
+    CLIENT_EXPECT_CERTIFICATE_REQUEST_OR_CERTIFICATE = 3,
+    CLIENT_EXPECT_CERTIFICATE_CERTIFICATE = 4,
+    CLIENT_EXPECT_CERTIFICATE_VERIFY = 5,
+    CLIENT_EXPECT_FINISHED = 6,
+    CLIENT_POST_HANDSHAKE = 7,
+
+    SERVER_EXPECT_CLIENT_HELLO = 8,
+    SERVER_EXPECT_FINISHED = 9,
+    SERVER_POST_HANDSHAKE = 10,
+}
