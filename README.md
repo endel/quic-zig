@@ -15,8 +15,17 @@ Browser's `web-platform-tests`: https://wpt.fyi/webtransport
 - [ ] QUIC: https://w3c.github.io/webtransport/
   - [ ] TLS 1.3: https://tools.ietf.org/html/draft-ietf-tls-tls13-14
   - [ ] TLS + QUIC: https://datatracker.ietf.org/doc/html/rfc9001
+    - [ ] Openssl 1.1.1p (Example PR) https://github.com/quictls/openssl/pull/87
+    - [ ] Openssl 3.0.5+quic (Example PR) https://github.com/quictls/openssl/pull/88
 - [ ] HTTP/3: https://datatracker.ietf.org/doc/html/draft-ietf-quic-http
 - [ ] WebTransport: https://w3c.github.io/webtransport/
+
+**Congestion Control Algorithms**
+
+- New Reno: https://tools.ietf.org/html/rfc6582
+- BBR: https://www.ietf.org/proceedings/97/slides/slides-97-iccrg-bbr-congestion-control-02.pdf
+- SCReAM: https://github.com/EricssonResearch/scream
+- (More: https://en.wikipedia.org/wiki/TCP_congestion_control)
 
 ---
 

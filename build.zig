@@ -1,32 +1,39 @@
 const std = @import("std");
 
-pub const pkg = std.build.Pkg{
-    .name = "netcode",
-    .source = .{ .path = thisDir() ++ "/src/main.zig" },
-};
-
 pub fn build(b: *std.build.Builder) void {
-    const build_mode = b.standardReleaseOptions();
+    // Standard target options allows the person running `zig build` to choose
+    // what target to build for. Here we do not override the defaults, which
+    // means any target is allowed, and the default is native. Other options
+    // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
-    const tests = buildTests(b, build_mode, target);
 
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&tests.step);
-}
+    // Standard release options allow the person running `zig build` to select
+    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
+    const mode = b.standardReleaseOptions();
 
-pub fn buildTests(
-    b: *std.build.Builder,
-    build_mode: std.builtin.Mode,
-    target: std.zig.CrossTarget,
-) *std.build.LibExeObjStep {
-    const tests = b.addTest(thisDir() ++ "/src/main.zig");
-    tests.setBuildMode(build_mode);
-    tests.setTarget(target);
-    return tests;
-}
+    const exe = b.addExecutable("netcode", "packages/example.zig");
+    // exe.setTarget(target);
+    exe.setBuildMode(mode);
+    exe.install();
 
-fn thisDir() []const u8 {
-    comptime {
-        return std.fs.path.dirname(@src().file) orelse ".";
+    const run_cmd = exe.run();
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
     }
+
+    const run_step = b.step("run", "Run the app");
+    run_step.dependOn(&run_cmd.step);
+
+    const exe_tests = b.addTest("packages/example.zig");
+    exe_tests.setTarget(target);
+    exe_tests.setBuildMode(mode);
+
+    const feilich_tests = b.addTest("packages/feilich/feilich.zig");
+    feilich_tests.setTarget(target);
+    feilich_tests.setBuildMode(mode);
+
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&exe_tests.step);
+    test_step.dependOn(&feilich_tests.step);
 }

@@ -1,3 +1,5 @@
+// https://github.com/aiortc/aioquic/blob/main/src/aioquic/tls.py
+
 const std = @import("std");
 
 pub const TLS_VERSION = enum(i32) {
