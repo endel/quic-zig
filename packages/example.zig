@@ -9,15 +9,19 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     var server = net.StreamServer.init(.{ .reuse_address = true });
-    defer server.close();
+    defer server.deinit();
 
+    // const addr = net.Address.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, }, 8080);
     const addr = net.Address.initIp4(.{ 0, 0, 0, 0 }, 8080);
     try server.listen(addr);
     std.log.info("Listening on {}", .{addr});
 
-    const privateKey = @embedFile("../self-signed/localhost.key");
-    // const publicKey = @embedFile("../self-signed/localhost.pem");
-    const publicKey = @embedFile("../self-signed/localhost.crt");
+    // const privateKey = @embedFile("../self-signed/localhost.key");
+    // const publicKey = @embedFile("../self-signed/localhost.crt");
+
+    const privateKey = @embedFile("../self-signed/aioquic/ssl_key.pem");
+    const publicKey = @embedFile("../self-signed/aioquic/ssl_cert.pem");
+
     // std.log.info("cert: {s}", .{privateKey});
     // std.log.info("key: {s}", .{publicKey});
 
@@ -26,6 +30,8 @@ pub fn main() !void {
     while (true) {
         const connection = try server.accept();
         const stream = connection.stream;
+
+        std.log.info("Accepting connection... {any}", .{connection});
 
         tls_server.connect(stream.reader(), stream.writer()) catch |err| {
             std.log.debug("Error: {s}\n", .{@errorName(err)});

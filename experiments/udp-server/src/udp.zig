@@ -4,7 +4,7 @@ const fs = std.fs;
 const os = std.os;
 const Queue = std.atomic.Queue;
 
-// pub const io_mode = .evented;
+pub const io_mode = .evented;
 
 pub const Packet = struct {
     payload: []u8,
@@ -15,7 +15,7 @@ pub fn main() anyerror!void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    const port = 8080;
+    const port = 50000;
     var sockfd: i32 = try os.socket(os.AF.INET, os.SOCK.DGRAM | os.SOCK.CLOEXEC | os.SOCK.NONBLOCK, 0);
     var addr = try std.net.Address.parseIp4("127.0.0.1", port);
     // defer os.closeSocket(sockfd);
@@ -73,12 +73,6 @@ pub fn main() anyerror!void {
         // take a pre-allocated buffers
         var node = packet_buffers.get().?;
 
-        std.log.info("node = {any}", .{node});
-
-        if (node.data.len == 0) {
-            continue;
-        }
-
         // copy the data
         std.mem.copy(u8, node.data.payload[0..rlen], buf[0..rlen]);
         node.data.len = rlen;
@@ -95,4 +89,5 @@ pub fn main() anyerror!void {
             drops = 0;
         }
     }
+
 }

@@ -109,6 +109,8 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
             const handshake_type = try reader.readByte();
             const remaining_length = try reader.readIntBig(u24);
 
+            std.log.info("let's decode handshake, type: {}, length: {}", .{handshake_type, remaining_length});
+
             switch (@intToEnum(HandshakeType, handshake_type)) {
                 .client_hello => return Result{ .client_hello = try self.decodeClientHello(remaining_length) },
                 else => @panic("TODO"),
@@ -119,6 +121,8 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
         /// This means the Record header and handshake header have already been read
         /// and the first data to read will be the protocol version.
         pub fn decodeClientHello(self: *Self, message_length: usize) Error!ClientHelloResult {
+            std.log.info("decodeClientHello...", .{});
+
             var result: ClientHelloResult = undefined;
 
             // maximum length of an entire record (record header + message)

@@ -11,7 +11,8 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const exe = b.addExecutable("netcode", "packages/example.zig");
+    // const exe = b.addExecutable("netcode", "packages/example.zig");
+    const exe = b.addExecutable("netcode", "packages/example_udp.zig");
     // exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.install();

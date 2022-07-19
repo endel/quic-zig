@@ -58,7 +58,9 @@ Browser's `web-platform-tests`: https://wpt.fyi/webtransport
 
 ### Load Balancing
 
-- ...
+- Draft: [QUIC-LB: Generating Routable QUIC Connection IDs](https://datatracker.ietf.org/doc/html/rfc9000)
+- "Process demultiplexing"? (https://github.com/quicwg/load-balancers/pull/178/files)
+- "Twelve-pass encryption"? (https://github.com/quicwg/load-balancers/pull/175)
 
 ### qlog
 

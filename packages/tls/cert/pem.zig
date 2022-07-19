@@ -94,6 +94,7 @@ pub fn decode(gpa: Allocator, data: []const u8) (DecodeError || std.base64.Error
     end_offset -= @boolToInt(data[end_offset - 1] == '\n');
     end_offset -= @boolToInt(data[end_offset - 1] == '\r');
     const content_to_decode = data[begin_offset..end_offset];
+    std.log.info("content to decode: {s}", .{content_to_decode});
     const len = try std.base64.standard.Decoder.calcSizeForSlice(content_to_decode);
     const decoded_data = try gpa.alloc(u8, len);
     errdefer gpa.free(decoded_data);
@@ -106,8 +107,8 @@ pub fn decode(gpa: Allocator, data: []const u8) (DecodeError || std.base64.Error
 
 /// Given a file path, will attempt to decode its content into a `Pem` instance.
 /// Memory is owned by the caller.
-pub fn fromFile(gpa: Allocator, file_path: []const u8) (DecodeError || std.base64.Error)!Pem {
-    const file = try std.fs.cwd().openFile(file_path, .{});
+pub fn fromFile(gpa: Allocator, file_path: []const u8) anyerror!Pem {
+    const file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_only });
     defer file.close();
 
     const file_length = (try file.stat()).size;
