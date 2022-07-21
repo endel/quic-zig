@@ -17,18 +17,11 @@ const tlsStructs = @import("quic/structs_tls.zig");
 
 // pub const io_mode = .evented;
 
-pub const Packet = struct {
-    payload: []u8,
-    len: usize,
-};
-
 pub fn main() anyerror!void {
-    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer _ = gpa.deinit();
-
-    var gpa = std.heap.page_allocator;
-
-    var ticket_store = std.StringHashMap(tlsStructs.SessionTicket).init(gpa);
+    // var alloc = std.heap.GeneralPurposeAllocator(.{}){};
+    // defer _ = alloc.deinit();
+    var alloc = std.heap.page_allocator;
+    var ticket_store = std.StringHashMap(tlsStructs.SessionTicket).init(alloc);
 
     var server = QuicServer.init(.{
         .alpn_protocols = h3.ALPN ++ h0.ALPN ++ [_][]const u8{"siduck"},
@@ -36,7 +29,7 @@ pub fn main() anyerror!void {
         .max_datagram_frame_size = 65536,
     }, ticket_store);
 
-    try server.configuration.readCertChain(gpa, .{
+    try server.configuration.readCertChain(alloc, .{
         .certfile = "self-signed/aioquic/ssl_cert.pem",
         .keyfile = "self-signed/aioquic/ssl_key.pem",
         // .certfile = @embedFile("../self-signed/aioquic/ssl_cert.pem"),
