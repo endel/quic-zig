@@ -47,16 +47,22 @@ pub fn main() anyerror!void {
         var src_addr: os.sockaddr = undefined;
         var addr_size: std.os.socklen_t = @sizeOf(os.sockaddr);
 
-        const udp_len = os.recvfrom(sockfd, &bytes, 0, &src_addr, &addr_size) catch {
+        const packet_length = os.recvfrom(sockfd, &bytes, 0, &src_addr, &addr_size) catch {
             continue;
         };
 
-        std.log.info("packet length {} => {}", .{ udp_len, src_addr });
-        std.log.info("packet received {any}", .{bytes[0..udp_len]});
+        std.log.info("packet length {} => {}", .{ packet_length, src_addr });
+        std.log.info("packet received {any}", .{bytes[0..packet_length]});
 
-        try packet.readQuicHeader(bytes[0..udp_len]);
+        // try packet.parseIncoming(bytes[0..packet_length]);
 
-        const sent_size = try os.sendto(sockfd, bytes[0..udp_len], 0, &src_addr, addr_size);
+        // var stream = io.fixedBufferStream(bytes[0..packet_length]);
+        // const reader = stream.reader();
+
+        var packet_header = try packet.QuicPacketHeader.parseFrom(bytes[0..packet_length]);
+        std.log.info("quicPacketHeader => {}", .{packet_header});
+
+        const sent_size = try os.sendto(sockfd, bytes[0..packet_length], 0, &src_addr, addr_size);
         std.log.info("sendto, size => {}", .{sent_size});
     }
 
@@ -101,4 +107,8 @@ pub fn main() anyerror!void {
     //     //     drops = 0;
     //     // }
     // }
+}
+
+test {
+    _ = @import("quic/packet.zig");
 }

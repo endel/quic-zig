@@ -11,8 +11,7 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    // const exe = b.addExecutable("netcode", "packages/example.zig");
-    const exe = b.addExecutable("netcode", "packages/example_udp.zig");
+    const exe = b.addExecutable("netcode", "src/example.zig");
     // exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.install();
@@ -26,15 +25,15 @@ pub fn build(b: *std.build.Builder) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    const exe_tests = b.addTest("packages/example.zig");
+    const exe_tests = b.addTest("src/example.zig");
     exe_tests.setTarget(target);
     exe_tests.setBuildMode(mode);
 
-    const feilich_tests = b.addTest("packages/feilich/feilich.zig");
-    feilich_tests.setTarget(target);
-    feilich_tests.setBuildMode(mode);
+    // const feilich_tests = b.addTest("src/feilich/feilich.zig");
+    // feilich_tests.setTarget(target);
+    // feilich_tests.setBuildMode(mode);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&exe_tests.step);
-    test_step.dependOn(&feilich_tests.step);
+    // test_step.dependOn(&feilich_tests.step);
 }
