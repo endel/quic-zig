@@ -1,41 +1,10 @@
 const std = @import("std");
-const cert = @import("../tls/cert/cert.zig");
 const string = []const u8;
-
-pub const QuicConnectionId = struct {
-    cid: []u8,
-    sequence_number: u32,
-    stateless_reset_token: []u8 = .{},
-    was_sent: bool = false,
-};
-
-pub const QuicConnectionState = enum(u8) {
-    FIRSTFLIGHT = 0,
-    CONNECTED = 1,
-    CLOSING = 2,
-    DRAINING = 3,
-    TERMINATED = 4,
-};
-
-pub const QuicNetworkPath = struct {
-    addr: std.net.Address,
-    bytes_received: u32,
-    bytes_sent: u32,
-    is_validated: bool,
-    local_challenge: []u8,
-    remote_challenge: []u8,
-
-    // TODO: i don't like "canXX()" bool method names.
-    pub fn canSend(self: QuicNetworkPath, size: u32) bool {
-        // TODO: this math looks suspicious!
-        return self.is_validated || (self.bytes_sent + size) <= 3 * self.bytes_received;
-    }
-};
 
 ///
 /// A QUIC Configuration
 ///
-pub const QuicConfiguration = struct {
+pub const Config = struct {
     /// A list of supported ALPN protocols.
     // TODO: dynamic allocation for protocols here.
     alpn_protocols: [11]string = &.{},
@@ -48,7 +17,7 @@ pub const QuicConfiguration = struct {
     idle_timeout: u8 = 60,
 
     // Whether this is the client side of the QUIC connection.
-    is_client: bool = false,
+    is_client: bool = true,
 
     // Connection-wide flow control limit.
     max_data: u32 = 1048576,
@@ -88,7 +57,7 @@ pub const QuicConfiguration = struct {
     verify_mode: u8 = undefined,
 
     // pub fn readCertChain(self: QuicConfiguration, certfile: string, keyfile: ?string, password: ?string) !void {
-    pub fn readCertChain(self: QuicConfiguration, alloc: std.mem.Allocator, opts: struct { certfile: string, keyfile: ?string, password: ?string = undefined }) !void {
+    pub fn readCertChain(self: Config, alloc: std.mem.Allocator, opts: struct { certfile: string, keyfile: ?string, password: ?string = undefined }) !void {
         _ = self;
         _ = opts;
 

@@ -13,29 +13,42 @@ pub const PACKET_TYPE_MASK = 0xF0;
 pub const MAX_PACKET_SIZE = 1536;
 
 pub const PacketType = enum(u8) {
+    /// Initial packet
     Initial = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x00,
-    ZeroRTT = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x10,
-    Handshake = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x20,
+
+    /// Retry packet
     Retry = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x30,
+
+    /// Handshake packet
+    Handshake = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x20,
+
+    /// 0-RTT packet
+    ZeroRTT = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x10,
+
+    /// Version negotiation packet
+    VersionNegotiation = 0,
+
+    /// 1-RTT short header packet
     OneRTT = PACKET_FIXED_BIT,
 };
 
-pub const Epoch = enum(u8) { Initial = 0, ZeroRTT = 1, Handshake = 2, OneRTT = 3 };
+pub const Epoch = enum(u8) {
+    Initial = 0,
+    Handshake = 1,
+    Application = 2,
+    Count = 3,
+};
+// pub const Epoch = enum(u8) { Initial = 0, ZeroRTT = 1, Handshake = 2, OneRTT = 3 };
 
 pub const CONNECTION_ID_MAX_SIZE: u8 = 20;
 pub const PACKET_NUMBER_MAX_SIZE = 4;
-// pub const RETRY_AEAD_KEY_DRAFT_29 = binascii.unhexlify("ccce187ed09a09d05728155a6cb96be1");
-// pub const RETRY_AEAD_KEY_VERSION_1 = binascii.unhexlify("be0c690b9f66575a1d766b54e368c84e");
-// pub const RETRY_AEAD_NONCE_DRAFT_29 = binascii.unhexlify("e54930f97f2136f0530a8c1c");
-// pub const RETRY_AEAD_NONCE_VERSION_1 = binascii.unhexlify("461599d35d632bf2239825bb");
+
 pub const RETRY_INTEGRITY_TAG_SIZE = 16;
 pub const STATELESS_RESET_TOKEN_SIZE = 16;
 
 pub const PacketError = error{
     InvalidVersion,
-    ConnectionIDTooLong,
-    FixedBitZero, //
-    PayloadTruncated,
+    InvalidPacket,
     InvalidVarLength,
 };
 
@@ -60,7 +73,7 @@ pub const QuicErrorCode = enum(u8) {
 };
 
 pub const ProtocolVersion = enum(u32) {
-    NEGOTIATION = 0,
+    NEGOTIATION = 0, // TODO: refactor me!
     VERSION_1 = 0x00000001,
     VERSION_2 = 0x709a50c4,
     DRAFT_29 = 0xFF00001D,
@@ -69,26 +82,31 @@ pub const ProtocolVersion = enum(u32) {
     DRAFT_32 = 0xFF000020,
 };
 
-/// QuicPacketHeader
-pub const QuicPacketHeader = struct {
-    // bytes: []const u8,
-
+/// A QUIC packet's header.
+pub const Header = struct {
     version: ProtocolVersion = undefined,
-    epoch: Epoch = undefined,
-
     packet_type: PacketType = undefined,
-    // payload_length: i32 = undefined,
 
-    source_cid: []const u8 = undefined,
     destination_cid: []const u8 = undefined,
+    source_cid: []const u8 = undefined,
 
-    token: []const u8 = undefined,
+    /// The address verification token of the packet. Only present in `Initial`
+    /// and `Retry` packets.
+    token: ?[]const u8 = null,
     remainder_length: u64 = undefined,
 
-    // pub fn parseFrom(reader: anytype) !QuicPacketHeader {
-    //     return parseQuicHeader(reader);
-    // }
-    pub fn parseFrom(bytes: []const u8) !QuicPacketHeader {
+    /// The packet number. It's only meaningful after the header protection is
+    /// removed.
+    packet_number: u64 = 0,
+
+    /// The length of the packet number. It's only meaningful after the header
+    /// protection is removed.
+    packet_number_len: usize = 0,
+
+    // TODO: version negotiation
+    // versions: ProtocolVersion = undefined,
+
+    pub fn parse(bytes: []const u8) !Header {
         return parseQuicHeader(bytes);
     }
 };
@@ -102,12 +120,12 @@ pub fn isLongHeader(first_byte: u8) bool {
     return (first_byte & PACKET_LONG_HEADER) == PACKET_LONG_HEADER;
 }
 
-pub fn parseQuicHeader(bytes: []const u8) !QuicPacketHeader {
+pub fn parseQuicHeader(bytes: []const u8) !Header {
     var stream = io.fixedBufferStream(bytes);
     const reader = stream.reader();
 
     const first_byte = try reader.readByte();
-    var packet_header = QuicPacketHeader{};
+    var packet_header = Header{};
 
     if (isLongHeader(first_byte)) {
         log.info("LONG HEADER!", .{});
@@ -118,7 +136,7 @@ pub fn parseQuicHeader(bytes: []const u8) !QuicPacketHeader {
         const destination_cid_length = try reader.readByte();
         if (destination_cid_length > CONNECTION_ID_MAX_SIZE) {
             std.log.err("Destination CID is too long ({any} bytes)", .{destination_cid_length});
-            return error.ConnectionIDTooLong;
+            return error.PacketError;
         }
 
         std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, destination_cid_length });
@@ -132,7 +150,7 @@ pub fn parseQuicHeader(bytes: []const u8) !QuicPacketHeader {
         const source_cid_length = try reader.readByte();
         if (source_cid_length > CONNECTION_ID_MAX_SIZE) {
             std.log.err("Source CID is too long ({any} bytes)", .{source_cid_length});
-            return error.ConnectionIDTooLong;
+            return error.InvalidPacket;
         }
 
         std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, source_cid_length });
@@ -142,9 +160,6 @@ pub fn parseQuicHeader(bytes: []const u8) !QuicPacketHeader {
         // advance source_cid_length
         try stream.seekBy(source_cid_length);
 
-        packet_header.packet_type = @intToEnum(PacketType, (first_byte & PACKET_TYPE_MASK));
-        std.log.info("packet_type => {any}", .{packet_header.packet_type});
-
         if (packet_header.version == ProtocolVersion.NEGOTIATION) {
             // version negotiation
             //
@@ -153,7 +168,7 @@ pub fn parseQuicHeader(bytes: []const u8) !QuicPacketHeader {
         } else {
             if ((first_byte & PACKET_FIXED_BIT) == 0) {
                 std.log.err("Packet fixed bit is zero", .{});
-                return error.FixedBitZero;
+                return error.InvalidPacket;
             }
 
             packet_header.packet_type = @intToEnum(PacketType, (first_byte & PACKET_TYPE_MASK));
@@ -161,28 +176,30 @@ pub fn parseQuicHeader(bytes: []const u8) !QuicPacketHeader {
 
             switch (packet_header.packet_type) {
                 PacketType.Initial => {
+                    //
+                    // Clients MUST ensure that UDP datagrams containing Initial packets
+                    // have UDP payloads of at least 1200 bytes,
+                    //
+                    // https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
+                    //
+                    if (bytes.len < 1200) {
+                        std.log.warn("Initial packet length must be 1200 bytes or higher. (actual length {})", .{bytes.len});
+                        return error.InvalidPacket;
+                    }
+
                     var token_length = try reader.readByte();
                     if (token_length == 0) {
                         std.log.warn("no token!", .{});
+                    } else {
+                        //
+                        // Token:  The value of the token that was previously provided in a
+                        //    Retry packet or NEW_TOKEN frame; see Section 8.1.
+                        //
+                        packet_header.token = bytes[stream.pos..(stream.pos + token_length)];
+                        try stream.seekBy(@intCast(i64, token_length));
                     }
 
-                    //
-                    // Token:  The value of the token that was previously provided in a
-                    //    Retry packet or NEW_TOKEN frame; see Section 8.1.
-                    //
-                    packet_header.token = bytes[stream.pos..(stream.pos + token_length)];
-                    try stream.seekBy(@intCast(i64, token_length));
-
                     packet_header.remainder_length = try readVarInt(reader);
-                    packet_header.epoch = Epoch.Initial;
-                },
-
-                PacketType.ZeroRTT => {
-                    packet_header.epoch = Epoch.ZeroRTT;
-                },
-
-                PacketType.Handshake => {
-                    packet_header.epoch = Epoch.Handshake;
                 },
 
                 PacketType.Retry => {
@@ -191,7 +208,16 @@ pub fn parseQuicHeader(bytes: []const u8) !QuicPacketHeader {
                     // try stream.seekBy(@intCast(i64, token_length));
 
                     // packet_header.token = token;
-                    packet_header.epoch = Epoch.Initial;
+                },
+
+                PacketType.VersionNegotiation => {
+                    // TODO: implement version negotiation packets
+                    std.log.warn("TODO: VersionNegotiation not implemented yet!", .{});
+
+                    while (stream.pos - bytes.len > 0) {
+                        const version = reader.readInt(u32, endian);
+                        std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
+                    }
                 },
 
                 else => {
@@ -203,7 +229,7 @@ pub fn parseQuicHeader(bytes: []const u8) !QuicPacketHeader {
             // check remainder length
             if (packet_header.remainder_length > bytes.len - stream.pos) {
                 std.log.err("Packet payload is truncated", .{});
-                return error.PayloadTruncated;
+                return error.InvalidPacket;
             }
         }
 

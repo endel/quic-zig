@@ -1,7 +1,20 @@
 # Netcode Journal and Progress Report
 
+## August 2022
+
+-
+
 ## July 2022
 
+- Finally touching TLS/Handshake stuff, need to understand how QUIC handshake
+  works.
+- Parsing QUIC "Initial" header in Zig. Progress! (tiny, but progress!)
+- Realized using aioquic as a reference may not be ideal, since it lacks
+  low-level system calls that are required on Zig. As I'm a noob with systems
+  programming, I need to see low-level references to better understand stuff.
+  Thus, started using picoquic (C++, very good & readable code!) _and_ quiche
+  (Rust, more elegant than picoquic, also very readable!). I'm not copying or
+  porting any code over, just using them as references.
 - Been trying to use feilich's server and the web browser as a client. Could see
   the TLS server receiving some messages, but the handshake doesn't succeed. I'm
   clearly missing some steps, as I'm not really sure what the browser is doing
