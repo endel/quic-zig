@@ -87,7 +87,10 @@ pub const Header = struct {
     version: ProtocolVersion = undefined,
     packet_type: PacketType = undefined,
 
+    /// Destination Connection ID
     destination_cid: []const u8 = undefined,
+
+    /// Source Connection ID
     source_cid: []const u8 = undefined,
 
     /// The address verification token of the packet. Only present in `Initial`
@@ -130,8 +133,10 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
     if (isLongHeader(first_byte)) {
         log.info("LONG HEADER!", .{});
 
-        packet_header.version = @intToEnum(ProtocolVersion, try reader.readInt(u32, endian));
-        log.info("version: {any}", .{packet_header.version});
+        var version = try reader.readInt(u32, endian);
+        log.info("version: {any}", .{version});
+        packet_header.version = @intToEnum(ProtocolVersion, version);
+        log.info("(enum) version: {any}", .{packet_header.version});
 
         const destination_cid_length = try reader.readByte();
         if (destination_cid_length > CONNECTION_ID_MAX_SIZE) {
@@ -215,8 +220,8 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
                     std.log.warn("TODO: VersionNegotiation not implemented yet!", .{});
 
                     while (stream.pos - bytes.len > 0) {
-                        const version = reader.readInt(u32, endian);
-                        std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
+                        _ = try reader.readInt(u32, endian); // const version = reader.readInt(u32, endian);
+                        // std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
                     }
                 },
 
