@@ -231,11 +231,12 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
                 },
             }
 
-            // check remainder length
-            if (packet_header.remainder_length > bytes.len - stream.pos) {
-                std.log.err("Packet payload is truncated", .{});
-                return error.InvalidPacket;
-            }
+            // // check remainder length
+            // if (packet_header.remainder_length > bytes.len - stream.pos) {
+            //     std.log.err("Packet payload is truncated", .{});
+            //     return error.InvalidPacket;
+            // }
+
         }
 
         //

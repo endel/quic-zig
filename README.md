@@ -52,11 +52,19 @@ Browser's `web-platform-tests`: https://wpt.fyi/webtransport
 
 ## QUIC "Extensions"
 
+### Unreliable Datagram Extension
+
+- https://datatracker.ietf.org/doc/html/rfc9221
+
 ### QPACK:
+
+QPACK is the header compression used in QUIC. It has a "simple" implementation,
+that compresses 50% of the header, and a "complex" implementation that
+compresses more.
 
 - https://github.com/litespeedtech/ls-qpack
 
-### Load Balancing
+### Load Balancing (Not fully established yet)
 
 - Draft: [QUIC-LB: Generating Routable QUIC Connection IDs](https://datatracker.ietf.org/doc/html/rfc9000)
 - "Process demultiplexing"? (https://github.com/quicwg/load-balancers/pull/178/files)
@@ -65,13 +73,6 @@ Browser's `web-platform-tests`: https://wpt.fyi/webtransport
 ### qlog
 
 - https://github.com/quicwg/qlog
-
----
-
-## Interesting ZIG code for reference:
-
-- statsd-zig: https://github.com/remeh/statsd-zig/blob/master/src/main.zig
-- zig-network: https://github.com/MasterQ32/zig-network/blob/master/network.zig
 
 ---
 

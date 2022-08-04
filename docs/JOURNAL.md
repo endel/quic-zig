@@ -2,10 +2,13 @@
 
 ## August 2022
 
-- 01.08: Got stuck understanding quiche's `quiche::accept()` method. Watched Robin
-  Marx's video on QUIC where he mentions that to understand QUIC one must read
-  and understand 4 different RFC documents. So, now I started reading RFC 9001
-  (Using TLS to Secure QUIC).
+- 04.08: _(💭 inner-thoughts)_ The more I read implementations and portions of
+  the specs, the more I see this is a multi-year endeavour that may never end.
+  I'm struggling to implement the very basics.
+- 01.08: Got stuck understanding quiche's `quiche::accept()` method. Watched
+  Robin Marx's video on QUIC where he mentions that to understand QUIC one must
+  read and understand 4 different RFC documents. So, now I started reading RFC
+  9001 (Using TLS to Secure QUIC).
 
 ## July 2022
 
