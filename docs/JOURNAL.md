@@ -2,9 +2,29 @@
 
 ## August 2022
 
+- 30.08: Having some progress understanding how TLS initial packets are
+  encrypted. Made a PR trying to support zig's stage2 compiler for feilich
+  (https://github.com/Luukdegram/feilich/pull/1)
+
+- 26.08: Found this gist from  [Martin
+  Thomson](https://datatracker.ietf.org/person/martin.thomson@gmail.com) (one of
+  the authors of QUIC, and other 38 RFCs) on protecting/encrypting quic
+  packets
+  https://gist.github.com/martinthomson/1f000d3e389b0bf1308e1043e141fbb9.
+
+- 25.08: Reading more aioquic sources. Continued adapting its TLS context stuff
+  to zig.
+
+- 24.08: Been feeling stuck reading TLS handshake and the TLS context required
+  for setting up connections. Considering embedding quictls/openssl instead of
+  trying to adapt feilich to support QUIC stuff. Final thought: embedding
+  external TLS is going to make cross-platform compilation potentially more
+  complicated.
+
 - 04.08: _(💭 inner-thoughts)_ The more I read implementations and portions of
   the specs, the more I see this is a multi-year endeavour that may never end.
   I'm struggling to implement the very basics.
+
 - 01.08: Got stuck understanding quiche's `quiche::accept()` method. Watched
   Robin Marx's video on QUIC where he mentions that to understand QUIC one must
   read and understand 4 different RFC documents. So, now I started reading RFC

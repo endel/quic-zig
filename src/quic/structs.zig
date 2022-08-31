@@ -38,7 +38,7 @@ pub const QuicNetworkPath = struct {
 pub const QuicConfiguration = struct {
     /// A list of supported ALPN protocols.
     // TODO: dynamic allocation for protocols here.
-    alpn_protocols: [11]string = &.{},
+    alpn_protocols: [11]string = undefined,
 
     // The length in bytes of local connection IDs.
     connection_id_length: u8 = 8,

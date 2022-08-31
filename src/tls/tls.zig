@@ -4,7 +4,6 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const crypto = std.crypto;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
-
 /// Target cpu's endianness. Use this to check if byte swapping is required.
 const target_endianness = @import("builtin").cpu.arch.endian();
 

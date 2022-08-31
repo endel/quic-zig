@@ -18,14 +18,16 @@ pub const QuicPacketSpace = struct {
     ack_queue: std.TailQueue(f32) = undefined,
     discarded: bool = false,
     expected_packet_number: u32 = 0,
-    largest_received_packet: u32 = -1,
+    largest_received_packet: i32 = -1,
     largest_received_time: f32 = undefined,
 
     // sent packets and loss
     ack_eliciting_in_flight: u32 = 0,
     largest_acked_packet: u32 = 0,
     loss_time: f32 = undefined,
-    sent_packets: std.HashMap(u32, u32), // Dict[int, QuicSentPacket] = {}
+
+    // TODO: sent pakcet?
+    // sent_packets: std.AutoHashMap(u32, u32), // Dict[int, QuicSentPacket] = {}
 
     pub fn init() QuicPacketSpace {
         return .{};

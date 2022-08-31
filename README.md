@@ -4,6 +4,13 @@ HTTP/3 implementation written in Zig.
 
 Objectives: https://github.com/private-octopus/picoquic/pull/1372/files
 
+For testing against: https://github.com/marten-seemann/quic-interop-runner
+Interoperability testing: https://interop.seemann.io/
+
+## Verbatim
+
+- AEAD = Authenticated Encryption with Associated Data
+
 ## WebTransport links
 
 Browser's `web-platform-tests`: https://wpt.fyi/webtransport

@@ -6,15 +6,15 @@ const os = std.os;
 const mem = std.mem;
 const Queue = std.atomic.Queue;
 
-const tls = @import("tls/feilich.zig");
 const QuicServer = @import("quic/server.zig").Server;
 const QuicConfig = @import("quic/config.zig").Config;
-const QuicConnection = @import("quic/connection.zig").Connection;
+const Connection = @import("quic/connection.zig").Connection;
 const packet = @import("quic/packet.zig");
+const protocol = @import("quic/protocol.zig");
 
 const h0 = @import("h0/connection.zig");
 const h3 = @import("h3/connection.zig");
-const tlsStructs = @import("quic/structs_tls.zig");
+const quictls = @import("quic/quictls.zig");
 
 const hmac = std.crypto.auth.hmac;
 
@@ -24,7 +24,7 @@ pub fn main() anyerror!void {
     // var alloc = std.heap.GeneralPurposeAllocator(.{}){};
     // defer _ = alloc.deinit();
     var alloc = std.heap.page_allocator;
-    var ticket_store = std.StringHashMap(tlsStructs.SessionTicket).init(alloc);
+    var ticket_store = std.StringHashMap(quictls.SessionTicket).init(alloc);
 
     var server = QuicServer.init(.{
         .alpn_protocols = h3.ALPN ++ h0.ALPN ++ [_][]const u8{"siduck"},
@@ -48,7 +48,7 @@ pub fn main() anyerror!void {
     const sockfd = try server.listen(try std.net.Address.parseIp4("127.0.0.1", 8080));
     defer os.close(sockfd);
 
-    var clients = std.StringHashMap(QuicConnection).init(alloc);
+    var clients = std.StringHashMap(Connection).init(alloc);
 
     while (true) {
         os.nanosleep(0, 100 * 1000 * 1000);
@@ -73,8 +73,9 @@ pub fn main() anyerror!void {
         // TODO: hmac sign `destination_cid` to avoid clients having full
         // control which ID is being used.
         // let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
+        const conn_id = header.dcid;
 
-        const conn_pair = try clients.getOrPut(header.destination_cid);
+        const conn_pair = try clients.getOrPut(conn_id);
         if (!conn_pair.found_existing) {
             if (header.packet_type != packet.PacketType.Initial) {
                 std.log.err("Packet is not initial!", .{});
@@ -84,18 +85,22 @@ pub fn main() anyerror!void {
             //
             // TODO: Version negotiation
             //
-            if (header.version != packet.ProtocolVersion.VERSION_1 and
-                header.version != packet.ProtocolVersion.VERSION_2)
-            {
+
+            if (!protocol.isSupportedVersion(header.version)) {
                 std.log.warn("TODO: CLIENT WANTS TO USE VERSION {}, let's negotiate the version...", .{header.version});
             }
 
-            if (header.token == null) {
+            if (header.token == null or header.token.?.len == 0) {
                 // TODO: Do stateless retry if the client didn't send a token.
                 std.log.warn("TODO: Do stateless retry!", .{});
             }
 
-            conn_pair.value_ptr.* = server.accept();
+            if (header.scid.len != header.dcid.len) {
+                std.log.err("Invalid destination connection ID", .{});
+            }
+
+            conn_pair.value_ptr.* = server.accept(header);
+
             //
         } else {
             std.log.warn("HAS CONNECTION!", .{});
@@ -103,6 +108,8 @@ pub fn main() anyerror!void {
 
         const conn = conn_pair.value_ptr.*;
         _ = conn;
+
+        // network_path = self._find_network_path(addr)
 
         if (header.packet_type == packet.PacketType.Initial) {}
 
@@ -113,4 +120,5 @@ pub fn main() anyerror!void {
 
 test {
     _ = @import("quic/packet.zig");
+    _ = @import("quic/connection.zig");
 }

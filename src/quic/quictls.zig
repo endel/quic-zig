@@ -1,5 +1,9 @@
 const std = @import("std");
 const string = []const u8;
+const tls = @import("../tls/tls.zig");
+
+const PTLS_MAX_DIGEST_SIZE = 42;
+const CRYPTO_BUFFER_SIZE = 16384;
 
 pub const Epoch = enum(u8) {
     INITIAL = 0,
@@ -8,12 +12,13 @@ pub const Epoch = enum(u8) {
     ONE_RTT = 3,
 };
 
-pub const CipherSuite = enum(u32) {
-    AES_128_GCM_SHA256 = 0x1301,
-    AES_256_GCM_SHA384 = 0x1302,
-    CHACHA20_POLY1305_SHA256 = 0x1303,
-    EMPTY_RENEGOTIATION_INFO_SCSV = 0x00FF,
-};
+pub const CipherSuite = tls.CipherSuite;
+// enum(u32) {
+//     AES_128_GCM_SHA256 = 0x1301,
+//     AES_256_GCM_SHA384 = 0x1302,
+//     CHACHA20_POLY1305_SHA256 = 0x1303,
+//     EMPTY_RENEGOTIATION_INFO_SCSV = 0x00FF,
+// };
 
 pub const State = enum(u8) {
     CLIENT_HANDSHAKE_START = 0,
@@ -28,6 +33,23 @@ pub const State = enum(u8) {
     SERVER_EXPECT_CLIENT_HELLO = 8,
     SERVER_EXPECT_FINISHED = 9,
     SERVER_POST_HANDSHAKE = 10,
+};
+
+pub const Context = struct {
+    // ptls_t* tls;
+    // picoquic_cnx_t* cnx;
+    // int client_mode;
+    // ptls_raw_extension_t ext[2];
+    // ptls_handshake_properties_t handshake_properties;
+    // ptls_iovec_t* alpn_vec;
+    // size_t alpn_vec_size;
+    // size_t alpn_count;
+    // uint8_t* ext_data;
+    // size_t ext_data_size;
+    // uint16_t esni_version;
+    // uint8_t esni_nonce[PICOQUIC_ESNI_NONCE_SIZE];
+    // uint8_t app_secret_enc[PTLS_MAX_DIGEST_SIZE];
+    // uint8_t app_secret_dec[PTLS_MAX_DIGEST_SIZE];
 };
 
 //

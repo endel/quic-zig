@@ -2,6 +2,8 @@ const std = @import("std");
 const io = std.io;
 const log = std.log;
 
+const protocol = @import("protocol.zig");
+
 // network byte order
 const endian = std.builtin.Endian.Big;
 
@@ -72,26 +74,16 @@ pub const QuicErrorCode = enum(u8) {
     CRYPTO_ERROR = 0x100,
 };
 
-pub const ProtocolVersion = enum(u32) {
-    NEGOTIATION = 0, // TODO: refactor me!
-    VERSION_1 = 0x00000001,
-    VERSION_2 = 0x709a50c4,
-    DRAFT_29 = 0xFF00001D,
-    DRAFT_30 = 0xFF00001E,
-    DRAFT_31 = 0xFF00001F,
-    DRAFT_32 = 0xFF000020,
-};
-
 /// A QUIC packet's header.
 pub const Header = struct {
-    version: ProtocolVersion = undefined,
+    version: protocol.Version = undefined,
     packet_type: PacketType = undefined,
 
     /// Destination Connection ID
-    destination_cid: []const u8 = undefined,
+    dcid: []const u8 = undefined,
 
     /// Source Connection ID
-    source_cid: []const u8 = undefined,
+    scid: []const u8 = undefined,
 
     /// The address verification token of the packet. Only present in `Initial`
     /// and `Retry` packets.
@@ -135,37 +127,37 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
 
         var version = try reader.readInt(u32, endian);
         log.info("version: {any}", .{version});
-        packet_header.version = @intToEnum(ProtocolVersion, version);
+        packet_header.version = @intToEnum(protocol.Version, version);
         log.info("(enum) version: {any}", .{packet_header.version});
 
-        const destination_cid_length = try reader.readByte();
-        if (destination_cid_length > CONNECTION_ID_MAX_SIZE) {
-            std.log.err("Destination CID is too long ({any} bytes)", .{destination_cid_length});
+        const dcid_length = try reader.readByte();
+        if (dcid_length > CONNECTION_ID_MAX_SIZE) {
+            std.log.err("Destination CID is too long ({any} bytes)", .{dcid_length});
             return error.PacketError;
         }
 
-        std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, destination_cid_length });
+        std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, dcid_length });
 
-        packet_header.destination_cid = bytes[stream.pos..(stream.pos + destination_cid_length)];
-        std.log.info("destination_cid: {s} ({any})", .{ packet_header.destination_cid, packet_header.destination_cid });
+        packet_header.dcid = bytes[stream.pos..(stream.pos + dcid_length)];
+        std.log.info("dcid: {s} ({any})", .{ packet_header.dcid, packet_header.dcid });
 
-        // advance destination_cid_length
-        try stream.seekBy(destination_cid_length);
+        // advance dcid_length
+        try stream.seekBy(dcid_length);
 
-        const source_cid_length = try reader.readByte();
-        if (source_cid_length > CONNECTION_ID_MAX_SIZE) {
-            std.log.err("Source CID is too long ({any} bytes)", .{source_cid_length});
+        const scid_length = try reader.readByte();
+        if (scid_length > CONNECTION_ID_MAX_SIZE) {
+            std.log.err("Source CID is too long ({any} bytes)", .{scid_length});
             return error.InvalidPacket;
         }
 
-        std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, source_cid_length });
-        packet_header.source_cid = bytes[stream.pos..(stream.pos + source_cid_length)];
-        std.log.info("source_cid: {s} ({any})", .{ packet_header.source_cid, packet_header.source_cid });
+        std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, scid_length });
+        packet_header.scid = bytes[stream.pos..(stream.pos + scid_length)];
+        std.log.info("scid: {s} ({any})", .{ packet_header.scid, packet_header.scid });
 
-        // advance source_cid_length
-        try stream.seekBy(source_cid_length);
+        // advance scid_length
+        try stream.seekBy(scid_length);
 
-        if (packet_header.version == ProtocolVersion.NEGOTIATION) {
+        if (packet_header.version == protocol.Version.NEGOTIATION) {
             // version negotiation
             //
             // TODO:
@@ -274,18 +266,18 @@ fn readVarInt(reader: anytype) !u64 {
 }
 
 test "QUIC: Variable-Length Integer Decoding" {
-    var reader = io.fixedBufferStream(&[_]u8{ 194, 25, 124, 94, 255, 20, 232, 140 }).reader();
-    try std.testing.expect(151288809941952652 == try readVarInt(reader));
+    var fbs = io.fixedBufferStream(&[_]u8{ 194, 25, 124, 94, 255, 20, 232, 140 });
+    try std.testing.expect(151288809941952652 == try readVarInt(fbs.reader()));
 
-    reader = io.fixedBufferStream(&[_]u8{ 0x9d, 0x7f, 0x3e, 0x7d }).reader();
-    try std.testing.expect(494878333 == try readVarInt(reader));
+    fbs = io.fixedBufferStream(&[_]u8{ 0x9d, 0x7f, 0x3e, 0x7d });
+    try std.testing.expect(494878333 == try readVarInt(fbs.reader()));
 
-    reader = io.fixedBufferStream(&[_]u8{ 0x7b, 0xbd }).reader();
-    try std.testing.expect(15293 == try readVarInt(reader));
+    fbs = io.fixedBufferStream(&[_]u8{ 0x7b, 0xbd });
+    try std.testing.expect(15293 == try readVarInt(fbs.reader()));
 
-    reader = io.fixedBufferStream(&[_]u8{0x25}).reader();
-    try std.testing.expect(37 == try readVarInt(reader));
+    fbs = io.fixedBufferStream(&[_]u8{0x25});
+    try std.testing.expect(37 == try readVarInt(fbs.reader()));
 
-    reader = io.fixedBufferStream(&[_]u8{ 0x40, 0x25 }).reader();
-    try std.testing.expect(37 == try readVarInt(reader));
+    fbs = io.fixedBufferStream(&[_]u8{ 0x40, 0x25 });
+    try std.testing.expect(37 == try readVarInt(fbs.reader()));
 }
