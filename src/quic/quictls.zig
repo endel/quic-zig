@@ -18,7 +18,7 @@ pub const Epoch = enum(u8) {
             packet.PacketType.ZeroRTT => Epoch.ZERO_RTT,
             packet.PacketType.Handshake => Epoch.HANDSHAKE,
             packet.PacketType.OneRTT => Epoch.ONE_RTT,
-            else => error.UnexpectedMessage,
+            else => (error{InvalidPacketType}).InvalidPacketType,
         };
     }
 };
@@ -28,6 +28,9 @@ test "Epoch fromPacketType" {
     try std.testing.expectEqual(Epoch.fromPacketType(packet.PacketType.ZeroRTT), Epoch.ZERO_RTT);
     try std.testing.expectEqual(Epoch.fromPacketType(packet.PacketType.Handshake), Epoch.HANDSHAKE);
     try std.testing.expectEqual(Epoch.fromPacketType(packet.PacketType.OneRTT), Epoch.ONE_RTT);
+
+    const err = Epoch.fromPacketType(packet.PacketType.Retry);
+    try std.testing.expectError(error.InvalidPacketType, err);
 }
 
 pub const CipherSuite = tls.CipherSuite;
