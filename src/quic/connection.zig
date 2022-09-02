@@ -52,27 +52,6 @@ pub const Connection = struct {
     // handshake: quictls,
     // is_client: bool = false,
 
-    pub fn init(data: struct { dcid: []const u8, scid: []const u8, version: protocol.Version }) Connection {
-        // init quictls context
-        var context = quictls.Context{};
-
-        var conn = Connection{
-            .dcid = data.dcid,
-            .scid = data.scid,
-            .version = data.version,
-            .context = context,
-            .state = ConnectionState.FirstFlight,
-        };
-
-        // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
-        conn._cryptos[@as(usize, @enumToInt(quictls.Epoch.INITIAL))].setupInitial(data.dcid, data.version);
-
-        // conn._cryptos[0].setupInitial(data.scid, data.version);
-        // conn._cryptos[@as(usize, quictls.Epoch.INITIAL)].setup_initial;
-
-        return conn;
-    }
-
     // fn initTLS(self: Connection) void {
     //     _ = self;
     //     // self._spaces.add
@@ -115,11 +94,16 @@ pub const Connection = struct {
 //
 
 test "init connection" {
-    var conn = Connection.init(.{
-        .dcid = "dest1234", // dummy
-        .scid = "src12345", // dummy
+    var context = quictls.Context.init(false);
+
+    var conn = Connection{
+        .dcid = "dest1234",
+        .scid = "src12345",
         .version = protocol.Version.VERSION_1,
-    });
+        .context = context,
+        .state = ConnectionState.FirstFlight,
+    };
 
     try std.testing.expectEqual(conn.dcid, "dest1234");
+    try std.testing.expectEqual(conn.scid, "src12345");
 }

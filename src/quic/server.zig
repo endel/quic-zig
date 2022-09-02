@@ -27,11 +27,21 @@ pub const Server = struct {
 
         std.log.info("ACCEPT!", .{});
 
-        var conn = Connection.init(.{
+        const is_client = false;
+
+        // init quictls context
+        var context = quictls.Context.init(is_client);
+
+        var conn = Connection{
             .dcid = header.dcid,
             .scid = header.scid,
             .version = header.version,
-        });
+            .context = context,
+            .state = ConnectionState.FirstFlight,
+        };
+
+        // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
+        conn._cryptos[@as(usize, @enumToInt(quictls.Epoch.INITIAL))].setupInitial(header.dcid, header.version, is_client);
 
         return conn;
     }

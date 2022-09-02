@@ -6,6 +6,10 @@ pub const Version = enum(u32) {
     DRAFT_30 = 0xFF00001E,
     DRAFT_31 = 0xFF00001F,
     DRAFT_32 = 0xFF000020,
+
+    pub fn int(self: Version) u32 {
+        return @enumToInt(self);
+    }
 };
 
 pub const ConnectionProtocol = struct {};

@@ -51,9 +51,6 @@ pub const Aes128 = struct {
     pub const nonce_length = Aes128Gcm.nonce_length;
     pub const key_length = Aes128Gcm.key_length;
 
-    pub const name: []const u8 = "aes-128-ecb";
-    pub const nameAEAD: []const u8 = "aes-128-gcm";
-
     pub const Context = struct {
         ctx: ReturnType(@TypeOf(StdAes128.initEnc)),
         mac: crypto.onetimeauth.Ghash,

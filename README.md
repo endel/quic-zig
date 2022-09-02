@@ -9,7 +9,9 @@ Interoperability testing: https://interop.seemann.io/
 
 ## Verbatim
 
+- KDF = Key Derivation Function
 - AEAD = Authenticated Encryption with Associated Data
+- IV = Initialization Vector
 
 ## WebTransport links
 

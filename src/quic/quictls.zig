@@ -36,6 +36,9 @@ pub const State = enum(u8) {
 };
 
 pub const Context = struct {
+    state: State,
+    is_client: bool,
+
     // ptls_t* tls;
     // picoquic_cnx_t* cnx;
     // int client_mode;
@@ -50,6 +53,21 @@ pub const Context = struct {
     // uint8_t esni_nonce[PICOQUIC_ESNI_NONCE_SIZE];
     // uint8_t app_secret_enc[PTLS_MAX_DIGEST_SIZE];
     // uint8_t app_secret_dec[PTLS_MAX_DIGEST_SIZE];
+
+    pub fn init(comptime is_client: bool) Context {
+        return .{
+            .state = if (is_client) State.CLIENT_HANDSHAKE_START else State.SERVER_EXPECT_CLIENT_HELLO,
+            .is_client = is_client,
+        };
+    }
+
+    pub fn handleMessage(self: Context) void {
+        if (self.state == State.CLIENT_HANDSHAKE_START) {
+            std.log.info("State.CLIENT_HANDSHAKE_START");
+            // TODO: send ClientHello
+            return;
+        }
+    }
 };
 
 //

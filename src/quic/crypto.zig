@@ -14,6 +14,10 @@ const INITIAL_SALT_VERSION_1: [20]u8 = .{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x
 pub const CryptoContext = struct {
     const Self = @This();
 
+    version: protocol.Version = undefined,
+    secret: []const u8 = undefined,
+    cipher_suite: tls.CipherSuite = tls.CipherSuite.tls_aes_256_gcm_sha384,
+
     // aead: Optional[AEAD] = None
     // cipher_suite: Optional[CipherSuite] = None
     // hp: Optional[HeaderProtection] = None
@@ -23,11 +27,46 @@ pub const CryptoContext = struct {
     // _setup_cb = setup_cb
     // _teardown_cb = teardown_cb
 
-    pub fn setup(self: Self, cipher_suite: tls.CipherSuite, secret: []const u8, version: protocol.Version) void {
+    pub fn setup(self: *Self, cipher_suite: tls.CipherSuite, secret: [32]u8, version: protocol.Version) void {
+        const key_size = 16;
+        // const key_size: u16 = switch (cipher_suite) {
+        //     tls.CipherSuite.tls_aes_256_gcm_sha384, tls.CipherSuite.tls_chacha20_poly1305_sha256 => 32,
+        //     else => 16,
+        // };
+
+        // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
+        // (derive_key_iv_hp)
+        const key = hkdfExpandLabel(secret, "quic key", "", key_size);
+        const iv = hkdfExpandLabel(secret, "quic iv", "", 12);
+        const hp = hkdfExpandLabel(secret, "quic hp", "", key_size);
+
+        // hp = Header Protection
+        const hp_cipher_name = switch (cipher_suite) {
+            tls.CipherSuite.tls_aes_128_gcm_sha256 => "aes-128-ecb",
+            else => "",
+        };
+
+        // AEAD = Authenticated Encryption with Associated Data
+        const aead_cipher_name = switch (cipher_suite) {
+            tls.CipherSuite.tls_aes_128_gcm_sha256 => "aes-128-gcm",
+            else => "",
+        };
+
+        // self.secret = secret;
+        // self.version = version;
+        self.cipher_suite = cipher_suite;
+
         _ = self;
-        _ = cipher_suite;
-        _ = secret;
         _ = version;
+        _ = key;
+        _ = iv;
+        _ = hp;
+        _ = hp_cipher_name;
+        _ = aead_cipher_name;
+
+        // , aead_cipher_name = CIPHER_SUITES[cipher_suite]
+
+        // self.aead = AEAD(aead_cipher_name, key, iv)
 
         // hp_cipher_name, aead_cipher_name = CIPHER_SUITES[cipher_suite]
         //
@@ -50,29 +89,24 @@ pub const CryptoPair = struct {
     aead_tag_size: u8 = 16,
     _update_key_requested: bool = false,
 
-    pub fn setupInitial(self: CryptoPair, cid: []const u8, version: protocol.Version) void {
-        _ = self;
-        _ = cid;
-        _ = version;
-
-        // if is_client:
-        //     recv_label, send_label = b"server in", b"client in"
-        // else:
-        //     recv_label, send_label = b"client in", b"server in"
+    pub fn setupInitial(self: *CryptoPair, cid: []const u8, version: protocol.Version, comptime is_client: bool) void {
+        _ = is_client;
 
         // TODO: invert this for client
         // only server side is implemented for now
-        const recv_label = "client in";
-        const send_label = "server in";
+        // const recv_label: []const u8 = "server in";
+        // const send_label: []const u8 = "client in";
+        const recv_label: []const u8 = if (is_client) "client in" else "server in";
+        const send_label: []const u8 = if (is_client) "server in" else "client in";
 
         const initial_salt = INITIAL_SALT_VERSION_1;
         const initial_secret = HkdfSha256.extract(&initial_salt, cid);
 
         const recv_secret = hkdfExpandLabel(initial_secret, recv_label, "", HmacSha256.key_length);
-        self.recv.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, &recv_secret, version);
+        self.recv.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, recv_secret, version);
 
         const send_secret = hkdfExpandLabel(initial_secret, send_label, "", HmacSha256.key_length);
-        self.send.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, &send_secret, version);
+        self.send.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, send_secret, version);
     }
 };
 
@@ -104,24 +138,6 @@ fn hkdfExpandLabel(
     return out[0..length].*;
 }
 
-fn deriveKeyIVHP() void {}
-// def derive_key_iv_hp(
-//     cipher_suite: CipherSuite, secret: bytes
-// ) -> Tuple[bytes, bytes, bytes]:
-//     algorithm = cipher_suite_hash(cipher_suite)
-//     if cipher_suite in [
-//         CipherSuite.AES_256_GCM_SHA384,
-//         CipherSuite.CHACHA20_POLY1305_SHA256,
-//     ]:
-//         key_size = 32
-//     else:
-//         key_size = 16
-//     return (
-//         hkdf_expand_label(algorithm, secret, b"quic key", b"", key_size),
-//         hkdf_expand_label(algorithm, secret, b"quic iv", b"", 12),
-//         hkdf_expand_label(algorithm, secret, b"quic hp", b"", key_size),
-//     )
-
 test "hkdfExpandLabel" {
     const early_secret = HkdfSha256.extract(&.{}, &[_]u8{0} ** 32);
     var empty_hash: [32]u8 = undefined;
@@ -136,9 +152,13 @@ test "hkdfExpandLabel" {
     }, &derived_secret);
 }
 
-test "cipher name" {
-    try std.testing.expectEqualSlices(u8, ciphers.Aes128.name, "aes-128-ecb");
-    try std.testing.expectEqualSlices(u8, ciphers.Aes128.nameAEAD, "aes-128-gcm");
+test "CryptoContext setup" {
+    var context = CryptoContext{};
+
+    const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, "dummy_source_id");
+    const secret = hkdfExpandLabel(initial_secret, "server in", "", HmacSha256.key_length);
+
+    context.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, secret, protocol.Version.VERSION_1);
 }
 
 // class CryptoContext:

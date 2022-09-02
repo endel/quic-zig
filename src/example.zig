@@ -48,7 +48,8 @@ pub fn main() anyerror!void {
     const sockfd = try server.listen(try std.net.Address.parseIp4("127.0.0.1", 8080));
     defer os.close(sockfd);
 
-    var clients = std.StringHashMap(Connection).init(alloc);
+    var connections = std.StringHashMap(Connection).init(alloc);
+    defer connections.clearAndFree();
 
     while (true) {
         os.nanosleep(0, 100 * 1000 * 1000);
@@ -70,12 +71,12 @@ pub fn main() anyerror!void {
 
         var header = try packet.Header.parse(bytes[0..packet_length]);
 
-        // TODO: hmac sign `destination_cid` to avoid clients having full
+        // TODO: hmac sign `destination_cid` to avoid connections having full
         // control which ID is being used.
         // let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
         const conn_id = header.dcid;
 
-        const conn_pair = try clients.getOrPut(conn_id);
+        const conn_pair = try connections.getOrPut(conn_id);
         if (!conn_pair.found_existing) {
             if (header.packet_type != packet.PacketType.Initial) {
                 std.log.err("Packet is not initial!", .{});
@@ -106,7 +107,7 @@ pub fn main() anyerror!void {
             std.log.warn("HAS CONNECTION!", .{});
         }
 
-        const conn = conn_pair.value_ptr.*;
+        var conn = conn_pair.value_ptr.*;
         _ = conn;
 
         // network_path = self._find_network_path(addr)
