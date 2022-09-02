@@ -108,6 +108,24 @@ pub const CryptoPair = struct {
         const send_secret = hkdfExpandLabel(initial_secret, send_label, "", HmacSha256.key_length);
         self.send.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, send_secret, version);
     }
+
+    pub fn decryptPacket(self: *CryptoPair, packet: []const u8, encrypted_offset: u32, expected_packet_number: u32) void {
+        _ = self;
+        _ = packet;
+        _ = encrypted_offset;
+        _ = expected_packet_number;
+
+        // def decrypt_packet(
+        //     self, packet: bytes, encrypted_offset: int, expected_packet_number: int
+        // ) -> Tuple[bytes, bytes, int]:
+        //     plain_header, payload, packet_number, update_key = self.recv.decrypt_packet(
+        //         packet, encrypted_offset, expected_packet_number
+        //     )
+        //     if update_key:
+        //         self._update_key("remote_update")
+        //     return plain_header, payload, packet_number
+
+    }
 };
 
 /// Uses hkdf's expand to generate a derived key.

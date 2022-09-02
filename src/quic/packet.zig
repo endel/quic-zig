@@ -34,13 +34,13 @@ pub const PacketType = enum(u8) {
     OneRTT = PACKET_FIXED_BIT,
 };
 
-pub const Epoch = enum(u8) {
-    Initial = 0,
-    Handshake = 1,
-    Application = 2,
-    Count = 3,
-};
-// pub const Epoch = enum(u8) { Initial = 0, ZeroRTT = 1, Handshake = 2, OneRTT = 3 };
+// pub const Epoch = enum(u8) {
+//     Initial = 0,
+//     Handshake = 1,
+//     Application = 2,
+//     Count = 3,
+// };
+// // pub const Epoch = enum(u8) { Initial = 0, ZeroRTT = 1, Handshake = 2, OneRTT = 3 };
 
 pub const CONNECTION_ID_MAX_SIZE: u8 = 20;
 pub const PACKET_NUMBER_MAX_SIZE = 4;

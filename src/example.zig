@@ -45,7 +45,7 @@ pub fn main() anyerror!void {
     // var connection_id_seed: [hmac.sha2.HmacSha256.mac_length]u8 = undefined;
     // hmac.sha2.HmacSha256.create(connection_id_seed[0..], "", "");
 
-    const sockfd = try server.listen(try std.net.Address.parseIp4("127.0.0.1", 8080));
+    const sockfd = try server.listen(try std.net.Address.parseIp4("127.0.0.1", 4433));
     defer os.close(sockfd);
 
     var connections = std.StringHashMap(Connection).init(alloc);
@@ -100,7 +100,20 @@ pub fn main() anyerror!void {
                 std.log.err("Invalid destination connection ID", .{});
             }
 
-            conn_pair.value_ptr.* = server.accept(header);
+            var conn = server.accept(header);
+            conn_pair.value_ptr.* = conn;
+
+            const epoch = try quictls.Epoch.fromPacketType(header.packet_type);
+            if (epoch == quictls.Epoch.ZERO_RTT) {
+                std.log.info("TODO: implement zero rtt", .{});
+                continue;
+            }
+
+            var crypto = conn._cryptos[@as(usize, @enumToInt(epoch))];
+            var space = conn._spaces[@as(usize, @enumToInt(epoch))];
+
+            _ = crypto;
+            _ = space;
 
             //
         } else {
