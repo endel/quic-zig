@@ -1,6 +1,15 @@
 # Netcode Journal and Progress Report
 
 ## August 2022
+- 13.09: Taking quiche + ring/aead as inspiration for decryption/removing header
+  protection. (Noticed that some Rust ring and tokyo maintainers are very young
+  {@briansmith}, which I found it very curious)
+
+- 12.09: I'm always mesmerized by the quality of quiche's source-code. Been
+  looking how they decrypt header, and their code overall looks so clean &
+  simple. I need to borrow some of that.
+
+- 06.09: Trying to decrypt header.
 
 - 30.08: Having some progress understanding how TLS initial packets are
   encrypted. Made a PR trying to support zig's stage2 compiler for feilich

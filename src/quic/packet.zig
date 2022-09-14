@@ -12,7 +12,11 @@ pub const PACKET_FIXED_BIT = 0x40;
 pub const PACKET_SPIN_BIT = 0x20;
 pub const PACKET_TYPE_MASK = 0xF0;
 
-pub const MAX_PACKET_SIZE = 1536;
+pub const MAX_PACKET_LEN = 1536;
+pub const MAX_PACKET_NUMBER_LEN = 4; // maxlength of a "packet number"
+
+// Header protection
+const SAMPLE_LEN = 16;
 
 pub const PacketType = enum(u8) {
     /// Initial packet
@@ -76,6 +80,8 @@ pub const QuicErrorCode = enum(u8) {
 
 /// A QUIC packet's header.
 pub const Header = struct {
+    const Self = @This();
+
     version: protocol.Version = undefined,
     packet_type: PacketType = undefined,
 
@@ -88,7 +94,7 @@ pub const Header = struct {
     /// The address verification token of the packet. Only present in `Initial`
     /// and `Retry` packets.
     token: ?[]const u8 = null,
-    remainder_length: u64 = undefined,
+    remainder_len: usize = undefined,
 
     /// The packet number. It's only meaningful after the header protection is
     /// removed.
@@ -101,8 +107,36 @@ pub const Header = struct {
     // TODO: version negotiation
     // versions: ProtocolVersion = undefined,
 
-    pub fn parse(bytes: []const u8) !Header {
-        return parseQuicHeader(bytes);
+    pub fn parse(stream: anytype) !Header {
+        return parseQuicHeader(stream);
+    }
+
+    pub fn decrypt(self: *Self, stream: anytype) !void {
+        _ = self;
+
+        // const encrypted_offset = stream.pos;
+        // const end_offset = stream.pos + self.remainder_len;
+
+        // try stream.seekBy(@intCast(i64, self.remainder_len));
+        // std.log.info("seekBy... {any}", .{self.remainder_len});
+
+        const pn_and_sample = stream.buffer[stream.pos..(stream.pos + (MAX_PACKET_NUMBER_LEN + SAMPLE_LEN))];
+        std.log.info("pn_and_sample: {any}", .{pn_and_sample});
+
+        var ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
+        var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..];
+
+        const first = pn_and_sample[0];
+        if (isLongHeader(first)) {
+            first ^= mask[0] & 0x0f;
+        } else {
+            first ^= mask[0] & 0x1f;
+        }
+
+        if (self.long)
+            std.log.info("ciphertext: {any}", .{ciphertext});
+        std.log.info("sample: {any}", .{sample});
+        std.log.info("first: {any}", .{first});
     }
 };
 
@@ -115,8 +149,7 @@ pub fn isLongHeader(first_byte: u8) bool {
     return (first_byte & PACKET_LONG_HEADER) == PACKET_LONG_HEADER;
 }
 
-pub fn parseQuicHeader(bytes: []const u8) !Header {
-    var stream = io.fixedBufferStream(bytes);
+pub fn parseQuicHeader(stream: anytype) !Header {
     const reader = stream.reader();
 
     const first_byte = try reader.readByte();
@@ -138,7 +171,7 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
 
         std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, dcid_length });
 
-        packet_header.dcid = bytes[stream.pos..(stream.pos + dcid_length)];
+        packet_header.dcid = stream.buffer[stream.pos..(stream.pos + dcid_length)];
         std.log.info("dcid: {s} ({any})", .{ packet_header.dcid, packet_header.dcid });
 
         // advance dcid_length
@@ -151,7 +184,7 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
         }
 
         std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, scid_length });
-        packet_header.scid = bytes[stream.pos..(stream.pos + scid_length)];
+        packet_header.scid = stream.buffer[stream.pos..(stream.pos + scid_length)];
         std.log.info("scid: {s} ({any})", .{ packet_header.scid, packet_header.scid });
 
         // advance scid_length
@@ -161,7 +194,7 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
             // version negotiation
             //
             // TODO:
-            // remainder_length = @intCast(u32, bytes.len) - @intCast(u32, stream.pos);
+            // remainder_len = @intCast(u32, bytes.len) - @intCast(u32, stream.pos);
         } else {
             if ((first_byte & PACKET_FIXED_BIT) == 0) {
                 std.log.err("Packet fixed bit is zero", .{});
@@ -179,8 +212,8 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
                     //
                     // https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
                     //
-                    if (bytes.len < 1200) {
-                        std.log.warn("Initial packet length must be 1200 bytes or higher. (actual length {})", .{bytes.len});
+                    if (stream.buffer.len < 1200) {
+                        std.log.warn("Initial packet length must be 1200 bytes or higher. (actual length {})", .{stream.buffer.len});
                         return error.InvalidPacket;
                     }
 
@@ -192,11 +225,11 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
                         // Token:  The value of the token that was previously provided in a
                         //    Retry packet or NEW_TOKEN frame; see Section 8.1.
                         //
-                        packet_header.token = bytes[stream.pos..(stream.pos + token_length)];
+                        packet_header.token = stream.buffer[stream.pos..(stream.pos + token_length)];
                         try stream.seekBy(@intCast(i64, token_length));
                     }
 
-                    packet_header.remainder_length = try readVarInt(reader);
+                    packet_header.remainder_len = try readVarInt(reader);
                 },
 
                 PacketType.Retry => {
@@ -211,7 +244,7 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
                     // TODO: implement version negotiation packets
                     std.log.warn("TODO: VersionNegotiation not implemented yet!", .{});
 
-                    while (stream.pos - bytes.len > 0) {
+                    while (stream.pos - stream.buffer.len > 0) {
                         _ = try reader.readInt(u32, endian); // const version = reader.readInt(u32, endian);
                         // std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
                     }
@@ -219,12 +252,12 @@ pub fn parseQuicHeader(bytes: []const u8) !Header {
 
                 else => {
                     std.log.err("Packet type not recognized: {any}", .{packet_header.packet_type});
-                    packet_header.remainder_length = try readVarInt(reader);
+                    packet_header.remainder_len = try readVarInt(reader);
                 },
             }
 
             // // check remainder length
-            // if (packet_header.remainder_length > bytes.len - stream.pos) {
+            // if (packet_header.remainder_len > bytes.len - stream.pos) {
             //     std.log.err("Packet payload is truncated", .{});
             //     return error.InvalidPacket;
             // }
@@ -280,4 +313,27 @@ test "QUIC: Variable-Length Integer Decoding" {
 
     fbs = io.fixedBufferStream(&[_]u8{ 0x40, 0x25 });
     try std.testing.expect(37 == try readVarInt(fbs.reader()));
+}
+
+//
+// Recover a packet number from a truncated packet number.
+//
+// See: Appendix A - Sample Packet Number Decoding Algorithm
+// (https://datatracker.ietf.org/doc/html/rfc9000#appendix-A.3)
+//
+pub fn decodePacketNumber(truncated: u64, num_bits: u64, expected: u64) u64 {
+    _ = truncated;
+    _ = num_bits;
+    _ = expected;
+
+    // window = 1 << num_bits
+    // half_window = window // 2
+    // candidate = (expected & ~(window - 1)) | truncated
+    // if candidate <= expected - half_window and candidate < (1 << 62) - window:
+    //     return candidate + window
+    // elif candidate > expected + half_window and candidate >= window:
+    //     return candidate - window
+    // else:
+    //     return candidate
+    return 0;
 }

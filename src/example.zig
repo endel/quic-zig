@@ -68,8 +68,8 @@ pub fn main() anyerror!void {
 
         // var stream = io.fixedBufferStream(bytes[0..packet_length]);
         // const reader = stream.reader();
-
-        var header = try packet.Header.parse(bytes[0..packet_length]);
+        var stream = io.fixedBufferStream(bytes[0..packet_length]);
+        var header = try packet.Header.parse(&stream);
 
         // TODO: hmac sign `destination_cid` to avoid connections having full
         // control which ID is being used.
@@ -104,14 +104,22 @@ pub fn main() anyerror!void {
             conn_pair.value_ptr.* = conn;
 
             const epoch = try quictls.Epoch.fromPacketType(header.packet_type);
+
             if (epoch == quictls.Epoch.ZERO_RTT) {
                 std.log.info("TODO: implement zero rtt", .{});
                 continue;
             }
 
+            std.log.info("stream.pos: {any}, header.remainder_len: {any}", .{ stream.pos, header.remainder_len });
+            try header.decrypt(&stream);
+
+            // var decrypted_bytes: [packet.MAX_PACKET_LEN]u8 = undefined;
+            // try crypto.decryptPacket(&decrypted_bytes, stream.buffer[0..end_offset], encrypted_offset, space.expected_packet_number);
+
+            std.log.info("remainder_len: {any}", .{header.remainder_len});
+
             var crypto = conn._cryptos[@as(usize, @enumToInt(epoch))];
             var space = conn._spaces[@as(usize, @enumToInt(epoch))];
-
             _ = crypto;
             _ = space;
 

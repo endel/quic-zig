@@ -26,7 +26,7 @@ pub const QuicPacketSpace = struct {
     largest_acked_packet: u32 = 0,
     loss_time: f32 = undefined,
 
-    // TODO: sent pakcet?
+    // TODO: sent packet?
     // sent_packets: std.AutoHashMap(u32, u32), // Dict[int, QuicSentPacket] = {}
 
     pub fn init() QuicPacketSpace {

@@ -3,13 +3,29 @@ const protocol = @import("protocol.zig");
 const quictls = @import("quictls.zig");
 const tls = @import("../tls/tls.zig");
 const ciphers = @import("../tls/ciphers.zig");
+const packet = @import("packet.zig");
+const aead = @import("aead.zig");
 
 const crypto = std.crypto;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
+const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 
 // binascii.unhexlify("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
 const INITIAL_SALT_VERSION_1: [20]u8 = .{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0xc, 0xad, 0xcc, 0xbb, 0x7f, 0xa };
+
+// pub const Algorithm = enum {
+//     AES128_GCM,
+//     AES256_GCM,
+//     ChaCha20_Poly1305,
+// };
+//
+// pub const Open = struct {
+//     alg: Algorithm,
+//     ctx: anytype, // EVP_AEAD_CTX
+//     hp_key: aead.HeaderProtectionKey,
+//     nonce: []const u8,
+// };
 
 pub const CryptoContext = struct {
     const Self = @This();
@@ -17,6 +33,9 @@ pub const CryptoContext = struct {
     version: protocol.Version = undefined,
     secret: []const u8 = undefined,
     cipher_suite: tls.CipherSuite = tls.CipherSuite.tls_aes_256_gcm_sha384,
+
+    cipher: ciphers.Aes128.Context = undefined,
+    key_data: ciphers.KeyStorage = ciphers.KeyStorage{},
 
     // aead: Optional[AEAD] = None
     // cipher_suite: Optional[CipherSuite] = None
@@ -46,6 +65,8 @@ pub const CryptoContext = struct {
             else => "",
         };
 
+        std.log.info("hp_cipher_name: {s}", .{hp_cipher_name});
+
         // AEAD = Authenticated Encryption with Associated Data
         const aead_cipher_name = switch (cipher_suite) {
             tls.CipherSuite.tls_aes_128_gcm_sha256 => "aes-128-gcm",
@@ -55,6 +76,8 @@ pub const CryptoContext = struct {
         // self.secret = secret;
         // self.version = version;
         self.cipher_suite = cipher_suite;
+
+        // self.cipher = ciphers.Aes128.init(self.key_data)
 
         _ = self;
         _ = version;
@@ -80,6 +103,107 @@ pub const CryptoContext = struct {
         // # trigger callback
         // self._setup_cb("tls")
     }
+
+    pub fn decryptPacket(self: *CryptoContext, decrypted_bytes: *[]u8, bytes: []const u8, encrypted_offset: usize, expected_packet_number: u64) !void {
+        // if (self.aead == null) {
+        //     return (error{DecryptPacketError}).DecryptPacketError;
+        // }
+
+        _ = try self.removeHeaderProtection(decrypted_bytes, bytes, encrypted_offset);
+
+        _ = bytes;
+        _ = expected_packet_number;
+
+        // // header protection
+        // plain_header, packet_number = self.hp.remove(packet, encrypted_offset)
+        // first_byte = plain_header[0]
+        //
+        // // packet number
+        // pn_length = (first_byte & 0x03) + 1
+        // packet_number = packet.decodePacketNumber(packet_number, pn_length * 8, expected_packet_number);
+        //
+        // // packet_number = decode_packet_number(
+        // //     packet_number, pn_length * 8, expected_packet_number
+        // // )
+        //
+        // // detect key phase change
+        // crypto = self
+        // if not is_long_header(first_byte):
+        //     key_phase = (first_byte & 4) >> 2
+        //     if key_phase != self.key_phase:
+        //         crypto = next_key_phase(self)
+        //
+        // // payload protection
+        // payload = crypto.aead.decrypt(
+        //     packet[len(plain_header) :], plain_header, packet_number
+        // )
+        //
+        // return plain_header, payload, packet_number, crypto != self
+    }
+
+    pub fn removeHeaderProtection(self: *CryptoContext, decrypted_bytes: *[]u8, bytes: []const u8, encrypted_offset: u64) !void {
+        _ = bytes;
+        _ = encrypted_offset;
+        _ = self;
+        _ = decrypted_bytes;
+
+        //
+        //     const first = bytes[0];
+        //     const pn_and_sample = bytes[0..]
+        // let mut pn_and_sample = b.peek_bytes_mut(MAX_PKT_NUM_LEN + SAMPLE_LEN)?;
+        //
+        //     std.log.info("removeHeaderProtection...", .{});
+        //
+        //     const mask_length: usize = 5;
+        //     const sample_offset: usize = encrypted_offset + 4;
+        //
+        //     const mask_bytes: []const u8 = .{ 0, 0, 0, 0, 0 };
+
+        //
+        // // TODO: check if (sample_offset + sample_size > header length)
+        //
+        // const first_mask = if ((first_byte & 0x80) == 0x80) 0x0F else 0x1F;
+        // var pn_l: u8 = undefined; // packet number length
+        // var pn_val: u8 = 0; // packet number value
+        //
+        // std.mem.copy(u8, decrypted_bytes, bytes);
+        // // memcpy(decrypted_bytes, bytes, ph->pn_offset);
+        //
+        // picoquic_pn_encrypt(pn_enc, bytes + sample_offset, mask_bytes, mask_bytes, mask_length);
+        // /* Decode the first byte */
+        // first_byte ^= (mask_bytes[0] & first_mask);
+        // pn_l = (first_byte & 3) + 1;
+        // ph->pnmask = (0xFFFFFFFFFFFFFFFFull);
+        // decrypted_bytes[0] = first_byte;
+        //
+        // /* Packet encoding is 1 to 4 bytes */
+        // for (uint8_t i = 1; i <= pn_l; i++) {
+        //     pn_val <<= 8;
+        //     decrypted_bytes[ph->offset] = bytes[ph->offset]^mask_bytes[i];
+        //     pn_val += decrypted_bytes[ph->offset++];
+        //     ph->pnmask <<= 8;
+        // }
+        //
+        // ph->pn = pn_val;
+        // ph->payload_length -= pn_l;
+        //
+        //
+        // const key: [Aes128Gcm.key_length]u8 = [_]u8{0x69} ** Aes128Gcm.key_length;
+        // const nonce: [Aes128Gcm.nonce_length]u8 = [_]u8{0x42} ** Aes128Gcm.nonce_length;
+        // const m = "Test with message";
+        // const ad = "Test with associated data";
+        // var c: [bytes.len]u8 = undefined;
+        // var m2: [bytes.len]u8 = undefined;
+        // var tag: [Aes128Gcm.tag_length]u8 = undefined;
+        //
+        // Aes128Gcm.encrypt(&c, &tag, m, ad, nonce, key);
+        // try Aes128Gcm.decrypt(&m2, &c, tag, ad, nonce, key);
+        //
+        // std.log.info("m2: {any}", .{m2});
+        // std.log.info("c: {any}", .{c});
+    }
+
+    pub fn encryptPacket() void {}
 };
 
 pub const CryptoPair = struct {
@@ -109,11 +233,14 @@ pub const CryptoPair = struct {
         self.send.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, send_secret, version);
     }
 
-    pub fn decryptPacket(self: *CryptoPair, packet: []const u8, encrypted_offset: u32, expected_packet_number: u32) void {
+    pub fn decryptPacket(self: *CryptoPair, decrypted_bytes: *[]u8, bytes: []const u8, encrypted_offset: usize, expected_packet_number: u32) !void {
         _ = self;
-        _ = packet;
+        _ = bytes;
         _ = encrypted_offset;
         _ = expected_packet_number;
+
+        std.log.info("decryptPacket ...", .{});
+        try self.recv.decryptPacket(decrypted_bytes, bytes, encrypted_offset, expected_packet_number);
 
         // def decrypt_packet(
         //     self, packet: bytes, encrypted_offset: int, expected_packet_number: int
@@ -177,6 +304,18 @@ test "CryptoContext setup" {
     const secret = hkdfExpandLabel(initial_secret, "server in", "", HmacSha256.key_length);
 
     context.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, secret, protocol.Version.VERSION_1);
+}
+
+pub fn headerProtectionMask(sample: []const u8) void {
+    _ = sample;
+
+    // int outlen;
+    // if (self->is_chacha20) {
+    //     return EVP_CipherInit_ex(self->ctx, NULL, NULL, NULL, sample, 1) &&
+    //            EVP_CipherUpdate(self->ctx, self->mask, &outlen, self->zero, sizeof(self->zero));
+    // } else {
+    //     return EVP_CipherUpdate(self->ctx, self->mask, &outlen, sample, SAMPLE_LENGTH);
+    // }
 }
 
 // class CryptoContext:

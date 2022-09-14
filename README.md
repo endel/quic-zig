@@ -2,10 +2,21 @@
 
 HTTP/3 implementation written in Zig.
 
-Objectives: https://github.com/private-octopus/picoquic/pull/1372/files
+## Initial goals
+
+- Be a QUIC client/server (with lots of limitations!)
+- Easily portable & embeddable
 
 For testing against: https://github.com/marten-seemann/quic-interop-runner
 Interoperability testing: https://interop.seemann.io/
+
+## QUIC SPEC Learnings:
+
+- The ["Multipath"
+  extension](https://datatracker.ietf.org/doc/html/draft-ietf-quic-multipath-02#section-1)
+  specifies a departure from the specification of path management in Section 9
+  of RFC9000.
+- Some deployments of QUIC use zero-length connection IDs.
 
 ## Verbatim
 
