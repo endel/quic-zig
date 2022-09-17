@@ -14,18 +14,103 @@ const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 // binascii.unhexlify("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
 const INITIAL_SALT_VERSION_1: [20]u8 = .{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0xc, 0xad, 0xcc, 0xbb, 0x7f, 0xa };
 
-// pub const Algorithm = enum {
-//     AES128_GCM,
-//     AES256_GCM,
-//     ChaCha20_Poly1305,
-// };
-//
-// pub const Open = struct {
-//     alg: Algorithm,
-//     ctx: anytype, // EVP_AEAD_CTX
-//     hp_key: aead.HeaderProtectionKey,
-//     nonce: []const u8,
-// };
+// Header protection sample length
+pub const SAMPLE_LEN = 16;
+
+// TODO: support the 3 algorithms
+// during this experimentational phaser, only AES128_GCM is supported.
+const alg = HmacSha256;
+const key_len = alg.key_length;
+const nonce_len = 12;
+
+pub const Algorithm = enum {
+    AES128_GCM,
+    AES256_GCM,
+    ChaCha20_Poly1305,
+};
+
+pub const Open = struct {
+    // alg: Algorithm,
+    // ctx: anytype, // EVP_AEAD_CTX
+    // hp_key: aead.HeaderProtectionKey,
+    key: [key_len]u8,
+    hp_key: [key_len]u8,
+    nonce: [nonce_len]u8,
+
+    /// Generate a new QUIC Header Protection mask.
+    ///
+    /// `sample` must be exactly `self.algorithm().sample_len()` bytes long.
+    pub fn newMask(self: *Open, sample: [packet.MAX_PACKET_NUMBER_LEN]u8) ![5]u8 {
+        _ = self;
+        _ = sample;
+        return .{1};
+        // var sample = <&[u8; SAMPLE_LEN]>::try_from(sample)?;
+        // let out = (self.algorithm.new_mask)(&self.inner, *sample);
+        // Ok(out)
+    }
+};
+
+pub const Seal = struct {
+    // alg: Algorithm,
+    // ctx: anytype, // EVP_AEAD_CTX
+    // hp_key: aead.HeaderProtectionKey,
+    key: [key_len]u8,
+    hp_key: [key_len]u8,
+    nonce: [nonce_len]u8,
+};
+
+pub fn deriveInitialKeyMaterial(
+    cid: []const u8,
+    version: protocol.Version,
+    comptime is_client: bool,
+) !std.meta.Tuple(&.{ Open, Seal }) {
+    if (version != protocol.Version.VERSION_1) {
+        std.log.err("only VERSION_1 is supported right now.", .{});
+        return error.InvalidVersion;
+    }
+
+    const initial_salt = INITIAL_SALT_VERSION_1;
+    const initial_secret = HkdfSha256.extract(&initial_salt, cid);
+
+    // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
+
+    var secret: [32]u8 = hkdfExpandLabel(initial_secret, "client in", "", alg.key_length);
+
+    // Client
+    const client_key = hkdfExpandLabel(secret, "quic key", "", key_len);
+    const client_iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
+    const client_hp_key = hkdfExpandLabel(secret, "quic hp", "", key_len); //header protection key
+
+    // Server
+    secret = hkdfExpandLabel(initial_secret, "server in", "", alg.key_length);
+    const server_key = hkdfExpandLabel(secret, "quic key", "", key_len);
+    const server_iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
+    const server_hp_key = hkdfExpandLabel(secret, "quic hp", "", key_len); //header protection key
+
+    return if (is_client) .{
+        Open{
+            .key = server_key,
+            .hp_key = server_hp_key,
+            .nonce = server_iv,
+        },
+        Seal{
+            .key = client_key,
+            .hp_key = client_hp_key,
+            .nonce = client_iv,
+        },
+    } else .{
+        Open{
+            .key = client_key,
+            .hp_key = client_hp_key,
+            .nonce = client_iv,
+        },
+        Seal{
+            .key = server_key,
+            .hp_key = server_hp_key,
+            .nonce = server_iv,
+        },
+    };
+}
 
 pub const CryptoContext = struct {
     const Self = @This();
@@ -214,7 +299,6 @@ pub const CryptoPair = struct {
     _update_key_requested: bool = false,
 
     pub fn setupInitial(self: *CryptoPair, cid: []const u8, version: protocol.Version, comptime is_client: bool) void {
-        _ = is_client;
 
         // TODO: invert this for client
         // only server side is implemented for now
@@ -317,88 +401,3 @@ pub fn headerProtectionMask(sample: []const u8) void {
     //     return EVP_CipherUpdate(self->ctx, self->mask, &outlen, sample, SAMPLE_LENGTH);
     // }
 }
-
-// class CryptoContext:
-//     def __init__(
-//         self,
-//         key_phase: int = 0,
-//         setup_cb: Callback = NoCallback,
-//         teardown_cb: Callback = NoCallback,
-//     ) -> None:
-//         self.aead: Optional[AEAD] = None
-//         self.cipher_suite: Optional[CipherSuite] = None
-//         self.hp: Optional[HeaderProtection] = None
-//         self.key_phase = key_phase
-//         self.secret: Optional[bytes] = None
-//         self.version: Optional[int] = None
-//         self._setup_cb = setup_cb
-//         self._teardown_cb = teardown_cb
-//
-//     def decrypt_packet(
-//         self, packet: bytes, encrypted_offset: int, expected_packet_number: int
-//     ) -> Tuple[bytes, bytes, int, bool]:
-//         if self.aead is None:
-//             raise KeyUnavailableError("Decryption key is not available")
-//
-//         # header protection
-//         plain_header, packet_number = self.hp.remove(packet, encrypted_offset)
-//         first_byte = plain_header[0]
-//
-//         # packet number
-//         pn_length = (first_byte & 0x03) + 1
-//         packet_number = decode_packet_number(
-//             packet_number, pn_length * 8, expected_packet_number
-//         )
-//
-//         # detect key phase change
-//         crypto = self
-//         if not is_long_header(first_byte):
-//             key_phase = (first_byte & 4) >> 2
-//             if key_phase != self.key_phase:
-//                 crypto = next_key_phase(self)
-//
-//         # payload protection
-//         payload = crypto.aead.decrypt(
-//             packet[len(plain_header) :], plain_header, packet_number
-//         )
-//
-//         return plain_header, payload, packet_number, crypto != self
-//
-//     def encrypt_packet(
-//         self, plain_header: bytes, plain_payload: bytes, packet_number: int
-//     ) -> bytes:
-//         assert self.is_valid(), "Encryption key is not available"
-//
-//         # payload protection
-//         protected_payload = self.aead.encrypt(
-//             plain_payload, plain_header, packet_number
-//         )
-//
-//         # header protection
-//         return self.hp.apply(plain_header, protected_payload)
-//
-//     def is_valid(self) -> bool:
-//         return self.aead is not None
-//
-//     def setup(self, cipher_suite: CipherSuite, secret: bytes, version: int) -> None:
-//         hp_cipher_name, aead_cipher_name = CIPHER_SUITES[cipher_suite]
-//
-//         key, iv, hp = derive_key_iv_hp(cipher_suite, secret)
-//         self.aead = AEAD(aead_cipher_name, key, iv)
-//         self.cipher_suite = cipher_suite
-//         self.hp = HeaderProtection(hp_cipher_name, hp)
-//         self.secret = secret
-//         self.version = version
-//
-//         # trigger callback
-//         self._setup_cb("tls")
-//
-//     def teardown(self) -> None:
-//         self.aead = None
-//         self.cipher_suite = None
-//         self.hp = None
-//         self.secret = None
-//
-//         # trigger callback
-//         self._teardown_cb("tls")
-//

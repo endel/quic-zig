@@ -1,8 +1,9 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
-const quictls = @import("quictls.zig");
 const crypto = @import("crypto.zig");
+const packet = @import("packet.zig");
 const recovery = @import("recovery.zig");
+const quictls = @import("quictls.zig");
 
 pub const ConnectionState = enum(u8) {
     FirstFlight = 0,
@@ -25,6 +26,13 @@ pub const Connection = struct {
 
     state: ConnectionState = ConnectionState.FirstFlight,
 
+    pkt_num_spaces: [3]packet.PacketNumSpace = .{
+        packet.PacketNumSpace{}, // quictls.Epoch.INITIAL
+        packet.PacketNumSpace{}, // quictls.Epoch.ZERO_RTT TODO: this one is never used!
+        packet.PacketNumSpace{}, // quictls.Epoch.HANDSHAKE
+        // packet.PacketNumSpace{}, // quictls.Epoch.ONE_RTT
+    },
+
     // stats
     recv_count: u32 = 0,
     sent_count: u32 = 0,
@@ -32,30 +40,31 @@ pub const Connection = struct {
     sent_bytes: u32 = 0,
     recv_bytes: u32 = 0,
 
+    rx_data: u64 = 0,
+
     context: quictls.Context,
 
-    _cryptos: [4]crypto.CryptoPair = .{
-        crypto.CryptoPair{}, // quictls.Epoch.INITIAL
-        crypto.CryptoPair{}, // quictls.Epoch.ZERO_RTT
-        crypto.CryptoPair{}, // quictls.Epoch.HANDSHAKE
-        crypto.CryptoPair{}, // quictls.Epoch.ONE_RTT
-    },
+    // dgram_recv_queue: dgram::DatagramQueue::new(
+    //     config.dgram_recv_max_queue_len,
+    // ),
+    //
+    // dgram_send_queue: dgram::DatagramQueue::new(
+    //     config.dgram_send_max_queue_len,
+    // ),
 
-    _spaces: [4]recovery.QuicPacketSpace = .{
-        recovery.QuicPacketSpace{}, // quictls.Epoch.INITIAL
-        recovery.QuicPacketSpace{}, // quictls.Epoch.ZERO_RTT TODO: this one is never used!
-        recovery.QuicPacketSpace{}, // quictls.Epoch.HANDSHAKE
-        recovery.QuicPacketSpace{}, // quictls.Epoch.ONE_RTT
-    },
+    // _cryptos: [4]crypto.CryptoPair = .{
+    //     crypto.CryptoPair{}, // quictls.Epoch.INITIAL
+    //     crypto.CryptoPair{}, // quictls.Epoch.ZERO_RTT
+    //     crypto.CryptoPair{}, // quictls.Epoch.HANDSHAKE
+    //     crypto.CryptoPair{}, // quictls.Epoch.ONE_RTT
+    // },
 
-    // pkt_num_spaces: u32,
-    // handshake: quictls,
-    // is_client: bool = false,
+    pub fn decrypt_packet(self: *Connection, header: packet.Header, stream: anytype) !void {
+        var epoch = try packet.Epoch.fromPacketType(header.packet_type);
+        var space = self.pkt_num_spaces[@as(usize, @enumToInt(epoch))];
 
-    // fn initTLS(self: Connection) void {
-    //     _ = self;
-    //     // self._spaces.add
-    // }
+        try packet.decrypt(header, stream, space.crypto_open.?);
+    }
 };
 
 // 0x00: (self._handle_padding_frame, EPOCHS("IH01")),

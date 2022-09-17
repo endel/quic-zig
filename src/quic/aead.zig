@@ -30,8 +30,8 @@ pub const HeaderProtectionKey = struct {
 pub const Algorithm = struct {
     // TODO fix this on stage2 compiler:
     // *const fn
-    init: fn (key: []const u8) anyerror!KeyInner,
-    new_mask: fn (key: KeyInner, sample: [SAMPLE_LEN]u8) [5]u8,
+    init: *const fn (key: []const u8) anyerror!KeyInner,
+    new_mask: *const fn (key: KeyInner, sample: [SAMPLE_LEN]u8) [5]u8,
     key_len: usize,
     id: AlgorithmID,
 };

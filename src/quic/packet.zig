@@ -1,8 +1,10 @@
 const std = @import("std");
 const io = std.io;
 const log = std.log;
+const time = std.time;
 
 const protocol = @import("protocol.zig");
+const crypto = @import("crypto.zig");
 
 // network byte order
 const endian = std.builtin.Endian.Big;
@@ -14,9 +16,6 @@ pub const PACKET_TYPE_MASK = 0xF0;
 
 pub const MAX_PACKET_LEN = 1536;
 pub const MAX_PACKET_NUMBER_LEN = 4; // maxlength of a "packet number"
-
-// Header protection
-const SAMPLE_LEN = 16;
 
 pub const PacketType = enum(u8) {
     /// Initial packet
@@ -38,13 +37,32 @@ pub const PacketType = enum(u8) {
     OneRTT = PACKET_FIXED_BIT,
 };
 
-// pub const Epoch = enum(u8) {
-//     Initial = 0,
-//     Handshake = 1,
-//     Application = 2,
-//     Count = 3,
-// };
-// // pub const Epoch = enum(u8) { Initial = 0, ZeroRTT = 1, Handshake = 2, OneRTT = 3 };
+pub const Epoch = enum(u8) {
+    INITIAL = 0,
+    ZERO_RTT = 1,
+    HANDSHAKE = 2,
+    ONE_RTT = 3,
+
+    pub fn fromPacketType(int: PacketType) !Epoch {
+        return switch (int) {
+            PacketType.Initial => Epoch.INITIAL,
+            PacketType.ZeroRTT => Epoch.ZERO_RTT,
+            PacketType.Handshake => Epoch.HANDSHAKE,
+            PacketType.OneRTT => Epoch.ONE_RTT,
+            else => (error{InvalidPacketType}).InvalidPacketType,
+        };
+    }
+};
+
+test "Epoch fromPacketType" {
+    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.Initial), Epoch.INITIAL);
+    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.ZeroRTT), Epoch.ZERO_RTT);
+    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.Handshake), Epoch.HANDSHAKE);
+    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.OneRTT), Epoch.ONE_RTT);
+
+    const err = Epoch.fromPacketType(PacketType.Retry);
+    try std.testing.expectError(error.InvalidPacketType, err);
+}
 
 pub const CONNECTION_ID_MAX_SIZE: u8 = 20;
 pub const PACKET_NUMBER_MAX_SIZE = 4;
@@ -58,7 +76,7 @@ pub const PacketError = error{
     InvalidVarLength,
 };
 
-pub const QuicErrorCode = enum(u8) {
+pub const ErrorCode = enum(u8) {
     NO_ERROR = 0x0,
     INTERNAL_ERROR = 0x1,
     CONNECTION_REFUSED = 0x2,
@@ -110,38 +128,67 @@ pub const Header = struct {
     pub fn parse(stream: anytype) !Header {
         return parseQuicHeader(stream);
     }
+};
 
-    pub fn decrypt(self: *Self, stream: anytype) !void {
-        _ = self;
+pub const PktNumWindow = struct {
+    lower: u64,
+    window: u128,
+};
 
-        // const encrypted_offset = stream.pos;
-        // const end_offset = stream.pos + self.remainder_len;
+pub const PacketNumSpace = struct {
+    // largest_rx_pkt_num: u64,
+    // largest_rx_pkt_time: time.Instant,
+    //
+    // next_pkt_num: u64,
+    // // recv_pkt_need_ack: ranges::RangeSet,
+    //
+    // recv_pkt_num: PktNumWindow,
+    // ack_elicited: bool,
 
-        // try stream.seekBy(@intCast(i64, self.remainder_len));
-        // std.log.info("seekBy... {any}", .{self.remainder_len});
+    crypto_open: ?crypto.Open = undefined,
+    crypto_seal: ?crypto.Seal = undefined,
 
-        const pn_and_sample = stream.buffer[stream.pos..(stream.pos + (MAX_PACKET_NUMBER_LEN + SAMPLE_LEN))];
-        std.log.info("pn_and_sample: {any}", .{pn_and_sample});
+    // crypto_open: Option<crypto::Open>,
+    // crypto_seal: Option<crypto::Seal>,
+    //
+    // crypto_0rtt_open: Option<crypto::Open>,
+    // crypto_0rtt_seal: Option<crypto::Seal>,
+    //
+    // crypto_stream: stream::Stream,
 
-        var ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
-        var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..];
-
-        const first = pn_and_sample[0];
-        if (isLongHeader(first)) {
-            first ^= mask[0] & 0x0f;
-        } else {
-            first ^= mask[0] & 0x1f;
-        }
-
-        if (self.long)
-            std.log.info("ciphertext: {any}", .{ciphertext});
-        std.log.info("sample: {any}", .{sample});
-        std.log.info("first: {any}", .{first});
+    pub fn setupInitial(self: *PacketNumSpace, cid: []const u8, version: protocol.Version, comptime is_client: bool) !void {
+        var keys = try crypto.deriveInitialKeyMaterial(cid, version, is_client);
+        self.crypto_open = keys[0];
+        self.crypto_seal = keys[1];
     }
 };
 
 pub fn parseIncoming(bytes: []const u8) void {
     _ = bytes;
+}
+
+pub fn decrypt(header: Header, stream: anytype, aead: crypto.Open) !void {
+    _ = header;
+    _ = aead;
+
+    const pn_and_sample = stream.buffer[stream.pos..(stream.pos + (MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN))];
+    std.log.info("pn_and_sample: {any}", .{pn_and_sample});
+
+    var ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
+    var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..];
+
+    const first = pn_and_sample[0];
+    var mask = aead.newMask(sample);
+    if (isLongHeader(first)) {
+        first ^= mask[0] & 0x0f;
+    } else {
+        first ^= mask[0] & 0x1f;
+    }
+
+    std.log.info("first: {any}", .{first});
+    std.log.info("ciphertext: {any}", .{ciphertext});
+    std.log.info("sample: {any}", .{sample});
+    // std.log.info("mask: {any}", .{mask});
 }
 
 // inline

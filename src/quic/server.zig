@@ -4,6 +4,7 @@ const os = std.os;
 const connection = @import("connection.zig");
 const structs = @import("structs.zig");
 const packet = @import("packet.zig");
+const crypto = @import("crypto.zig");
 const quictls = @import("quictls.zig");
 
 const TicketStore = std.StringHashMap(quictls.SessionTicket);
@@ -19,7 +20,7 @@ pub const Server = struct {
         return .{ .config = config, .ticket_store = ticket_store };
     }
 
-    pub fn accept(self: Server, header: packet.Header) Connection {
+    pub fn accept(self: Server, header: packet.Header) !Connection {
         // , scid: []const u8, dcid: []const u8
         _ = self;
         // _ = scid;
@@ -41,7 +42,8 @@ pub const Server = struct {
         };
 
         // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
-        conn._cryptos[@as(usize, @enumToInt(quictls.Epoch.INITIAL))].setupInitial(header.dcid, header.version, is_client);
+        const INITIAL = @as(usize, @enumToInt(packet.Epoch.INITIAL));
+        try conn.pkt_num_spaces[INITIAL].setupInitial(header.dcid, header.version, is_client);
 
         return conn;
     }

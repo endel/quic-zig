@@ -1,6 +1,9 @@
 # Netcode Journal and Progress Report
 
 ## August 2022
+- 17.09: Found this nice TLS+QUIC step-by-step illustrations that explains every
+  byte. Very interesting! https://tls13.xargs.org/ | https://quic.xargs.org/
+
 - 13.09: Taking quiche + ring/aead as inspiration for decryption/removing header
   protection. (Noticed that some Rust ring and tokyo maintainers are very young
   {@briansmith}, which I found it very curious)

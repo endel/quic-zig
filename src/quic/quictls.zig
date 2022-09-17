@@ -6,33 +6,6 @@ const packet = @import("packet.zig");
 const PTLS_MAX_DIGEST_SIZE = 42;
 const CRYPTO_BUFFER_SIZE = 16384;
 
-pub const Epoch = enum(u8) {
-    INITIAL = 0,
-    ZERO_RTT = 1,
-    HANDSHAKE = 2,
-    ONE_RTT = 3,
-
-    pub fn fromPacketType(int: packet.PacketType) !Epoch {
-        return switch (int) {
-            packet.PacketType.Initial => Epoch.INITIAL,
-            packet.PacketType.ZeroRTT => Epoch.ZERO_RTT,
-            packet.PacketType.Handshake => Epoch.HANDSHAKE,
-            packet.PacketType.OneRTT => Epoch.ONE_RTT,
-            else => (error{InvalidPacketType}).InvalidPacketType,
-        };
-    }
-};
-
-test "Epoch fromPacketType" {
-    try std.testing.expectEqual(Epoch.fromPacketType(packet.PacketType.Initial), Epoch.INITIAL);
-    try std.testing.expectEqual(Epoch.fromPacketType(packet.PacketType.ZeroRTT), Epoch.ZERO_RTT);
-    try std.testing.expectEqual(Epoch.fromPacketType(packet.PacketType.Handshake), Epoch.HANDSHAKE);
-    try std.testing.expectEqual(Epoch.fromPacketType(packet.PacketType.OneRTT), Epoch.ONE_RTT);
-
-    const err = Epoch.fromPacketType(packet.PacketType.Retry);
-    try std.testing.expectError(error.InvalidPacketType, err);
-}
-
 pub const CipherSuite = tls.CipherSuite;
 // enum(u32) {
 //     AES_128_GCM_SHA256 = 0x1301,
