@@ -177,8 +177,9 @@ pub fn decrypt(header: Header, stream: anytype, aead: crypto.Open) !void {
     var ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
     var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..];
 
-    const first = pn_and_sample[0];
-    var mask = aead.newMask(sample);
+    var first = pn_and_sample[0];
+    var mask = try aead.newMask(sample);
+
     if (isLongHeader(first)) {
         first ^= mask[0] & 0x0f;
     } else {

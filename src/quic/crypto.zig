@@ -18,7 +18,7 @@ const INITIAL_SALT_VERSION_1: [20]u8 = .{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x
 pub const SAMPLE_LEN = 16;
 
 // TODO: support the 3 algorithms
-// during this experimentational phaser, only AES128_GCM is supported.
+// during this experimentational phase, only AES128_GCM is supported.
 const alg = HmacSha256;
 const key_len = alg.key_length;
 const nonce_len = 12;
@@ -40,13 +40,11 @@ pub const Open = struct {
     /// Generate a new QUIC Header Protection mask.
     ///
     /// `sample` must be exactly `self.algorithm().sample_len()` bytes long.
-    pub fn newMask(self: *Open, sample: [packet.MAX_PACKET_NUMBER_LEN]u8) ![5]u8 {
+    // pub fn newMask(self: *const Open, sample: [packet.MAX_PACKET_NUMBER_LEN]u8) ![5]u8 {
+    pub fn newMask(self: *const Open, sample: []u8) ![5]u8 {
         _ = self;
         _ = sample;
-        return .{1};
-        // var sample = <&[u8; SAMPLE_LEN]>::try_from(sample)?;
-        // let out = (self.algorithm.new_mask)(&self.inner, *sample);
-        // Ok(out)
+        return .{ 1, 2, 3, 4, 5 };
     }
 };
 

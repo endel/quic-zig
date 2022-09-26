@@ -17,6 +17,8 @@ pub const SAMPLE_LEN = 16;
 pub const AlgorithmID = enum { AES_128, AES_256, CHACHA20 };
 pub const KeyInner = enum { Aes, Chacha20 };
 
+const MAX_ROUNDS = 14; // Keep this in sync with `AES_MAXNR` in aes.h
+
 pub const HeaderProtectionKey = struct {
     inner: KeyInner,
     algorithm: Algorithm,

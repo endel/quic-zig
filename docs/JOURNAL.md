@@ -1,6 +1,15 @@
 # Netcode Journal and Progress Report
 
 ## August 2022
+- 26.09: _(💭 inner-thoughts)_ How can it be so hard to get 5 encrypted bytes? The `new_mask()`
+  method goes through assembler just to get 5 encrypted bytes out of a sample.
+- 23.09: Diving into the `aead.new_mask()` method call habbit hole from quiche,
+  I found out that boringssl has many different ASM implementations based on the
+  host chipset, which are compiled using PERL. They were implemented originally
+  by [@appro](https://www.openssl.org/~appro/cryptogams/), he also released the
+  low-level cryptographic primitives on a more permissive license under the name
+  of CRYPTOGAMS.
+
 - 17.09: Found this nice TLS+QUIC step-by-step illustrations that explains every
   byte. Very interesting! https://tls13.xargs.org/ | https://quic.xargs.org/
 
