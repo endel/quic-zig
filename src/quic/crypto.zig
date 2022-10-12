@@ -10,9 +10,11 @@ const crypto = std.crypto;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
+const Aes128 = crypto.core.aes.Aes128;
+const Aes256 = crypto.core.aes.Aes256;
 
 // binascii.unhexlify("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
-const INITIAL_SALT_VERSION_1: [20]u8 = .{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0xc, 0xad, 0xcc, 0xbb, 0x7f, 0xa };
+const INITIAL_SALT_VERSION_1 = [_]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0xc, 0xad, 0xcc, 0xbb, 0x7f, 0xa };
 
 // Header protection sample length
 pub const SAMPLE_LEN = 16;
@@ -20,7 +22,7 @@ pub const SAMPLE_LEN = 16;
 // TODO: support the 3 algorithms
 // during this experimentational phase, only AES128_GCM is supported.
 const alg = HmacSha256;
-const key_len = alg.key_length;
+const key_len = 16;
 const nonce_len = 12;
 
 pub const Algorithm = enum {
@@ -33,18 +35,21 @@ pub const Open = struct {
     // alg: Algorithm,
     // ctx: anytype, // EVP_AEAD_CTX
     // hp_key: aead.HeaderProtectionKey,
-    key: [key_len]u8,
-    hp_key: [key_len]u8,
-    nonce: [nonce_len]u8,
+
+    key: [key_len]u8, // KEY
+    hp_key: [key_len]u8, // HP key
+    nonce: [nonce_len]u8, // IV
 
     /// Generate a new QUIC Header Protection mask.
     ///
-    /// `sample` must be exactly `self.algorithm().sample_len()` bytes long.
-    // pub fn newMask(self: *const Open, sample: [packet.MAX_PACKET_NUMBER_LEN]u8) ![5]u8 {
-    pub fn newMask(self: *const Open, sample: []u8) ![5]u8 {
-        _ = self;
-        _ = sample;
-        return .{ 1, 2, 3, 4, 5 };
+    pub fn newMask(self: *const Open, sample: *[SAMPLE_LEN]u8) *[5]u8 {
+        std.log.info("hp_key: {any}", .{self.hp_key});
+        const ctx = Aes128.initEnc(self.hp_key);
+        // const ctx = Aes256.initEnc(self.hp_key);
+        var encrypted_out: [SAMPLE_LEN]u8 = .{0x00} ** SAMPLE_LEN;
+        ctx.encrypt(&encrypted_out, sample);
+        std.log.info("mask?? {any}", .{encrypted_out});
+        return encrypted_out[0..5];
     }
 };
 
@@ -67,14 +72,13 @@ pub fn deriveInitialKeyMaterial(
         return error.InvalidVersion;
     }
 
-    const initial_salt = INITIAL_SALT_VERSION_1;
-    const initial_secret = HkdfSha256.extract(&initial_salt, cid);
-
     // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
 
-    var secret: [32]u8 = hkdfExpandLabel(initial_secret, "client in", "", alg.key_length);
+    const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, cid);
+    var secret: [32]u8 = undefined;
 
     // Client
+    secret = hkdfExpandLabel(initial_secret, "client in", "", alg.key_length);
     const client_key = hkdfExpandLabel(secret, "quic key", "", key_len);
     const client_iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
     const client_hp_key = hkdfExpandLabel(secret, "quic hp", "", key_len); //header protection key
@@ -110,232 +114,144 @@ pub fn deriveInitialKeyMaterial(
     };
 }
 
-pub const CryptoContext = struct {
-    const Self = @This();
+// https://www.rfc-editor.org/rfc/rfc9001#section-a.1
+test "a.1: keys - initial secret" {
+    {
+        const expected = [_]u8{ 0x7d, 0xb5, 0xdf, 0x06, 0xe7, 0xa6, 0x9e, 0x43, 0x24, 0x96, 0xad, 0xed, 0xb0, 0x08, 0x51, 0x92, 0x35, 0x95, 0x22, 0x15, 0x96, 0xae, 0x2a, 0xe9, 0xfb, 0x81, 0x15, 0xc1, 0xe9, 0xed, 0x0a, 0x44 };
+        const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+        const out = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+    {
+        const expected = [_]u8{ 0xf0, 0x16, 0xbb, 0x2d, 0xc9, 0x97, 0x6d, 0xea, 0x27, 0x26, 0xc4, 0xe6, 0x1e, 0x73, 0x8a, 0x1e, 0x36, 0x80, 0xa2, 0x48, 0x75, 0x91, 0xdc, 0x76, 0xb2, 0xae, 0xe2, 0xed, 0x75, 0x98, 0x22, 0xf6 };
+        const dcid = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
+        const out = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+}
 
-    version: protocol.Version = undefined,
-    secret: []const u8 = undefined,
-    cipher_suite: tls.CipherSuite = tls.CipherSuite.tls_aes_256_gcm_sha384,
+// https://www.rfc-editor.org/rfc/rfc9001#section-a.1
+test "a.1: keys - server initial secret" {
+    {
+        const expected = [_]u8{ 0x3c, 0x19, 0x98, 0x28, 0xfd, 0x13, 0x9e, 0xfd, 0x21, 0x6c, 0x15, 0x5a, 0xd8, 0x44, 0xcc, 0x81, 0xfb, 0x82, 0xfa, 0x8d, 0x74, 0x46, 0xfa, 0x7d, 0x78, 0xbe, 0x80, 0x3a, 0xcd, 0xda, 0x95, 0x1b };
+        const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        var out = hkdfExpandLabel(initial_secret, "server in", "", alg.key_length);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+    {
+        // This test case is brought from https://quic.xargs.org/
+        const expected = [_]u8{ 0xad, 0xc1, 0x99, 0x5b, 0x5c, 0xee, 0x8f, 0x03, 0x74, 0x6b, 0xf8, 0x30, 0x9d, 0x02, 0xd5, 0xea, 0x27, 0x15, 0x9c, 0x1e, 0xd6, 0x91, 0x54, 0x03, 0xb3, 0x63, 0x18, 0xd5, 0xa0, 0x3a, 0xfe, 0xb8 };
+        const dcid = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
+        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        var out = hkdfExpandLabel(initial_secret, "server in", "", alg.key_length);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+}
 
-    cipher: ciphers.Aes128.Context = undefined,
-    key_data: ciphers.KeyStorage = ciphers.KeyStorage{},
-
-    // aead: Optional[AEAD] = None
-    // cipher_suite: Optional[CipherSuite] = None
-    // hp: Optional[HeaderProtection] = None
-    // key_phase = key_phase
-    // secret: Optional[bytes] = None
-    // version: Optional[int] = None
-    // _setup_cb = setup_cb
-    // _teardown_cb = teardown_cb
-
-    pub fn setup(self: *Self, cipher_suite: tls.CipherSuite, secret: [32]u8, version: protocol.Version) void {
-        const key_size = 16;
-        // const key_size: u16 = switch (cipher_suite) {
-        //     tls.CipherSuite.tls_aes_256_gcm_sha384, tls.CipherSuite.tls_chacha20_poly1305_sha256 => 32,
-        //     else => 16,
-        // };
-
-        // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
-        // (derive_key_iv_hp)
-        const key = hkdfExpandLabel(secret, "quic key", "", key_size);
-        const iv = hkdfExpandLabel(secret, "quic iv", "", 12);
-        const hp = hkdfExpandLabel(secret, "quic hp", "", key_size);
-
-        // hp = Header Protection
-        const hp_cipher_name = switch (cipher_suite) {
-            tls.CipherSuite.tls_aes_128_gcm_sha256 => "aes-128-ecb",
-            else => "",
-        };
-
-        std.log.info("hp_cipher_name: {s}", .{hp_cipher_name});
-
-        // AEAD = Authenticated Encryption with Associated Data
-        const aead_cipher_name = switch (cipher_suite) {
-            tls.CipherSuite.tls_aes_128_gcm_sha256 => "aes-128-gcm",
-            else => "",
-        };
-
-        // self.secret = secret;
-        // self.version = version;
-        self.cipher_suite = cipher_suite;
-
-        // self.cipher = ciphers.Aes128.init(self.key_data)
-
-        _ = self;
-        _ = version;
-        _ = key;
-        _ = iv;
-        _ = hp;
-        _ = hp_cipher_name;
-        _ = aead_cipher_name;
-
-        // , aead_cipher_name = CIPHER_SUITES[cipher_suite]
-
-        // self.aead = AEAD(aead_cipher_name, key, iv)
-
-        // hp_cipher_name, aead_cipher_name = CIPHER_SUITES[cipher_suite]
-        //
-        // key, iv, hp = derive_key_iv_hp(cipher_suite, secret)
-        // self.aead = AEAD(aead_cipher_name, key, iv)
-        // self.cipher_suite = cipher_suite
-        // self.hp = HeaderProtection(hp_cipher_name, hp)
-        // self.secret = secret
-        // self.version = version
-        //
-        // # trigger callback
-        // self._setup_cb("tls")
+test "a.1: keys - client initial secret" {
+    {
+        const expected = [_]u8{ 0xc0, 0x0c, 0xf1, 0x51, 0xca, 0x5b, 0xe0, 0x75, 0xed, 0x0e, 0xbf, 0xb5, 0xc8, 0x03, 0x23, 0xc4, 0x2d, 0x6b, 0x7d, 0xb6, 0x78, 0x81, 0x28, 0x9a, 0xf4, 0x00, 0x8f, 0x1f, 0x6c, 0x35, 0x7a, 0xea };
+        const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        var out = hkdfExpandLabel(initial_secret, "client in", "", alg.key_length);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
     }
 
-    pub fn decryptPacket(self: *CryptoContext, decrypted_bytes: *[]u8, bytes: []const u8, encrypted_offset: usize, expected_packet_number: u64) !void {
-        // if (self.aead == null) {
-        //     return (error{DecryptPacketError}).DecryptPacketError;
-        // }
-
-        _ = try self.removeHeaderProtection(decrypted_bytes, bytes, encrypted_offset);
-
-        _ = bytes;
-        _ = expected_packet_number;
-
-        // // header protection
-        // plain_header, packet_number = self.hp.remove(packet, encrypted_offset)
-        // first_byte = plain_header[0]
-        //
-        // // packet number
-        // pn_length = (first_byte & 0x03) + 1
-        // packet_number = packet.decodePacketNumber(packet_number, pn_length * 8, expected_packet_number);
-        //
-        // // packet_number = decode_packet_number(
-        // //     packet_number, pn_length * 8, expected_packet_number
-        // // )
-        //
-        // // detect key phase change
-        // crypto = self
-        // if not is_long_header(first_byte):
-        //     key_phase = (first_byte & 4) >> 2
-        //     if key_phase != self.key_phase:
-        //         crypto = next_key_phase(self)
-        //
-        // // payload protection
-        // payload = crypto.aead.decrypt(
-        //     packet[len(plain_header) :], plain_header, packet_number
-        // )
-        //
-        // return plain_header, payload, packet_number, crypto != self
+    {
+        // This test case is brought from https://quic.xargs.org/
+        const expected = [_]u8{ 0x47, 0xc6, 0xa6, 0x38, 0xd4, 0x96, 0x85, 0x95, 0xcc, 0x20, 0xb7, 0xc8, 0xbc, 0x5f, 0xbf, 0xbf, 0xd0, 0x2d, 0x7c, 0x17, 0xcc, 0x67, 0xfa, 0x54, 0x8c, 0x04, 0x3e, 0xcb, 0x54, 0x7b, 0x0e, 0xaa };
+        const dcid = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
+        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        var out = hkdfExpandLabel(initial_secret, "client in", "", alg.key_length);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
     }
+}
 
-    pub fn removeHeaderProtection(self: *CryptoContext, decrypted_bytes: *[]u8, bytes: []const u8, encrypted_offset: u64) !void {
-        _ = bytes;
-        _ = encrypted_offset;
-        _ = self;
-        _ = decrypted_bytes;
-
-        //
-        //     const first = bytes[0];
-        //     const pn_and_sample = bytes[0..]
-        // let mut pn_and_sample = b.peek_bytes_mut(MAX_PKT_NUM_LEN + SAMPLE_LEN)?;
-        //
-        //     std.log.info("removeHeaderProtection...", .{});
-        //
-        //     const mask_length: usize = 5;
-        //     const sample_offset: usize = encrypted_offset + 4;
-        //
-        //     const mask_bytes: []const u8 = .{ 0, 0, 0, 0, 0 };
-
-        //
-        // // TODO: check if (sample_offset + sample_size > header length)
-        //
-        // const first_mask = if ((first_byte & 0x80) == 0x80) 0x0F else 0x1F;
-        // var pn_l: u8 = undefined; // packet number length
-        // var pn_val: u8 = 0; // packet number value
-        //
-        // std.mem.copy(u8, decrypted_bytes, bytes);
-        // // memcpy(decrypted_bytes, bytes, ph->pn_offset);
-        //
-        // picoquic_pn_encrypt(pn_enc, bytes + sample_offset, mask_bytes, mask_bytes, mask_length);
-        // /* Decode the first byte */
-        // first_byte ^= (mask_bytes[0] & first_mask);
-        // pn_l = (first_byte & 3) + 1;
-        // ph->pnmask = (0xFFFFFFFFFFFFFFFFull);
-        // decrypted_bytes[0] = first_byte;
-        //
-        // /* Packet encoding is 1 to 4 bytes */
-        // for (uint8_t i = 1; i <= pn_l; i++) {
-        //     pn_val <<= 8;
-        //     decrypted_bytes[ph->offset] = bytes[ph->offset]^mask_bytes[i];
-        //     pn_val += decrypted_bytes[ph->offset++];
-        //     ph->pnmask <<= 8;
-        // }
-        //
-        // ph->pn = pn_val;
-        // ph->payload_length -= pn_l;
-        //
-        //
-        // const key: [Aes128Gcm.key_length]u8 = [_]u8{0x69} ** Aes128Gcm.key_length;
-        // const nonce: [Aes128Gcm.nonce_length]u8 = [_]u8{0x42} ** Aes128Gcm.nonce_length;
-        // const m = "Test with message";
-        // const ad = "Test with associated data";
-        // var c: [bytes.len]u8 = undefined;
-        // var m2: [bytes.len]u8 = undefined;
-        // var tag: [Aes128Gcm.tag_length]u8 = undefined;
-        //
-        // Aes128Gcm.encrypt(&c, &tag, m, ad, nonce, key);
-        // try Aes128Gcm.decrypt(&m2, &c, tag, ad, nonce, key);
-        //
-        // std.log.info("m2: {any}", .{m2});
-        // std.log.info("c: {any}", .{c});
+test "AEAD key" {
+    {
+        // This test case is brought from https://www.rfc-editor.org/rfc/rfc9001#section-a.1
+        const server_initial_secret = [_]u8{ 0x3c, 0x19, 0x98, 0x28, 0xfd, 0x13, 0x9e, 0xfd, 0x21, 0x6c, 0x15, 0x5a, 0xd8, 0x44, 0xcc, 0x81, 0xfb, 0x82, 0xfa, 0x8d, 0x74, 0x46, 0xfa, 0x7d, 0x78, 0xbe, 0x80, 0x3a, 0xcd, 0xda, 0x95, 0x1b };
+        const expected = [_]u8{ 0xcf, 0x3a, 0x53, 0x31, 0x65, 0x3c, 0x36, 0x4c, 0x88, 0xf0, 0xf3, 0x79, 0xb6, 0x06, 0x7e, 0x37 };
+        const out = hkdfExpandLabel(server_initial_secret, "quic key", "", key_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
     }
-
-    pub fn encryptPacket() void {}
-};
-
-pub const CryptoPair = struct {
-    recv: CryptoContext = CryptoContext{},
-    send: CryptoContext = CryptoContext{},
-
-    aead_tag_size: u8 = 16,
-    _update_key_requested: bool = false,
-
-    pub fn setupInitial(self: *CryptoPair, cid: []const u8, version: protocol.Version, comptime is_client: bool) void {
-
-        // TODO: invert this for client
-        // only server side is implemented for now
-        // const recv_label: []const u8 = "server in";
-        // const send_label: []const u8 = "client in";
-        const recv_label: []const u8 = if (is_client) "client in" else "server in";
-        const send_label: []const u8 = if (is_client) "server in" else "client in";
-
-        const initial_salt = INITIAL_SALT_VERSION_1;
-        const initial_secret = HkdfSha256.extract(&initial_salt, cid);
-
-        const recv_secret = hkdfExpandLabel(initial_secret, recv_label, "", HmacSha256.key_length);
-        self.recv.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, recv_secret, version);
-
-        const send_secret = hkdfExpandLabel(initial_secret, send_label, "", HmacSha256.key_length);
-        self.send.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, send_secret, version);
+    {
+        // This test case is brought from https://www.rfc-editor.org/rfc/rfc9001#section-a.1
+        const client_initial_secret = [_]u8{ 0xc0, 0x0c, 0xf1, 0x51, 0xca, 0x5b, 0xe0, 0x75, 0xed, 0x0e, 0xbf, 0xb5, 0xc8, 0x03, 0x23, 0xc4, 0x2d, 0x6b, 0x7d, 0xb6, 0x78, 0x81, 0x28, 0x9a, 0xf4, 0x00, 0x8f, 0x1f, 0x6c, 0x35, 0x7a, 0xea };
+        const expected = [_]u8{ 0x1f, 0x36, 0x96, 0x13, 0xdd, 0x76, 0xd5, 0x46, 0x77, 0x30, 0xef, 0xcb, 0xe3, 0xb1, 0xa2, 0x2d };
+        const out = hkdfExpandLabel(client_initial_secret, "quic key", "", key_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
     }
-
-    pub fn decryptPacket(self: *CryptoPair, decrypted_bytes: *[]u8, bytes: []const u8, encrypted_offset: usize, expected_packet_number: u32) !void {
-        _ = self;
-        _ = bytes;
-        _ = encrypted_offset;
-        _ = expected_packet_number;
-
-        std.log.info("decryptPacket ...", .{});
-        try self.recv.decryptPacket(decrypted_bytes, bytes, encrypted_offset, expected_packet_number);
-
-        // def decrypt_packet(
-        //     self, packet: bytes, encrypted_offset: int, expected_packet_number: int
-        // ) -> Tuple[bytes, bytes, int]:
-        //     plain_header, payload, packet_number, update_key = self.recv.decrypt_packet(
-        //         packet, encrypted_offset, expected_packet_number
-        //     )
-        //     if update_key:
-        //         self._update_key("remote_update")
-        //     return plain_header, payload, packet_number
-
+    {
+        const server_initial_secret = [_]u8{ 0xad, 0xc1, 0x99, 0x5b, 0x5c, 0xee, 0x8f, 0x03, 0x74, 0x6b, 0xf8, 0x30, 0x9d, 0x02, 0xd5, 0xea, 0x27, 0x15, 0x9c, 0x1e, 0xd6, 0x91, 0x54, 0x03, 0xb3, 0x63, 0x18, 0xd5, 0xa0, 0x3a, 0xfe, 0xb8 };
+        const expected = [_]u8{ 0xd7, 0x7f, 0xc4, 0x05, 0x6f, 0xcf, 0xa3, 0x2b, 0xd1, 0x30, 0x24, 0x69, 0xee, 0x6e, 0xbf, 0x90 };
+        const out = hkdfExpandLabel(server_initial_secret, "quic key", "", key_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
     }
-};
+    {
+        // This test case is brought from https://quic.xargs.org/
+        const client_initial_secret = [_]u8{ 0x47, 0xc6, 0xa6, 0x38, 0xd4, 0x96, 0x85, 0x95, 0xcc, 0x20, 0xb7, 0xc8, 0xbc, 0x5f, 0xbf, 0xbf, 0xd0, 0x2d, 0x7c, 0x17, 0xcc, 0x67, 0xfa, 0x54, 0x8c, 0x04, 0x3e, 0xcb, 0x54, 0x7b, 0x0e, 0xaa };
+        const expected = [_]u8{ 0xb1, 0x4b, 0x91, 0x81, 0x24, 0xfd, 0xa5, 0xc8, 0xd7, 0x98, 0x47, 0x60, 0x2f, 0xa3, 0x52, 0x0b };
+        const out = hkdfExpandLabel(client_initial_secret, "quic key", "", key_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+}
+
+test "IV (initialization vector)" {
+    {
+        // This test case is brought from https://www.rfc-editor.org/rfc/rfc9001#section-a.1
+        const expected = [_]u8{ 0x0a, 0xc1, 0x49, 0x3c, 0xa1, 0x90, 0x58, 0x53, 0xb0, 0xbb, 0xa0, 0x3e };
+        const server_initial_secret = [_]u8{ 0x3c, 0x19, 0x98, 0x28, 0xfd, 0x13, 0x9e, 0xfd, 0x21, 0x6c, 0x15, 0x5a, 0xd8, 0x44, 0xcc, 0x81, 0xfb, 0x82, 0xfa, 0x8d, 0x74, 0x46, 0xfa, 0x7d, 0x78, 0xbe, 0x80, 0x3a, 0xcd, 0xda, 0x95, 0x1b };
+        const out = hkdfExpandLabel(server_initial_secret, "quic iv", "", nonce_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+    {
+        const expected = [_]u8{ 0xfa, 0x04, 0x4b, 0x2f, 0x42, 0xa3, 0xfd, 0x3b, 0x46, 0xfb, 0x25, 0x5c };
+        const client_initial_secret = [_]u8{ 0xc0, 0x0c, 0xf1, 0x51, 0xca, 0x5b, 0xe0, 0x75, 0xed, 0x0e, 0xbf, 0xb5, 0xc8, 0x03, 0x23, 0xc4, 0x2d, 0x6b, 0x7d, 0xb6, 0x78, 0x81, 0x28, 0x9a, 0xf4, 0x00, 0x8f, 0x1f, 0x6c, 0x35, 0x7a, 0xea };
+        const out = hkdfExpandLabel(client_initial_secret, "quic iv", "", nonce_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+    {
+        const expected = [_]u8{ 0xfc, 0xb7, 0x48, 0xe3, 0x7f, 0xf7, 0x98, 0x60, 0xfa, 0xa0, 0x74, 0x77 };
+        const server_initial_secret = [_]u8{ 0xad, 0xc1, 0x99, 0x5b, 0x5c, 0xee, 0x8f, 0x03, 0x74, 0x6b, 0xf8, 0x30, 0x9d, 0x02, 0xd5, 0xea, 0x27, 0x15, 0x9c, 0x1e, 0xd6, 0x91, 0x54, 0x03, 0xb3, 0x63, 0x18, 0xd5, 0xa0, 0x3a, 0xfe, 0xb8 };
+        const out = hkdfExpandLabel(server_initial_secret, "quic iv", "", nonce_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+    {
+        const expected = [_]u8{ 0xdd, 0xbc, 0x15, 0xde, 0xa8, 0x09, 0x25, 0xa5, 0x56, 0x86, 0xa7, 0xdf };
+        const client_initial_secret = [_]u8{ 0x47, 0xc6, 0xa6, 0x38, 0xd4, 0x96, 0x85, 0x95, 0xcc, 0x20, 0xb7, 0xc8, 0xbc, 0x5f, 0xbf, 0xbf, 0xd0, 0x2d, 0x7c, 0x17, 0xcc, 0x67, 0xfa, 0x54, 0x8c, 0x04, 0x3e, 0xcb, 0x54, 0x7b, 0x0e, 0xaa };
+        const out = hkdfExpandLabel(client_initial_secret, "quic iv", "", nonce_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+}
+
+test "header protection key" {
+    {
+        const expected = [_]u8{ 0xc2, 0x06, 0xb8, 0xd9, 0xb9, 0xf0, 0xf3, 0x76, 0x44, 0x43, 0x0b, 0x49, 0x0e, 0xea, 0xa3, 0x14 };
+        const server_initial_secret = [_]u8{ 0x3c, 0x19, 0x98, 0x28, 0xfd, 0x13, 0x9e, 0xfd, 0x21, 0x6c, 0x15, 0x5a, 0xd8, 0x44, 0xcc, 0x81, 0xfb, 0x82, 0xfa, 0x8d, 0x74, 0x46, 0xfa, 0x7d, 0x78, 0xbe, 0x80, 0x3a, 0xcd, 0xda, 0x95, 0x1b };
+        const out = hkdfExpandLabel(server_initial_secret, "quic hp", "", key_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+    {
+        const expected = [_]u8{ 0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2 };
+        const client_initial_secret = [_]u8{ 0xc0, 0x0c, 0xf1, 0x51, 0xca, 0x5b, 0xe0, 0x75, 0xed, 0x0e, 0xbf, 0xb5, 0xc8, 0x03, 0x23, 0xc4, 0x2d, 0x6b, 0x7d, 0xb6, 0x78, 0x81, 0x28, 0x9a, 0xf4, 0x00, 0x8f, 0x1f, 0x6c, 0x35, 0x7a, 0xea };
+        const out = hkdfExpandLabel(client_initial_secret, "quic hp", "", key_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+    {
+        const expected = [_]u8{ 0x44, 0x0b, 0x27, 0x25, 0xe9, 0x1d, 0xc7, 0x9b, 0x37, 0x07, 0x11, 0xef, 0x79, 0x2f, 0xaa, 0x3d };
+        const server_initial_secret = [_]u8{ 0xad, 0xc1, 0x99, 0x5b, 0x5c, 0xee, 0x8f, 0x03, 0x74, 0x6b, 0xf8, 0x30, 0x9d, 0x02, 0xd5, 0xea, 0x27, 0x15, 0x9c, 0x1e, 0xd6, 0x91, 0x54, 0x03, 0xb3, 0x63, 0x18, 0xd5, 0xa0, 0x3a, 0xfe, 0xb8 };
+        const out = hkdfExpandLabel(server_initial_secret, "quic hp", "", key_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+    {
+        const expected = [_]u8{ 0x6d, 0xf4, 0xe9, 0xd7, 0x37, 0xcd, 0xf7, 0x14, 0x71, 0x1d, 0x7c, 0x61, 0x7e, 0xe8, 0x29, 0x81 };
+        const client_initial_secret = [_]u8{ 0x47, 0xc6, 0xa6, 0x38, 0xd4, 0x96, 0x85, 0x95, 0xcc, 0x20, 0xb7, 0xc8, 0xbc, 0x5f, 0xbf, 0xbf, 0xd0, 0x2d, 0x7c, 0x17, 0xcc, 0x67, 0xfa, 0x54, 0x8c, 0x04, 0x3e, 0xcb, 0x54, 0x7b, 0x0e, 0xaa };
+        const out = hkdfExpandLabel(client_initial_secret, "quic hp", "", key_len);
+        try std.testing.expectEqualSlices(u8, &expected, &out);
+    }
+}
 
 /// Uses hkdf's expand to generate a derived key.
 /// Constructs a hkdf context by generating a hkdf-label
@@ -377,25 +293,4 @@ test "hkdfExpandLabel" {
         0x48, 0x25, 0x0c, 0xeb, 0xea, 0xc3, 0x57,
         0x6c, 0x36, 0x11, 0xba,
     }, &derived_secret);
-}
-
-test "CryptoContext setup" {
-    var context = CryptoContext{};
-
-    const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, "dummy_source_id");
-    const secret = hkdfExpandLabel(initial_secret, "server in", "", HmacSha256.key_length);
-
-    context.setup(tls.CipherSuite.tls_aes_128_gcm_sha256, secret, protocol.Version.VERSION_1);
-}
-
-pub fn headerProtectionMask(sample: []const u8) void {
-    _ = sample;
-
-    // int outlen;
-    // if (self->is_chacha20) {
-    //     return EVP_CipherInit_ex(self->ctx, NULL, NULL, NULL, sample, 1) &&
-    //            EVP_CipherUpdate(self->ctx, self->mask, &outlen, self->zero, sizeof(self->zero));
-    // } else {
-    //     return EVP_CipherUpdate(self->ctx, self->mask, &outlen, sample, SAMPLE_LENGTH);
-    // }
 }

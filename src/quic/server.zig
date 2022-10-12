@@ -42,6 +42,7 @@ pub const Server = struct {
         };
 
         // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
+        // TODO: improve me!
         const INITIAL = @as(usize, @enumToInt(packet.Epoch.INITIAL));
         try conn.pkt_num_spaces[INITIAL].setupInitial(header.dcid, header.version, is_client);
 

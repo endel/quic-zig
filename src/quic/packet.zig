@@ -2,9 +2,11 @@ const std = @import("std");
 const io = std.io;
 const log = std.log;
 const time = std.time;
+const assert = std.debug.assert;
 
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
+const util = @import("util.zig");
 
 // network byte order
 const endian = std.builtin.Endian.Big;
@@ -13,6 +15,8 @@ pub const PACKET_LONG_HEADER = 0x80;
 pub const PACKET_FIXED_BIT = 0x40;
 pub const PACKET_SPIN_BIT = 0x20;
 pub const PACKET_TYPE_MASK = 0xF0;
+
+const PACKET_NUM_MASK: u8 = 0x03;
 
 pub const MAX_PACKET_LEN = 1536;
 pub const MAX_PACKET_NUMBER_LEN = 4; // maxlength of a "packet number"
@@ -144,6 +148,7 @@ pub const PacketNumSpace = struct {
     //
     // recv_pkt_num: PktNumWindow,
     // ack_elicited: bool,
+    next_packet_number: u64 = 0, // TODO: largest_recv_packet_number
 
     crypto_open: ?crypto.Open = undefined,
     crypto_seal: ?crypto.Seal = undefined,
@@ -156,8 +161,8 @@ pub const PacketNumSpace = struct {
     //
     // crypto_stream: stream::Stream,
 
-    pub fn setupInitial(self: *PacketNumSpace, cid: []const u8, version: protocol.Version, comptime is_client: bool) !void {
-        var keys = try crypto.deriveInitialKeyMaterial(cid, version, is_client);
+    pub fn setupInitial(self: *PacketNumSpace, dcid: []const u8, version: protocol.Version, comptime is_client: bool) !void {
+        var keys = try crypto.deriveInitialKeyMaterial(dcid, version, is_client);
         self.crypto_open = keys[0];
         self.crypto_seal = keys[1];
     }
@@ -167,28 +172,64 @@ pub fn parseIncoming(bytes: []const u8) void {
     _ = bytes;
 }
 
-pub fn decrypt(header: Header, stream: anytype, aead: crypto.Open) !void {
-    _ = header;
-    _ = aead;
+pub fn decrypt(header: *Header, stream: anytype, space: *PacketNumSpace) !void {
+    std.log.info("header.remainder_len: {any}", .{header.remainder_len});
 
     const pn_and_sample = stream.buffer[stream.pos..(stream.pos + (MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN))];
     std.log.info("pn_and_sample: {any}", .{pn_and_sample});
 
     var ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
-    var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..];
+    var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
 
-    var first = pn_and_sample[0];
-    var mask = try aead.newMask(sample);
+    var first_byte = pn_and_sample[0];
 
-    if (isLongHeader(first)) {
-        first ^= mask[0] & 0x0f;
+    // unprotect header
+    var aead = space.crypto_open.?;
+    var mask = aead.newMask(sample);
+
+    std.log.info("sample: {any}", .{sample.*});
+    std.log.info("mask: {any}", .{mask.*});
+    std.log.info("first_byte (pre): {any}", .{first_byte});
+    std.log.info("ciphertext: {any}", .{ciphertext.*});
+
+    if (isLongHeader(first_byte)) {
+        first_byte ^= (mask[0] & 0x0f);
     } else {
-        first ^= mask[0] & 0x1f;
+        first_byte ^= (mask[0] & 0x1f);
     }
 
-    std.log.info("first: {any}", .{first});
-    std.log.info("ciphertext: {any}", .{ciphertext});
-    std.log.info("sample: {any}", .{sample});
+    header.packet_number_len = @intCast(usize, (first_byte & PACKET_NUM_MASK)) + 1;
+
+    // unprotect packer number
+    var unprotected_pkt_num = [_]u8{0x00} ** MAX_PACKET_NUMBER_LEN;
+    var i: usize = 0;
+    while (i < header.packet_number_len) : (i += 1) {
+        unprotected_pkt_num[i] = ciphertext.*[i] ^ mask[1 + i];
+    }
+    std.log.info("unprotected_pkt_num {any}", .{unprotected_pkt_num});
+    var packet_number = try switch (header.packet_number_len) {
+        1 => @intCast(u64, std.mem.readInt(u8, unprotected_pkt_num[0..util.sizeOf(u8)], endian)),
+        2 => @intCast(u64, std.mem.readInt(u16, unprotected_pkt_num[0..util.sizeOf(u16)], endian)),
+        3 => @intCast(u64, std.mem.readInt(u24, unprotected_pkt_num[0..util.sizeOf(u24)], endian)),
+        4 => @intCast(u64, std.mem.readInt(u32, unprotected_pkt_num[0..util.sizeOf(u32)], endian)),
+        else => error.InvalidPacket,
+    };
+
+    //
+    // RFC 9000
+    // 17.1. Packet Number Encoding and Decoding
+    // ------
+    // https://www.rfc-editor.org/rfc/rfc9000.html#name-packet-number-encoding-and-
+    //
+
+    std.log.info("next_packet_number: {any}", .{space.next_packet_number});
+    std.log.info("header.packet_number_len: {any}", .{header.packet_number_len});
+    std.log.info("header.packet_number: {any}", .{packet_number});
+    header.packet_number = decodePacketNumber(space.next_packet_number, packet_number, header.packet_number_len * 8);
+
+    std.log.info("first_byte (post): {any}", .{first_byte});
+    std.log.info("header.packet_number_len: {any}", .{header.packet_number_len});
+    std.log.info("header.packet_number: {any}", .{header.packet_number});
     // std.log.info("mask: {any}", .{mask});
 }
 
@@ -199,7 +240,6 @@ pub fn isLongHeader(first_byte: u8) bool {
 
 pub fn parseQuicHeader(stream: anytype) !Header {
     const reader = stream.reader();
-
     const first_byte = try reader.readByte();
     var packet_header = Header{};
 
@@ -220,7 +260,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
         std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, dcid_length });
 
         packet_header.dcid = stream.buffer[stream.pos..(stream.pos + dcid_length)];
-        std.log.info("dcid: {s} ({any})", .{ packet_header.dcid, packet_header.dcid });
+        std.log.info("dcid: {any}", .{packet_header.dcid});
 
         // advance dcid_length
         try stream.seekBy(dcid_length);
@@ -369,19 +409,28 @@ test "QUIC: Variable-Length Integer Decoding" {
 // See: Appendix A - Sample Packet Number Decoding Algorithm
 // (https://datatracker.ietf.org/doc/html/rfc9000#appendix-A.3)
 //
-pub fn decodePacketNumber(truncated: u64, num_bits: u64, expected: u64) u64 {
-    _ = truncated;
-    _ = num_bits;
-    _ = expected;
+fn decodePacketNumber(expected_pkt_num: u64, truncated_pkt_num: u64, num_bits: usize) u64 {
+    assert(num_bits <= 32); // The maximum length of a encoded packet number is 32 in bits.
 
-    // window = 1 << num_bits
-    // half_window = window // 2
-    // candidate = (expected & ~(window - 1)) | truncated
-    // if candidate <= expected - half_window and candidate < (1 << 62) - window:
-    //     return candidate + window
-    // elif candidate > expected + half_window and candidate >= window:
-    //     return candidate - window
-    // else:
-    //     return candidate
-    return 0;
+    const window = @intCast(u64, 1) << @intCast(u5, num_bits);
+    const half_window = window / 2;
+    const pkt_num_mask = window - 1;
+
+    std.log.info("expected_pkt_num: {any}", .{expected_pkt_num});
+    std.log.info("window: {any}", .{window});
+    std.log.info("half_window: {any}", .{half_window});
+    std.log.info("pkt_num_mask: {any}", .{pkt_num_mask});
+
+    const candidate = (expected_pkt_num & ~pkt_num_mask) | truncated_pkt_num;
+    std.log.info("candidate: {any}", .{candidate});
+
+    if ((candidate <= expected_pkt_num - half_window) and (candidate < (1 << 62) - window)) {
+        return candidate + window;
+    }
+
+    if ((candidate > expected_pkt_num + half_window) and (candidate >= window)) {
+        return candidate - window;
+    }
+
+    return candidate;
 }

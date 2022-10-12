@@ -7,7 +7,6 @@ const mem = std.mem;
 const Queue = std.atomic.Queue;
 
 const QuicServer = @import("quic/server.zig").Server;
-const QuicConfig = @import("quic/config.zig").Config;
 const Connection = @import("quic/connection.zig").Connection;
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
@@ -63,8 +62,8 @@ pub fn main() anyerror!void {
             continue;
         };
 
-        std.log.info("packet length {} => {}", .{ packet_length, src_addr });
-        std.log.info("packet received {any}", .{bytes[0..packet_length]});
+        std.log.info("packet received, length {} => {}", .{ packet_length, src_addr });
+        // std.log.info("packet received {any}", .{bytes[0..packet_length]});
 
         // var stream = io.fixedBufferStream(bytes[0..packet_length]);
         // const reader = stream.reader();
@@ -111,7 +110,7 @@ pub fn main() anyerror!void {
             }
 
             std.log.info("stream.pos: {any}, header.remainder_len: {any}", .{ stream.pos, header.remainder_len });
-            try conn.decrypt_packet(header, stream);
+            try conn.decrypt_packet(&header, stream);
 
             // var decrypted_bytes: [packet.MAX_PACKET_LEN]u8 = undefined;
             // try crypto.decryptPacket(&decrypted_bytes, stream.buffer[0..end_offset], encrypted_offset, space.expected_packet_number);

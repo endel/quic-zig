@@ -2,6 +2,13 @@
 
 HTTP/3 implementation written in Zig.
 
+**Spawning a client:**
+
+```
+$ cd lient-implementations/quiche-client
+$ RUST_LOG=debug cargo run
+```
+
 ## Initial goals
 
 - Be a QUIC client/server (with lots of limitations!)
@@ -22,7 +29,7 @@ Interoperability testing: https://interop.seemann.io/
 
 - KDF = Key Derivation Function
 - AEAD = Authenticated Encryption with Associated Data
-- IV = Initialization Vector
+- IV/IVec = Initialization Vector
 
 ## WebTransport links
 
@@ -57,11 +64,14 @@ Browser's `web-platform-tests`: https://wpt.fyi/webtransport
 
 **Implementations**
 
+- https://github.com/aiortc/aioquic/
+- https://github.com/cloudflare/quiche
+- https://github.com/NTAP/quant
 - https://github.com/aws/s2n-quic
+- https://github.com/microsoft/msquic
 - https://github.com/private-octopus/picoquic
 - https://en.wikipedia.org/wiki/HTTP/3#Libraries
 - https://github.com/facebookincubator/mvfst
-- https://github.com/microsoft/msquic
 - https://github.com/lucas-clemente/quic-go
 - https://github.com/Vect0rZ/Quic.NET
 

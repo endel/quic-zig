@@ -1,6 +1,28 @@
 # Netcode Journal and Progress Report
 
+## October 2022
+- 10.10: First heard of the [Warp draft](https://datatracker.ietf.org/doc/draft-lcurley-warp/) This draft is brought by a Twitch engineer: Luke Curley / @kixelated very active on WebTransport draft as well.
+  Warp is a segmented live media transport protocol. Warp maps live media to
+  QUIC streams based on the underlying media encoding.  Media is prioritized to
+  reduce latency when encountering congestion.
+- 09.10: Realized the part where I've been stuck ([parsing packer
+  number](https://www.rfc-editor.org/rfc/rfc9000.html#name-packet-number-encoding-and-))
+  is not fully implemented even by shiguredo's implementation.
+- 01.10 ~ 08.10: Been reading and understanding shiguredo's take on their QUIC
+  implementation.
+
 ## August 2022
+
+- 29.09: `SSLKEYLOGFILE` support is important for debugging from external software https://firefox-source-docs.mozilla.org/security/nss/legacy/key_log_format/index.html
+  - > "Key logs can be written by NSS so that external programs can decrypt TLS connections. Wireshark 1.6.0 and above can use these log files to decrypt packets. You can tell Wireshark where to find the key file via Edit→Preferences→Protocols→TLS→(Pre)-Master-Secret log filename."
+- 29.09: A japanese company (shiguredo) seems to be implementing TLS1.3 on Zig!
+  https://github.com/shiguredo/tls13-zig/, oops and they also are implementing
+  QUIC! Apache 2.0-licensed ongoing development for server and client here:
+  https://github.com/shiguredo/quic-server-zig |
+  https://github.com/shiguredo/quic-client-zig
+- 26.09: Opened/had a glance at RFC3394 for the first time today
+  https://www.rfc-editor.org/rfc/rfc3394. Apparently Feilich already implements
+  it and hopefully I won't need to "port" cryptogams over.
 - 26.09: _(💭 inner-thoughts)_ How can it be so hard to get 5 encrypted bytes? The `new_mask()`
   method goes through assembler just to get 5 encrypted bytes out of a sample.
 - 23.09: Diving into the `aead.new_mask()` method call habbit hole from quiche,
