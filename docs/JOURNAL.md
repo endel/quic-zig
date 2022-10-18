@@ -1,6 +1,12 @@
 # Netcode Journal and Progress Report
 
 ## October 2022
+- 18.10: Ok 🤦 I was getting the `first` from the (pn+sample) rather than the
+  first byte of the packet itself.
+- 16.10: Still trying to decrypt packet number. The `first` byte seems to
+  diverge on my implementation than Quiche's. The `mask`, and `sample` are ok,
+  though. (Maybe the quic-varint is advancing a byte that it shouldn't? need to
+  research & experiment)
 - 10.10: First heard of the [Warp draft](https://datatracker.ietf.org/doc/draft-lcurley-warp/) This draft is brought by a Twitch engineer: Luke Curley / @kixelated very active on WebTransport draft as well.
   Warp is a segmented live media transport protocol. Warp maps live media to
   QUIC streams based on the underlying media encoding.  Media is prioritized to

@@ -173,15 +173,16 @@ pub fn parseIncoming(bytes: []const u8) void {
 }
 
 pub fn decrypt(header: *Header, stream: anytype, space: *PacketNumSpace) !void {
-    std.log.info("header.remainder_len: {any}", .{header.remainder_len});
-
+    std.log.info("\n\nheader.remainder_len: {any}", .{header.remainder_len});
     const pn_and_sample = stream.buffer[stream.pos..(stream.pos + (MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN))];
-    std.log.info("pn_and_sample: {any}", .{pn_and_sample});
+
+    var payload = stream.buffer[stream.pos..(stream.pos + header.remainder_len)];
+    std.log.info("payload: (len: {any}) {any}", .{ payload.len, payload });
 
     var ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
     var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
 
-    var first_byte = pn_and_sample[0];
+    var first_byte = stream.buffer[0];
 
     // unprotect header
     var aead = space.crypto_open.?;
@@ -189,7 +190,7 @@ pub fn decrypt(header: *Header, stream: anytype, space: *PacketNumSpace) !void {
 
     std.log.info("sample: {any}", .{sample.*});
     std.log.info("mask: {any}", .{mask.*});
-    std.log.info("first_byte (pre): {any}", .{first_byte});
+    std.log.info("first_byte (masked): {any}", .{first_byte});
     std.log.info("ciphertext: {any}", .{ciphertext.*});
 
     if (isLongHeader(first_byte)) {
@@ -197,6 +198,7 @@ pub fn decrypt(header: *Header, stream: anytype, space: *PacketNumSpace) !void {
     } else {
         first_byte ^= (mask[0] & 0x1f);
     }
+    std.log.info("first_byte (unmasked): {any}", .{first_byte});
 
     header.packet_number_len = @intCast(usize, (first_byte & PACKET_NUM_MASK)) + 1;
 
@@ -206,8 +208,8 @@ pub fn decrypt(header: *Header, stream: anytype, space: *PacketNumSpace) !void {
     while (i < header.packet_number_len) : (i += 1) {
         unprotected_pkt_num[i] = ciphertext.*[i] ^ mask[1 + i];
     }
-    std.log.info("unprotected_pkt_num {any}", .{unprotected_pkt_num});
-    var packet_number = try switch (header.packet_number_len) {
+    std.log.info("unprotected packet number {any}", .{unprotected_pkt_num});
+    var truncated_packet_number = try switch (header.packet_number_len) {
         1 => @intCast(u64, std.mem.readInt(u8, unprotected_pkt_num[0..util.sizeOf(u8)], endian)),
         2 => @intCast(u64, std.mem.readInt(u16, unprotected_pkt_num[0..util.sizeOf(u16)], endian)),
         3 => @intCast(u64, std.mem.readInt(u24, unprotected_pkt_num[0..util.sizeOf(u24)], endian)),
@@ -224,8 +226,8 @@ pub fn decrypt(header: *Header, stream: anytype, space: *PacketNumSpace) !void {
 
     std.log.info("next_packet_number: {any}", .{space.next_packet_number});
     std.log.info("header.packet_number_len: {any}", .{header.packet_number_len});
-    std.log.info("header.packet_number: {any}", .{packet_number});
-    header.packet_number = decodePacketNumber(space.next_packet_number, packet_number, header.packet_number_len * 8);
+    std.log.info("packet number (truncated) {any}", .{truncated_packet_number});
+    header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
 
     std.log.info("first_byte (post): {any}", .{first_byte});
     std.log.info("header.packet_number_len: {any}", .{header.packet_number_len});
@@ -241,15 +243,16 @@ pub fn isLongHeader(first_byte: u8) bool {
 pub fn parseQuicHeader(stream: anytype) !Header {
     const reader = stream.reader();
     const first_byte = try reader.readByte();
-    var packet_header = Header{};
+
+    var header = Header{};
 
     if (isLongHeader(first_byte)) {
         log.info("LONG HEADER!", .{});
 
         var version = try reader.readInt(u32, endian);
         log.info("version: {any}", .{version});
-        packet_header.version = @intToEnum(protocol.Version, version);
-        log.info("(enum) version: {any}", .{packet_header.version});
+        header.version = @intToEnum(protocol.Version, version);
+        log.info("(enum) version: {any}", .{header.version});
 
         const dcid_length = try reader.readByte();
         if (dcid_length > CONNECTION_ID_MAX_SIZE) {
@@ -259,8 +262,8 @@ pub fn parseQuicHeader(stream: anytype) !Header {
 
         std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, dcid_length });
 
-        packet_header.dcid = stream.buffer[stream.pos..(stream.pos + dcid_length)];
-        std.log.info("dcid: {any}", .{packet_header.dcid});
+        header.dcid = stream.buffer[stream.pos..(stream.pos + dcid_length)];
+        std.log.info("dcid: {any}", .{header.dcid});
 
         // advance dcid_length
         try stream.seekBy(dcid_length);
@@ -272,13 +275,13 @@ pub fn parseQuicHeader(stream: anytype) !Header {
         }
 
         std.log.info("stream.pos: {any}, cid length: {any}", .{ stream.pos, scid_length });
-        packet_header.scid = stream.buffer[stream.pos..(stream.pos + scid_length)];
-        std.log.info("scid: {s} ({any})", .{ packet_header.scid, packet_header.scid });
+        header.scid = stream.buffer[stream.pos..(stream.pos + scid_length)];
+        std.log.info("scid: {s} ({any})", .{ header.scid, header.scid });
 
         // advance scid_length
         try stream.seekBy(scid_length);
 
-        if (packet_header.version == protocol.Version.NEGOTIATION) {
+        if (header.version == protocol.Version.NEGOTIATION) {
             // version negotiation
             //
             // TODO:
@@ -289,10 +292,10 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                 return error.InvalidPacket;
             }
 
-            packet_header.packet_type = @intToEnum(PacketType, (first_byte & PACKET_TYPE_MASK));
-            std.log.info("packet_type => {any}", .{packet_header.packet_type});
+            header.packet_type = @intToEnum(PacketType, (first_byte & PACKET_TYPE_MASK));
+            std.log.info("packet_type => {any}", .{header.packet_type});
 
-            switch (packet_header.packet_type) {
+            switch (header.packet_type) {
                 PacketType.Initial => {
                     //
                     // Clients MUST ensure that UDP datagrams containing Initial packets
@@ -313,11 +316,11 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                         // Token:  The value of the token that was previously provided in a
                         //    Retry packet or NEW_TOKEN frame; see Section 8.1.
                         //
-                        packet_header.token = stream.buffer[stream.pos..(stream.pos + token_length)];
+                        header.token = stream.buffer[stream.pos..(stream.pos + token_length)];
                         try stream.seekBy(@intCast(i64, token_length));
                     }
 
-                    packet_header.remainder_len = try readVarInt(reader);
+                    header.remainder_len = try readVarInt(reader);
                 },
 
                 PacketType.Retry => {
@@ -325,7 +328,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                     // var token = bytes[stream.pos..(stream.pos + token_length)];
                     // try stream.seekBy(@intCast(i64, token_length));
 
-                    // packet_header.token = token;
+                    // header.token = token;
                 },
 
                 PacketType.VersionNegotiation => {
@@ -339,13 +342,13 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                 },
 
                 else => {
-                    std.log.err("Packet type not recognized: {any}", .{packet_header.packet_type});
-                    packet_header.remainder_len = try readVarInt(reader);
+                    std.log.err("Packet type not recognized: {any}", .{header.packet_type});
+                    header.remainder_len = try readVarInt(reader);
                 },
             }
 
             // // check remainder length
-            // if (packet_header.remainder_len > bytes.len - stream.pos) {
+            // if (header.remainder_len > bytes.len - stream.pos) {
             //     std.log.err("Packet payload is truncated", .{});
             //     return error.InvalidPacket;
             // }
@@ -357,7 +360,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
         log.info("SHORT HEADER!", .{});
     }
 
-    return packet_header;
+    return header;
 }
 
 fn readVarInt(reader: anytype) !u64 {
@@ -372,6 +375,8 @@ fn readVarInt(reader: anytype) !u64 {
     //
     const first_byte = try reader.readByte();
 
+    std.log.info("readVarInt, read => {}", .{first_byte});
+
     // the first two bits of the first byte encode the length
     var len = @as(i32, 1) << @intCast(u5, (first_byte & 0xc0) >> 6);
     len = len - 1;
@@ -380,14 +385,18 @@ fn readVarInt(reader: anytype) !u64 {
     while (len > 0) {
         len = len - 1;
         value = (value << 8);
-        value = value + try reader.readByte();
+
+        var red = try reader.readByte();
+        value = value + red;
+
+        std.log.info("(...readVarInt), read => {}", .{red});
     }
 
     return value;
 }
 
 test "QUIC: Variable-Length Integer Decoding" {
-    var fbs = io.fixedBufferStream(&[_]u8{ 194, 25, 124, 94, 255, 20, 232, 140 });
+    var fbs = io.fixedBufferStream(&[_]u8{ 0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c });
     try std.testing.expect(151288809941952652 == try readVarInt(fbs.reader()));
 
     fbs = io.fixedBufferStream(&[_]u8{ 0x9d, 0x7f, 0x3e, 0x7d });
@@ -424,7 +433,7 @@ fn decodePacketNumber(expected_pkt_num: u64, truncated_pkt_num: u64, num_bits: u
     const candidate = (expected_pkt_num & ~pkt_num_mask) | truncated_pkt_num;
     std.log.info("candidate: {any}", .{candidate});
 
-    if ((candidate <= expected_pkt_num - half_window) and (candidate < (1 << 62) - window)) {
+    if ((candidate + half_window <= expected_pkt_num) and (candidate < (1 << 62) - window)) {
         return candidate + window;
     }
 
@@ -433,4 +442,24 @@ fn decodePacketNumber(expected_pkt_num: u64, truncated_pkt_num: u64, num_bits: u
     }
 
     return candidate;
+
+    // let pn_nbits = pn_len * 8;
+    // let expected_pn = largest_pn + 1;
+    // let pn_win = 1 << pn_nbits;
+    // let pn_hwin = pn_win / 2;
+    // let pn_mask = pn_win - 1;
+    // let candidate_pn = (expected_pn & !pn_mask) | truncated_pn;
+    //
+    // if candidate_pn + pn_hwin <= expected_pn && candidate_pn < (1 << 62) - pn_win
+    // {
+    //     return candidate_pn + pn_win;
+    // }
+    //
+    // if candidate_pn > expected_pn + pn_hwin && candidate_pn >= pn_win {
+    //     return candidate_pn - pn_win;
+    // }
+    //
+    // println!("decode_pkt_num: {:?} => {:?}", truncated_pn, candidate_pn);
+    //
+    // candidate_pn
 }
