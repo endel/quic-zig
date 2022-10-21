@@ -63,8 +63,7 @@ pub const Connection = struct {
         var epoch = try packet.Epoch.fromPacketType(header.*.packet_type);
         var space = self.pkt_num_spaces[@as(usize, @enumToInt(epoch))];
 
-        // try packet.decrypt(header, stream, space.crypto_open.?);
-        try packet.decrypt(header, stream, &space);
+        try packet.decrypt(header, stream, space);
     }
 };
 

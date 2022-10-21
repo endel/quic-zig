@@ -1,8 +1,11 @@
 # Netcode Journal and Progress Report
 
 ## October 2022
+- 21.10: Trying to decode payload of INITIAL packet type.
 - 18.10: Ok 🤦 I was getting the `first` from the (pn+sample) rather than the
-  first byte of the packet itself.
+  first byte of the packet itself. Need to decrypt the payload now.
+- 17.10: _(💭 inner-thoughts)_ saw that Shiguredo is sponsoring/supporting
+  zig-lang with $1k+.
 - 16.10: Still trying to decrypt packet number. The `first` byte seems to
   diverge on my implementation than Quiche's. The `mask`, and `sample` are ok,
   though. (Maybe the quic-varint is advancing a byte that it shouldn't? need to
@@ -11,7 +14,7 @@
   Warp is a segmented live media transport protocol. Warp maps live media to
   QUIC streams based on the underlying media encoding.  Media is prioritized to
   reduce latency when encountering congestion.
-- 09.10: Realized the part where I've been stuck ([parsing packer
+- 09.10: Realized the part where I've been stuck ([parsing packet
   number](https://www.rfc-editor.org/rfc/rfc9000.html#name-packet-number-encoding-and-))
   is not fully implemented even by shiguredo's implementation.
 - 01.10 ~ 08.10: Been reading and understanding shiguredo's take on their QUIC

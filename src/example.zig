@@ -63,12 +63,19 @@ pub fn main() anyerror!void {
         };
 
         std.log.info("packet received, length {} => {}", .{ packet_length, src_addr });
-        // std.log.info("packet received {any}", .{bytes[0..packet_length]});
+        std.log.info("packet received {any}", .{bytes[0..packet_length]});
 
         // var stream = io.fixedBufferStream(bytes[0..packet_length]);
         // const reader = stream.reader();
         var stream = io.fixedBufferStream(bytes[0..packet_length]);
         var header = try packet.Header.parse(&stream);
+
+        // make sure payload is not higher than received packet  length
+        std.log.info("remainder_len: {any} / {any} (packet_length)", .{ header.remainder_len, packet_length });
+        if (header.remainder_len > packet_length) {
+            std.log.warn("remaining length is higher than packet length!", .{});
+            continue;
+        }
 
         // TODO: hmac sign `destination_cid` to avoid connections having full
         // control which ID is being used.
@@ -95,6 +102,9 @@ pub fn main() anyerror!void {
                 std.log.warn("TODO: Do stateless retry!", .{});
             }
 
+            std.log.info("header.scid: ({}) {any}", .{ header.scid.len, header.scid });
+            std.log.info("header.dcid: ({}) {any}", .{ header.dcid.len, header.dcid });
+
             if (header.scid.len != header.dcid.len) {
                 std.log.err("Invalid destination connection ID", .{});
             }
@@ -102,33 +112,34 @@ pub fn main() anyerror!void {
             var conn = try server.accept(header);
             conn_pair.value_ptr.* = conn;
 
-            const epoch = try packet.Epoch.fromPacketType(header.packet_type);
-
-            if (epoch == packet.Epoch.ZERO_RTT) {
-                std.log.info("TODO: implement zero rtt", .{});
-                continue;
-            }
-
-            std.log.info("stream.pos: {any}, header.remainder_len: {any}", .{ stream.pos, header.remainder_len });
-            try conn.decrypt_packet(&header, stream);
-
-            // var decrypted_bytes: [packet.MAX_PACKET_LEN]u8 = undefined;
-            // try crypto.decryptPacket(&decrypted_bytes, stream.buffer[0..end_offset], encrypted_offset, space.expected_packet_number);
-
-            std.log.info("remainder_len: {any}", .{header.remainder_len});
-
-            // var crypto = conn._cryptos[@as(usize, @enumToInt(epoch))];
-            // var space = conn._spaces[@as(usize, @enumToInt(epoch))];
-            // _ = crypto;
-            // _ = space;
-
             //
         } else {
             std.log.warn("HAS CONNECTION!", .{});
         }
 
         var conn = conn_pair.value_ptr.*;
-        _ = conn;
+
+        const epoch = try packet.Epoch.fromPacketType(header.packet_type);
+
+        if (epoch == packet.Epoch.ZERO_RTT) {
+            std.log.info("TODO: implement zero rtt", .{});
+            continue;
+        }
+
+        std.log.info("stream.pos: {any}, header.remainder_len: {any}", .{ stream.pos, header.remainder_len });
+
+        conn.decrypt_packet(&header, &stream) catch |err| {
+            std.log.err("decrypt error: {any}", .{err});
+            break;
+        };
+
+        // var decrypted_bytes: [packet.MAX_PACKET_LEN]u8 = undefined;
+        // try crypto.decryptPacket(&decrypted_bytes, stream.buffer[0..end_offset], encrypted_offset, space.expected_packet_number);
+
+        // var crypto = conn._cryptos[@as(usize, @enumToInt(epoch))];
+        // var space = conn._spaces[@as(usize, @enumToInt(epoch))];
+        // _ = crypto;
+        // _ = space;
 
         // network_path = self._find_network_path(addr)
 
