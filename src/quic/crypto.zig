@@ -87,9 +87,10 @@ pub const Open = struct {
         // padded packet number and the IV forms the AEAD nonce.
         //
 
-        const nonce = nonce: {
+        const aead_nonce = nonce: {
             var pn: [nonce_len]u8 = undefined;
             std.mem.writeIntSliceBig(u64, &pn, packet_number);
+
             var n: [nonce_len]u8 = undefined;
             for (n) |_, i| {
                 n[i] = pn[i] ^ self.nonce[i];
@@ -98,15 +99,22 @@ pub const Open = struct {
             break :nonce n;
         };
 
-        std.log.info("let's decode payload...", .{});
-        std.log.info("decrypted: (len: {any}) {any}", .{ decrypted.len, decrypted });
-        std.log.info("ciphertext: (len: {any}) {any}", .{ ciphertext.len, ciphertext });
-        std.log.info("tag: (len: {any}) {any}", .{ tag.len, tag });
-        std.log.info("header: (len: {any}) {any}", .{ header.len, header });
-        std.log.info("nonce: (len: {any}) {any}", .{ nonce.len, nonce });
-        std.log.info("key: (len: {any}) {any}", .{ self.key.len, self.key });
+        std.log.info("payload: ({any}) {any}", .{ payload.len, payload });
+        std.log.info("decrypted: ({any}) {any}", .{ decrypted.len, decrypted });
+        std.log.info("ciphertext: ({any}) {any}", .{ ciphertext.len, ciphertext });
+        std.log.info("tag: ({any}) {any}", .{ tag.len, tag });
+        std.log.info("header: ({any}) {any}", .{ header.len, header });
+        std.log.info("aead_nonce: ({any}) {any}", .{ aead_nonce.len, aead_nonce });
+        std.log.info("key: ({any}) {any}", .{ self.key.len, self.key });
 
-        try Aead.decrypt(decrypted, ciphertext, tag, header, nonce, self.key);
+        try Aead.decrypt(
+            decrypted,
+            ciphertext,
+            tag,
+            header,
+            aead_nonce,
+            self.key,
+        );
 
         std.log.info("payload: (len: {any}) {any}", .{ decrypted.len, decrypted });
     }

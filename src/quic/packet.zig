@@ -178,7 +178,8 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
     const pn_and_sample = stream.buffer[stream.pos..(stream.pos + pn_and_sample_len)];
 
     // advance stream position
-    try stream.seekBy(pn_and_sample_len);
+    // try stream.seekBy(pn_and_sample_len);
+    // try stream.seekBy(MAX_PACKET_NUMBER_LEN);
 
     var ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
     var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
@@ -196,6 +197,8 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
     }
 
     header.packet_number_len = @intCast(usize, (first_byte & PACKET_NUM_MASK)) + 1;
+
+    try stream.seekBy(@intCast(i64, (first_byte & PACKET_NUM_MASK)));
 
     // unprotect packer number
     var unprotected_pkt_num = [_]u8{0x00} ** MAX_PACKET_NUMBER_LEN;
@@ -224,6 +227,8 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
 
     // var payload = stream.buffer[stream.pos..(stream.pos + header.remainder_len - pn_and_sample_len)];
+
+    // TODO: both of these may be wrong
     var encrypted_payload = stream.buffer[stream.pos..(stream.pos + header.remainder_len)];
     var header_bytes = stream.buffer[0..stream.pos];
 
