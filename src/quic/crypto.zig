@@ -99,9 +99,8 @@ pub const Open = struct {
             break :nonce n;
         };
 
-        std.log.info("payload: ({any}) {any}", .{ payload.len, payload });
-        std.log.info("decrypted: ({any}) {any}", .{ decrypted.len, decrypted });
-        std.log.info("ciphertext: ({any}) {any}", .{ ciphertext.len, ciphertext });
+        std.log.info("payload (encoded): ({any}) {any}", .{ payload.len, payload });
+        // std.log.info("payload (encoded): ({any}) {any}", .{ ciphertext.len, ciphertext });
         std.log.info("tag: ({any}) {any}", .{ tag.len, tag });
         std.log.info("header: ({any}) {any}", .{ header.len, header });
         std.log.info("aead_nonce: ({any}) {any}", .{ aead_nonce.len, aead_nonce });

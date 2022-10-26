@@ -1,6 +1,15 @@
 # Netcode Journal and Progress Report
 
 ## October 2022
+- 26.10: Update: There are 2 INITIAL packets. 1st doesn't have "retry token"
+  thus server need to generate it and send back. 2nd has the "retry token" +
+  payload. _The first round-trip accounts for a challenge-response mechanism
+  known as stateless retry. This mechanism validates the claimed source address to
+  prevent IP spoofing attacks. The second round-trip is used to conduct the
+  cryptographic connection establishment._
+- 25.10: Figured there are at least 3 INITIAL packets being transferred. The 1st
+  and 2nd do not seem to have a PAYLOAD, but the 3rd has it. Need to see what
+  should be done with the first packets first.
 - 21.10: Trying to decode payload of INITIAL packet type.
 - 18.10: Ok 🤦 I was getting the `first` from the (pn+sample) rather than the
   first byte of the packet itself. Need to decrypt the payload now.

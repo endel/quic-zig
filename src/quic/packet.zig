@@ -11,8 +11,10 @@ const util = @import("util.zig");
 // network byte order
 const endian = std.builtin.Endian.Big;
 
-pub const PACKET_LONG_HEADER = 0x80;
-pub const PACKET_FIXED_BIT = 0x40;
+pub const LONG_HEADER_BIT = 0x80;
+pub const FIXED_BIT = 0x40;
+pub const KEY_PHASE_BIT = 0x04;
+
 pub const PACKET_SPIN_BIT = 0x20;
 pub const PACKET_TYPE_MASK = 0xF0;
 
@@ -23,22 +25,22 @@ pub const MAX_PACKET_NUMBER_LEN = 4; // maxlength of a "packet number"
 
 pub const PacketType = enum(u8) {
     /// Initial packet
-    Initial = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x00,
+    Initial = LONG_HEADER_BIT | FIXED_BIT | 0x00,
 
     /// Retry packet
-    Retry = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x30,
+    Retry = LONG_HEADER_BIT | FIXED_BIT | 0x30,
 
     /// Handshake packet
-    Handshake = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x20,
+    Handshake = LONG_HEADER_BIT | FIXED_BIT | 0x20,
 
     /// 0-RTT packet
-    ZeroRTT = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x10,
+    ZeroRTT = LONG_HEADER_BIT | FIXED_BIT | 0x10,
 
     /// Version negotiation packet
     VersionNegotiation = 0,
 
     /// 1-RTT short header packet
-    OneRTT = PACKET_FIXED_BIT,
+    OneRTT = FIXED_BIT,
 };
 
 pub const Epoch = enum(u8) {
@@ -129,8 +131,80 @@ pub const Header = struct {
     // TODO: version negotiation
     // versions: ProtocolVersion = undefined,
 
+    /// The key phase bit of the packet. It's only meaningful after the header
+    /// protection is removed.
+    key_phase: bool = false,
+
     pub fn parse(stream: anytype) !Header {
         return parseQuicHeader(stream);
+    }
+
+    pub fn encode(self: *Self, writer: anytype) !void {
+        var first = 0;
+
+        // encode pkt num length.
+        first |= self.packet_number_len -| 1; // (saturating sub)
+
+        // encode short header.
+        if (self.packet_type == PacketType.OneRTT) {
+            // Unset form bit for short header.
+            first &= !LONG_HEADER_BIT;
+
+            // Set fixed bit.
+            first |= FIXED_BIT;
+
+            // Set key phase bit.
+            if (self.key_phase) {
+                first |= KEY_PHASE_BIT;
+            } else {
+                first &= !KEY_PHASE_BIT;
+            }
+
+            writer.writeByte(first);
+            writer.writeBytes(&self.dcid);
+
+            return;
+        }
+
+        // Encode long header.
+        const ty: u8 = switch (self.packet_type) {
+            PacketType.Initial => 0x00,
+            PacketType.ZeroRTT => 0x01,
+            PacketType.Handshake => 0x02,
+            PacketType.Retry => 0x03,
+            else => error.InvalidPacket,
+        };
+
+        first |= LONG_HEADER_BIT | FIXED_BIT | (ty << 4);
+
+        writer.writeByte(first);
+        writer.writeInt(u32, self.version, endian);
+
+        writer.writeByte(self.dcid.len);
+        writer.writeBytes(&self.dcid);
+
+        writer.writeByte(self.scid.len);
+        writer.writeBytes(&self.scid);
+
+        // Only Initial and Retry packets have a token.
+        switch (self.packet_type) {
+            PacketType.Initial => {
+                if (self.token == null or self.token.?.len == 0) {
+                    writeVarInt(writer, self.token.?.len);
+                    writer.writeBytes(self.token.*);
+                } else {
+                    // no token, 0 length
+                    writeVarInt(writer, 0);
+                }
+            },
+
+            PacketType.Retry => {
+                // Retry packets don't have a token length.
+                writer.writeBytes(self.token.*);
+            },
+
+            else => {}, // do nothing
+        }
     }
 };
 
@@ -198,8 +272,6 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
 
     header.packet_number_len = @intCast(usize, (first_byte & PACKET_NUM_MASK)) + 1;
 
-    try stream.seekBy(@intCast(i64, (first_byte & PACKET_NUM_MASK)));
-
     // unprotect packer number
     var unprotected_pkt_num = [_]u8{0x00} ** MAX_PACKET_NUMBER_LEN;
     var i: usize = 0;
@@ -218,6 +290,9 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
     // Write decrypted first byte back into the input buffer.
     stream.buffer[0] = first_byte;
 
+    // try stream.seekBy(@intCast(i64, (first_byte & PACKET_NUM_MASK)));
+    try stream.seekBy(@intCast(i64, header.packet_number_len));
+
     //
     // RFC 9000
     // 17.1. Packet Number Encoding and Decoding
@@ -229,8 +304,8 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
     // var payload = stream.buffer[stream.pos..(stream.pos + header.remainder_len - pn_and_sample_len)];
 
     // TODO: both of these may be wrong
-    var encrypted_payload = stream.buffer[stream.pos..(stream.pos + header.remainder_len)];
-    var header_bytes = stream.buffer[0..stream.pos];
+    var header_bytes = stream.buffer[0 .. (stream.pos + crypto.SAMPLE_LEN) + 14];
+    var encrypted_payload = stream.buffer[((stream.pos + crypto.SAMPLE_LEN) + 14)..(stream.pos + header.remainder_len)];
 
     // var payload: []u8 = undefined;
     try aead.decryptPayload(header.packet_number, header_bytes, encrypted_payload);
@@ -241,7 +316,7 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
 
 // inline
 pub fn isLongHeader(first_byte: u8) bool {
-    return (first_byte & PACKET_LONG_HEADER) == PACKET_LONG_HEADER;
+    return (first_byte & LONG_HEADER_BIT) == LONG_HEADER_BIT;
 }
 
 pub fn parseQuicHeader(stream: anytype) !Header {
@@ -291,7 +366,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
             // TODO:
             // remainder_len = @intCast(u32, bytes.len) - @intCast(u32, stream.pos);
         } else {
-            if ((first_byte & PACKET_FIXED_BIT) == 0) {
+            if ((first_byte & FIXED_BIT) == 0) {
                 std.log.err("Packet fixed bit is zero", .{});
                 return error.InvalidPacket;
             }
@@ -312,7 +387,8 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                         return error.InvalidPacket;
                     }
 
-                    var token_length = try reader.readByte();
+                    var token_length = try readVarInt(reader);
+
                     if (token_length == 0) {
                         std.log.warn("no token!", .{});
                     } else {
@@ -369,6 +445,24 @@ pub fn parseQuicHeader(stream: anytype) !Header {
     return header;
 }
 
+pub fn retry(
+    header: Header,
+    token: []u8,
+    writer: anytype,
+) void {
+    var hdr = Header{
+        .version = header.version,
+        .packet_type = PacketType.RETRY,
+        .dcid = header.scid,
+        .scid = header.dcid,
+        .token = token,
+        .packet_number = 0,
+        .packet_number_len = 0,
+    };
+
+    hdr.encode(writer);
+}
+
 fn readVarInt(reader: anytype) !u64 {
     //
     // https://datatracker.ietf.org/doc/html/draft-ietf-quic-transport-16#section-16
@@ -395,6 +489,35 @@ fn readVarInt(reader: anytype) !u64 {
     }
 
     return value;
+}
+
+fn writeVarInt(writer: anytype, value: u64) !void {
+    _ = writer;
+    _ = value;
+
+    // /// Writes the given integer as variable-length encoded, into the current position of the buffer,
+    // /// advancing the position.
+    // pub fn putVarInt(self: *Self, value: u64) Error!void {
+    //     const length = varIntLength(value);
+    //
+    //     try self.putVarIntWithLength(value, length);
+    // }
+    //
+    // /// Writes the given integer as variable-length encoded in the specified length, into the current
+    // /// position of the buffer, advancing the position.
+    // pub fn putVarIntWithLength(self: *Self, value: u64, length: usize) Error!void {
+    //     var rest = self.buf[self.pos..];
+    //     if (rest.len < length)
+    //         return Error.BufferTooShort;
+    //
+    //     switch (length) {
+    //         1 => try self.put(u8, @truncate(u8, value) | (0b00 << 6)),
+    //         2 => try self.put(u16, @truncate(u16, value) | (0b01 << 14)),
+    //         4 => try self.put(u32, @truncate(u32, value) | (0b10 << 30)),
+    //         8 => try self.put(u64, value | (0b11 << 62)),
+    //         else => unreachable,
+    //     }
+    // }
 }
 
 test "QUIC: Variable-Length Integer Decoding" {

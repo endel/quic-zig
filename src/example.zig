@@ -18,6 +18,7 @@ const quictls = @import("quic/quictls.zig");
 const hmac = std.crypto.auth.hmac;
 
 // pub const io_mode = .evented;
+const MAX_DATAGRAM_SIZE: usize = 1350;
 
 pub fn main() anyerror!void {
     // var alloc = std.heap.GeneralPurposeAllocator(.{}){};
@@ -50,6 +51,10 @@ pub fn main() anyerror!void {
     var connections = std.StringHashMap(Connection).init(alloc);
     defer connections.clearAndFree();
 
+    // out/write buffer
+    var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
+    var out_writer = io.fixedBufferStream(&out).writer();
+
     while (true) {
         os.nanosleep(0, 100 * 1000 * 1000);
 
@@ -62,7 +67,7 @@ pub fn main() anyerror!void {
             continue;
         };
 
-        std.log.info("packet received, length {} => {}", .{ packet_length, src_addr });
+        std.log.info("packet received, length {} => {} (size: {})", .{ packet_length, src_addr, addr_size });
         std.log.info("packet received {any}", .{bytes[0..packet_length]});
 
         // var stream = io.fixedBufferStream(bytes[0..packet_length]);
@@ -82,26 +87,39 @@ pub fn main() anyerror!void {
         // let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
         const conn_id = header.dcid;
 
+        if (header.packet_type != packet.PacketType.Initial) {
+            std.log.err("Packet is not initial!", .{});
+            continue;
+        }
+
+        //
+        // TODO: Version negotiation
+        //
+
+        if (!protocol.isSupportedVersion(header.version)) {
+            std.log.warn("TODO: CLIENT WANTS TO USE VERSION {}, let's negotiate the version...", .{header.version});
+            continue;
+        }
+
+        if (header.token == null or header.token.?.len == 0) {
+            // TODO: Do stateless retry if the client didn't send a token.
+            std.log.warn("TODO: Do stateless retry!", .{});
+
+            var new_token = generateStatelessRetryToken(header, src_addr);
+            packet.retry(header, new_token, &out_writer);
+
+            var tosend = out_writer.getWritten();
+
+            try os.sendto(sockfd, tosend, 0, &src_addr, &addr_size) catch |e| {
+                std.log.warn("sendto {:?}, error -> {:?}", .{ src_addr, e });
+                continue;
+            };
+
+            continue;
+        }
+
         const conn_pair = try connections.getOrPut(conn_id);
         if (!conn_pair.found_existing) {
-            if (header.packet_type != packet.PacketType.Initial) {
-                std.log.err("Packet is not initial!", .{});
-                continue;
-            }
-
-            //
-            // TODO: Version negotiation
-            //
-
-            if (!protocol.isSupportedVersion(header.version)) {
-                std.log.warn("TODO: CLIENT WANTS TO USE VERSION {}, let's negotiate the version...", .{header.version});
-            }
-
-            if (header.token == null or header.token.?.len == 0) {
-                // TODO: Do stateless retry if the client didn't send a token.
-                std.log.warn("TODO: Do stateless retry!", .{});
-            }
-
             std.log.info("header.scid: ({}) {any}", .{ header.scid.len, header.scid });
             std.log.info("header.dcid: ({}) {any}", .{ header.dcid.len, header.dcid });
 
@@ -148,6 +166,11 @@ pub fn main() anyerror!void {
         // const sent_size = try os.sendto(sockfd, bytes[0..packet_length], 0, &src_addr, addr_size);
         // std.log.info("sendto, size => {}", .{sent_size});
     }
+}
+
+fn generateStatelessRetryToken(header: packet.Header, from: os.sockaddr) void {
+    _ = header;
+    _ = from;
 }
 
 test {
