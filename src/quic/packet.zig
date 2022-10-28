@@ -18,10 +18,17 @@ pub const KEY_PHASE_BIT = 0x04;
 pub const PACKET_SPIN_BIT = 0x20;
 pub const PACKET_TYPE_MASK = 0xF0;
 
-const PACKET_NUM_MASK: u8 = 0x03;
-
 pub const MAX_PACKET_LEN = 1536;
 pub const MAX_PACKET_NUMBER_LEN = 4; // maxlength of a "packet number"
+
+pub const CONNECTION_ID_MAX_SIZE: u8 = 20;
+
+const PACKET_NUM_MASK: u8 = 0x03;
+
+pub const STATELESS_RESET_TOKEN_SIZE = 16; // aren't these 2 the same?
+const RETRY_INTEGRITY_TAG_SIZE = 16;
+const RETRY_INTEGRITY_KEY_V1: [crypto.key_len]u8 = .{ 0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e };
+const RETRY_INTEGRITY_NONCE_V1: [crypto.nonce_len]u8 = .{ 0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb };
 
 pub const PacketType = enum(u8) {
     /// Initial packet
@@ -69,12 +76,6 @@ test "Epoch fromPacketType" {
     const err = Epoch.fromPacketType(PacketType.Retry);
     try std.testing.expectError(error.InvalidPacketType, err);
 }
-
-pub const CONNECTION_ID_MAX_SIZE: u8 = 20;
-pub const PACKET_NUMBER_MAX_SIZE = 4;
-
-pub const RETRY_INTEGRITY_TAG_SIZE = 16;
-pub const STATELESS_RESET_TOKEN_SIZE = 16;
 
 pub const PacketError = error{
     InvalidVersion,
@@ -145,15 +146,15 @@ pub const Header = struct {
         // encode pkt num length.
         first |= self.packet_number_len -| 1; // (saturating sub)
 
-        // encode short header.
+        // encode short header
         if (self.packet_type == PacketType.OneRTT) {
-            // Unset form bit for short header.
+            // unset form bit for short header
             first &= !LONG_HEADER_BIT;
 
-            // Set fixed bit.
+            // set fixed bit
             first |= FIXED_BIT;
 
-            // Set key phase bit.
+            // set key phase bit
             if (self.key_phase) {
                 first |= KEY_PHASE_BIT;
             } else {
@@ -166,7 +167,7 @@ pub const Header = struct {
             return;
         }
 
-        // Encode long header.
+        // encode long header
         const ty: u8 = switch (self.packet_type) {
             PacketType.Initial => 0x00,
             PacketType.ZeroRTT => 0x01,
@@ -192,6 +193,7 @@ pub const Header = struct {
                 if (self.token == null or self.token.?.len == 0) {
                     writeVarInt(writer, self.token.?.len);
                     writer.writeBytes(self.token.*);
+
                 } else {
                     // no token, 0 length
                     writeVarInt(writer, 0);
@@ -199,7 +201,7 @@ pub const Header = struct {
             },
 
             PacketType.Retry => {
-                // Retry packets don't have a token length.
+                // retry packets don't have a token length.
                 writer.writeBytes(self.token.*);
             },
 
@@ -447,6 +449,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
 
 pub fn retry(
     header: Header,
+    odcid: []u8, // original destination connection id
     token: []u8,
     writer: anytype,
 ) void {
@@ -461,6 +464,42 @@ pub fn retry(
     };
 
     hdr.encode(writer);
+
+    const integrity_tag = computeRetryIntegrityTag(writer.context.buffer, odcid, header.version);
+    std.log.info("integrity_tag: {:?}", .{integrity_tag});
+
+    writer.writeBytes(integrity_tag);
+
+}
+
+///
+/// Retry packets carry a Retry Integrity Tag that provides two properties: it
+/// allows the discarding of packets that have accidentally been corrupted by the
+/// network, and only an entity that observes an Initial packet can send a valid
+/// Retry packet.
+///
+/// - Retry Packets: https://datatracker.ietf.org/doc/html/rfc9000#section-17.2.5
+/// - Retry Packet Integrity: https://datatracker.ietf.org/doc/html/rfc9001#section-5.8
+///
+fn computeRetryIntegrityTag(
+    bytes: []u8,
+    odcid: []u8,
+    version: protocol.Version,
+) ![]u8 {
+    var key = RETRY_INTEGRITY_KEY_V1;
+    var nonce = RETRY_INTEGRITY_NONCE_V1;
+
+    var hdr_len = bytes.len;
+
+   //
+   // The secret key and the nonce are values derived by calling HKDF-
+   // Expand-Label using
+   // 0xd9c9943e6101fd200021506bcc02814c73030f25c79d71ce876eca876e6fca8e as
+   // the secret, with labels being "quic key" and "quic iv" (Section 5.1).
+   //
+   // https://datatracker.ietf.org/doc/html/rfc9001#section-5.8
+   //
+
 }
 
 fn readVarInt(reader: anytype) !u64 {
@@ -494,6 +533,8 @@ fn readVarInt(reader: anytype) !u64 {
 fn writeVarInt(writer: anytype, value: u64) !void {
     _ = writer;
     _ = value;
+
+    std.log.err("TODO: writeVarInt not implemented yet.", .{});
 
     // /// Writes the given integer as variable-length encoded, into the current position of the buffer,
     // /// advancing the position.

@@ -104,6 +104,10 @@ compresses more.
 
 - https://github.com/quicwg/qlog
 
+### [?] Unnoficial / Studies
+
+- ["QUICker Connection Establishment with Out-Of-Band Validation Tokens"](https://svs.informatik.uni-hamburg.de/publications/2019/2019-10-15_Sy_LCN_Poster_QUICker.pdf)
+
 ---
 
 ## License

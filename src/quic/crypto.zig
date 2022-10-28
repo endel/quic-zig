@@ -23,8 +23,9 @@ pub const SAMPLE_LEN = 16;
 // during this experimentational phase, only AES128_GCM is supported.
 const Aead = Aes128Gcm;
 const Hmac = HmacSha256;
-const key_len = 16;
-const nonce_len = 12;
+
+pub const key_len = 16;
+pub const nonce_len = 12;
 
 // TODO: support the 3 algorithms below (only AES128_GCM currently supported)
 pub const Algorithm = enum {

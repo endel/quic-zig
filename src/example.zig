@@ -16,6 +16,7 @@ const h3 = @import("h3/connection.zig");
 const quictls = @import("quic/quictls.zig");
 
 const hmac = std.crypto.auth.hmac;
+const random = std.crypto.random;
 
 // pub const io_mode = .evented;
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -105,12 +106,15 @@ pub fn main() anyerror!void {
             // TODO: Do stateless retry if the client didn't send a token.
             std.log.warn("TODO: Do stateless retry!", .{});
 
+            var odcid: [packet.CONNECTION_ID_MAX_SIZE]u8 = undefined;
+            random.bytes(&odcid);
+
             var new_token = generateStatelessRetryToken(header, src_addr);
             packet.retry(header, new_token, &out_writer);
 
-            var tosend = out_writer.getWritten();
+            var bytes_to_send = out_writer.getWritten();
 
-            try os.sendto(sockfd, tosend, 0, &src_addr, &addr_size) catch |e| {
+            try os.sendto(sockfd, bytes_to_send, 0, &src_addr, &addr_size) catch |e| {
                 std.log.warn("sendto {:?}, error -> {:?}", .{ src_addr, e });
                 continue;
             };
