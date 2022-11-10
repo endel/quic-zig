@@ -1,11 +1,13 @@
 const std = @import("std");
 const os = std.os;
+const io = std.io;
 
 const connection = @import("connection.zig");
 const structs = @import("structs.zig");
 const packet = @import("packet.zig");
 const crypto = @import("crypto.zig");
 const quictls = @import("quictls.zig");
+// const token = @import("handshake/token.zig");
 
 const TicketStore = std.StringHashMap(quictls.SessionTicket);
 
@@ -15,6 +17,7 @@ const ConnectionState = connection.ConnectionState;
 pub const Server = struct {
     config: structs.QuicConfiguration,
     ticket_store: TicketStore,
+    // generate_token: *const fn (header: packet.Header, from: os.sockaddr) []u8 = token.defaultTokenGenerator,
 
     pub fn init(config: structs.QuicConfiguration, ticket_store: TicketStore) Server {
         return .{ .config = config, .ticket_store = ticket_store };

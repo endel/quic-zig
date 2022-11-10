@@ -106,6 +106,7 @@ compresses more.
 
 ### [?] Unnoficial / Studies
 
+- [QUIC Retry Offload](https://datatracker.ietf.org/doc/html/draft-ietf-quic-retry-offload-00)
 - ["QUICker Connection Establishment with Out-Of-Band Validation Tokens"](https://svs.informatik.uni-hamburg.de/publications/2019/2019-10-15_Sy_LCN_Poster_QUICker.pdf)
 
 ---

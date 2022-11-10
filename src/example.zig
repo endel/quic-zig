@@ -6,17 +6,17 @@ const os = std.os;
 const mem = std.mem;
 const Queue = std.atomic.Queue;
 
-const QuicServer = @import("quic/server.zig").Server;
-const Connection = @import("quic/connection.zig").Connection;
+const Server = @import("quic/server.zig").Server;
+const connection = @import("quic/connection.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
+const token = @import("quic/handshake/token.zig");
 
 const h0 = @import("h0/connection.zig");
 const h3 = @import("h3/connection.zig");
 const quictls = @import("quic/quictls.zig");
 
 const hmac = std.crypto.auth.hmac;
-const random = std.crypto.random;
 
 // pub const io_mode = .evented;
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -27,7 +27,7 @@ pub fn main() anyerror!void {
     var alloc = std.heap.page_allocator;
     var ticket_store = std.StringHashMap(quictls.SessionTicket).init(alloc);
 
-    var server = QuicServer.init(.{
+    var server = Server.init(.{
         .alpn_protocols = h3.ALPN ++ h0.ALPN ++ [_][]const u8{"siduck"},
         // .is_client = false,
         .max_datagram_frame_size = 65536,
@@ -47,14 +47,16 @@ pub fn main() anyerror!void {
     // hmac.sha2.HmacSha256.create(connection_id_seed[0..], "", "");
 
     const sockfd = try server.listen(try std.net.Address.parseIp4("127.0.0.1", 4433));
+    // const sockfd = try server.listen(try std.net.Address.parseIp6("::1", 4433));
     defer os.close(sockfd);
 
-    var connections = std.StringHashMap(Connection).init(alloc);
+    var connections = std.StringHashMap(connection.Connection).init(alloc);
     defer connections.clearAndFree();
 
     // out/write buffer
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
-    var out_writer = io.fixedBufferStream(&out).writer();
+    var out_buff = io.fixedBufferStream(&out);
+    var out_writer = out_buff.writer();
 
     while (true) {
         os.nanosleep(0, 100 * 1000 * 1000);
@@ -68,8 +70,8 @@ pub fn main() anyerror!void {
             continue;
         };
 
-        std.log.info("packet received, length {} => {} (size: {})", .{ packet_length, src_addr, addr_size });
-        std.log.info("packet received {any}", .{bytes[0..packet_length]});
+        std.log.info("\n<<-\nRECEIVED PACKET from {} (addr size: {})", .{ src_addr, addr_size });
+        std.log.info("FULL PACKET: (len: {}) {any}", .{ packet_length, bytes[0..packet_length] });
 
         // var stream = io.fixedBufferStream(bytes[0..packet_length]);
         // const reader = stream.reader();
@@ -104,23 +106,27 @@ pub fn main() anyerror!void {
 
         if (header.token == null or header.token.?.len == 0) {
             // TODO: Do stateless retry if the client didn't send a token.
-            std.log.warn("TODO: Do stateless retry!", .{});
+            std.log.warn("(->) PREPPING RETRY PACKET", .{});
 
-            var odcid: [packet.CONNECTION_ID_MAX_SIZE]u8 = undefined;
-            random.bytes(&odcid);
+            // generates a random original destination connection id
+            var new_scid = connection.generateConnectionId();
+            var retry_token = try token.generateRetryToken(header, new_scid, src_addr);
 
-            var new_token = generateStatelessRetryToken(header, src_addr);
-            packet.retry(header, new_token, &out_writer);
+            std.log.info("new scid: {any}", .{new_scid});
+            std.log.warn("retry token: {any}", .{retry_token});
 
-            var bytes_to_send = out_writer.getWritten();
+            try packet.retry(header, new_scid, retry_token, &out_writer);
 
-            try os.sendto(sockfd, bytes_to_send, 0, &src_addr, &addr_size) catch |e| {
-                std.log.warn("sendto {:?}, error -> {:?}", .{ src_addr, e });
-                continue;
-            };
+            var bytes_to_send = out_buff.getWritten();
+
+            const bytes_sent = try os.sendto(sockfd, bytes_to_send, 0, &src_addr, addr_size);
+            std.log.info("\n->>\nRETRY PACKET (sent: {} bytes)\n{any}", .{ bytes_sent, bytes_to_send });
 
             continue;
         }
+
+        // TODO: validate token!
+        std.log.info("TOKEN FOUND: {any}", .{header.token});
 
         const conn_pair = try connections.getOrPut(conn_id);
         if (!conn_pair.found_existing) {
@@ -170,11 +176,6 @@ pub fn main() anyerror!void {
         // const sent_size = try os.sendto(sockfd, bytes[0..packet_length], 0, &src_addr, addr_size);
         // std.log.info("sendto, size => {}", .{sent_size});
     }
-}
-
-fn generateStatelessRetryToken(header: packet.Header, from: os.sockaddr) void {
-    _ = header;
-    _ = from;
 }
 
 test {

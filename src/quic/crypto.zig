@@ -21,7 +21,7 @@ const INITIAL_SALT_VERSION_1 = [_]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 
 pub const SAMPLE_LEN = 16;
 
 // during this experimentational phase, only AES128_GCM is supported.
-const Aead = Aes128Gcm;
+pub const Aead = Aes128Gcm;
 const Hmac = HmacSha256;
 
 pub const key_len = 16;
@@ -128,6 +128,22 @@ pub const Seal = struct {
     hp_key: [key_len]u8,
     nonce: [nonce_len]u8,
 };
+
+// pub fn aeadEncrypt(bytes: []u8, ad: []u8, nonce: []u8, key: []u8) void {
+//     const tag_len = key_len;
+//     const tag: [tag_len]u8 = tag: {
+//         var t: [tag_len]u8 = undefined;
+//         std.mem.copy(u8, &t, bytes[(bytes.len - tag_len)..bytes.len]);
+//         break :tag t;
+//     };
+//
+//     // TODO: avoid using dynamic allocation
+//     const allocator = std.heap.page_allocator;
+//     var encrypted = try allocator.alloc(u8, bytes.len);
+//     defer allocator.free(encrypted);
+//
+//     return Aead.encrypt(encrypted, bytes, tag, "", nonce, key);
+// }
 
 pub fn deriveInitialKeyMaterial(
     cid: []const u8,

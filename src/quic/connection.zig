@@ -1,4 +1,6 @@
 const std = @import("std");
+const random = std.crypto.random;
+
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const packet = @import("packet.zig");
@@ -101,6 +103,13 @@ pub const Connection = struct {
 // 0x30: (self._handle_datagram_frame, EPOCHS("01")),
 // 0x31: (self._handle_datagram_frame, EPOCHS("01")),
 //
+
+/// Generates a new connection id
+pub fn generateConnectionId() [packet.CONNECTION_ID_MAX_SIZE]u8 {
+    var cid: [packet.CONNECTION_ID_MAX_SIZE]u8 = undefined;
+    random.bytes(&cid);
+    return cid;
+}
 
 test "init connection" {
     var context = quictls.Context.init(false);

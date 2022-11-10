@@ -11,9 +11,9 @@ const util = @import("util.zig");
 // network byte order
 const endian = std.builtin.Endian.Big;
 
-pub const LONG_HEADER_BIT = 0x80;
-pub const FIXED_BIT = 0x40;
-pub const KEY_PHASE_BIT = 0x04;
+pub const LONG_HEADER_BIT: u8 = 0x80;
+pub const FIXED_BIT: u8 = 0x40;
+pub const KEY_PHASE_BIT: u8 = 0x04;
 
 pub const PACKET_SPIN_BIT = 0x20;
 pub const PACKET_TYPE_MASK = 0xF0;
@@ -141,15 +141,15 @@ pub const Header = struct {
     }
 
     pub fn encode(self: *Self, writer: anytype) !void {
-        var first = 0;
+        var first: usize = 0;
 
         // encode pkt num length.
-        first |= self.packet_number_len -| 1; // (saturating sub)
+        first |= (self.packet_number_len -| 1); // (saturating sub)
 
         // encode short header
         if (self.packet_type == PacketType.OneRTT) {
             // unset form bit for short header
-            first &= !LONG_HEADER_BIT;
+            first &= ~LONG_HEADER_BIT; // bitwise NOT
 
             // set fixed bit
             first |= FIXED_BIT;
@@ -158,11 +158,11 @@ pub const Header = struct {
             if (self.key_phase) {
                 first |= KEY_PHASE_BIT;
             } else {
-                first &= !KEY_PHASE_BIT;
+                first &= ~KEY_PHASE_BIT; // bitwise NOT
             }
 
-            writer.writeByte(first);
-            writer.writeBytes(&self.dcid);
+            try writer.writeByte(@intCast(u8, first));
+            try writer.writeAll(self.dcid);
 
             return;
         }
@@ -173,36 +173,35 @@ pub const Header = struct {
             PacketType.ZeroRTT => 0x01,
             PacketType.Handshake => 0x02,
             PacketType.Retry => 0x03,
-            else => error.InvalidPacket,
+            else => return error.InvalidPacket,
         };
 
         first |= LONG_HEADER_BIT | FIXED_BIT | (ty << 4);
 
-        writer.writeByte(first);
-        writer.writeInt(u32, self.version, endian);
+        try writer.writeByte(@intCast(u8, first));
+        try writer.writeInt(u32, self.version.int(), endian);
 
-        writer.writeByte(self.dcid.len);
-        writer.writeBytes(&self.dcid);
+        try writer.writeByte(@intCast(u8, self.dcid.len));
+        try writer.writeAll(self.dcid);
 
-        writer.writeByte(self.scid.len);
-        writer.writeBytes(&self.scid);
+        try writer.writeByte(@intCast(u8, self.scid.len));
+        try writer.writeAll(self.scid);
 
         // Only Initial and Retry packets have a token.
         switch (self.packet_type) {
             PacketType.Initial => {
                 if (self.token == null or self.token.?.len == 0) {
-                    writeVarInt(writer, self.token.?.len);
-                    writer.writeBytes(self.token.*);
-
+                    try writeVarInt(writer, self.token.?.len);
+                    try writer.writeAll(self.token.?);
                 } else {
                     // no token, 0 length
-                    writeVarInt(writer, 0);
+                    try writeVarInt(writer, 0);
                 }
             },
 
             PacketType.Retry => {
                 // retry packets don't have a token length.
-                writer.writeBytes(self.token.*);
+                try writer.writeAll(self.token.?);
             },
 
             else => {}, // do nothing
@@ -390,16 +389,15 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                     }
 
                     var token_length = try readVarInt(reader);
-
-                    if (token_length == 0) {
-                        std.log.warn("no token!", .{});
-                    } else {
+                    if (token_length > 0) {
                         //
                         // Token:  The value of the token that was previously provided in a
                         //    Retry packet or NEW_TOKEN frame; see Section 8.1.
                         //
                         header.token = stream.buffer[stream.pos..(stream.pos + token_length)];
                         try stream.seekBy(@intCast(i64, token_length));
+                    } else {
+                        std.log.warn("no token!", .{});
                     }
 
                     header.remainder_len = try readVarInt(reader);
@@ -449,29 +447,32 @@ pub fn parseQuicHeader(stream: anytype) !Header {
 
 pub fn retry(
     header: Header,
-    odcid: []u8, // original destination connection id
+    new_scid: [CONNECTION_ID_MAX_SIZE]u8, // original destination connection id
     token: []u8,
     writer: anytype,
-) void {
+) !void {
     var hdr = Header{
         .version = header.version,
-        .packet_type = PacketType.RETRY,
+        .packet_type = PacketType.Retry,
         .dcid = header.scid,
-        .scid = header.dcid,
+        .scid = &new_scid,
         .token = token,
         .packet_number = 0,
         .packet_number_len = 0,
     };
 
-    hdr.encode(writer);
+    try hdr.encode(writer);
 
-    const integrity_tag = computeRetryIntegrityTag(writer.context.buffer, odcid, header.version);
-    std.log.info("integrity_tag: {:?}", .{integrity_tag});
+    const integrity_tag = try computeRetryIntegrityTag(writer.context.getWritten(), header.dcid, header.version);
+    std.log.info("integrity_tag: {any}", .{integrity_tag});
 
-    writer.writeBytes(integrity_tag);
-
+    try writer.writeAll(&integrity_tag);
 }
 
+///
+/// Compute the integrity tag for a RETRY packet.
+///
+/// ---------------------------------------------
 ///
 /// Retry packets carry a Retry Integrity Tag that provides two properties: it
 /// allows the discarding of packets that have accidentally been corrupted by the
@@ -482,24 +483,46 @@ pub fn retry(
 /// - Retry Packet Integrity: https://datatracker.ietf.org/doc/html/rfc9001#section-5.8
 ///
 fn computeRetryIntegrityTag(
-    bytes: []u8,
-    odcid: []u8,
+    packet_bytes_without_tag: []u8,
+    odcid: []const u8,
     version: protocol.Version,
-) ![]u8 {
+) ![crypto.Aead.tag_length]u8 {
+    _ = version;
+
+    //
+    // The secret key and the nonce are values derived by calling HKDF-
+    // Expand-Label using
+    // 0xd9c9943e6101fd200021506bcc02814c73030f25c79d71ce876eca876e6fca8e as
+    // the secret, with labels being "quic key" and "quic iv" (Section 5.1).
+    //
+    // https://datatracker.ietf.org/doc/html/rfc9001#section-5.8
+    //
+
+    // Implementation references
+    // - aiortc/aioquic: https://github.com/aiortc/aioquic/blob/444be09157aed3c81881d18647484165dd07139c/src/aioquic/quic/packet.py#L92-L116
+    // - lucas-clemente/quic-go: https://github.com/lucas-clemente/quic-go/blob/2de4af00d06891b8b110965a2aa44b0a84dcc71b/internal/handshake/retry.go#L43-L62
+
     var key = RETRY_INTEGRITY_KEY_V1;
     var nonce = RETRY_INTEGRITY_NONCE_V1;
 
-    var hdr_len = bytes.len;
+    // TODO: avoid using dynamic allocation
+    const allocator = std.heap.page_allocator;
+    var buf = try allocator.alloc(u8, odcid.len + packet_bytes_without_tag.len + 1);
+    defer allocator.free(buf);
 
-   //
-   // The secret key and the nonce are values derived by calling HKDF-
-   // Expand-Label using
-   // 0xd9c9943e6101fd200021506bcc02814c73030f25c79d71ce876eca876e6fca8e as
-   // the secret, with labels being "quic key" and "quic iv" (Section 5.1).
-   //
-   // https://datatracker.ietf.org/doc/html/rfc9001#section-5.8
-   //
+    var stream = io.fixedBufferStream(buf);
+    var buf_writer = stream.writer();
+    try buf_writer.writeByte(@intCast(u8, odcid.len));
+    try buf_writer.writeAll(odcid);
+    try buf_writer.writeAll(packet_bytes_without_tag);
 
+    // encrypt with associated data only
+    const m = "";
+    var c: [m.len]u8 = undefined;
+    var tag: [crypto.Aead.tag_length]u8 = undefined;
+    crypto.Aead.encrypt(&c, &tag, m, buf_writer.context.buffer, nonce, key);
+
+    return tag;
 }
 
 fn readVarInt(reader: anytype) !u64 {
