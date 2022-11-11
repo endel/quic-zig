@@ -1,12 +1,11 @@
 const std = @import("std");
 const string = []const u8;
-const tls = @import("../tls/tls.zig");
 const packet = @import("packet.zig");
 
 const PTLS_MAX_DIGEST_SIZE = 42;
 const CRYPTO_BUFFER_SIZE = 16384;
 
-pub const CipherSuite = tls.CipherSuite;
+// pub const CipherSuite = tls.CipherSuite;
 // enum(u32) {
 //     AES_128_GCM_SHA256 = 0x1301,
 //     AES_256_GCM_SHA384 = 0x1302,
@@ -69,7 +68,7 @@ pub const Context = struct {
 //
 pub const SessionTicket = struct {
     age_add: u32,
-    cipher_suite: CipherSuite,
+    // cipher_suite: CipherSuite,
     not_valid_after: i64, // datetime.datetime
     not_valid_before: i64, // datetime.datetime
     resumption_secret: []const u8,

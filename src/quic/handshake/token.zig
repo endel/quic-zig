@@ -11,9 +11,6 @@ pub fn generateRetryToken(
     new_scid: [packet.CONNECTION_ID_MAX_SIZE]u8,
     addr: os.sockaddr,
 ) ![]u8 {
-    _ = header;
-    _ = addr;
-
     var buf: [512]u8 = undefined;
     var stream = io.fixedBufferStream(&buf);
     var writer = stream.writer();
