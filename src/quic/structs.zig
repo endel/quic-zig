@@ -1,5 +1,4 @@
 const std = @import("std");
-const cert = @import("../tls/cert/cert.zig");
 const string = []const u8;
 
 pub const QuicConnectionId = struct {

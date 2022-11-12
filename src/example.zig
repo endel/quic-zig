@@ -109,7 +109,7 @@ pub fn main() anyerror!void {
             std.log.warn("(->) PREPPING RETRY PACKET", .{});
 
             // generates a random original destination connection id
-            var new_scid = connection.generateConnectionId();
+            var new_scid = connection.generateConnectionId(header.scid.len);
             var retry_token = try token.generateRetryToken(header, new_scid, src_addr);
 
             std.log.info("new scid: {any}", .{new_scid});
@@ -135,6 +135,8 @@ pub fn main() anyerror!void {
 
             if (header.scid.len != header.dcid.len) {
                 std.log.err("Invalid destination connection ID", .{});
+            } else {
+                std.log.info("SCID and DCID have same length: '{any}', '{any}'", .{ header.scid, header.dcid });
             }
 
             var conn = try server.accept(header);

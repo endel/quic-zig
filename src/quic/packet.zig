@@ -447,7 +447,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
 
 pub fn retry(
     header: Header,
-    new_scid: [CONNECTION_ID_MAX_SIZE]u8, // original destination connection id
+    new_scid: []u8, // original destination connection id
     token: []u8,
     writer: anytype,
 ) !void {
@@ -455,7 +455,7 @@ pub fn retry(
         .version = header.version,
         .packet_type = PacketType.Retry,
         .dcid = header.scid,
-        .scid = &new_scid,
+        .scid = new_scid,
         .token = token,
         .packet_number = 0,
         .packet_number_len = 0,

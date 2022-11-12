@@ -105,10 +105,11 @@ pub const Connection = struct {
 //
 
 /// Generates a new connection id
-pub fn generateConnectionId() [packet.CONNECTION_ID_MAX_SIZE]u8 {
+pub fn generateConnectionId(size: usize) []u8 {
+    // OPTIMIZE: potentially wasting compute here in order to avoid dynamic mem allocation
     var cid: [packet.CONNECTION_ID_MAX_SIZE]u8 = undefined;
     random.bytes(&cid);
-    return cid;
+    return cid[0..size];
 }
 
 test "init connection" {

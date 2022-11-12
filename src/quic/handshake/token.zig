@@ -8,7 +8,7 @@ const packet = @import("../packet.zig");
 ///
 pub fn generateRetryToken(
     header: packet.Header,
-    new_scid: [packet.CONNECTION_ID_MAX_SIZE]u8,
+    new_scid: []u8,
     addr: os.sockaddr,
 ) ![]u8 {
     var buf: [512]u8 = undefined;
@@ -22,7 +22,7 @@ pub fn generateRetryToken(
     try writer.writeAll(header.dcid);
 
     try writer.writeByte(@intCast(u8, new_scid.len));
-    try writer.writeAll(&new_scid);
+    try writer.writeAll(new_scid);
 
     return stream.getWritten();
 
@@ -49,6 +49,8 @@ pub fn generateRetryToken(
     // }
     // return g.tokenProtector.NewToken(data)
 }
+
+pub fn decodeRetryToken() void {}
 
 pub fn defaultTokenValidator(token: []u8, addr: os.sockaddr) bool {
     _ = token;
