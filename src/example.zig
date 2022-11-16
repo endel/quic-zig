@@ -63,6 +63,9 @@ pub fn main() anyerror!void {
     while (true) {
         os.nanosleep(0, 100 * 1000 * 1000);
 
+        // reset writer position
+        try out_buff.seekTo(0);
+
         var bytes: [8192]u8 = undefined;
 
         var src_addr: os.sockaddr = undefined;

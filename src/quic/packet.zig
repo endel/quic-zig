@@ -331,9 +331,9 @@ pub fn parseQuicHeader(stream: anytype) !Header {
         log.info("LONG HEADER!", .{});
 
         var version = try reader.readInt(u32, endian);
-        log.info("version: {any}", .{version});
         header.version = version;
-        log.info("(enum) version: {any}", .{header.version});
+
+        log.info("version: {any}", .{header.version});
 
         const dcid_length = try reader.readByte();
         if (dcid_length > CONNECTION_ID_MAX_SIZE) {
@@ -357,7 +357,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
 
         std.log.info("stream.pos: {any}, scid length: {any}", .{ stream.pos, scid_length });
         header.scid = stream.buffer[stream.pos..(stream.pos + scid_length)];
-        std.log.info("scid: {s} ({any})", .{ header.scid, header.scid });
+        std.log.info("scid: {any}", .{header.scid});
 
         // advance scid_length
         try stream.seekBy(scid_length);
@@ -367,6 +367,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
             //
             // TODO:
             // remainder_len = @intCast(u32, bytes.len) - @intCast(u32, stream.pos);
+            std.log.info("TODO: negotiation!", .{});
         } else {
             if ((first_byte & FIXED_BIT) == 0) {
                 std.log.err("Packet fixed bit is zero", .{});
