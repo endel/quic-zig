@@ -58,6 +58,8 @@ pub fn main() anyerror!void {
     var out_buff = io.fixedBufferStream(&out);
     var out_writer = out_buff.writer();
 
+    var prevTimestamp = std.time.timestamp();
+
     while (true) {
         os.nanosleep(0, 100 * 1000 * 1000);
 
@@ -70,7 +72,8 @@ pub fn main() anyerror!void {
             continue;
         };
 
-        std.log.info("\n<<-\nRECEIVED PACKET from {} (addr size: {})", .{ src_addr, addr_size });
+        std.log.info("\n<<-\nRECEIVED PACKET ({}ms) from {} (addr size: {})", .{ (std.time.timestamp() - prevTimestamp), src_addr, addr_size });
+        prevTimestamp = std.time.timestamp();
         std.log.info("FULL PACKET: (len: {}) {any}", .{ packet_length, bytes[0..packet_length] });
 
         // var stream = io.fixedBufferStream(bytes[0..packet_length]);
@@ -100,7 +103,13 @@ pub fn main() anyerror!void {
         //
 
         if (!protocol.isSupportedVersion(header.version)) {
-            std.log.warn("TODO: CLIENT WANTS TO USE VERSION {}, let's negotiate the version...", .{header.version});
+            std.log.warn("client wants to use unsupported version {}, let's negotiate version...", .{header.version});
+            try packet.negotiateVersion(header, &out_writer);
+
+            var bytes_to_send = out_buff.getWritten();
+            const bytes_sent = try os.sendto(sockfd, bytes_to_send, 0, &src_addr, addr_size);
+            std.log.info("\n->>\nSENT VERSION NEGOTIATION PACKET (sent: {} bytes) => {any}", .{ bytes_sent, bytes_to_send });
+
             continue;
         }
 
@@ -135,8 +144,6 @@ pub fn main() anyerror!void {
 
             if (header.scid.len != header.dcid.len) {
                 std.log.err("Invalid destination connection ID", .{});
-            } else {
-                std.log.info("SCID and DCID have same length: '{any}', '{any}'", .{ header.scid, header.dcid });
             }
 
             var conn = try server.accept(header);

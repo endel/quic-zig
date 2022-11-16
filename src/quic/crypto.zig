@@ -145,11 +145,11 @@ pub const Seal = struct {
 
 pub fn deriveInitialKeyMaterial(
     cid: []const u8,
-    version: protocol.Version,
+    version: u32,
     comptime is_client: bool,
 ) !std.meta.Tuple(&.{ Open, Seal }) {
-    if (version != protocol.Version.VERSION_1) {
-        std.log.err("only VERSION_1 is supported right now.", .{});
+    if (version != protocol.SUPPORTED_VERSIONS[0]) {
+        std.log.err("only version 1 is supported right now.", .{});
         return error.InvalidVersion;
     }
 

@@ -5,8 +5,19 @@ HTTP/3 implementation written in Zig.
 **Spawning a client:**
 
 ```
-$ cd lient-implementations/quiche-client
+$ cd client-implementations/quiche-client
+
+# (Less logs)
 $ RUST_LOG=debug cargo run
+
+# (More logs)
+$ RUST_LOG=trace cargo run
+```
+
+```
+$ cd client-implementations/apps
+$ RUST_LOG=debug cargo run --bin quiche-server -- --root ./server-root
+$ RUST_LOG=debug cargo run --bin quiche-client -- --method GET https://localhost:4433/index.html --no-verify
 ```
 
 ## Initial goals

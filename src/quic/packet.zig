@@ -3,6 +3,7 @@ const io = std.io;
 const log = std.log;
 const time = std.time;
 const assert = std.debug.assert;
+const random = std.crypto.random;
 
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
@@ -107,7 +108,7 @@ pub const ErrorCode = enum(u8) {
 pub const Header = struct {
     const Self = @This();
 
-    version: protocol.Version = undefined,
+    version: u32 = undefined,
     packet_type: PacketType = undefined,
 
     /// Destination Connection ID
@@ -179,7 +180,7 @@ pub const Header = struct {
         first |= LONG_HEADER_BIT | FIXED_BIT | (ty << 4);
 
         try writer.writeByte(@intCast(u8, first));
-        try writer.writeInt(u32, self.version.int(), endian);
+        try writer.writeInt(u32, self.version, endian);
 
         try writer.writeByte(@intCast(u8, self.dcid.len));
         try writer.writeAll(self.dcid);
@@ -236,7 +237,7 @@ pub const PacketNumSpace = struct {
     //
     // crypto_stream: stream::Stream,
 
-    pub fn setupInitial(self: *PacketNumSpace, dcid: []const u8, version: protocol.Version, comptime is_client: bool) !void {
+    pub fn setupInitial(self: *PacketNumSpace, dcid: []const u8, version: u32, comptime is_client: bool) !void {
         var keys = try crypto.deriveInitialKeyMaterial(dcid, version, is_client);
         self.crypto_open = keys[0];
         self.crypto_seal = keys[1];
@@ -331,7 +332,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
 
         var version = try reader.readInt(u32, endian);
         log.info("version: {any}", .{version});
-        header.version = @intToEnum(protocol.Version, version);
+        header.version = version;
         log.info("(enum) version: {any}", .{header.version});
 
         const dcid_length = try reader.readByte();
@@ -361,7 +362,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
         // advance scid_length
         try stream.seekBy(scid_length);
 
-        if (header.version == protocol.Version.NEGOTIATION) {
+        if (header.version == undefined) {
             // version negotiation
             //
             // TODO:
@@ -445,6 +446,21 @@ pub fn parseQuicHeader(stream: anytype) !Header {
     return header;
 }
 
+pub fn negotiateVersion(header: Header, writer: anytype) !void {
+    try writer.writeByte(random.int(u8) | LONG_HEADER_BIT);
+    try writer.writeInt(u32, 0, endian);
+
+    try writer.writeByte(@intCast(u8, header.scid.len));
+    try writer.writeAll(header.scid);
+
+    try writer.writeByte(@intCast(u8, header.dcid.len));
+    try writer.writeAll(header.dcid);
+
+    for (protocol.SUPPORTED_VERSIONS) |version| {
+        try writer.writeInt(u32, version, endian);
+    }
+}
+
 pub fn retry(
     header: Header,
     new_scid: []u8, // original destination connection id
@@ -485,7 +501,7 @@ pub fn retry(
 fn computeRetryIntegrityTag(
     packet_bytes_without_tag: []u8,
     odcid: []const u8,
-    version: protocol.Version,
+    version: u32,
 ) ![crypto.Aead.tag_length]u8 {
     _ = version;
 

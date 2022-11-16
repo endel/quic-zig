@@ -21,7 +21,7 @@ pub const ConnectionId = struct {};
 /// A Quic connection
 ///
 pub const Connection = struct {
-    version: ?protocol.Version = null,
+    version: u32 = undefined,
 
     dcid: []const u8,
     scid: []const u8,
