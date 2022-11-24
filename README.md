@@ -17,7 +17,7 @@ $ RUST_LOG=trace cargo run
 ```
 $ cd client-implementations/apps
 $ RUST_LOG=debug cargo run --bin quiche-server -- --root ./server-root
-$ RUST_LOG=debug cargo run --bin quiche-client -- --method GET https://localhost:4433/index.html --no-verify
+$ RUST_LOG=debug cargo run --bin quiche-client -- --method GET --connect-to 127.0.0.1:4433 --no-verify https://localhost:4433/index.html
 ```
 
 ## Initial goals

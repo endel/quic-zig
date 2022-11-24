@@ -91,11 +91,7 @@ pub fn main() anyerror!void {
             continue;
         }
 
-        // TODO: hmac sign `destination_cid` to avoid connections having full
-        // control which ID is being used.
-        // let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
-        const conn_id = header.dcid;
-
+        std.log.info("packet type: {any}", .{header.packet_type});
         if (header.packet_type != packet.PacketType.Initial) {
             std.log.err("Packet is not initial!", .{});
             continue;
@@ -137,18 +133,15 @@ pub fn main() anyerror!void {
             continue;
         }
 
-        // TODO: validate token!
-        std.log.info("TOKEN FOUND: {any}", .{header.token});
+        std.log.info("retry token length: {}", .{header.token.?.len});
 
-        const conn_pair = try connections.getOrPut(conn_id);
+        const conn_pair = try connections.getOrPut(header.scid);
         if (!conn_pair.found_existing) {
-            std.log.info("header.scid: ({}) {any}", .{ header.scid.len, header.scid });
-            std.log.info("header.dcid: ({}) {any}", .{ header.dcid.len, header.dcid });
-
             if (header.scid.len != header.dcid.len) {
                 std.log.err("Invalid destination connection ID", .{});
             }
 
+            std.log.info("ACCEPT CONNECTION!", .{});
             var conn = try server.accept(header);
             conn_pair.value_ptr.* = conn;
 

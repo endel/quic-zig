@@ -251,13 +251,18 @@ pub fn parseIncoming(bytes: []const u8) void {
 pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
     std.log.info("\n\nheader.remainder_len: {any}", .{header.remainder_len});
     const pn_and_sample_len = MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN;
+
+    const pn_and_sample_begin = stream.pos;
+    const pn_and_sample_end = (stream.pos + pn_and_sample_len);
     const pn_and_sample = stream.buffer[stream.pos..(stream.pos + pn_and_sample_len)];
+    std.log.info("pn_and_sample (before): {any}", .{stream.buffer[pn_and_sample_begin..(pn_and_sample_end)]});
 
     // advance stream position
     // try stream.seekBy(pn_and_sample_len);
     // try stream.seekBy(MAX_PACKET_NUMBER_LEN);
+    // try stream.seekBy(crypto.SAMPLE_LEN);
 
-    var ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
+    var pn_ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
     var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
 
     var first_byte = stream.buffer[0];
@@ -274,26 +279,23 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
 
     header.packet_number_len = @intCast(usize, (first_byte & PACKET_NUM_MASK)) + 1;
 
-    // unprotect packer number
-    var unprotected_pkt_num = [_]u8{0x00} ** MAX_PACKET_NUMBER_LEN;
     var i: usize = 0;
     while (i < header.packet_number_len) : (i += 1) {
-        unprotected_pkt_num[i] = ciphertext.*[i] ^ mask[1 + i];
+        pn_ciphertext.*[i] ^= mask[1 + i];
     }
 
+    std.log.info("pn_and_sample (after): {any}", .{stream.buffer[pn_and_sample_begin..(pn_and_sample_end)]});
+
     var truncated_packet_number = try switch (header.packet_number_len) {
-        1 => @intCast(u64, std.mem.readInt(u8, unprotected_pkt_num[0..util.sizeOf(u8)], endian)),
-        2 => @intCast(u64, std.mem.readInt(u16, unprotected_pkt_num[0..util.sizeOf(u16)], endian)),
-        3 => @intCast(u64, std.mem.readInt(u24, unprotected_pkt_num[0..util.sizeOf(u24)], endian)),
-        4 => @intCast(u64, std.mem.readInt(u32, unprotected_pkt_num[0..util.sizeOf(u32)], endian)),
+        1 => @intCast(u64, std.mem.readInt(u8, pn_ciphertext.*[0..util.sizeOf(u8)], endian)),
+        2 => @intCast(u64, std.mem.readInt(u16, pn_ciphertext.*[0..util.sizeOf(u16)], endian)),
+        3 => @intCast(u64, std.mem.readInt(u24, pn_ciphertext.*[0..util.sizeOf(u24)], endian)),
+        4 => @intCast(u64, std.mem.readInt(u32, pn_ciphertext.*[0..util.sizeOf(u32)], endian)),
         else => error.InvalidPacket,
     };
 
     // Write decrypted first byte back into the input buffer.
     stream.buffer[0] = first_byte;
-
-    // try stream.seekBy(@intCast(i64, (first_byte & PACKET_NUM_MASK)));
-    try stream.seekBy(@intCast(i64, header.packet_number_len));
 
     //
     // RFC 9000
@@ -303,14 +305,25 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
     //
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
 
+    // try stream.seekBy(@intCast(i64, (first_byte & PACKET_NUM_MASK)));
+    try stream.seekBy(@intCast(i64, header.packet_number_len));
+
+    std.log.info("header.packet_number: {any}", .{header.packet_number});
+    std.log.info("payload offset: {}", .{stream.pos});
+
     // var payload = stream.buffer[stream.pos..(stream.pos + header.remainder_len - pn_and_sample_len)];
 
     // TODO: both of these may be wrong
-    var header_bytes = stream.buffer[0 .. (stream.pos + crypto.SAMPLE_LEN) + 14];
-    var encrypted_payload = stream.buffer[((stream.pos + crypto.SAMPLE_LEN) + 14)..(stream.pos + header.remainder_len)];
+    var header_bytes = stream.buffer[0..(stream.pos)];
+
+    // TODO: validate if following slice is valid (`remainder_len` and `header.packet_number_len`)
+    var payload_ciphertext = stream.buffer[(stream.pos)..(stream.pos + header.remainder_len - header.packet_number_len)];
+
+    std.log.info("header ({any}): {any}", .{ header_bytes.len, header_bytes });
+    std.log.info("payload_ciphertext ({any}): {any}", .{ payload_ciphertext.len, payload_ciphertext });
 
     // var payload: []u8 = undefined;
-    try aead.decryptPayload(header.packet_number, header_bytes, encrypted_payload);
+    try aead.decryptPayload(header.packet_number, header_bytes, payload_ciphertext);
     // try aead.decryptPayload(header.packet_number, pn_and_sample, encrypted_payload, payload);
 
     // std.log.info("final payload: (len: {any}) {any}", .{ payload.len, payload });
@@ -344,7 +357,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
         std.log.info("stream.pos: {any}, dcid length: {any}", .{ stream.pos, dcid_length });
 
         header.dcid = stream.buffer[stream.pos..(stream.pos + dcid_length)];
-        std.log.info("dcid: {any}", .{header.dcid});
+        std.log.info("dcid ({}): {any}", .{ dcid_length, header.dcid });
 
         // advance length
         try stream.seekBy(dcid_length);
@@ -357,7 +370,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
 
         std.log.info("stream.pos: {any}, scid length: {any}", .{ stream.pos, scid_length });
         header.scid = stream.buffer[stream.pos..(stream.pos + scid_length)];
-        std.log.info("scid: {any}", .{header.scid});
+        std.log.info("scid ({}): {any}", .{ scid_length, header.scid });
 
         // advance scid_length
         try stream.seekBy(scid_length);
@@ -367,7 +380,9 @@ pub fn parseQuicHeader(stream: anytype) !Header {
             //
             // TODO:
             // remainder_len = @intCast(u32, bytes.len) - @intCast(u32, stream.pos);
+
             std.log.info("TODO: negotiation!", .{});
+            //
         } else {
             if ((first_byte & FIXED_BIT) == 0) {
                 std.log.err("Packet fixed bit is zero", .{});
@@ -410,17 +425,24 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                     // var token = bytes[stream.pos..(stream.pos + token_length)];
                     // try stream.seekBy(@intCast(i64, token_length));
 
+                    std.log.info("TODO: handle Retry packet type...", .{});
+                    header.remainder_len = 0;
                     // header.token = token;
                 },
 
                 PacketType.VersionNegotiation => {
-                    // TODO: implement version negotiation packets
-                    std.log.warn("TODO: VersionNegotiation not implemented yet!", .{});
-
-                    while (stream.pos - stream.buffer.len > 0) {
-                        _ = try reader.readInt(u32, endian); // const version = reader.readInt(u32, endian);
-                        // std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
-                    }
+                    // FIXME: this \
+                    // std.log.err("TODO: server-side should not accept VersionNegotiation packets.", .{});
+                    //
+                    // header.remainder_len = stream.buffer.len - stream.pos;
+                    //
+                    // while (stream.pos - stream.buffer.len > 0) {
+                    //     _ = try reader.readInt(u32, endian); // const version = reader.readInt(u32, endian);
+                    //     // std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
+                    // }
+                    //
+                    // std.log.err("WHAT>?????", .{});
+                    // // return error.InvalidPacket;
                 },
 
                 else => {

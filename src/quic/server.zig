@@ -29,8 +29,6 @@ pub const Server = struct {
         // _ = scid;
         // _ = dcid;
 
-        std.log.info("ACCEPT!", .{});
-
         const is_client = false;
 
         // init quictls context

@@ -27,7 +27,7 @@ pub fn build(b: *std.build.Builder) void {
     run_step.dependOn(&run_cmd.step);
 
     const exe_tests = b.addTest("src/example.zig");
-    exe_tests.use_stage1 = true; // TODO: remove me!
+    // exe_tests.use_stage1 = true; // TODO: remove me!
     exe_tests.setTarget(target);
     exe_tests.setBuildMode(mode);
 

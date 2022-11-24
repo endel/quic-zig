@@ -55,22 +55,22 @@ pub const Open = struct {
     pub fn decryptPayload(
         self: *Open,
         packet_number: u64,
-        header: []const u8,
+        associated_data: []const u8,
         payload: []const u8,
         // decrypted: []u8,
     ) error{ AuthenticationFailed, OutOfMemory }!void {
-        const tag_len = key_len;
+        const tag_len = Aead.tag_length;
         const payload_len = payload.len;
 
         assert(payload_len >= tag_len);
 
+        // the tag is on last bytes of the payload
         const tag: [tag_len]u8 = tag: {
             var t: [tag_len]u8 = undefined;
             std.mem.copy(u8, &t, payload[(payload_len - tag_len)..payload_len]);
             break :tag t;
         };
-
-        const ciphertext = payload[0..(payload_len - tag_len)];
+        std.log.info("tag ({any}): {any}", .{ tag.len, tag });
 
         // TODO: avoid using dynamic allocation
         const allocator = std.heap.page_allocator;
@@ -85,36 +85,32 @@ pub const Open = struct {
         // order are left-padded with zeros to the size of the IV. The exclusive OR of the
         // padded packet number and the IV forms the AEAD nonce.
         //
-
         const aead_nonce = nonce: {
-            var pn: [nonce_len]u8 = undefined;
-            std.mem.writeIntSliceBig(u64, &pn, packet_number);
-
             var n: [nonce_len]u8 = undefined;
-            for (n) |_, i| {
-                n[i] = pn[i] ^ self.nonce[i];
+            std.mem.copy(u8, &n, &self.nonce);
+
+            var pn: [nonce_len]u8 = .{0x0} ** nonce_len;
+            std.mem.writeIntSliceBig(u64, pn[4..nonce_len], packet_number);
+
+            var i: usize = 4;
+            while (i < nonce_len) {
+                n[i] ^= pn[i];
+                i = i + 1;
             }
 
             break :nonce n;
         };
 
-        std.log.info("payload (encoded): ({any}) {any}", .{ payload.len, payload });
-        // std.log.info("payload (encoded): ({any}) {any}", .{ ciphertext.len, ciphertext });
-        std.log.info("tag: ({any}) {any}", .{ tag.len, tag });
-        std.log.info("header: ({any}) {any}", .{ header.len, header });
-        std.log.info("aead_nonce: ({any}) {any}", .{ aead_nonce.len, aead_nonce });
-        std.log.info("key: ({any}) {any}", .{ self.key.len, self.key });
-
         try Aead.decrypt(
             decrypted,
-            ciphertext,
+            payload[0..(payload_len - tag_len)],
             tag,
-            header,
+            associated_data,
             aead_nonce,
             self.key,
         );
 
-        std.log.info("payload: (len: {any}) {any}", .{ decrypted.len, decrypted });
+        std.log.info("DECRYPTED: (len: {any}) {any}", .{ decrypted.len, decrypted });
     }
 };
 
