@@ -63,7 +63,7 @@ pub fn main() anyerror!void {
     while (true) {
         os.nanosleep(0, 100 * 1000 * 1000);
 
-        // reset writer position
+        // reset write position
         try out_buff.seekTo(0);
 
         var bytes: [8192]u8 = undefined;
@@ -161,10 +161,14 @@ pub fn main() anyerror!void {
 
         std.log.info("stream.pos: {any}, header.remainder_len: {any}", .{ stream.pos, header.remainder_len });
 
-        conn.decrypt_packet(&header, &stream) catch |err| {
+        var decrypted = conn.decrypt_packet(&header, &stream) catch |err| {
             std.log.err("decrypt error: {any}", .{err});
             break;
         };
+
+        // TODO: ignore duplicate packets (aka "num spaces")
+        // (check against local cache of packet numbers)
+        std.log.info("payload ({any}): {any}", .{ decrypted.len, decrypted });
 
         // var decrypted_bytes: [packet.MAX_PACKET_LEN]u8 = undefined;
         // try crypto.decryptPacket(&decrypted_bytes, stream.buffer[0..end_offset], encrypted_offset, space.expected_packet_number);

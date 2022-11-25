@@ -248,19 +248,10 @@ pub fn parseIncoming(bytes: []const u8) void {
     _ = bytes;
 }
 
-pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
+pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) ![]u8 {
     std.log.info("\n\nheader.remainder_len: {any}", .{header.remainder_len});
     const pn_and_sample_len = MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN;
-
-    const pn_and_sample_begin = stream.pos;
-    const pn_and_sample_end = (stream.pos + pn_and_sample_len);
     const pn_and_sample = stream.buffer[stream.pos..(stream.pos + pn_and_sample_len)];
-    std.log.info("pn_and_sample (before): {any}", .{stream.buffer[pn_and_sample_begin..(pn_and_sample_end)]});
-
-    // advance stream position
-    // try stream.seekBy(pn_and_sample_len);
-    // try stream.seekBy(MAX_PACKET_NUMBER_LEN);
-    // try stream.seekBy(crypto.SAMPLE_LEN);
 
     var pn_ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
     var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
@@ -284,8 +275,7 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
         pn_ciphertext.*[i] ^= mask[1 + i];
     }
 
-    std.log.info("pn_and_sample (after): {any}", .{stream.buffer[pn_and_sample_begin..(pn_and_sample_end)]});
-
+    // read truncated/raw packet number
     var truncated_packet_number = try switch (header.packet_number_len) {
         1 => @intCast(u64, std.mem.readInt(u8, pn_ciphertext.*[0..util.sizeOf(u8)], endian)),
         2 => @intCast(u64, std.mem.readInt(u16, pn_ciphertext.*[0..util.sizeOf(u16)], endian)),
@@ -293,6 +283,9 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
         4 => @intCast(u64, std.mem.readInt(u32, pn_ciphertext.*[0..util.sizeOf(u32)], endian)),
         else => error.InvalidPacket,
     };
+
+    // skip packet length byte
+    try stream.seekBy(@intCast(i64, header.packet_number_len));
 
     // Write decrypted first byte back into the input buffer.
     stream.buffer[0] = first_byte;
@@ -304,29 +297,13 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) !void {
     // https://www.rfc-editor.org/rfc/rfc9000.html#name-packet-number-encoding-and-
     //
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
+    std.log.info("packet number: {any}", .{header.packet_number});
 
-    // try stream.seekBy(@intCast(i64, (first_byte & PACKET_NUM_MASK)));
-    try stream.seekBy(@intCast(i64, header.packet_number_len));
-
-    std.log.info("header.packet_number: {any}", .{header.packet_number});
-    std.log.info("payload offset: {}", .{stream.pos});
-
-    // var payload = stream.buffer[stream.pos..(stream.pos + header.remainder_len - pn_and_sample_len)];
-
-    // TODO: both of these may be wrong
-    var header_bytes = stream.buffer[0..(stream.pos)];
-
-    // TODO: validate if following slice is valid (`remainder_len` and `header.packet_number_len`)
-    var payload_ciphertext = stream.buffer[(stream.pos)..(stream.pos + header.remainder_len - header.packet_number_len)];
-
-    std.log.info("header ({any}): {any}", .{ header_bytes.len, header_bytes });
-    std.log.info("payload_ciphertext ({any}): {any}", .{ payload_ciphertext.len, payload_ciphertext });
-
-    // var payload: []u8 = undefined;
-    try aead.decryptPayload(header.packet_number, header_bytes, payload_ciphertext);
-    // try aead.decryptPayload(header.packet_number, pn_and_sample, encrypted_payload, payload);
-
-    // std.log.info("final payload: (len: {any}) {any}", .{ payload.len, payload });
+    return try aead.decryptPayload(
+        header.packet_number,
+        stream.buffer[0..(stream.pos)], // header bytes
+        stream.buffer[(stream.pos)..(stream.pos + header.remainder_len - header.packet_number_len)], // payload
+    );
 }
 
 // inline

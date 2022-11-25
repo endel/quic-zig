@@ -56,9 +56,8 @@ pub const Open = struct {
         self: *Open,
         packet_number: u64,
         associated_data: []const u8,
-        payload: []const u8,
-        // decrypted: []u8,
-    ) error{ AuthenticationFailed, OutOfMemory }!void {
+        payload: []u8,
+    ) error{ AuthenticationFailed, OutOfMemory }![]u8 {
         const tag_len = Aead.tag_length;
         const payload_len = payload.len;
 
@@ -70,12 +69,6 @@ pub const Open = struct {
             std.mem.copy(u8, &t, payload[(payload_len - tag_len)..payload_len]);
             break :tag t;
         };
-        std.log.info("tag ({any}): {any}", .{ tag.len, tag });
-
-        // TODO: avoid using dynamic allocation
-        const allocator = std.heap.page_allocator;
-        var decrypted = try allocator.alloc(u8, payload_len - tag_len);
-        defer allocator.free(decrypted);
 
         //
         // https://datatracker.ietf.org/doc/html/rfc9001#section-5.3
@@ -101,16 +94,18 @@ pub const Open = struct {
             break :nonce n;
         };
 
+        var bytes = payload[0..(payload_len - tag_len)];
+
         try Aead.decrypt(
-            decrypted,
-            payload[0..(payload_len - tag_len)],
+            bytes, // output
+            bytes, // input
             tag,
             associated_data,
             aead_nonce,
             self.key,
         );
 
-        std.log.info("DECRYPTED: (len: {any}) {any}", .{ decrypted.len, decrypted });
+        return bytes;
     }
 };
 

@@ -61,11 +61,11 @@ pub const Connection = struct {
     //     crypto.CryptoPair{}, // quictls.Epoch.ONE_RTT
     // },
 
-    pub fn decrypt_packet(self: *Connection, header: *packet.Header, stream: anytype) !void {
+    pub fn decrypt_packet(self: *Connection, header: *packet.Header, stream: anytype) ![]u8 {
         var epoch = try packet.Epoch.fromPacketType(header.*.packet_type);
         var space = self.pkt_num_spaces[@as(usize, @enumToInt(epoch))];
 
-        try packet.decrypt(header, stream, space);
+        return try packet.decrypt(header, stream, space);
     }
 };
 
