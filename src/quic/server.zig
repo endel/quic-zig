@@ -17,7 +17,6 @@ const ConnectionState = connection.ConnectionState;
 pub const Server = struct {
     config: structs.QuicConfiguration,
     ticket_store: TicketStore,
-    // generate_token: *const fn (header: packet.Header, from: os.sockaddr) []u8 = token.defaultTokenGenerator,
 
     pub fn init(config: structs.QuicConfiguration, ticket_store: TicketStore) Server {
         return .{ .config = config, .ticket_store = ticket_store };
@@ -40,6 +39,7 @@ pub const Server = struct {
             .version = header.version,
             .context = context,
             .state = ConnectionState.FirstFlight,
+            .is_server = !is_client,
         };
 
         // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1

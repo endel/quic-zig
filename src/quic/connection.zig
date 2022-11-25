@@ -35,6 +35,9 @@ pub const Connection = struct {
         // packet.PacketNumSpace{}, // quictls.Epoch.ONE_RTT
     },
 
+    is_server: bool,
+    got_peer_conn_id: bool = false,
+
     // stats
     recv_count: u32 = 0,
     sent_count: u32 = 0,
@@ -118,7 +121,7 @@ test "init connection" {
     var conn = Connection{
         .dcid = "dest1234",
         .scid = "src12345",
-        .version = protocol.Version.VERSION_1,
+        .version = protocol.SUPPORTED_VERSIONS[0],
         .context = context,
         .state = ConnectionState.FirstFlight,
     };

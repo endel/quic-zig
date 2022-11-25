@@ -166,24 +166,27 @@ pub fn main() anyerror!void {
             break;
         };
 
-        // TODO: ignore duplicate packets (aka "num spaces")
-        // (check against local cache of packet numbers)
+        // no frames. skip invalid packet!
+        // TODO: move and throw an error at the `server.recv()` scope
+        if (decrypted.len == 0) {
+            std.log.info("no frames. skip invalid packet!", .{});
+            continue;
+        }
+
+        // TODO: determine path id
+        // ...
+
+        if (conn.is_server and !conn.got_peer_conn_id) {
+            // conn.set_initial_dcid(hdr.scid.clone(), None, recv_pid)?;
+        }
+
         std.log.info("payload ({any}): {any}", .{ decrypted.len, decrypted });
 
-        // var decrypted_bytes: [packet.MAX_PACKET_LEN]u8 = undefined;
-        // try crypto.decryptPacket(&decrypted_bytes, stream.buffer[0..end_offset], encrypted_offset, space.expected_packet_number);
+        // TODO: ignore duplicate packets (aka "num spaces")
+        // (check against local cache of packet numbers)
+        // ...
 
-        // var crypto = conn._cryptos[@as(usize, @enumToInt(epoch))];
-        // var space = conn._spaces[@as(usize, @enumToInt(epoch))];
-        // _ = crypto;
-        // _ = space;
-
-        // network_path = self._find_network_path(addr)
-
-        if (header.packet_type == packet.PacketType.Initial) {}
-
-        // const sent_size = try os.sendto(sockfd, bytes[0..packet_length], 0, &src_addr, addr_size);
-        // std.log.info("sendto, size => {}", .{sent_size});
+        if (header.packet_type == packet.PacketType.OneRTT) {}
     }
 }
 
