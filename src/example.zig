@@ -14,7 +14,6 @@ const token = @import("quic/handshake/token.zig");
 
 const h0 = @import("h0/connection.zig");
 const h3 = @import("h3/connection.zig");
-const quictls = @import("quic/quictls.zig");
 
 const hmac = std.crypto.auth.hmac;
 
@@ -25,20 +24,21 @@ pub fn main() anyerror!void {
     // var alloc = std.heap.GeneralPurposeAllocator(.{}){};
     // defer _ = alloc.deinit();
     var alloc = std.heap.page_allocator;
-    var ticket_store = std.StringHashMap(quictls.SessionTicket).init(alloc);
 
-    var server = Server.init(.{
-        .alpn_protocols = h3.ALPN ++ h0.ALPN ++ [_][]const u8{"siduck"},
-        // .is_client = false,
-        .max_datagram_frame_size = 65536,
-    }, ticket_store);
+    var server = Server.init();
+    // .{
+    //     .alpn_protocols = h3.ALPN ++ h0.ALPN ++ [_][]const u8{"siduck"},
+    //     // .is_client = false,
+    //     .max_datagram_frame_size = 65536,
+    // }
+    //
 
-    try server.config.readCertChain(alloc, .{
-        .certfile = "self-signed/aioquic/ssl_cert.pem",
-        .keyfile = "self-signed/aioquic/ssl_key.pem",
-        // .certfile = @embedFile("../self-signed/aioquic/ssl_cert.pem"),
-        // .keyfile = @embedFile("../self-signed/aioquic/ssl_key.pem"),
-    });
+    // try server.config.readCertChain(alloc, .{
+    //     .certfile = "self-signed/aioquic/ssl_cert.pem",
+    //     .keyfile = "self-signed/aioquic/ssl_key.pem",
+    //     // .certfile = @embedFile("../self-signed/aioquic/ssl_cert.pem"),
+    //     // .keyfile = @embedFile("../self-signed/aioquic/ssl_key.pem"),
+    // });
 
     // var rnd: [hmac.sha2.HmacSha256.mac_length]u8 = undefined;
     // std.crypto.random.bytes(&rnd);
@@ -174,7 +174,21 @@ pub fn main() anyerror!void {
         }
 
         // TODO: determine path id
-        // ...
+        const path_id = path_id: {
+            var id = "";
+
+            if (header.packet_type == packet.PacketType.ZeroRTT and conn.got_peer_conn_id) {
+                // let pkt_dcid = ConnectionId::from_ref(&hdr.dcid);
+                // self.get_or_create_recv_path_id(recv_pid, &pkt_dcid, buf_len, info)?
+
+            } else {
+                // we are on handshake, use the initial path.
+                // self.paths.get_active_path_id()?
+            }
+
+            break :path_id id;
+        };
+        _ = path_id;
 
         if (conn.is_server and !conn.got_peer_conn_id) {
             // conn.set_initial_dcid(hdr.scid.clone(), None, recv_pid)?;

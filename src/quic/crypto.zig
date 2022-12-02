@@ -1,8 +1,6 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
-const quictls = @import("quictls.zig");
 const packet = @import("packet.zig");
-const aead = @import("aead.zig");
 const assert = std.debug.assert;
 
 const crypto = std.crypto;
@@ -22,15 +20,16 @@ pub const SAMPLE_LEN = 16;
 pub const Aead = Aes128Gcm;
 const Hmac = HmacSha256;
 
+// TODO: sizes differ per algorithm. Currently using `Aes128`
 pub const key_len = 16;
 pub const nonce_len = 12;
 
-// TODO: support the 3 algorithms below (only AES128_GCM currently supported)
-pub const Algorithm = enum {
-    AES128_GCM,
-    AES256_GCM,
-    ChaCha20_Poly1305,
-};
+// // TODO: support the 3 algorithms below (only AES128_GCM currently supported)
+// pub const Algorithm = enum {
+//     AES128_GCM,
+//     AES256_GCM,
+//     ChaCha20_Poly1305,
+// };
 
 pub const Open = struct {
     // alg: Algorithm,

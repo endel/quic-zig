@@ -3,23 +3,18 @@ const os = std.os;
 const io = std.io;
 
 const connection = @import("connection.zig");
-const structs = @import("structs.zig");
 const packet = @import("packet.zig");
 const crypto = @import("crypto.zig");
-const quictls = @import("quictls.zig");
-// const token = @import("handshake/token.zig");
-
-const TicketStore = std.StringHashMap(quictls.SessionTicket);
 
 const Connection = connection.Connection;
 const ConnectionState = connection.ConnectionState;
 
 pub const Server = struct {
-    config: structs.QuicConfiguration,
-    ticket_store: TicketStore,
+    // config: structs.QuicConfiguration,
 
-    pub fn init(config: structs.QuicConfiguration, ticket_store: TicketStore) Server {
-        return .{ .config = config, .ticket_store = ticket_store };
+    // pub fn init(config: QuicConfiguration) Server {
+    pub fn init() Server {
+        return .{};
     }
 
     pub fn accept(self: Server, header: packet.Header) !Connection {
@@ -30,14 +25,14 @@ pub const Server = struct {
 
         const is_client = false;
 
-        // init quictls context
-        var context = quictls.Context.init(is_client);
+        // // init quictls context
+        // var context = quictls.Context.init(is_client);
 
         var conn = Connection{
             .dcid = header.dcid,
             .scid = header.scid,
             .version = header.version,
-            .context = context,
+            // .context = context,
             .state = ConnectionState.FirstFlight,
             .is_server = !is_client,
         };

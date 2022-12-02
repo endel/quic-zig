@@ -4,8 +4,6 @@ const random = std.crypto.random;
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const packet = @import("packet.zig");
-const recovery = @import("recovery.zig");
-const quictls = @import("quictls.zig");
 
 pub const ConnectionState = enum(u8) {
     FirstFlight = 0,
@@ -15,7 +13,22 @@ pub const ConnectionState = enum(u8) {
     Terminated = 4,
 };
 
-pub const ConnectionId = struct {};
+// pub const ConnectionId = struct {};
+
+pub const NetworkPath = struct {
+    addr: std.net.Address,
+    bytes_received: u32,
+    bytes_sent: u32,
+    is_validated: bool,
+    local_challenge: []u8,
+    remote_challenge: []u8,
+
+    // TODO: i don't like "canXX()" bool method names.
+    pub fn canSend(self: NetworkPath, size: u32) bool {
+        // TODO: this math looks suspicious!
+        return self.is_validated || (self.bytes_sent + size) <= 3 * self.bytes_received;
+    }
+};
 
 ///
 /// A Quic connection
@@ -29,10 +42,10 @@ pub const Connection = struct {
     state: ConnectionState = ConnectionState.FirstFlight,
 
     pkt_num_spaces: [3]packet.PacketNumSpace = .{
-        packet.PacketNumSpace{}, // quictls.Epoch.INITIAL
-        packet.PacketNumSpace{}, // quictls.Epoch.ZERO_RTT TODO: this one is never used!
-        packet.PacketNumSpace{}, // quictls.Epoch.HANDSHAKE
-        // packet.PacketNumSpace{}, // quictls.Epoch.ONE_RTT
+        packet.PacketNumSpace{}, // packet.Epoch.INITIAL
+        packet.PacketNumSpace{}, // packet.Epoch.ZERO_RTT // TODO: this one is never used!
+        packet.PacketNumSpace{}, // packet.Epoch.HANDSHAKE
+        // packet.PacketNumSpace{}, // packet.Epoch.ONE_RTT
     },
 
     is_server: bool,
@@ -47,8 +60,6 @@ pub const Connection = struct {
 
     rx_data: u64 = 0,
 
-    context: quictls.Context,
-
     // dgram_recv_queue: dgram::DatagramQueue::new(
     //     config.dgram_recv_max_queue_len,
     // ),
@@ -58,10 +69,10 @@ pub const Connection = struct {
     // ),
 
     // _cryptos: [4]crypto.CryptoPair = .{
-    //     crypto.CryptoPair{}, // quictls.Epoch.INITIAL
-    //     crypto.CryptoPair{}, // quictls.Epoch.ZERO_RTT
-    //     crypto.CryptoPair{}, // quictls.Epoch.HANDSHAKE
-    //     crypto.CryptoPair{}, // quictls.Epoch.ONE_RTT
+    //     crypto.CryptoPair{}, // packet.Epoch.INITIAL
+    //     crypto.CryptoPair{}, // packet.Epoch.ZERO_RTT
+    //     crypto.CryptoPair{}, // packet.Epoch.HANDSHAKE
+    //     crypto.CryptoPair{}, // packet.Epoch.ONE_RTT
     // },
 
     pub fn decrypt_packet(self: *Connection, header: *packet.Header, stream: anytype) ![]u8 {
@@ -116,13 +127,10 @@ pub fn generateConnectionId(size: usize) []u8 {
 }
 
 test "init connection" {
-    var context = quictls.Context.init(false);
-
     var conn = Connection{
         .dcid = "dest1234",
         .scid = "src12345",
         .version = protocol.SUPPORTED_VERSIONS[0],
-        .context = context,
         .state = ConnectionState.FirstFlight,
     };
 
