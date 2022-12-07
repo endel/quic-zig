@@ -1,11 +1,13 @@
 const std = @import("std");
+const net = std.net;
+const os = std.os;
 const random = std.crypto.random;
 
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const packet = @import("packet.zig");
 
-pub const ConnectionState = enum(u8) {
+pub const State = enum(u8) {
     FirstFlight = 0,
     Connected = 1,
     Closing = 2,
@@ -15,18 +17,78 @@ pub const ConnectionState = enum(u8) {
 
 // pub const ConnectionId = struct {};
 
-pub const NetworkPath = struct {
-    addr: std.net.Address,
-    bytes_received: u32,
-    bytes_sent: u32,
-    is_validated: bool,
-    local_challenge: []u8,
-    remote_challenge: []u8,
+pub const RecoveryConfig = struct {};
 
-    // TODO: i don't like "canXX()" bool method names.
-    pub fn canSend(self: NetworkPath, size: u32) bool {
-        // TODO: this math looks suspicious!
-        return self.is_validated || (self.bytes_sent + size) <= 3 * self.bytes_received;
+pub const NetworkPath = struct {
+    local_addr: os.sockaddr,
+    peer_addr: os.sockaddr,
+    is_initial: bool,
+    // recovery_config: RecoveryConfig,
+
+    // bytes_received: u32,
+    // bytes_sent: u32,
+    // is_validated: bool,
+    // local_challenge: []u8,
+    // remote_challenge: []u8,
+
+    pub fn init(
+        local_addr: os.sockaddr, // net.Address,
+        peer_addr: os.sockaddr, // net.Address,
+        is_initial: bool,
+    ) NetworkPath {
+        return .{
+            .local_addr = local_addr,
+            .peer_addr = peer_addr,
+            .is_initial = is_initial,
+        };
+    }
+
+    // pub fn canSend(self: NetworkPath, size: u32) bool {
+    //     // TODO: this math looks suspicious!
+    //     return self.is_validated || (self.bytes_sent + size) <= 3 * self.bytes_received;
+    // }
+};
+
+pub const TransportParams = struct {
+    original_destination_connection_id: []u8,
+    max_idle_timeout: u64,
+    stateless_reset_token: ?u128,
+    max_udp_payload_size: u64,
+    initial_max_data: u64,
+    initial_max_stream_data_bidi_local: u64,
+    initial_max_stream_data_bidi_remote: u64,
+    initial_max_stream_data_uni: u64,
+    initial_max_streams_bidi: u64,
+    initial_max_streams_uni: u64,
+    ack_delay_exponent: u64,
+    max_ack_delay: u64,
+    disable_active_migration: bool,
+
+    active_conn_id_limit: u64,
+    initial_source_connection_id: ?[]u8,
+    retry_source_connection_id: ?[]u8,
+    max_datagram_frame_size: ?u64,
+
+    pub fn default() TransportParams {
+        return TransportParams{
+            .original_destination_connection_id = undefined,
+            .max_idle_timeout = 0,
+            .stateless_reset_token = undefined,
+            .max_udp_payload_size = 65527,
+            .initial_max_data = 0,
+            .initial_max_stream_data_bidi_local = 0,
+            .initial_max_stream_data_bidi_remote = 0,
+            .initial_max_stream_data_uni = 0,
+            .initial_max_streams_bidi = 0,
+            .initial_max_streams_uni = 0,
+            .ack_delay_exponent = 3,
+            .max_ack_delay = 25,
+            .disable_active_migration = false,
+            .active_conn_id_limit = 2,
+            .initial_source_connection_id = undefined,
+            .retry_source_connection_id = undefined,
+            .max_datagram_frame_size = undefined,
+        };
     }
 };
 
@@ -39,7 +101,10 @@ pub const Connection = struct {
     dcid: []const u8,
     scid: []const u8,
 
-    state: ConnectionState = ConnectionState.FirstFlight,
+    is_server: bool,
+
+    state: State = State.FirstFlight,
+    paths: [1]NetworkPath = .{undefined} ** 1, // TODO: support multiple paths
 
     pkt_num_spaces: [3]packet.PacketNumSpace = .{
         packet.PacketNumSpace{}, // packet.Epoch.INITIAL
@@ -48,7 +113,6 @@ pub const Connection = struct {
         // packet.PacketNumSpace{}, // packet.Epoch.ONE_RTT
     },
 
-    is_server: bool,
     got_peer_conn_id: bool = false,
 
     // stats
@@ -75,7 +139,7 @@ pub const Connection = struct {
     //     crypto.CryptoPair{}, // packet.Epoch.ONE_RTT
     // },
 
-    pub fn decrypt_packet(self: *Connection, header: *packet.Header, stream: anytype) ![]u8 {
+    pub fn decryptPacket(self: *Connection, header: *packet.Header, stream: anytype) ![]u8 {
         var epoch = try packet.Epoch.fromPacketType(header.*.packet_type);
         var space = self.pkt_num_spaces[@as(usize, @enumToInt(epoch))];
 
@@ -131,7 +195,7 @@ test "init connection" {
         .dcid = "dest1234",
         .scid = "src12345",
         .version = protocol.SUPPORTED_VERSIONS[0],
-        .state = ConnectionState.FirstFlight,
+        .state = State.FirstFlight,
     };
 
     try std.testing.expectEqual(conn.dcid, "dest1234");

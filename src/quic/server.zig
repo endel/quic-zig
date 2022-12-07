@@ -1,13 +1,11 @@
 const std = @import("std");
 const os = std.os;
 const io = std.io;
+const net = std.net;
 
 const connection = @import("connection.zig");
 const packet = @import("packet.zig");
 const crypto = @import("crypto.zig");
-
-const Connection = connection.Connection;
-const ConnectionState = connection.ConnectionState;
 
 pub const Server = struct {
     // config: structs.QuicConfiguration,
@@ -17,7 +15,12 @@ pub const Server = struct {
         return .{};
     }
 
-    pub fn accept(self: Server, header: packet.Header) !Connection {
+    pub fn accept(
+        self: Server,
+        header: packet.Header,
+        local: os.sockaddr, // net.Address,
+        remote: os.sockaddr, // net.Address,
+    ) !connection.Connection {
         // , scid: []const u8, dcid: []const u8
         _ = self;
         // _ = scid;
@@ -28,13 +31,15 @@ pub const Server = struct {
         // // init quictls context
         // var context = quictls.Context.init(is_client);
 
-        var conn = Connection{
+        var initial_path = connection.NetworkPath.init(local, remote, true);
+
+        var conn = connection.Connection{
             .dcid = header.dcid,
             .scid = header.scid,
             .version = header.version,
-            // .context = context,
-            .state = ConnectionState.FirstFlight,
+            .state = connection.State.FirstFlight,
             .is_server = !is_client,
+            .paths = .{initial_path},
         };
 
         // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1

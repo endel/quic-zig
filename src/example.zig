@@ -46,8 +46,9 @@ pub fn main() anyerror!void {
     // var connection_id_seed: [hmac.sha2.HmacSha256.mac_length]u8 = undefined;
     // hmac.sha2.HmacSha256.create(connection_id_seed[0..], "", "");
 
-    const sockfd = try server.listen(try std.net.Address.parseIp4("127.0.0.1", 4433));
-    // const sockfd = try server.listen(try std.net.Address.parseIp6("::1", 4433));
+    const local_addr = try std.net.Address.parseIp4("127.0.0.1", 4433);
+    // const local_addr = try std.net.Address.parseIp6("::1", 4433);
+    const sockfd = try server.listen(local_addr);
     defer os.close(sockfd);
 
     var connections = std.StringHashMap(connection.Connection).init(alloc);
@@ -68,14 +69,14 @@ pub fn main() anyerror!void {
 
         var bytes: [8192]u8 = undefined;
 
-        var src_addr: os.sockaddr = undefined;
+        var remote_addr: os.sockaddr = undefined;
         var addr_size: std.os.socklen_t = @sizeOf(os.sockaddr);
 
-        const packet_length = os.recvfrom(sockfd, &bytes, 0, &src_addr, &addr_size) catch {
+        const packet_length = os.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch {
             continue;
         };
 
-        std.log.info("\n<<-\nRECEIVED PACKET ({}ms) from {} (addr size: {})", .{ (std.time.timestamp() - prevTimestamp), src_addr, addr_size });
+        std.log.info("\n<<-\nRECEIVED PACKET ({}ms) from {} (addr size: {})", .{ (std.time.timestamp() - prevTimestamp), remote_addr, addr_size });
         prevTimestamp = std.time.timestamp();
         std.log.info("FULL PACKET: (len: {}) {any}", .{ packet_length, bytes[0..packet_length] });
 
@@ -106,7 +107,7 @@ pub fn main() anyerror!void {
             try packet.negotiateVersion(header, &out_writer);
 
             var bytes_to_send = out_buff.getWritten();
-            const bytes_sent = try os.sendto(sockfd, bytes_to_send, 0, &src_addr, addr_size);
+            const bytes_sent = try os.sendto(sockfd, bytes_to_send, 0, &remote_addr, addr_size);
             std.log.info("\n->>\nSENT VERSION NEGOTIATION PACKET (sent: {} bytes) => {any}", .{ bytes_sent, bytes_to_send });
 
             continue;
@@ -118,7 +119,7 @@ pub fn main() anyerror!void {
 
             // generates a random original destination connection id
             var new_scid = connection.generateConnectionId(header.scid.len);
-            var retry_token = try token.generateRetryToken(header, new_scid, src_addr);
+            var retry_token = try token.generateRetryToken(header, new_scid, remote_addr);
 
             std.log.info("new scid: {any}", .{new_scid});
             std.log.warn("retry token: {any}", .{retry_token});
@@ -127,7 +128,7 @@ pub fn main() anyerror!void {
 
             var bytes_to_send = out_buff.getWritten();
 
-            const bytes_sent = try os.sendto(sockfd, bytes_to_send, 0, &src_addr, addr_size);
+            const bytes_sent = try os.sendto(sockfd, bytes_to_send, 0, &remote_addr, addr_size);
             std.log.info("\n->>\nRETRY PACKET (sent: {} bytes)\n{any}", .{ bytes_sent, bytes_to_send });
 
             continue;
@@ -142,7 +143,7 @@ pub fn main() anyerror!void {
             }
 
             std.log.info("ACCEPT CONNECTION!", .{});
-            var conn = try server.accept(header);
+            var conn = try server.accept(header, local_addr.any, remote_addr);
             conn_pair.value_ptr.* = conn;
 
             //
@@ -161,7 +162,7 @@ pub fn main() anyerror!void {
 
         std.log.info("stream.pos: {any}, header.remainder_len: {any}", .{ stream.pos, header.remainder_len });
 
-        var decrypted = conn.decrypt_packet(&header, &stream) catch |err| {
+        var decrypted = conn.decryptPacket(&header, &stream) catch |err| {
             std.log.err("decrypt error: {any}", .{err});
             break;
         };
@@ -173,25 +174,33 @@ pub fn main() anyerror!void {
             continue;
         }
 
-        // TODO: determine path id
-        const path_id = path_id: {
-            var id = "";
+        // TODO: determine path / support multiple paths (+ multipath extension)
+        const path_idx = path_idx: {
+            var idx: usize = undefined;
 
-            if (header.packet_type == packet.PacketType.ZeroRTT and conn.got_peer_conn_id) {
+            if (header.packet_type == packet.PacketType.ZeroRTT and
+                conn.got_peer_conn_id)
+            {
                 // let pkt_dcid = ConnectionId::from_ref(&hdr.dcid);
-                // self.get_or_create_recv_path_id(recv_pid, &pkt_dcid, buf_len, info)?
+                // get_or_create_recv_path_id(recv_pid, &pkt_dcid, buf_len, info)
 
             } else {
                 // we are on handshake, use the initial path.
-                // self.paths.get_active_path_id()?
+                idx = 0;
+                // get_active_path_id()
             }
 
-            break :path_id id;
+            break :path_idx idx;
         };
-        _ = path_id;
+        _ = path_idx;
+
+        if (!conn.is_server and !conn.got_peer_conn_id) {
+            // TODO: Replace the randomly generated destination connection ID
+            // with the one supplied by the server.
+        }
 
         if (conn.is_server and !conn.got_peer_conn_id) {
-            // conn.set_initial_dcid(hdr.scid.clone(), None, recv_pid)?;
+            // conn.setInitialDCID(header.scid, None, recv_pid)?;
         }
 
         std.log.info("payload ({any}): {any}", .{ decrypted.len, decrypted });
