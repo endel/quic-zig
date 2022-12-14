@@ -3,7 +3,7 @@ const io = std.io;
 
 const packet = @import("packet.zig");
 
-pub const FrameType = enum(u64) {
+pub const FrameType = enum {
     padding,
     ping,
     ack,
@@ -36,40 +36,63 @@ pub const FrameType = enum(u64) {
 pub const NotImplementedFrame = struct {};
 
 pub const Frame = union(FrameType) {
-    padding: struct { len: usize },
+    padding: usize,
 
-    ping: NotImplementedFrame,
+    ping: void,
     ack: NotImplementedFrame,
+
     reset_stream: struct {
         stream_id: u64,
         error_code: u64,
         final_size: u64,
     },
+
     stop_sending: struct {
         stream_id: u64,
         error_code: u64,
     },
 
-    crypto: struct {
+    crypto: []u8,
+    new_token: []u8,
+
+    stream: struct {
+        stream_id: u64,
         data: []u8,
     },
 
-    new_token: NotImplementedFrame,
-    stream: NotImplementedFrame,
-    max_data: NotImplementedFrame,
-    max_stream_data: NotImplementedFrame,
-    max_streams_bidi: NotImplementedFrame,
-    max_streams_uni: NotImplementedFrame,
-    data_blocked: NotImplementedFrame,
-    stream_data_blocked: NotImplementedFrame,
-    streams_blocked_bidi: NotImplementedFrame,
-    streams_blocked_uni: NotImplementedFrame,
-    new_connection_id: NotImplementedFrame,
-    retire_connection_id: NotImplementedFrame,
-    path_challenge: NotImplementedFrame,
-    path_response: NotImplementedFrame,
-    connection_close: NotImplementedFrame,
-    handshake_done: NotImplementedFrame,
+    max_data: u64,
+    max_stream_data: struct {
+        stream_id: u64,
+        max: u64,
+    },
+
+    max_streams_bidi: u64,
+    max_streams_uni: u64,
+    data_blocked: u64,
+    stream_data_blocked: struct {
+        stream_id: u64,
+        limit: u64,
+    },
+    streams_blocked_bidi: u64,
+    streams_blocked_uni: u64,
+    new_connection_id: struct {
+        seq_num: u64,
+        retire_prior_to: u64,
+        conn_id: []u8,
+        reset_token: [16]u8,
+    },
+    retire_connection_id: struct {
+        seq_num: u64,
+    },
+    path_challenge: [8]u8,
+    path_response: [8]u8,
+    connection_close: struct {
+        error_code: u64,
+        frame_type: u64,
+        reason: []u8,
+    },
+
+    handshake_done: void,
 
     pub fn parse(bytes: []u8) !Frame {
         var stream = io.fixedBufferStream(bytes);
@@ -80,70 +103,174 @@ pub const Frame = union(FrameType) {
 
         return switch (frame_type) {
             // padding
-            0x00 => {
-                var len: usize = 1;
+            0x00 => .{
+                .padding = blk: {
+                    var len: usize = 1;
 
-                while (stream.pos < bytes.len) {
-                    if (try reader.readByte() != 0x00) {
-                        break;
+                    while (stream.pos < bytes.len) {
+                        if (try reader.readByte() != 0x00) {
+                            break;
+                        }
+                        len += 1;
                     }
-                    len += 1;
-                }
 
-                return .{ .padding = .{ .len = len } };
+                    break :blk len;
+                },
             },
 
             // ping
-            0x01 => .{ .ping = .{} },
-
-            // ack
-            // TODO: parse ack frame
-            0x02...0x03 => .{ .ack = .{} },
-
-            // Reset stream
-            0x04 => .{ .reset_stream = .{
-                .stream_id = try packet.readVarInt(reader),
-                .error_code = try packet.readVarInt(reader),
-                .final_size = try packet.readVarInt(reader),
-            } },
-
-            // Stop Sending
-            0x05 => .{ .stop_sending = .{
-                .stream_id = try packet.readVarInt(reader),
-                .error_code = try packet.readVarInt(reader),
-            } },
-
-            0x06 => {
-                const offset = try packet.readVarInt(reader);
-                return .{ .crypto = .{ .data = bytes[stream.pos..offset] } };
+            0x01 => .{
+                .ping = {},
             },
 
-            // 0x07 => (self._handle_new_token_frame, EPOCHS("1")),
-            // 0x08 => (self._handle_stream_frame, EPOCHS("01")),
-            // 0x09 => (self._handle_stream_frame, EPOCHS("01")),
-            // 0x0a => (self._handle_stream_frame, EPOCHS("01")),
-            // 0x0b => (self._handle_stream_frame, EPOCHS("01")),
-            // 0x0c => (self._handle_stream_frame, EPOCHS("01")),
-            // 0x0d => (self._handle_stream_frame, EPOCHS("01")),
-            // 0x0e => (self._handle_stream_frame, EPOCHS("01")),
-            // 0x0f => (self._handle_stream_frame, EPOCHS("01")),
-            // 0x10 => (self._handle_max_data_frame, EPOCHS("01")),
-            // 0x11 => (self._handle_max_stream_data_frame, EPOCHS("01")),
-            // 0x12 => (self._handle_max_streams_bidi_frame, EPOCHS("01")),
-            // 0x13 => (self._handle_max_streams_uni_frame, EPOCHS("01")),
-            // 0x14 => (self._handle_data_blocked_frame, EPOCHS("01")),
-            // 0x15 => (self._handle_stream_data_blocked_frame, EPOCHS("01")),
-            // 0x16 => (self._handle_streams_blocked_frame, EPOCHS("01")),
-            // 0x17 => (self._handle_streams_blocked_frame, EPOCHS("01")),
-            // 0x18 => (self._handle_new_connection_id_frame, EPOCHS("01")),
-            // 0x19 => (self._handle_retire_connection_id_frame, EPOCHS("01")),
-            // 0x1a => (self._handle_path_challenge_frame, EPOCHS("01")),
-            // 0x1b => (self._handle_path_response_frame, EPOCHS("01")),
+            // ack
+            // TODO: parse
+            0x02...0x03 => .{
+                .ack = .{},
+            },
+
+            // reset_stream
+            0x04 => .{
+                .reset_stream = .{
+                    .stream_id = try packet.readVarInt(reader),
+                    .error_code = try packet.readVarInt(reader),
+                    .final_size = try packet.readVarInt(reader),
+                },
+            },
+
+            // stop_sending
+            0x05 => .{
+                .stop_sending = .{
+                    .stream_id = try packet.readVarInt(reader),
+                    .error_code = try packet.readVarInt(reader),
+                },
+            },
+
+            // crypto
+            0x06 => .{
+                .crypto = bytes[stream.pos..try packet.readVarInt(reader)],
+            },
+
+            // new token
+            0x07 => .{
+                .new_token = bytes[0..(try packet.readVarInt(reader))],
+            },
+
+            // stream frame
+            // TODO: parse
+            0x08...0x0f => .{ .stream = .{
+                .stream_id = 0,
+                .data = bytes,
+            } },
+
+            // max data
+            0x10 => .{
+                .max_data = try packet.readVarInt(reader),
+            },
+
+            // max stream data
+            0x11 => .{
+                .max_stream_data = .{
+                    .stream_id = try packet.readVarInt(reader),
+                    .max = try packet.readVarInt(reader),
+                },
+            },
+
+            // max streams bidi
+            0x12 => .{
+                .max_streams_bidi = try packet.readVarInt(reader),
+            },
+
+            // max streams uni
+            0x13 => .{
+                .max_streams_uni = try packet.readVarInt(reader),
+            },
+
+            // data blocked
+            0x14 => .{
+                .data_blocked = try packet.readVarInt(reader),
+            },
+
+            // stream data blocked
+            0x15 => .{
+                .stream_data_blocked = .{
+                    .stream_id = try packet.readVarInt(reader),
+                    .limit = try packet.readVarInt(reader),
+                },
+            },
+
+            // streams blocked bidi
+            0x16 => .{
+                .streams_blocked_bidi = try packet.readVarInt(reader),
+            },
+
+            // streams blocked uni
+            0x17 => .{
+                .streams_blocked_uni = try packet.readVarInt(reader),
+            },
+
+            // new connection id
+            0x18 => {
+                var conn_id_len: u8 = undefined;
+
+                return .{
+                    .new_connection_id = .{
+                        .seq_num = try packet.readVarInt(reader),
+                        .retire_prior_to = try packet.readVarInt(reader),
+                        .conn_id = blk: {
+                            conn_id_len = try reader.readByte();
+
+                            var conn_id = bytes[0..conn_id_len];
+                            try stream.seekBy(conn_id_len);
+
+                            break :blk conn_id;
+                        },
+                        .reset_token = try reader.readBytesNoEof(16),
+                        // {
+                        //     // throw error if check out of bounds
+                        //     if (bytes.len < stream.pos + 16) {
+                        //         return error.InvalidPacket;
+                        //     }
+                        //
+                        //     return bytes[stream.pos..16];
+                        // },
+                    },
+                };
+            },
+
+            // retire connection id
+            0x19 => .{
+                .retire_connection_id = .{
+                    .seq_num = try packet.readVarInt(reader),
+                },
+            },
+
+            // path challenge
+            0x1a => .{
+                .path_challenge = try reader.readBytesNoEof(8),
+            },
+
+            // path response
+            0x1b => .{
+                .path_response = try reader.readBytesNoEof(8),
+            },
+
+            // connection close
+            0x1c => .{
+                .connection_close = .{
+                    .error_code = try packet.readVarInt(reader),
+                    .frame_type = try packet.readVarInt(reader),
+                    .reason = bytes[stream.pos..(try packet.readVarInt(reader))],
+                },
+            },
+
+            0x1e => .{ .handshake_done = undefined },
+
             // 0x1c => (self._handle_connection_close_frame, EPOCHS("IH01")),
             // 0x1d => (self._handle_connection_close_frame, EPOCHS("01")),
-            // 0x1e => (self._handle_handshake_done_frame, EPOCHS("1")),
             // 0x30 => (self._handle_datagram_frame, EPOCHS("01")),
             // 0x31 => (self._handle_datagram_frame, EPOCHS("01")),
+
             else => unreachable,
         };
     }
@@ -153,21 +280,21 @@ test "parse padding frame" {
     {
         var bytes = [_]u8{0x00};
         switch (try Frame.parse(&bytes)) {
-            FrameType.padding => |frame| try std.testing.expect(1 == frame.len),
+            FrameType.padding => |padding| try std.testing.expect(1 == padding),
             else => unreachable,
         }
     }
     {
         var bytes = [_]u8{ 0x00, 0x00, 0x01 };
         switch (try Frame.parse(&bytes)) {
-            FrameType.padding => |frame| try std.testing.expect(2 == frame.len),
+            FrameType.padding => |padding| try std.testing.expect(2 == padding),
             else => unreachable,
         }
     }
     {
         var bytes = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
         switch (try Frame.parse(&bytes)) {
-            FrameType.padding => |frame| try std.testing.expect(10 == frame.len),
+            FrameType.padding => |padding| try std.testing.expect(10 == padding),
             else => unreachable,
         }
     }
