@@ -10,7 +10,7 @@ const crypto = @import("crypto.zig");
 const util = @import("util.zig");
 
 // network byte order
-const endian = std.builtin.Endian.Big;
+pub const ENDIAN = std.builtin.Endian.Big;
 
 pub const LONG_HEADER_BIT: u8 = 0x80;
 pub const FIXED_BIT: u8 = 0x40;
@@ -180,7 +180,7 @@ pub const Header = struct {
         first |= LONG_HEADER_BIT | FIXED_BIT | (ty << 4);
 
         try writer.writeByte(@intCast(u8, first));
-        try writer.writeInt(u32, self.version, endian);
+        try writer.writeInt(u32, self.version, ENDIAN);
 
         try writer.writeByte(@intCast(u8, self.dcid.len));
         try writer.writeAll(self.dcid);
@@ -277,10 +277,10 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) ![]u8 {
 
     // read truncated/raw packet number
     var truncated_packet_number = try switch (header.packet_number_len) {
-        1 => @intCast(u64, std.mem.readInt(u8, pn_ciphertext.*[0..util.sizeOf(u8)], endian)),
-        2 => @intCast(u64, std.mem.readInt(u16, pn_ciphertext.*[0..util.sizeOf(u16)], endian)),
-        3 => @intCast(u64, std.mem.readInt(u24, pn_ciphertext.*[0..util.sizeOf(u24)], endian)),
-        4 => @intCast(u64, std.mem.readInt(u32, pn_ciphertext.*[0..util.sizeOf(u32)], endian)),
+        1 => @intCast(u64, std.mem.readInt(u8, pn_ciphertext.*[0..util.sizeOf(u8)], ENDIAN)),
+        2 => @intCast(u64, std.mem.readInt(u16, pn_ciphertext.*[0..util.sizeOf(u16)], ENDIAN)),
+        3 => @intCast(u64, std.mem.readInt(u24, pn_ciphertext.*[0..util.sizeOf(u24)], ENDIAN)),
+        4 => @intCast(u64, std.mem.readInt(u32, pn_ciphertext.*[0..util.sizeOf(u32)], ENDIAN)),
         else => error.InvalidPacket,
     };
 
@@ -320,7 +320,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
     if (isLongHeader(first_byte)) {
         log.info("LONG HEADER!", .{});
 
-        var version = try reader.readInt(u32, endian);
+        var version = try reader.readInt(u32, ENDIAN);
         header.version = version;
 
         log.info("version: {any}", .{header.version});
@@ -414,7 +414,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                     // header.remainder_len = stream.buffer.len - stream.pos;
                     //
                     // while (stream.pos - stream.buffer.len > 0) {
-                    //     _ = try reader.readInt(u32, endian); // const version = reader.readInt(u32, endian);
+                    //     _ = try reader.readInt(u32, ENDIAN); // const version = reader.readInt(u32, ENDIAN);
                     //     // std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
                     // }
                     //
@@ -448,7 +448,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
 
 pub fn negotiateVersion(header: Header, writer: anytype) !void {
     try writer.writeByte(random.int(u8) | LONG_HEADER_BIT);
-    try writer.writeInt(u32, 0, endian);
+    try writer.writeInt(u32, 0, ENDIAN);
 
     try writer.writeByte(@intCast(u8, header.scid.len));
     try writer.writeAll(header.scid);
@@ -457,7 +457,7 @@ pub fn negotiateVersion(header: Header, writer: anytype) !void {
     try writer.writeAll(header.dcid);
 
     for (protocol.SUPPORTED_VERSIONS) |version| {
-        try writer.writeInt(u32, version, endian);
+        try writer.writeInt(u32, version, ENDIAN);
     }
 }
 
@@ -541,7 +541,7 @@ fn computeRetryIntegrityTag(
     return tag;
 }
 
-fn readVarInt(reader: anytype) !u64 {
+pub fn readVarInt(reader: anytype) !u64 {
     //
     // https://datatracker.ietf.org/doc/html/draft-ietf-quic-transport-16#section-16
     //

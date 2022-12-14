@@ -11,6 +11,7 @@ const connection = @import("quic/connection.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const token = @import("quic/handshake/token.zig");
+const Frame = @import("quic/frame.zig").Frame;
 
 const h0 = @import("h0/connection.zig");
 const h3 = @import("h3/connection.zig");
@@ -162,14 +163,18 @@ pub fn main() anyerror!void {
 
         std.log.info("stream.pos: {any}, header.remainder_len: {any}", .{ stream.pos, header.remainder_len });
 
-        var decrypted = conn.decryptPacket(&header, &stream) catch |err| {
+        var payload = conn.decryptPacket(&header, &stream) catch |err| {
             std.log.err("decrypt error: {any}", .{err});
             break;
         };
 
+        // TODO: ignore duplicate packets (aka "num spaces")
+        // (check against local cache of packet numbers)
+        // ...
+
         // no frames. skip invalid packet!
         // TODO: move and throw an error at the `server.recv()` scope
-        if (decrypted.len == 0) {
+        if (payload.len == 0) {
             std.log.info("no frames. skip invalid packet!", .{});
             continue;
         }
@@ -192,7 +197,6 @@ pub fn main() anyerror!void {
 
             break :path_idx idx;
         };
-        _ = path_idx;
 
         if (!conn.is_server and !conn.got_peer_conn_id) {
             // TODO: Replace the randomly generated destination connection ID
@@ -200,20 +204,25 @@ pub fn main() anyerror!void {
         }
 
         if (conn.is_server and !conn.got_peer_conn_id) {
-            // conn.setInitialDCID(header.scid, None, recv_pid)?;
+            conn.setInitialDCID(header.scid, path_idx, undefined);
+
+            // TODO: local transport params (+encode it)
+
+            conn.got_peer_conn_id = true;
         }
+        std.log.info("payload ({any}): {any}", .{ payload.len, payload });
 
-        std.log.info("payload ({any}): {any}", .{ decrypted.len, decrypted });
-
-        // TODO: ignore duplicate packets (aka "num spaces")
-        // (check against local cache of packet numbers)
-        // ...
-
-        if (header.packet_type == packet.PacketType.OneRTT) {}
+        // process frames on payload
+        const frame = Frame.parse(payload);
+        std.log.info("frame: {any}", .{frame});
     }
 }
 
 test {
-    _ = @import("quic/packet.zig");
+    _ = @import("quic/server.zig");
     _ = @import("quic/connection.zig");
+    _ = @import("quic/packet.zig");
+    _ = @import("quic/protocol.zig");
+    _ = @import("quic/handshake/token.zig");
+    _ = @import("quic/frame.zig");
 }
