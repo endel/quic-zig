@@ -56,7 +56,10 @@ pub const Frame = union(FrameType) {
         error_code: u64,
     },
 
-    crypto: []u8,
+    crypto: struct {
+        offset: u64,
+        data: []u8,
+    },
     new_token: []u8,
 
     stream: struct {
@@ -168,7 +171,10 @@ pub const Frame = union(FrameType) {
                 const length = try packet.readVarInt(reader);
 
                 return .{
-                    .crypto = bytes[stream.pos..(stream.pos + offset + length)],
+                    .crypto = .{
+                        .offset = offset,
+                        .data = bytes[stream.pos..(stream.pos + offset + length)],
+                    },
                 };
             },
 
@@ -327,6 +333,20 @@ pub const Frame = union(FrameType) {
             else => unreachable,
         };
     }
+
+    pub fn isAckEliciting(self: Frame) bool {
+        return switch (self) {
+            .padding, .ack, .connection_close, .application_close => false,
+            else => true,
+        };
+    }
+
+    pub fn isProbing(self: Frame) bool {
+        return switch (self) {
+            .padding, .new_connection_id, .path_challenge, .path_response => false,
+            else => true,
+        };
+    }
 };
 
 test "parse padding frame" {
@@ -411,7 +431,11 @@ test "parse crypto frame" {
         0x00, 0x00, 0x00, 0x00, // Data
     };
     switch (try Frame.parse(&bytes)) {
-        FrameType.crypto => try std.testing.expect(true),
+        FrameType.crypto => |crypto| {
+            try std.testing.expect(crypto.offset == 0);
+            try std.testing.expectFmt("{  }", "{any}", .{crypto.data});
+            try std.testing.expect(true);
+        },
         else => unreachable,
     }
 }

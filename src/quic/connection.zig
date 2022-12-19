@@ -6,13 +6,14 @@ const random = std.crypto.random;
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const packet = @import("packet.zig");
+const frame = @import("frame.zig");
 
 pub const State = enum(u8) {
-    FirstFlight = 0,
-    Connected = 1,
-    Closing = 2,
-    Draining = 3,
-    Terminated = 4,
+    first_flight = 0,
+    connected = 1,
+    closing = 2,
+    draining = 3,
+    terminated = 4,
 };
 
 // pub const ConnectionId = struct {};
@@ -103,7 +104,7 @@ pub const Connection = struct {
 
     is_server: bool,
 
-    state: State = State.FirstFlight,
+    state: State = State.first_flight,
     paths: [1]NetworkPath = .{undefined} ** 1, // TODO: support multiple paths
 
     pkt_num_spaces: [3]packet.PacketNumSpace = .{
@@ -115,14 +116,48 @@ pub const Connection = struct {
 
     got_peer_conn_id: bool = false,
 
-    // stats
-    recv_count: u32 = 0,
-    sent_count: u32 = 0,
-    retrans_count: u32 = 0,
-    sent_bytes: u32 = 0,
-    recv_bytes: u32 = 0,
+    allocator: std.mem.Allocator,
 
-    rx_data: u64 = 0,
+    pub fn accept(
+        allocator: std.mem.Allocator,
+        header: packet.Header,
+        local: os.sockaddr, // net.Address,
+        remote: os.sockaddr, // net.Address,
+    ) !Connection {
+        const is_client = false;
+
+        var initial_path = NetworkPath.init(local, remote, true);
+
+        var conn = Connection{
+            .allocator = allocator,
+            .dcid = header.dcid,
+            .scid = header.scid,
+            .version = header.version,
+            .is_server = !is_client,
+            .paths = .{initial_path},
+        };
+
+        // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
+        // TODO: improve me!
+        const INITIAL = @as(usize, @enumToInt(packet.Epoch.INITIAL));
+        try conn.pkt_num_spaces[INITIAL].setupInitial(header.dcid, header.version, is_client);
+
+        return conn;
+    }
+
+    pub fn deinit(self: Connection) void {
+        _ = self;
+        // self.allocator
+    }
+
+    // // stats
+    // recv_count: u32 = 0,
+    // sent_count: u32 = 0,
+    // retrans_count: u32 = 0,
+    // sent_bytes: u32 = 0,
+    // recv_bytes: u32 = 0,
+    //
+    // rx_data: u64 = 0,
 
     // dgram_recv_queue: dgram::DatagramQueue::new(
     //     config.dgram_recv_max_queue_len,
@@ -152,6 +187,47 @@ pub const Connection = struct {
         _ = reset_token;
         _ = path_id;
     }
+
+    pub fn processFrame(self: Connection, f: frame.Frame, epoch: packet.Epoch) frame.FrameError!void {
+        var space = self.pkt_num_spaces[epoch];
+        _ = space;
+
+        switch (f) {
+            .padding => {},
+            .ping => {},
+
+            .ack => {},
+            .ack_ecn => {},
+
+            .reset_stream => {},
+            .stop_sending => {},
+
+            .crypto => {
+                // f.offset
+                // f.data
+                std.log.info("processing crypto frame: {any}", .{f});
+                // space.crypto_stream
+            },
+
+            .new_token => {},
+            .stream => {},
+            .max_data => {},
+            .max_stream_data => {},
+            .max_streams_bidi => {},
+            .max_streams_uni => {},
+            .data_blocked => {},
+            .stream_data_blocked => {},
+            .streams_blocked_bidi => {},
+            .streams_blocked_uni => {},
+            .new_connection_id => {},
+            .retire_connection_id => {},
+            .path_challenge => {},
+            .path_response => {},
+            .connection_close => {},
+            .application_close => {},
+            .handshake_done => {},
+        }
+    }
 };
 
 /// Generates a new connection id
@@ -164,11 +240,11 @@ pub fn generateConnectionId(size: usize) []u8 {
 
 test "init connection" {
     var conn = Connection{
+        .allocator = std.testing.allocator,
         .is_server = true,
         .dcid = "dest1234",
         .scid = "src12345",
         .version = protocol.SUPPORTED_VERSIONS[0],
-        .state = State.FirstFlight,
     };
 
     try std.testing.expectEqual(conn.dcid, "dest1234");

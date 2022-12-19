@@ -8,6 +8,7 @@ const random = std.crypto.random;
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const util = @import("util.zig");
+const stream = @import("stream.zig");
 
 // network byte order
 pub const ENDIAN = std.builtin.Endian.Big;
@@ -137,8 +138,8 @@ pub const Header = struct {
     /// protection is removed.
     key_phase: bool = false,
 
-    pub fn parse(stream: anytype) !Header {
-        return parseQuicHeader(stream);
+    pub fn parse(fbs: anytype) !Header {
+        return parseQuicHeader(fbs);
     }
 
     pub fn encode(self: *Self, writer: anytype) !void {
@@ -229,13 +230,11 @@ pub const PacketNumSpace = struct {
     crypto_open: ?crypto.Open = undefined,
     crypto_seal: ?crypto.Seal = undefined,
 
-    // crypto_open: Option<crypto::Open>,
-    // crypto_seal: Option<crypto::Seal>,
-    //
     // crypto_0rtt_open: Option<crypto::Open>,
     // crypto_0rtt_seal: Option<crypto::Seal>,
-    //
-    // crypto_stream: stream::Stream,
+
+    // crypto_stream: stream.Stream = stream.Stream{},
+    crypto_stream: stream.Stream = undefined,
 
     pub fn setupInitial(self: *PacketNumSpace, dcid: []const u8, version: u32, comptime is_client: bool) !void {
         var keys = try crypto.deriveInitialKeyMaterial(dcid, version, is_client);
@@ -248,15 +247,15 @@ pub fn parseIncoming(bytes: []const u8) void {
     _ = bytes;
 }
 
-pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) ![]u8 {
+pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     std.log.info("\n\nheader.remainder_len: {any}", .{header.remainder_len});
     const pn_and_sample_len = MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN;
-    const pn_and_sample = stream.buffer[stream.pos..(stream.pos + pn_and_sample_len)];
+    const pn_and_sample = fbs.buffer[fbs.pos..(fbs.pos + pn_and_sample_len)];
 
     var pn_ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
     var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
 
-    var first_byte = stream.buffer[0];
+    var first_byte = fbs.buffer[0];
 
     // unprotect header
     var aead = space.crypto_open.?;
@@ -285,10 +284,10 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) ![]u8 {
     };
 
     // skip packet length byte
-    try stream.seekBy(@intCast(i64, header.packet_number_len));
+    try fbs.seekBy(@intCast(i64, header.packet_number_len));
 
     // Write decrypted first byte back into the input buffer.
-    stream.buffer[0] = first_byte;
+    fbs.buffer[0] = first_byte;
 
     //
     // RFC 9000
@@ -301,8 +300,8 @@ pub fn decrypt(header: *Header, stream: anytype, space: PacketNumSpace) ![]u8 {
 
     return try aead.decryptPayload(
         header.packet_number,
-        stream.buffer[0..(stream.pos)], // header bytes
-        stream.buffer[(stream.pos)..(stream.pos + header.remainder_len - header.packet_number_len)], // payload
+        fbs.buffer[0..(fbs.pos)], // header bytes
+        fbs.buffer[(fbs.pos)..(fbs.pos + header.remainder_len - header.packet_number_len)], // payload
     );
 }
 
@@ -311,8 +310,8 @@ pub fn isLongHeader(first_byte: u8) bool {
     return (first_byte & LONG_HEADER_BIT) == LONG_HEADER_BIT;
 }
 
-pub fn parseQuicHeader(stream: anytype) !Header {
-    const reader = stream.reader();
+pub fn parseQuicHeader(fbs: anytype) !Header {
+    const reader = fbs.reader();
     const first_byte = try reader.readByte();
 
     var header = Header{};
@@ -331,13 +330,13 @@ pub fn parseQuicHeader(stream: anytype) !Header {
             return error.PacketError;
         }
 
-        std.log.info("stream.pos: {any}, dcid length: {any}", .{ stream.pos, dcid_length });
+        std.log.info("fbs.pos: {any}, dcid length: {any}", .{ fbs.pos, dcid_length });
 
-        header.dcid = stream.buffer[stream.pos..(stream.pos + dcid_length)];
+        header.dcid = fbs.buffer[fbs.pos..(fbs.pos + dcid_length)];
         std.log.info("dcid ({}): {any}", .{ dcid_length, header.dcid });
 
         // advance length
-        try stream.seekBy(dcid_length);
+        try fbs.seekBy(dcid_length);
 
         const scid_length = try reader.readByte();
         if (scid_length > CONNECTION_ID_MAX_SIZE) {
@@ -345,18 +344,18 @@ pub fn parseQuicHeader(stream: anytype) !Header {
             return error.InvalidPacket;
         }
 
-        std.log.info("stream.pos: {any}, scid length: {any}", .{ stream.pos, scid_length });
-        header.scid = stream.buffer[stream.pos..(stream.pos + scid_length)];
+        std.log.info("fbs.pos: {any}, scid length: {any}", .{ fbs.pos, scid_length });
+        header.scid = fbs.buffer[fbs.pos..(fbs.pos + scid_length)];
         std.log.info("scid ({}): {any}", .{ scid_length, header.scid });
 
         // advance scid_length
-        try stream.seekBy(scid_length);
+        try fbs.seekBy(scid_length);
 
         if (header.version == undefined) {
             // version negotiation
             //
             // TODO:
-            // remainder_len = @intCast(u32, bytes.len) - @intCast(u32, stream.pos);
+            // remainder_len = @intCast(u32, bytes.len) - @intCast(u32, fbs.pos);
 
             std.log.info("TODO: negotiation!", .{});
             //
@@ -377,8 +376,8 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                     //
                     // https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
                     //
-                    if (stream.buffer.len < 1200) {
-                        std.log.warn("Initial packet length must be 1200 bytes or higher. (actual length {})", .{stream.buffer.len});
+                    if (fbs.buffer.len < 1200) {
+                        std.log.warn("Initial packet length must be 1200 bytes or higher. (actual length {})", .{fbs.buffer.len});
                         return error.InvalidPacket;
                     }
 
@@ -388,8 +387,8 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                         // Token:  The value of the token that was previously provided in a
                         //    Retry packet or NEW_TOKEN frame; see Section 8.1.
                         //
-                        header.token = stream.buffer[stream.pos..(stream.pos + token_length)];
-                        try stream.seekBy(@intCast(i64, token_length));
+                        header.token = fbs.buffer[fbs.pos..(fbs.pos + token_length)];
+                        try fbs.seekBy(@intCast(i64, token_length));
                     } else {
                         std.log.warn("no token!", .{});
                     }
@@ -398,9 +397,9 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                 },
 
                 PacketType.Retry => {
-                    // var token_length = len - stream.pos - RETRY_INTEGRITY_TAG_SIZE;
-                    // var token = bytes[stream.pos..(stream.pos + token_length)];
-                    // try stream.seekBy(@intCast(i64, token_length));
+                    // var token_length = len - fbs.pos - RETRY_INTEGRITY_TAG_SIZE;
+                    // var token = bytes[fbs.pos..(fbs.pos + token_length)];
+                    // try fbs.seekBy(@intCast(i64, token_length));
 
                     std.log.info("TODO: handle Retry packet type...", .{});
                     header.remainder_len = 0;
@@ -411,9 +410,9 @@ pub fn parseQuicHeader(stream: anytype) !Header {
                     // FIXME: this \
                     // std.log.err("TODO: server-side should not accept VersionNegotiation packets.", .{});
                     //
-                    // header.remainder_len = stream.buffer.len - stream.pos;
+                    // header.remainder_len = fbs.buffer.len - fbs.pos;
                     //
-                    // while (stream.pos - stream.buffer.len > 0) {
+                    // while (fbs.pos - fbs.buffer.len > 0) {
                     //     _ = try reader.readInt(u32, ENDIAN); // const version = reader.readInt(u32, ENDIAN);
                     //     // std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
                     // }
@@ -429,7 +428,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
             }
 
             // // check remainder length
-            // if (header.remainder_len > bytes.len - stream.pos) {
+            // if (header.remainder_len > bytes.len - fbs.pos) {
             //     std.log.err("Packet payload is truncated", .{});
             //     return error.InvalidPacket;
             // }
@@ -440,7 +439,7 @@ pub fn parseQuicHeader(stream: anytype) !Header {
     } else {
         log.info("SHORT HEADER!", .{});
 
-        header.remainder_len = stream.buffer.len;
+        header.remainder_len = fbs.buffer.len;
     }
 
     return header;
@@ -526,8 +525,8 @@ fn computeRetryIntegrityTag(
     var buf = try allocator.alloc(u8, odcid.len + packet_bytes_without_tag.len + 1);
     defer allocator.free(buf);
 
-    var stream = io.fixedBufferStream(buf);
-    var buf_writer = stream.writer();
+    var fbs = io.fixedBufferStream(buf);
+    var buf_writer = fbs.writer();
     try buf_writer.writeByte(@intCast(u8, odcid.len));
     try buf_writer.writeAll(odcid);
     try buf_writer.writeAll(packet_bytes_without_tag);

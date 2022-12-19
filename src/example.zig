@@ -22,9 +22,9 @@ const hmac = std.crypto.auth.hmac;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 pub fn main() anyerror!void {
-    // var alloc = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer _ = alloc.deinit();
-    var alloc = std.heap.page_allocator;
+    // var allocator = std.heap.GeneralPurposeAllocator(.{}){};
+    // defer _ = allocator.deinit();
+    var allocator = std.heap.page_allocator;
 
     var server = Server.init();
     // .{
@@ -52,7 +52,7 @@ pub fn main() anyerror!void {
     const sockfd = try server.listen(local_addr);
     defer os.close(sockfd);
 
-    var connections = std.StringHashMap(connection.Connection).init(alloc);
+    var connections = std.StringHashMap(connection.Connection).init(allocator);
     defer connections.clearAndFree();
 
     // out/write buffer
@@ -81,10 +81,10 @@ pub fn main() anyerror!void {
         prevTimestamp = std.time.timestamp();
         std.log.info("FULL PACKET: (len: {}) {any}", .{ packet_length, bytes[0..packet_length] });
 
-        // var stream = io.fixedBufferStream(bytes[0..packet_length]);
-        // const reader = stream.reader();
-        var stream = io.fixedBufferStream(bytes[0..packet_length]);
-        var header = try packet.Header.parse(&stream);
+        // var fbs = io.fixedBufferStream(bytes[0..packet_length]);
+        // const reader = fbs.reader();
+        var fbs = io.fixedBufferStream(bytes[0..packet_length]);
+        var header = try packet.Header.parse(&fbs);
 
         // make sure payload is not higher than received packet  length
         std.log.info("remainder_len: {any} / {any} (packet_length)", .{ header.remainder_len, packet_length });
@@ -144,7 +144,9 @@ pub fn main() anyerror!void {
             }
 
             std.log.info("ACCEPT CONNECTION!", .{});
-            var conn = try server.accept(header, local_addr.any, remote_addr);
+            var conn = try connection.Connection.accept(allocator, header, local_addr.any, remote_addr);
+            defer conn.deinit();
+
             conn_pair.value_ptr.* = conn;
 
             //
@@ -155,15 +157,14 @@ pub fn main() anyerror!void {
         var conn = conn_pair.value_ptr.*;
 
         const epoch = try packet.Epoch.fromPacketType(header.packet_type);
-
         if (epoch == packet.Epoch.ZERO_RTT) {
             std.log.info("TODO: implement zero rtt", .{});
             continue;
         }
 
-        std.log.info("stream.pos: {any}, header.remainder_len: {any}", .{ stream.pos, header.remainder_len });
+        std.log.info("fbs.pos: {any}, header.remainder_len: {any}", .{ fbs.pos, header.remainder_len });
 
-        var payload = conn.decryptPacket(&header, &stream) catch |err| {
+        var payload = conn.decryptPacket(&header, &fbs) catch |err| {
             std.log.err("decrypt error: {any}", .{err});
             break;
         };
@@ -213,7 +214,9 @@ pub fn main() anyerror!void {
         std.log.info("payload ({any}): {any}", .{ payload.len, payload });
 
         // process frames on payload
-        const frame = Frame.parse(payload);
+        const frame = try Frame.parse(payload);
+        try conn.processFrame(frame, epoch);
+
         std.log.info("frame: {any}", .{frame});
     }
 }
