@@ -36,6 +36,7 @@ pub const FrameType = enum(u64) {
     handshake_done = 0x1e,
     // datagram = 0x30,
     // datagram_header = 0x31, (with length)
+    _,
 };
 
 pub const Frame = union(FrameType) {

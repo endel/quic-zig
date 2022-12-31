@@ -1,9 +1,11 @@
 const std = @import("std");
 const io = std.io;
+const os = std.os;
 const log = std.log;
 const time = std.time;
 const assert = std.debug.assert;
 const random = std.crypto.random;
+const tls = std.crypto.tls;
 
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
@@ -34,48 +36,50 @@ const RETRY_INTEGRITY_NONCE_V1: [crypto.nonce_len]u8 = .{ 0x46, 0x15, 0x99, 0xd3
 
 pub const PacketType = enum(u8) {
     /// Initial packet
-    Initial = LONG_HEADER_BIT | FIXED_BIT | 0x00,
+    initial = LONG_HEADER_BIT | FIXED_BIT | 0x00,
 
     /// Retry packet
-    Retry = LONG_HEADER_BIT | FIXED_BIT | 0x30,
+    retry = LONG_HEADER_BIT | FIXED_BIT | 0x30,
 
     /// Handshake packet
-    Handshake = LONG_HEADER_BIT | FIXED_BIT | 0x20,
+    handshake = LONG_HEADER_BIT | FIXED_BIT | 0x20,
 
     /// 0-RTT packet
-    ZeroRTT = LONG_HEADER_BIT | FIXED_BIT | 0x10,
+    zero_rtt = LONG_HEADER_BIT | FIXED_BIT | 0x10,
 
     /// Version negotiation packet
-    VersionNegotiation = 0,
+    version_negotiation = 0,
 
     /// 1-RTT short header packet
-    OneRTT = FIXED_BIT,
+    one_rtt = FIXED_BIT,
+
+    _,
 };
 
 pub const Epoch = enum(u8) {
-    INITIAL = 0,
-    ZERO_RTT = 1,
-    HANDSHAKE = 2,
-    ONE_RTT = 3,
+    initial = 0,
+    zero_rtt = 1,
+    handshake = 2,
+    one_rtt = 3,
 
     pub fn fromPacketType(int: PacketType) !Epoch {
         return switch (int) {
-            PacketType.Initial => Epoch.INITIAL,
-            PacketType.ZeroRTT => Epoch.ZERO_RTT,
-            PacketType.Handshake => Epoch.HANDSHAKE,
-            PacketType.OneRTT => Epoch.ONE_RTT,
+            PacketType.initial => Epoch.initial,
+            PacketType.zero_rtt => Epoch.zero_rtt,
+            PacketType.handshake => Epoch.handshake,
+            PacketType.one_rtt => Epoch.one_rtt,
             else => (error{InvalidPacketType}).InvalidPacketType,
         };
     }
 };
 
 test "Epoch fromPacketType" {
-    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.Initial), Epoch.INITIAL);
-    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.ZeroRTT), Epoch.ZERO_RTT);
-    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.Handshake), Epoch.HANDSHAKE);
-    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.OneRTT), Epoch.ONE_RTT);
+    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.initial), Epoch.initial);
+    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.zero_rtt), Epoch.zero_rtt);
+    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.handshake), Epoch.handshake);
+    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.one_rtt), Epoch.one_rtt);
 
-    const err = Epoch.fromPacketType(PacketType.Retry);
+    const err = Epoch.fromPacketType(PacketType.retry);
     try std.testing.expectError(error.InvalidPacketType, err);
 }
 
@@ -86,30 +90,30 @@ pub const PacketError = error{
 };
 
 pub const ErrorCode = enum(u8) {
-    NO_ERROR = 0x0,
-    INTERNAL_ERROR = 0x1,
-    CONNECTION_REFUSED = 0x2,
-    FLOW_CONTROL_ERROR = 0x3,
-    STREAM_LIMIT_ERROR = 0x4,
-    STREAM_STATE_ERROR = 0x5,
-    FINAL_SIZE_ERROR = 0x6,
-    FRAME_ENCODING_ERROR = 0x7,
-    TRANSPORT_PARAMETER_ERROR = 0x8,
-    CONNECTION_ID_LIMIT_ERROR = 0x9,
-    PROTOCOL_VIOLATION = 0xA,
-    INVALID_TOKEN = 0xB,
-    APPLICATION_ERROR = 0xC,
-    CRYPTO_BUFFER_EXCEEDED = 0xD,
-    KEY_UPDATE_ERROR = 0xE,
-    AEAD_LIMIT_REACHED = 0xF,
-    CRYPTO_ERROR = 0x100,
+    no_error = 0x0,
+    internal_error = 0x1,
+    connection_refused = 0x2,
+    flow_control_error = 0x3,
+    stream_limit_error = 0x4,
+    stream_state_error = 0x5,
+    final_size_error = 0x6,
+    frame_encoding_error = 0x7,
+    transport_parameter_error = 0x8,
+    connection_id_limit_error = 0x9,
+    protocol_violation = 0xa,
+    invalid_token = 0xb,
+    application_error = 0xc,
+    crypto_buffer_exceeded = 0xd,
+    key_update_error = 0xe,
+    aead_limit_reached = 0xf,
+    crypto_error = 0x100,
 };
 
 /// A QUIC packet's header.
 pub const Header = struct {
     const Self = @This();
 
-    version: u32 = undefined,
+    version: u32 = 0,
     packet_type: PacketType = undefined,
 
     /// Destination Connection ID
@@ -149,7 +153,7 @@ pub const Header = struct {
         first |= (self.packet_number_len -| 1); // (saturating sub)
 
         // encode short header
-        if (self.packet_type == PacketType.OneRTT) {
+        if (self.packet_type == PacketType.one_rtt) {
             // unset form bit for short header
             first &= ~LONG_HEADER_BIT; // bitwise NOT
 
@@ -169,12 +173,12 @@ pub const Header = struct {
             return;
         }
 
-        // encode long header
+        // encode long header https://datatracker.ietf.org/doc/html/rfc9000#long-packet-types
         const ty: u8 = switch (self.packet_type) {
-            PacketType.Initial => 0x00,
-            PacketType.ZeroRTT => 0x01,
-            PacketType.Handshake => 0x02,
-            PacketType.Retry => 0x03,
+            PacketType.initial => 0x00,
+            PacketType.zero_rtt => 0x01,
+            PacketType.handshake => 0x02,
+            PacketType.retry => 0x03,
             else => return error.InvalidPacket,
         };
 
@@ -191,7 +195,7 @@ pub const Header = struct {
 
         // Only Initial and Retry packets have a token.
         switch (self.packet_type) {
-            PacketType.Initial => {
+            PacketType.initial => {
                 if (self.token == null or self.token.?.len == 0) {
                     try writeVarInt(writer, self.token.?.len);
                     try writer.writeAll(self.token.?);
@@ -201,7 +205,7 @@ pub const Header = struct {
                 }
             },
 
-            PacketType.Retry => {
+            PacketType.retry => {
                 // retry packets don't have a token length.
                 try writer.writeAll(self.token.?);
             },
@@ -351,89 +355,78 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
         // advance scid_length
         try fbs.seekBy(scid_length);
 
-        if (header.version == undefined) {
-            // version negotiation
-            //
-            // TODO:
-            // remainder_len = @intCast(u32, bytes.len) - @intCast(u32, fbs.pos);
-
-            std.log.info("TODO: negotiation!", .{});
-            //
-        } else {
-            if ((first_byte & FIXED_BIT) == 0) {
-                std.log.err("Packet fixed bit is zero", .{});
-                return error.InvalidPacket;
-            }
-
-            header.packet_type = @intToEnum(PacketType, (first_byte & PACKET_TYPE_MASK));
-            std.log.info("packet_type => {any}", .{header.packet_type});
-
-            switch (header.packet_type) {
-                PacketType.Initial => {
-                    //
-                    // Clients MUST ensure that UDP datagrams containing Initial packets
-                    // have UDP payloads of at least 1200 bytes,
-                    //
-                    // https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
-                    //
-                    if (fbs.buffer.len < 1200) {
-                        std.log.warn("Initial packet length must be 1200 bytes or higher. (actual length {})", .{fbs.buffer.len});
-                        return error.InvalidPacket;
-                    }
-
-                    var token_length = try readVarInt(reader);
-                    if (token_length > 0) {
-                        //
-                        // Token:  The value of the token that was previously provided in a
-                        //    Retry packet or NEW_TOKEN frame; see Section 8.1.
-                        //
-                        header.token = fbs.buffer[fbs.pos..(fbs.pos + token_length)];
-                        try fbs.seekBy(@intCast(i64, token_length));
-                    } else {
-                        std.log.warn("no token!", .{});
-                    }
-
-                    header.remainder_len = try readVarInt(reader);
-                },
-
-                PacketType.Retry => {
-                    // var token_length = len - fbs.pos - RETRY_INTEGRITY_TAG_SIZE;
-                    // var token = bytes[fbs.pos..(fbs.pos + token_length)];
-                    // try fbs.seekBy(@intCast(i64, token_length));
-
-                    std.log.info("TODO: handle Retry packet type...", .{});
-                    header.remainder_len = 0;
-                    // header.token = token;
-                },
-
-                PacketType.VersionNegotiation => {
-                    // FIXME: this \
-                    // std.log.err("TODO: server-side should not accept VersionNegotiation packets.", .{});
-                    //
-                    // header.remainder_len = fbs.buffer.len - fbs.pos;
-                    //
-                    // while (fbs.pos - fbs.buffer.len > 0) {
-                    //     _ = try reader.readInt(u32, ENDIAN); // const version = reader.readInt(u32, ENDIAN);
-                    //     // std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
-                    // }
-                    //
-                    // std.log.err("WHAT>?????", .{});
-                    // // return error.InvalidPacket;
-                },
-
-                else => {
-                    std.log.err("Packet type not recognized: {any}", .{header.packet_type});
-                    header.remainder_len = try readVarInt(reader);
-                },
-            }
-
-            // // check remainder length
-            // if (header.remainder_len > bytes.len - fbs.pos) {
-            //     std.log.err("Packet payload is truncated", .{});
-            //     return error.InvalidPacket;
-            // }
-
+        if ((first_byte & FIXED_BIT) == 0) {
+            std.log.err("Packet fixed bit is zero", .{});
+            return error.InvalidPacket;
         }
+
+        header.packet_type = @intToEnum(PacketType, (first_byte & PACKET_TYPE_MASK));
+        std.log.info("packet_type => {any}", .{header.packet_type});
+
+        switch (header.packet_type) {
+            PacketType.initial => {
+                //
+                // Clients MUST ensure that UDP datagrams containing Initial packets
+                // have UDP payloads of at least 1200 bytes,
+                //
+                // https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
+                //
+                if (fbs.buffer.len < 1200) {
+                    std.log.warn("Initial packet length must be 1200 bytes or higher. (actual length {})", .{fbs.buffer.len});
+                    return error.InvalidPacket;
+                }
+
+                var token_length = try readVarInt(reader);
+                if (token_length > 0) {
+                    //
+                    // Token:  The value of the token that was previously provided in a
+                    //    Retry packet or NEW_TOKEN frame; see Section 8.1.
+                    //
+                    header.token = fbs.buffer[fbs.pos..(fbs.pos + token_length)];
+                    try fbs.seekBy(@intCast(i64, token_length));
+                } else {
+                    std.log.warn("no token!", .{});
+                }
+
+                header.remainder_len = try readVarInt(reader);
+            },
+
+            PacketType.retry => {
+                // var token_length = len - fbs.pos - RETRY_INTEGRITY_TAG_SIZE;
+                // var token = bytes[fbs.pos..(fbs.pos + token_length)];
+                // try fbs.seekBy(@intCast(i64, token_length));
+
+                std.log.info("TODO: handle Retry packet type...", .{});
+                header.remainder_len = 0;
+                // header.token = token;
+            },
+
+            PacketType.version_negotiation => {
+                // FIXME: this \
+                // std.log.err("TODO: server-side should not accept VersionNegotiation packets.", .{});
+                //
+                // header.remainder_len = fbs.buffer.len - fbs.pos;
+                //
+                // while (fbs.pos - fbs.buffer.len > 0) {
+                //     _ = try reader.readInt(u32, ENDIAN); // const version = reader.readInt(u32, ENDIAN);
+                //     // std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
+                // }
+                //
+                // std.log.err("WHAT>?????", .{});
+                // // return error.InvalidPacket;
+            },
+
+            else => {
+                std.log.err("Packet type not recognized: {any}", .{header.packet_type});
+                header.remainder_len = try readVarInt(reader);
+            },
+        }
+
+        // // check remainder length
+        // if (header.remainder_len > bytes.len - fbs.pos) {
+        //     std.log.err("Packet payload is truncated", .{});
+        //     return error.InvalidPacket;
+        // }
 
         //
     } else {
@@ -468,7 +461,7 @@ pub fn retry(
 ) !void {
     var hdr = Header{
         .version = header.version,
-        .packet_type = PacketType.Retry,
+        .packet_type = PacketType.retry,
         .dcid = header.scid,
         .scid = new_scid,
         .token = token,
@@ -538,6 +531,60 @@ fn computeRetryIntegrityTag(
     crypto.Aead.encrypt(&c, &tag, m, buf_writer.context.buffer, nonce, key);
 
     return tag;
+}
+
+///
+///
+pub fn generateRetryToken(
+    header: Header,
+    new_scid: []u8,
+    addr: os.sockaddr,
+) ![]u8 {
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    var writer = fbs.writer();
+
+    try writer.writeAll(encodeAddr(addr));
+
+    // original destination connection id
+    try writer.writeByte(@intCast(u8, header.dcid.len));
+    try writer.writeAll(header.dcid);
+
+    try writer.writeByte(@intCast(u8, new_scid.len));
+    try writer.writeAll(new_scid);
+
+    return fbs.getWritten();
+
+    // buf = Buffer(capacity=512)
+    // push_opaque(buf, 1, encode_address(addr))
+    // push_opaque(buf, 1, original_destination_connection_id)
+    // push_opaque(buf, 1, retry_source_connection_id)
+    // return self._key.public_key().encrypt(
+    //     buf.data,
+    //     padding.OAEP(
+    //         mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None
+    //     ),
+    // )
+
+    // data, err := asn1.Marshal(token{
+    //     IsRetryToken:             true,
+    //     RemoteAddr:               encodeRemoteAddr(raddr),
+    //     OriginalDestConnectionID: origDestConnID.Bytes(),
+    //     RetrySrcConnectionID:     retrySrcConnID.Bytes(),
+    //     Timestamp:                time.Now().UnixNano(),
+    // })
+    // if err != nil {
+    //     return nil, err
+    // }
+    // return g.tokenProtector.NewToken(data)
+}
+
+fn encodeAddr(addr: os.sockaddr) []const u8 {
+    return switch (addr.family) {
+        os.AF.INET => &addr.data,
+        os.AF.INET6 => &addr.data,
+        else => unreachable,
+    };
 }
 
 pub fn readVarInt(reader: anytype) !u64 {

@@ -2,11 +2,13 @@ const std = @import("std");
 const net = std.net;
 const os = std.os;
 const random = std.crypto.random;
+const crypto = std.crypto;
 
 const protocol = @import("protocol.zig");
-const crypto = @import("crypto.zig");
+// const crypto = @import("crypto.zig");
 const packet = @import("packet.zig");
 const frame = @import("frame.zig");
+const Client = @import("handshake/Client.zig");
 
 pub const State = enum(u8) {
     first_flight = 0,
@@ -123,8 +125,9 @@ pub const Connection = struct {
         header: packet.Header,
         local: os.sockaddr, // net.Address,
         remote: os.sockaddr, // net.Address,
+        comptime is_client: bool,
     ) !Connection {
-        const is_client = false;
+        // const is_client = false;
 
         var initial_path = NetworkPath.init(local, remote, true);
 
@@ -139,8 +142,7 @@ pub const Connection = struct {
 
         // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
         // TODO: improve me!
-        const INITIAL = @as(usize, @enumToInt(packet.Epoch.INITIAL));
-        try conn.pkt_num_spaces[INITIAL].setupInitial(header.dcid, header.version, is_client);
+        try conn.pkt_num_spaces[@enumToInt(packet.Epoch.initial)].setupInitial(header.dcid, header.version, is_client);
 
         return conn;
     }
@@ -176,7 +178,7 @@ pub const Connection = struct {
 
     pub fn decryptPacket(self: *Connection, header: *packet.Header, stream: anytype) ![]u8 {
         var epoch = try packet.Epoch.fromPacketType(header.*.packet_type);
-        var space = self.pkt_num_spaces[@as(usize, @enumToInt(epoch))];
+        var space = self.pkt_num_spaces[@enumToInt(epoch)];
 
         return try packet.decrypt(header, stream, space);
     }
@@ -188,9 +190,9 @@ pub const Connection = struct {
         _ = path_id;
     }
 
-    pub fn processFrame(self: Connection, f: frame.Frame, epoch: packet.Epoch) frame.FrameError!void {
-        var space = self.pkt_num_spaces[epoch];
-        _ = space;
+    // pub fn processFrame(self: Connection, f: frame.Frame, epoch: packet.Epoch) !void {
+    pub fn processFrame(self: Connection, f: frame.Frame, epoch: packet.Epoch, ca_bundle: crypto.Certificate.Bundle) !void {
+        var space = self.pkt_num_spaces[@enumToInt(epoch)];
 
         switch (f) {
             .padding => {},
@@ -202,11 +204,27 @@ pub const Connection = struct {
             .reset_stream => {},
             .stop_sending => {},
 
-            .crypto => {
+            .crypto => |crypto_frame| {
+                //
+                // CRYPTO frames are functionally identical to STREAM frames,
+                // except that they do not bear a stream identifier; they are
+                // not flow controlled; and they do not carry markers for
+                // optional offset, optional length, and the end of the stream
+                //
+                // => https://datatracker.ietf.org/doc/html/rfc9000#name-crypto-frames
+                //
+
+                std.log.info("processing crypto frame: {any}", .{crypto_frame});
                 // f.offset
                 // f.data
-                std.log.info("processing crypto frame: {any}", .{f});
-                // space.crypto_stream
+
+                var crypto_stream = space.crypto_stream;
+                crypto_stream.recv(crypto_frame.data);
+
+                // var encryption_level = @enumToInt(epoch);
+
+                var tls_client = try Client.init(&crypto_stream, ca_bundle, "");
+                std.log.info("TLS Client: {any}", .{tls_client});
             },
 
             .new_token => {},

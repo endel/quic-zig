@@ -10,7 +10,6 @@ const Server = @import("quic/server.zig").Server;
 const connection = @import("quic/connection.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
-const token = @import("quic/handshake/token.zig");
 const Frame = @import("quic/frame.zig").Frame;
 
 const h0 = @import("h0/connection.zig");
@@ -26,7 +25,8 @@ pub fn main() anyerror!void {
     // defer _ = allocator.deinit();
     var allocator = std.heap.page_allocator;
 
-    var server = Server.init();
+    var server = try Server.init(allocator, "cert.crt");
+
     // .{
     //     .alpn_protocols = h3.ALPN ++ h0.ALPN ++ [_][]const u8{"siduck"},
     //     // .is_client = false,
@@ -94,7 +94,7 @@ pub fn main() anyerror!void {
         }
 
         std.log.info("packet type: {any}", .{header.packet_type});
-        if (header.packet_type != packet.PacketType.Initial) {
+        if (header.packet_type != packet.PacketType.initial) {
             std.log.err("Packet is not initial!", .{});
             continue;
         }
@@ -120,7 +120,7 @@ pub fn main() anyerror!void {
 
             // generates a random original destination connection id
             var new_scid = connection.generateConnectionId(header.scid.len);
-            var retry_token = try token.generateRetryToken(header, new_scid, remote_addr);
+            var retry_token = try packet.generateRetryToken(header, new_scid, remote_addr);
 
             std.log.info("new scid: {any}", .{new_scid});
             std.log.warn("retry token: {any}", .{retry_token});
@@ -144,7 +144,7 @@ pub fn main() anyerror!void {
             }
 
             std.log.info("ACCEPT CONNECTION!", .{});
-            var conn = try connection.Connection.accept(allocator, header, local_addr.any, remote_addr);
+            var conn = try connection.Connection.accept(allocator, header, local_addr.any, remote_addr, false);
             defer conn.deinit();
 
             conn_pair.value_ptr.* = conn;
@@ -157,7 +157,7 @@ pub fn main() anyerror!void {
         var conn = conn_pair.value_ptr.*;
 
         const epoch = try packet.Epoch.fromPacketType(header.packet_type);
-        if (epoch == packet.Epoch.ZERO_RTT) {
+        if (epoch == packet.Epoch.zero_rtt) {
             std.log.info("TODO: implement zero rtt", .{});
             continue;
         }
@@ -184,7 +184,7 @@ pub fn main() anyerror!void {
         const path_idx = path_idx: {
             var idx: usize = undefined;
 
-            if (header.packet_type == packet.PacketType.ZeroRTT and
+            if (header.packet_type == packet.PacketType.zero_rtt and
                 conn.got_peer_conn_id)
             {
                 // let pkt_dcid = ConnectionId::from_ref(&hdr.dcid);
@@ -215,7 +215,9 @@ pub fn main() anyerror!void {
 
         // process frames on payload
         const frame = try Frame.parse(payload);
-        try conn.processFrame(frame, epoch);
+        try conn.processFrame(frame, epoch, server.ca_bundle);
+
+        // try conn.processFrame(frame, epoch);
 
         std.log.info("frame: {any}", .{frame});
     }
@@ -226,6 +228,5 @@ test {
     _ = @import("quic/connection.zig");
     _ = @import("quic/packet.zig");
     _ = @import("quic/protocol.zig");
-    _ = @import("quic/handshake/token.zig");
     _ = @import("quic/frame.zig");
 }

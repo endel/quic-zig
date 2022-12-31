@@ -4,6 +4,7 @@ const packet = @import("packet.zig");
 const assert = std.debug.assert;
 
 const crypto = std.crypto;
+// const tls = std.crypto.tls;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
@@ -116,22 +117,6 @@ pub const Seal = struct {
     hp_key: [key_len]u8,
     nonce: [nonce_len]u8,
 };
-
-// pub fn aeadEncrypt(bytes: []u8, ad: []u8, nonce: []u8, key: []u8) void {
-//     const tag_len = key_len;
-//     const tag: [tag_len]u8 = tag: {
-//         var t: [tag_len]u8 = undefined;
-//         std.mem.copy(u8, &t, bytes[(bytes.len - tag_len)..bytes.len]);
-//         break :tag t;
-//     };
-//
-//     // TODO: avoid using dynamic allocation
-//     const allocator = std.heap.page_allocator;
-//     var encrypted = try allocator.alloc(u8, bytes.len);
-//     defer allocator.free(encrypted);
-//
-//     return Aead.encrypt(encrypted, bytes, tag, "", nonce, key);
-// }
 
 pub fn deriveInitialKeyMaterial(
     cid: []const u8,
@@ -334,6 +319,8 @@ fn hkdfExpandLabel(
     context: []const u8,
     comptime length: u16,
 ) [length]u8 {
+    // return tls.hkdfExpandLabel(HkdfSha256, secret, label, context, length);
+
     std.debug.assert(label.len <= 255 and label.len > 0);
     std.debug.assert(context.len <= 255);
     const full_label = "tls13 " ++ label;
