@@ -258,12 +258,14 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
 
     var pn_ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
     var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
+    std.log.info("sample: {any}", .{sample.*});
 
     var first_byte = fbs.buffer[0];
 
     // unprotect header
     var aead = space.crypto_open.?;
     var mask = aead.newMask(sample);
+    std.log.info("mask? {any}", .{mask.*});
 
     if (isLongHeader(first_byte)) {
         first_byte ^= (mask[0] & 0x0f);
@@ -272,11 +274,15 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     }
 
     header.packet_number_len = @intCast(usize, (first_byte & PACKET_NUM_MASK)) + 1;
+    std.log.info("header.packet_number_len => {any}", .{header.packet_number_len});
+
+    std.log.info("pn_ciphertext (before): {any}", .{pn_ciphertext.*});
 
     var i: usize = 0;
     while (i < header.packet_number_len) : (i += 1) {
         pn_ciphertext.*[i] ^= mask[1 + i];
     }
+    std.log.info("pn_ciphertext (after): {any}", .{pn_ciphertext.*});
 
     // read truncated/raw packet number
     var truncated_packet_number = try switch (header.packet_number_len) {
@@ -286,6 +292,7 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
         4 => @intCast(u64, std.mem.readInt(u32, pn_ciphertext.*[0..util.sizeOf(u32)], ENDIAN)),
         else => error.InvalidPacket,
     };
+    std.log.info("truncated_packet_number: {any}", .{truncated_packet_number});
 
     // skip packet length byte
     try fbs.seekBy(@intCast(i64, header.packet_number_len));
@@ -376,19 +383,24 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
                     return error.InvalidPacket;
                 }
 
+                std.log.info("token_length: readVarInt (before) => fbs.pos: {any}", .{fbs.pos});
                 var token_length = try readVarInt(reader);
+                std.log.info("token_length: {any}, readVarInt (after) => fbs.pos: {any}", .{ token_length, fbs.pos });
                 if (token_length > 0) {
                     //
                     // Token:  The value of the token that was previously provided in a
                     //    Retry packet or NEW_TOKEN frame; see Section 8.1.
                     //
                     header.token = fbs.buffer[fbs.pos..(fbs.pos + token_length)];
+                    std.log.info("token: {any}", .{header.token});
                     try fbs.seekBy(@intCast(i64, token_length));
                 } else {
                     std.log.warn("no token!", .{});
                 }
 
+                std.log.info("remainder_len: readVarInt (before) => fbs.pos: {any}", .{fbs.pos});
                 header.remainder_len = try readVarInt(reader);
+                std.log.info("remainder_len: {any}, readVarInt (before) => fbs.pos: {any}", .{ header.remainder_len, fbs.pos });
             },
 
             PacketType.retry => {
@@ -418,7 +430,7 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
 
             else => {
                 std.log.err("Packet type not recognized: {any}", .{header.packet_type});
-                header.remainder_len = try readVarInt(reader);
+                header.remainder_len = try readVarInt(&reader);
             },
         }
 

@@ -37,13 +37,13 @@ pub const Stream = struct {
     }
 
     // pub fn read(self: *Stream, buffer: []u8, len: usize) void {
-    pub fn readAtLeast(self: *Stream, buffer: []u8, len: usize) usize {
+    pub fn readAtLeast(self: *Stream, dest: []u8, len: usize) !usize {
         std.log.info(".readAtLeast(), len: {any}, buf.off: {any}, buf.data: {any}", .{ len, self.recv_buffer.off, self.recv_buffer.data });
 
         // TODO: check if off+len is a valid slice. (out of bounds?)
         var slice = self.recv_buffer.data[self.recv_buffer.off..(self.recv_buffer.off + len)];
         for (slice) |b, i| {
-            buffer[i] = b;
+            dest[i] = b;
         }
 
         std.log.info(".readAtLeast(), off: {any}, slice: {any}", .{ self.recv_buffer.off, slice });
@@ -53,7 +53,21 @@ pub const Stream = struct {
         return len;
     }
 
-    pub fn write(self: *Stream, bytes: []const u8) usize {
+    pub fn writevAll(self: *@This(), iovecs: []std.os.iovec_const) !usize {
+        for (iovecs) |iovec| {
+            var i: usize = 0;
+            while (i < iovec.iov_len) : (i += 1) {
+                var ptr = @ptrCast(@TypeOf(iovec.iov_base), iovec.iov_base);
+                self.send_buffer.data[self.send_buffer.off + i] = ptr[i];
+            }
+
+            self.send_buffer.off += iovec.iov_len;
+        }
+
+        return self.send_buffer.off;
+    }
+
+    pub fn writeAll(self: *Stream, bytes: []const u8) !usize {
         for (bytes) |b, i| {
             self.send_buffer.data[self.send_buffer.off + i] = b;
         }
@@ -63,13 +77,13 @@ pub const Stream = struct {
         return self.send_buffer.off;
     }
 
-    pub fn writeString(self: *Stream, data: []const u8) void {
-        // write length
-        self.send_buffer.data[self.send_buffer.off] = @intCast(u8, data.len);
-        self.send_buffer.off += 1;
-
-        _ = self.write(data);
-    }
+    // pub fn writeString(self: *Stream, data: []const u8) void {
+    //     // write length
+    //     self.send_buffer.data[self.send_buffer.off] = @intCast(u8, data.len);
+    //     self.send_buffer.off += 1;
+    //
+    //     _ = self.write(data);
+    // }
 };
 
 pub const RecvBuf = struct {

@@ -16,6 +16,7 @@ const INITIAL_SALT_VERSION_1 = [_]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 
 
 // Header protection sample length
 pub const SAMPLE_LEN = 16;
+pub const MASK_LEN = 5;
 
 // during this experimentational phase, only AES128_GCM is supported.
 pub const Aead = Aes128Gcm;
@@ -43,13 +44,19 @@ pub const Open = struct {
 
     /// Generate a new QUIC Header Protection mask.
     ///
-    pub fn newMask(self: *const Open, sample: *[SAMPLE_LEN]u8) *[5]u8 {
+    pub fn newMask(self: *const Open, sample: *[SAMPLE_LEN]u8) *[MASK_LEN]u8 {
+        // pub fn newMask(self: *const Open, sample: *[SAMPLE_LEN]u8, out: *[SAMPLE_LEN]u8) *[5]u8 {
         const ctx = Aes128.initEnc(self.hp_key);
         // const ctx = Aes256.initEnc(self.hp_key);
 
         var encrypted_out: [SAMPLE_LEN]u8 = .{0x00} ** SAMPLE_LEN;
         ctx.encrypt(&encrypted_out, sample);
-        return encrypted_out[0..5];
+
+        var mask = encrypted_out[0..MASK_LEN];
+
+        std.log.info("inside mask... {any}", .{mask.*});
+
+        return mask;
     }
 
     pub fn decryptPayload(

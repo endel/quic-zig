@@ -12,26 +12,25 @@ const packet = @import("packet.zig");
 pub const Server = struct {
     // config: structs.QuicConfiguration,
     ca_bundle: crypto.Certificate.Bundle = .{},
+    alloc: std.mem.Allocator,
 
-    // pub fn init(config: QuicConfiguration) Server {
-    pub fn init(gpa: std.mem.Allocator, cert_filename: []const u8) !Server { // , key: []const u8
+    pub fn init(gpa: std.mem.Allocator, cert_path: []const u8) !Server { // , key: []const u8
         var ca_bundle: crypto.Certificate.Bundle = .{};
-
-        var cert_path = [_]u8{undefined} ** std.fs.MAX_PATH_BYTES;
-        var path = try std.fs.realpath("self-signed", &cert_path);
-        var cert_dir = try fs.openDirAbsolute(path, .{});
-
-        try ca_bundle.addCertsFromFile(gpa, cert_dir, cert_filename);
-
-        return .{ .ca_bundle = ca_bundle };
-
+        var cert_file = try fs.openFileAbsolute(cert_path, .{});
+        defer cert_file.close();
+        try ca_bundle.addCertsFromFile(gpa, cert_file);
+        return .{
+            .ca_bundle = ca_bundle,
+            .alloc = gpa,
+        };
+        //
         // _ = gpa;
-        // _ = cert_filename;
+        // _ = cert_path;
         // return .{};
     }
 
     pub fn deinit(self: *Server) void {
-        self.ca_bundle.deinit();
+        self.ca_bundle.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -46,5 +45,6 @@ pub const Server = struct {
 };
 
 test "init" {
-    _ = try Server.init(std.testing.allocator, "");
+    var server = try Server.init(std.testing.allocator, "/Users/endel/Projects/netcode.io/quic-zig/self-signed/cert.crt");
+    defer server.deinit();
 }

@@ -171,6 +171,16 @@ pub const Frame = union(FrameType) {
                 const offset = try packet.readVarInt(reader);
                 const length = try packet.readVarInt(reader);
 
+                //
+                // TODO: Support coalesced packets
+                //
+                // Because packets could be reordered on the wire, QUIC
+                // uses the packet type to indicate which keys were used to
+                // protect a given packet, as shown in Table 1. When packets of
+                // different types need to be sent, endpoints SHOULD use
+                // coalesced packets to send them in the same UDP datagram
+                //
+
                 return .{
                     .crypto = .{
                         .offset = offset,
@@ -348,6 +358,14 @@ pub const Frame = union(FrameType) {
             else => true,
         };
     }
+
+    // pub fn format(self: @This(), comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+    //     _ = self;
+    //     _ = fmt;
+    //     _ = options;
+    //     _ = writer;
+    //     try writer.print("Frame.padding, {}", .{0});
+    // }
 };
 
 test "parse padding frame" {

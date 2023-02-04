@@ -25,7 +25,7 @@ pub fn main() anyerror!void {
     // defer _ = allocator.deinit();
     var allocator = std.heap.page_allocator;
 
-    var server = try Server.init(allocator, "cert.crt");
+    var server = try Server.init(allocator, "/Users/endel/Projects/netcode.io/quic-zig/self-signed/cert.crt");
 
     // .{
     //     .alpn_protocols = h3.ALPN ++ h0.ALPN ++ [_][]const u8{"siduck"},
@@ -85,6 +85,7 @@ pub fn main() anyerror!void {
         // const reader = fbs.reader();
         var fbs = io.fixedBufferStream(bytes[0..packet_length]);
         var header = try packet.Header.parse(&fbs);
+        std.log.info("FBS POS => {any}", .{fbs.pos});
 
         // make sure payload is not higher than received packet  length
         std.log.info("remainder_len: {any} / {any} (packet_length)", .{ header.remainder_len, packet_length });
@@ -144,7 +145,7 @@ pub fn main() anyerror!void {
             }
 
             std.log.info("ACCEPT CONNECTION!", .{});
-            var conn = try connection.Connection.accept(allocator, header, local_addr.any, remote_addr, false);
+            var conn = try connection.Connection.accept(allocator, header, local_addr.any, remote_addr, true);
             defer conn.deinit();
 
             conn_pair.value_ptr.* = conn;
@@ -164,6 +165,7 @@ pub fn main() anyerror!void {
 
         std.log.info("fbs.pos: {any}, header.remainder_len: {any}", .{ fbs.pos, header.remainder_len });
 
+        std.log.info("FBS POS => {any}", .{fbs.pos});
         var payload = conn.decryptPacket(&header, &fbs) catch |err| {
             std.log.err("decrypt error: {any}", .{err});
             break;
@@ -215,11 +217,10 @@ pub fn main() anyerror!void {
 
         // process frames on payload
         const frame = try Frame.parse(payload);
+        std.log.info("received frame: {any}", .{frame});
+
         try conn.processFrame(frame, epoch, server.ca_bundle);
-
         // try conn.processFrame(frame, epoch);
-
-        std.log.info("frame: {any}", .{frame});
     }
 }
 

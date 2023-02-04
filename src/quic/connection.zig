@@ -8,6 +8,7 @@ const protocol = @import("protocol.zig");
 // const crypto = @import("crypto.zig");
 const packet = @import("packet.zig");
 const frame = @import("frame.zig");
+const tls = @import("tls.zig");
 const Client = @import("handshake/Client.zig");
 
 pub const State = enum(u8) {
@@ -93,6 +94,10 @@ pub const TransportParams = struct {
             .max_datagram_frame_size = undefined,
         };
     }
+
+    pub fn encode() void {
+        // TODO: encode TransportParams
+    }
 };
 
 ///
@@ -104,7 +109,10 @@ pub const Connection = struct {
     dcid: []const u8,
     scid: []const u8,
 
+    handshake: tls.Handshake = .{},
+
     is_server: bool,
+    transport_params: TransportParams = TransportParams.default(),
 
     state: State = State.first_flight,
     paths: [1]NetworkPath = .{undefined} ** 1, // TODO: support multiple paths
@@ -125,9 +133,9 @@ pub const Connection = struct {
         header: packet.Header,
         local: os.sockaddr, // net.Address,
         remote: os.sockaddr, // net.Address,
-        comptime is_client: bool,
+        comptime is_server: bool,
     ) !Connection {
-        // const is_client = false;
+        // const is_server = false;
 
         var initial_path = NetworkPath.init(local, remote, true);
 
@@ -136,13 +144,13 @@ pub const Connection = struct {
             .dcid = header.dcid,
             .scid = header.scid,
             .version = header.version,
-            .is_server = !is_client,
+            .is_server = is_server,
             .paths = .{initial_path},
         };
 
         // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
         // TODO: improve me!
-        try conn.pkt_num_spaces[@enumToInt(packet.Epoch.initial)].setupInitial(header.dcid, header.version, is_client);
+        try conn.pkt_num_spaces[@enumToInt(packet.Epoch.initial)].setupInitial(header.dcid, header.version, is_server);
 
         return conn;
     }
@@ -176,11 +184,11 @@ pub const Connection = struct {
     //     crypto.CryptoPair{}, // packet.Epoch.ONE_RTT
     // },
 
-    pub fn decryptPacket(self: *Connection, header: *packet.Header, stream: anytype) ![]u8 {
+    pub fn decryptPacket(self: *Connection, header: *packet.Header, fbs: anytype) ![]u8 {
         var epoch = try packet.Epoch.fromPacketType(header.*.packet_type);
         var space = self.pkt_num_spaces[@enumToInt(epoch)];
 
-        return try packet.decrypt(header, stream, space);
+        return try packet.decrypt(header, fbs, space);
     }
 
     pub fn setInitialDCID(self: Connection, cid: []const u8, path_id: usize, reset_token: ?[]u8) void {
@@ -190,13 +198,20 @@ pub const Connection = struct {
         _ = path_id;
     }
 
-    // pub fn processFrame(self: Connection, f: frame.Frame, epoch: packet.Epoch) !void {
-    pub fn processFrame(self: Connection, f: frame.Frame, epoch: packet.Epoch, ca_bundle: crypto.Certificate.Bundle) !void {
+    // pub fn processFrame(self: *Connection, f: frame.Frame, epoch: packet.Epoch) !void {
+    pub fn processFrame(self: *Connection, f: frame.Frame, epoch: packet.Epoch, ca_bundle: crypto.Certificate.Bundle) !void {
         var space = self.pkt_num_spaces[@enumToInt(epoch)];
 
+        _ = space;
+        _ = ca_bundle;
+
         switch (f) {
-            .padding => {},
-            .ping => {},
+            .padding => |size| {
+                std.log.info("Padding, size: {}", .{size});
+            },
+            .ping => {
+                std.log.info("Ping...", .{});
+            },
 
             .ack => {},
             .ack_ecn => {},
@@ -205,6 +220,7 @@ pub const Connection = struct {
             .stop_sending => {},
 
             .crypto => |crypto_frame| {
+
                 //
                 // CRYPTO frames are functionally identical to STREAM frames,
                 // except that they do not bear a stream identifier; they are
@@ -215,16 +231,16 @@ pub const Connection = struct {
                 //
 
                 std.log.info("processing crypto frame: {any}", .{crypto_frame});
-                // f.offset
-                // f.data
 
-                var crypto_stream = space.crypto_stream;
-                crypto_stream.recv(crypto_frame.data);
+                // var crypto_stream = space.crypto_stream;
+                // crypto_stream.recv(crypto_frame.data);
 
-                // var encryption_level = @enumToInt(epoch);
+                self.handshake.provideData(crypto_frame.data, @enumToInt(epoch));
 
-                var tls_client = try Client.init(&crypto_stream, ca_bundle, "");
-                std.log.info("TLS Client: {any}", .{tls_client});
+                self.handshake.perform(self.is_server);
+
+                // var tls_client = try Client.init(&crypto_stream, ca_bundle, "");
+                // std.log.info("TLS Client: {any}", .{tls_client});
             },
 
             .new_token => {},
@@ -245,6 +261,10 @@ pub const Connection = struct {
             .application_close => {},
             .handshake_done => {},
         }
+    }
+
+    fn doHandshake(data: []u8) void {
+        _ = data;
     }
 };
 
