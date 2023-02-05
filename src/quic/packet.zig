@@ -258,7 +258,6 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
 
     var pn_ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
     var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
-    std.log.info("sample: {any}", .{sample.*});
 
     var first_byte = fbs.buffer[0];
 
@@ -266,28 +265,19 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     var aead = space.crypto_open.?;
 
     var mask = aead.newMask(sample);
-    std.log.info("mask? {any}", .{mask});
 
-    std.log.info("first_byte (before) {any}", .{first_byte});
     if (isLongHeader(first_byte)) {
-        std.log.info("first_byte ^= (mask[0] & 0x0f), mask[0] = {any}, result = {any}", .{ mask[0], first_byte ^ (mask[0] & 0x0f) });
         first_byte ^= (mask[0] & 0x0f);
     } else {
-        std.log.info("first_byte ^= (mask[0] & 0x0f), mask[0] = {any}, result = {any}", .{ mask[0], first_byte ^ (mask[0] & 0x1f) });
         first_byte ^= (mask[0] & 0x1f);
     }
-    std.log.info("first_byte (after) {any}", .{first_byte});
 
     header.packet_number_len = @intCast(usize, (first_byte & PACKET_NUM_MASK)) + 1;
-    std.log.info("header.packet_number_len => {any}", .{header.packet_number_len});
-
-    std.log.info("pn_ciphertext (before): {any}", .{pn_ciphertext.*});
 
     var i: usize = 0;
     while (i < header.packet_number_len) : (i += 1) {
         pn_ciphertext.*[i] ^= mask[1 + i];
     }
-    std.log.info("pn_ciphertext (after): {any}", .{pn_ciphertext.*});
 
     // read truncated/raw packet number
     var truncated_packet_number = try switch (header.packet_number_len) {
@@ -297,7 +287,6 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
         4 => @intCast(u64, std.mem.readInt(u32, pn_ciphertext.*[0..util.sizeOf(u32)], ENDIAN)),
         else => error.InvalidPacket,
     };
-    std.log.info("truncated_packet_number: {any}", .{truncated_packet_number});
 
     // skip packet length byte
     try fbs.seekBy(@intCast(i64, header.packet_number_len));
@@ -312,7 +301,6 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     // https://www.rfc-editor.org/rfc/rfc9000.html#name-packet-number-encoding-and-
     //
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
-    std.log.info("packet number: {any}", .{header.packet_number});
 
     return try aead.decryptPayload(
         header.packet_number,

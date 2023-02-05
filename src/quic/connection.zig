@@ -234,7 +234,7 @@ pub const Connection = struct {
 
                 self.handshake.provideData(crypto_frame.data, @enumToInt(epoch));
 
-                self.handshake.perform(self.is_server);
+                try self.handshake.perform(self.is_server);
 
                 // var tls_client = try Client.init(&crypto_stream, ca_bundle, "");
                 // std.log.info("TLS Client: {any}", .{tls_client});

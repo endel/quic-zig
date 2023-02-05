@@ -97,15 +97,23 @@ pub const Handshake = struct {
         self.encryption_level = encryption_level;
     }
 
-    pub fn perform(self: *Handshake, is_server: bool) void {
-        _ = self;
-        _ = is_server;
+    pub fn perform(self: *Handshake, is_server: bool) !void {
+        if (is_server) {
+            try self.doServerHandshake();
+        } else {
+            try self.doClientHandshake();
+        }
     }
 
-    fn do_server_handshake(self: *Handshake) void {
-        var decoder = tls.Decoder(.{ .buf = &self.buffer });
+    fn doServerHandshake(self: *Handshake) !void {
+        var decoder: tls.Decoder = .{
+            .buf = &self.buffer,
+            .our_end = self.buffer.len,
+        };
+        // try decoder.ensure(self.buffer.len);
 
         while (self.state != .done) {
+            std.log.info("doServerHandshake ... state: {any}", .{self.state});
             //
             switch (self.state) {
                 .start => {
@@ -123,20 +131,30 @@ pub const Handshake = struct {
 
                     // parse client hello
                     var protocol_version = decoder.decode(u16);
-                    var random = decoder.array(RANDOM_SIZE);
-                    var session_id = decoder.array(decoder.decode(u8));
+                    std.log.info("protocol_version: {any}", .{protocol_version});
+
+                    var random = decoder.slice(RANDOM_SIZE);
+                    std.log.info("random: {any}", .{random});
+
+                    var session_id = decoder.slice(decoder.decode(u8));
+                    std.log.info("session_id: ({any}) => {any}", .{ session_id.len, session_id });
+
                     if (session_id.len > MAX_SESSION_ID_LENGTH) {
                         std.log.err("ClientHello: session_id must not exceed {} length", .{MAX_SESSION_ID_LENGTH});
                         return error.HandshakeError;
                     }
 
-                    var cipher_suites = decoder.array(decoder.decode(u16));
+                    var cipher_suites = decoder.slice(decoder.decode(u16));
+                    std.log.info("cipher_suites: {any}", .{cipher_suites});
+
                     if (cipher_suites.len < 2) {
                         std.log.err("ClientHello: cipher_suites must be length 2 or higher.", .{});
                         return error.HandshakeError;
                     }
 
-                    var compression_methods = decoder.array(decoder.decode(u8));
+                    var compression_methods = decoder.slice(decoder.decode(u8));
+                    std.log.info("compression_methods: {any}", .{compression_methods});
+
                     if (compression_methods.len < 1) {
                         std.log.err("ClientHello: compression_methods must be length 1 or higher.", .{});
                         return error.HandshakeError;
@@ -153,11 +171,11 @@ pub const Handshake = struct {
                         //
                         // => http://tools.ietf.org/html/rfc5246#section-7.4.1.4
                         //
-                        extensions = decoder.array(decoder.decode(u16));
+                        extensions = decoder.slice(decoder.decode(u16));
                     }
 
                     var client_hello: ClientHello = .{
-                        .raw_bytes = self.buffer,
+                        .raw_bytes = &self.buffer,
                         .protocol_version = protocol_version,
                         .random = random,
                         .session_id = session_id,
@@ -191,8 +209,14 @@ pub const Handshake = struct {
                 .send_server_finished => {},
                 .finish_server_handshake => {},
                 .done => {},
+                else => return error.HandshakeError,
             }
         }
+    }
+
+    fn doClientHandshake(self: *Handshake) !void {
+        _ = self;
+        std.log.info("TODO: doClientHandshake ...", .{});
     }
 };
 
