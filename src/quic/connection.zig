@@ -1,7 +1,6 @@
 const std = @import("std");
 const net = std.net;
 const os = std.os;
-const random = std.crypto.random;
 const crypto = std.crypto;
 
 const protocol = @import("protocol.zig");
@@ -135,8 +134,6 @@ pub const Connection = struct {
         remote: os.sockaddr, // net.Address,
         comptime is_server: bool,
     ) !Connection {
-        // const is_server = false;
-
         var initial_path = NetworkPath.init(local, remote, true);
 
         var conn = Connection{
@@ -272,7 +269,7 @@ pub const Connection = struct {
 pub fn generateConnectionId(size: usize) []u8 {
     // OPTIMIZE: potentially wasting compute here in order to avoid dynamic mem allocation
     var cid: [packet.CONNECTION_ID_MAX_SIZE]u8 = undefined;
-    random.bytes(&cid);
+    crypto.random.bytes(&cid);
     return cid[0..size];
 }
 

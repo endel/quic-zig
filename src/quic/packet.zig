@@ -240,8 +240,8 @@ pub const PacketNumSpace = struct {
     // crypto_stream: stream.Stream = stream.Stream{},
     crypto_stream: stream.Stream = undefined,
 
-    pub fn setupInitial(self: *PacketNumSpace, dcid: []const u8, version: u32, comptime is_client: bool) !void {
-        var keys = try crypto.deriveInitialKeyMaterial(dcid, version, is_client);
+    pub fn setupInitial(self: *PacketNumSpace, dcid: []const u8, version: u32, comptime is_server: bool) !void {
+        var keys = try crypto.deriveInitialKeyMaterial(dcid, version, is_server);
         self.crypto_open = keys[0];
         self.crypto_seal = keys[1];
     }
@@ -264,14 +264,19 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
 
     // unprotect header
     var aead = space.crypto_open.?;
-    var mask = aead.newMask(sample);
-    std.log.info("mask? {any}", .{mask.*});
 
+    var mask = aead.newMask(sample);
+    std.log.info("mask? {any}", .{mask});
+
+    std.log.info("first_byte (before) {any}", .{first_byte});
     if (isLongHeader(first_byte)) {
+        std.log.info("first_byte ^= (mask[0] & 0x0f), mask[0] = {any}, result = {any}", .{ mask[0], first_byte ^ (mask[0] & 0x0f) });
         first_byte ^= (mask[0] & 0x0f);
     } else {
+        std.log.info("first_byte ^= (mask[0] & 0x0f), mask[0] = {any}, result = {any}", .{ mask[0], first_byte ^ (mask[0] & 0x1f) });
         first_byte ^= (mask[0] & 0x1f);
     }
+    std.log.info("first_byte (after) {any}", .{first_byte});
 
     header.packet_number_len = @intCast(usize, (first_byte & PACKET_NUM_MASK)) + 1;
     std.log.info("header.packet_number_len => {any}", .{header.packet_number_len});

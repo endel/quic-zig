@@ -165,7 +165,6 @@ pub fn main() anyerror!void {
 
         std.log.info("fbs.pos: {any}, header.remainder_len: {any}", .{ fbs.pos, header.remainder_len });
 
-        std.log.info("FBS POS => {any}", .{fbs.pos});
         var payload = conn.decryptPacket(&header, &fbs) catch |err| {
             std.log.err("decrypt error: {any}", .{err});
             break;

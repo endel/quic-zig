@@ -44,7 +44,7 @@ pub const Open = struct {
 
     /// Generate a new QUIC Header Protection mask.
     ///
-    pub fn newMask(self: *const Open, sample: *[SAMPLE_LEN]u8) *[MASK_LEN]u8 {
+    pub fn newMask(self: *const Open, sample: *[SAMPLE_LEN]u8) []u8 {
         // pub fn newMask(self: *const Open, sample: *[SAMPLE_LEN]u8, out: *[SAMPLE_LEN]u8) *[5]u8 {
         const ctx = Aes128.initEnc(self.hp_key);
         // const ctx = Aes256.initEnc(self.hp_key);
@@ -52,11 +52,7 @@ pub const Open = struct {
         var encrypted_out: [SAMPLE_LEN]u8 = .{0x00} ** SAMPLE_LEN;
         ctx.encrypt(&encrypted_out, sample);
 
-        var mask = encrypted_out[0..MASK_LEN];
-
-        std.log.info("inside mask... {any}", .{mask.*});
-
-        return mask;
+        return std.mem.sliceAsBytes(encrypted_out[0..MASK_LEN]);
     }
 
     pub fn decryptPayload(
@@ -128,7 +124,7 @@ pub const Seal = struct {
 pub fn deriveInitialKeyMaterial(
     cid: []const u8,
     version: u32,
-    comptime is_client: bool,
+    comptime is_server: bool,
 ) !std.meta.Tuple(&.{ Open, Seal }) {
     if (version != protocol.SUPPORTED_VERSIONS[0]) {
         std.log.err("only version 1 is supported right now.", .{});
@@ -152,28 +148,12 @@ pub fn deriveInitialKeyMaterial(
     const server_iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
     const server_hp_key = hkdfExpandLabel(secret, "quic hp", "", key_len); //header protection key
 
-    return if (is_client) .{
-        Open{
-            .key = server_key,
-            .hp_key = server_hp_key,
-            .nonce = server_iv,
-        },
-        Seal{
-            .key = client_key,
-            .hp_key = client_hp_key,
-            .nonce = client_iv,
-        },
+    return if (is_server) .{
+        Open{ .key = client_key, .hp_key = client_hp_key, .nonce = client_iv },
+        Seal{ .key = server_key, .hp_key = server_hp_key, .nonce = server_iv },
     } else .{
-        Open{
-            .key = client_key,
-            .hp_key = client_hp_key,
-            .nonce = client_iv,
-        },
-        Seal{
-            .key = server_key,
-            .hp_key = server_hp_key,
-            .nonce = server_iv,
-        },
+        Open{ .key = server_key, .hp_key = server_hp_key, .nonce = server_iv },
+        Seal{ .key = client_key, .hp_key = client_hp_key, .nonce = client_iv },
     };
 }
 
