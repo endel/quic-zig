@@ -106,11 +106,11 @@ pub const Handshake = struct {
     }
 
     fn doServerHandshake(self: *Handshake) !void {
+        // try decoder.ensure(self.buffer.len);
         var decoder: tls.Decoder = .{
             .buf = &self.buffer,
             .our_end = self.buffer.len,
         };
-        // try decoder.ensure(self.buffer.len);
 
         while (self.state != .done) {
             std.log.info("doServerHandshake ... state: {any}", .{self.state});
@@ -122,61 +122,60 @@ pub const Handshake = struct {
                 },
 
                 .read_client_hello => {
-                    // get message type
+                    // get message type and length
                     const message_type = @intToEnum(MessageType, decoder.decode(u8));
                     if (message_type != .client_hello) {
                         std.log.err("ClientHello: invalid message type", .{});
                         return error.HandshakeError;
                     }
 
+                    const message_len = decoder.decode(u24);
+
+                    // FIXME: use tls.Decoder.sub()??
+                    var msg_decoder = tls.Decoder.fromTheirSlice(self.buffer[decoder.idx..(decoder.idx + message_len)]);
+                    msg_decoder.our_end = message_len;
+                    // advance main decoder, we're gonna use only the
+                    // msg_decoder within this block
+                    decoder.skip(message_len);
+
                     // parse client hello
-                    var protocol_version = decoder.decode(u16);
-                    std.log.info("protocol_version: {any}", .{protocol_version});
-
-                    var random = decoder.slice(RANDOM_SIZE);
-                    std.log.info("random: {any}", .{random});
-
-                    var session_id = decoder.slice(decoder.decode(u8));
-                    std.log.info("session_id: ({any}) => {any}", .{ session_id.len, session_id });
-
+                    var legacy_version = msg_decoder.decode(u16);
+                    var random = msg_decoder.slice(RANDOM_SIZE);
+                    var session_id_len = msg_decoder.decode(u8);
+                    var session_id = msg_decoder.slice(session_id_len);
                     if (session_id.len > MAX_SESSION_ID_LENGTH) {
                         std.log.err("ClientHello: session_id must not exceed {} length", .{MAX_SESSION_ID_LENGTH});
                         return error.HandshakeError;
                     }
 
-                    var cipher_suites = decoder.slice(decoder.decode(u16));
-                    std.log.info("cipher_suites: {any}", .{cipher_suites});
-
+                    var cipher_suites = msg_decoder.slice(msg_decoder.decode(u16));
                     if (cipher_suites.len < 2) {
                         std.log.err("ClientHello: cipher_suites must be length 2 or higher.", .{});
                         return error.HandshakeError;
                     }
 
-                    var compression_methods = decoder.slice(decoder.decode(u8));
-                    std.log.info("compression_methods: {any}", .{compression_methods});
-
+                    var compression_methods = msg_decoder.slice(msg_decoder.decode(u8));
                     if (compression_methods.len < 1) {
                         std.log.err("ClientHello: compression_methods must be length 1 or higher.", .{});
                         return error.HandshakeError;
                     }
 
                     var extensions: ?[]u8 = null;
-
-                    if (!decoder.eof()) {
+                    if (msg_decoder.idx + 3 < msg_decoder.our_end) {
                         //
-                        // parse extrension
+                        // parse extensions
                         //
                         // there may not be more than one extension of the same
                         // type in a ClientHello or ServerHello.
                         //
                         // => http://tools.ietf.org/html/rfc5246#section-7.4.1.4
                         //
-                        extensions = decoder.slice(decoder.decode(u16));
+                        extensions = msg_decoder.slice(msg_decoder.decode(u16));
                     }
 
                     var client_hello: ClientHello = .{
-                        .raw_bytes = &self.buffer,
-                        .protocol_version = protocol_version,
+                        .buf = msg_decoder.buf,
+                        .legacy_version = legacy_version,
                         .random = random,
                         .session_id = session_id,
                         .cipher_suites = cipher_suites,
@@ -184,10 +183,19 @@ pub const Handshake = struct {
                         .extensions = extensions,
                     };
 
-                    std.log.info("ClientHello: {any}", .{client_hello});
+                    std.log.info("ClientHello => {any}", .{client_hello});
+
+                    // TODO: decrypt ECH
+                    // TODO: validate ECH
+                    // TODO: extract SNI
+
+                    self.state = .read_client_hello_after_ech;
                 },
 
-                .read_client_hello_after_ech => {},
+                .read_client_hello_after_ech => {
+                    return (error{NotImplemented}).NotImplemented;
+                },
+
                 .select_certificate => {},
                 .tls13 => {},
                 .select_parameters => {},
@@ -247,8 +255,8 @@ pub const Handshake = struct {
 // };
 
 pub const ClientHello = struct {
-    raw_bytes: []u8,
-    protocol_version: u16,
+    buf: []u8,
+    legacy_version: u16,
     random: []u8,
     session_id: []u8,
     cipher_suites: []u8,

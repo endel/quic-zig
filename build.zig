@@ -13,7 +13,7 @@ pub fn build(b: *std.build.Builder) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "netcode",
+        .name = "quic",
         .root_source_file = .{ .path = "src/example.zig" },
         .target = target,
         .optimize = optimize,
