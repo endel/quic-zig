@@ -1,12 +1,16 @@
 const std = @import("std");
+const io = std.io;
 const tls = std.crypto.tls;
 const packet = @import("packet.zig");
+const util = @import("util.zig");
 
 const RANDOM_SIZE = 32;
 const MAX_SESSION_ID_LENGTH = 32;
 
 pub const TLSError = error{
     HandshakeError,
+    DecodeError,
+    NotImplemented,
 };
 
 pub const HandshakeState = enum(u8) {
@@ -90,6 +94,7 @@ pub const Handshake = struct {
     buffer: [8000]u8 = .{0} ** 8000,
     encryption_level: u8 = 0,
     state: HandshakeState = .start, // .start_accept
+    hostname: []u8 = undefined,
 
     pub fn provideData(self: *Handshake, data: []u8, encryption_level: u8) void {
         // FIXME: append here instead of replacing into position 0
@@ -186,14 +191,16 @@ pub const Handshake = struct {
                     std.log.info("ClientHello => {any}", .{client_hello});
 
                     // TODO: decrypt ECH
+                    try decryptECH(&client_hello);
                     // TODO: validate ECH
-                    // TODO: extract SNI
+
+                    try self.extractSNI(&client_hello);
 
                     self.state = .read_client_hello_after_ech;
                 },
 
                 .read_client_hello_after_ech => {
-                    return (error{NotImplemented}).NotImplemented;
+                    return error.NotImplemented;
                 },
 
                 .select_certificate => {},
@@ -225,6 +232,45 @@ pub const Handshake = struct {
     fn doClientHandshake(self: *Handshake) !void {
         _ = self;
         std.log.info("TODO: doClientHandshake ...", .{});
+    }
+
+    fn decryptECH(client_hello: *ClientHello) !void {
+        var encrypted_client_hello = try client_hello.getExtension(.encrypted_client_hello);
+        if (encrypted_client_hello != null) {
+            std.log.err("encrypted_client_hello extension FOUND. ECH decryption not implemented.", .{});
+            return error.NotImplemented;
+        }
+    }
+
+    fn extractSNI(self: *Handshake, client_hello: *ClientHello) !void {
+        //
+        // SNI = ServerNameIndication extension
+        //
+
+        var server_name_ext = try client_hello.getExtension(.server_name);
+        if (server_name_ext == null) {
+            // no SNI extension to parse
+            return;
+        }
+
+        // TODO: optimize here
+
+        var ext = util.StreamReader.from(server_name_ext.?);
+        var server_name_list = util.StreamReader.from(ext.getSlicePrefixedLength(u16));
+        var name_type = server_name_list.get(u8);
+        var host_name_len = server_name_list.get(u16);
+        var host_name = server_name_list.getSlice(host_name_len);
+
+        if (name_type != 0 or
+            host_name.len == 0 or
+            host_name.len > 255 or // max hostname length
+            host_name.len != host_name_len // memchr 0
+        ) {
+            return error.DecodeError;
+        }
+
+        self.hostname = host_name;
+        // hs->should_ack_sni = true;
     }
 };
 
@@ -262,6 +308,28 @@ pub const ClientHello = struct {
     cipher_suites: []u8,
     compression_methods: []u8,
     extensions: ?[]u8,
+
+    pub fn getExtension(self: *ClientHello, find_extension_type: ExtensionType) !?[]u8 {
+        if (self.extensions != null) {
+            var reader = util.StreamReader.from(self.extensions.?);
+
+            while (!reader.eof()) {
+                var extension_type = reader.get(ExtensionType);
+                std.log.info("extension type => {any}", .{extension_type});
+
+                var value_len = reader.get(u16);
+                std.log.info("extension value length => {any}", .{value_len});
+
+                var value = reader.getSlice(value_len);
+                std.log.info("extension value => {any}", .{value});
+
+                if (extension_type == find_extension_type) {
+                    return value;
+                }
+            }
+        }
+        return null;
+    }
 };
 
 pub const ExtensionType = enum(u16) {
@@ -269,6 +337,7 @@ pub const ExtensionType = enum(u16) {
     max_fragment_length = 1, // RFC 6066
     status_request = 5, // RFC 6066
     supported_groups = 10, // RFC 8422, 7919
+    ec_point_formats = 11, // RFC 4492
     signature_algorithms = 13, // RFC 8446
     use_srtp = 14, // RFC 5764
     heartbeat = 15, // RFC 6520
@@ -277,6 +346,9 @@ pub const ExtensionType = enum(u16) {
     client_certificate_type = 19, // RFC 7250
     server_certificate_type = 20, // RFC 7250
     padding = 21, // RFC 7685
+    extended_master_secret = 23, // RFC 7627
+    cert_compression = 27, // RFC 8879
+    session_ticket = 35, // RFC 4507
     pre_shared_key = 41, // RFC 8446
     early_data = 42, // RFC 8446
     supported_versions = 43, // RFC 8446
@@ -287,5 +359,17 @@ pub const ExtensionType = enum(u16) {
     post_handshake_auth = 49, // RFC 8446
     signature_algorithms_cert = 50, // RFC 8446
     key_share = 51, // RFC 8446
+    quic_transport_parameters = 57, // RFC 9000
+
+    //
+    renegotiate = 0xff01, // RFC 5746
+    next_proto_neg = 13172, // (This is not an IANA defined extension number)
+    delegated_credential = 0x22, // draft-ietf-tls-subcerts.
+    application_settings = 17513, // (draft-vvv-tls-alps. This is not an IANA defined extension number.)
+    encrypted_client_hello = 0xfe0d, // (draft-ietf-tls-esni-13. This is not an IANA defined extension number.)
+    ech_outer_extensions = 0xfd00, // (draft-ietf-tls-esni-13. This is not an IANA defined extension number.)
+    channel_id = 30032, // (This is not an IANA defined extension number)
+    //
+
     _,
 };
