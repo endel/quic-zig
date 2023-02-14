@@ -68,7 +68,7 @@ pub const Epoch = enum(u8) {
             PacketType.zero_rtt => Epoch.zero_rtt,
             PacketType.handshake => Epoch.handshake,
             PacketType.one_rtt => Epoch.one_rtt,
-            else => (error{InvalidPacketType}).InvalidPacketType,
+            else => error.InvalidPacketType,
         };
     }
 };
@@ -86,6 +86,7 @@ test "Epoch fromPacketType" {
 pub const PacketError = error{
     InvalidVersion,
     InvalidPacket,
+    InvalidPacketType,
     InvalidVarLength,
 };
 

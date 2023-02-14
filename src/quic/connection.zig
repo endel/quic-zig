@@ -6,8 +6,8 @@ const crypto = std.crypto;
 const protocol = @import("protocol.zig");
 // const crypto = @import("crypto.zig");
 const packet = @import("packet.zig");
-const frame = @import("frame.zig");
 const tls = @import("tls.zig");
+const Frame = @import("frame.zig").Frame;
 const Client = @import("handshake/Client.zig");
 
 pub const State = enum(u8) {
@@ -99,6 +99,11 @@ pub const TransportParams = struct {
     }
 };
 
+pub const RecvInfo = struct {
+    to: os.sockaddr,
+    from: os.sockaddr,
+};
+
 ///
 /// A Quic connection
 ///
@@ -157,29 +162,89 @@ pub const Connection = struct {
         // self.allocator
     }
 
-    // // stats
-    // recv_count: u32 = 0,
-    // sent_count: u32 = 0,
-    // retrans_count: u32 = 0,
-    // sent_bytes: u32 = 0,
-    // recv_bytes: u32 = 0,
-    //
-    // rx_data: u64 = 0,
+    pub fn recv(self: *Connection, header: *packet.Header, fbs: anytype, info: RecvInfo) !void {
+        _ = info;
+        std.log.info("fbs.pos: {any}, header.remainder_len: {any}", .{ fbs.pos, header.remainder_len });
 
-    // dgram_recv_queue: dgram::DatagramQueue::new(
-    //     config.dgram_recv_max_queue_len,
-    // ),
-    //
-    // dgram_send_queue: dgram::DatagramQueue::new(
-    //     config.dgram_send_max_queue_len,
-    // ),
+        // TODO:
+        const epoch = try packet.Epoch.fromPacketType(header.packet_type);
+        if (epoch == packet.Epoch.zero_rtt) {
+            std.log.info("TODO: implement zero rtt", .{});
+            return error.NotImplemented;
+        }
 
-    // _cryptos: [4]crypto.CryptoPair = .{
-    //     crypto.CryptoPair{}, // packet.Epoch.INITIAL
-    //     crypto.CryptoPair{}, // packet.Epoch.ZERO_RTT
-    //     crypto.CryptoPair{}, // packet.Epoch.HANDSHAKE
-    //     crypto.CryptoPair{}, // packet.Epoch.ONE_RTT
-    // },
+        var payload = self.decryptPacket(header, fbs) catch |err| {
+            std.log.err("can't decrypt packet. {any}", .{err});
+            return error.InvalidPacket;
+        };
+
+        // TODO: ignore duplicate packets (aka "num spaces")
+        // (check against local cache of packet numbers)
+        // ...
+
+        // no frames. skip invalid packet!
+        if (payload.len == 0) {
+            std.log.info("no frames. skip invalid packet!", .{});
+            return error.InvalidPacket;
+        }
+
+        // TODO: determine path / support multiple paths (+ multipath extension)
+        const path_idx = path_idx: {
+            var idx: usize = undefined;
+
+            if (header.packet_type == packet.PacketType.zero_rtt and
+                self.got_peer_conn_id)
+            {
+                // let pkt_dcid = ConnectionId::from_ref(&hdr.dcid);
+                // get_or_create_recv_path_id(recv_pid, &pkt_dcid, buf_len, info)
+
+            } else {
+                // we are on handshake, use the initial path.
+                idx = 0;
+                // get_active_path_id()
+            }
+
+            break :path_idx idx;
+        };
+
+        if (!self.is_server and !self.got_peer_conn_id) {
+            // TODO: Replace the randomly generated destination connection ID
+            // with the one supplied by the server.
+        }
+
+        if (self.is_server and !self.got_peer_conn_id) {
+            self.setInitialDCID(header.scid, path_idx, undefined);
+
+            // TODO: local transport params (+encode it)
+
+            self.got_peer_conn_id = true;
+        }
+        std.log.info("payload ({any}): {any}", .{ payload.len, payload });
+
+        // To avoid sending an ACK in response to an ACK-only packet, we need
+        // to keep track of whether this packet contains any frame other than
+        // ACK and PADDING.
+        var ack_elicited = false;
+
+        // To know if the peer migrated the connection, we need to keep track
+        // whether this is a non-probing packet.
+        var is_probing = false;
+
+        // process payload frames
+        const frame = try Frame.parse(payload);
+
+        if (frame.isAckEliciting()) {
+            ack_elicited = true;
+        }
+
+        if (frame.isProbing()) {
+            is_probing = true;
+        }
+
+        try self.processFrame(frame, epoch); // server.ca_bundle
+
+        // build response
+    }
 
     pub fn decryptPacket(self: *Connection, header: *packet.Header, fbs: anytype) ![]u8 {
         var epoch = try packet.Epoch.fromPacketType(header.*.packet_type);
@@ -195,14 +260,11 @@ pub const Connection = struct {
         _ = path_id;
     }
 
-    // pub fn processFrame(self: *Connection, f: frame.Frame, epoch: packet.Epoch) !void {
-    pub fn processFrame(self: *Connection, f: frame.Frame, epoch: packet.Epoch, ca_bundle: crypto.Certificate.Bundle) !void {
+    pub fn processFrame(self: *Connection, frame: Frame, epoch: packet.Epoch) !void {
+        // pub fn processFrame(self: *Connection, frame: Frame, epoch: packet.Epoch, ca_bundle: crypto.Certificate.Bundle) !void {
         var space = self.pkt_num_spaces[@enumToInt(epoch)];
 
-        _ = space;
-        _ = ca_bundle;
-
-        switch (f) {
+        switch (frame) {
             .padding => |size| {
                 std.log.info("Padding, size: {}", .{size});
             },
@@ -226,6 +288,8 @@ pub const Connection = struct {
                 //
                 // => https://datatracker.ietf.org/doc/html/rfc9000#name-crypto-frames
                 //
+
+                space.crypto_stream.recv(crypto_frame.data);
 
                 std.log.info("processing crypto frame: {any}", .{crypto_frame});
 

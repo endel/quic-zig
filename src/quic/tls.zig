@@ -94,7 +94,10 @@ pub const Handshake = struct {
     buffer: [8000]u8 = .{0} ** 8000,
     encryption_level: u8 = 0,
     state: HandshakeState = .start, // .start_accept
+
     hostname: []u8 = undefined,
+    client_random: []u8 = undefined,
+    client_version: u16 = undefined,
 
     pub fn provideData(self: *Handshake, data: []u8, encryption_level: u8) void {
         // FIXME: append here instead of replacing into position 0
@@ -116,6 +119,8 @@ pub const Handshake = struct {
             .buf = &self.buffer,
             .our_end = self.buffer.len,
         };
+
+        var client_hello: ClientHello = undefined;
 
         while (self.state != .done) {
             std.log.info("doServerHandshake ... state: {any}", .{self.state});
@@ -178,7 +183,7 @@ pub const Handshake = struct {
                         extensions = msg_decoder.slice(msg_decoder.decode(u16));
                     }
 
-                    var client_hello: ClientHello = .{
+                    client_hello = .{
                         .buf = msg_decoder.buf,
                         .legacy_version = legacy_version,
                         .random = random,
@@ -194,17 +199,41 @@ pub const Handshake = struct {
                     try decryptECH(&client_hello);
                     // TODO: validate ECH
 
+                    // hostname
                     try self.extractSNI(&client_hello);
+
+                    self.client_random = client_hello.random;
+                    self.client_version = client_hello.legacy_version;
 
                     self.state = .read_client_hello_after_ech;
                 },
 
                 .read_client_hello_after_ech => {
-                    return error.NotImplemented;
+                    // TODO: run "select certificate" early callback
+
+                    // BoringSSL does a "version freeze" here. we can simply enforce TLS 1.3 here.
+
+                    // Only null compression is supported. TLS 1.3 further
+                    // requires the peer advertise no other compression.
+                    if (client_hello.compression_methods.len != 1 or
+                        client_hello.compression_methods[0] != 0)
+                    {
+                        return error.HandshakeError;
+                    }
+
+                    self.state = .select_certificate;
                 },
 
-                .select_certificate => {},
-                .tls13 => {},
+                .select_certificate => {
+                    // TODO: Callback to update server certificates if required.
+
+                    self.state = .tls13;
+                },
+
+                .tls13 => {
+                    //
+                },
+
                 .select_parameters => {},
                 .send_server_hello => {},
                 .send_server_certificate => {},
