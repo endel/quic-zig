@@ -158,19 +158,21 @@ pub fn main() anyerror!void {
                 std.log.warn("HAS CONNECTION!", .{});
             }
 
-            // var conn = conn_pair.value_ptr.*;
-            //
-            // var recv_info: connection.RecvInfo = .{
-            //     .to = local_addr.any,
-            //     .from = remote_addr,
-            // };
-            //
-            // // receive packet + process frames
-            // try conn.recv(&header, &fbs, recv_info);
+            var recv_info: connection.RecvInfo = .{
+                .to = local_addr.any,
+                .from = remote_addr,
+            };
+
+            // receive packet + process frames
+            var conn = conn_pair.value_ptr.*;
+            conn.recv(&header, &fbs, recv_info) catch |e| {
+                std.log.err("RECV ERROR -> {any}", .{e});
+                continue :udp_read;
+            };
         }
 
-        var it = connections.iterator();
-        while (it.next()) |kv| {
+        var conn_it = connections.iterator();
+        while (conn_it.next()) |kv| {
             var scid = kv.key_ptr.*;
             var conn = kv.value_ptr.*;
             std.log.info("looping through connections... key: {any} => {any}", .{ scid, conn });

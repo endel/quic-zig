@@ -173,7 +173,8 @@ pub const Connection = struct {
             return error.NotImplemented;
         }
 
-        var payload = self.decryptPacket(header, fbs) catch |err| {
+        var space = self.pkt_num_spaces[@enumToInt(epoch)];
+        var payload = packet.decrypt(header, fbs, space) catch |err| {
             std.log.err("can't decrypt packet. {any}", .{err});
             return error.InvalidPacket;
         };
@@ -241,16 +242,9 @@ pub const Connection = struct {
             is_probing = true;
         }
 
-        try self.processFrame(frame, epoch); // server.ca_bundle
+        try self.processFrame(frame, epoch);
 
         // build response
-    }
-
-    pub fn decryptPacket(self: *Connection, header: *packet.Header, fbs: anytype) ![]u8 {
-        var epoch = try packet.Epoch.fromPacketType(header.*.packet_type);
-        var space = self.pkt_num_spaces[@enumToInt(epoch)];
-
-        return try packet.decrypt(header, fbs, space);
     }
 
     pub fn setInitialDCID(self: Connection, cid: []const u8, path_id: usize, reset_token: ?[]u8) void {
@@ -261,7 +255,6 @@ pub const Connection = struct {
     }
 
     pub fn processFrame(self: *Connection, frame: Frame, epoch: packet.Epoch) !void {
-        // pub fn processFrame(self: *Connection, frame: Frame, epoch: packet.Epoch, ca_bundle: crypto.Certificate.Bundle) !void {
         var space = self.pkt_num_spaces[@enumToInt(epoch)];
 
         switch (frame) {
