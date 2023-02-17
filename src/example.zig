@@ -11,6 +11,7 @@ const connection = @import("quic/connection.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const Frame = @import("quic/frame.zig").Frame;
+const tls = @import("quic/tls.zig");
 
 const h0 = @import("h0/connection.zig");
 const h3 = @import("h3/connection.zig");
@@ -25,6 +26,7 @@ pub fn main() anyerror!void {
     // defer _ = allocator.deinit();
     var allocator = std.heap.page_allocator;
 
+    tls.setSupportedALPN(&[_][]const u8{"h3"});
     var server = try Server.init(allocator, "/Users/endel/Projects/netcode.io/quic-zig/self-signed/cert.crt");
 
     // .{

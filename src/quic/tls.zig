@@ -1,3 +1,8 @@
+//
+// We only care about TLS 1.3 here
+// No intentions to implement TLS <= 1.2
+//
+
 const std = @import("std");
 const io = std.io;
 const tls = std.crypto.tls;
@@ -62,6 +67,27 @@ pub const HandshakeState = enum(u8) {
     finish_client_handshake,
 };
 
+pub const TLSState = enum(u8) {
+    select_parameters = 0,
+    select_session,
+    send_hello_retry_request,
+    read_second_client_hello,
+    send_server_hello,
+    send_server_certificate_verify,
+    send_server_finished,
+    send_half_rtt_ticket,
+    read_second_client_flight,
+    process_end_of_early_data,
+    read_client_encrypted_extensions,
+    read_client_certificate,
+    read_client_certificate_verify,
+    read_channel_id,
+    read_client_finished,
+    send_new_session_ticket,
+    done,
+    _,
+};
+
 // TLS Message Type
 pub const MessageType = enum(u8) {
     hello_request = 0,
@@ -87,13 +113,17 @@ pub const MessageType = enum(u8) {
     _,
 };
 
-// const Message = struct {
-// };
+var supported_alpn_list: ?[]const []const u8 = null;
+pub fn setSupportedALPN(alpn_list: []const []const u8) void {
+    supported_alpn_list = alpn_list;
+}
 
 pub const Handshake = struct {
     buffer: [8000]u8 = .{0} ** 8000,
     encryption_level: u8 = 0,
+
     state: HandshakeState = .start, // .start_accept
+    tls_state: TLSState = .select_parameters,
 
     hostname: []u8 = undefined,
     client_random: []u8 = undefined,
@@ -232,6 +262,7 @@ pub const Handshake = struct {
 
                 .tls13 => {
                     //
+
                 },
 
                 .select_parameters => {},
