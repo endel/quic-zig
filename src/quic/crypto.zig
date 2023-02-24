@@ -33,6 +33,14 @@ pub const nonce_len = 12;
 //     ChaCha20_Poly1305,
 // };
 
+// TODO: merge this structure with "packet.Epoch" [??] they're basically the same!
+pub const EncryptionLevel = enum(u8) {
+    initial = 0,
+    early_data,
+    handshake,
+    application,
+};
+
 pub const Open = struct {
     // alg: Algorithm,
     // ctx: anytype, // EVP_AEAD_CTX

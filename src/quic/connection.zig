@@ -99,6 +99,12 @@ pub const TransportParams = struct {
     }
 };
 
+pub const ConnectionError = struct {
+    is_app: bool,
+    code: u64,
+    reason: []const u8,
+};
+
 pub const RecvInfo = struct {
     to: os.sockaddr,
     from: os.sockaddr,
@@ -110,13 +116,14 @@ pub const RecvInfo = struct {
 pub const Connection = struct {
     version: u32 = undefined,
 
-    dcid: []const u8,
-    scid: []const u8,
+    dcid: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
+    scid: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
 
     handshake: tls.Handshake = .{},
 
     is_server: bool,
     transport_params: TransportParams = TransportParams.default(),
+    local_err: ?ConnectionError = null,
 
     state: State = State.first_flight,
     paths: [1]NetworkPath = .{undefined} ** 1, // TODO: support multiple paths
@@ -132,6 +139,8 @@ pub const Connection = struct {
 
     allocator: std.mem.Allocator,
 
+    tmp_handshake_loop: u8 = 0,
+
     pub fn accept(
         allocator: std.mem.Allocator,
         header: packet.Header,
@@ -143,12 +152,15 @@ pub const Connection = struct {
 
         var conn = Connection{
             .allocator = allocator,
-            .dcid = header.dcid,
-            .scid = header.scid,
+            // .dcid = header.dcid,
+            // .scid = header.scid,
             .version = header.version,
             .is_server = is_server,
             .paths = .{initial_path},
         };
+
+        @memcpy(&conn.dcid, header.dcid.ptr, header.dcid.len);
+        @memcpy(&conn.scid, header.scid.ptr, header.scid.len);
 
         // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
         // TODO: improve me!
@@ -247,6 +259,62 @@ pub const Connection = struct {
         // build response
     }
 
+    pub fn send(self: *Connection, out_writer: anytype) !void {
+        std.log.info("> SEND() ...", .{});
+        if (self.local_err != null) {
+            self.doHandshake(out_writer.context.buffer);
+        }
+    }
+
+    pub fn sendSingle(self: *Connection, out_writer: anytype) !void {
+        // var is_closing = self.isDraining();
+
+        // TODO: process lost frames/recovery [?]
+
+        var packet_type: packet.PacketType = switch (self.handshake.write_level) {
+            .initial => .initial,
+            .early_data => unreachable,
+            .handshake => .handshake,
+            .application => .one_rtt,
+        };
+        if (packet_type == .one_rtt and self.handshake.is_completed) {
+            packet_type = .handshake;
+        }
+
+        var epoch = packet.Epoch.fromPacketType(packet_type);
+        var num_space = self.pkt_num_spaces[epoch];
+
+        var pn = num_space.next_packet_number;
+        var pn_len = packet.packetNumberLength(pn);
+
+        var crypto_tag_len = num_space.cryptoTagLen();
+
+        // FIXME: allow to select different network path
+        var send_path_id = 0;
+        var path = self.paths[send_path_id];
+
+        _ = out_writer;
+        _ = path;
+        _ = crypto_tag_len;
+        _ = pn_len;
+        // var pn =
+
+    }
+
+    pub fn isClosed() bool {
+        // TODO
+        return false;
+    }
+
+    ///
+    /// Returns true if the connection is waiting for all data to be sent and
+    /// received before closing, false otherwise.
+    ///
+    pub fn isDraining() bool {
+        // TODO
+        return false;
+    }
+
     pub fn setInitialDCID(self: Connection, cid: []const u8, path_id: usize, reset_token: ?[]u8) void {
         _ = self;
         _ = cid;
@@ -317,7 +385,8 @@ pub const Connection = struct {
         }
     }
 
-    fn doHandshake(data: []u8) void {
+    fn doHandshake(self: *Connection, data: []u8) void {
+        _ = self;
         _ = data;
     }
 };

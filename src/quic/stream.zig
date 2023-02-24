@@ -26,7 +26,7 @@ pub const Stream = struct {
     priority: u8 = @enumToInt(Priority.default), // 0 = highest. default is `Priority.default`.
 
     pub fn recv(self: *Stream, data: []u8) void {
-        for (data) |b, i| {
+        for (data, 0..) |b, i| {
             self.recv_buffer.data[self.recv_buffer.pos + i] = b;
         }
 
@@ -42,7 +42,7 @@ pub const Stream = struct {
 
         // TODO: check if off+len is a valid slice. (out of bounds?)
         var slice = self.recv_buffer.data[self.recv_buffer.off..(self.recv_buffer.off + len)];
-        for (slice) |b, i| {
+        for (slice, 0..) |b, i| {
             dest[i] = b;
         }
 
@@ -68,7 +68,7 @@ pub const Stream = struct {
     }
 
     pub fn writeAll(self: *Stream, bytes: []const u8) !usize {
-        for (bytes) |b, i| {
+        for (bytes, 0..) |b, i| {
             self.send_buffer.data[self.send_buffer.off + i] = b;
         }
 

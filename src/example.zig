@@ -22,12 +22,15 @@ const hmac = std.crypto.auth.hmac;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 pub fn main() anyerror!void {
-    // var allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer _ = allocator.deinit();
-    var allocator = std.heap.page_allocator;
+    // var alloc = std.heap.GeneralPurposeAllocator(.{}){};
+    // defer _ = alloc.deinit();
+    // var alloc = std.heap.page_allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     tls.setSupportedALPN(&[_][]const u8{"h3"});
-    var server = try Server.init(allocator, "/Users/endel/Projects/netcode.io/quic-zig/self-signed/cert.crt");
+    var server = try Server.init(alloc, "/Users/endel/Projects/netcode.io/quic-zig/self-signed/cert.crt");
 
     // .{
     //     .alpn_protocols = h3.ALPN ++ h0.ALPN ++ [_][]const u8{"siduck"},
@@ -55,7 +58,12 @@ pub fn main() anyerror!void {
     const sockfd = try server.listen(local_addr);
     defer os.close(sockfd);
 
-    var connections = std.StringHashMap(connection.Connection).init(allocator);
+    // var connections = std.StringHashMap(connection.Connection).init(alloc);
+    var client_ids = std.ArrayList([]const u8).init(alloc);
+    defer client_ids.deinit();
+
+    var connections = std.StringArrayHashMap(connection.Connection).init(alloc);
+    // defer connections.clearAndFree();
     defer connections.clearAndFree();
 
     // out/write buffer
@@ -128,7 +136,7 @@ pub fn main() anyerror!void {
                 var new_scid = connection.generateConnectionId(header.scid.len);
                 var retry_token = try packet.generateRetryToken(header, new_scid, remote_addr);
 
-                std.log.info("new scid: {any}", .{new_scid});
+                std.log.info("new scid (len: {any}): {any}", .{ new_scid.len, new_scid });
                 std.log.warn("retry token: {any}", .{retry_token});
 
                 try packet.retry(header, new_scid, retry_token, &out_writer);
@@ -143,21 +151,20 @@ pub fn main() anyerror!void {
 
             std.log.info("retry token length: {}", .{header.token.?.len});
 
-            const conn_pair = try connections.getOrPut(header.scid);
-            if (!conn_pair.found_existing) {
+            var conn: connection.Connection = undefined;
+            if (connections.get(header.scid)) |value| {
+                std.log.warn("HAS CONNECTION!", .{});
+                conn = value;
+                //
+            } else {
                 if (header.scid.len != header.dcid.len) {
                     std.log.err("Invalid destination connection ID", .{});
                 }
 
                 std.log.info("ACCEPT CONNECTION!", .{});
-                var conn = try connection.Connection.accept(allocator, header, local_addr.any, remote_addr, true);
-                defer conn.deinit();
 
-                conn_pair.value_ptr.* = conn;
-
-                //
-            } else {
-                std.log.warn("HAS CONNECTION!", .{});
+                conn = try connection.Connection.accept(alloc, header, local_addr.any, remote_addr, true);
+                try connections.put(&conn.scid, conn);
             }
 
             var recv_info: connection.RecvInfo = .{
@@ -166,7 +173,6 @@ pub fn main() anyerror!void {
             };
 
             // receive packet + process frames
-            var conn = conn_pair.value_ptr.*;
             conn.recv(&header, &fbs, recv_info) catch |e| {
                 std.log.err("RECV ERROR -> {any}", .{e});
                 continue :udp_read;
@@ -175,9 +181,18 @@ pub fn main() anyerror!void {
 
         var conn_it = connections.iterator();
         while (conn_it.next()) |kv| {
+            try out_buff.seekTo(0);
+
             var scid = kv.key_ptr.*;
             var conn = kv.value_ptr.*;
-            std.log.info("looping through connections... key: {any} => {any}", .{ scid, conn });
+            std.log.info("looping through connections... key: {any} => (dcid (len: {any}): {any}, scid (len: {any}): {any})", .{ scid, conn.dcid.len, conn.dcid, conn.scid.len, conn.scid });
+
+            try conn.send(&out_writer);
+
+            var written = out_buff.getWritten();
+            if (written.len > 0) {
+                std.log.info("out buf: {any}", .{written});
+            }
         }
 
         // TODO: garbage collect closed connections ...

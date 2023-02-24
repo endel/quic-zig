@@ -5,7 +5,7 @@ const log = std.log;
 const time = std.time;
 const assert = std.debug.assert;
 const random = std.crypto.random;
-const tls = std.crypto.tls;
+// const tls = std.crypto.tls;
 
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
@@ -60,14 +60,14 @@ pub const Epoch = enum(u8) {
     initial = 0,
     zero_rtt = 1,
     handshake = 2,
-    one_rtt = 3,
+    application = 3,
 
     pub fn fromPacketType(int: PacketType) !Epoch {
         return switch (int) {
             PacketType.initial => Epoch.initial,
             PacketType.zero_rtt => Epoch.zero_rtt,
             PacketType.handshake => Epoch.handshake,
-            PacketType.one_rtt => Epoch.one_rtt,
+            PacketType.one_rtt => Epoch.application,
             else => error.InvalidPacketType,
         };
     }
@@ -77,7 +77,7 @@ test "Epoch fromPacketType" {
     try std.testing.expectEqual(Epoch.fromPacketType(PacketType.initial), Epoch.initial);
     try std.testing.expectEqual(Epoch.fromPacketType(PacketType.zero_rtt), Epoch.zero_rtt);
     try std.testing.expectEqual(Epoch.fromPacketType(PacketType.handshake), Epoch.handshake);
-    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.one_rtt), Epoch.one_rtt);
+    try std.testing.expectEqual(Epoch.fromPacketType(PacketType.one_rtt), Epoch.application);
 
     const err = Epoch.fromPacketType(PacketType.retry);
     try std.testing.expectError(error.InvalidPacketType, err);
@@ -232,14 +232,19 @@ pub const PacketNumSpace = struct {
     // ack_elicited: bool,
     next_packet_number: u64 = 0, // TODO: largest_recv_packet_number
 
-    crypto_open: ?crypto.Open = undefined,
-    crypto_seal: ?crypto.Seal = undefined,
+    crypto_open: ?crypto.Open = null,
+    crypto_seal: ?crypto.Seal = null,
 
     // crypto_0rtt_open: Option<crypto::Open>,
     // crypto_0rtt_seal: Option<crypto::Seal>,
 
     // crypto_stream: stream.Stream = stream.Stream{},
     crypto_stream: stream.Stream = undefined,
+
+    pub fn cryptoTagLen(self: *PacketNumSpace) usize {
+        _ = self;
+        return crypto.Aead.tag_length;
+    }
 
     pub fn setupInitial(self: *PacketNumSpace, dcid: []const u8, version: u32, comptime is_server: bool) !void {
         var keys = try crypto.deriveInitialKeyMaterial(dcid, version, is_server);
@@ -337,6 +342,7 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
 
         std.log.info("fbs.pos: {any}, dcid length: {any}", .{ fbs.pos, dcid_length });
 
+        // @memcpy(&header.dcid, fbs.buffer[fbs.pos..(fbs.pos + dcid_length)], dcid_length);
         header.dcid = fbs.buffer[fbs.pos..(fbs.pos + dcid_length)];
         std.log.info("dcid ({}): {any}", .{ dcid_length, header.dcid });
 
@@ -350,6 +356,9 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
         }
 
         std.log.info("fbs.pos: {any}, scid length: {any}", .{ fbs.pos, scid_length });
+
+        // @memcpy(&header.scid, fbs.buffer[fbs.pos..(fbs.pos + scid_length)], scid_length);
+        // std.mem.copy(u8, header.scid, fbs.buffer[fbs.pos..(fbs.pos + scid_length)]);
         header.scid = fbs.buffer[fbs.pos..(fbs.pos + scid_length)];
         std.log.info("scid ({}): {any}", .{ scid_length, header.scid });
 
@@ -481,6 +490,22 @@ pub fn retry(
     std.log.info("integrity_tag: {any}", .{integrity_tag});
 
     try writer.writeAll(&integrity_tag);
+}
+
+pub fn packetNumberLength(pn: u64) !usize {
+    var len: usize = undefined;
+
+    if (pn < std.math.maxInt(u8)) {
+        len = 1;
+    } else if (pn < std.math.maxInt(u16)) {
+        len = 2;
+    } else if (pn < std.math.maxInt(u32)) {
+        len = 4;
+    } else {
+        return error.InvalidPacket;
+    }
+
+    return len;
 }
 
 ///

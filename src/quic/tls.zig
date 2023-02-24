@@ -8,6 +8,7 @@ const io = std.io;
 const tls = std.crypto.tls;
 const packet = @import("packet.zig");
 const util = @import("util.zig");
+const crypto = @import("crypto.zig");
 
 const RANDOM_SIZE = 32;
 const MAX_SESSION_ID_LENGTH = 32;
@@ -124,10 +125,13 @@ pub const Handshake = struct {
 
     state: HandshakeState = .start, // .start_accept
     tls_state: TLSState = .select_parameters,
+    is_completed: bool = false,
 
     hostname: []u8 = undefined,
     client_random: []u8 = undefined,
     client_version: u16 = undefined,
+
+    write_level: crypto.EncryptionLevel = undefined,
 
     pub fn provideData(self: *Handshake, data: []u8, encryption_level: u8) void {
         // FIXME: append here instead of replacing into position 0
@@ -263,6 +267,7 @@ pub const Handshake = struct {
                 .tls13 => {
                     //
 
+                    return error.NotImplemented;
                 },
 
                 .select_parameters => {},
