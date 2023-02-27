@@ -1,3 +1,9 @@
+quiche cli apps:
+
+RUST_BACKTRACE=1 RUST_LOG=debug cargo run --bin quiche-server
+RUST_LOG=debug cargo run --bin quiche-client -- --method GET --connect-to 127.0.0.1:4433 --no-verify https://localhost:4433
+---
+
 - Generate Self-signed Certificate: https://www.linode.com/docs/guides/create-a-self-signed-tls-certificate/
 - Getting Chrome to accept self-signed localhost certificate: https://stackoverflow.com/a/60516812/892698
 
