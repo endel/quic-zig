@@ -30,7 +30,7 @@ pub fn main() anyerror!void {
     const alloc = arena.allocator();
 
     tls.setSupportedALPN(&[_][]const u8{"h3"});
-    var server = try Server.init(alloc, "/Users/endel/Projects/netcode.io/quic-zig/self-signed/cert.crt");
+    var server = try Server.init(alloc, "self-signed/cert.crt");
 
     // .{
     //     .alpn_protocols = h3.ALPN ++ h0.ALPN ++ [_][]const u8{"siduck"},

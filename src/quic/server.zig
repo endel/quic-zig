@@ -16,7 +16,7 @@ pub const Server = struct {
 
     pub fn init(gpa: std.mem.Allocator, cert_path: []const u8) !Server { // , key: []const u8
         var ca_bundle: crypto.Certificate.Bundle = .{};
-        var cert_file = try fs.openFileAbsolute(cert_path, .{});
+        var cert_file = try fs.cwd().openFile(cert_path, .{});
         defer cert_file.close();
         try ca_bundle.addCertsFromFile(gpa, cert_file);
         return .{
@@ -45,6 +45,6 @@ pub const Server = struct {
 };
 
 test "init" {
-    var server = try Server.init(std.testing.allocator, "/Users/endel/Projects/netcode.io/quic-zig/self-signed/cert.crt");
+    var server = try Server.init(std.testing.allocator, "self-signed/cert.crt");
     defer server.deinit();
 }
