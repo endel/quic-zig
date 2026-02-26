@@ -11,6 +11,7 @@ const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const Frame = @import("quic/frame.zig").Frame;
 const tls = @import("quic/tls.zig");
+const tls13 = @import("quic/tls13.zig");
 
 const h0 = @import("h0/connection.zig");
 const h3 = @import("h3/connection.zig");
@@ -132,7 +133,9 @@ pub fn main() anyerror!void {
                 std.log.warn("(->) PREPPING RETRY PACKET", .{});
 
                 // generates a random original destination connection id
-                const new_scid = connection.generateConnectionId(header.scid.len);
+                var new_scid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = undefined;
+                const new_scid = new_scid_buf[0..header.scid.len];
+                connection.generateConnectionId(new_scid);
                 const retry_token = try packet.generateRetryToken(header, new_scid, remote_addr);
 
                 std.log.info("new scid (len: {any}): {any}", .{ new_scid.len, new_scid });
@@ -162,7 +165,7 @@ pub fn main() anyerror!void {
 
                 std.log.info("ACCEPT CONNECTION!", .{});
 
-                conn = try connection.Connection.accept(alloc, header, local_addr.any, remote_addr, true);
+                conn = try connection.Connection.accept(alloc, header, local_addr.any, remote_addr, true, .{}, null);
                 try connections.put(&conn.scid, conn);
             }
 
@@ -186,7 +189,7 @@ pub fn main() anyerror!void {
             var conn = kv.value_ptr.*;
             std.log.info("looping through connections... key: {any} => (dcid (len: {any}): {any}, scid (len: {any}): {any})", .{ scid, conn.dcid.len, conn.dcid, conn.scid.len, conn.scid });
 
-            try conn.send(&out);
+            _ = try conn.send(&out);
 
             const written = out_buff.getWritten();
             if (written.len > 0) {
@@ -204,4 +207,14 @@ test {
     _ = @import("quic/packet.zig");
     _ = @import("quic/protocol.zig");
     _ = @import("quic/frame.zig");
+    _ = @import("quic/ranges.zig");
+    _ = @import("quic/rtt.zig");
+    _ = @import("quic/ack_handler.zig");
+    _ = @import("quic/congestion.zig");
+    _ = @import("quic/flow_control.zig");
+    _ = @import("quic/transport_params.zig");
+    _ = @import("quic/stream.zig");
+    _ = @import("quic/crypto_stream.zig");
+    _ = @import("quic/packet_packer.zig");
+    _ = @import("quic/tls13.zig");
 }

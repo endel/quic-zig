@@ -643,35 +643,72 @@ pub fn readVarInt(reader: anytype) !u64 {
     return value;
 }
 
-fn writeVarInt(writer: anytype, value: u64) !void {
-    _ = writer;
-    _ = value;
+/// Returns the number of bytes needed to encode a value as a QUIC variable-length integer.
+pub fn varIntLength(value: u64) usize {
+    if (value <= 63) return 1;
+    if (value <= 16383) return 2;
+    if (value <= 1073741823) return 4;
+    return 8;
+}
 
-    std.log.err("TODO: writeVarInt not implemented yet.", .{});
+/// Writes a QUIC variable-length integer (RFC 9000 Section 16).
+pub fn writeVarInt(writer: anytype, value: u64) !void {
+    if (value <= 63) {
+        // 1-byte encoding: 00xxxxxx
+        try writer.writeByte(@intCast(value));
+    } else if (value <= 16383) {
+        // 2-byte encoding: 01xxxxxx xxxxxxxx
+        try writer.writeInt(u16, @intCast(value | (0b01 << 14)), ENDIAN);
+    } else if (value <= 1073741823) {
+        // 4-byte encoding: 10xxxxxx xxxxxxxx xxxxxxxx xxxxxxxx
+        try writer.writeInt(u32, @intCast(value | (0b10 << 30)), ENDIAN);
+    } else if (value <= 4611686018427387903) {
+        // 8-byte encoding: 11xxxxxx xxxxxxxx ... xxxxxxxx
+        try writer.writeInt(u64, value | (0b11 << 62), ENDIAN);
+    } else {
+        return error.VarIntTooLarge;
+    }
+}
 
-    // /// Writes the given integer as variable-length encoded, into the current position of the buffer,
-    // /// advancing the position.
-    // pub fn putVarInt(self: *Self, value: u64) Error!void {
-    //     const length = varIntLength(value);
-    //
-    //     try self.putVarIntWithLength(value, length);
-    // }
-    //
-    // /// Writes the given integer as variable-length encoded in the specified length, into the current
-    // /// position of the buffer, advancing the position.
-    // pub fn putVarIntWithLength(self: *Self, value: u64, length: usize) Error!void {
-    //     var rest = self.buf[self.pos..];
-    //     if (rest.len < length)
-    //         return Error.BufferTooShort;
-    //
-    //     switch (length) {
-    //         1 => try self.put(u8, @truncate(u8, value) | (0b00 << 6)),
-    //         2 => try self.put(u16, @truncate(u16, value) | (0b01 << 14)),
-    //         4 => try self.put(u32, @truncate(u32, value) | (0b10 << 30)),
-    //         8 => try self.put(u64, value | (0b11 << 62)),
-    //         else => unreachable,
-    //     }
-    // }
+test "QUIC: Variable-Length Integer Encoding" {
+    // 1-byte encoding
+    {
+        var buf: [8]u8 = undefined;
+        var fbs = io.fixedBufferStream(&buf);
+        try writeVarInt(fbs.writer(), 37);
+        try std.testing.expectEqualSlices(u8, &[_]u8{0x25}, fbs.getWritten());
+    }
+    // 2-byte encoding
+    {
+        var buf: [8]u8 = undefined;
+        var fbs = io.fixedBufferStream(&buf);
+        try writeVarInt(fbs.writer(), 15293);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x7b, 0xbd }, fbs.getWritten());
+    }
+    // 4-byte encoding
+    {
+        var buf: [8]u8 = undefined;
+        var fbs = io.fixedBufferStream(&buf);
+        try writeVarInt(fbs.writer(), 494878333);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x9d, 0x7f, 0x3e, 0x7d }, fbs.getWritten());
+    }
+    // 8-byte encoding
+    {
+        var buf: [8]u8 = undefined;
+        var fbs = io.fixedBufferStream(&buf);
+        try writeVarInt(fbs.writer(), 151288809941952652);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c }, fbs.getWritten());
+    }
+}
+
+test "QUIC: varIntLength" {
+    try std.testing.expectEqual(@as(usize, 1), varIntLength(0));
+    try std.testing.expectEqual(@as(usize, 1), varIntLength(63));
+    try std.testing.expectEqual(@as(usize, 2), varIntLength(64));
+    try std.testing.expectEqual(@as(usize, 2), varIntLength(16383));
+    try std.testing.expectEqual(@as(usize, 4), varIntLength(16384));
+    try std.testing.expectEqual(@as(usize, 4), varIntLength(1073741823));
+    try std.testing.expectEqual(@as(usize, 8), varIntLength(1073741824));
 }
 
 test "QUIC: Variable-Length Integer Decoding" {

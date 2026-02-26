@@ -1,121 +1,553 @@
 const std = @import("std");
-const os = std.io;
-const mem = std.mem;
+const Allocator = std.mem.Allocator;
+const testing = std.testing;
 
-const MAX_DATA: usize = 512;
+const flow_control = @import("flow_control.zig");
+const Frame = @import("frame.zig").Frame;
 
-// allocator: std.mem.Allocator,
-
-pub const Priority = enum(u8) {
-    max = 0,
-    high = 64,
-    default = 127,
-    low = 192,
-    min = 255,
+/// Stream ID encoding per RFC 9000 Section 2.1:
+///   Bit 0: initiator (0 = client, 1 = server)
+///   Bit 1: directionality (0 = bidirectional, 1 = unidirectional)
+pub const StreamType = enum(u2) {
+    client_bidi = 0b00,
+    server_bidi = 0b01,
+    client_uni = 0b10,
+    server_uni = 0b11,
 };
 
+/// Returns the type of a stream from its ID.
+pub fn streamType(stream_id: u64) StreamType {
+    return @enumFromInt(@as(u2, @truncate(stream_id)));
+}
+
+/// Returns true if the stream is bidirectional.
+pub fn isBidi(stream_id: u64) bool {
+    return (stream_id & 0x02) == 0;
+}
+
+/// Returns true if the stream was initiated by the client.
+pub fn isClient(stream_id: u64) bool {
+    return (stream_id & 0x01) == 0;
+}
+
+/// Returns true if the stream was locally initiated.
+pub fn isLocal(stream_id: u64, is_server: bool) bool {
+    const server_initiated = (stream_id & 0x01) != 0;
+    return server_initiated == is_server;
+}
+
+/// Gap-based frame sorter for out-of-order reassembly of stream data.
+/// Tracks received byte ranges and returns contiguous data starting from read_pos.
+pub const FrameSorter = struct {
+    allocator: Allocator,
+
+    /// Buffered data chunks, keyed by offset.
+    chunks: std.AutoArrayHashMap(u64, []const u8),
+
+    /// Next offset to be read by the application.
+    read_pos: u64 = 0,
+
+    /// The final offset (set when FIN is received).
+    fin_offset: ?u64 = null,
+
+    pub fn init(allocator: Allocator) FrameSorter {
+        return .{
+            .allocator = allocator,
+            .chunks = std.AutoArrayHashMap(u64, []const u8).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *FrameSorter) void {
+        // Free any owned data
+        for (self.chunks.values()) |data| {
+            self.allocator.free(data);
+        }
+        self.chunks.deinit();
+    }
+
+    /// Push received data at the given offset.
+    pub fn push(self: *FrameSorter, offset: u64, data: []const u8, fin: bool) !void {
+        if (fin) {
+            self.fin_offset = offset + data.len;
+        }
+
+        if (data.len == 0) return;
+
+        // Skip data that's already been read
+        if (offset + data.len <= self.read_pos) return;
+
+        // Trim data that partially overlaps with already-read region
+        var effective_offset = offset;
+        var effective_data = data;
+        if (offset < self.read_pos) {
+            const skip = self.read_pos - offset;
+            effective_data = data[skip..];
+            effective_offset = self.read_pos;
+        }
+
+        // Copy data to owned buffer
+        const owned = try self.allocator.dupe(u8, effective_data);
+        errdefer self.allocator.free(owned);
+
+        try self.chunks.put(effective_offset, owned);
+    }
+
+    /// Pop the next contiguous chunk of data from the read position.
+    /// Returns null if there's no data available at the current read position.
+    pub fn pop(self: *FrameSorter) ?[]const u8 {
+        if (self.chunks.get(self.read_pos)) |data| {
+            _ = self.chunks.orderedRemove(self.read_pos);
+            self.read_pos += data.len;
+            return data;
+        }
+        return null;
+    }
+
+    /// Check if all data has been received (FIN reached and all data consumed).
+    pub fn isComplete(self: *const FrameSorter) bool {
+        if (self.fin_offset) |fin| {
+            return self.read_pos >= fin;
+        }
+        return false;
+    }
+};
+
+/// A QUIC receive stream.
+pub const ReceiveStream = struct {
+    stream_id: u64,
+    sorter: FrameSorter,
+
+    /// Final offset (set when FIN received).
+    fin_received: bool = false,
+
+    /// Error code from RESET_STREAM.
+    reset_err: ?u64 = null,
+
+    /// Whether all data has been read.
+    finished: bool = false,
+
+    pub fn init(allocator: Allocator, stream_id: u64) ReceiveStream {
+        return .{
+            .stream_id = stream_id,
+            .sorter = FrameSorter.init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *ReceiveStream) void {
+        self.sorter.deinit();
+    }
+
+    /// Handle an incoming STREAM frame.
+    pub fn handleStreamFrame(self: *ReceiveStream, offset: u64, data: []const u8, fin: bool) !void {
+        if (self.reset_err != null) return; // Ignore data after reset
+        if (fin) self.fin_received = true;
+        try self.sorter.push(offset, data, fin);
+    }
+
+    /// Handle a RESET_STREAM frame.
+    pub fn handleResetStream(self: *ReceiveStream, error_code: u64, final_size: u64) void {
+        self.reset_err = error_code;
+        self.sorter.fin_offset = final_size;
+    }
+
+    /// Read contiguous data from the stream.
+    /// Returns the data slice or null if no data is available.
+    pub fn read(self: *ReceiveStream) ?[]const u8 {
+        if (self.reset_err != null) return null;
+
+        const data = self.sorter.pop();
+        if (data == null and self.sorter.isComplete()) {
+            self.finished = true;
+        }
+        return data;
+    }
+};
+
+/// A QUIC send stream.
+pub const SendStream = struct {
+    stream_id: u64,
+    allocator: Allocator,
+
+    /// Data buffered for sending.
+    write_buffer: std.ArrayList(u8),
+
+    /// Current write offset (total bytes written).
+    write_offset: u64 = 0,
+
+    /// Next offset to be sent.
+    send_offset: u64 = 0,
+
+    /// Whether FIN has been queued.
+    fin_queued: bool = false,
+
+    /// Whether FIN has been sent.
+    fin_sent: bool = false,
+
+    /// Whether the stream has been reset.
+    reset_err: ?u64 = null,
+
+    pub fn init(allocator: Allocator, stream_id: u64) SendStream {
+        return .{
+            .stream_id = stream_id,
+            .allocator = allocator,
+            .write_buffer = .{ .items = &.{}, .capacity = 0 },
+        };
+    }
+
+    pub fn deinit(self: *SendStream) void {
+        self.write_buffer.deinit(self.allocator);
+    }
+
+    /// Write data to the stream. Buffers it for later sending.
+    pub fn writeData(self: *SendStream, data: []const u8) !void {
+        try self.write_buffer.appendSlice(self.allocator, data);
+        self.write_offset += data.len;
+    }
+
+    /// Close the stream (queue FIN).
+    pub fn close(self: *SendStream) void {
+        self.fin_queued = true;
+    }
+
+    /// Cancel the stream with an error code (sends RESET_STREAM).
+    pub fn reset(self: *SendStream, error_code: u64) void {
+        self.reset_err = error_code;
+    }
+
+    /// Check if there's data available to send.
+    pub fn hasData(self: *const SendStream) bool {
+        return self.send_offset < self.write_offset or
+            (self.fin_queued and !self.fin_sent);
+    }
+
+    /// Pop a STREAM frame with at most max_len bytes of payload.
+    /// Returns null if there's nothing to send.
+    pub fn popStreamFrame(self: *SendStream, max_len: u64) ?Frame {
+        if (self.reset_err != null) return null;
+
+        const buffered = self.write_buffer.items;
+        const unsent_start = self.send_offset;
+        const unsent_len = self.write_offset - self.send_offset;
+
+        if (unsent_len == 0 and !(self.fin_queued and !self.fin_sent)) {
+            return null;
+        }
+
+        const data_len = @min(unsent_len, max_len);
+        const data = if (data_len > 0) buffered[unsent_start..][0..data_len] else &[_]u8{};
+        const fin = self.fin_queued and !self.fin_sent and (unsent_start + data_len == self.write_offset);
+
+        self.send_offset += data_len;
+        if (fin) self.fin_sent = true;
+
+        return Frame{
+            .stream = .{
+                .stream_id = self.stream_id,
+                .offset = unsent_start,
+                .length = data_len,
+                .fin = fin,
+                .data = @constCast(data),
+            },
+        };
+    }
+};
+
+/// A bidirectional QUIC stream combining send and receive.
 pub const Stream = struct {
-    recv_buffer: RecvBuf = .{},
-    send_buffer: SendBuffer = .{},
+    stream_id: u64,
+    send: SendStream,
+    recv: ReceiveStream,
 
-    is_bidi: bool = undefined, // is bidirectional?
-    is_local: bool = undefined, // created by local endpoint?
-    is_incremental: bool = true, // can be flushed incrementally? default is `true`
-
-    data: [MAX_DATA]u8 = undefined,
-    priority: u8 = @intFromEnum(Priority.default), // 0 = highest. default is `Priority.default`.
-
-    pub fn recv(self: *Stream, data: []u8) void {
-        for (data, 0..) |b, i| {
-            self.recv_buffer.data[self.recv_buffer.pos + i] = b;
-        }
-
-        self.recv_buffer.pos += data.len;
-        self.recv_buffer.len += data.len;
-
-        std.log.info(".recv(), buf.data: {any}", .{self.recv_buffer.data});
+    pub fn init(allocator: Allocator, stream_id: u64) Stream {
+        return .{
+            .stream_id = stream_id,
+            .send = SendStream.init(allocator, stream_id),
+            .recv = ReceiveStream.init(allocator, stream_id),
+        };
     }
 
-    // pub fn read(self: *Stream, buffer: []u8, len: usize) void {
-    pub fn readAtLeast(self: *Stream, dest: []u8, len: usize) !usize {
-        std.log.info(".readAtLeast(), len: {any}, buf.off: {any}, buf.data: {any}", .{ len, self.recv_buffer.off, self.recv_buffer.data });
-
-        // TODO: check if off+len is a valid slice. (out of bounds?)
-        const slice = self.recv_buffer.data[self.recv_buffer.off..(self.recv_buffer.off + len)];
-        for (slice, 0..) |b, i| {
-            dest[i] = b;
-        }
-
-        std.log.info(".readAtLeast(), off: {any}, slice: {any}", .{ self.recv_buffer.off, slice });
-
-        self.recv_buffer.off += len;
-
-        return len;
+    pub fn deinit(self: *Stream) void {
+        self.send.deinit();
+        self.recv.deinit();
     }
-
-    pub fn writevAll(self: *@This(), iovecs: []std.posix.iovec_const) !usize {
-        for (iovecs) |iovec| {
-            var i: usize = 0;
-            while (i < iovec.len) : (i += 1) {
-                self.send_buffer.data[self.send_buffer.off + i] = iovec.base[i];
-            }
-
-            self.send_buffer.off += iovec.len;
-        }
-
-        return self.send_buffer.off;
-    }
-
-    pub fn writeAll(self: *Stream, bytes: []const u8) !usize {
-        for (bytes, 0..) |b, i| {
-            self.send_buffer.data[self.send_buffer.off + i] = b;
-        }
-
-        self.send_buffer.off += bytes.len;
-
-        return self.send_buffer.off;
-    }
-
-    // pub fn writeString(self: *Stream, data: []const u8) void {
-    //     // write length
-    //     self.send_buffer.data[self.send_buffer.off] = @intCast(u8, data.len);
-    //     self.send_buffer.off += 1;
-    //
-    //     _ = self.write(data);
-    // }
 };
 
-pub const RecvBuf = struct {
-    data: [MAX_DATA]u8 = .{undefined} ** MAX_DATA, // BinaryHeap<RangeBuf>,
-    // data_buf: std.io.FixedBufferStream = std.io.fixedBufferStream(&@This().data),
+/// Manages all streams for a connection.
+pub const StreamsMap = struct {
+    allocator: Allocator,
+    is_server: bool,
 
-    pos: usize = 0, // writing data position (to be read later)
-    off: u64 = 0, // lowest data offset that has yet to be read by the application.
-    len: u64 = 0, // total length of data received on this stream
+    /// All active streams indexed by stream ID.
+    streams: std.AutoHashMap(u64, *Stream),
 
-    // flow_control, // receiver flow controller
+    /// Send-only streams (unidirectional, locally initiated).
+    send_streams: std.AutoHashMap(u64, *SendStream),
 
-    fin_off: ?u64 = null, // final stream offset received from the peer, if any
-    err: ?u64 = null, // error code received via RESET_STREAM
-    is_draining: bool = false, // is incoming data validated but not buffered
+    /// Receive-only streams (unidirectional, peer initiated).
+    recv_streams: std.AutoHashMap(u64, *ReceiveStream),
+
+    /// Next outgoing stream IDs.
+    next_bidi_stream_id: u64,
+    next_uni_stream_id: u64,
+
+    /// Maximum stream counts from peer's transport parameters.
+    max_bidi_streams: u64 = 0,
+    max_uni_streams: u64 = 0,
+
+    /// Maximum stream IDs from peer.
+    max_incoming_bidi_streams: u64 = 0,
+    max_incoming_uni_streams: u64 = 0,
+
+    /// Number of open streams.
+    open_bidi_streams: u64 = 0,
+    open_uni_streams: u64 = 0,
+
+    pub fn init(allocator: Allocator, is_server: bool) StreamsMap {
+        // Stream IDs: client bidi = 0, 4, 8, ...; server bidi = 1, 5, 9, ...
+        // Client uni = 2, 6, 10, ...; server uni = 3, 7, 11, ...
+        const bidi_base: u64 = if (is_server) 1 else 0;
+        const uni_base: u64 = if (is_server) 3 else 2;
+
+        return .{
+            .allocator = allocator,
+            .is_server = is_server,
+            .streams = std.AutoHashMap(u64, *Stream).init(allocator),
+            .send_streams = std.AutoHashMap(u64, *SendStream).init(allocator),
+            .recv_streams = std.AutoHashMap(u64, *ReceiveStream).init(allocator),
+            .next_bidi_stream_id = bidi_base,
+            .next_uni_stream_id = uni_base,
+        };
+    }
+
+    pub fn deinit(self: *StreamsMap) void {
+        // Free all stream objects
+        var stream_it = self.streams.valueIterator();
+        while (stream_it.next()) |s| {
+            s.*.deinit();
+            self.allocator.destroy(s.*);
+        }
+        self.streams.deinit();
+
+        var send_it = self.send_streams.valueIterator();
+        while (send_it.next()) |s| {
+            s.*.deinit();
+            self.allocator.destroy(s.*);
+        }
+        self.send_streams.deinit();
+
+        var recv_it = self.recv_streams.valueIterator();
+        while (recv_it.next()) |s| {
+            s.*.deinit();
+            self.allocator.destroy(s.*);
+        }
+        self.recv_streams.deinit();
+    }
+
+    /// Update the maximum stream limits from peer's transport parameters.
+    pub fn setMaxStreams(self: *StreamsMap, max_bidi: u64, max_uni: u64) void {
+        self.max_bidi_streams = max_bidi;
+        self.max_uni_streams = max_uni;
+    }
+
+    /// Set the maximum incoming stream limits (our advertised limits).
+    pub fn setMaxIncomingStreams(self: *StreamsMap, max_bidi: u64, max_uni: u64) void {
+        self.max_incoming_bidi_streams = max_bidi;
+        self.max_incoming_uni_streams = max_uni;
+    }
+
+    /// Open a new bidirectional stream. Returns error if stream limit reached.
+    pub fn openBidiStream(self: *StreamsMap) !*Stream {
+        if (self.open_bidi_streams >= self.max_bidi_streams) {
+            return error.StreamLimitError;
+        }
+
+        const id = self.next_bidi_stream_id;
+        self.next_bidi_stream_id += 4;
+        self.open_bidi_streams += 1;
+
+        const s = try self.allocator.create(Stream);
+        s.* = Stream.init(self.allocator, id);
+        try self.streams.put(id, s);
+        return s;
+    }
+
+    /// Open a new unidirectional send stream. Returns error if stream limit reached.
+    pub fn openUniStream(self: *StreamsMap) !*SendStream {
+        if (self.open_uni_streams >= self.max_uni_streams) {
+            return error.StreamLimitError;
+        }
+
+        const id = self.next_uni_stream_id;
+        self.next_uni_stream_id += 4;
+        self.open_uni_streams += 1;
+
+        const s = try self.allocator.create(SendStream);
+        s.* = SendStream.init(self.allocator, id);
+        try self.send_streams.put(id, s);
+        return s;
+    }
+
+    /// Get or create a stream from an incoming STREAM frame.
+    pub fn getOrCreateStream(self: *StreamsMap, stream_id: u64) !*Stream {
+        if (self.streams.get(stream_id)) |existing| {
+            return existing;
+        }
+
+        // Verify this is a valid peer-initiated stream
+        if (isLocal(stream_id, self.is_server)) {
+            return error.StreamStateError; // We don't have this stream
+        }
+
+        if (!isBidi(stream_id)) {
+            return error.StreamStateError; // Uni streams should use recv_streams
+        }
+
+        const s = try self.allocator.create(Stream);
+        s.* = Stream.init(self.allocator, stream_id);
+        try self.streams.put(stream_id, s);
+        self.open_bidi_streams += 1;
+        return s;
+    }
+
+    /// Get or create a receive stream for an incoming unidirectional stream.
+    pub fn getOrCreateRecvStream(self: *StreamsMap, stream_id: u64) !*ReceiveStream {
+        if (self.recv_streams.get(stream_id)) |existing| {
+            return existing;
+        }
+
+        const s = try self.allocator.create(ReceiveStream);
+        s.* = ReceiveStream.init(self.allocator, stream_id);
+        try self.recv_streams.put(stream_id, s);
+        self.open_uni_streams += 1;
+        return s;
+    }
+
+    /// Get a stream by ID.
+    pub fn getStream(self: *StreamsMap, stream_id: u64) ?*Stream {
+        return self.streams.get(stream_id);
+    }
 };
 
-pub const SendBuffer = struct {
-    /// Chunks of data to be sent, ordered by offset
-    data: [MAX_DATA]u8 = .{undefined} ** MAX_DATA, // VecDeque<RangeBuf>
-    pos: usize = 0, // index of the buffer that needs to be sent next
+// Tests
 
-    off: u64 = 0, // maximum offset of data buffered in the stream
-    len: u64 = 0, // amount of data currently buffered
+test "FrameSorter: in-order data" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
 
-    max_data: u64 = MAX_DATA, // maximum offset we are allowed to send to the peer
+    try sorter.push(0, "hello", false);
+    try sorter.push(5, " world", true);
 
-    blocked_at: ?u64 = null, // last offset the stream was blocked at, if any
-    fin_off: ?u64 = null, // final stream offset written to the stream, if any
+    const chunk1 = sorter.pop();
+    try testing.expect(chunk1 != null);
+    try testing.expectEqualStrings("hello", chunk1.?);
+    testing.allocator.free(chunk1.?);
 
-    is_shutdown: bool = false, // whether sending has been shut down
+    const chunk2 = sorter.pop();
+    try testing.expect(chunk2 != null);
+    try testing.expectEqualStrings(" world", chunk2.?);
+    testing.allocator.free(chunk2.?);
 
-    // // ranges::RangeSet,
-    // acked: [MAX_DATA]u64, // range of data offsets that have been acked
-    // err: ?u64, // error code received via STOP_SENDING
-};
+    try testing.expect(sorter.isComplete());
+}
+
+test "FrameSorter: out-of-order data" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    // Receive second chunk first
+    try sorter.push(5, " world", false);
+
+    // Nothing available yet (gap at offset 0)
+    try testing.expect(sorter.pop() == null);
+
+    // Receive first chunk
+    try sorter.push(0, "hello", false);
+
+    const chunk1 = sorter.pop();
+    try testing.expect(chunk1 != null);
+    try testing.expectEqualStrings("hello", chunk1.?);
+    testing.allocator.free(chunk1.?);
+
+    const chunk2 = sorter.pop();
+    try testing.expect(chunk2 != null);
+    try testing.expectEqualStrings(" world", chunk2.?);
+    testing.allocator.free(chunk2.?);
+}
+
+test "SendStream: basic write and pop" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("hello");
+    try testing.expect(ss.hasData());
+
+    const frame = ss.popStreamFrame(100);
+    try testing.expect(frame != null);
+    switch (frame.?) {
+        .stream => |s| {
+            try testing.expectEqual(@as(u64, 0), s.stream_id);
+            try testing.expectEqual(@as(u64, 0), s.offset);
+            try testing.expectEqualSlices(u8, "hello", s.data);
+            try testing.expect(!s.fin);
+        },
+        else => unreachable,
+    }
+}
+
+test "SendStream: write with FIN" {
+    var ss = SendStream.init(testing.allocator, 4);
+    defer ss.deinit();
+
+    try ss.writeData("data");
+    ss.close();
+
+    const frame = ss.popStreamFrame(100);
+    try testing.expect(frame != null);
+    switch (frame.?) {
+        .stream => |s| {
+            try testing.expect(s.fin);
+        },
+        else => unreachable,
+    }
+}
+
+test "StreamsMap: open and manage streams" {
+    var sm = StreamsMap.init(testing.allocator, false); // client
+    defer sm.deinit();
+
+    sm.setMaxStreams(10, 10);
+
+    // Open a bidi stream
+    const s = try sm.openBidiStream();
+    try testing.expectEqual(@as(u64, 0), s.stream_id); // Client bidi: 0, 4, 8, ...
+
+    // Open another
+    const s2 = try sm.openBidiStream();
+    try testing.expectEqual(@as(u64, 4), s2.stream_id);
+
+    // Open uni stream
+    const us = try sm.openUniStream();
+    try testing.expectEqual(@as(u64, 2), us.stream_id); // Client uni: 2, 6, 10, ...
+}
+
+test "StreamsMap: server stream IDs" {
+    var sm = StreamsMap.init(testing.allocator, true); // server
+    defer sm.deinit();
+
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.openBidiStream();
+    try testing.expectEqual(@as(u64, 1), s.stream_id); // Server bidi: 1, 5, 9, ...
+
+    const us = try sm.openUniStream();
+    try testing.expectEqual(@as(u64, 3), us.stream_id); // Server uni: 3, 7, 11, ...
+}
+
+test "streamType" {
+    try testing.expectEqual(StreamType.client_bidi, streamType(0));
+    try testing.expectEqual(StreamType.server_bidi, streamType(1));
+    try testing.expectEqual(StreamType.client_uni, streamType(2));
+    try testing.expectEqual(StreamType.server_uni, streamType(3));
+    try testing.expectEqual(StreamType.client_bidi, streamType(4));
+    try testing.expectEqual(StreamType.server_bidi, streamType(5));
+}
