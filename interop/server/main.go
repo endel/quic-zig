@@ -79,7 +79,7 @@ func main() {
 	}
 }
 
-func handleConnection(conn quic.Connection) {
+func handleConnection(conn *quic.Conn) {
 	defer conn.CloseWithError(0, "done")
 
 	for {
@@ -92,7 +92,7 @@ func handleConnection(conn quic.Connection) {
 	}
 }
 
-func handleStream(conn quic.Connection, stream quic.Stream) {
+func handleStream(conn *quic.Conn, stream *quic.Stream) {
 	log.Printf("[%s] accepted stream %d", conn.RemoteAddr(), stream.StreamID())
 
 	data, err := io.ReadAll(stream)

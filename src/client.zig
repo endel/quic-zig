@@ -16,7 +16,7 @@ pub fn main() !void {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Connect to quic-go server at localhost:4434
+    // Connect to quic-go v0.59.0 server at localhost:4434
     const server_addr = try net.Address.parseIp4("127.0.0.1", 4434);
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
@@ -24,7 +24,7 @@ pub fn main() !void {
     // Create a local socket with any available port
     const local_addr = try net.Address.parseIp4("127.0.0.1", 0);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
-    std.log.info("QUIC client connecting to localhost:4434", .{});
+    std.log.info("QUIC client connecting to localhost:4434 (quic-go v0.59.0)", .{});
 
     // Create TLS config for the client
     // (Clients don't need certificates - empty arrays are fine)
@@ -90,6 +90,16 @@ pub fn main() !void {
             };
 
             std.log.info("recv {any} packet ({} bytes)", .{ header.packet_type, packet_length });
+
+            // Save first response packet for debugging
+            if (header.packet_type == .initial) {
+                std.debug.print("\n=== RECEIVED INITIAL PACKET BYTES ===\n", .{});
+                for (bytes[0..@min(116, packet_length)], 0..) |byte, i| {
+                    if (i % 16 == 0) std.debug.print("\n{x:0>3}: ", .{i});
+                    std.debug.print("{x:0>2} ", .{byte});
+                }
+                std.debug.print("\n\n", .{});
+            }
 
             conn.recv(&header, &fbs, .{
                 .to = local_addr.any,
