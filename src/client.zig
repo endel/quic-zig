@@ -56,7 +56,7 @@ pub fn main() !void {
     var iteration: usize = 0;
 
     while (!handshake_complete and iteration < max_iterations) : (iteration += 1) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        std.Thread.sleep(1 * std.time.ns_per_ms);
 
         // Send any pending packets
         if (!handshake_complete) {
@@ -66,8 +66,11 @@ pub fn main() !void {
             };
             if (bytes_written > 0) {
                 send_count += 1;
-                _ = try posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size);
-                std.log.info("sent {d} bytes (packet #{d})", .{ bytes_written, send_count });
+                const sent = posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size) catch |err| {
+                    std.log.err("sendto failed: {any}", .{err});
+                    continue;
+                };
+                std.log.info("sent {d} bytes (packet #{d}), sendto returned {d}", .{ bytes_written, send_count, sent });
             }
         }
 
