@@ -832,6 +832,8 @@ pub fn connect(
     conn.dcid_len = 8;
     @memcpy(conn.dcid[0..8], &dcid);
 
+    std.log.info("connection.connect: dcid={any}, scid={any}", .{ dcid, scid });
+
     // Derive Initial encryption keys from the DCID we chose
     try conn.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].setupInitial(
         &dcid,

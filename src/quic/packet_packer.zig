@@ -187,6 +187,8 @@ pub const PacketPacker = struct {
             try writer.writeByte(@intCast(self.scid.len));
             try writer.writeAll(self.scid);
 
+            std.log.info("packInitial: writing dcid={any}, scid={any}", .{ self.dcid, self.scid });
+
             // Token (Initial only)
             if (pkt_type == .initial) {
                 if (self.initial_token) |token| {

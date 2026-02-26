@@ -72,6 +72,10 @@ pub const Open = struct {
         const tag_len = Aead.tag_length;
         const payload_len = payload.len;
 
+        std.log.info("decryptPayload: pn={d}, ad.len={d}, payload.len={d}", .{ packet_number, associated_data.len, payload_len });
+        std.log.info("decryptPayload: key={any}", .{self.key});
+        std.log.info("decryptPayload: iv={any}", .{self.nonce});
+
         assert(payload_len >= tag_len);
 
         const tag: [tag_len]u8 = tag: {
@@ -79,19 +83,26 @@ pub const Open = struct {
             @memcpy(&t, payload[(payload_len - tag_len)..payload_len]);
             break :tag t;
         };
+        std.log.info("decryptPayload: tag={any}", .{tag});
 
         const aead_nonce = makeNonce(self.nonce, packet_number);
         const bytes = payload[0..(payload_len - tag_len)];
 
-        try Aead.decrypt(
+        std.log.info("decryptPayload: aead_nonce={any}, bytes.len={d}", .{ aead_nonce, bytes.len });
+
+        Aead.decrypt(
             bytes, // output
             bytes, // input
             tag,
             associated_data,
             aead_nonce,
             self.key,
-        );
+        ) catch |err| {
+            std.log.err("AEAD decryption failed: {any}", .{err});
+            return err;
+        };
 
+        std.log.info("decryptPayload: success, first_byte={x}", .{if (bytes.len > 0) bytes[0] else 0});
         return bytes;
     }
 };
@@ -271,7 +282,10 @@ pub fn deriveInitialKeyMaterial(
 
     // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
 
+    std.log.info("deriveInitialKeyMaterial: cid_len={d}, is_server={}", .{ cid.len, is_server });
+
     const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, cid);
+    std.log.info("deriveInitialKeyMaterial: initial_secret={any}", .{initial_secret});
     var secret: [32]u8 = undefined;
 
     // Client

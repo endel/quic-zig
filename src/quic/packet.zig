@@ -258,12 +258,20 @@ pub fn parseIncoming(bytes: []const u8) void {
 }
 
 pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
-    std.log.info("\n\nheader.remainder_len: {any}", .{header.remainder_len});
+    std.log.info("\n\nheader.remainder_len: {any}, fbs.pos: {d}, buffer.len: {d}", .{ header.remainder_len, fbs.pos, fbs.buffer.len });
     const pn_and_sample_len = MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN;
+
+    if (fbs.pos + pn_and_sample_len > fbs.buffer.len) {
+        std.log.err("Not enough data for packet number + sample: pos={d}, needed={d}, buffer.len={d}", .{ fbs.pos, pn_and_sample_len, fbs.buffer.len });
+        return error.InvalidPacket;
+    }
+
     const pn_and_sample = fbs.buffer[fbs.pos..(fbs.pos + pn_and_sample_len)];
 
     const pn_ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
     const sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
+
+    std.log.info("decrypt: sample={any}", .{sample});
 
     var first_byte = fbs.buffer[0];
 
@@ -271,6 +279,7 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     var aead = space.crypto_open.?;
 
     const mask = aead.newMask(sample);
+    std.log.info("decrypt: mask={any}", .{mask});
 
     if (isLongHeader(first_byte)) {
         first_byte ^= (mask[0] & 0x0f);
@@ -307,12 +316,27 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     // https://www.rfc-editor.org/rfc/rfc9000.html#name-packet-number-encoding-and-
     //
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
+    std.log.info("decrypt: decoded packet_number={d}, truncated={d}", .{ header.packet_number, truncated_packet_number });
 
-    return try aead.decryptPayload(
+    const payload_len = header.remainder_len - header.packet_number_len;
+    std.log.info("decrypt: payload_len={d}, packet_number_len={d}", .{ payload_len, header.packet_number_len });
+
+    const header_bytes = fbs.buffer[0..(fbs.pos)];
+    const encrypted_payload = fbs.buffer[(fbs.pos)..(fbs.pos + payload_len)];
+
+    std.log.info("decrypt: header_bytes.len={d}, encrypted_payload.len={d}", .{ header_bytes.len, encrypted_payload.len });
+    std.log.info("decrypt: header_bytes={any}", .{header_bytes});
+    std.log.info("decrypt: dcid={any}, scid={any}", .{ header.dcid, header.scid });
+
+    const decrypted = try aead.decryptPayload(
         header.packet_number,
-        fbs.buffer[0..(fbs.pos)], // header bytes
-        fbs.buffer[(fbs.pos)..(fbs.pos + header.remainder_len - header.packet_number_len)], // payload
+        header_bytes,
+        encrypted_payload,
     );
+
+    std.log.info("decrypt: decrypted.len={d}, first_byte={x}", .{ decrypted.len, if (decrypted.len > 0) decrypted[0] else 0 });
+
+    return decrypted;
 }
 
 // inline
