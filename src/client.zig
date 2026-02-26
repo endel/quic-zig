@@ -26,12 +26,23 @@ pub fn main() !void {
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
     std.log.info("QUIC client connecting to localhost:4434", .{});
 
-    // Create client connection (no TLS config for now - no cert validation)
+    // Create TLS config for the client
+    // (Clients don't need certificates - empty arrays are fine)
+    const alpn = try alloc.alloc([]const u8, 1);
+    alpn[0] = "h3";
+
+    const tls_config: tls13.TlsConfig = .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = alpn,
+    };
+
+    // Create client connection with TLS config
     var conn = try connection.connect(
         alloc,
         "localhost",
         .{},
-        null,
+        tls_config,
     );
 
     var remote_addr = server_addr.any;

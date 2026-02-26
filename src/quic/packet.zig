@@ -375,16 +375,9 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
 
         switch (header.packet_type) {
             PacketType.initial => {
-                //
-                // Clients MUST ensure that UDP datagrams containing Initial packets
-                // have UDP payloads of at least 1200 bytes,
-                //
-                // https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
-                //
-                if (fbs.buffer.len < 1200) {
-                    std.log.warn("Initial packet length must be 1200 bytes or higher. (actual length {})", .{fbs.buffer.len});
-                    return error.InvalidPacket;
-                }
+                // NOTE: RFC 9000 Section 8.1 requires clients to send Initial packets
+                // with at least 1200 bytes payload. This is validated when sending (in packet_packer),
+                // not when receiving, since the server may send smaller Initial packets.
 
                 std.log.info("token_length: readVarInt (before) => fbs.pos: {any}", .{fbs.pos});
                 const token_length = try readVarInt(reader);
