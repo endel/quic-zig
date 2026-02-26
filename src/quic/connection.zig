@@ -151,6 +151,8 @@ pub const Connection = struct {
         const now: i64 = @intCast(std.time.nanoTimestamp());
 
         const local_params: transport_params.TransportParams = .{
+            .original_destination_connection_id = if (is_server) header.dcid else null,
+            .initial_source_connection_id = header.scid,
             .max_idle_timeout = config.max_idle_timeout,
             .initial_max_data = config.initial_max_data,
             .initial_max_stream_data_bidi_local = config.initial_max_stream_data_bidi_local,
@@ -243,7 +245,7 @@ pub const Connection = struct {
             return error.NotImplemented;
         }
 
-        const space = self.pkt_num_spaces[@intFromEnum(epoch)];
+        const space = self.pkt_num_spaces[@intFromEnum(epochToEncLevel(epoch))];
         const payload = packet.decrypt(header, fbs, space) catch |err| {
             std.log.err("can't decrypt packet. {any}", .{err});
             return error.InvalidPacket;

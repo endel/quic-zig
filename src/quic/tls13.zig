@@ -1166,7 +1166,7 @@ fn buildCertificateVerify(
 ) ![]const u8 {
     // Build the content to sign:
     // 0x20 repeated 64 times + context_string + 0x00 + transcript_hash
-    var sign_content: [64 + 34 + 1 + 32]u8 = undefined;
+    var sign_content: [64 + 33 + 1 + 32]u8 = undefined;
     @memset(sign_content[0..64], 0x20);
     const context_str = if (is_server) "TLS 1.3, server CertificateVerify" else "TLS 1.3, client CertificateVerify";
     @memcpy(sign_content[64..][0..33], context_str);

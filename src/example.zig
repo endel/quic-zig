@@ -1,208 +1,144 @@
 const std = @import("std");
-const net = std.net;
-const fs = std.fs;
-const io = std.io;
 const posix = std.posix;
-const mem = std.mem;
+const io = std.io;
 
-const Server = @import("quic/server.zig").Server;
 const connection = @import("quic/connection.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
-const Frame = @import("quic/frame.zig").Frame;
-const tls = @import("quic/tls.zig");
 const tls13 = @import("quic/tls13.zig");
 
-const h0 = @import("h0/connection.zig");
-const h3 = @import("h3/connection.zig");
-
-const hmac = std.crypto.auth.hmac;
-
-// pub const io_mode = .evented;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-pub fn main() anyerror!void {
-    // var alloc = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer _ = alloc.deinit();
-    // var alloc = std.heap.page_allocator;
+pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    tls.setSupportedALPN(&[_][]const u8{"h3"});
-    var server = try Server.init(alloc, "self-signed/cert.crt");
+    // Read cert files at runtime
+    const server_cert_pem = try std.fs.cwd().readFileAlloc(alloc, "interop/certs/server.crt", 8192);
+    const server_key_pem = try std.fs.cwd().readFileAlloc(alloc, "interop/certs/server.key", 8192);
 
-    // .{
-    //     .alpn_protocols = h3.ALPN ++ h0.ALPN ++ [_][]const u8{"siduck"},
-    //     // .is_client = false,
-    //     .max_datagram_frame_size = 65536,
-    // }
-    //
+    // Parse PEM → DER
+    var cert_der_buf: [4096]u8 = undefined;
+    const cert_der = try tls13.parsePemCert(server_cert_pem, &cert_der_buf);
 
-    // try server.config.readCertChain(alloc, .{
-    //     .certfile = "self-signed/aioquic/ssl_cert.pem",
-    //     .keyfile = "self-signed/aioquic/ssl_key.pem",
-    //     // .certfile = @embedFile("../self-signed/aioquic/ssl_cert.pem"),
-    //     // .keyfile = @embedFile("../self-signed/aioquic/ssl_key.pem"),
-    // });
+    var key_der_buf: [4096]u8 = undefined;
+    const key_der = try tls13.parsePemPrivateKey(server_key_pem, &key_der_buf);
+    const ec_private_key = try tls13.extractEcPrivateKey(key_der);
 
-    // var rnd: [hmac.sha2.HmacSha256.mac_length]u8 = undefined;
-    // std.crypto.random.bytes(&rnd);
-    //
-    // var connection_id_seed: [hmac.sha2.HmacSha256.mac_length]u8 = undefined;
-    // hmac.sha2.HmacSha256.create(connection_id_seed[0..], "", "");
+    // Build TLS config
+    const cert_chain = try alloc.alloc([]const u8, 1);
+    cert_chain[0] = cert_der;
 
+    const alpn = try alloc.alloc([]const u8, 1);
+    alpn[0] = "h3";
+
+    const tls_config: tls13.TlsConfig = .{
+        .cert_chain_der = cert_chain,
+        .private_key_bytes = ec_private_key,
+        .alpn = alpn,
+    };
+
+    // Create UDP socket
     const local_addr = try std.net.Address.parseIp4("127.0.0.1", 4433);
-    // const local_addr = try std.net.Address.parseIp6("::1", 4433);
-
-    const sockfd = try server.listen(local_addr);
+    const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
+    try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
+    std.log.info("QUIC server listening on 127.0.0.1:4433", .{});
 
-    // var connections = std.StringHashMap(connection.Connection).init(alloc);
-    var client_ids = std.array_list.Managed([]const u8).init(alloc);
-    defer client_ids.deinit();
-
-    var connections = std.StringArrayHashMap(connection.Connection).init(alloc);
-    // defer connections.clearAndFree();
-    defer connections.clearAndFree();
-
-    // out/write buffer
+    var conn_state: ?connection.Connection = null;
+    var remote_addr: posix.sockaddr = undefined;
+    var addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
-    var out_buff = io.fixedBufferStream(&out);
-    const out_writer = out_buff.writer();
-
-    var prevTimestamp: i64 = std.time.timestamp();
 
     while (true) {
-        std.Thread.sleep(100 * 1000 * 1000);
+        std.Thread.sleep(1 * std.time.ns_per_ms);
 
-        udp_read: while (true) {
-            // reset write position
-            try out_buff.seekTo(0);
-
+        // Read loop: process all available UDP packets
+        read_loop: while (true) {
             var bytes: [8192]u8 = undefined;
-
-            var remote_addr: posix.sockaddr = undefined;
-            var addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
+            addr_size = @sizeOf(posix.sockaddr);
 
             const packet_length = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch {
-                std.log.info("No more packets to read. Break read loop!", .{});
-                break :udp_read;
+                break :read_loop;
             };
 
-            std.log.info("\n<<-\nRECEIVED PACKET ({}ms) from {} (addr size: {})", .{ (std.time.timestamp() - prevTimestamp), remote_addr, addr_size });
-            prevTimestamp = std.time.timestamp();
-            std.log.info("FULL PACKET: (len: {}) {any}", .{ packet_length, bytes[0..packet_length] });
-
-            // var fbs = io.fixedBufferStream(bytes[0..packet_length]);
-            // const reader = fbs.reader();
             var fbs = io.fixedBufferStream(bytes[0..packet_length]);
-            var header = try packet.Header.parse(&fbs);
-            std.log.info("FBS POS => {any}", .{fbs.pos});
+            var header = packet.Header.parse(&fbs) catch |err| {
+                std.log.err("header parse error: {any}", .{err});
+                continue :read_loop;
+            };
 
-            // make sure payload is not higher than received packet  length
-            std.log.info("remainder_len: {any} / {any} (packet_length)", .{ header.remainder_len, packet_length });
-            if (header.remainder_len > packet_length) {
-                std.log.warn("remaining length is higher than packet length!", .{});
-                continue :udp_read;
+            std.log.info("recv {any} packet ({} bytes)", .{ header.packet_type, packet_length });
+
+            // Version negotiation
+            if (header.version != 0 and !protocol.isSupportedVersion(header.version)) {
+                var vn_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                var vn_fbs = io.fixedBufferStream(&vn_buf);
+                const vn_writer = vn_fbs.writer();
+                try packet.negotiateVersion(header, &vn_writer);
+                const vn_bytes = vn_fbs.getWritten();
+                _ = try posix.sendto(sockfd, vn_bytes, 0, &remote_addr, addr_size);
+                std.log.info("sent version negotiation", .{});
+                continue :read_loop;
             }
 
-            std.log.info("packet type: {any}", .{header.packet_type});
-            if (header.packet_type != packet.PacketType.initial) {
-                std.log.err("Packet is not initial!", .{});
-                continue :udp_read;
-            }
-
-            //
-            // TODO: Version negotiation
-            //
-
-            if (!protocol.isSupportedVersion(header.version)) {
-                std.log.warn("client wants to use unsupported version {}, let's negotiate version...", .{header.version});
-                try packet.negotiateVersion(header, &out_writer);
-
-                const bytes_to_send = out_buff.getWritten();
-                const bytes_sent = try posix.sendto(sockfd, bytes_to_send, 0, &remote_addr, addr_size);
-                std.log.info("\n->>\nSENT VERSION NEGOTIATION PACKET (sent: {} bytes) => {any}", .{ bytes_sent, bytes_to_send });
-
-                continue :udp_read;
-            }
-
-            if (header.token == null or header.token.?.len == 0) {
-                // TODO: Do stateless retry if the client didn't send a token.
-                std.log.warn("(->) PREPPING RETRY PACKET", .{});
-
-                // generates a random original destination connection id
-                var new_scid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = undefined;
-                const new_scid = new_scid_buf[0..header.scid.len];
-                connection.generateConnectionId(new_scid);
-                const retry_token = try packet.generateRetryToken(header, new_scid, remote_addr);
-
-                std.log.info("new scid (len: {any}): {any}", .{ new_scid.len, new_scid });
-                std.log.warn("retry token: {any}", .{retry_token});
-
-                try packet.retry(header, new_scid, retry_token, &out_buff);
-
-                const bytes_to_send = out_buff.getWritten();
-
-                const bytes_sent = try posix.sendto(sockfd, bytes_to_send, 0, &remote_addr, addr_size);
-                std.log.info("\n->>\nRETRY PACKET (sent: {} bytes)\n{any}", .{ bytes_sent, bytes_to_send });
-
-                continue :udp_read;
-            }
-
-            std.log.info("retry token length: {}", .{header.token.?.len});
-
-            var conn: connection.Connection = undefined;
-            if (connections.get(header.scid)) |value| {
-                std.log.warn("HAS CONNECTION!", .{});
-                conn = value;
-                //
-            } else {
-                if (header.scid.len != header.dcid.len) {
-                    std.log.err("Invalid destination connection ID", .{});
+            // Accept connection on first Initial (skip retry)
+            if (conn_state == null) {
+                if (header.packet_type != .initial) {
+                    std.log.warn("ignoring non-initial before connection established", .{});
+                    continue :read_loop;
                 }
-
-                std.log.info("ACCEPT CONNECTION!", .{});
-
-                conn = try connection.Connection.accept(alloc, header, local_addr.any, remote_addr, true, .{}, null);
-                try connections.put(&conn.scid, conn);
+                conn_state = try connection.Connection.accept(
+                    alloc,
+                    header,
+                    local_addr.any,
+                    remote_addr,
+                    true,
+                    .{},
+                    tls_config,
+                );
+                std.log.info("accepted new connection", .{});
             }
 
+            var conn = &conn_state.?;
             const recv_info: connection.RecvInfo = .{
                 .to = local_addr.any,
                 .from = remote_addr,
             };
 
-            // receive packet + process frames
-            conn.recv(&header, &fbs, recv_info) catch |e| {
-                std.log.err("RECV ERROR -> {any}", .{e});
-                continue :udp_read;
+            conn.recv(&header, &fbs, recv_info) catch |err| {
+                std.log.err("recv error: {any}", .{err});
+                continue :read_loop;
             };
-        }
 
-        var conn_it = connections.iterator();
-        while (conn_it.next()) |kv| {
-            try out_buff.seekTo(0);
-
-            const scid = kv.key_ptr.*;
-            var conn = kv.value_ptr.*;
-            std.log.info("looping through connections... key: {any} => (dcid (len: {any}): {any}, scid (len: {any}): {any})", .{ scid, conn.dcid.len, conn.dcid, conn.scid.len, conn.scid });
-
-            _ = try conn.send(&out);
-
-            const written = out_buff.getWritten();
-            if (written.len > 0) {
-                std.log.info("out buf: {any}", .{written});
+            // Send response packets after processing
+            const bytes_written = conn.send(&out) catch |err| {
+                std.log.err("send error: {any}", .{err});
+                continue :read_loop;
+            };
+            if (bytes_written > 0) {
+                _ = try posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size);
+                std.log.info("sent {d} bytes", .{bytes_written});
             }
         }
 
-        // TODO: garbage collect closed connections ...
+        // Periodic send for retransmissions/ACKs
+        if (conn_state != null) {
+            var conn = &conn_state.?;
+            const bytes_written = conn.send(&out) catch |err| {
+                std.log.err("periodic send error: {any}", .{err});
+                continue;
+            };
+            if (bytes_written > 0) {
+                _ = try posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size);
+                std.log.info("periodic sent {d} bytes", .{bytes_written});
+            }
+        }
     }
 }
 
 test {
-    _ = @import("quic/server.zig");
     _ = @import("quic/connection.zig");
     _ = @import("quic/packet.zig");
     _ = @import("quic/protocol.zig");
