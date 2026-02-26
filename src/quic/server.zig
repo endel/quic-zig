@@ -1,5 +1,5 @@
 const std = @import("std");
-const os = std.os;
+const posix = std.posix;
 const fs = std.fs;
 const io = std.io;
 const net = std.net;
@@ -34,10 +34,10 @@ pub const Server = struct {
         self.* = undefined;
     }
 
-    pub fn listen(_: Server, addr: std.net.Address) !i32 {
-        const sockfd = try os.socket(os.AF.INET, os.SOCK.DGRAM | os.SOCK.CLOEXEC | os.SOCK.NONBLOCK, 0);
+    pub fn listen(_: Server, addr: std.net.Address) !posix.socket_t {
+        const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
 
-        try os.bind(sockfd, &addr.any, @sizeOf(os.sockaddr.in));
+        try posix.bind(sockfd, &addr.any, @sizeOf(posix.sockaddr.in));
         std.log.info("socket bound at {any}", .{addr});
 
         return sockfd;

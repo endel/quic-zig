@@ -77,7 +77,7 @@ pub const Open = struct {
         // the tag is on last bytes of the payload
         const tag: [tag_len]u8 = tag: {
             var t: [tag_len]u8 = undefined;
-            std.mem.copy(u8, &t, payload[(payload_len - tag_len)..payload_len]);
+            @memcpy(&t, payload[(payload_len - tag_len)..payload_len]);
             break :tag t;
         };
 
@@ -91,10 +91,10 @@ pub const Open = struct {
         //
         const aead_nonce = nonce: {
             var n: [nonce_len]u8 = undefined;
-            std.mem.copy(u8, &n, &self.nonce);
+            @memcpy(&n, &self.nonce);
 
             var pn: [nonce_len]u8 = .{0x0} ** nonce_len;
-            std.mem.writeIntSliceBig(u64, pn[4..nonce_len], packet_number);
+            std.mem.writeInt(u64, pn[4..nonce_len], packet_number, .big);
 
             var i: usize = 4;
             while (i < nonce_len) {
@@ -105,7 +105,7 @@ pub const Open = struct {
             break :nonce n;
         };
 
-        var bytes = payload[0..(payload_len - tag_len)];
+        const bytes = payload[0..(payload_len - tag_len)];
 
         try Aead.decrypt(
             bytes, // output
@@ -322,11 +322,11 @@ fn hkdfExpandLabel(
 
     // length, label, context
     var buf: [2 + 255 + 255]u8 = undefined;
-    std.mem.writeIntBig(u16, buf[0..2], length);
+    std.mem.writeInt(u16, buf[0..2], length, .big);
     buf[2] = full_label.len;
-    std.mem.copy(u8, buf[3..], full_label);
-    buf[3 + full_label.len] = @intCast(u8, context.len);
-    std.mem.copy(u8, buf[4 + full_label.len ..], context);
+    @memcpy(buf[3..][0..full_label.len], full_label);
+    buf[3 + full_label.len] = @intCast(context.len);
+    @memcpy(buf[4 + full_label.len ..][0..context.len], context);
     const actual_context = buf[0 .. 4 + full_label.len + context.len];
 
     var out: [32]u8 = undefined;

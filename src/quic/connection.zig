@@ -1,6 +1,6 @@
 const std = @import("std");
 const net = std.net;
-const os = std.os;
+const posix = std.posix;
 const crypto = std.crypto;
 
 const protocol = @import("protocol.zig");
@@ -8,7 +8,6 @@ const protocol = @import("protocol.zig");
 const packet = @import("packet.zig");
 const tls = @import("tls.zig");
 const Frame = @import("frame.zig").Frame;
-const Client = @import("handshake/Client.zig");
 
 pub const State = enum(u8) {
     first_flight = 0,
@@ -23,8 +22,8 @@ pub const State = enum(u8) {
 pub const RecoveryConfig = struct {};
 
 pub const NetworkPath = struct {
-    local_addr: os.sockaddr,
-    peer_addr: os.sockaddr,
+    local_addr: posix.sockaddr,
+    peer_addr: posix.sockaddr,
     is_initial: bool,
     // recovery_config: RecoveryConfig,
 
@@ -35,8 +34,8 @@ pub const NetworkPath = struct {
     // remote_challenge: []u8,
 
     pub fn init(
-        local_addr: os.sockaddr, // net.Address,
-        peer_addr: os.sockaddr, // net.Address,
+        local_addr: posix.sockaddr, // net.Address,
+        peer_addr: posix.sockaddr, // net.Address,
         is_initial: bool,
     ) NetworkPath {
         return .{
@@ -106,8 +105,8 @@ pub const ConnectionError = struct {
 };
 
 pub const RecvInfo = struct {
-    to: os.sockaddr,
-    from: os.sockaddr,
+    to: posix.sockaddr,
+    from: posix.sockaddr,
 };
 
 ///
@@ -144,11 +143,11 @@ pub const Connection = struct {
     pub fn accept(
         allocator: std.mem.Allocator,
         header: packet.Header,
-        local: os.sockaddr, // net.Address,
-        remote: os.sockaddr, // net.Address,
+        local: posix.sockaddr, // net.Address,
+        remote: posix.sockaddr, // net.Address,
         comptime is_server: bool,
     ) !Connection {
-        var initial_path = NetworkPath.init(local, remote, true);
+        const initial_path = NetworkPath.init(local, remote, true);
 
         var conn = Connection{
             .allocator = allocator,
@@ -159,12 +158,12 @@ pub const Connection = struct {
             .paths = .{initial_path},
         };
 
-        @memcpy(&conn.dcid, header.dcid.ptr, header.dcid.len);
-        @memcpy(&conn.scid, header.scid.ptr, header.scid.len);
+        @memcpy(conn.dcid[0..header.dcid.len], header.dcid);
+        @memcpy(conn.scid[0..header.scid.len], header.scid);
 
         // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
         // TODO: improve me!
-        try conn.pkt_num_spaces[@enumToInt(packet.Epoch.initial)].setupInitial(header.dcid, header.version, is_server);
+        try conn.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].setupInitial(header.dcid, header.version, is_server);
 
         return conn;
     }
@@ -185,8 +184,8 @@ pub const Connection = struct {
             return error.NotImplemented;
         }
 
-        var space = self.pkt_num_spaces[@enumToInt(epoch)];
-        var payload = packet.decrypt(header, fbs, space) catch |err| {
+        const space = self.pkt_num_spaces[@intFromEnum(epoch)];
+        const payload = packet.decrypt(header, fbs, space) catch |err| {
             std.log.err("can't decrypt packet. {any}", .{err});
             return error.InvalidPacket;
         };
@@ -203,7 +202,7 @@ pub const Connection = struct {
 
         // TODO: determine path / support multiple paths (+ multipath extension)
         const path_idx = path_idx: {
-            var idx: usize = undefined;
+            var idx: usize = 0;
 
             if (header.packet_type == packet.PacketType.zero_rtt and
                 self.got_peer_conn_id)
@@ -259,10 +258,10 @@ pub const Connection = struct {
         // build response
     }
 
-    pub fn send(self: *Connection, out_writer: anytype) !void {
+    pub fn send(self: *Connection, out_buf: []u8) !void {
         std.log.info("> SEND() ...", .{});
         if (self.local_err != null) {
-            self.doHandshake(out_writer.context.buffer);
+            self.doHandshake(out_buf);
         }
     }
 
@@ -281,17 +280,17 @@ pub const Connection = struct {
             packet_type = .handshake;
         }
 
-        var epoch = packet.Epoch.fromPacketType(packet_type);
-        var num_space = self.pkt_num_spaces[epoch];
+        const epoch = try packet.Epoch.fromPacketType(packet_type);
+        var num_space = self.pkt_num_spaces[@intFromEnum(epoch)];
 
-        var pn = num_space.next_packet_number;
-        var pn_len = packet.packetNumberLength(pn);
+        const pn = num_space.next_packet_number;
+        const pn_len = try packet.packetNumberLength(pn);
 
-        var crypto_tag_len = num_space.cryptoTagLen();
+        const crypto_tag_len = num_space.cryptoTagLen();
 
         // FIXME: allow to select different network path
-        var send_path_id = 0;
-        var path = self.paths[send_path_id];
+        const send_path_id = 0;
+        const path = self.paths[send_path_id];
 
         _ = out_writer;
         _ = path;
@@ -323,7 +322,7 @@ pub const Connection = struct {
     }
 
     pub fn processFrame(self: *Connection, frame: Frame, epoch: packet.Epoch) !void {
-        var space = self.pkt_num_spaces[@enumToInt(epoch)];
+        var space = &self.pkt_num_spaces[@intFromEnum(epoch)];
 
         switch (frame) {
             .padding => |size| {
@@ -357,7 +356,7 @@ pub const Connection = struct {
                 // var crypto_stream = space.crypto_stream;
                 // crypto_stream.recv(crypto_frame.data);
 
-                self.handshake.provideData(crypto_frame.data, @enumToInt(epoch));
+                self.handshake.provideData(crypto_frame.data, @intFromEnum(epoch));
 
                 try self.handshake.perform(self.is_server);
 
@@ -400,14 +399,16 @@ pub fn generateConnectionId(size: usize) []u8 {
 }
 
 test "init connection" {
-    var conn = Connection{
+    const dcid_val = "dest1234" ++ ([_]u8{0} ** 12);
+    const scid_val = "src12345" ++ ([_]u8{0} ** 12);
+    const conn = Connection{
         .allocator = std.testing.allocator,
         .is_server = true,
-        .dcid = "dest1234",
-        .scid = "src12345",
+        .dcid = dcid_val.*,
+        .scid = scid_val.*,
         .version = protocol.SUPPORTED_VERSIONS[0],
     };
 
-    try std.testing.expectEqual(conn.dcid, "dest1234");
-    try std.testing.expectEqual(conn.scid, "src12345");
+    try std.testing.expectEqual(conn.dcid, dcid_val.*);
+    try std.testing.expectEqual(conn.scid, scid_val.*);
 }

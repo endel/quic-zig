@@ -1,11 +1,11 @@
 const std = @import("std");
 
-const endian = std.builtin.Endian.Big;
+const endian = std.builtin.Endian.big;
 
 pub fn sizeOf(comptime T: type) comptime_int {
     return switch (@typeInfo(T)) {
-        .Int => |i| @divExact(i.bits, 8),
-        .Array => |a| a.len * sizeOf(a.child),
+        .int => |i| @divExact(i.bits, 8),
+        .array => |a| a.len * sizeOf(a.child),
         else => @compileError("`sizeOf` only supports `Int` or `Array`"),
     };
 }
@@ -40,7 +40,7 @@ pub const StreamReader = struct {
 
     pub fn get(self: *StreamReader, comptime T: type) T {
         switch (@typeInfo(T)) {
-            .Int => |info| switch (info.bits) {
+            .int => |info| switch (info.bits) {
                 8 => {
                     self.idx += 1;
                     return self.buf[self.idx - 1];
@@ -60,17 +60,17 @@ pub const StreamReader = struct {
                 },
                 else => @compileError("unsupported int type: " ++ @typeName(T)),
             },
-            .Enum => |info| {
+            .@"enum" => |info| {
                 const int = self.get(info.tag_type);
                 if (info.is_exhaustive) @compileError("exhaustive enum cannot be used");
-                return @intToEnum(T, int);
+                return @enumFromInt(int);
             },
             else => @compileError("unsupported type: " ++ @typeName(T)),
         }
     }
 
     pub fn getSlice(self: *StreamReader, len: usize) []u8 {
-        var value = self.buf[self.idx..(self.idx + len)];
+        const value = self.buf[self.idx..(self.idx + len)];
         self.idx += len;
         return value;
     }

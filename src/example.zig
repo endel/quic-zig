@@ -2,9 +2,8 @@ const std = @import("std");
 const net = std.net;
 const fs = std.fs;
 const io = std.io;
-const os = std.os;
+const posix = std.posix;
 const mem = std.mem;
-const Queue = std.atomic.Queue;
 
 const Server = @import("quic/server.zig").Server;
 const connection = @import("quic/connection.zig");
@@ -56,10 +55,10 @@ pub fn main() anyerror!void {
     // const local_addr = try std.net.Address.parseIp6("::1", 4433);
 
     const sockfd = try server.listen(local_addr);
-    defer os.close(sockfd);
+    defer posix.close(sockfd);
 
     // var connections = std.StringHashMap(connection.Connection).init(alloc);
-    var client_ids = std.ArrayList([]const u8).init(alloc);
+    var client_ids = std.array_list.Managed([]const u8).init(alloc);
     defer client_ids.deinit();
 
     var connections = std.StringArrayHashMap(connection.Connection).init(alloc);
@@ -69,12 +68,12 @@ pub fn main() anyerror!void {
     // out/write buffer
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
     var out_buff = io.fixedBufferStream(&out);
-    var out_writer = out_buff.writer();
+    const out_writer = out_buff.writer();
 
-    var prevTimestamp = std.time.timestamp();
+    var prevTimestamp: i64 = std.time.timestamp();
 
     while (true) {
-        os.nanosleep(0, 100 * 1000 * 1000);
+        std.Thread.sleep(100 * 1000 * 1000);
 
         udp_read: while (true) {
             // reset write position
@@ -82,10 +81,10 @@ pub fn main() anyerror!void {
 
             var bytes: [8192]u8 = undefined;
 
-            var remote_addr: os.sockaddr = undefined;
-            var addr_size: std.os.socklen_t = @sizeOf(os.sockaddr);
+            var remote_addr: posix.sockaddr = undefined;
+            var addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
 
-            const packet_length = os.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch {
+            const packet_length = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch {
                 std.log.info("No more packets to read. Break read loop!", .{});
                 break :udp_read;
             };
@@ -121,8 +120,8 @@ pub fn main() anyerror!void {
                 std.log.warn("client wants to use unsupported version {}, let's negotiate version...", .{header.version});
                 try packet.negotiateVersion(header, &out_writer);
 
-                var bytes_to_send = out_buff.getWritten();
-                const bytes_sent = try os.sendto(sockfd, bytes_to_send, 0, &remote_addr, addr_size);
+                const bytes_to_send = out_buff.getWritten();
+                const bytes_sent = try posix.sendto(sockfd, bytes_to_send, 0, &remote_addr, addr_size);
                 std.log.info("\n->>\nSENT VERSION NEGOTIATION PACKET (sent: {} bytes) => {any}", .{ bytes_sent, bytes_to_send });
 
                 continue :udp_read;
@@ -133,17 +132,17 @@ pub fn main() anyerror!void {
                 std.log.warn("(->) PREPPING RETRY PACKET", .{});
 
                 // generates a random original destination connection id
-                var new_scid = connection.generateConnectionId(header.scid.len);
-                var retry_token = try packet.generateRetryToken(header, new_scid, remote_addr);
+                const new_scid = connection.generateConnectionId(header.scid.len);
+                const retry_token = try packet.generateRetryToken(header, new_scid, remote_addr);
 
                 std.log.info("new scid (len: {any}): {any}", .{ new_scid.len, new_scid });
                 std.log.warn("retry token: {any}", .{retry_token});
 
-                try packet.retry(header, new_scid, retry_token, &out_writer);
+                try packet.retry(header, new_scid, retry_token, &out_buff);
 
-                var bytes_to_send = out_buff.getWritten();
+                const bytes_to_send = out_buff.getWritten();
 
-                const bytes_sent = try os.sendto(sockfd, bytes_to_send, 0, &remote_addr, addr_size);
+                const bytes_sent = try posix.sendto(sockfd, bytes_to_send, 0, &remote_addr, addr_size);
                 std.log.info("\n->>\nRETRY PACKET (sent: {} bytes)\n{any}", .{ bytes_sent, bytes_to_send });
 
                 continue :udp_read;
@@ -167,7 +166,7 @@ pub fn main() anyerror!void {
                 try connections.put(&conn.scid, conn);
             }
 
-            var recv_info: connection.RecvInfo = .{
+            const recv_info: connection.RecvInfo = .{
                 .to = local_addr.any,
                 .from = remote_addr,
             };
@@ -183,13 +182,13 @@ pub fn main() anyerror!void {
         while (conn_it.next()) |kv| {
             try out_buff.seekTo(0);
 
-            var scid = kv.key_ptr.*;
+            const scid = kv.key_ptr.*;
             var conn = kv.value_ptr.*;
             std.log.info("looping through connections... key: {any} => (dcid (len: {any}): {any}, scid (len: {any}): {any})", .{ scid, conn.dcid.len, conn.dcid, conn.scid.len, conn.scid });
 
-            try conn.send(&out_writer);
+            try conn.send(&out);
 
-            var written = out_buff.getWritten();
+            const written = out_buff.getWritten();
             if (written.len > 0) {
                 std.log.info("out buf: {any}", .{written});
             }

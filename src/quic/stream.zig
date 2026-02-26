@@ -23,7 +23,7 @@ pub const Stream = struct {
     is_incremental: bool = true, // can be flushed incrementally? default is `true`
 
     data: [MAX_DATA]u8 = undefined,
-    priority: u8 = @enumToInt(Priority.default), // 0 = highest. default is `Priority.default`.
+    priority: u8 = @intFromEnum(Priority.default), // 0 = highest. default is `Priority.default`.
 
     pub fn recv(self: *Stream, data: []u8) void {
         for (data, 0..) |b, i| {
@@ -41,7 +41,7 @@ pub const Stream = struct {
         std.log.info(".readAtLeast(), len: {any}, buf.off: {any}, buf.data: {any}", .{ len, self.recv_buffer.off, self.recv_buffer.data });
 
         // TODO: check if off+len is a valid slice. (out of bounds?)
-        var slice = self.recv_buffer.data[self.recv_buffer.off..(self.recv_buffer.off + len)];
+        const slice = self.recv_buffer.data[self.recv_buffer.off..(self.recv_buffer.off + len)];
         for (slice, 0..) |b, i| {
             dest[i] = b;
         }
@@ -53,15 +53,14 @@ pub const Stream = struct {
         return len;
     }
 
-    pub fn writevAll(self: *@This(), iovecs: []std.os.iovec_const) !usize {
+    pub fn writevAll(self: *@This(), iovecs: []std.posix.iovec_const) !usize {
         for (iovecs) |iovec| {
             var i: usize = 0;
-            while (i < iovec.iov_len) : (i += 1) {
-                var ptr = @ptrCast(@TypeOf(iovec.iov_base), iovec.iov_base);
-                self.send_buffer.data[self.send_buffer.off + i] = ptr[i];
+            while (i < iovec.len) : (i += 1) {
+                self.send_buffer.data[self.send_buffer.off + i] = iovec.base[i];
             }
 
-            self.send_buffer.off += iovec.iov_len;
+            self.send_buffer.off += iovec.len;
         }
 
         return self.send_buffer.off;

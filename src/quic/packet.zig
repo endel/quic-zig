@@ -1,6 +1,6 @@
 const std = @import("std");
 const io = std.io;
-const os = std.os;
+const posix = std.posix;
 const log = std.log;
 const time = std.time;
 const assert = std.debug.assert;
@@ -13,7 +13,7 @@ const util = @import("util.zig");
 const stream = @import("stream.zig");
 
 // network byte order
-pub const ENDIAN = std.builtin.Endian.Big;
+pub const ENDIAN = std.builtin.Endian.big;
 
 pub const LONG_HEADER_BIT: u8 = 0x80;
 pub const FIXED_BIT: u8 = 0x40;
@@ -90,7 +90,7 @@ pub const PacketError = error{
     InvalidVarLength,
 };
 
-pub const ErrorCode = enum(u8) {
+pub const ErrorCode = enum(u16) {
     no_error = 0x0,
     internal_error = 0x1,
     connection_refused = 0x2,
@@ -168,7 +168,7 @@ pub const Header = struct {
                 first &= ~KEY_PHASE_BIT; // bitwise NOT
             }
 
-            try writer.writeByte(@intCast(u8, first));
+            try writer.writeByte(@intCast(first));
             try writer.writeAll(self.dcid);
 
             return;
@@ -185,13 +185,13 @@ pub const Header = struct {
 
         first |= LONG_HEADER_BIT | FIXED_BIT | (ty << 4);
 
-        try writer.writeByte(@intCast(u8, first));
+        try writer.writeByte(@intCast(first));
         try writer.writeInt(u32, self.version, ENDIAN);
 
-        try writer.writeByte(@intCast(u8, self.dcid.len));
+        try writer.writeByte(@intCast(self.dcid.len));
         try writer.writeAll(self.dcid);
 
-        try writer.writeByte(@intCast(u8, self.scid.len));
+        try writer.writeByte(@intCast(self.scid.len));
         try writer.writeAll(self.scid);
 
         // Only Initial and Retry packets have a token.
@@ -247,7 +247,7 @@ pub const PacketNumSpace = struct {
     }
 
     pub fn setupInitial(self: *PacketNumSpace, dcid: []const u8, version: u32, comptime is_server: bool) !void {
-        var keys = try crypto.deriveInitialKeyMaterial(dcid, version, is_server);
+        const keys = try crypto.deriveInitialKeyMaterial(dcid, version, is_server);
         self.crypto_open = keys[0];
         self.crypto_seal = keys[1];
     }
@@ -262,15 +262,15 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     const pn_and_sample_len = MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN;
     const pn_and_sample = fbs.buffer[fbs.pos..(fbs.pos + pn_and_sample_len)];
 
-    var pn_ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
-    var sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
+    const pn_ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
+    const sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
 
     var first_byte = fbs.buffer[0];
 
     // unprotect header
     var aead = space.crypto_open.?;
 
-    var mask = aead.newMask(sample);
+    const mask = aead.newMask(sample);
 
     if (isLongHeader(first_byte)) {
         first_byte ^= (mask[0] & 0x0f);
@@ -278,7 +278,7 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
         first_byte ^= (mask[0] & 0x1f);
     }
 
-    header.packet_number_len = @intCast(usize, (first_byte & PACKET_NUM_MASK)) + 1;
+    header.packet_number_len = @as(usize, @intCast(first_byte & PACKET_NUM_MASK)) + 1;
 
     var i: usize = 0;
     while (i < header.packet_number_len) : (i += 1) {
@@ -286,16 +286,16 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     }
 
     // read truncated/raw packet number
-    var truncated_packet_number = try switch (header.packet_number_len) {
-        1 => @intCast(u64, std.mem.readInt(u8, pn_ciphertext.*[0..util.sizeOf(u8)], ENDIAN)),
-        2 => @intCast(u64, std.mem.readInt(u16, pn_ciphertext.*[0..util.sizeOf(u16)], ENDIAN)),
-        3 => @intCast(u64, std.mem.readInt(u24, pn_ciphertext.*[0..util.sizeOf(u24)], ENDIAN)),
-        4 => @intCast(u64, std.mem.readInt(u32, pn_ciphertext.*[0..util.sizeOf(u32)], ENDIAN)),
+    const truncated_packet_number: u64 = try switch (header.packet_number_len) {
+        1 => @as(u64, std.mem.readInt(u8, pn_ciphertext.*[0..util.sizeOf(u8)], ENDIAN)),
+        2 => @as(u64, std.mem.readInt(u16, pn_ciphertext.*[0..util.sizeOf(u16)], ENDIAN)),
+        3 => @as(u64, std.mem.readInt(u24, pn_ciphertext.*[0..util.sizeOf(u24)], ENDIAN)),
+        4 => @as(u64, std.mem.readInt(u32, pn_ciphertext.*[0..util.sizeOf(u32)], ENDIAN)),
         else => error.InvalidPacket,
     };
 
     // skip packet length byte
-    try fbs.seekBy(@intCast(i64, header.packet_number_len));
+    try fbs.seekBy(@intCast(header.packet_number_len));
 
     // Write decrypted first byte back into the input buffer.
     fbs.buffer[0] = first_byte;
@@ -329,7 +329,7 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
     if (isLongHeader(first_byte)) {
         log.info("LONG HEADER!", .{});
 
-        var version = try reader.readInt(u32, ENDIAN);
+        const version = try reader.readInt(u32, ENDIAN);
         header.version = version;
 
         log.info("version: {any}", .{header.version});
@@ -370,7 +370,7 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
             return error.InvalidPacket;
         }
 
-        header.packet_type = @intToEnum(PacketType, (first_byte & PACKET_TYPE_MASK));
+        header.packet_type = @enumFromInt(first_byte & PACKET_TYPE_MASK);
         std.log.info("packet_type => {any}", .{header.packet_type});
 
         switch (header.packet_type) {
@@ -387,7 +387,7 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
                 }
 
                 std.log.info("token_length: readVarInt (before) => fbs.pos: {any}", .{fbs.pos});
-                var token_length = try readVarInt(reader);
+                const token_length = try readVarInt(reader);
                 std.log.info("token_length: {any}, readVarInt (after) => fbs.pos: {any}", .{ token_length, fbs.pos });
                 if (token_length > 0) {
                     //
@@ -396,7 +396,7 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
                     //
                     header.token = fbs.buffer[fbs.pos..(fbs.pos + token_length)];
                     std.log.info("token: {any}", .{header.token});
-                    try fbs.seekBy(@intCast(i64, token_length));
+                    try fbs.seekBy(@intCast(token_length));
                 } else {
                     std.log.warn("no token!", .{});
                 }
@@ -409,7 +409,7 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
             PacketType.retry => {
                 // var token_length = len - fbs.pos - RETRY_INTEGRITY_TAG_SIZE;
                 // var token = bytes[fbs.pos..(fbs.pos + token_length)];
-                // try fbs.seekBy(@intCast(i64, token_length));
+                // try fbs.seekBy(@intCast(token_length));
 
                 std.log.info("TODO: handle Retry packet type...", .{});
                 header.remainder_len = 0;
@@ -433,7 +433,7 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
 
             else => {
                 std.log.err("Packet type not recognized: {any}", .{header.packet_type});
-                header.remainder_len = try readVarInt(&reader);
+                header.remainder_len = try readVarInt(reader);
             },
         }
 
@@ -457,10 +457,10 @@ pub fn negotiateVersion(header: Header, writer: anytype) !void {
     try writer.writeByte(random.int(u8) | LONG_HEADER_BIT);
     try writer.writeInt(u32, 0, ENDIAN);
 
-    try writer.writeByte(@intCast(u8, header.scid.len));
+    try writer.writeByte(@intCast(header.scid.len));
     try writer.writeAll(header.scid);
 
-    try writer.writeByte(@intCast(u8, header.dcid.len));
+    try writer.writeByte(@intCast(header.dcid.len));
     try writer.writeAll(header.dcid);
 
     for (protocol.SUPPORTED_VERSIONS) |version| {
@@ -472,8 +472,9 @@ pub fn retry(
     header: Header,
     new_scid: []u8, // original destination connection id
     token: []u8,
-    writer: anytype,
+    fbs: anytype,
 ) !void {
+    const writer = fbs.writer();
     var hdr = Header{
         .version = header.version,
         .packet_type = PacketType.retry,
@@ -486,26 +487,22 @@ pub fn retry(
 
     try hdr.encode(writer);
 
-    const integrity_tag = try computeRetryIntegrityTag(writer.context.getWritten(), header.dcid, header.version);
+    const integrity_tag = try computeRetryIntegrityTag(fbs.getWritten(), header.dcid, header.version);
     std.log.info("integrity_tag: {any}", .{integrity_tag});
 
     try writer.writeAll(&integrity_tag);
 }
 
 pub fn packetNumberLength(pn: u64) !usize {
-    var len: usize = undefined;
-
     if (pn < std.math.maxInt(u8)) {
-        len = 1;
+        return 1;
     } else if (pn < std.math.maxInt(u16)) {
-        len = 2;
+        return 2;
     } else if (pn < std.math.maxInt(u32)) {
-        len = 4;
+        return 4;
     } else {
         return error.InvalidPacket;
     }
-
-    return len;
 }
 
 ///
@@ -541,17 +538,17 @@ fn computeRetryIntegrityTag(
     // - aiortc/aioquic: https://github.com/aiortc/aioquic/blob/444be09157aed3c81881d18647484165dd07139c/src/aioquic/quic/packet.py#L92-L116
     // - lucas-clemente/quic-go: https://github.com/lucas-clemente/quic-go/blob/2de4af00d06891b8b110965a2aa44b0a84dcc71b/internal/handshake/retry.go#L43-L62
 
-    var key = RETRY_INTEGRITY_KEY_V1;
-    var nonce = RETRY_INTEGRITY_NONCE_V1;
+    const key = RETRY_INTEGRITY_KEY_V1;
+    const nonce = RETRY_INTEGRITY_NONCE_V1;
 
     // TODO: avoid using dynamic allocation
     const allocator = std.heap.page_allocator;
-    var buf = try allocator.alloc(u8, odcid.len + packet_bytes_without_tag.len + 1);
+    const buf = try allocator.alloc(u8, odcid.len + packet_bytes_without_tag.len + 1);
     defer allocator.free(buf);
 
-    var fbs = io.fixedBufferStream(buf);
-    var buf_writer = fbs.writer();
-    try buf_writer.writeByte(@intCast(u8, odcid.len));
+    var inner_fbs = io.fixedBufferStream(buf);
+    const buf_writer = inner_fbs.writer();
+    try buf_writer.writeByte(@intCast(odcid.len));
     try buf_writer.writeAll(odcid);
     try buf_writer.writeAll(packet_bytes_without_tag);
 
@@ -559,7 +556,7 @@ fn computeRetryIntegrityTag(
     const m = "";
     var c: [m.len]u8 = undefined;
     var tag: [crypto.Aead.tag_length]u8 = undefined;
-    crypto.Aead.encrypt(&c, &tag, m, buf_writer.context.buffer, nonce, key);
+    crypto.Aead.encrypt(&c, &tag, m, inner_fbs.getWritten(), nonce, key);
 
     return tag;
 }
@@ -569,7 +566,7 @@ fn computeRetryIntegrityTag(
 pub fn generateRetryToken(
     header: Header,
     new_scid: []u8,
-    addr: os.sockaddr,
+    addr: posix.sockaddr,
 ) ![]u8 {
     var buf: [512]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
@@ -578,10 +575,10 @@ pub fn generateRetryToken(
     try writer.writeAll(encodeAddr(addr));
 
     // original destination connection id
-    try writer.writeByte(@intCast(u8, header.dcid.len));
+    try writer.writeByte(@intCast(header.dcid.len));
     try writer.writeAll(header.dcid);
 
-    try writer.writeByte(@intCast(u8, new_scid.len));
+    try writer.writeByte(@intCast(new_scid.len));
     try writer.writeAll(new_scid);
 
     return fbs.getWritten();
@@ -610,10 +607,10 @@ pub fn generateRetryToken(
     // return g.tokenProtector.NewToken(data)
 }
 
-fn encodeAddr(addr: os.sockaddr) []const u8 {
+fn encodeAddr(addr: posix.sockaddr) []const u8 {
     return switch (addr.family) {
-        os.AF.INET => &addr.data,
-        os.AF.INET6 => &addr.data,
+        posix.AF.INET => &addr.data,
+        posix.AF.INET6 => &addr.data,
         else => unreachable,
     };
 }
@@ -631,7 +628,7 @@ pub fn readVarInt(reader: anytype) !u64 {
     const first_byte = try reader.readByte();
 
     // the first two bits of the first byte encode the length
-    var len = @as(i32, 1) << @intCast(u5, (first_byte & 0xc0) >> 6);
+    var len: i32 = @as(i32, 1) << @intCast((first_byte & 0xc0) >> 6);
     len = len - 1;
 
     var value: u64 = first_byte & 0x3F;
@@ -639,7 +636,7 @@ pub fn readVarInt(reader: anytype) !u64 {
         len = len - 1;
         value = (value << 8);
 
-        var red = try reader.readByte();
+        const red = try reader.readByte();
         value = value + red;
     }
 
@@ -703,7 +700,7 @@ test "QUIC: Variable-Length Integer Decoding" {
 fn decodePacketNumber(expected_pkt_num: u64, truncated_pkt_num: u64, num_bits: usize) u64 {
     assert(num_bits <= 32); // The maximum length of a encoded packet number is 32 in bits.
 
-    const window = @intCast(u64, 1) << @intCast(u5, num_bits);
+    const window: u64 = @as(u64, 1) << @intCast(num_bits);
     const half_window = window / 2;
     const pkt_num_mask = window - 1;
 

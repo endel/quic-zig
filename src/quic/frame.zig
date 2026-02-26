@@ -191,7 +191,7 @@ pub const Frame = union(FrameType) {
 
             // new token
             0x07 => {
-                var len = try packet.readVarInt(reader);
+                const len = try packet.readVarInt(reader);
                 return .{
                     .new_token = bytes[stream.pos..(stream.pos + len)],
                 };
@@ -277,7 +277,7 @@ pub const Frame = union(FrameType) {
                                 return error.FrameEncodingError;
                             }
 
-                            var conn_id = bytes[stream.pos..(stream.pos + conn_id_len)];
+                            const conn_id = bytes[stream.pos..(stream.pos + conn_id_len)];
                             try stream.seekBy(conn_id_len);
 
                             break :blk conn_id;
@@ -648,12 +648,12 @@ test "parse path_response frame" {
 }
 
 test "parse connection_close frame" {
-    var bytes = [_]u8{ 0x1c, 0x10, @enumToInt(FrameType.max_data), 16, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112 };
+    var bytes = [_]u8{ 0x1c, 0x10, @intFromEnum(FrameType.max_data), 16, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112 };
 
     switch (try Frame.parse(&bytes)) {
         FrameType.connection_close => |connection_close| {
             try std.testing.expect(connection_close.error_code == 0x10);
-            try std.testing.expect(connection_close.frame_type == @enumToInt(FrameType.max_data));
+            try std.testing.expect(connection_close.frame_type == @intFromEnum(FrameType.max_data));
             try std.testing.expectEqualStrings("abcdefghijklmnop", connection_close.reason);
             try std.testing.expect(true);
         },

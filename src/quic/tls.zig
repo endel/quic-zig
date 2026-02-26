@@ -135,7 +135,7 @@ pub const Handshake = struct {
 
     pub fn provideData(self: *Handshake, data: []u8, encryption_level: u8) void {
         // FIXME: append here instead of replacing into position 0
-        std.mem.copy(u8, self.buffer[0..data.len], data);
+        @memcpy(self.buffer[0..data.len], data);
         self.encryption_level = encryption_level;
     }
 
@@ -149,10 +149,7 @@ pub const Handshake = struct {
 
     fn doServerHandshake(self: *Handshake) !void {
         // try decoder.ensure(self.buffer.len);
-        var decoder: tls.Decoder = .{
-            .buf = &self.buffer,
-            .our_end = self.buffer.len,
-        };
+        var decoder = tls.Decoder.fromTheirSlice(&self.buffer);
 
         var client_hello: ClientHello = undefined;
 
@@ -167,7 +164,7 @@ pub const Handshake = struct {
 
                 .read_client_hello => {
                     // get message type and length
-                    const message_type = @intToEnum(MessageType, decoder.decode(u8));
+                    const message_type: MessageType = @enumFromInt(decoder.decode(u8));
                     if (message_type != .client_hello) {
                         std.log.err("ClientHello: invalid message type", .{});
                         return error.HandshakeError;
@@ -183,22 +180,22 @@ pub const Handshake = struct {
                     decoder.skip(message_len);
 
                     // parse client hello
-                    var legacy_version = msg_decoder.decode(u16);
-                    var random = msg_decoder.slice(RANDOM_SIZE);
-                    var session_id_len = msg_decoder.decode(u8);
-                    var session_id = msg_decoder.slice(session_id_len);
+                    const legacy_version = msg_decoder.decode(u16);
+                    const random = msg_decoder.slice(RANDOM_SIZE);
+                    const session_id_len = msg_decoder.decode(u8);
+                    const session_id = msg_decoder.slice(session_id_len);
                     if (session_id.len > MAX_SESSION_ID_LENGTH) {
                         std.log.err("ClientHello: session_id must not exceed {} length", .{MAX_SESSION_ID_LENGTH});
                         return error.HandshakeError;
                     }
 
-                    var cipher_suites = msg_decoder.slice(msg_decoder.decode(u16));
+                    const cipher_suites = msg_decoder.slice(msg_decoder.decode(u16));
                     if (cipher_suites.len < 2) {
                         std.log.err("ClientHello: cipher_suites must be length 2 or higher.", .{});
                         return error.HandshakeError;
                     }
 
-                    var compression_methods = msg_decoder.slice(msg_decoder.decode(u8));
+                    const compression_methods = msg_decoder.slice(msg_decoder.decode(u8));
                     if (compression_methods.len < 1) {
                         std.log.err("ClientHello: compression_methods must be length 1 or higher.", .{});
                         return error.HandshakeError;
@@ -300,7 +297,7 @@ pub const Handshake = struct {
     }
 
     fn decryptECH(client_hello: *ClientHello) !void {
-        var encrypted_client_hello = try client_hello.getExtension(.encrypted_client_hello);
+        const encrypted_client_hello = try client_hello.getExtension(.encrypted_client_hello);
         if (encrypted_client_hello != null) {
             std.log.err("encrypted_client_hello extension FOUND. ECH decryption not implemented.", .{});
             return error.NotImplemented;
@@ -312,7 +309,7 @@ pub const Handshake = struct {
         // SNI = ServerNameIndication extension
         //
 
-        var server_name_ext = try client_hello.getExtension(.server_name);
+        const server_name_ext = try client_hello.getExtension(.server_name);
         if (server_name_ext == null) {
             // no SNI extension to parse
             return;
@@ -322,9 +319,9 @@ pub const Handshake = struct {
 
         var ext = util.StreamReader.from(server_name_ext.?);
         var server_name_list = util.StreamReader.from(ext.getSlicePrefixedLength(u16));
-        var name_type = server_name_list.get(u8);
-        var host_name_len = server_name_list.get(u16);
-        var host_name = server_name_list.getSlice(host_name_len);
+        const name_type = server_name_list.get(u8);
+        const host_name_len = server_name_list.get(u16);
+        const host_name = server_name_list.getSlice(host_name_len);
 
         if (name_type != 0 or
             host_name.len == 0 or
@@ -379,13 +376,13 @@ pub const ClientHello = struct {
             var reader = util.StreamReader.from(self.extensions.?);
 
             while (!reader.eof()) {
-                var extension_type = reader.get(ExtensionType);
+                const extension_type = reader.get(ExtensionType);
                 std.log.info("extension type => {any}", .{extension_type});
 
-                var value_len = reader.get(u16);
+                const value_len = reader.get(u16);
                 std.log.info("extension value length => {any}", .{value_len});
 
-                var value = reader.getSlice(value_len);
+                const value = reader.getSlice(value_len);
                 std.log.info("extension value => {any}", .{value});
 
                 if (extension_type == find_extension_type) {
