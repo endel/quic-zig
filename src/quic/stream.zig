@@ -177,6 +177,9 @@ pub const SendStream = struct {
     /// Next offset to be sent.
     send_offset: u64 = 0,
 
+    /// Maximum data the peer allows us to send on this stream.
+    send_window: u64 = std.math.maxInt(u64),
+
     /// Whether FIN has been queued.
     fin_queued: bool = false,
 
@@ -214,6 +217,13 @@ pub const SendStream = struct {
         self.reset_err = error_code;
     }
 
+    /// Update the send window from a MAX_STREAM_DATA frame.
+    pub fn updateSendWindow(self: *SendStream, new_max: u64) void {
+        if (new_max > self.send_window) {
+            self.send_window = new_max;
+        }
+    }
+
     /// Check if there's data available to send.
     pub fn hasData(self: *const SendStream) bool {
         return self.send_offset < self.write_offset or
@@ -233,7 +243,12 @@ pub const SendStream = struct {
             return null;
         }
 
-        const data_len = @min(unsent_len, max_len);
+        // Constrain by both max_len and send_window
+        const window_remaining = if (self.send_window > self.send_offset)
+            self.send_window - self.send_offset
+        else
+            0;
+        const data_len = @min(unsent_len, @min(max_len, window_remaining));
         const data = if (data_len > 0) buffered[unsent_start..][0..data_len] else &[_]u8{};
         const fin = self.fin_queued and !self.fin_sent and (unsent_start + data_len == self.write_offset);
 

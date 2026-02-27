@@ -431,8 +431,7 @@ pub const Connection = struct {
 
             .max_stream_data => |msd| {
                 if (self.streams.getStream(msd.stream_id)) |s| {
-                    // Update stream-level send window
-                    _ = s; // TODO: integrate with stream flow controller
+                    s.send.updateSendWindow(msd.max);
                 }
             },
 
@@ -743,7 +742,32 @@ pub const Connection = struct {
 
     /// Build and send outgoing packets.
     pub fn send(self: *Connection, out_buf: []u8) !usize {
+        // Draining: do not send anything
+        if (self.state == .draining) return 0;
+
         const now: i64 = @intCast(std.time.nanoTimestamp());
+
+        // Closing: send one packet with CONNECTION_CLOSE, then transition to draining
+        if (self.state == .closing) {
+            const app_seal = self.pkt_num_spaces[2].crypto_seal;
+            if (app_seal != null) {
+                const bytes_written = try self.packer.packCoalesced(
+                    out_buf,
+                    &self.pkt_handler,
+                    &self.crypto_streams,
+                    &self.streams,
+                    &self.pending_frames,
+                    null,
+                    null,
+                    app_seal,
+                    now,
+                );
+                self.state = .draining;
+                return bytes_written;
+            }
+            self.state = .draining;
+            return 0;
+        }
 
         // Check if pacer allows sending
         const pacer_delay = self.pacer.timeUntilSend(now);
@@ -822,6 +846,11 @@ pub const Connection = struct {
             .code = error_code,
             .reason = reason,
         };
+        self.pending_frames.push(.{ .connection_close = .{
+            .error_code = error_code,
+            .frame_type = 0,
+            .is_app = true,
+        } });
     }
 
     /// Open a new bidirectional stream.
