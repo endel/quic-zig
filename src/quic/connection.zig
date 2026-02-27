@@ -464,9 +464,7 @@ pub const Connection = struct {
             },
 
             .path_challenge => |data| {
-                // Queue PATH_RESPONSE with the same data
-                _ = data;
-                // TODO: queue path response frame
+                self.pending_frames.push(.{ .path_response = data });
             },
 
             .path_response => {},
@@ -811,7 +809,7 @@ pub const Connection = struct {
         if (self.pkt_handler.getPtoTimeout()) |pto_time| {
             if (now >= pto_time) {
                 self.pkt_handler.pto_count += 1;
-                // TODO: send PTO probe packets
+                self.pending_frames.push(.{ .ping = {} });
             }
         }
     }
