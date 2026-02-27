@@ -147,8 +147,8 @@ pub const Header = struct {
     /// Used to correctly handle coalesced packets.
     packet_start: usize = 0,
 
-    pub fn parse(fbs: anytype) !Header {
-        return parseQuicHeader(fbs);
+    pub fn parse(fbs: anytype, short_dcid_len: u8) !Header {
+        return parseQuicHeader(fbs, short_dcid_len);
     }
 
     pub fn encode(self: *Self, writer: anytype) !void {
@@ -349,7 +349,7 @@ pub fn isLongHeader(first_byte: u8) bool {
     return (first_byte & LONG_HEADER_BIT) == LONG_HEADER_BIT;
 }
 
-pub fn parseQuicHeader(fbs: anytype) !Header {
+pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
     const packet_start_pos = fbs.pos;
     const reader = fbs.reader();
     const first_byte = try reader.readByte();
@@ -420,7 +420,6 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
 
             PacketType.one_rtt => {
                 // Short header packet (1-RTT)
-                const short_dcid_len = 8; // TODO: get actual DCID length from connection state
                 if (fbs.pos + short_dcid_len <= fbs.buffer.len) {
                     header.dcid = fbs.buffer[fbs.pos..(fbs.pos + short_dcid_len)];
                     try fbs.seekBy(short_dcid_len);
@@ -440,8 +439,6 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
         header.packet_type = PacketType.one_rtt;
 
         // Short header: first_byte + DCID (known length from connection state) + payload
-        // TODO: use actual peer DCID length from connection state
-        const short_dcid_len: usize = 8;
         if (fbs.pos + short_dcid_len <= fbs.buffer.len) {
             header.dcid = fbs.buffer[fbs.pos..(fbs.pos + short_dcid_len)];
             try fbs.seekBy(short_dcid_len);

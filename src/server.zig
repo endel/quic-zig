@@ -91,7 +91,7 @@ pub fn main() !void {
                 if (bytes[fbs.pos] & 0x40 == 0) break;
 
                 const packet_start_pos = fbs.pos;
-                var header = packet.Header.parse(&fbs) catch |err| {
+                var header = packet.Header.parse(&fbs, if (conn_state) |*cs| cs.scid_len else 8) catch |err| {
                     std.log.err("header parse error: {any}", .{err});
                     break;
                 };

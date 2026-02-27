@@ -91,7 +91,7 @@ pub fn main() !void {
                 if (bytes[fbs.pos] & 0x40 == 0) break;
 
                 const packet_start_pos = fbs.pos;
-                var header = packet.Header.parse(&fbs) catch |err| {
+                var header = packet.Header.parse(&fbs, conn.scid_len) catch |err| {
                     std.log.err("header parse error: {any}", .{err});
                     break;
                 };
@@ -180,7 +180,7 @@ pub fn main() !void {
             };
 
             var fbs = io.fixedBufferStream(bytes[0..packet_length]);
-            var header = packet.Header.parse(&fbs) catch {
+            var header = packet.Header.parse(&fbs, conn.scid_len) catch {
                 continue :read_loop;
             };
 
