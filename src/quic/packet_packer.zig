@@ -36,8 +36,9 @@ pub const PacketPacker = struct {
     allocator: Allocator,
     is_server: bool,
 
-    /// Source connection ID.
-    scid: []const u8,
+    /// Source connection ID (owned buffer to avoid dangling slices).
+    scid_buf: [20]u8 = .{0} ** 20,
+    scid_len: u8 = 0,
 
     /// Destination connection ID (owned buffer to avoid dangling slices).
     dcid_buf: [20]u8 = .{0} ** 20,
@@ -49,6 +50,9 @@ pub const PacketPacker = struct {
     /// Token for Initial packets (from Retry).
     initial_token: ?[]const u8 = null,
 
+    /// Whether to send HANDSHAKE_DONE frame in the next 1-RTT packet (server only).
+    send_handshake_done: bool = false,
+
     pub fn init(
         allocator: Allocator,
         is_server: bool,
@@ -59,12 +63,17 @@ pub const PacketPacker = struct {
         var packer = PacketPacker{
             .allocator = allocator,
             .is_server = is_server,
-            .scid = scid,
+            .scid_len = @intCast(scid.len),
             .dcid_len = @intCast(dcid.len),
             .version = version,
         };
+        @memcpy(packer.scid_buf[0..scid.len], scid);
         @memcpy(packer.dcid_buf[0..dcid.len], dcid);
         return packer;
+    }
+
+    pub fn getScid(self: *const PacketPacker) []const u8 {
+        return self.scid_buf[0..self.scid_len];
     }
 
     pub fn getDcid(self: *const PacketPacker) []const u8 {
@@ -197,10 +206,10 @@ pub const PacketPacker = struct {
 
             try writer.writeByte(@intCast(self.getDcid().len));
             try writer.writeAll(self.getDcid());
-            try writer.writeByte(@intCast(self.scid.len));
-            try writer.writeAll(self.scid);
+            try writer.writeByte(@intCast(self.getScid().len));
+            try writer.writeAll(self.getScid());
 
-            std.log.info("packInitial: writing dcid={any}, scid={any}", .{ self.getDcid(), self.scid });
+            std.log.info("packInitial: writing dcid={any}, scid={any}", .{ self.getDcid(), self.getScid() });
 
             // Token (Initial only)
             if (pkt_type == .initial) {
@@ -248,7 +257,15 @@ pub const PacketPacker = struct {
             }
         }
 
-        // 3. Stream frames (only in 1-RTT)
+        // 3. HANDSHAKE_DONE frame (server only, 1-RTT)
+        if (level == .application and self.send_handshake_done) {
+            try writer.writeByte(0x1e); // HANDSHAKE_DONE frame type
+            self.send_handshake_done = false;
+            ack_eliciting = true;
+            std.log.info("packing HANDSHAKE_DONE frame", .{});
+        }
+
+        // 4. Stream frames (only in 1-RTT)
         if (level == .application) {
             var stream_it = streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| {
@@ -400,6 +417,6 @@ test "PacketPacker: basic init" {
         dcid,
         0x00000001,
     );
-    try testing.expectEqualSlices(u8, scid, packer.scid);
+    try testing.expectEqualSlices(u8, scid, packer.getScid());
     try testing.expectEqualSlices(u8, dcid, packer.getDcid());
 }

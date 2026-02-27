@@ -150,19 +150,6 @@ pub const Connection = struct {
         const initial_path = NetworkPath.init(local, remote, true);
         const now: i64 = @intCast(std.time.nanoTimestamp());
 
-        const local_params: transport_params.TransportParams = .{
-            .original_destination_connection_id = if (is_server) header.dcid else null,
-            .initial_source_connection_id = header.scid,
-            .max_idle_timeout = config.max_idle_timeout,
-            .initial_max_data = config.initial_max_data,
-            .initial_max_stream_data_bidi_local = config.initial_max_stream_data_bidi_local,
-            .initial_max_stream_data_bidi_remote = config.initial_max_stream_data_bidi_remote,
-            .initial_max_stream_data_uni = config.initial_max_stream_data_uni,
-            .initial_max_streams_bidi = config.initial_max_streams_bidi,
-            .initial_max_streams_uni = config.initial_max_streams_uni,
-            .max_datagram_frame_size = config.max_datagram_frame_size,
-        };
-
         var conn = Connection{
             .allocator = allocator,
             .version = header.version,
@@ -179,9 +166,38 @@ pub const Connection = struct {
             ),
             .streams = stream_mod.StreamsMap.init(allocator, is_server),
             .crypto_streams = crypto_stream.CryptoStreamManager.init(allocator),
-
-            .local_params = local_params,
         };
+
+        // Set connection IDs:
+        // Server: dcid = client's SCID (for sending TO client), scid = our generated CID
+        // Client: dcid = header.dcid, scid = header.scid
+        if (is_server) {
+            conn.dcid_len = @intCast(header.scid.len);
+            @memcpy(conn.dcid[0..header.scid.len], header.scid);
+            conn.scid_len = 8;
+            generateConnectionId(conn.scid[0..8]);
+            conn.got_peer_conn_id = true;
+        } else {
+            conn.dcid_len = @intCast(header.dcid.len);
+            @memcpy(conn.dcid[0..header.dcid.len], header.dcid);
+            conn.scid_len = @intCast(header.scid.len);
+            @memcpy(conn.scid[0..header.scid.len], header.scid);
+        }
+
+        // Build transport params AFTER CIDs are stored in conn (to avoid dangling slices)
+        const local_params: transport_params.TransportParams = .{
+            .original_destination_connection_id = if (is_server) header.dcid else null,
+            .initial_source_connection_id = conn.scid[0..conn.scid_len],
+            .max_idle_timeout = config.max_idle_timeout,
+            .initial_max_data = config.initial_max_data,
+            .initial_max_stream_data_bidi_local = config.initial_max_stream_data_bidi_local,
+            .initial_max_stream_data_bidi_remote = config.initial_max_stream_data_bidi_remote,
+            .initial_max_stream_data_uni = config.initial_max_stream_data_uni,
+            .initial_max_streams_bidi = config.initial_max_streams_bidi,
+            .initial_max_streams_uni = config.initial_max_streams_uni,
+            .max_datagram_frame_size = config.max_datagram_frame_size,
+        };
+        conn.local_params = local_params;
 
         // Initialize TLS 1.3 handshake if config provided
         if (tls_config) |tc| {
@@ -191,13 +207,7 @@ pub const Connection = struct {
                 tls13.Tls13Handshake.initClient(tc, local_params);
         }
 
-        // Copy connection IDs
-        conn.dcid_len = @intCast(header.dcid.len);
-        @memcpy(conn.dcid[0..header.dcid.len], header.dcid);
-        conn.scid_len = @intCast(header.scid.len);
-        @memcpy(conn.scid[0..header.scid.len], header.scid);
-
-        // Set up initial crypto keys
+        // Set up initial crypto keys (always use header.dcid for key derivation)
         try conn.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].setupInitial(
             header.dcid,
             header.version,
@@ -252,6 +262,11 @@ pub const Connection = struct {
         const space = self.pkt_num_spaces[space_idx];
         const has_keys = space.crypto_open != null and space.crypto_seal != null;
         std.log.info("recv: using space {d} ({s}), has_keys={}", .{ space_idx, @tagName(enc_level), has_keys });
+
+        if (!has_keys) {
+            std.log.info("recv: dropping packet for {s} (keys not available)", .{@tagName(enc_level)});
+            return;
+        }
 
         const payload = packet.decrypt(header, fbs, space) catch |err| {
             std.log.err("can't decrypt packet. {any}", .{err});
@@ -608,6 +623,7 @@ pub const Connection = struct {
 
     /// Advance the TLS 1.3 handshake by reading contiguous crypto data.
     fn advanceHandshake(self: *Connection) !void {
+        if (self.handshake_confirmed) return;
         var hs = &(self.tls13_hs orelse return);
 
         std.log.info("advanceHandshake: state={}, iterations starting", .{@intFromEnum(hs.state)});
@@ -663,6 +679,16 @@ pub const Connection = struct {
                     // Clear Initial encryption keys so we stop sending padded Initial packets
                     self.pkt_num_spaces[0].crypto_open = null;
                     self.pkt_num_spaces[0].crypto_seal = null;
+
+                    if (self.is_server) {
+                        // Server clears Handshake keys (Finished already sent)
+                        self.pkt_num_spaces[1].crypto_open = null;
+                        self.pkt_num_spaces[1].crypto_seal = null;
+
+                        // Server must send HANDSHAKE_DONE to the client (RFC 9001 Section 4.1.2)
+                        self.packer.send_handshake_done = true;
+                    }
+                    // Client: Handshake keys cleared in client.zig after sending Finished
 
                     // Store peer transport parameters and apply stream limits
                     if (hs.peer_transport_params) |peer_tp| {

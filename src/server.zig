@@ -157,9 +157,28 @@ pub fn main() !void {
             }
         }
 
-        // Periodic send for retransmissions/ACKs
+        // Check streams for incoming data and echo it back
         if (conn_state != null) {
             var conn = &conn_state.?;
+
+            if (conn.isEstablished()) {
+                var stream_it = conn.streams.streams.valueIterator();
+                while (stream_it.next()) |s_ptr| {
+                    const s = s_ptr.*;
+                    if (s.recv.read()) |data| {
+                        std.log.info("received stream data ({d} bytes): {s}", .{ data.len, data });
+                        const echo_msg = std.fmt.allocPrint(alloc, "Echo: {s}", .{data}) catch continue;
+                        s.send.writeData(echo_msg) catch |err| {
+                            std.log.err("stream write error: {any}", .{err});
+                            continue;
+                        };
+                        s.send.close();
+                        std.log.info("echoed {d} bytes back on stream {d}", .{ echo_msg.len, s.stream_id });
+                    }
+                }
+            }
+
+            // Periodic send for retransmissions/ACKs/stream data
             const bytes_written = conn.send(&out) catch |err| {
                 std.log.err("periodic send error: {any}", .{err});
                 continue;

@@ -262,6 +262,10 @@ pub const Tls13Handshake = struct {
     handshake_keys_installed: bool = false,
     app_keys_installed: bool = false,
 
+    // Pre-encoded transport params (avoids dangling slice issues after struct move)
+    tp_encoded: [256]u8 = undefined,
+    tp_encoded_len: usize = 0,
+
     // Buffered incoming data
     in_buf: [8192]u8 = undefined,
     in_len: usize = 0,
@@ -296,6 +300,11 @@ pub const Tls13Handshake = struct {
         self.handshake_keys_installed = false;
         self.app_keys_installed = false;
 
+        // Pre-encode transport params to avoid dangling slices after struct move
+        var tp_fbs = std.io.fixedBufferStream(&self.tp_encoded);
+        local_tp.encode(tp_fbs.writer()) catch {};
+        self.tp_encoded_len = tp_fbs.pos;
+
         // Generate X25519 key pair
         crypto.random.bytes(&self.x25519_secret);
         self.x25519_public = X25519.recoverPublicKey(self.x25519_secret) catch blk: {
@@ -326,6 +335,11 @@ pub const Tls13Handshake = struct {
         self.pending_install_app = false;
         self.handshake_keys_installed = false;
         self.app_keys_installed = false;
+
+        // Pre-encode transport params to avoid dangling slices after struct move
+        var tp_fbs = std.io.fixedBufferStream(&self.tp_encoded);
+        local_tp.encode(tp_fbs.writer()) catch {};
+        self.tp_encoded_len = tp_fbs.pos;
 
         // Generate X25519 key pair
         crypto.random.bytes(&self.x25519_secret);
@@ -423,7 +437,7 @@ pub const Tls13Handshake = struct {
             &self.x25519_public,
             self.config.alpn,
             self.config.server_name,
-            &self.local_transport_params,
+            self.tp_encoded[0..self.tp_encoded_len],
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
@@ -717,10 +731,10 @@ pub const Tls13Handshake = struct {
 
     fn serverBuildEncryptedExtensions(self: *Tls13Handshake) !Action {
         var buf: [1024]u8 = undefined;
-        const msg = buildEncryptedExtensions(
+        const msg = buildEncryptedExtensionsFromEncoded(
             &buf,
             self.config.alpn,
-            &self.local_transport_params,
+            self.tp_encoded[0..self.tp_encoded_len],
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
@@ -883,7 +897,7 @@ fn buildClientHello(
     x25519_pub: *const [32]u8,
     alpn_list: []const []const u8,
     server_name: ?[]const u8,
-    local_tp: *const transport_params.TransportParams,
+    tp_encoded_data: []const u8,
 ) ![]const u8 {
     // Build the body first, then wrap with type + length
     var pos: usize = 4; // reserve space for type + 3-byte length
@@ -988,14 +1002,10 @@ fn buildClientHello(
         }
     }
 
-    // QUIC transport parameters extension
-    var tp_buf_arr: [256]u8 = undefined;
-    var tp_fbs = std.io.fixedBufferStream(&tp_buf_arr);
-    try local_tp.encode(tp_fbs.writer());
-    const tp_data = tp_fbs.getWritten();
-    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.quic_transport_parameters), tp_data.len);
-    @memcpy(buf[pos..][0..tp_data.len], tp_data);
-    pos += tp_data.len;
+    // QUIC transport parameters extension (pre-encoded)
+    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.quic_transport_parameters), tp_encoded_data.len);
+    @memcpy(buf[pos..][0..tp_encoded_data.len], tp_encoded_data);
+    pos += tp_encoded_data.len;
 
     // Fill in extensions length
     const ext_len: u16 = @intCast(pos - ext_start - 2);
@@ -1072,10 +1082,10 @@ fn buildServerHello(
     return buf[0..pos];
 }
 
-fn buildEncryptedExtensions(
+fn buildEncryptedExtensionsFromEncoded(
     buf: []u8,
     alpn_list: []const []const u8,
-    local_tp: *const transport_params.TransportParams,
+    tp_encoded_data: []const u8,
 ) ![]const u8 {
     var pos: usize = 4; // reserve for header
 
@@ -1100,14 +1110,10 @@ fn buildEncryptedExtensions(
         }
     }
 
-    // QUIC transport parameters
-    var tp_buf_arr: [256]u8 = undefined;
-    var tp_fbs = std.io.fixedBufferStream(&tp_buf_arr);
-    try local_tp.encode(tp_fbs.writer());
-    const tp_data = tp_fbs.getWritten();
-    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.quic_transport_parameters), tp_data.len);
-    @memcpy(buf[pos..][0..tp_data.len], tp_data);
-    pos += tp_data.len;
+    // QUIC transport parameters (pre-encoded)
+    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.quic_transport_parameters), tp_encoded_data.len);
+    @memcpy(buf[pos..][0..tp_encoded_data.len], tp_encoded_data);
+    pos += tp_encoded_data.len;
 
     // Fill in extensions length
     const ext_len: u16 = @intCast(pos - ext_list_start - 2);
@@ -1408,6 +1414,12 @@ test "buildClientHello: produces valid message" {
         .initial_max_streams_bidi = 100,
     };
 
+    // Pre-encode transport params
+    var tp_enc_buf: [256]u8 = undefined;
+    var tp_fbs = std.io.fixedBufferStream(&tp_enc_buf);
+    try tp.encode(tp_fbs.writer());
+    const tp_encoded = tp_fbs.getWritten();
+
     var buf: [4096]u8 = undefined;
     const msg = try buildClientHello(
         &buf,
@@ -1415,7 +1427,7 @@ test "buildClientHello: produces valid message" {
         &pub_key,
         &[_][]const u8{"h3"},
         "example.com",
-        &tp,
+        tp_encoded,
     );
 
     // Check message type

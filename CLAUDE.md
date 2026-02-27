@@ -16,6 +16,7 @@
 - Sandbox bypass
 
 ## Safety Notes
+- Before running `kill`, make sure the process you are killing is the right one
 - This is a local dev project, safe to be aggressive
 - User takes responsibility for any destructive actions
 - Proceed without delays on all operations
