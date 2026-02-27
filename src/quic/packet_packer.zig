@@ -5,7 +5,8 @@ const io = std.io;
 
 const packet_mod = @import("packet.zig");
 const crypto_mod = @import("crypto.zig");
-const Frame = @import("frame.zig").Frame;
+const frame_mod = @import("frame.zig");
+const Frame = frame_mod.Frame;
 const ack_handler = @import("ack_handler.zig");
 const crypto_stream = @import("crypto_stream.zig");
 const stream_mod = @import("stream.zig");
@@ -93,6 +94,7 @@ pub const PacketPacker = struct {
         pkt_handler: *ack_handler.PacketHandler,
         crypto_mgr: *crypto_stream.CryptoStreamManager,
         streams: *stream_mod.StreamsMap,
+        pending_frames: *frame_mod.PendingFrameQueue,
         initial_seal: ?crypto_mod.Seal,
         handshake_seal: ?crypto_mod.Seal,
         app_seal: ?crypto_mod.Seal,
@@ -108,6 +110,7 @@ pub const PacketPacker = struct {
                 pkt_handler,
                 crypto_mgr,
                 streams,
+                pending_frames,
                 initial_seal.?,
                 now,
                 true, // pad to minimum size
@@ -123,6 +126,7 @@ pub const PacketPacker = struct {
                 pkt_handler,
                 crypto_mgr,
                 streams,
+                pending_frames,
                 handshake_seal.?,
                 now,
                 false,
@@ -138,6 +142,7 @@ pub const PacketPacker = struct {
                 pkt_handler,
                 crypto_mgr,
                 streams,
+                pending_frames,
                 app_seal.?,
                 now,
                 false,
@@ -157,6 +162,7 @@ pub const PacketPacker = struct {
         pkt_handler: *ack_handler.PacketHandler,
         crypto_mgr: *crypto_stream.CryptoStreamManager,
         streams: *stream_mod.StreamsMap,
+        pending_frames: *frame_mod.PendingFrameQueue,
         seal: crypto_mod.Seal,
         now: i64,
         pad_to_min: bool,
@@ -262,7 +268,16 @@ pub const PacketPacker = struct {
             std.log.info("packing HANDSHAKE_DONE frame", .{});
         }
 
-        // 4. Stream frames (only in 1-RTT)
+        // 4. Pending control frames (only in 1-RTT)
+        if (level == .application) {
+            while (pending_frames.pop()) |pcf| {
+                const ctrl_frame = pcf.toFrame();
+                try ctrl_frame.write(writer);
+                ack_eliciting = true;
+            }
+        }
+
+        // 5. Stream frames (only in 1-RTT)
         if (level == .application) {
             var stream_it = streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| {
@@ -362,39 +377,6 @@ pub const PacketPacker = struct {
         return total_packet_len;
     }
 
-    /// Pack a CONNECTION_CLOSE frame.
-    pub fn packConnectionClose(
-        self: *PacketPacker,
-        buf: []u8,
-        error_code: u64,
-        reason: []const u8,
-        seal: crypto_mod.Seal,
-    ) !usize {
-        _ = seal;
-
-        var fbs = io.fixedBufferStream(buf);
-        const writer = fbs.writer();
-
-        // Short header (if 1-RTT keys available)
-        const first_byte: u8 = packet_mod.FIXED_BIT | 0x03; // 4-byte pn
-        try writer.writeByte(first_byte);
-        try writer.writeAll(self.getDcid());
-
-        // Packet number (0 for close)
-        try writer.writeInt(u32, 0, .big);
-
-        // CONNECTION_CLOSE frame
-        const frame = Frame{
-            .connection_close = .{
-                .error_code = error_code,
-                .frame_type = 0,
-                .reason = @constCast(reason),
-            },
-        };
-        try frame.write(writer);
-
-        return fbs.pos;
-    }
 };
 
 // Tests

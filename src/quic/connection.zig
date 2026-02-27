@@ -128,6 +128,9 @@ pub const Connection = struct {
     local_params: transport_params.TransportParams = .{},
     peer_params: ?transport_params.TransportParams = null,
 
+    // Pending control frames queue
+    pending_frames: frame_mod.PendingFrameQueue = .{},
+
     // Connection state
     got_peer_conn_id: bool = false,
     peer_max_cid_seq: u64 = 0,
@@ -770,6 +773,7 @@ pub const Connection = struct {
             &self.pkt_handler,
             &self.crypto_streams,
             &self.streams,
+            &self.pending_frames,
             initial_seal,
             handshake_seal,
             app_seal,

@@ -615,6 +615,64 @@ pub fn parseFrames(bytes: []u8, comptime handler: fn (Frame) anyerror!void) !voi
     }
 }
 
+/// A pending control frame to be sent in the next outgoing packet.
+/// Uses value types only (no slices) to avoid dangling references.
+pub const PendingControlFrame = union(enum) {
+    ping: void,
+    path_response: [8]u8,
+    retire_connection_id: u64,
+    connection_close: struct {
+        error_code: u64,
+        frame_type: u64,
+        is_app: bool,
+    },
+    max_data: u64,
+    max_stream_data: struct {
+        stream_id: u64,
+        max: u64,
+    },
+
+    /// Convert to a Frame for writing on the wire.
+    pub fn toFrame(self: PendingControlFrame) Frame {
+        return switch (self) {
+            .ping => .{ .ping = {} },
+            .path_response => |data| .{ .path_response = data },
+            .retire_connection_id => |seq| .{ .retire_connection_id = .{ .seq_num = seq } },
+            .connection_close => |cc| if (cc.is_app)
+                .{ .application_close = .{ .error_code = cc.error_code, .reason = &.{} } }
+            else
+                .{ .connection_close = .{ .error_code = cc.error_code, .frame_type = cc.frame_type, .reason = &.{} } },
+            .max_data => |max| .{ .max_data = max },
+            .max_stream_data => |msd| .{ .max_stream_data = .{ .stream_id = msd.stream_id, .max = msd.max } },
+        };
+    }
+};
+
+/// Fixed-capacity queue for pending control frames.
+pub const PendingFrameQueue = struct {
+    items: [16]PendingControlFrame = undefined,
+    len: u8 = 0,
+
+    pub fn push(self: *PendingFrameQueue, frame: PendingControlFrame) void {
+        if (self.len < 16) {
+            self.items[self.len] = frame;
+            self.len += 1;
+        }
+    }
+
+    pub fn pop(self: *PendingFrameQueue) ?PendingControlFrame {
+        if (self.len == 0) return null;
+        const item = self.items[0];
+        self.len -= 1;
+        // Shift remaining items
+        var i: u8 = 0;
+        while (i < self.len) : (i += 1) {
+            self.items[i] = self.items[i + 1];
+        }
+        return item;
+    }
+};
+
 // Tests
 
 test "parse padding frame" {
