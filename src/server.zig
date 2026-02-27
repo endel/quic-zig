@@ -40,26 +40,45 @@ pub fn main() !void {
     };
 
     // Create UDP socket
-    const local_addr = try std.net.Address.parseIp4("127.0.0.1", 4433);
+    const local_addr = try std.net.Address.parseIp4("127.0.0.1", 4434);
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
-    std.log.info("QUIC server listening on 127.0.0.1:4433", .{});
+    std.log.info("QUIC server listening on 127.0.0.1:4434 (sockfd={d})", .{sockfd});
+
+    // Try recvfrom immediately to verify socket is open
+    var test_addr: posix.sockaddr = undefined;
+    var test_addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
+    var test_buf: [100]u8 = undefined;
+    _ = posix.recvfrom(sockfd, &test_buf, 0, &test_addr, &test_addr_size) catch |err| {
+        std.log.info("First recvfrom (expected WouldBlock): {any}", .{err});
+    };
 
     var conn_state: ?connection.Connection = null;
     var remote_addr: posix.sockaddr = undefined;
     var addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
 
+    var loop_count: usize = 0;
     while (true) {
         std.Thread.sleep(1 * std.time.ns_per_ms);
+        loop_count += 1;
+        if (loop_count % 1000 == 0) {
+            std.log.info("server loop iteration {d}", .{loop_count});
+        }
 
         // Read loop: process all available UDP packets
         read_loop: while (true) {
             var bytes: [8192]u8 = undefined;
             addr_size = @sizeOf(posix.sockaddr);
 
-            const packet_length = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch {
+            const packet_length = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch |err| {
+                // WouldBlock is expected on non-blocking socket when no data available
+                if (err == error.WouldBlock) {
+                    break :read_loop;
+                }
+                // Other errors are unexpected
+                std.log.err("recvfrom error: {any}", .{err});
                 break :read_loop;
             };
 

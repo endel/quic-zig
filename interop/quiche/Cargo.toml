@@ -1,0 +1,20 @@
+[package]
+name = "quiche-interop"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[dependencies]
+quiche = "0.22"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ring = "0.17"
+rustls = "0.23"
+rustls-pemfile = "2"

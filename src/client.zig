@@ -18,13 +18,14 @@ pub fn main() !void {
 
     // Connect to quic-go v0.59.0 server at localhost:4434
     const server_addr = try net.Address.parseIp4("127.0.0.1", 4434);
+    // const server_addr = try net.Address.parseIp4("127.0.0.1", 4433);
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
 
     // Create a local socket with any available port
     const local_addr = try net.Address.parseIp4("127.0.0.1", 0);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
-    std.log.info("QUIC client connecting to localhost:4434 (quic-go v0.59.0)", .{});
+    std.log.info("QUIC client connecting to localhost:4434 (quic-go v0.59.0) - sockfd={d}", .{sockfd});
 
     // Create TLS config for the client
     // (Clients don't need certificates - empty arrays are fine)

@@ -250,9 +250,20 @@ pub const PacketPacker = struct {
         }
 
         // Check if we have any payload
-        const payload_len = fbs.pos - payload_start;
+        var payload_len = fbs.pos - payload_start;
         if (payload_len == 0 and !pad_to_min) {
             return 0; // Nothing to send
+        }
+
+        // RFC 9001 Section 5.4: ensure Initial packets have at least 5 bytes plaintext for header protection
+        // (5 bytes plaintext + 16 bytes AEAD tag = 21 bytes encrypted minimum >= 20 required)
+        if (pkt_type == .initial and payload_len < 5) {
+            const min_pad = 5 - payload_len;
+            var p: usize = 0;
+            while (p < min_pad) : (p += 1) {
+                try writer.writeByte(0x00); // PADDING frame
+            }
+            payload_len = 5;
         }
 
         // Pad to minimum size for Initial packets (client only)
@@ -288,14 +299,17 @@ pub const PacketPacker = struct {
 
         // Encrypt payload into output buffer (after pn)
         const encrypted_start = pn_offset + pn_len;
-        // Associated data = the full header up to (but not including) the plaintext payload
-        const ad = buf[header_start..][0..(pn_offset + pn_len)];
+        // RFC 9001 Section 5.2: AD is the header up to and including the packet number field
+        const ad = buf[header_start..][0..(pn_offset - header_start + pn_len)];
+        std.log.info("packSinglePacket encrypt: pn={d}, ad.len={d}, ad={any}", .{ pn, ad.len, ad });
+        std.log.info("packSinglePacket encrypt: plaintext_payload.len={d}", .{plaintext_payload.len});
         const encrypted_len = seal.encryptPayload(
             pn,
             ad,
             plaintext_payload,
             buf[encrypted_start..],
         );
+        std.log.info("packSinglePacket encrypt: encrypted_len={d}", .{encrypted_len});
 
         const total_packet_len = encrypted_start + encrypted_len;
 

@@ -259,40 +259,55 @@ pub fn parseIncoming(bytes: []const u8) void {
 
 pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     std.log.info("\n\nheader.remainder_len: {any}, fbs.pos: {d}, buffer.len: {d}", .{ header.remainder_len, fbs.pos, fbs.buffer.len });
-    const pn_and_sample_len = MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN;
 
-    if (fbs.pos + pn_and_sample_len > fbs.buffer.len) {
-        std.log.err("Not enough data for packet number + sample: pos={d}, needed={d}, buffer.len={d}", .{ fbs.pos, pn_and_sample_len, fbs.buffer.len });
+    // We need at least 4 bytes for packet number + 16 for sample
+    if (fbs.pos + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
+        std.log.err("Not enough data for packet number + sample: pos={d}, buffer.len={d}", .{ fbs.pos, fbs.buffer.len });
         return error.InvalidPacket;
     }
 
-    const pn_and_sample = fbs.buffer[fbs.pos..(fbs.pos + pn_and_sample_len)];
-
-    const pn_ciphertext = pn_and_sample[0..MAX_PACKET_NUMBER_LEN];
-    const sample = pn_and_sample[MAX_PACKET_NUMBER_LEN..(MAX_PACKET_NUMBER_LEN + crypto.SAMPLE_LEN)];
-
-    std.log.info("decrypt: sample={any}", .{sample});
-
     var first_byte = fbs.buffer[0];
+    const protected_first_byte = first_byte;
 
     // unprotect header
     var aead = space.crypto_open.?;
 
-    const mask = aead.newMask(sample);
+    // RFC 9001 Section 5.4.2: Sample is taken 4 bytes after START of packet number field
+    // The sample starts at pn_offset + 4, NOT pn_offset + pn_len + 4
+    // We cannot read pn_len from the protected first byte because those bits are protected!
+    const sample_offset = fbs.pos + 4;
+    if (sample_offset + crypto.SAMPLE_LEN > fbs.buffer.len) {
+        std.log.err("Not enough data for sample: offset={d}, buffer.len={d}", .{ sample_offset, fbs.buffer.len });
+        return error.InvalidPacket;
+    }
+
+    var sample_buf: [crypto.SAMPLE_LEN]u8 = undefined;
+    @memcpy(&sample_buf, fbs.buffer[sample_offset..][0..crypto.SAMPLE_LEN]);
+    std.log.info("decrypt: sample_offset={d}, sample={any}", .{ sample_offset, sample_buf });
+
+    const mask = aead.newMask(&sample_buf);
     std.log.info("decrypt: mask={any}", .{mask});
+    std.log.info("decrypt: protected_first_byte={x}, mask[0]={x}", .{ protected_first_byte, mask[0] });
 
     if (isLongHeader(first_byte)) {
         first_byte ^= (mask[0] & 0x0f);
     } else {
         first_byte ^= (mask[0] & 0x1f);
     }
+    std.log.info("decrypt: unprotected_first_byte={x}", .{first_byte});
 
+    // Calculate packet number length from the unprotected first byte BEFORE using it
     header.packet_number_len = @as(usize, @intCast(first_byte & PACKET_NUM_MASK)) + 1;
+    std.log.info("packet.decrypt: calculated_pn_len={d}", .{header.packet_number_len});
 
+    // Remove header protection from packet number bytes
     var i: usize = 0;
     while (i < header.packet_number_len) : (i += 1) {
-        pn_ciphertext.*[i] ^= mask[1 + i];
+        fbs.buffer[fbs.pos + i] ^= mask[1 + i];
     }
+
+    // Now extract the decrypted packet number
+    const pn_ciphertext: *const [MAX_PACKET_NUMBER_LEN]u8 = fbs.buffer[fbs.pos..][0..MAX_PACKET_NUMBER_LEN];
 
     // read truncated/raw packet number
     const truncated_packet_number: u64 = try switch (header.packet_number_len) {
@@ -303,36 +318,42 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
         else => error.InvalidPacket,
     };
 
-    // skip packet length byte
+    // Skip the packet number bytes in the buffer
     try fbs.seekBy(@intCast(header.packet_number_len));
-
-    // Write decrypted first byte back into the input buffer.
-    fbs.buffer[0] = first_byte;
-
-    //
-    // RFC 9000
-    // 17.1. Packet Number Encoding and Decoding
-    // ------
-    // https://www.rfc-editor.org/rfc/rfc9000.html#name-packet-number-encoding-and-
-    //
-    header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
-    std.log.info("decrypt: decoded packet_number={d}, truncated={d}", .{ header.packet_number, truncated_packet_number });
 
     const payload_len = header.remainder_len - header.packet_number_len;
     std.log.info("decrypt: payload_len={d}, packet_number_len={d}", .{ payload_len, header.packet_number_len });
 
-    const header_bytes = fbs.buffer[0..(fbs.pos)];
+    // RFC 9001 Section 5.2: AD includes the unprotected first byte and everything up to and including packet number
+    // We need to construct the AD with:
+    // - The unprotected first byte
+    // - Everything else including the (still encrypted) packet number bytes
+    var header_bytes_buf: [512]u8 = undefined;
+    // Copy first byte as unprotected
+    header_bytes_buf[0] = first_byte;
+    // Copy the rest of the header and packet number
+    const after_first_byte = fbs.pos; // Position after packet number
+    @memcpy(header_bytes_buf[1..][0..(after_first_byte - 1)], fbs.buffer[1..after_first_byte]);
+    const header_bytes = header_bytes_buf[0..after_first_byte];
     const encrypted_payload = fbs.buffer[(fbs.pos)..(fbs.pos + payload_len)];
 
     std.log.info("decrypt: header_bytes.len={d}, encrypted_payload.len={d}", .{ header_bytes.len, encrypted_payload.len });
     std.log.info("decrypt: header_bytes={any}", .{header_bytes});
     std.log.info("decrypt: dcid={any}, scid={any}", .{ header.dcid, header.scid });
 
+    // Decode packet number
+    std.log.info("packet.decrypt: before_decode next_pn={d}, truncated_pn={d}, pn_len_bits={d}", .{ space.next_packet_number, truncated_packet_number, header.packet_number_len * 8 });
+    header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
+    std.log.info("packet.decrypt: decoded packet_number={d}, truncated={d}", .{ header.packet_number, truncated_packet_number });
+
     const decrypted = try aead.decryptPayload(
         header.packet_number,
         header_bytes,
         encrypted_payload,
     );
+
+    // Write decrypted first byte back into the input buffer for further processing.
+    fbs.buffer[0] = first_byte;
 
     std.log.info("decrypt: decrypted.len={d}, first_byte={x}", .{ decrypted.len, if (decrypted.len > 0) decrypted[0] else 0 });
 

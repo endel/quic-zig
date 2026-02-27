@@ -52,15 +52,11 @@ pub const Open = struct {
 
     /// Generate a new QUIC Header Protection mask.
     ///
-    pub fn newMask(self: *const Open, sample: *[SAMPLE_LEN]u8) []u8 {
-        // pub fn newMask(self: *const Open, sample: *[SAMPLE_LEN]u8, out: *[SAMPLE_LEN]u8) *[5]u8 {
+    pub fn newMask(self: *const Open, sample: *const [SAMPLE_LEN]u8) [MASK_LEN]u8 {
         const ctx = Aes128.initEnc(self.hp_key);
-        // const ctx = Aes256.initEnc(self.hp_key);
-
         var encrypted_out: [SAMPLE_LEN]u8 = .{0x00} ** SAMPLE_LEN;
         ctx.encrypt(&encrypted_out, sample);
-
-        return std.mem.sliceAsBytes(encrypted_out[0..MASK_LEN]);
+        return encrypted_out[0..MASK_LEN].*;
     }
 
     pub fn decryptPayload(
@@ -72,9 +68,9 @@ pub const Open = struct {
         const tag_len = Aead.tag_length;
         const payload_len = payload.len;
 
-        std.log.info("decryptPayload: pn={d}, ad.len={d}, payload.len={d}", .{ packet_number, associated_data.len, payload_len });
-        std.log.info("decryptPayload: key={any}", .{self.key});
-        std.log.info("decryptPayload: iv={any}", .{self.nonce});
+        std.log.info("DECRYPT: pn={d}, ad.len={d}, ad[0]={x}, payload.len={d}", .{ packet_number, associated_data.len, if (associated_data.len > 0) associated_data[0] else 0, payload_len });
+        std.log.info("DECRYPT: key={any}", .{self.key});
+        std.log.info("DECRYPT: iv={any}", .{self.nonce});
 
         assert(payload_len >= tag_len);
 
@@ -83,12 +79,12 @@ pub const Open = struct {
             @memcpy(&t, payload[(payload_len - tag_len)..payload_len]);
             break :tag t;
         };
-        std.log.info("decryptPayload: tag={any}", .{tag});
+        std.log.info("DECRYPT: extracted_tag={any}", .{tag});
 
         const aead_nonce = makeNonce(self.nonce, packet_number);
         const bytes = payload[0..(payload_len - tag_len)];
 
-        std.log.info("decryptPayload: aead_nonce={any}, bytes.len={d}", .{ aead_nonce, bytes.len });
+        std.log.info("DECRYPT: aead_nonce={any}, plaintext_len={d}", .{ aead_nonce, bytes.len });
 
         Aead.decrypt(
             bytes, // output
@@ -133,6 +129,9 @@ pub const Seal = struct {
         const aead_nonce = makeNonce(self.nonce, packet_number);
         const tag_len = Aead.tag_length;
 
+        std.log.info("ENCRYPT: pn={d}, ad.len={d}, ad[0]={x}, plaintext.len={d}", .{ packet_number, associated_data.len, if (associated_data.len > 0) associated_data[0] else 0, plaintext.len });
+        std.log.info("ENCRYPT: key={any}, nonce={any}", .{ self.key, aead_nonce });
+
         assert(out.len >= plaintext.len + tag_len);
 
         var tag: [tag_len]u8 = undefined;
@@ -145,6 +144,8 @@ pub const Seal = struct {
             self.key,
         );
         @memcpy(out[plaintext.len..][0..tag_len], &tag);
+
+        std.log.info("ENCRYPT: tag={any}", .{tag});
 
         return plaintext.len + tag_len;
     }
@@ -174,15 +175,18 @@ pub fn applyHeaderProtection(
     pn_len: usize,
     hp_key: [key_len]u8,
 ) void {
-    // Sample starts 4 bytes after the start of the packet number field
+    // RFC 9001 Section 5.4.2: Sample starts 4 bytes after the START of packet number field
     const sample_offset = pn_offset + 4;
     if (sample_offset + SAMPLE_LEN > pkt_buf.len) return;
 
     const sample: *const [SAMPLE_LEN]u8 = pkt_buf[sample_offset..][0..SAMPLE_LEN];
+    std.log.info("HP_APPLY: pn_offset={d}, pn_len={d}, sample_offset={d}, first_byte_before={x}", .{ pn_offset, pn_len, sample_offset, pkt_buf[0] });
+    std.log.info("HP_APPLY: sample={any}", .{sample});
     const ctx = Aes128.initEnc(hp_key);
     var encrypted: [SAMPLE_LEN]u8 = undefined;
     ctx.encrypt(&encrypted, sample);
     const mask = encrypted[0..MASK_LEN];
+    std.log.info("HP_APPLY: mask={any}", .{mask});
 
     // Apply mask to first byte
     if (isLongHeader(pkt_buf[0])) {
@@ -190,6 +194,7 @@ pub fn applyHeaderProtection(
     } else {
         pkt_buf[0] ^= (mask[0] & 0x1f);
     }
+    std.log.info("HP_APPLY: first_byte_after={x}", .{pkt_buf[0]});
 
     // Apply mask to packet number bytes
     for (0..pn_len) |i| {
@@ -300,13 +305,18 @@ pub fn deriveInitialKeyMaterial(
     const server_iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
     const server_hp_key = hkdfExpandLabel(secret, "quic hp", "", key_len); //header protection key
 
-    return if (is_server) .{
+    const result = if (is_server) .{
         Open{ .key = client_key, .hp_key = client_hp_key, .nonce = client_iv },
         Seal{ .key = server_key, .hp_key = server_hp_key, .nonce = server_iv },
     } else .{
         Open{ .key = server_key, .hp_key = server_hp_key, .nonce = server_iv },
         Seal{ .key = client_key, .hp_key = client_hp_key, .nonce = client_iv },
     };
+
+    std.log.info("deriveInitialKeyMaterial result: Open.key={any}, Seal.key={any}", .{ result[0].key, result[1].key });
+    std.log.info("deriveInitialKeyMaterial result: Open.hp_key={any}, Seal.hp_key={any}", .{ result[0].hp_key, result[1].hp_key });
+
+    return result;
 }
 
 // https://www.rfc-editor.org/rfc/rfc9001#section-a.1
@@ -706,7 +716,7 @@ test "RFC 9001 A.2: Client Initial packet protection" {
     // 2-byte varint: set top 2 bits to 01
     std.mem.writeInt(u16, pkt_buf[length_offset..][0..2], payload_length | 0x4000, .big);
 
-    // Associated data = everything from first byte up to (and including) packet number
+    // Associated data = everything from first byte up to and including packet number
     const ad = pkt_buf[0 .. pn_offset + 4];
 
     // Encrypt the payload
