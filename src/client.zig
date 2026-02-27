@@ -86,6 +86,10 @@ pub fn main() !void {
 
             // Process all coalesced packets in the UDP datagram
             while (fbs.pos < packet_length) {
+                // All valid QUIC packets have the fixed bit (0x40) set in the first byte.
+                // If not set, remaining bytes are datagram padding — stop parsing.
+                if (bytes[fbs.pos] & 0x40 == 0) break;
+
                 const packet_start_pos = fbs.pos;
                 var header = packet.Header.parse(&fbs) catch |err| {
                     std.log.err("header parse error: {any}", .{err});
@@ -135,7 +139,9 @@ pub fn main() !void {
         std.log.info("sent {d} bytes (handshake completion)", .{hs_bytes});
     }
 
-    // Clear Handshake keys so subsequent sends don't include Handshake packets
+    // Clear Initial and Handshake keys so subsequent sends only use 1-RTT
+    conn.pkt_num_spaces[0].crypto_open = null;
+    conn.pkt_num_spaces[0].crypto_seal = null;
     conn.pkt_num_spaces[1].crypto_open = null;
     conn.pkt_num_spaces[1].crypto_seal = null;
 

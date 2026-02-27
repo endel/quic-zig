@@ -333,6 +333,12 @@ pub const Connection = struct {
         // Record receipt for ACK generation
         try self.pkt_handler.onPacketReceived(enc_level, header.packet_number, ack_eliciting, now);
 
+        // Update expected packet number for correct decoding of subsequent packets
+        // (critical for coalesced packets where multiple packets share a datagram)
+        if (header.packet_number + 1 > self.pkt_num_spaces[space_idx].next_packet_number) {
+            self.pkt_num_spaces[space_idx].next_packet_number = header.packet_number + 1;
+        }
+
         // Update connection state
         if (self.state == .first_flight and epoch == .initial) {
             self.state = .handshake;
@@ -754,9 +760,10 @@ pub const Connection = struct {
         const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
         const app_seal = self.pkt_num_spaces[2].crypto_seal;
 
+        const has_initial = initial_seal != null;
         const has_handshake = handshake_seal != null;
         const has_app = app_seal != null;
-        std.log.debug("send: packing coalesced packet, has_initial=true has_handshake={} has_app={}", .{ has_handshake, has_app });
+        std.log.debug("send: packing coalesced packet, has_initial={} has_handshake={} has_app={}", .{ has_initial, has_handshake, has_app });
 
         const bytes_written = try self.packer.packCoalesced(
             out_buf,
