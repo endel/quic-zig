@@ -16,16 +16,14 @@ pub fn main() !void {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Connect to quic-go v0.59.0 server at localhost:4434
     const server_addr = try net.Address.parseIp4("127.0.0.1", 4434);
-    // const server_addr = try net.Address.parseIp4("127.0.0.1", 4433);
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
 
     // Create a local socket with any available port
     const local_addr = try net.Address.parseIp4("127.0.0.1", 0);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
-    std.log.info("QUIC client connecting to localhost:4434 (quic-go v0.59.0) - sockfd={d}", .{sockfd});
+    std.log.info("QUIC client connecting to 127.0.0.1:4434", .{});
 
     // Create TLS config for the client
     // (Clients don't need certificates - empty arrays are fine)
@@ -98,18 +96,6 @@ pub fn main() !void {
                 const encrypted_payload_size = header.remainder_len;
                 const full_packet_size = header_end_pos - packet_start_pos + encrypted_payload_size;
 
-                std.log.info("recv {any} packet at offset {d}, header_size={d}, encrypted_size={d}, full_size={d}", .{ header.packet_type, packet_start_pos, header_end_pos - packet_start_pos, encrypted_payload_size, full_packet_size });
-
-                // Save first response packet for debugging
-                if (header.packet_type == .initial and fbs.pos == 0) {
-                    std.debug.print("\n=== RECEIVED INITIAL PACKET BYTES ===\n", .{});
-                    for (bytes[0..@min(116, packet_length)], 0..) |byte, i| {
-                        if (i % 16 == 0) std.debug.print("\n{x:0>3}: ", .{i});
-                        std.debug.print("{x:0>2} ", .{byte});
-                    }
-                    std.debug.print("\n\n", .{});
-                }
-
                 conn.recv(&header, &fbs, .{
                     .to = local_addr.any,
                     .from = remote_addr,
@@ -121,7 +107,6 @@ pub fn main() !void {
                 // Ensure fbs is positioned at the start of the next packet
                 const expected_next_pos = packet_start_pos + full_packet_size;
                 if (fbs.pos < expected_next_pos) {
-                    std.log.info("advancing fbs from {d} to {d}", .{ fbs.pos, expected_next_pos });
                     fbs.pos = expected_next_pos;
                 }
             }
@@ -139,6 +124,23 @@ pub fn main() !void {
     }
 
     std.log.info("handshake complete, connection active", .{});
+
+    // First, send any pending handshake packets (Finished, ACKs)
+    const hs_bytes = conn.send(&out) catch |err| {
+        std.log.err("send error (handshake): {any}", .{err});
+        return;
+    };
+    if (hs_bytes > 0) {
+        _ = try posix.sendto(sockfd, out[0..hs_bytes], 0, &remote_addr, addr_size);
+        std.log.info("sent {d} bytes (handshake completion)", .{hs_bytes});
+    }
+
+    // Clear Handshake keys so subsequent sends don't include Handshake packets
+    conn.pkt_num_spaces[1].crypto_open = null;
+    conn.pkt_num_spaces[1].crypto_seal = null;
+
+    // Small delay for the server to process the Finished
+    std.Thread.sleep(50 * std.time.ns_per_ms);
 
     // Now open a stream and send test data
     const test_data = "Hello from Zig QUIC client!";

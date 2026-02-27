@@ -143,6 +143,10 @@ pub const Header = struct {
     /// protection is removed.
     key_phase: bool = false,
 
+    /// The offset of this packet's first byte within the buffer.
+    /// Used to correctly handle coalesced packets.
+    packet_start: usize = 0,
+
     pub fn parse(fbs: anytype) !Header {
         return parseQuicHeader(fbs);
     }
@@ -266,7 +270,7 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
         return error.InvalidPacket;
     }
 
-    var first_byte = fbs.buffer[0];
+    var first_byte = fbs.buffer[header.packet_start];
     const protected_first_byte = first_byte;
 
     // unprotect header
@@ -325,16 +329,15 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     std.log.info("decrypt: payload_len={d}, packet_number_len={d}", .{ payload_len, header.packet_number_len });
 
     // RFC 9001 Section 5.2: AD includes the unprotected first byte and everything up to and including packet number
-    // We need to construct the AD with:
-    // - The unprotected first byte
-    // - Everything else including the (still encrypted) packet number bytes
+    // For coalesced packets, use packet_start to get the correct offset within the buffer
+    const pkt_start = header.packet_start;
+    const header_len = fbs.pos - pkt_start; // total header length including packet number
     var header_bytes_buf: [512]u8 = undefined;
     // Copy first byte as unprotected
     header_bytes_buf[0] = first_byte;
-    // Copy the rest of the header and packet number
-    const after_first_byte = fbs.pos; // Position after packet number
-    @memcpy(header_bytes_buf[1..][0..(after_first_byte - 1)], fbs.buffer[1..after_first_byte]);
-    const header_bytes = header_bytes_buf[0..after_first_byte];
+    // Copy the rest of the header and packet number (from byte after first to current position)
+    @memcpy(header_bytes_buf[1..][0..(header_len - 1)], fbs.buffer[(pkt_start + 1)..fbs.pos]);
+    const header_bytes = header_bytes_buf[0..header_len];
     const encrypted_payload = fbs.buffer[(fbs.pos)..(fbs.pos + payload_len)];
 
     std.log.info("decrypt: header_bytes.len={d}, encrypted_payload.len={d}", .{ header_bytes.len, encrypted_payload.len });
@@ -353,7 +356,7 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     );
 
     // Write decrypted first byte back into the input buffer for further processing.
-    fbs.buffer[0] = first_byte;
+    fbs.buffer[header.packet_start] = first_byte;
 
     std.log.info("decrypt: decrypted.len={d}, first_byte={x}", .{ decrypted.len, if (decrypted.len > 0) decrypted[0] else 0 });
 
@@ -366,10 +369,12 @@ pub fn isLongHeader(first_byte: u8) bool {
 }
 
 pub fn parseQuicHeader(fbs: anytype) !Header {
+    const packet_start_pos = fbs.pos;
     const reader = fbs.reader();
     const first_byte = try reader.readByte();
 
     var header = Header{};
+    header.packet_start = packet_start_pos;
 
     if (isLongHeader(first_byte)) {
         log.info("LONG HEADER!", .{});
@@ -469,11 +474,17 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
                 // // return error.InvalidPacket;
             },
 
-            PacketType.handshake, PacketType.zero_rtt, PacketType.one_rtt => {
-                // Short header packet (Handshake, 0-RTT, or 1-RTT)
-                // Short header format: 1 byte first_byte + dcid + packet_number (variable) + payload
-                // For now, just read the DCID and set remainder_len to rest of buffer
+            PacketType.handshake, PacketType.zero_rtt => {
+                // Long header packets (like Initial but without Token field)
+                // DCID and SCID already parsed above
+                // Just need to read the Length varint
+                header.remainder_len = try readVarInt(reader);
+                std.log.info("long_header (handshake/0-rtt): type={any}, remainder_len={d}", .{ header.packet_type, header.remainder_len });
+            },
 
+            PacketType.one_rtt => {
+                // Short header packet (1-RTT)
+                // Short header format: 1 byte first_byte + dcid + packet_number (variable) + payload
                 // DCID is present in all short header packets
                 const short_dcid_len = 8; // TODO: get actual DCID length from connection state
                 if (fbs.pos + short_dcid_len <= fbs.buffer.len) {
@@ -501,7 +512,17 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
     } else {
         log.info("SHORT HEADER!", .{});
 
-        header.remainder_len = fbs.buffer.len;
+        header.packet_type = PacketType.one_rtt;
+
+        // Short header: first_byte + DCID (known length from connection state) + payload
+        // TODO: use actual peer DCID length from connection state
+        const short_dcid_len: usize = 8;
+        if (fbs.pos + short_dcid_len <= fbs.buffer.len) {
+            header.dcid = fbs.buffer[fbs.pos..(fbs.pos + short_dcid_len)];
+            try fbs.seekBy(short_dcid_len);
+        }
+
+        header.remainder_len = fbs.buffer.len - fbs.pos;
     }
 
     return header;

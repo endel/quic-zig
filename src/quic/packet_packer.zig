@@ -39,8 +39,9 @@ pub const PacketPacker = struct {
     /// Source connection ID.
     scid: []const u8,
 
-    /// Destination connection ID.
-    dcid: []const u8,
+    /// Destination connection ID (owned buffer to avoid dangling slices).
+    dcid_buf: [20]u8 = .{0} ** 20,
+    dcid_len: u8 = 0,
 
     /// QUIC version.
     version: u32,
@@ -55,13 +56,24 @@ pub const PacketPacker = struct {
         dcid: []const u8,
         version: u32,
     ) PacketPacker {
-        return .{
+        var packer = PacketPacker{
             .allocator = allocator,
             .is_server = is_server,
             .scid = scid,
-            .dcid = dcid,
+            .dcid_len = @intCast(dcid.len),
             .version = version,
         };
+        @memcpy(packer.dcid_buf[0..dcid.len], dcid);
+        return packer;
+    }
+
+    pub fn getDcid(self: *const PacketPacker) []const u8 {
+        return self.dcid_buf[0..self.dcid_len];
+    }
+
+    pub fn updateDcid(self: *PacketPacker, new_dcid: []const u8) void {
+        @memcpy(self.dcid_buf[0..new_dcid.len], new_dcid);
+        self.dcid_len = @intCast(new_dcid.len);
     }
 
     /// Pack a coalesced packet (Initial + Handshake + 1-RTT).
@@ -169,7 +181,7 @@ pub const PacketPacker = struct {
             var first_byte: u8 = packet_mod.FIXED_BIT;
             first_byte |= @as(u8, @intCast(pn_len - 1));
             try writer.writeByte(first_byte);
-            try writer.writeAll(self.dcid);
+            try writer.writeAll(self.getDcid());
         } else {
             // Long header
             var first_byte: u8 = packet_mod.LONG_HEADER_BIT | packet_mod.FIXED_BIT;
@@ -183,12 +195,12 @@ pub const PacketPacker = struct {
             try writer.writeByte(first_byte);
             try writer.writeInt(u32, self.version, .big);
 
-            try writer.writeByte(@intCast(self.dcid.len));
-            try writer.writeAll(self.dcid);
+            try writer.writeByte(@intCast(self.getDcid().len));
+            try writer.writeAll(self.getDcid());
             try writer.writeByte(@intCast(self.scid.len));
             try writer.writeAll(self.scid);
 
-            std.log.info("packInitial: writing dcid={any}, scid={any}", .{ self.dcid, self.scid });
+            std.log.info("packInitial: writing dcid={any}, scid={any}", .{ self.getDcid(), self.scid });
 
             // Token (Initial only)
             if (pkt_type == .initial) {
@@ -244,6 +256,10 @@ pub const PacketPacker = struct {
                 if (fbs.pos + AEAD_TAG_LEN + 16 >= tmp.len) break;
                 const max_stream_data = tmp.len - fbs.pos - AEAD_TAG_LEN - 8;
                 if (s.send.popStreamFrame(max_stream_data)) |stream_frame| {
+                    const sf = stream_frame.stream;
+                    std.log.info("packing STREAM frame: id={d}, offset={d}, len={d}, fin={}, data_len={d}", .{
+                        sf.stream_id, sf.offset, sf.length, sf.fin, sf.data.len,
+                    });
                     try stream_frame.write(writer);
                     ack_eliciting = true;
                 }
@@ -353,7 +369,7 @@ pub const PacketPacker = struct {
         // Short header (if 1-RTT keys available)
         const first_byte: u8 = packet_mod.FIXED_BIT | 0x03; // 4-byte pn
         try writer.writeByte(first_byte);
-        try writer.writeAll(self.dcid);
+        try writer.writeAll(self.getDcid());
 
         // Packet number (0 for close)
         try writer.writeInt(u32, 0, .big);
@@ -385,5 +401,5 @@ test "PacketPacker: basic init" {
         0x00000001,
     );
     try testing.expectEqualSlices(u8, scid, packer.scid);
-    try testing.expectEqualSlices(u8, dcid, packer.dcid);
+    try testing.expectEqualSlices(u8, dcid, packer.getDcid());
 }

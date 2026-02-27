@@ -274,8 +274,12 @@ pub const Connection = struct {
         }
 
         // Determine path - set peer connection ID on first packet
-        if (self.is_server and !self.got_peer_conn_id) {
-            self.setInitialDCID(header.scid);
+        if (!self.got_peer_conn_id and header.scid.len > 0) {
+            std.log.info("recv: updating DCID to peer SCID={any}", .{header.scid});
+            self.dcid_len = @intCast(header.scid.len);
+            @memcpy(self.dcid[0..header.scid.len], header.scid);
+            // Update packer with new DCID
+            self.packer.updateDcid(header.scid);
             self.got_peer_conn_id = true;
         }
 
@@ -439,6 +443,12 @@ pub const Connection = struct {
             .path_response => {},
 
             .connection_close => |cc| {
+                std.log.err("CONNECTION_CLOSE: error_code=0x{x}, frame_type=0x{x}, reason_len={d}, reason={s}", .{
+                    cc.error_code,
+                    cc.frame_type,
+                    cc.reason.len,
+                    if (cc.reason.len > 0) cc.reason else "none",
+                });
                 self.state = .draining;
                 self.local_err = .{
                     .is_app = false,
@@ -650,9 +660,23 @@ pub const Connection = struct {
                     self.pkt_handler.dropSpace(.initial);
                     self.pkt_handler.dropSpace(.handshake);
 
-                    // Store peer transport parameters if available
+                    // Clear Initial encryption keys so we stop sending padded Initial packets
+                    self.pkt_num_spaces[0].crypto_open = null;
+                    self.pkt_num_spaces[0].crypto_seal = null;
+
+                    // Store peer transport parameters and apply stream limits
                     if (hs.peer_transport_params) |peer_tp| {
                         self.peer_params = peer_tp;
+                        self.streams.setMaxStreams(
+                            peer_tp.initial_max_streams_bidi,
+                            peer_tp.initial_max_streams_uni,
+                        );
+                        self.conn_flow_ctrl.base.send_window = peer_tp.initial_max_data;
+                        std.log.info("applied peer transport params: max_bidi={d}, max_uni={d}, max_data={d}", .{
+                            peer_tp.initial_max_streams_bidi,
+                            peer_tp.initial_max_streams_uni,
+                            peer_tp.initial_max_data,
+                        });
                     }
                     break;
                 },
@@ -830,6 +854,7 @@ pub fn connect(
         .initial_max_streams_bidi = config.initial_max_streams_bidi,
         .initial_max_streams_uni = config.initial_max_streams_uni,
         .max_datagram_frame_size = config.max_datagram_frame_size,
+        .initial_source_connection_id = &scid,
     };
 
     var conn = Connection{

@@ -38,8 +38,11 @@ const ExtType = enum(u16) {
     _,
 };
 
-// Signature algorithm: ecdsa_secp256r1_sha256
+// Signature algorithms
 const SIG_ECDSA_P256_SHA256: u16 = 0x0403;
+const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
+const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
+const SIG_RSA_PSS_RSAE_SHA512: u16 = 0x0806;
 
 // Named group: x25519
 const GROUP_X25519: u16 = 0x001d;
@@ -934,10 +937,16 @@ fn buildClientHello(
     pos += 32;
 
     // signature_algorithms extension
-    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.signature_algorithms), 2 + 2);
-    writeU16(buf[pos..], 2); // list length
+    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.signature_algorithms), 2 + 8);
+    writeU16(buf[pos..], 8); // list length (4 algorithms x 2 bytes)
     pos += 2;
     writeU16(buf[pos..], SIG_ECDSA_P256_SHA256);
+    pos += 2;
+    writeU16(buf[pos..], SIG_RSA_PSS_RSAE_SHA256);
+    pos += 2;
+    writeU16(buf[pos..], SIG_RSA_PSS_RSAE_SHA384);
+    pos += 2;
+    writeU16(buf[pos..], SIG_RSA_PSS_RSAE_SHA512);
     pos += 2;
 
     // supported_groups extension
