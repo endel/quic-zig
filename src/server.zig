@@ -51,7 +51,7 @@ pub fn main() !void {
     var test_addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
     var test_buf: [100]u8 = undefined;
     _ = posix.recvfrom(sockfd, &test_buf, 0, &test_addr, &test_addr_size) catch |err| {
-        std.log.info("First recvfrom (expected WouldBlock): {any}", .{err});
+        std.log.debug("First recvfrom (expected WouldBlock): {any}", .{err});
     };
 
     var conn_state: ?connection.Connection = null;
@@ -64,7 +64,7 @@ pub fn main() !void {
         std.Thread.sleep(1 * std.time.ns_per_ms);
         loop_count += 1;
         if (loop_count % 1000 == 0) {
-            std.log.info("server loop iteration {d}", .{loop_count});
+            std.log.debug("server loop iteration {d}", .{loop_count});
         }
 
         // Read loop: process all available UDP packets

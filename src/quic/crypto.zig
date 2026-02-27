@@ -68,10 +68,6 @@ pub const Open = struct {
         const tag_len = Aead.tag_length;
         const payload_len = payload.len;
 
-        std.log.info("DECRYPT: pn={d}, ad.len={d}, ad[0]={x}, payload.len={d}", .{ packet_number, associated_data.len, if (associated_data.len > 0) associated_data[0] else 0, payload_len });
-        std.log.info("DECRYPT: key={any}", .{self.key});
-        std.log.info("DECRYPT: iv={any}", .{self.nonce});
-
         assert(payload_len >= tag_len);
 
         const tag: [tag_len]u8 = tag: {
@@ -79,12 +75,9 @@ pub const Open = struct {
             @memcpy(&t, payload[(payload_len - tag_len)..payload_len]);
             break :tag t;
         };
-        std.log.info("DECRYPT: extracted_tag={any}", .{tag});
 
         const aead_nonce = makeNonce(self.nonce, packet_number);
         const bytes = payload[0..(payload_len - tag_len)];
-
-        std.log.info("DECRYPT: aead_nonce={any}, plaintext_len={d}", .{ aead_nonce, bytes.len });
 
         Aead.decrypt(
             bytes, // output
@@ -98,7 +91,6 @@ pub const Open = struct {
             return err;
         };
 
-        std.log.info("decryptPayload: success, first_byte={x}", .{if (bytes.len > 0) bytes[0] else 0});
         return bytes;
     }
 };
@@ -129,9 +121,6 @@ pub const Seal = struct {
         const aead_nonce = makeNonce(self.nonce, packet_number);
         const tag_len = Aead.tag_length;
 
-        std.log.info("ENCRYPT: pn={d}, ad.len={d}, ad[0]={x}, plaintext.len={d}", .{ packet_number, associated_data.len, if (associated_data.len > 0) associated_data[0] else 0, plaintext.len });
-        std.log.info("ENCRYPT: key={any}, nonce={any}", .{ self.key, aead_nonce });
-
         assert(out.len >= plaintext.len + tag_len);
 
         var tag: [tag_len]u8 = undefined;
@@ -144,8 +133,6 @@ pub const Seal = struct {
             self.key,
         );
         @memcpy(out[plaintext.len..][0..tag_len], &tag);
-
-        std.log.info("ENCRYPT: tag={any}", .{tag});
 
         return plaintext.len + tag_len;
     }
@@ -180,13 +167,10 @@ pub fn applyHeaderProtection(
     if (sample_offset + SAMPLE_LEN > pkt_buf.len) return;
 
     const sample: *const [SAMPLE_LEN]u8 = pkt_buf[sample_offset..][0..SAMPLE_LEN];
-    std.log.info("HP_APPLY: pn_offset={d}, pn_len={d}, sample_offset={d}, first_byte_before={x}", .{ pn_offset, pn_len, sample_offset, pkt_buf[0] });
-    std.log.info("HP_APPLY: sample={any}", .{sample});
     const ctx = Aes128.initEnc(hp_key);
     var encrypted: [SAMPLE_LEN]u8 = undefined;
     ctx.encrypt(&encrypted, sample);
     const mask = encrypted[0..MASK_LEN];
-    std.log.info("HP_APPLY: mask={any}", .{mask});
 
     // Apply mask to first byte
     if (isLongHeader(pkt_buf[0])) {
@@ -194,7 +178,6 @@ pub fn applyHeaderProtection(
     } else {
         pkt_buf[0] ^= (mask[0] & 0x1f);
     }
-    std.log.info("HP_APPLY: first_byte_after={x}", .{pkt_buf[0]});
 
     // Apply mask to packet number bytes
     for (0..pn_len) |i| {
@@ -287,10 +270,7 @@ pub fn deriveInitialKeyMaterial(
 
     // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
 
-    std.log.info("deriveInitialKeyMaterial: cid_len={d}, is_server={}", .{ cid.len, is_server });
-
     const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, cid);
-    std.log.info("deriveInitialKeyMaterial: initial_secret={any}", .{initial_secret});
     var secret: [32]u8 = undefined;
 
     // Client
@@ -305,18 +285,13 @@ pub fn deriveInitialKeyMaterial(
     const server_iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
     const server_hp_key = hkdfExpandLabel(secret, "quic hp", "", key_len); //header protection key
 
-    const result = if (is_server) .{
+    return if (is_server) .{
         Open{ .key = client_key, .hp_key = client_hp_key, .nonce = client_iv },
         Seal{ .key = server_key, .hp_key = server_hp_key, .nonce = server_iv },
     } else .{
         Open{ .key = server_key, .hp_key = server_hp_key, .nonce = server_iv },
         Seal{ .key = client_key, .hp_key = client_hp_key, .nonce = client_iv },
     };
-
-    std.log.info("deriveInitialKeyMaterial result: Open.key={any}, Seal.key={any}", .{ result[0].key, result[1].key });
-    std.log.info("deriveInitialKeyMaterial result: Open.hp_key={any}, Seal.hp_key={any}", .{ result[0].hp_key, result[1].hp_key });
-
-    return result;
 }
 
 // https://www.rfc-editor.org/rfc/rfc9001#section-a.1

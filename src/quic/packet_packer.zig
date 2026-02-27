@@ -161,7 +161,6 @@ pub const PacketPacker = struct {
         now: i64,
         pad_to_min: bool,
     ) !usize {
-        std.log.info("packSinglePacket: level={s} buf.len={d}", .{ @tagName(level), buf.len });
         if (buf.len < 64) return 0; // Not enough space
 
         // We build the packet in a temporary buffer, then encrypt into buf
@@ -208,8 +207,6 @@ pub const PacketPacker = struct {
             try writer.writeAll(self.getDcid());
             try writer.writeByte(@intCast(self.getScid().len));
             try writer.writeAll(self.getScid());
-
-            std.log.info("packInitial: writing dcid={any}, scid={any}", .{ self.getDcid(), self.getScid() });
 
             // Token (Initial only)
             if (pkt_type == .initial) {
@@ -286,10 +283,8 @@ pub const PacketPacker = struct {
         // Check if we have any payload
         var payload_len = fbs.pos - payload_start;
         if (payload_len == 0 and !pad_to_min) {
-            std.log.info("packSinglePacket: level={s} returning 0 - no payload", .{ @tagName(level) });
             return 0; // Nothing to send
         }
-        std.log.info("packSinglePacket: level={s} has payload_len={d}", .{ @tagName(level), payload_len });
 
         // RFC 9001 Section 5.4: ensure Initial packets have at least 5 bytes plaintext for header protection
         // (5 bytes plaintext + 16 bytes AEAD tag = 21 bytes encrypted minimum >= 20 required)
@@ -337,15 +332,12 @@ pub const PacketPacker = struct {
         const encrypted_start = pn_offset + pn_len;
         // RFC 9001 Section 5.2: AD is the header up to and including the packet number field
         const ad = buf[header_start..][0..(pn_offset - header_start + pn_len)];
-        std.log.info("packSinglePacket encrypt: pn={d}, ad.len={d}, ad={any}", .{ pn, ad.len, ad });
-        std.log.info("packSinglePacket encrypt: plaintext_payload.len={d}", .{plaintext_payload.len});
         const encrypted_len = seal.encryptPayload(
             pn,
             ad,
             plaintext_payload,
             buf[encrypted_start..],
         );
-        std.log.info("packSinglePacket encrypt: encrypted_len={d}", .{encrypted_len});
 
         const total_packet_len = encrypted_start + encrypted_len;
 

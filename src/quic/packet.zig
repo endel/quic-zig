@@ -262,8 +262,6 @@ pub fn parseIncoming(bytes: []const u8) void {
 }
 
 pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
-    std.log.info("\n\nheader.remainder_len: {any}, fbs.pos: {d}, buffer.len: {d}", .{ header.remainder_len, fbs.pos, fbs.buffer.len });
-
     // We need at least 4 bytes for packet number + 16 for sample
     if (fbs.pos + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
         std.log.err("Not enough data for packet number + sample: pos={d}, buffer.len={d}", .{ fbs.pos, fbs.buffer.len });
@@ -271,14 +269,11 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     }
 
     var first_byte = fbs.buffer[header.packet_start];
-    const protected_first_byte = first_byte;
 
     // unprotect header
     var aead = space.crypto_open.?;
 
     // RFC 9001 Section 5.4.2: Sample is taken 4 bytes after START of packet number field
-    // The sample starts at pn_offset + 4, NOT pn_offset + pn_len + 4
-    // We cannot read pn_len from the protected first byte because those bits are protected!
     const sample_offset = fbs.pos + 4;
     if (sample_offset + crypto.SAMPLE_LEN > fbs.buffer.len) {
         std.log.err("Not enough data for sample: offset={d}, buffer.len={d}", .{ sample_offset, fbs.buffer.len });
@@ -287,22 +282,17 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
 
     var sample_buf: [crypto.SAMPLE_LEN]u8 = undefined;
     @memcpy(&sample_buf, fbs.buffer[sample_offset..][0..crypto.SAMPLE_LEN]);
-    std.log.info("decrypt: sample_offset={d}, sample={any}", .{ sample_offset, sample_buf });
 
     const mask = aead.newMask(&sample_buf);
-    std.log.info("decrypt: mask={any}", .{mask});
-    std.log.info("decrypt: protected_first_byte={x}, mask[0]={x}", .{ protected_first_byte, mask[0] });
 
     if (isLongHeader(first_byte)) {
         first_byte ^= (mask[0] & 0x0f);
     } else {
         first_byte ^= (mask[0] & 0x1f);
     }
-    std.log.info("decrypt: unprotected_first_byte={x}", .{first_byte});
 
     // Calculate packet number length from the unprotected first byte BEFORE using it
     header.packet_number_len = @as(usize, @intCast(first_byte & PACKET_NUM_MASK)) + 1;
-    std.log.info("packet.decrypt: calculated_pn_len={d}", .{header.packet_number_len});
 
     // Remove header protection from packet number bytes
     var i: usize = 0;
@@ -326,7 +316,6 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     try fbs.seekBy(@intCast(header.packet_number_len));
 
     const payload_len = header.remainder_len - header.packet_number_len;
-    std.log.info("decrypt: payload_len={d}, packet_number_len={d}", .{ payload_len, header.packet_number_len });
 
     // RFC 9001 Section 5.2: AD includes the unprotected first byte and everything up to and including packet number
     // For coalesced packets, use packet_start to get the correct offset within the buffer
@@ -340,14 +329,8 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     const header_bytes = header_bytes_buf[0..header_len];
     const encrypted_payload = fbs.buffer[(fbs.pos)..(fbs.pos + payload_len)];
 
-    std.log.info("decrypt: header_bytes.len={d}, encrypted_payload.len={d}", .{ header_bytes.len, encrypted_payload.len });
-    std.log.info("decrypt: header_bytes={any}", .{header_bytes});
-    std.log.info("decrypt: dcid={any}, scid={any}", .{ header.dcid, header.scid });
-
     // Decode packet number
-    std.log.info("packet.decrypt: before_decode next_pn={d}, truncated_pn={d}, pn_len_bits={d}", .{ space.next_packet_number, truncated_packet_number, header.packet_number_len * 8 });
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
-    std.log.info("packet.decrypt: decoded packet_number={d}, truncated={d}", .{ header.packet_number, truncated_packet_number });
 
     const decrypted = try aead.decryptPayload(
         header.packet_number,
@@ -357,8 +340,6 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
 
     // Write decrypted first byte back into the input buffer for further processing.
     fbs.buffer[header.packet_start] = first_byte;
-
-    std.log.info("decrypt: decrypted.len={d}, first_byte={x}", .{ decrypted.len, if (decrypted.len > 0) decrypted[0] else 0 });
 
     return decrypted;
 }
@@ -377,12 +358,10 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
     header.packet_start = packet_start_pos;
 
     if (isLongHeader(first_byte)) {
-        log.info("LONG HEADER!", .{});
+        log.debug("LONG HEADER", .{});
 
         const version = try reader.readInt(u32, ENDIAN);
         header.version = version;
-
-        log.info("version: {any}", .{header.version});
 
         const dcid_length = try reader.readByte();
         if (dcid_length > CONNECTION_ID_MAX_SIZE) {
@@ -390,11 +369,7 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
             return error.PacketError;
         }
 
-        std.log.info("fbs.pos: {any}, dcid length: {any}", .{ fbs.pos, dcid_length });
-
-        // @memcpy(&header.dcid, fbs.buffer[fbs.pos..(fbs.pos + dcid_length)], dcid_length);
         header.dcid = fbs.buffer[fbs.pos..(fbs.pos + dcid_length)];
-        std.log.info("dcid ({}): {any}", .{ dcid_length, header.dcid });
 
         // advance length
         try fbs.seekBy(dcid_length);
@@ -405,12 +380,7 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
             return error.InvalidPacket;
         }
 
-        std.log.info("fbs.pos: {any}, scid length: {any}", .{ fbs.pos, scid_length });
-
-        // @memcpy(&header.scid, fbs.buffer[fbs.pos..(fbs.pos + scid_length)], scid_length);
-        // std.mem.copy(u8, header.scid, fbs.buffer[fbs.pos..(fbs.pos + scid_length)]);
         header.scid = fbs.buffer[fbs.pos..(fbs.pos + scid_length)];
-        std.log.info("scid ({}): {any}", .{ scid_length, header.scid });
 
         // advance scid_length
         try fbs.seekBy(scid_length);
@@ -421,7 +391,6 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
         }
 
         header.packet_type = @enumFromInt(first_byte & PACKET_TYPE_MASK);
-        std.log.info("packet_type => {any}", .{header.packet_type});
 
         switch (header.packet_type) {
             PacketType.initial => {
@@ -429,63 +398,28 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
                 // with at least 1200 bytes payload. This is validated when sending (in packet_packer),
                 // not when receiving, since the server may send smaller Initial packets.
 
-                std.log.info("token_length: readVarInt (before) => fbs.pos: {any}", .{fbs.pos});
                 const token_length = try readVarInt(reader);
-                std.log.info("token_length: {any}, readVarInt (after) => fbs.pos: {any}", .{ token_length, fbs.pos });
                 if (token_length > 0) {
-                    //
-                    // Token:  The value of the token that was previously provided in a
-                    //    Retry packet or NEW_TOKEN frame; see Section 8.1.
-                    //
                     header.token = fbs.buffer[fbs.pos..(fbs.pos + token_length)];
-                    std.log.info("token: {any}", .{header.token});
                     try fbs.seekBy(@intCast(token_length));
-                } else {
-                    std.log.warn("no token!", .{});
                 }
 
-                std.log.info("remainder_len: readVarInt (before) => fbs.pos: {any}", .{fbs.pos});
                 header.remainder_len = try readVarInt(reader);
-                std.log.info("remainder_len: {any}, readVarInt (before) => fbs.pos: {any}", .{ header.remainder_len, fbs.pos });
             },
 
             PacketType.retry => {
-                // var token_length = len - fbs.pos - RETRY_INTEGRITY_TAG_SIZE;
-                // var token = bytes[fbs.pos..(fbs.pos + token_length)];
-                // try fbs.seekBy(@intCast(token_length));
-
-                std.log.info("TODO: handle Retry packet type...", .{});
                 header.remainder_len = 0;
-                // header.token = token;
             },
 
-            PacketType.version_negotiation => {
-                // FIXME: this \
-                // std.log.err("TODO: server-side should not accept VersionNegotiation packets.", .{});
-                //
-                // header.remainder_len = fbs.buffer.len - fbs.pos;
-                //
-                // while (fbs.pos - fbs.buffer.len > 0) {
-                //     _ = try reader.readInt(u32, ENDIAN); // const version = reader.readInt(u32, ENDIAN);
-                //     // std.log.info("PacketType.VersionNegotiation, accepts: {any}", .{version});
-                // }
-                //
-                // std.log.err("WHAT>?????", .{});
-                // // return error.InvalidPacket;
-            },
+            PacketType.version_negotiation => {},
 
             PacketType.handshake, PacketType.zero_rtt => {
                 // Long header packets (like Initial but without Token field)
-                // DCID and SCID already parsed above
-                // Just need to read the Length varint
                 header.remainder_len = try readVarInt(reader);
-                std.log.info("long_header (handshake/0-rtt): type={any}, remainder_len={d}", .{ header.packet_type, header.remainder_len });
             },
 
             PacketType.one_rtt => {
                 // Short header packet (1-RTT)
-                // Short header format: 1 byte first_byte + dcid + packet_number (variable) + payload
-                // DCID is present in all short header packets
                 const short_dcid_len = 8; // TODO: get actual DCID length from connection state
                 if (fbs.pos + short_dcid_len <= fbs.buffer.len) {
                     header.dcid = fbs.buffer[fbs.pos..(fbs.pos + short_dcid_len)];
@@ -493,7 +427,6 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
                 }
 
                 header.remainder_len = fbs.buffer.len - fbs.pos;
-                std.log.info("short_header: type={any}, remainder_len={d}", .{ header.packet_type, header.remainder_len });
             },
 
             else => {
@@ -501,16 +434,8 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
                 header.remainder_len = try readVarInt(reader);
             },
         }
-
-        // // check remainder length
-        // if (header.remainder_len > bytes.len - fbs.pos) {
-        //     std.log.err("Packet payload is truncated", .{});
-        //     return error.InvalidPacket;
-        // }
-
-        //
     } else {
-        log.info("SHORT HEADER!", .{});
+        log.debug("SHORT HEADER", .{});
 
         header.packet_type = PacketType.one_rtt;
 
@@ -563,7 +488,6 @@ pub fn retry(
     try hdr.encode(writer);
 
     const integrity_tag = try computeRetryIntegrityTag(fbs.getWritten(), header.dcid, header.version);
-    std.log.info("integrity_tag: {any}", .{integrity_tag});
 
     try writer.writeAll(&integrity_tag);
 }

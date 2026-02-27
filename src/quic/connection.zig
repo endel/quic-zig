@@ -130,6 +130,7 @@ pub const Connection = struct {
 
     // Connection state
     got_peer_conn_id: bool = false,
+    peer_max_cid_seq: u64 = 0,
     local_err: ?ConnectionError = null,
     handshake_confirmed: bool = false,
 
@@ -261,7 +262,7 @@ pub const Connection = struct {
         const space_idx = @intFromEnum(enc_level);
         const space = self.pkt_num_spaces[space_idx];
         const has_keys = space.crypto_open != null and space.crypto_seal != null;
-        std.log.info("recv: using space {d} ({s}), has_keys={}", .{ space_idx, @tagName(enc_level), has_keys });
+        std.log.debug("recv: using space {d} ({s}), has_keys={}", .{ space_idx, @tagName(enc_level), has_keys });
 
         if (!has_keys) {
             std.log.info("recv: dropping packet for {s} (keys not available)", .{@tagName(enc_level)});
@@ -440,8 +441,12 @@ pub const Connection = struct {
             .streams_blocked_uni => {},
 
             .new_connection_id => |ncid| {
-                _ = ncid;
-                // TODO: manage connection ID rotation
+                if (ncid.seq_num > self.peer_max_cid_seq) {
+                    self.peer_max_cid_seq = ncid.seq_num;
+                    self.packer.updateDcid(ncid.conn_id);
+                    std.log.info("updated DCID from NEW_CONNECTION_ID seq={d}", .{ncid.seq_num});
+                    // TODO: queue RETIRE_CONNECTION_ID for old sequence
+                }
             },
 
             .retire_connection_id => |rcid| {
@@ -751,7 +756,7 @@ pub const Connection = struct {
 
         const has_handshake = handshake_seal != null;
         const has_app = app_seal != null;
-        std.log.info("send: packing coalesced packet, has_initial=true has_handshake={} has_app={}", .{ has_handshake, has_app });
+        std.log.debug("send: packing coalesced packet, has_initial=true has_handshake={} has_app={}", .{ has_handshake, has_app });
 
         const bytes_written = try self.packer.packCoalesced(
             out_buf,

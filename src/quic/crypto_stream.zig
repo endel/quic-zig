@@ -53,13 +53,7 @@ pub const CryptoStream = struct {
     /// Read contiguous TLS handshake data from the receive buffer.
     /// Returns null if no complete data is available.
     pub fn read(self: *CryptoStream) ?[]const u8 {
-        const result = self.recv_sorter.pop();
-        if (result) |r| {
-            std.log.info("CryptoStream.read: returning {d} bytes", .{r.len});
-        } else {
-            std.log.info("CryptoStream.read: no contiguous data available", .{});
-        }
-        return result;
+        return self.recv_sorter.pop();
     }
 
     /// Queue TLS handshake data for sending.

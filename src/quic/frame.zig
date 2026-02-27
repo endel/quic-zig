@@ -146,7 +146,6 @@ pub const Frame = union(FrameType) {
         var reader = stream.reader();
 
         const frame_type = try packet.readVarInt(reader);
-        std.log.info("frame_type: {any}", .{frame_type});
 
         return switch (frame_type) {
             // padding
