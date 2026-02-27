@@ -240,12 +240,19 @@ pub const Connection = struct {
         _ = info;
 
         const epoch = try packet.Epoch.fromPacketType(header.packet_type);
+        std.log.info("recv: packet_type={s}, epoch={s}", .{ @tagName(header.packet_type), @tagName(epoch) });
+
         if (epoch == packet.Epoch.zero_rtt) {
             std.log.info("TODO: implement zero rtt", .{});
             return error.NotImplemented;
         }
 
-        const space = self.pkt_num_spaces[@intFromEnum(epochToEncLevel(epoch))];
+        const enc_level = epochToEncLevel(epoch);
+        const space_idx = @intFromEnum(enc_level);
+        const space = self.pkt_num_spaces[space_idx];
+        const has_keys = space.crypto_open != null and space.crypto_seal != null;
+        std.log.info("recv: using space {d} ({s}), has_keys={}", .{ space_idx, @tagName(enc_level), has_keys });
+
         const payload = packet.decrypt(header, fbs, space) catch |err| {
             std.log.err("can't decrypt packet. {any}", .{err});
             return error.InvalidPacket;
@@ -262,7 +269,6 @@ pub const Connection = struct {
         self.paths[0].bytes_received += @intCast(fbs.buffer.len);
 
         // Check for duplicate
-        const enc_level = epochToEncLevel(epoch);
         if (self.pkt_handler.recv[@intFromEnum(enc_level)].isDuplicate(header.packet_number)) {
             return; // Duplicate, ignore
         }
