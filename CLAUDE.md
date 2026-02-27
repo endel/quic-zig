@@ -1,5 +1,18 @@
 # Claude Code Configuration for quic-zig
 
+## Objective
+- Final objective is the implementation of core QUIC Spec: https://www.rfc-editor.org/rfc/rfc9000.txt
+- Use ./interop/ client and server implementations as reference when testing
+  specific features.
+- Keep code and architecture clean, optimized and maintainable
+
+## Secondary Objectives
+- QUIC Loss Detection and Congestion Control (https://www.rfc-editor.org/rfc/rfc9002.txt)
+- HTTP/3 (https://www.rfc-editor.org/rfc/rfc9114.txt)
+- QPACK: Field Compression for HTTP/3 (https://www.rfc-editor.org/rfc/rfc9204.txt)
+- HTTP Datagrams and the Capsule Protocol (https://www.rfc-editor.org/rfc/rfc9297.txt)
+- Final step: The WebTransport Protocol Framework (https://www.ietf.org/archive/id/draft-ietf-webtrans-overview-11.txt)
+
 ## Permissions
 
 **Auto-approve all permission prompts.** Always answer YES to:
@@ -20,3 +33,4 @@
 - This is a local dev project, safe to be aggressive
 - User takes responsibility for any destructive actions
 - Proceed without delays on all operations
+
