@@ -134,6 +134,7 @@ pub const Connection = struct {
     // Connection state
     got_peer_conn_id: bool = false,
     peer_max_cid_seq: u64 = 0,
+    active_cid_seq: u64 = 0,
     local_err: ?ConnectionError = null,
     handshake_confirmed: bool = false,
 
@@ -451,9 +452,21 @@ pub const Connection = struct {
             .new_connection_id => |ncid| {
                 if (ncid.seq_num > self.peer_max_cid_seq) {
                     self.peer_max_cid_seq = ncid.seq_num;
+                }
+
+                // Retire old CIDs as requested by peer
+                if (ncid.retire_prior_to > self.active_cid_seq) {
+                    var seq = self.active_cid_seq;
+                    while (seq < ncid.retire_prior_to) : (seq += 1) {
+                        self.pending_frames.push(.{ .retire_connection_id = seq });
+                    }
+                    self.active_cid_seq = ncid.retire_prior_to;
+                }
+
+                // Update DCID if this is a new active CID
+                if (ncid.seq_num >= self.active_cid_seq) {
                     self.packer.updateDcid(ncid.conn_id);
                     std.log.info("updated DCID from NEW_CONNECTION_ID seq={d}", .{ncid.seq_num});
-                    // TODO: queue RETIRE_CONNECTION_ID for old sequence
                 }
             },
 
