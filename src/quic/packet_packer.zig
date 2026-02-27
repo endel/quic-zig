@@ -140,6 +140,7 @@ pub const PacketPacker = struct {
         now: i64,
         pad_to_min: bool,
     ) !usize {
+        std.log.info("packSinglePacket: level={s} buf.len={d}", .{ @tagName(level), buf.len });
         if (buf.len < 64) return 0; // Not enough space
 
         // We build the packet in a temporary buffer, then encrypt into buf
@@ -252,8 +253,10 @@ pub const PacketPacker = struct {
         // Check if we have any payload
         var payload_len = fbs.pos - payload_start;
         if (payload_len == 0 and !pad_to_min) {
+            std.log.info("packSinglePacket: level={s} returning 0 - no payload", .{ @tagName(level) });
             return 0; // Nothing to send
         }
+        std.log.info("packSinglePacket: level={s} has payload_len={d}", .{ @tagName(level), payload_len });
 
         // RFC 9001 Section 5.4: ensure Initial packets have at least 5 bytes plaintext for header protection
         // (5 bytes plaintext + 16 bytes AEAD tag = 21 bytes encrypted minimum >= 20 required)

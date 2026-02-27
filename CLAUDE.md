@@ -10,7 +10,7 @@
 - All other safety/permission confirmations
 
 **Work autonomously.** Skip asking for confirmation on risky actions. Proceed with:
-- Git commits and pushes
+- git commits and pushes
 - Force operations
 - Destructive changes
 - Sandbox bypass

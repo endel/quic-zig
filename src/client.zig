@@ -85,30 +85,46 @@ pub fn main() !void {
             };
 
             var fbs = io.fixedBufferStream(bytes[0..packet_length]);
-            var header = packet.Header.parse(&fbs) catch |err| {
-                std.log.err("header parse error: {any}", .{err});
-                continue :read_loop;
-            };
 
-            std.log.info("recv {any} packet ({} bytes)", .{ header.packet_type, packet_length });
+            // Process all coalesced packets in the UDP datagram
+            while (fbs.pos < packet_length) {
+                const packet_start_pos = fbs.pos;
+                var header = packet.Header.parse(&fbs) catch |err| {
+                    std.log.err("header parse error: {any}", .{err});
+                    break;
+                };
 
-            // Save first response packet for debugging
-            if (header.packet_type == .initial) {
-                std.debug.print("\n=== RECEIVED INITIAL PACKET BYTES ===\n", .{});
-                for (bytes[0..@min(116, packet_length)], 0..) |byte, i| {
-                    if (i % 16 == 0) std.debug.print("\n{x:0>3}: ", .{i});
-                    std.debug.print("{x:0>2} ", .{byte});
+                const header_end_pos = fbs.pos;
+                const encrypted_payload_size = header.remainder_len;
+                const full_packet_size = header_end_pos - packet_start_pos + encrypted_payload_size;
+
+                std.log.info("recv {any} packet at offset {d}, header_size={d}, encrypted_size={d}, full_size={d}", .{ header.packet_type, packet_start_pos, header_end_pos - packet_start_pos, encrypted_payload_size, full_packet_size });
+
+                // Save first response packet for debugging
+                if (header.packet_type == .initial and fbs.pos == 0) {
+                    std.debug.print("\n=== RECEIVED INITIAL PACKET BYTES ===\n", .{});
+                    for (bytes[0..@min(116, packet_length)], 0..) |byte, i| {
+                        if (i % 16 == 0) std.debug.print("\n{x:0>3}: ", .{i});
+                        std.debug.print("{x:0>2} ", .{byte});
+                    }
+                    std.debug.print("\n\n", .{});
                 }
-                std.debug.print("\n\n", .{});
-            }
 
-            conn.recv(&header, &fbs, .{
-                .to = local_addr.any,
-                .from = remote_addr,
-            }) catch |err| {
-                std.log.err("recv error: {any}", .{err});
-                continue :read_loop;
-            };
+                conn.recv(&header, &fbs, .{
+                    .to = local_addr.any,
+                    .from = remote_addr,
+                }) catch |err| {
+                    std.log.err("recv error: {any}", .{err});
+                    break;
+                };
+
+                // Ensure fbs is positioned at the start of the next packet
+                const expected_next_pos = packet_start_pos + full_packet_size;
+                if (fbs.pos < expected_next_pos) {
+                    std.log.info("advancing fbs from {d} to {d}", .{ fbs.pos, expected_next_pos });
+                    fbs.pos = expected_next_pos;
+                }
+            }
 
             // Check if connection is established
             if (conn.state == .connected) {

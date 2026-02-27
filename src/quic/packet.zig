@@ -469,6 +469,22 @@ pub fn parseQuicHeader(fbs: anytype) !Header {
                 // // return error.InvalidPacket;
             },
 
+            PacketType.handshake, PacketType.zero_rtt, PacketType.one_rtt => {
+                // Short header packet (Handshake, 0-RTT, or 1-RTT)
+                // Short header format: 1 byte first_byte + dcid + packet_number (variable) + payload
+                // For now, just read the DCID and set remainder_len to rest of buffer
+
+                // DCID is present in all short header packets
+                const short_dcid_len = 8; // TODO: get actual DCID length from connection state
+                if (fbs.pos + short_dcid_len <= fbs.buffer.len) {
+                    header.dcid = fbs.buffer[fbs.pos..(fbs.pos + short_dcid_len)];
+                    try fbs.seekBy(short_dcid_len);
+                }
+
+                header.remainder_len = fbs.buffer.len - fbs.pos;
+                std.log.info("short_header: type={any}, remainder_len={d}", .{ header.packet_type, header.remainder_len });
+            },
+
             else => {
                 std.log.err("Packet type not recognized: {any}", .{header.packet_type});
                 header.remainder_len = try readVarInt(reader);

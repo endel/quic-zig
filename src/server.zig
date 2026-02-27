@@ -83,62 +83,77 @@ pub fn main() !void {
             };
 
             var fbs = io.fixedBufferStream(bytes[0..packet_length]);
-            var header = packet.Header.parse(&fbs) catch |err| {
-                std.log.err("header parse error: {any}", .{err});
-                continue :read_loop;
-            };
 
-            std.log.info("recv {any} packet ({} bytes)", .{ header.packet_type, packet_length });
+            // Process all coalesced packets in the UDP datagram
+            while (fbs.pos < packet_length) {
+                const packet_start_pos = fbs.pos;
+                var header = packet.Header.parse(&fbs) catch |err| {
+                    std.log.err("header parse error: {any}", .{err});
+                    break;
+                };
 
-            // Version negotiation
-            if (header.version != 0 and !protocol.isSupportedVersion(header.version)) {
-                var vn_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-                var vn_fbs = io.fixedBufferStream(&vn_buf);
-                const vn_writer = vn_fbs.writer();
-                try packet.negotiateVersion(header, &vn_writer);
-                const vn_bytes = vn_fbs.getWritten();
-                _ = try posix.sendto(sockfd, vn_bytes, 0, &remote_addr, addr_size);
-                std.log.info("sent version negotiation", .{});
-                continue :read_loop;
-            }
+                const header_end_pos = fbs.pos;
+                const encrypted_payload_size = header.remainder_len;
+                const full_packet_size = header_end_pos - packet_start_pos + encrypted_payload_size;
 
-            // Accept connection on first Initial (skip retry)
-            if (conn_state == null) {
-                if (header.packet_type != .initial) {
-                    std.log.warn("ignoring non-initial before connection established", .{});
-                    continue :read_loop;
+                std.log.info("recv {any} packet at offset {d}, full_size={d}", .{ header.packet_type, packet_start_pos, full_packet_size });
+
+                // Version negotiation
+                if (header.version != 0 and !protocol.isSupportedVersion(header.version)) {
+                    var vn_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                    var vn_fbs = io.fixedBufferStream(&vn_buf);
+                    const vn_writer = vn_fbs.writer();
+                    try packet.negotiateVersion(header, &vn_writer);
+                    const vn_bytes = vn_fbs.getWritten();
+                    _ = try posix.sendto(sockfd, vn_bytes, 0, &remote_addr, addr_size);
+                    std.log.info("sent version negotiation", .{});
+                    break;
                 }
-                conn_state = try connection.Connection.accept(
-                    alloc,
-                    header,
-                    local_addr.any,
-                    remote_addr,
-                    true,
-                    .{},
-                    tls_config,
-                );
-                std.log.info("accepted new connection", .{});
-            }
 
-            var conn = &conn_state.?;
-            const recv_info: connection.RecvInfo = .{
-                .to = local_addr.any,
-                .from = remote_addr,
-            };
+                // Accept connection on first Initial (skip retry)
+                if (conn_state == null) {
+                    if (header.packet_type != .initial) {
+                        std.log.warn("ignoring non-initial before connection established", .{});
+                        break;
+                    }
+                    conn_state = try connection.Connection.accept(
+                        alloc,
+                        header,
+                        local_addr.any,
+                        remote_addr,
+                        true,
+                        .{},
+                        tls_config,
+                    );
+                    std.log.info("accepted new connection", .{});
+                }
 
-            conn.recv(&header, &fbs, recv_info) catch |err| {
-                std.log.err("recv error: {any}", .{err});
-                continue :read_loop;
-            };
+                var conn = &conn_state.?;
+                const recv_info: connection.RecvInfo = .{
+                    .to = local_addr.any,
+                    .from = remote_addr,
+                };
 
-            // Send response packets after processing
-            const bytes_written = conn.send(&out) catch |err| {
-                std.log.err("send error: {any}", .{err});
-                continue :read_loop;
-            };
-            if (bytes_written > 0) {
-                _ = try posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size);
-                std.log.info("sent {d} bytes", .{bytes_written});
+                conn.recv(&header, &fbs, recv_info) catch |err| {
+                    std.log.err("recv error: {any}", .{err});
+                    break;
+                };
+
+                // Ensure fbs is positioned at the start of the next packet
+                const expected_next_pos = packet_start_pos + full_packet_size;
+                if (fbs.pos < expected_next_pos) {
+                    fbs.pos = expected_next_pos;
+                }
+
+                // Send response packets after processing each coalesced packet
+                const bytes_written = conn.send(&out) catch |err| {
+                    std.log.err("send error: {any}", .{err});
+                    break;
+                };
+                if (bytes_written > 0) {
+                    _ = try posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size);
+                    std.log.info("sent {d} bytes", .{bytes_written});
+                }
             }
         }
 

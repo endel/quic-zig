@@ -46,13 +46,20 @@ pub const CryptoStream = struct {
 
     /// Handle an incoming CRYPTO frame.
     pub fn handleCryptoFrame(self: *CryptoStream, offset: u64, data: []const u8) !void {
+        std.log.info("CryptoStream.handleCryptoFrame: offset={d} len={d}", .{ offset, data.len });
         try self.recv_sorter.push(offset, data, false);
     }
 
     /// Read contiguous TLS handshake data from the receive buffer.
     /// Returns null if no complete data is available.
     pub fn read(self: *CryptoStream) ?[]const u8 {
-        return self.recv_sorter.pop();
+        const result = self.recv_sorter.pop();
+        if (result) |r| {
+            std.log.info("CryptoStream.read: returning {d} bytes", .{r.len});
+        } else {
+            std.log.info("CryptoStream.read: no contiguous data available", .{});
+        }
+        return result;
     }
 
     /// Queue TLS handshake data for sending.
@@ -112,11 +119,13 @@ pub const CryptoStreamManager = struct {
     }
 
     /// Get the crypto stream for the given encryption level index.
+    /// EncryptionLevel enum: initial=0, early_data=1, handshake=2, application=3
     pub fn getStream(self: *CryptoStreamManager, level: u8) *CryptoStream {
         return switch (level) {
-            0 => &self.initial,
-            1, 2 => &self.handshake,
-            3 => &self.one_rtt,
+            0 => &self.initial,       // initial
+            1 => &self.initial,       // early_data (not used, reuse initial)
+            2 => &self.handshake,     // handshake
+            3 => &self.one_rtt,       // application (1-RTT)
             else => unreachable,
         };
     }

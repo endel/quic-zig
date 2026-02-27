@@ -289,6 +289,8 @@ pub const Connection = struct {
                 break;
             };
 
+            std.log.info("recv: parsed frame type={s}", .{@tagName(frame)});
+
             if (frame.isAckEliciting()) {
                 ack_eliciting = true;
             }
@@ -367,6 +369,7 @@ pub const Connection = struct {
 
             .crypto => |crypto_frame| {
                 const level: u8 = @intFromEnum(epoch);
+                std.log.info("processFrame: CRYPTO frame level={} offset={d} data_len={d}", .{ level, crypto_frame.offset, crypto_frame.data.len });
                 try self.crypto_streams.handleCryptoFrame(level, crypto_frame.offset, crypto_frame.data);
                 // Handshake advancement happens after all frames are processed
             },
@@ -591,12 +594,20 @@ pub const Connection = struct {
     fn advanceHandshake(self: *Connection) !void {
         var hs = &(self.tls13_hs orelse return);
 
+        std.log.info("advanceHandshake: state={}, iterations starting", .{@intFromEnum(hs.state)});
+
         // Feed crypto stream data to the handshake
         inline for ([_]u8{ 0, 2, 3 }) |level| {
             const cs = self.crypto_streams.getStream(level);
+            var crypto_data_count: usize = 0;
             while (cs.read()) |data| {
                 defer self.allocator.free(data);
+                crypto_data_count += 1;
+                std.log.info("advanceHandshake: feeding crypto level={} data len={}", .{ level, data.len });
                 hs.provideData(data);
+            }
+            if (crypto_data_count > 0) {
+                std.log.info("advanceHandshake: fed {d} crypto frames from level {}", .{ crypto_data_count, level });
             }
         }
 
@@ -608,12 +619,14 @@ pub const Connection = struct {
                 std.log.err("TLS 1.3 handshake error: {}", .{err});
                 return;
             };
+            std.log.info("advanceHandshake: step {d} produced action={s}", .{ iterations, @tagName(action) });
 
             switch (action) {
                 .send_data => |sd| {
                     // Write the TLS handshake data to the appropriate crypto stream
                     const cs_level: u8 = @intFromEnum(sd.level);
                     const cs = self.crypto_streams.getStream(cs_level);
+                    std.log.info("advanceHandshake: writing {d} bytes to level {}", .{ sd.data.len, cs_level });
                     try cs.writeData(sd.data);
                 },
                 .install_keys => |ik| {
@@ -648,6 +661,7 @@ pub const Connection = struct {
         // Packet number space index 1 = Handshake
         self.pkt_num_spaces[1].crypto_open = open;
         self.pkt_num_spaces[1].crypto_seal = seal;
+        std.log.info("installHandshakeKeys: keys installed for space 1", .{});
     }
 
     /// Install 1-RTT (Application) encryption keys.
@@ -656,6 +670,7 @@ pub const Connection = struct {
         // Packet number space index 2 = Application (1-RTT)
         self.pkt_num_spaces[2].crypto_open = open;
         self.pkt_num_spaces[2].crypto_seal = seal;
+        std.log.info("installAppKeys: keys installed for space 2", .{});
     }
 
     /// Build and send outgoing packets.
@@ -677,6 +692,10 @@ pub const Connection = struct {
         const initial_seal = self.pkt_num_spaces[0].crypto_seal;
         const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
         const app_seal = self.pkt_num_spaces[2].crypto_seal;
+
+        const has_handshake = handshake_seal != null;
+        const has_app = app_seal != null;
+        std.log.info("send: packing coalesced packet, has_initial=true has_handshake={} has_app={}", .{ has_handshake, has_app });
 
         const bytes_written = try self.packer.packCoalesced(
             out_buf,
