@@ -7,7 +7,8 @@ const connection = @import("quic/connection.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
-const stream_mod = @import("quic/stream.zig");
+const h3 = @import("h3/connection.zig");
+const qpack = @import("h3/qpack.zig");
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
 
@@ -23,10 +24,9 @@ pub fn main() !void {
     // Create a local socket with any available port
     const local_addr = try net.Address.parseIp4("127.0.0.1", 0);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
-    std.log.info("QUIC client connecting to 127.0.0.1:4434", .{});
+    std.log.info("QUIC H3 client connecting to 127.0.0.1:4434", .{});
 
     // Create TLS config for the client
-    // (Clients don't need certificates - empty arrays are fine)
     const alpn = try alloc.alloc([]const u8, 1);
     alpn[0] = "h3";
 
@@ -86,8 +86,6 @@ pub fn main() !void {
 
             // Process all coalesced packets in the UDP datagram
             while (fbs.pos < packet_length) {
-                // All valid QUIC packets have the fixed bit (0x40) set in the first byte.
-                // If not set, remaining bytes are datagram padding — stop parsing.
                 if (bytes[fbs.pos] & 0x40 == 0) break;
 
                 const packet_start_pos = fbs.pos;
@@ -108,14 +106,12 @@ pub fn main() !void {
                     break;
                 };
 
-                // Ensure fbs is positioned at the start of the next packet
                 const expected_next_pos = packet_start_pos + full_packet_size;
                 if (fbs.pos < expected_next_pos) {
                     fbs.pos = expected_next_pos;
                 }
             }
 
-            // Check if connection is established
             if (conn.state == .connected) {
                 handshake_complete = true;
             }
@@ -129,7 +125,7 @@ pub fn main() !void {
 
     std.log.info("handshake complete, connection active", .{});
 
-    // First, send any pending handshake packets (Finished, ACKs)
+    // Send any pending handshake packets (Finished, ACKs)
     const hs_bytes = conn.send(&out) catch |err| {
         std.log.err("send error (handshake): {any}", .{err});
         return;
@@ -148,62 +144,119 @@ pub fn main() !void {
     // Small delay for the server to process the Finished
     std.Thread.sleep(50 * std.time.ns_per_ms);
 
-    // Now open a stream and send test data
-    const test_data = "Hello from Zig QUIC client!";
-    var stream = try conn.openStream();
-    try stream.send.writeData(test_data);
-    stream.send.close();
-    std.log.info("sent test data: {s}", .{test_data});
+    // Initialize HTTP/3 connection
+    var h3_conn = h3.H3Connection.init(alloc, &conn, false);
+    defer h3_conn.deinit();
+    try h3_conn.initConnection();
+    std.log.info("HTTP/3 connection initialized", .{});
 
-    // Send the packet with the stream data
-    const bytes_written = conn.send(&out) catch |err| {
+    // Send HTTP/3 GET request
+    const req_headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "user-agent", .value = "quic-zig/1.0" },
+    };
+    const req_stream_id = try h3_conn.sendRequest(&req_headers, null);
+    std.log.info("H3: sent GET / request on stream {d}", .{req_stream_id});
+
+    // Send the H3 control streams + request data
+    const data_bytes = conn.send(&out) catch |err| {
         std.log.err("send error: {any}", .{err});
         return;
     };
-    if (bytes_written > 0) {
-        _ = try posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size);
-        std.log.info("sent {d} bytes with stream data", .{bytes_written});
+    if (data_bytes > 0) {
+        _ = try posix.sendto(sockfd, out[0..data_bytes], 0, &remote_addr, addr_size);
+        std.log.info("sent {d} bytes with H3 data", .{data_bytes});
+    }
+
+    // Keep sending until all stream data is flushed
+    var flush_count: usize = 0;
+    while (flush_count < 10) : (flush_count += 1) {
+        const more = conn.send(&out) catch break;
+        if (more == 0) break;
+        _ = posix.sendto(sockfd, out[0..more], 0, &remote_addr, addr_size) catch break;
+        std.log.info("sent {d} more bytes (flush #{d})", .{ more, flush_count + 1 });
     }
 
     // Read response
-    var response_data: ?[]const u8 = null;
+    var got_response = false;
+    var response_iteration: usize = 0;
+    const max_response_iterations: usize = 500;
 
-    read_response: while (response_data == null and iteration < max_iterations) : (iteration += 1) {
+    while (!got_response and response_iteration < max_response_iterations) : (response_iteration += 1) {
         std.Thread.sleep(10 * std.time.ns_per_ms);
 
-        read_loop: while (true) {
+        // Read QUIC packets
+        while (true) {
             var bytes: [8192]u8 = undefined;
             addr_size = @sizeOf(posix.sockaddr);
 
-            const packet_length = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch {
-                break :read_loop;
-            };
+            const packet_length = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch break;
 
             var fbs = io.fixedBufferStream(bytes[0..packet_length]);
-            var header = packet.Header.parse(&fbs, conn.scid_len) catch {
-                continue :read_loop;
-            };
 
-            conn.recv(&header, &fbs, .{
-                .to = local_addr.any,
-                .from = remote_addr,
-            }) catch {
-                continue :read_loop;
-            };
+            while (fbs.pos < packet_length) {
+                if (bytes[fbs.pos] & 0x40 == 0) break;
+
+                const packet_start_pos = fbs.pos;
+                var header = packet.Header.parse(&fbs, conn.scid_len) catch break;
+
+                const header_end_pos = fbs.pos;
+                const full_packet_size = header_end_pos - packet_start_pos + header.remainder_len;
+
+                conn.recv(&header, &fbs, .{
+                    .to = local_addr.any,
+                    .from = remote_addr,
+                }) catch break;
+
+                const expected_next_pos = packet_start_pos + full_packet_size;
+                if (fbs.pos < expected_next_pos) {
+                    fbs.pos = expected_next_pos;
+                }
+            }
         }
 
-        // Try to read from stream
-        response_data = stream.recv.read();
-        if (response_data != null) {
-            break :read_response;
+        // Send ACKs
+        const ack_bytes = conn.send(&out) catch continue;
+        if (ack_bytes > 0) {
+            _ = posix.sendto(sockfd, out[0..ack_bytes], 0, &remote_addr, addr_size) catch {};
+        }
+
+        // Poll for H3 events
+        while (true) {
+            const event = h3_conn.poll() catch break;
+            if (event == null) break;
+
+            switch (event.?) {
+                .settings => |settings| {
+                    std.log.info("H3: received peer SETTINGS (qpack_max_table_capacity={d})", .{settings.qpack_max_table_capacity});
+                },
+                .headers => |hdr| {
+                    std.log.info("H3: received response headers on stream {d}", .{hdr.stream_id});
+                    for (hdr.headers) |h_item| {
+                        std.log.info("  {s}: {s}", .{ h_item.name, h_item.value });
+                    }
+                },
+                .data => |d| {
+                    std.log.info("H3: received response body ({d} bytes)", .{d.data.len});
+                    std.debug.print("Response: {s}\n", .{d.data});
+                    got_response = true;
+                },
+                .finished => |stream_id| {
+                    std.log.info("H3: stream {d} finished", .{stream_id});
+                    got_response = true;
+                },
+                .goaway => |id| {
+                    std.log.info("H3: received GOAWAY (id={d})", .{id});
+                },
+            }
         }
     }
 
-    if (response_data) |data| {
-        std.log.info("received response: {s}", .{data});
-        std.debug.print("Response: {s}\n", .{data});
-    } else {
-        std.log.warn("no response received", .{});
+    if (!got_response) {
+        std.log.warn("no H3 response received", .{});
     }
 
     // Close connection

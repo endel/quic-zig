@@ -6,6 +6,8 @@ const connection = @import("quic/connection.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
+const h3 = @import("h3/connection.zig");
+const qpack = @import("h3/qpack.zig");
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
 
@@ -44,7 +46,7 @@ pub fn main() !void {
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
-    std.log.info("QUIC server listening on 127.0.0.1:4434 (sockfd={d})", .{sockfd});
+    std.log.info("QUIC H3 server listening on 127.0.0.1:4434 (sockfd={d})", .{sockfd});
 
     // Try recvfrom immediately to verify socket is open
     var test_addr: posix.sockaddr = undefined;
@@ -55,6 +57,8 @@ pub fn main() !void {
     };
 
     var conn_state: ?connection.Connection = null;
+    var h3_conn: ?h3.H3Connection = null;
+    var h3_initialized = false;
     var remote_addr: posix.sockaddr = undefined;
     var addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
@@ -155,7 +159,6 @@ pub fn main() !void {
                     break;
                 };
                 if (bytes_written > 0) {
-                    // Use active path's peer address (may differ from remote_addr after migration)
                     const send_addr = &conn.paths[conn.active_path_idx].peer_addr;
                     _ = try posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr));
                     std.log.info("sent {d} bytes", .{bytes_written});
@@ -163,23 +166,67 @@ pub fn main() !void {
             }
         }
 
-        // Check streams for incoming data and echo it back
+        // HTTP/3 processing
         if (conn_state != null) {
             var conn = &conn_state.?;
 
-            if (conn.isEstablished()) {
-                var stream_it = conn.streams.streams.valueIterator();
-                while (stream_it.next()) |s_ptr| {
-                    const s = s_ptr.*;
-                    if (s.recv.read()) |data| {
-                        std.log.info("received stream data ({d} bytes): {s}", .{ data.len, data });
-                        const echo_msg = std.fmt.allocPrint(alloc, "Echo: {s}", .{data}) catch continue;
-                        s.send.writeData(echo_msg) catch |err| {
-                            std.log.err("stream write error: {any}", .{err});
-                            continue;
-                        };
-                        s.send.close();
-                        std.log.info("echoed {d} bytes back on stream {d}", .{ echo_msg.len, s.stream_id });
+            if (conn.isEstablished() and !h3_initialized) {
+                h3_conn = h3.H3Connection.init(alloc, conn, true);
+                h3_conn.?.initConnection() catch |err| {
+                    std.log.err("H3 init error: {any}", .{err});
+                    continue;
+                };
+                h3_initialized = true;
+                std.log.info("HTTP/3 connection initialized", .{});
+            }
+
+            if (h3_conn != null) {
+                var h3c = &h3_conn.?;
+
+                // Poll for H3 events
+                while (true) {
+                    const event = h3c.poll() catch |err| {
+                        std.log.err("H3 poll error: {any}", .{err});
+                        break;
+                    };
+
+                    if (event == null) break;
+
+                    switch (event.?) {
+                        .settings => |settings| {
+                            std.log.info("H3: received peer SETTINGS (qpack_max_table_capacity={d})", .{settings.qpack_max_table_capacity});
+                        },
+                        .headers => |hdr| {
+                            std.log.info("H3: received request headers on stream {d}", .{hdr.stream_id});
+                            var method: []const u8 = "?";
+                            var path: []const u8 = "?";
+                            for (hdr.headers) |h_item| {
+                                std.log.info("  {s}: {s}", .{ h_item.name, h_item.value });
+                                if (std.mem.eql(u8, h_item.name, ":method")) method = h_item.value;
+                                if (std.mem.eql(u8, h_item.name, ":path")) path = h_item.value;
+                            }
+
+                            // Send HTTP response
+                            const body = std.fmt.allocPrint(alloc, "Hello from Zig HTTP/3 server! You requested {s} {s}\n", .{ method, path }) catch continue;
+                            const resp_headers = [_]qpack.Header{
+                                .{ .name = ":status", .value = "200" },
+                                .{ .name = "content-type", .value = "text/plain" },
+                            };
+                            h3c.sendResponse(hdr.stream_id, &resp_headers, body) catch |err| {
+                                std.log.err("H3 sendResponse error: {any}", .{err});
+                                continue;
+                            };
+                            std.log.info("H3: sent 200 response on stream {d} ({d} bytes body)", .{ hdr.stream_id, body.len });
+                        },
+                        .data => |d| {
+                            std.log.info("H3: received {d} bytes of data on stream {d}", .{ d.data.len, d.stream_id });
+                        },
+                        .finished => |stream_id| {
+                            std.log.info("H3: stream {d} finished", .{stream_id});
+                        },
+                        .goaway => |id| {
+                            std.log.info("H3: received GOAWAY (id={d})", .{id});
+                        },
                     }
                 }
             }
@@ -190,7 +237,6 @@ pub fn main() !void {
                 continue;
             };
             if (bytes_written > 0) {
-                // Use active path's peer address (may differ from remote_addr after migration)
                 const send_addr = &conn.paths[conn.active_path_idx].peer_addr;
                 _ = try posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr));
                 std.log.info("periodic sent {d} bytes", .{bytes_written});
@@ -217,4 +263,5 @@ test {
     _ = @import("quic/mtu.zig");
     _ = @import("h3/frame.zig");
     _ = @import("h3/qpack.zig");
+    _ = @import("h3/connection.zig");
 }

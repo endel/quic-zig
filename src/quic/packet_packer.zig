@@ -290,6 +290,7 @@ pub const PacketPacker = struct {
 
         // 5. Stream frames (only in 1-RTT)
         if (level == .application) {
+            // Bidirectional streams
             var stream_it = streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| {
                 const s = s_ptr.*;
@@ -298,6 +299,22 @@ pub const PacketPacker = struct {
                 if (s.send.popStreamFrame(max_stream_data)) |stream_frame| {
                     const sf = stream_frame.stream;
                     std.log.info("packing STREAM frame: id={d}, offset={d}, len={d}, fin={}, data_len={d}", .{
+                        sf.stream_id, sf.offset, sf.length, sf.fin, sf.data.len,
+                    });
+                    try stream_frame.write(writer);
+                    ack_eliciting = true;
+                }
+            }
+
+            // Unidirectional send streams
+            var uni_it = streams.send_streams.valueIterator();
+            while (uni_it.next()) |s_ptr| {
+                const s = s_ptr.*;
+                if (fbs.pos + AEAD_TAG_LEN + 16 >= effective_max) break;
+                const max_stream_data = effective_max - fbs.pos - AEAD_TAG_LEN - 8;
+                if (s.popStreamFrame(max_stream_data)) |stream_frame| {
+                    const sf = stream_frame.stream;
+                    std.log.info("packing UNI STREAM frame: id={d}, offset={d}, len={d}, fin={}, data_len={d}", .{
                         sf.stream_id, sf.offset, sf.length, sf.fin, sf.data.len,
                     });
                     try stream_frame.write(writer);

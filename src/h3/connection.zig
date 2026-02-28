@@ -76,12 +76,16 @@ pub const H3Connection = struct {
     // Key: stream_id, Value: accumulated bytes
     stream_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
 
+    // Streams that have been reported as finished (avoid duplicate events)
+    finished_streams: std.AutoHashMap(u64, void),
+
     pub fn init(allocator: Allocator, quic_conn: *quic_connection.Connection, is_server: bool) H3Connection {
         return .{
             .allocator = allocator,
             .quic_conn = quic_conn,
             .is_server = is_server,
             .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
+            .finished_streams = std.AutoHashMap(u64, void).init(allocator),
         };
     }
 
@@ -91,6 +95,7 @@ pub const H3Connection = struct {
             buf.deinit(self.allocator);
         }
         self.stream_bufs.deinit();
+        self.finished_streams.deinit();
     }
 
     /// Initialize the HTTP/3 connection: open control + QPACK streams, send SETTINGS.
@@ -254,7 +259,7 @@ pub const H3Connection = struct {
         if (self.quic_conn.streams.recv_streams.get(ctrl_id)) |recv_stream| {
             if (recv_stream.read()) |data| {
                 var buf = self.stream_bufs.getPtr(ctrl_id) orelse blk: {
-                    var new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                    const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
                     try self.stream_bufs.put(ctrl_id, new_buf);
                     break :blk self.stream_bufs.getPtr(ctrl_id).?;
                 };
@@ -301,10 +306,14 @@ pub const H3Connection = struct {
             const stream_id = entry.key_ptr.*;
             const stream = entry.value_ptr.*;
 
+            // Skip already-finished streams
+            if (self.finished_streams.contains(stream_id)) continue;
+
             // Read incoming data
             const data = stream.recv.read() orelse {
                 // Check if stream is finished
                 if (stream.recv.finished) {
+                    try self.finished_streams.put(stream_id, {});
                     return .{ .finished = stream_id };
                 }
                 continue;
@@ -312,7 +321,7 @@ pub const H3Connection = struct {
 
             // Buffer the data
             var buf = self.stream_bufs.getPtr(stream_id) orelse blk: {
-                var new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
                 try self.stream_bufs.put(stream_id, new_buf);
                 break :blk self.stream_bufs.getPtr(stream_id).?;
             };
@@ -361,5 +370,6 @@ test "H3Connection: init and deinit" {
     // Just verify struct construction doesn't crash
     var conn: H3Connection = undefined;
     conn.stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(testing.allocator);
+    conn.finished_streams = std.AutoHashMap(u64, void).init(testing.allocator);
     conn.deinit();
 }

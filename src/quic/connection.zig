@@ -620,14 +620,21 @@ pub const Connection = struct {
             .new_token => {},
 
             .stream => |s| {
-                // Get or create the stream
-                const strm = self.streams.getOrCreateStream(s.stream_id) catch |err| {
-                    std.log.err("Failed to get/create stream {}: {}", .{ s.stream_id, err });
-                    return;
-                };
-
-                // Deliver data to the receive stream
-                try strm.recv.handleStreamFrame(s.offset, s.data, s.fin);
+                if (stream_mod.isBidi(s.stream_id)) {
+                    // Bidirectional stream
+                    const strm = self.streams.getOrCreateStream(s.stream_id) catch |err| {
+                        std.log.err("Failed to get/create stream {}: {}", .{ s.stream_id, err });
+                        return;
+                    };
+                    try strm.recv.handleStreamFrame(s.offset, s.data, s.fin);
+                } else {
+                    // Unidirectional stream — route to recv_streams
+                    const recv_strm = self.streams.getOrCreateRecvStream(s.stream_id) catch |err| {
+                        std.log.err("Failed to get/create recv stream {}: {}", .{ s.stream_id, err });
+                        return;
+                    };
+                    try recv_strm.handleStreamFrame(s.offset, s.data, s.fin);
+                }
 
                 // Update flow control
                 try self.conn_flow_ctrl.base.addBytesReceived(s.offset + s.data.len);
