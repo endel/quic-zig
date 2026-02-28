@@ -227,6 +227,9 @@ pub fn main() !void {
                         .goaway => |id| {
                             std.log.info("H3: received GOAWAY (id={d})", .{id});
                         },
+                        .connect_request => |req| {
+                            std.log.info("H3: received CONNECT request on stream {d} (protocol={s})", .{ req.stream_id, req.protocol });
+                        },
                     }
                 }
             }
@@ -265,4 +268,5 @@ test {
     _ = @import("h3/qpack.zig");
     _ = @import("h3/huffman.zig");
     _ = @import("h3/connection.zig");
+    _ = @import("webtransport/session.zig");
 }

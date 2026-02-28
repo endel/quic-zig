@@ -251,6 +251,7 @@ pub fn main() !void {
                 .goaway => |id| {
                     std.log.info("H3: received GOAWAY (id={d})", .{id});
                 },
+                .connect_request => {},
             }
         }
     }

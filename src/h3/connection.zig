@@ -39,6 +39,13 @@ pub const H3Event = union(enum) {
     data: struct { stream_id: u64, data: []const u8 },
     finished: u64,
     goaway: u64,
+    connect_request: struct {
+        stream_id: u64,
+        protocol: []const u8,
+        authority: []const u8,
+        path: []const u8,
+        headers: []const qpack.Header,
+    },
 };
 
 /// Maximum number of headers we'll decode from a single HEADERS frame.
@@ -160,6 +167,53 @@ pub const H3Connection = struct {
 
         stream.send.close();
         return stream_id;
+    }
+
+    /// Send an Extended CONNECT request (RFC 9220).
+    /// Opens a bidi stream, sends HEADERS with :method=CONNECT, :protocol, etc.
+    /// Does NOT close the stream — session lifetime = stream lifetime.
+    pub fn sendConnectRequest(self: *H3Connection, protocol_name: []const u8, authority: []const u8, path: []const u8) !u64 {
+        const stream = try self.quic_conn.openStream();
+        const stream_id = stream.stream_id;
+
+        const req_headers = [_]qpack.Header{
+            .{ .name = ":method", .value = "CONNECT" },
+            .{ .name = ":protocol", .value = protocol_name },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = authority },
+            .{ .name = ":path", .value = path },
+        };
+
+        var qpack_buf: [4096]u8 = undefined;
+        const qpack_len = try qpack.encodeHeaders(&req_headers, &qpack_buf);
+
+        var frame_buf: [4096 + 16]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer());
+        try stream.send.writeData(fbs.getWritten());
+
+        // Do NOT close the stream — session stays open
+        return stream_id;
+    }
+
+    /// Send a CONNECT response (server-side, RFC 9220).
+    /// Sends :status response HEADERS, does NOT close the stream.
+    pub fn sendConnectResponse(self: *H3Connection, stream_id: u64, status: []const u8) !void {
+        const stream = self.quic_conn.streams.getStream(stream_id) orelse return error.StreamNotFound;
+
+        const resp_headers = [_]qpack.Header{
+            .{ .name = ":status", .value = status },
+        };
+
+        var qpack_buf: [4096]u8 = undefined;
+        const qpack_len = try qpack.encodeHeaders(&resp_headers, &qpack_buf);
+
+        var frame_buf: [4096 + 16]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer());
+        try stream.send.writeData(fbs.getWritten());
+
+        // Do NOT close the stream — session stays open
     }
 
     /// Send an HTTP response (server-side).
@@ -347,9 +401,33 @@ pub const H3Connection = struct {
                             std.log.err("QPACK decode error on stream {d}: {}", .{ stream_id, err });
                             continue;
                         };
+                        const hdrs = self.headers_buf[0..count];
+
+                        // Check for Extended CONNECT (:method=CONNECT + :protocol)
+                        var method: ?[]const u8 = null;
+                        var proto: ?[]const u8 = null;
+                        var authority: []const u8 = "";
+                        var path: []const u8 = "";
+                        for (hdrs) |h_item| {
+                            if (std.mem.eql(u8, h_item.name, ":method")) method = h_item.value;
+                            if (std.mem.eql(u8, h_item.name, ":protocol")) proto = h_item.value;
+                            if (std.mem.eql(u8, h_item.name, ":authority")) authority = h_item.value;
+                            if (std.mem.eql(u8, h_item.name, ":path")) path = h_item.value;
+                        }
+
+                        if (method != null and std.mem.eql(u8, method.?, "CONNECT") and proto != null) {
+                            return .{ .connect_request = .{
+                                .stream_id = stream_id,
+                                .protocol = proto.?,
+                                .authority = authority,
+                                .path = path,
+                                .headers = hdrs,
+                            } };
+                        }
+
                         return .{ .headers = .{
                             .stream_id = stream_id,
-                            .headers = self.headers_buf[0..count],
+                            .headers = hdrs,
                         } };
                     },
                     .data => |payload| {
