@@ -32,6 +32,8 @@ pub const FrameType = enum(u64) {
     connection_close = 0x1c,
     application_close = 0x1d,
     handshake_done = 0x1e,
+    datagram = 0x30,
+    datagram_with_length = 0x31,
     _,
 };
 
@@ -140,6 +142,14 @@ pub const Frame = union(FrameType) {
     },
 
     handshake_done: void,
+
+    datagram: struct {
+        data: []u8,
+    },
+
+    datagram_with_length: struct {
+        data: []u8,
+    },
 
     /// Parse a single frame from a byte buffer. Returns the frame and advances
     /// the stream position.
@@ -407,7 +417,20 @@ pub const Frame = union(FrameType) {
             // handshake done
             0x1e => .{ .handshake_done = {} },
 
-            else => unreachable,
+            // datagram without length (0x30) — data is rest of packet
+            0x30 => .{ .datagram = .{
+                .data = bytes[stream.pos..],
+            } },
+
+            // datagram with length (0x31) — varint length prefix
+            0x31 => blk: {
+                const length = try packet.readVarInt(reader);
+                break :blk .{ .datagram_with_length = .{
+                    .data = bytes[stream.pos..@min(stream.pos + length, bytes.len)],
+                } };
+            },
+
+            else => return error.FrameEncodingError,
         };
     }
 
@@ -587,12 +610,24 @@ pub const Frame = union(FrameType) {
             .handshake_done => {
                 try packet.writeVarInt(writer, 0x1e);
             },
+
+            .datagram => |d| {
+                try packet.writeVarInt(writer, 0x30);
+                try writer.writeAll(d.data);
+            },
+
+            .datagram_with_length => |d| {
+                try packet.writeVarInt(writer, 0x31);
+                try packet.writeVarInt(writer, d.data.len);
+                try writer.writeAll(d.data);
+            },
         }
     }
 
     pub fn isAckEliciting(self: Frame) bool {
         return switch (self) {
             .padding, .ack, .ack_ecn, .connection_close, .application_close => false,
+            .datagram, .datagram_with_length => true,
             else => true,
         };
     }

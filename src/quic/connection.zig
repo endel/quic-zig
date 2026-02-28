@@ -191,6 +191,42 @@ pub const ConnectionIdPool = struct {
     }
 };
 
+/// Fixed-capacity queue for QUIC DATAGRAM frames (RFC 9221).
+/// Stores up to 16 datagrams, each up to MAX_DATAGRAM_SIZE bytes.
+pub const DatagramQueue = struct {
+    pub const MAX_ITEMS: usize = 16;
+    pub const MAX_DATAGRAM_SIZE: usize = 1200;
+
+    bufs: [MAX_ITEMS][MAX_DATAGRAM_SIZE]u8 = undefined,
+    lens: [MAX_ITEMS]usize = .{0} ** MAX_ITEMS,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+
+    pub fn push(self: *DatagramQueue, data: []const u8) bool {
+        if (self.count >= MAX_ITEMS or data.len > MAX_DATAGRAM_SIZE) return false;
+        @memcpy(self.bufs[self.tail][0..data.len], data);
+        self.lens[self.tail] = data.len;
+        self.tail = (self.tail + 1) % MAX_ITEMS;
+        self.count += 1;
+        return true;
+    }
+
+    pub fn pop(self: *DatagramQueue, out: []u8) ?usize {
+        if (self.count == 0) return null;
+        const len = self.lens[self.head];
+        if (out.len < len) return null;
+        @memcpy(out[0..len], self.bufs[self.head][0..len]);
+        self.head = (self.head + 1) % MAX_ITEMS;
+        self.count -= 1;
+        return len;
+    }
+
+    pub fn isEmpty(self: *const DatagramQueue) bool {
+        return self.count == 0;
+    }
+};
+
 pub const ConnectionError = struct {
     is_app: bool,
     code: u64,
@@ -269,6 +305,11 @@ pub const Connection = struct {
 
     // Path MTU Discovery (DPLPMTUD, RFC 8899)
     mtu_discoverer: mtu_mod.MtuDiscoverer = .{},
+
+    // QUIC DATAGRAM support (RFC 9221)
+    datagram_recv_queue: DatagramQueue = .{},
+    datagram_send_queue: DatagramQueue = .{},
+    datagrams_enabled: bool = false,
 
     // Connection state
     got_peer_conn_id: bool = false,
@@ -740,6 +781,18 @@ pub const Connection = struct {
                 self.pkt_handler.dropSpace(.initial);
                 self.pkt_handler.dropSpace(.handshake);
             },
+
+            .datagram => |d| {
+                if (self.datagrams_enabled) {
+                    _ = self.datagram_recv_queue.push(d.data);
+                }
+            },
+
+            .datagram_with_length => |d| {
+                if (self.datagrams_enabled) {
+                    _ = self.datagram_recv_queue.push(d.data);
+                }
+            },
         }
     }
 
@@ -868,6 +921,12 @@ pub const Connection = struct {
                 return fbs.pos + @as(usize, @intCast(len));
             },
             0x1e => return fbs.pos, // handshake_done
+            0x30 => return buf.len, // datagram without length - rest of packet
+            0x31 => {
+                // datagram with length
+                const len = packet.readVarInt(reader) catch return fbs.pos;
+                return fbs.pos + @as(usize, @intCast(len));
+            },
             else => return buf.len, // unknown - consume rest
         }
     }
@@ -973,6 +1032,16 @@ pub const Connection = struct {
                             peer_tp.initial_max_streams_uni,
                         );
                         self.conn_flow_ctrl.base.send_window = peer_tp.initial_max_data;
+
+                        // Enable DATAGRAM support if both sides advertise max_datagram_frame_size
+                        if (peer_tp.max_datagram_frame_size != null and self.local_params.max_datagram_frame_size != null) {
+                            self.datagrams_enabled = true;
+                            std.log.info("DATAGRAM support enabled (peer max_dgram={d}, local max_dgram={d})", .{
+                                peer_tp.max_datagram_frame_size.?,
+                                self.local_params.max_datagram_frame_size.?,
+                            });
+                        }
+
                         std.log.info("applied peer transport params: max_bidi={d}, max_uni={d}, max_data={d}", .{
                             peer_tp.initial_max_streams_bidi,
                             peer_tp.initial_max_streams_uni,
@@ -1039,6 +1108,7 @@ pub const Connection = struct {
                     null,
                     app_seal,
                     now,
+                    null,
                 );
                 self.state = .draining;
                 return bytes_written;
@@ -1097,6 +1167,11 @@ pub const Connection = struct {
         const has_app = app_seal != null;
         std.log.debug("send: packing coalesced packet, has_initial={} has_handshake={} has_app={}", .{ has_initial, has_handshake, has_app });
 
+        const dq: ?*DatagramQueue = if (self.datagrams_enabled and !self.datagram_send_queue.isEmpty())
+            &self.datagram_send_queue
+        else
+            null;
+
         const bytes_written = try self.packer.packCoalesced(
             out_buf,
             &self.pkt_handler,
@@ -1107,6 +1182,7 @@ pub const Connection = struct {
             handshake_seal,
             app_seal,
             now,
+            dq,
         );
 
         if (bytes_written > 0) {
@@ -1257,6 +1333,19 @@ pub const Connection = struct {
     /// Open a new unidirectional stream.
     pub fn openUniStream(self: *Connection) !*stream_mod.SendStream {
         return self.streams.openUniStream();
+    }
+
+    /// Send a QUIC DATAGRAM frame (RFC 9221).
+    /// Returns error if datagrams are not enabled or the queue is full.
+    pub fn sendDatagram(self: *Connection, data: []const u8) !void {
+        if (!self.datagrams_enabled) return error.DatagramsNotEnabled;
+        if (!self.datagram_send_queue.push(data)) return error.DatagramQueueFull;
+    }
+
+    /// Receive a QUIC DATAGRAM frame (RFC 9221).
+    /// Returns the number of bytes written to buf, or null if no datagram available.
+    pub fn recvDatagram(self: *Connection, buf: []u8) ?usize {
+        return self.datagram_recv_queue.pop(buf);
     }
 
     pub fn isClosed(self: *const Connection) bool {

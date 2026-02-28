@@ -10,6 +10,7 @@ const Frame = frame_mod.Frame;
 const ack_handler = @import("ack_handler.zig");
 const crypto_stream = @import("crypto_stream.zig");
 const stream_mod = @import("stream.zig");
+const conn_mod = @import("connection.zig");
 
 /// Default QUIC packet size (UDP payload).
 const DEFAULT_MAX_PACKET_SIZE: usize = 1200;
@@ -108,6 +109,7 @@ pub const PacketPacker = struct {
         handshake_seal: ?crypto_mod.Seal,
         app_seal: ?crypto_mod.Seal,
         now: i64,
+        datagram_queue: ?*conn_mod.DatagramQueue,
     ) !usize {
         var offset: usize = 0;
 
@@ -123,6 +125,7 @@ pub const PacketPacker = struct {
                 initial_seal.?,
                 now,
                 true, // pad to minimum size
+                null,
             );
             offset += initial_len;
         }
@@ -139,6 +142,7 @@ pub const PacketPacker = struct {
                 handshake_seal.?,
                 now,
                 false,
+                null,
             );
             offset += hs_len;
         }
@@ -155,6 +159,7 @@ pub const PacketPacker = struct {
                 app_seal.?,
                 now,
                 false,
+                datagram_queue,
             );
             offset += app_len;
         }
@@ -175,6 +180,7 @@ pub const PacketPacker = struct {
         seal: crypto_mod.Seal,
         now: i64,
         pad_to_min: bool,
+        datagram_queue: ?*conn_mod.DatagramQueue,
     ) !usize {
         if (buf.len < 64) return 0; // Not enough space
 
@@ -318,6 +324,20 @@ pub const PacketPacker = struct {
                         sf.stream_id, sf.offset, sf.length, sf.fin, sf.data.len,
                     });
                     try stream_frame.write(writer);
+                    ack_eliciting = true;
+                }
+            }
+
+            // 6. DATAGRAM frames (RFC 9221)
+            if (datagram_queue) |dq| {
+                var dgram_buf: [conn_mod.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
+                while (fbs.pos + AEAD_TAG_LEN + 16 < effective_max) {
+                    const dgram_len = dq.pop(&dgram_buf) orelse break;
+                    // Use DATAGRAM_WITH_LENGTH (0x31) so multiple datagrams can coexist in one packet
+                    const dgram_frame = Frame{ .datagram_with_length = .{
+                        .data = dgram_buf[0..dgram_len],
+                    } };
+                    try dgram_frame.write(writer);
                     ack_eliciting = true;
                 }
             }
