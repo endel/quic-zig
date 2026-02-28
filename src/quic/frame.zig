@@ -43,6 +43,9 @@ pub const AckRange = struct {
     end: u64,
 };
 
+/// Maximum number of additional ACK ranges stored inline (avoids allocation).
+pub const MAX_ACK_RANGES: usize = 32;
+
 pub const Frame = union(FrameType) {
     padding: usize,
 
@@ -52,17 +55,16 @@ pub const Frame = union(FrameType) {
         largest_ack: u64,
         ack_delay: u64,
         first_ack_range: u64,
-        ranges: []AckRange, // stored in descending order
-        ecn_ect0: u64 = 0,
-        ecn_ect1: u64 = 0,
-        ecn_ce: u64 = 0,
+        ack_range_count: u8 = 0,
+        ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
     },
 
     ack_ecn: struct {
         largest_ack: u64,
         ack_delay: u64,
         first_ack_range: u64,
-        ranges: []AckRange,
+        ack_range_count: u8 = 0,
+        ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
         ecn_ect0: u64,
         ecn_ect1: u64,
         ecn_ce: u64,
@@ -177,13 +179,22 @@ pub const Frame = union(FrameType) {
                 const ack_range_count = try packet.readVarInt(reader);
                 const first_ack_range = try packet.readVarInt(reader);
 
-                // Parse additional ACK ranges
-                // We store them inline in the remaining bytes buffer
-                // For now, skip over them (TODO: use allocator for dynamic ranges)
+                // Parse additional ACK ranges, computing absolute PN ranges
+                var additional_ranges: [MAX_ACK_RANGES]AckRange = undefined;
+                var range_count: u8 = 0;
+                var smallest = largest_ack -| first_ack_range;
+
                 var i: u64 = 0;
                 while (i < ack_range_count) : (i += 1) {
-                    _ = try packet.readVarInt(reader); // gap
-                    _ = try packet.readVarInt(reader); // ack range length
+                    const gap = try packet.readVarInt(reader);
+                    const ack_range_len = try packet.readVarInt(reader);
+                    if (range_count < MAX_ACK_RANGES) {
+                        const range_largest = smallest -| gap -| 2;
+                        const range_smallest = range_largest -| ack_range_len;
+                        additional_ranges[range_count] = .{ .start = range_smallest, .end = range_largest };
+                        range_count += 1;
+                        smallest = range_smallest;
+                    }
                 }
 
                 var ecn_ect0: u64 = 0;
@@ -201,7 +212,8 @@ pub const Frame = union(FrameType) {
                             .largest_ack = largest_ack,
                             .ack_delay = ack_delay,
                             .first_ack_range = first_ack_range,
-                            .ranges = &.{},
+                            .ack_range_count = range_count,
+                            .ack_ranges = additional_ranges,
                             .ecn_ect0 = ecn_ect0,
                             .ecn_ect1 = ecn_ect1,
                             .ecn_ce = ecn_ce,
@@ -213,7 +225,8 @@ pub const Frame = union(FrameType) {
                             .largest_ack = largest_ack,
                             .ack_delay = ack_delay,
                             .first_ack_range = first_ack_range,
-                            .ranges = &.{},
+                            .ack_range_count = range_count,
+                            .ack_ranges = additional_ranges,
                         },
                     };
                 }
@@ -416,13 +429,17 @@ pub const Frame = union(FrameType) {
                 try packet.writeVarInt(writer, 0x02);
                 try packet.writeVarInt(writer, ack.largest_ack);
                 try packet.writeVarInt(writer, ack.ack_delay);
-                try packet.writeVarInt(writer, ack.ranges.len);
+                try packet.writeVarInt(writer, @as(u64, ack.ack_range_count));
                 try packet.writeVarInt(writer, ack.first_ack_range);
 
-                for (ack.ranges) |r| {
-                    // gap and ack range
-                    try packet.writeVarInt(writer, r.start); // gap
-                    try packet.writeVarInt(writer, r.end); // ack range
+                // Convert absolute ranges back to gap/ack_range wire format
+                var prev_smallest = ack.largest_ack -| ack.first_ack_range;
+                for (ack.ack_ranges[0..ack.ack_range_count]) |r| {
+                    const gap = prev_smallest -| r.end -| 2;
+                    const ack_range_len = r.end - r.start;
+                    try packet.writeVarInt(writer, gap);
+                    try packet.writeVarInt(writer, ack_range_len);
+                    prev_smallest = r.start;
                 }
             },
 
@@ -430,12 +447,16 @@ pub const Frame = union(FrameType) {
                 try packet.writeVarInt(writer, 0x03);
                 try packet.writeVarInt(writer, ack.largest_ack);
                 try packet.writeVarInt(writer, ack.ack_delay);
-                try packet.writeVarInt(writer, ack.ranges.len);
+                try packet.writeVarInt(writer, @as(u64, ack.ack_range_count));
                 try packet.writeVarInt(writer, ack.first_ack_range);
 
-                for (ack.ranges) |r| {
-                    try packet.writeVarInt(writer, r.start);
-                    try packet.writeVarInt(writer, r.end);
+                var prev_smallest = ack.largest_ack -| ack.first_ack_range;
+                for (ack.ack_ranges[0..ack.ack_range_count]) |r| {
+                    const gap = prev_smallest -| r.end -| 2;
+                    const ack_range_len = r.end - r.start;
+                    try packet.writeVarInt(writer, gap);
+                    try packet.writeVarInt(writer, ack_range_len);
+                    prev_smallest = r.start;
                 }
 
                 try packet.writeVarInt(writer, ack.ecn_ect0);

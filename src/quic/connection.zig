@@ -366,7 +366,7 @@ pub const Connection = struct {
                     ack.largest_ack,
                     ack.ack_delay,
                     @intCast(peer_tp.ack_delay_exponent),
-                    ack.ranges,
+                    ack.ack_ranges[0..ack.ack_range_count],
                     ack.first_ack_range,
                     now,
                 );

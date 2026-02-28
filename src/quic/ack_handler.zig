@@ -6,8 +6,10 @@ const ranges = @import("ranges.zig");
 const RangeSet = ranges.RangeSet;
 const rtt_mod = @import("rtt.zig");
 const RttStats = rtt_mod.RttStats;
-const Frame = @import("frame.zig").Frame;
-const AckRange = @import("frame.zig").AckRange;
+const frame_mod = @import("frame.zig");
+const Frame = frame_mod.Frame;
+const AckRange = frame_mod.AckRange;
+const MAX_ACK_RANGES = frame_mod.MAX_ACK_RANGES;
 
 /// Encryption level / packet number space.
 pub const EncLevel = enum(u2) {
@@ -149,7 +151,20 @@ pub const SentPacketTracker = struct {
             }
         }
 
-        _ = ack_ranges; // TODO: process additional ranges
+        // Process additional ACK ranges
+        for (ack_ranges) |range| {
+            var pn = range.start;
+            while (pn <= range.end) : (pn += 1) {
+                if (self.sent_packets.fetchRemove(pn)) |kv| {
+                    const pkt = kv.value;
+                    if (pkt.ack_eliciting) {
+                        self.ack_eliciting_in_flight -|= 1;
+                    }
+                    result.acked.append(pkt);
+                }
+                if (pn == range.end) break;
+            }
+        }
 
         // Detect lost packets
         self.detectLostPackets(rtt_stats, now, &result);
@@ -275,12 +290,24 @@ pub const ReceivedPacketTracker = struct {
         self.ack_alarm = null;
         self.ack_eliciting_since_last_ack = 0;
 
+        // Populate additional ACK ranges from received range set
+        var ack_ranges: [MAX_ACK_RANGES]AckRange = undefined;
+        var ack_range_count: u8 = 0;
+        if (recv_ranges.len > 1) {
+            for (recv_ranges[1..]) |r| {
+                if (ack_range_count >= MAX_ACK_RANGES) break;
+                ack_ranges[ack_range_count] = .{ .start = r.start, .end = r.end };
+                ack_range_count += 1;
+            }
+        }
+
         return Frame{
             .ack = .{
                 .largest_ack = largest,
                 .ack_delay = ack_delay_encoded,
                 .first_ack_range = first_ack_range,
-                .ranges = &.{},
+                .ack_range_count = ack_range_count,
+                .ack_ranges = ack_ranges,
             },
         };
     }
