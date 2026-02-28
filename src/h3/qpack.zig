@@ -262,12 +262,11 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
 
     var pos: usize = 0;
 
-    // Required Insert Count (we only support 0)
-    const ric = try decodeInteger(data, &pos, 8);
-    if (ric != 0) return error.DynamicTableNotSupported;
+    // Required Insert Count — accept any value (we ignore dynamic table refs)
+    _ = try decodeInteger(data, &pos, 8);
 
-    // Delta Base (sign bit + value)
-    _ = try decodeInteger(data, &pos, 7); // ignore, always 0 for static-only
+    // Delta Base (sign bit + value) — accept any value
+    _ = try decodeInteger(data, &pos, 7);
 
     var count: usize = 0;
 
@@ -316,13 +315,24 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
             };
             count += 1;
         } else if (first & 0x80 == 0x80) {
-            // Indexed field line: 1TNNNNNN, T=0 means dynamic (not supported)
-            if (first & 0x40 == 0) return error.DynamicTableNotSupported;
+            // Indexed field line: 1TNNNNNN
+            if (first & 0x40 == 0) {
+                // T=0: dynamic table reference — skip (consume the integer)
+                _ = try decodeInteger(data, &pos, 6);
+                continue;
+            }
             // T=1 already handled above (0xc0 check)
-            return error.InvalidEncoding;
+            _ = try decodeInteger(data, &pos, 6);
+        } else if (first & 0xf0 == 0x10) {
+            // Post-base indexed (dynamic): 0001NNNN — skip
+            _ = try decodeInteger(data, &pos, 4);
+        } else if (first & 0xf0 == 0x00) {
+            // Literal with post-base name ref (dynamic): 0000NNNN — skip
+            _ = try decodeInteger(data, &pos, 3);
+            _ = try decodeString(data, &pos);
         } else {
-            // Unknown encoding pattern — skip
-            return error.InvalidEncoding;
+            // Unknown encoding pattern — skip byte
+            pos += 1;
         }
     }
 
