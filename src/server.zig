@@ -263,5 +263,6 @@ test {
     _ = @import("quic/mtu.zig");
     _ = @import("h3/frame.zig");
     _ = @import("h3/qpack.zig");
+    _ = @import("h3/huffman.zig");
     _ = @import("h3/connection.zig");
 }

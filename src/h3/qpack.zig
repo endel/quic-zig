@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const huffman = @import("huffman.zig");
 
 /// A single HTTP header field (name-value pair).
 pub const Header = struct {
@@ -189,19 +190,29 @@ fn encodeString(buf: []u8, pos: *usize, s: []const u8) void {
     pos.* += s.len;
 }
 
-/// Decode a string literal.
+/// Decode a string literal (plain or Huffman-encoded).
 fn decodeString(data: []const u8, pos: *usize) ![]const u8 {
     if (pos.* >= data.len) return error.BufferTooShort;
-    const huffman = (data[pos.*] & 0x80) != 0;
-    if (huffman) return error.HuffmanNotSupported;
+    const is_huffman = (data[pos.*] & 0x80) != 0;
 
     const len = try decodeInteger(data, pos, 7);
     if (pos.* + len > data.len) return error.BufferTooShort;
 
-    const s = data[pos.*..][0..len];
+    const raw = data[pos.*..][0..len];
     pos.* += len;
-    return s;
+
+    if (is_huffman) {
+        // Decode Huffman-encoded string into thread-local buffer
+        const decoded_len = huffman.decode(raw, &huffman_decode_buf) catch return error.InvalidEncoding;
+        return huffman_decode_buf[0..decoded_len];
+    }
+
+    return raw;
 }
+
+// Thread-local buffer for Huffman decoded strings.
+// Huffman decoding expands data, so we need a generous buffer.
+var huffman_decode_buf: [8192]u8 = undefined;
 
 /// Encode HTTP headers into a QPACK header block (static-only, no Huffman).
 /// Returns the number of bytes written.

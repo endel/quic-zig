@@ -343,7 +343,10 @@ pub const H3Connection = struct {
 
                 switch (result.frame) {
                     .headers => |qpack_data| {
-                        const count = qpack.decodeHeaders(qpack_data, &self.headers_buf) catch continue;
+                        const count = qpack.decodeHeaders(qpack_data, &self.headers_buf) catch |err| {
+                            std.log.err("QPACK decode error on stream {d}: {}", .{ stream_id, err });
+                            continue;
+                        };
                         return .{ .headers = .{
                             .stream_id = stream_id,
                             .headers = self.headers_buf[0..count],
