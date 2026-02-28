@@ -291,6 +291,11 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
         first_byte ^= (mask[0] & 0x1f);
     }
 
+    // Extract key phase bit from unprotected short header (RFC 9001 Section 5.4.1)
+    if (!isLongHeader(first_byte)) {
+        header.key_phase = (first_byte & KEY_PHASE_BIT) != 0;
+    }
+
     // Calculate packet number length from the unprotected first byte BEFORE using it
     header.packet_number_len = @as(usize, @intCast(first_byte & PACKET_NUM_MASK)) + 1;
 
@@ -339,6 +344,85 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     );
 
     // Write decrypted first byte back into the input buffer for further processing.
+    fbs.buffer[header.packet_start] = first_byte;
+
+    return decrypted;
+}
+
+/// Decrypt a 1-RTT packet using the KeyUpdateManager for key phase handling.
+/// Uses the (unchanging) HP key for header unprotection, then selects the
+/// appropriate AEAD keys based on the key phase bit (RFC 9001 Section 6).
+pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *PacketNumSpace, ku: *crypto.KeyUpdateManager) ![]u8 {
+    if (fbs.pos + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
+        return error.InvalidPacket;
+    }
+
+    var first_byte = fbs.buffer[header.packet_start];
+
+    // Use the HP open key (never changes across key updates)
+    const sample_offset = fbs.pos + 4;
+    if (sample_offset + crypto.SAMPLE_LEN > fbs.buffer.len) {
+        return error.InvalidPacket;
+    }
+
+    var sample_buf: [crypto.SAMPLE_LEN]u8 = undefined;
+    @memcpy(&sample_buf, fbs.buffer[sample_offset..][0..crypto.SAMPLE_LEN]);
+
+    // Generate mask using the invariant HP key
+    const hp_ctx = std.crypto.core.aes.Aes128.initEnc(ku.hp_open);
+    var encrypted: [crypto.SAMPLE_LEN]u8 = undefined;
+    hp_ctx.encrypt(&encrypted, &sample_buf);
+    const mask = encrypted[0..crypto.MASK_LEN];
+
+    // Short header unmasking
+    first_byte ^= (mask[0] & 0x1f);
+
+    // Extract key phase from unprotected first byte
+    header.key_phase = (first_byte & KEY_PHASE_BIT) != 0;
+
+    header.packet_number_len = @as(usize, @intCast(first_byte & PACKET_NUM_MASK)) + 1;
+
+    // Unmask packet number bytes
+    var i: usize = 0;
+    while (i < header.packet_number_len) : (i += 1) {
+        fbs.buffer[fbs.pos + i] ^= mask[1 + i];
+    }
+
+    // Extract truncated packet number
+    const pn_ciphertext: *const [MAX_PACKET_NUMBER_LEN]u8 = fbs.buffer[fbs.pos..][0..MAX_PACKET_NUMBER_LEN];
+    const truncated_packet_number: u64 = try switch (header.packet_number_len) {
+        1 => @as(u64, std.mem.readInt(u8, pn_ciphertext.*[0..util.sizeOf(u8)], ENDIAN)),
+        2 => @as(u64, std.mem.readInt(u16, pn_ciphertext.*[0..util.sizeOf(u16)], ENDIAN)),
+        3 => @as(u64, std.mem.readInt(u24, pn_ciphertext.*[0..util.sizeOf(u24)], ENDIAN)),
+        4 => @as(u64, std.mem.readInt(u32, pn_ciphertext.*[0..util.sizeOf(u32)], ENDIAN)),
+        else => error.InvalidPacket,
+    };
+
+    try fbs.seekBy(@intCast(header.packet_number_len));
+
+    const payload_len = header.remainder_len - header.packet_number_len;
+
+    // Build associated data
+    const pkt_start = header.packet_start;
+    const header_len = fbs.pos - pkt_start;
+    var header_bytes_buf: [512]u8 = undefined;
+    header_bytes_buf[0] = first_byte;
+    @memcpy(header_bytes_buf[1..][0..(header_len - 1)], fbs.buffer[(pkt_start + 1)..fbs.pos]);
+    const header_bytes = header_bytes_buf[0..header_len];
+    const encrypted_payload = fbs.buffer[(fbs.pos)..(fbs.pos + payload_len)];
+
+    // Decode packet number
+    header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
+
+    // Select the right Open keys based on key phase
+    var aead = ku.getOpenKeys(header.key_phase) orelse return error.InvalidPacket;
+
+    const decrypted = try aead.decryptPayload(
+        header.packet_number,
+        header_bytes,
+        encrypted_payload,
+    );
+
     fbs.buffer[header.packet_start] = first_byte;
 
     return decrypted;

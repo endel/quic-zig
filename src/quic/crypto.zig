@@ -463,6 +463,319 @@ pub fn hkdfExpandLabel(
     return out[0..length].*;
 }
 
+/// AES-128-GCM confidentiality limit: 2^23 packets (~8M).
+/// After this many packets, keys must be rotated to maintain security.
+pub const CONFIDENTIALITY_LIMIT: u64 = 1 << 23;
+
+/// Derive the next traffic secret for key update.
+/// RFC 9001 Section 6.1:
+///   secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", 32)
+pub fn deriveNextTrafficSecret(current: [32]u8) [32]u8 {
+    return hkdfExpandLabel(current, "quic ku", "", 32);
+}
+
+/// Manages QUIC key update (RFC 9001 Section 6).
+///
+/// Holds three generations of keys (previous/current/next) to handle
+/// packet reordering during key transitions. The header protection key
+/// never changes across updates (RFC 9001 Section 6.6).
+pub const KeyUpdateManager = struct {
+    // Current keys for decrypt/encrypt
+    current_open: Open,
+    current_seal: Seal,
+
+    // Previous open keys for decrypting reordered packets from the prior generation
+    prev_open: ?Open = null,
+
+    // Pre-computed next keys for fast key update processing
+    next_open: Open,
+    next_seal: Seal,
+
+    // Current key phase bit (toggled on each update)
+    key_phase: bool = false,
+
+    // Header protection keys (never change across updates)
+    hp_open: [key_len]u8,
+    hp_seal: [key_len]u8,
+
+    // Traffic secrets for deriving next-generation keys
+    recv_secret: [32]u8,
+    send_secret: [32]u8,
+
+    // Timestamp when previous keys expire (now + 3×PTO)
+    prev_open_expires: ?i64 = null,
+
+    // Packet number of first packet sent with current keys
+    first_sent_with_current: ?u64 = null,
+
+    // Whether a packet sent with current keys has been ACKed
+    first_acked_with_current: bool = false,
+
+    // Number of packets sent with current keys
+    packets_sent_with_current: u64 = 0,
+
+    /// Initialize the key update manager from initial traffic secrets.
+    /// `recv_secret` is the peer's traffic secret (for decryption).
+    /// `send_secret` is our traffic secret (for encryption).
+    pub fn init(recv_secret: [32]u8, send_secret: [32]u8, recv_hp: [key_len]u8, send_hp: [key_len]u8) KeyUpdateManager {
+        // Derive current Open/Seal from the initial secrets
+        const recv_key = hkdfExpandLabel(recv_secret, "quic key", "", key_len);
+        const recv_iv = hkdfExpandLabel(recv_secret, "quic iv", "", nonce_len);
+        const send_key = hkdfExpandLabel(send_secret, "quic key", "", key_len);
+        const send_iv = hkdfExpandLabel(send_secret, "quic iv", "", nonce_len);
+
+        // Pre-compute next generation secrets and keys
+        const next_recv_secret = deriveNextTrafficSecret(recv_secret);
+        const next_send_secret = deriveNextTrafficSecret(send_secret);
+        const next_recv_key = hkdfExpandLabel(next_recv_secret, "quic key", "", key_len);
+        const next_recv_iv = hkdfExpandLabel(next_recv_secret, "quic iv", "", nonce_len);
+        const next_send_key = hkdfExpandLabel(next_send_secret, "quic key", "", key_len);
+        const next_send_iv = hkdfExpandLabel(next_send_secret, "quic iv", "", nonce_len);
+
+        return .{
+            .current_open = .{ .key = recv_key, .hp_key = recv_hp, .nonce = recv_iv },
+            .current_seal = .{ .key = send_key, .hp_key = send_hp, .nonce = send_iv },
+            .next_open = .{ .key = next_recv_key, .hp_key = recv_hp, .nonce = next_recv_iv },
+            .next_seal = .{ .key = next_send_key, .hp_key = send_hp, .nonce = next_send_iv },
+            .hp_open = recv_hp,
+            .hp_seal = send_hp,
+            .recv_secret = recv_secret,
+            .send_secret = send_secret,
+        };
+    }
+
+    /// Rotate keys: prev←current, current←next, pre-compute new next.
+    /// Toggles the key phase bit. Sets prev_open expiry to now + 3×PTO.
+    pub fn rollKeys(self: *KeyUpdateManager, now: i64, pto_ns: i64) void {
+        // Move current → previous
+        self.prev_open = self.current_open;
+        self.prev_open_expires = now + 3 * pto_ns;
+
+        // Move next → current
+        self.current_open = self.next_open;
+        self.current_seal = self.next_seal;
+
+        // Advance secrets
+        self.recv_secret = deriveNextTrafficSecret(self.recv_secret);
+        self.send_secret = deriveNextTrafficSecret(self.send_secret);
+
+        // Pre-compute new next-generation keys
+        const next_recv_secret = deriveNextTrafficSecret(self.recv_secret);
+        const next_send_secret = deriveNextTrafficSecret(self.send_secret);
+        self.next_open = .{
+            .key = hkdfExpandLabel(next_recv_secret, "quic key", "", key_len),
+            .hp_key = self.hp_open,
+            .nonce = hkdfExpandLabel(next_recv_secret, "quic iv", "", nonce_len),
+        };
+        self.next_seal = .{
+            .key = hkdfExpandLabel(next_send_secret, "quic key", "", key_len),
+            .hp_key = self.hp_seal,
+            .nonce = hkdfExpandLabel(next_send_secret, "quic iv", "", nonce_len),
+        };
+
+        // Toggle key phase
+        self.key_phase = !self.key_phase;
+
+        // Reset tracking for the new generation
+        self.first_sent_with_current = null;
+        self.first_acked_with_current = false;
+        self.packets_sent_with_current = 0;
+    }
+
+    /// Get the Open keys for decrypting a packet based on its key phase bit.
+    /// Returns null if the key phase doesn't match any available generation.
+    pub fn getOpenKeys(self: *KeyUpdateManager, key_phase_bit: bool) ?*Open {
+        if (key_phase_bit == self.key_phase) {
+            return &self.current_open;
+        }
+        // Key phase differs from current → either previous or next generation
+        if (self.prev_open != null) {
+            return &self.prev_open.?;
+        }
+        return null;
+    }
+
+    /// Get the current Seal keys and key phase bit for encrypting a packet.
+    pub fn getSealAndPhase(self: *KeyUpdateManager) struct { seal: *const Seal, key_phase: bool } {
+        return .{ .seal = &self.current_seal, .key_phase = self.key_phase };
+    }
+
+    /// Record that a packet was sent with current keys.
+    pub fn onPacketSent(self: *KeyUpdateManager, pn: u64) void {
+        if (self.first_sent_with_current == null) {
+            self.first_sent_with_current = pn;
+        }
+        self.packets_sent_with_current += 1;
+    }
+
+    /// Drop previous-generation keys if they have expired.
+    pub fn maybeDropPrevKeys(self: *KeyUpdateManager, now: i64) void {
+        if (self.prev_open_expires) |expires| {
+            if (now >= expires) {
+                self.prev_open = null;
+                self.prev_open_expires = null;
+            }
+        }
+    }
+
+    /// Check if we should proactively initiate a key update.
+    /// Returns true if packets sent with current keys >= confidentiality limit.
+    pub fn shouldInitiateUpdate(self: *const KeyUpdateManager) bool {
+        return self.packets_sent_with_current >= CONFIDENTIALITY_LIMIT;
+    }
+
+    /// Check if we are allowed to initiate a key update.
+    /// Must have sent and received ACK for a packet with current keys.
+    pub fn canUpdate(self: *const KeyUpdateManager) bool {
+        return self.first_acked_with_current;
+    }
+};
+
+// Key update tests
+test "deriveNextTrafficSecret produces different secret" {
+    const initial_secret = [_]u8{
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+    };
+    const next = deriveNextTrafficSecret(initial_secret);
+
+    // Next secret must differ from original
+    try std.testing.expect(!std.mem.eql(u8, &initial_secret, &next));
+
+    // Deterministic: same input → same output
+    const next2 = deriveNextTrafficSecret(initial_secret);
+    try std.testing.expectEqualSlices(u8, &next, &next2);
+
+    // Chaining: deriving again gives a third distinct secret
+    const next3 = deriveNextTrafficSecret(next);
+    try std.testing.expect(!std.mem.eql(u8, &next, &next3));
+    try std.testing.expect(!std.mem.eql(u8, &initial_secret, &next3));
+}
+
+test "KeyUpdateManager: init and basic operations" {
+    const recv_secret = [_]u8{0xAA} ** 32;
+    const send_secret = [_]u8{0xBB} ** 32;
+    const recv_hp = [_]u8{0xCC} ** 16;
+    const send_hp = [_]u8{0xDD} ** 16;
+
+    var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
+
+    // Initial key phase is false
+    try std.testing.expect(!mgr.key_phase);
+
+    // Current keys should match key phase
+    const open = mgr.getOpenKeys(false);
+    try std.testing.expect(open != null);
+
+    // Get seal should return current seal and phase
+    const seal_info = mgr.getSealAndPhase();
+    try std.testing.expect(!seal_info.key_phase);
+
+    // HP keys should match
+    try std.testing.expectEqualSlices(u8, &recv_hp, &mgr.hp_open);
+    try std.testing.expectEqualSlices(u8, &send_hp, &mgr.hp_seal);
+
+    // Should not initiate update yet (0 packets sent)
+    try std.testing.expect(!mgr.shouldInitiateUpdate());
+    try std.testing.expect(!mgr.canUpdate());
+}
+
+test "KeyUpdateManager: roll keys" {
+    const recv_secret = [_]u8{0xAA} ** 32;
+    const send_secret = [_]u8{0xBB} ** 32;
+    const recv_hp = [_]u8{0xCC} ** 16;
+    const send_hp = [_]u8{0xDD} ** 16;
+
+    var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
+    const orig_open_key = mgr.current_open.key;
+    const orig_seal_key = mgr.current_seal.key;
+
+    // Roll keys
+    const now: i64 = 1_000_000_000;
+    const pto: i64 = 100_000_000; // 100ms
+    mgr.rollKeys(now, pto);
+
+    // Key phase should toggle
+    try std.testing.expect(mgr.key_phase);
+
+    // Current keys should be different
+    try std.testing.expect(!std.mem.eql(u8, &orig_open_key, &mgr.current_open.key));
+    try std.testing.expect(!std.mem.eql(u8, &orig_seal_key, &mgr.current_seal.key));
+
+    // Previous open should exist
+    try std.testing.expect(mgr.prev_open != null);
+    try std.testing.expectEqualSlices(u8, &orig_open_key, &mgr.prev_open.?.key);
+
+    // Previous should expire at now + 3*PTO
+    try std.testing.expectEqual(now + 3 * pto, mgr.prev_open_expires.?);
+
+    // HP keys should not change
+    try std.testing.expectEqualSlices(u8, &recv_hp, &mgr.current_open.hp_key);
+    try std.testing.expectEqualSlices(u8, &send_hp, &mgr.current_seal.hp_key);
+
+    // Counters should be reset
+    try std.testing.expect(mgr.first_sent_with_current == null);
+    try std.testing.expect(!mgr.first_acked_with_current);
+    try std.testing.expectEqual(@as(u64, 0), mgr.packets_sent_with_current);
+}
+
+test "KeyUpdateManager: prev key expiry" {
+    const recv_secret = [_]u8{0xAA} ** 32;
+    const send_secret = [_]u8{0xBB} ** 32;
+    const recv_hp = [_]u8{0xCC} ** 16;
+    const send_hp = [_]u8{0xDD} ** 16;
+
+    var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
+
+    const now: i64 = 1_000_000_000;
+    const pto: i64 = 100_000_000;
+    mgr.rollKeys(now, pto);
+
+    // Before expiry: prev keys should exist
+    mgr.maybeDropPrevKeys(now + 2 * pto);
+    try std.testing.expect(mgr.prev_open != null);
+
+    // After expiry: prev keys should be dropped
+    mgr.maybeDropPrevKeys(now + 3 * pto);
+    try std.testing.expect(mgr.prev_open == null);
+    try std.testing.expect(mgr.prev_open_expires == null);
+}
+
+test "KeyUpdateManager: encrypt/decrypt roundtrip across key update" {
+    // Simulate two sides: client and server with swapped secrets
+    const client_recv = [_]u8{0x11} ** 32; // = server_send
+    const client_send = [_]u8{0x22} ** 32; // = server_recv
+    const hp_a = [_]u8{0x33} ** 16;
+    const hp_b = [_]u8{0x44} ** 16;
+
+    var client = KeyUpdateManager.init(client_recv, client_send, hp_a, hp_b);
+    var server = KeyUpdateManager.init(client_send, client_recv, hp_b, hp_a);
+
+    // Client encrypts, server decrypts (generation 0)
+    const plaintext = "hello key update";
+    const ad = "associated data";
+    var ciphertext: [plaintext.len + Aead.tag_length]u8 = undefined;
+    _ = client.current_seal.encryptPayload(0, ad, plaintext, &ciphertext);
+
+    const open_keys = server.getOpenKeys(false).?;
+    const decrypted = try open_keys.decryptPayload(0, ad, &ciphertext);
+    try std.testing.expectEqualStrings(plaintext, decrypted);
+
+    // Roll both sides
+    client.rollKeys(1_000_000_000, 100_000_000);
+    server.rollKeys(1_000_000_000, 100_000_000);
+
+    // Client encrypts with new keys, server decrypts (generation 1)
+    var ciphertext2: [plaintext.len + Aead.tag_length]u8 = undefined;
+    _ = client.current_seal.encryptPayload(1, ad, plaintext, &ciphertext2);
+
+    const open_keys2 = server.getOpenKeys(true).?;
+    const decrypted2 = try open_keys2.decryptPayload(1, ad, &ciphertext2);
+    try std.testing.expectEqualStrings(plaintext, decrypted2);
+}
+
 test "Seal/Open encrypt/decrypt roundtrip" {
     const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     const keys = try deriveInitialKeyMaterial(&dcid, 0x00000001, true);

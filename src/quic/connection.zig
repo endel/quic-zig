@@ -131,6 +131,9 @@ pub const Connection = struct {
     // Pending control frames queue
     pending_frames: frame_mod.PendingFrameQueue = .{},
 
+    // Key update manager for 1-RTT key rotation (RFC 9001 Section 6)
+    key_update: ?quic_crypto.KeyUpdateManager = null,
+
     // Connection state
     got_peer_conn_id: bool = false,
     peer_max_cid_seq: u64 = 0,
@@ -264,7 +267,7 @@ pub const Connection = struct {
 
         const enc_level = epochToEncLevel(epoch);
         const space_idx = @intFromEnum(enc_level);
-        const space = self.pkt_num_spaces[space_idx];
+        var space = self.pkt_num_spaces[space_idx];
         const has_keys = space.crypto_open != null and space.crypto_seal != null;
         std.log.debug("recv: using space {d} ({s}), has_keys={}", .{ space_idx, @tagName(enc_level), has_keys });
 
@@ -273,10 +276,21 @@ pub const Connection = struct {
             return;
         }
 
-        const payload = packet.decrypt(header, fbs, space) catch |err| {
-            std.log.err("can't decrypt packet. {any}", .{err});
-            return error.InvalidPacket;
-        };
+        // For 1-RTT packets with key update manager, use the appropriate key generation
+        var payload: []u8 = undefined;
+        if (epoch == .application and self.key_update != null) {
+            // Decrypt using KeyUpdateManager: first do header unprotection with the
+            // (unchanging) HP key, then select the right AEAD key based on key phase
+            payload = packet.decryptWithKeyUpdate(header, fbs, &space, &self.key_update.?) catch |err| {
+                std.log.err("can't decrypt 1-RTT packet with key update. {any}", .{err});
+                return error.InvalidPacket;
+            };
+        } else {
+            payload = packet.decrypt(header, fbs, space) catch |err| {
+                std.log.err("can't decrypt packet. {any}", .{err});
+                return error.InvalidPacket;
+            };
+        }
 
         if (payload.len == 0) {
             return error.InvalidPacket;
@@ -284,6 +298,20 @@ pub const Connection = struct {
 
         const now: i64 = @intCast(std.time.nanoTimestamp());
         self.last_packet_received_time = now;
+
+        // Handle key phase change for 1-RTT packets (RFC 9001 Section 6)
+        if (epoch == .application) {
+            if (self.key_update) |*ku| {
+                if (header.key_phase != ku.key_phase) {
+                    // Peer initiated a key update
+                    const pto_ns = self.pkt_handler.rtt_stats.pto();
+                    ku.rollKeys(now, pto_ns);
+                    self.packer.key_phase = ku.key_phase;
+                    std.log.info("key update: peer-initiated, new key_phase={}", .{ku.key_phase});
+                }
+                ku.maybeDropPrevKeys(now);
+            }
+        }
 
         // Update network path stats
         self.paths[0].bytes_received += @intCast(fbs.buffer.len);
@@ -371,9 +399,20 @@ pub const Connection = struct {
                     now,
                 );
 
-                // Notify congestion controller
+                // Notify congestion controller and track key update ACKs
                 for (result.acked.constSlice()) |pkt| {
                     self.cc.onPacketAcked(pkt.size, pkt.pn);
+
+                    // Track whether a packet sent with current keys has been ACKed
+                    if (enc_level == .application) {
+                        if (self.key_update) |*ku| {
+                            if (ku.first_sent_with_current) |first_pn| {
+                                if (pkt.pn >= first_pn) {
+                                    ku.first_acked_with_current = true;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if (result.lost.len > 0) {
@@ -715,6 +754,30 @@ pub const Connection = struct {
                     }
                     // Client: Handshake keys cleared in client.zig after sending Finished
 
+                    // Initialize KeyUpdateManager from TLS traffic secrets (RFC 9001 Section 6)
+                    if (hs.key_schedule.computed_app) {
+                        const recv_secret = if (self.is_server)
+                            hs.key_schedule.client_app_traffic_secret
+                        else
+                            hs.key_schedule.server_app_traffic_secret;
+                        const send_secret = if (self.is_server)
+                            hs.key_schedule.server_app_traffic_secret
+                        else
+                            hs.key_schedule.client_app_traffic_secret;
+
+                        // Get HP keys from current app-level Open/Seal (they never change)
+                        const app_open = self.pkt_num_spaces[2].crypto_open.?;
+                        const app_seal = self.pkt_num_spaces[2].crypto_seal.?;
+
+                        self.key_update = quic_crypto.KeyUpdateManager.init(
+                            recv_secret,
+                            send_secret,
+                            app_open.hp_key,
+                            app_seal.hp_key,
+                        );
+                        std.log.info("KeyUpdateManager initialized for 1-RTT key rotation", .{});
+                    }
+
                     // Store peer transport parameters and apply stream limits
                     if (hs.peer_transport_params) |peer_tp| {
                         self.peer_params = peer_tp;
@@ -770,7 +833,10 @@ pub const Connection = struct {
 
         // Closing: send one packet with CONNECTION_CLOSE, then transition to draining
         if (self.state == .closing) {
-            const app_seal = self.pkt_num_spaces[2].crypto_seal;
+            const app_seal: ?quic_crypto.Seal = if (self.key_update) |*ku|
+                ku.current_seal
+            else
+                self.pkt_num_spaces[2].crypto_seal;
             if (app_seal != null) {
                 const bytes_written = try self.packer.packCoalesced(
                     out_buf,
@@ -803,11 +869,28 @@ pub const Connection = struct {
         // Queue flow control updates before packing
         self.queueFlowControlUpdates();
 
+        // Check if we should proactively initiate a key update (RFC 9001 Section 6)
+        if (self.key_update) |*ku| {
+            if (ku.shouldInitiateUpdate() and ku.canUpdate()) {
+                const pto_ns = self.pkt_handler.rtt_stats.pto();
+                ku.rollKeys(now, pto_ns);
+                self.packer.key_phase = ku.key_phase;
+                std.log.info("key update: self-initiated at {d} packets, new key_phase={}", .{
+                    quic_crypto.CONFIDENTIALITY_LIMIT,
+                    ku.key_phase,
+                });
+            }
+        }
+
         // Build coalesced packet with available encryption levels
         // Packet number space indices: 0=Initial, 1=Handshake, 2=Application
         const initial_seal = self.pkt_num_spaces[0].crypto_seal;
         const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
-        const app_seal = self.pkt_num_spaces[2].crypto_seal;
+        // Use KeyUpdateManager seal for 1-RTT if available
+        const app_seal: ?quic_crypto.Seal = if (self.key_update) |*ku|
+            ku.current_seal
+        else
+            self.pkt_num_spaces[2].crypto_seal;
 
         const has_initial = initial_seal != null;
         const has_handshake = handshake_seal != null;
@@ -829,6 +912,15 @@ pub const Connection = struct {
         if (bytes_written > 0) {
             self.paths[0].bytes_sent += bytes_written;
             self.pacer.onPacketSent(bytes_written, now);
+
+            // Track packets sent with current keys for key update
+            if (self.key_update) |*ku| {
+                if (app_seal != null) {
+                    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+                    const pn = self.pkt_handler.next_pn[app_idx];
+                    if (pn > 0) ku.onPacketSent(pn - 1);
+                }
+            }
         }
 
         return bytes_written;

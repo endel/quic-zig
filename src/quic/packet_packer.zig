@@ -54,6 +54,9 @@ pub const PacketPacker = struct {
     /// Whether to send HANDSHAKE_DONE frame in the next 1-RTT packet (server only).
     send_handshake_done: bool = false,
 
+    /// Current key phase bit for 1-RTT packets (toggled on key update).
+    key_phase: bool = false,
+
     pub fn init(
         allocator: Allocator,
         is_server: bool,
@@ -193,6 +196,7 @@ pub const PacketPacker = struct {
         if (pkt_type == .one_rtt) {
             // Short header: 1 byte + DCID
             var first_byte: u8 = packet_mod.FIXED_BIT;
+            if (self.key_phase) first_byte |= packet_mod.KEY_PHASE_BIT;
             first_byte |= @as(u8, @intCast(pn_len - 1));
             try writer.writeByte(first_byte);
             try writer.writeAll(self.getDcid());
