@@ -7,8 +7,6 @@ const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
 const h3 = @import("h3/connection.zig");
-const h3_frame = @import("h3/frame.zig");
-const qpack = @import("h3/qpack.zig");
 const wt = @import("webtransport/session.zig");
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
@@ -147,6 +145,7 @@ pub fn main() !void {
                 h3_conn.?.local_settings = .{
                     .enable_connect_protocol = true,
                     .h3_datagram = true,
+                    .enable_webtransport = true,
                     .webtransport_max_sessions = 1,
                 };
                 h3_conn.?.initConnection() catch |err| {
@@ -161,47 +160,23 @@ pub fn main() !void {
             if (wt_conn != null) {
                 var wtc = &wt_conn.?;
 
-                // First poll H3 for connect_request events
-                while (true) {
-                    const h3_event = h3_conn.?.poll() catch break;
-                    if (h3_event == null) break;
-
-                    switch (h3_event.?) {
-                        .settings => |settings| {
-                            std.log.info("H3: received peer SETTINGS (enable_connect={}, h3_datagram={})", .{
-                                settings.enable_connect_protocol, settings.h3_datagram,
-                            });
-                        },
-                        .connect_request => |req| {
-                            std.debug.print("WebTransport session request on stream {d} (protocol={s}, path={s})\n", .{
-                                req.stream_id, req.protocol, req.path,
-                            });
-                            // Accept the session
-                            wtc.acceptSession(req.stream_id) catch |err| {
-                                std.log.err("WT accept error: {any}", .{err});
-                                continue;
-                            };
-                            std.debug.print("WebTransport session accepted (session_id={d})\n", .{req.stream_id});
-                        },
-                        .headers => |hdr| {
-                            std.log.info("H3: headers on stream {d}", .{hdr.stream_id});
-                        },
-                        .data => |d| {
-                            std.log.info("H3: data on stream {d} ({d} bytes)", .{ d.stream_id, d.data.len });
-                        },
-                        .finished => |stream_id| {
-                            std.log.info("H3: stream {d} finished", .{stream_id});
-                        },
-                        .goaway => {},
-                    }
-                }
-
-                // Poll WT events
+                // Poll WT events (includes H3 events internally)
                 while (true) {
                     const event = wtc.poll() catch break;
                     if (event == null) break;
 
                     switch (event.?) {
+                        .connect_request => |req| {
+                            std.debug.print("WebTransport session request on stream {d} (protocol={s}, path={s})\n", .{
+                                req.session_id, req.protocol, req.path,
+                            });
+                            // Accept the session
+                            wtc.acceptSession(req.session_id) catch |err| {
+                                std.log.err("WT accept error: {any}", .{err});
+                                continue;
+                            };
+                            std.debug.print("WebTransport session accepted (session_id={d})\n", .{req.session_id});
+                        },
                         .bidi_stream => |bs| {
                             std.debug.print("WT: new bidi stream {d} (session={d})\n", .{ bs.stream_id, bs.session_id });
                         },

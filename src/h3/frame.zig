@@ -41,7 +41,8 @@ pub const SettingsId = enum(u64) {
     max_field_section_size = 0x06,
     qpack_blocked_streams = 0x07,
     enable_connect_protocol = 0x08,
-    h3_datagram = 0x33de,
+    h3_datagram = 0x33,
+    enable_webtransport = 0x2b603742,
     webtransport_max_sessions = 0xc671706a,
 
     pub fn fromInt(v: u64) ?SettingsId {
@@ -50,7 +51,8 @@ pub const SettingsId = enum(u64) {
             0x06 => .max_field_section_size,
             0x07 => .qpack_blocked_streams,
             0x08 => .enable_connect_protocol,
-            0x33de => .h3_datagram,
+            0x33 => .h3_datagram,
+            0x2b603742 => .enable_webtransport,
             0xc671706a => .webtransport_max_sessions,
             else => null,
         };
@@ -64,6 +66,7 @@ pub const Settings = struct {
     qpack_blocked_streams: u64 = 0,
     enable_connect_protocol: bool = false,
     h3_datagram: bool = false,
+    enable_webtransport: bool = false,
     webtransport_max_sessions: ?u64 = null,
 };
 
@@ -149,6 +152,7 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
                         .qpack_blocked_streams => settings.qpack_blocked_streams = value,
                         .enable_connect_protocol => settings.enable_connect_protocol = (value != 0),
                         .h3_datagram => settings.h3_datagram = (value != 0),
+                        .enable_webtransport => settings.enable_webtransport = (value != 0),
                         .webtransport_max_sessions => settings.webtransport_max_sessions = value,
                     }
                 }
@@ -221,6 +225,11 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
 
             if (s.h3_datagram) {
                 try packet.writeVarInt(sw, @intFromEnum(SettingsId.h3_datagram));
+                try packet.writeVarInt(sw, 1);
+            }
+
+            if (s.enable_webtransport) {
+                try packet.writeVarInt(sw, @intFromEnum(SettingsId.enable_webtransport));
                 try packet.writeVarInt(sw, 1);
             }
 
@@ -398,6 +407,7 @@ test "H3Frame: write and parse SETTINGS with WebTransport fields" {
         .qpack_blocked_streams = 0,
         .enable_connect_protocol = true,
         .h3_datagram = true,
+        .enable_webtransport = true,
         .webtransport_max_sessions = 1,
     };
     try write(.{ .settings = settings }, fbs.writer());
@@ -408,6 +418,7 @@ test "H3Frame: write and parse SETTINGS with WebTransport fields" {
     try testing.expectEqual(H3FrameType.settings, std.meta.activeTag(result.frame));
     try testing.expect(result.frame.settings.enable_connect_protocol);
     try testing.expect(result.frame.settings.h3_datagram);
+    try testing.expect(result.frame.settings.enable_webtransport);
     try testing.expectEqual(@as(u64, 1), result.frame.settings.webtransport_max_sessions.?);
 }
 

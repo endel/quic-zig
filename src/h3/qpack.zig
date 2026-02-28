@@ -191,7 +191,9 @@ fn encodeString(buf: []u8, pos: *usize, s: []const u8) void {
 }
 
 /// Decode a string literal (plain or Huffman-encoded).
-fn decodeString(data: []const u8, pos: *usize) ![]const u8 {
+/// Huffman-decoded strings are written into `scratch` at `scratch_pos.*`,
+/// which advances so each string gets its own stable slice.
+fn decodeString(data: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usize) ![]const u8 {
     if (pos.* >= data.len) return error.BufferTooShort;
     const is_huffman = (data[pos.*] & 0x80) != 0;
 
@@ -202,17 +204,19 @@ fn decodeString(data: []const u8, pos: *usize) ![]const u8 {
     pos.* += len;
 
     if (is_huffman) {
-        // Decode Huffman-encoded string into thread-local buffer
-        const decoded_len = huffman.decode(raw, &huffman_decode_buf) catch return error.InvalidEncoding;
-        return huffman_decode_buf[0..decoded_len];
+        // Decode Huffman-encoded string into scratch buffer at current position
+        const remaining = scratch[scratch_pos.*..];
+        var temp_buf: [4096]u8 = undefined;
+        const decoded_len = huffman.decode(raw, &temp_buf) catch return error.InvalidEncoding;
+        if (scratch_pos.* + decoded_len > scratch.len) return error.BufferTooSmall;
+        @memcpy(remaining[0..decoded_len], temp_buf[0..decoded_len]);
+        const result = scratch[scratch_pos.*..][0..decoded_len];
+        scratch_pos.* += decoded_len;
+        return result;
     }
 
     return raw;
 }
-
-// Thread-local buffer for Huffman decoded strings.
-// Huffman decoding expands data, so we need a generous buffer.
-var huffman_decode_buf: [8192]u8 = undefined;
 
 /// Encode HTTP headers into a QPACK header block (static-only, no Huffman).
 /// Returns the number of bytes written.
@@ -241,13 +245,13 @@ pub fn encodeHeaders(headers: []const Header, buf: []u8) !usize {
                 encodeString(buf, &pos, h.value);
             }
         } else {
-            // Literal with literal name: 0010HNNN
-            // H=0 (no Huffman), 3-bit name length prefix
-            buf[pos] = 0x20;
-            pos += 1;
-            // Name length + name
-            encodeString(buf, &pos, h.name);
-            // Value length + value
+            // Literal with literal name: 001NHNNN
+            // N=0 (allow indexing), H=0 (no Huffman for name), 3-bit name length prefix
+            // Name length is encoded in the first byte's lower 3 bits
+            encodeInteger(buf, &pos, h.name.len, 3, 0x20);
+            @memcpy(buf[pos..][0..h.name.len], h.name);
+            pos += h.name.len;
+            // Value length + value (7-bit prefix, H=0)
             encodeString(buf, &pos, h.value);
         }
     }
@@ -255,12 +259,17 @@ pub fn encodeHeaders(headers: []const Header, buf: []u8) !usize {
     return pos;
 }
 
+/// Scratch buffer for Huffman-decoded strings within a single decodeHeaders call.
+/// Each decoded string gets its own slice, so they don't overwrite each other.
+var huffman_scratch: [16384]u8 = undefined;
+
 /// Decode a QPACK header block into headers.
 /// Returns the number of headers decoded.
 pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
     if (data.len < 2) return error.BufferTooShort;
 
     var pos: usize = 0;
+    var scratch_pos: usize = 0;
 
     // Required Insert Count — accept any value (we ignore dynamic table refs)
     _ = try decodeInteger(data, &pos, 8);
@@ -288,7 +297,7 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
             // Literal with name reference (static): 0101NNNN
             const index = try decodeInteger(data, &pos, 4);
             if (index >= static_table.len) return error.InvalidIndex;
-            const value = try decodeString(data, &pos);
+            const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
             headers_buf[count] = .{
                 .name = static_table[index].name,
                 .value = value,
@@ -298,17 +307,31 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
             // Literal with name reference (static, never-indexed): 0100NNNN
             const index = try decodeInteger(data, &pos, 4);
             if (index >= static_table.len) return error.InvalidIndex;
-            const value = try decodeString(data, &pos);
+            const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
             headers_buf[count] = .{
                 .name = static_table[index].name,
                 .value = value,
             };
             count += 1;
         } else if (first & 0xe0 == 0x20) {
-            // Literal with literal name: 001NNNNN
-            pos += 1; // skip first byte (pattern byte)
-            const name = try decodeString(data, &pos);
-            const value = try decodeString(data, &pos);
+            // Literal with literal name: 001NHNNN
+            // H bit (bit 3) indicates Huffman for name, 3-bit name length prefix
+            const is_name_huffman = (first & 0x08) != 0;
+            const name_len = try decodeInteger(data, &pos, 3);
+            if (pos + name_len > data.len) return error.BufferTooShort;
+            var name: []const u8 = undefined;
+            if (is_name_huffman) {
+                var temp_buf: [4096]u8 = undefined;
+                const decoded_len = huffman.decode(data[pos..][0..name_len], &temp_buf) catch return error.InvalidEncoding;
+                if (scratch_pos + decoded_len > huffman_scratch.len) return error.BufferTooSmall;
+                @memcpy(huffman_scratch[scratch_pos..][0..decoded_len], temp_buf[0..decoded_len]);
+                name = huffman_scratch[scratch_pos..][0..decoded_len];
+                scratch_pos += decoded_len;
+            } else {
+                name = data[pos..][0..name_len];
+            }
+            pos += name_len;
+            const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
             headers_buf[count] = .{
                 .name = name,
                 .value = value,
@@ -329,7 +352,7 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
         } else if (first & 0xf0 == 0x00) {
             // Literal with post-base name ref (dynamic): 0000NNNN — skip
             _ = try decodeInteger(data, &pos, 3);
-            _ = try decodeString(data, &pos);
+            _ = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
         } else {
             // Unknown encoding pattern — skip byte
             pos += 1;

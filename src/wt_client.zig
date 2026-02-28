@@ -116,6 +116,7 @@ pub fn main() !void {
     h3_conn.local_settings = .{
         .enable_connect_protocol = true,
         .h3_datagram = true,
+        .enable_webtransport = true,
         .webtransport_max_sessions = 1,
     };
     try h3_conn.initConnection();

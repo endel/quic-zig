@@ -34,6 +34,7 @@ pub const Session = struct {
 pub const WtEvent = union(enum) {
     session_ready: u64, // session_id
     session_rejected: struct { session_id: u64, status: []const u8 },
+    connect_request: struct { session_id: u64, protocol: []const u8, authority: []const u8, path: []const u8 },
     bidi_stream: struct { session_id: u64, stream_id: u64 },
     uni_stream: struct { session_id: u64, stream_id: u64 },
     stream_data: struct { stream_id: u64, data: []const u8 },
@@ -56,6 +57,9 @@ pub const WebTransportConnection = struct {
     // Streams whose type prefix hasn't been read yet
     pending_uni_streams: std.AutoHashMap(u64, void),
 
+    // Buffered data for WT streams (data after type prefix, or data read before poll)
+    stream_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
+
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, h3: *h3_conn.H3Connection, quic: *quic_connection.Connection, is_server: bool) WebTransportConnection {
@@ -66,6 +70,7 @@ pub const WebTransportConnection = struct {
             .wt_bidi_streams = std.AutoHashMap(u64, u64).init(allocator),
             .wt_uni_streams = std.AutoHashMap(u64, u64).init(allocator),
             .pending_uni_streams = std.AutoHashMap(u64, void).init(allocator),
+            .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
             .allocator = allocator,
         };
     }
@@ -292,6 +297,13 @@ pub const WebTransportConnection = struct {
             if (self.wt_bidi_streams.contains(stream_id)) continue;
             // Skip streams we opened (they don't have type prefix to read)
             if (self.h3.finished_streams.contains(stream_id)) continue;
+            // Skip streams initiated by us (client: even IDs, server: odd IDs)
+            // WT type prefix only appears on peer-initiated bidi streams
+            const is_client_initiated = (stream_id % 4) == 0;
+            if (is_client_initiated and !self.is_server) continue;
+            if (!is_client_initiated and self.is_server) continue;
+            // Also skip our CONNECT session streams
+            if (self.getSession(stream_id) != null) continue;
 
             // Try to read prefix data
             const data = stream.recv.read() orelse continue;
@@ -305,14 +317,16 @@ pub const WebTransportConnection = struct {
                 const session_id = packet.readVarInt(reader) catch continue;
                 if (self.getSession(session_id) != null) {
                     try self.wt_bidi_streams.put(stream_id, session_id);
+                    // Exclude from H3 processing
+                    try self.h3.excluded_bidi_streams.put(stream_id, {});
 
-                    // If there's remaining data after the prefix, buffer it back
+                    // If there's remaining data after the prefix, buffer it in WT buffer
                     if (fbs.pos < data.len) {
                         const remaining = data[fbs.pos..];
-                        var buf = self.h3.stream_bufs.getPtr(stream_id) orelse blk: {
+                        var buf = self.stream_bufs.getPtr(stream_id) orelse blk: {
                             const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-                            try self.h3.stream_bufs.put(stream_id, new_buf);
-                            break :blk self.h3.stream_bufs.getPtr(stream_id).?;
+                            try self.stream_bufs.put(stream_id, new_buf);
+                            break :blk self.stream_bufs.getPtr(stream_id).?;
                         };
                         try buf.appendSlice(self.allocator, remaining);
                     }
@@ -340,6 +354,20 @@ pub const WebTransportConnection = struct {
         var bidi_it = self.wt_bidi_streams.iterator();
         while (bidi_it.next()) |entry| {
             const stream_id = entry.key_ptr.*;
+
+            // First check WT buffer for data left over from prefix parsing
+            if (self.stream_bufs.getPtr(stream_id)) |buf| {
+                if (buf.items.len > 0) {
+                    // Return buffered data; will be consumed on next call
+                    const data_slice = self.allocator.dupe(u8, buf.items) catch continue;
+                    buf.items.len = 0;
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = data_slice,
+                    } };
+                }
+            }
+
             if (self.quic.streams.getStream(stream_id)) |stream| {
                 if (stream.recv.read()) |data| {
                     return .{ .stream_data = .{
@@ -354,6 +382,19 @@ pub const WebTransportConnection = struct {
         var uni_it = self.wt_uni_streams.iterator();
         while (uni_it.next()) |entry| {
             const stream_id = entry.key_ptr.*;
+
+            // First check WT buffer
+            if (self.stream_bufs.getPtr(stream_id)) |buf| {
+                if (buf.items.len > 0) {
+                    const data_slice = self.allocator.dupe(u8, buf.items) catch continue;
+                    buf.items.len = 0;
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = data_slice,
+                    } };
+                }
+            }
+
             if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
                 if (recv_stream.read()) |data| {
                     return .{ .stream_data = .{
@@ -377,11 +418,13 @@ pub const WebTransportConnection = struct {
                 if (std.mem.eql(u8, req.protocol, "webtransport")) {
                     // Register as a connecting session
                     _ = self.allocateSession(req.stream_id, .connecting);
-                    // Return the connect_request as-is for the server to accept/reject
-                    // The caller should use acceptSession() or closeSession()
-                    return .{ .bidi_stream = .{
+                    // Exclude this stream from H3 bidi processing
+                    try self.h3.excluded_bidi_streams.put(req.stream_id, {});
+                    return .{ .connect_request = .{
                         .session_id = req.stream_id,
-                        .stream_id = req.stream_id,
+                        .protocol = req.protocol,
+                        .authority = req.authority,
+                        .path = req.path,
                     } };
                 }
             },

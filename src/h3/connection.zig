@@ -86,6 +86,9 @@ pub const H3Connection = struct {
     // Streams that have been reported as finished (avoid duplicate events)
     finished_streams: std.AutoHashMap(u64, void),
 
+    // Bidi streams excluded from H3 processing (owned by WT layer)
+    excluded_bidi_streams: std.AutoHashMap(u64, void),
+
     pub fn init(allocator: Allocator, quic_conn: *quic_connection.Connection, is_server: bool) H3Connection {
         return .{
             .allocator = allocator,
@@ -93,6 +96,7 @@ pub const H3Connection = struct {
             .is_server = is_server,
             .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
             .finished_streams = std.AutoHashMap(u64, void).init(allocator),
+            .excluded_bidi_streams = std.AutoHashMap(u64, void).init(allocator),
         };
     }
 
@@ -103,6 +107,7 @@ pub const H3Connection = struct {
         }
         self.stream_bufs.deinit();
         self.finished_streams.deinit();
+        self.excluded_bidi_streams.deinit();
     }
 
     /// Initialize the HTTP/3 connection: open control + QPACK streams, send SETTINGS.
@@ -362,24 +367,28 @@ pub const H3Connection = struct {
 
             // Skip already-finished streams
             if (self.finished_streams.contains(stream_id)) continue;
+            // Skip streams owned by the WebTransport layer
+            if (self.excluded_bidi_streams.contains(stream_id)) continue;
 
             // Read incoming data
-            const data = stream.recv.read() orelse {
+            if (stream.recv.read()) |data| {
+                // Buffer new data
+                var new_buf_ptr = self.stream_bufs.getPtr(stream_id) orelse blk: {
+                    const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                    try self.stream_bufs.put(stream_id, new_buf);
+                    break :blk self.stream_bufs.getPtr(stream_id).?;
+                };
+                try new_buf_ptr.appendSlice(self.allocator, data);
+            } else {
                 // Check if stream is finished
                 if (stream.recv.finished) {
                     try self.finished_streams.put(stream_id, {});
                     return .{ .finished = stream_id };
                 }
-                continue;
-            };
+            }
 
-            // Buffer the data
-            var buf = self.stream_bufs.getPtr(stream_id) orelse blk: {
-                const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-                try self.stream_bufs.put(stream_id, new_buf);
-                break :blk self.stream_bufs.getPtr(stream_id).?;
-            };
-            try buf.appendSlice(self.allocator, data);
+            // Try to parse H3 frames from buffered data (even without new recv data)
+            var buf = self.stream_bufs.getPtr(stream_id) orelse continue;
 
             // Try to parse H3 frames from buffered data
             while (buf.items.len > 0) {
@@ -452,5 +461,6 @@ test "H3Connection: init and deinit" {
     var conn: H3Connection = undefined;
     conn.stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(testing.allocator);
     conn.finished_streams = std.AutoHashMap(u64, void).init(testing.allocator);
+    conn.excluded_bidi_streams = std.AutoHashMap(u64, void).init(testing.allocator);
     conn.deinit();
 }
