@@ -40,12 +40,18 @@ pub const SettingsId = enum(u64) {
     qpack_max_table_capacity = 0x01,
     max_field_section_size = 0x06,
     qpack_blocked_streams = 0x07,
+    enable_connect_protocol = 0x08,
+    h3_datagram = 0x33de,
+    webtransport_max_sessions = 0xc671706a,
 
     pub fn fromInt(v: u64) ?SettingsId {
         return switch (v) {
             0x01 => .qpack_max_table_capacity,
             0x06 => .max_field_section_size,
             0x07 => .qpack_blocked_streams,
+            0x08 => .enable_connect_protocol,
+            0x33de => .h3_datagram,
+            0xc671706a => .webtransport_max_sessions,
             else => null,
         };
     }
@@ -56,6 +62,9 @@ pub const Settings = struct {
     qpack_max_table_capacity: u64 = 0,
     max_field_section_size: ?u64 = null,
     qpack_blocked_streams: u64 = 0,
+    enable_connect_protocol: bool = false,
+    h3_datagram: bool = false,
+    webtransport_max_sessions: ?u64 = null,
 };
 
 /// HTTP/3 frame (RFC 9114 Section 7).
@@ -138,6 +147,9 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
                         .qpack_max_table_capacity => settings.qpack_max_table_capacity = value,
                         .max_field_section_size => settings.max_field_section_size = value,
                         .qpack_blocked_streams => settings.qpack_blocked_streams = value,
+                        .enable_connect_protocol => settings.enable_connect_protocol = (value != 0),
+                        .h3_datagram => settings.h3_datagram = (value != 0),
+                        .webtransport_max_sessions => settings.webtransport_max_sessions = value,
                     }
                 }
                 // Unknown settings are ignored (RFC 9114 Section 7.2.4.1)
@@ -186,7 +198,7 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
         },
         .settings => |s| {
             // Serialize settings to a temp buffer to get length
-            var buf: [64]u8 = undefined;
+            var buf: [128]u8 = undefined;
             var sfbs = io.fixedBufferStream(&buf);
             const sw = sfbs.writer();
 
@@ -200,6 +212,21 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
             if (s.max_field_section_size) |max_size| {
                 try packet.writeVarInt(sw, @intFromEnum(SettingsId.max_field_section_size));
                 try packet.writeVarInt(sw, max_size);
+            }
+
+            if (s.enable_connect_protocol) {
+                try packet.writeVarInt(sw, @intFromEnum(SettingsId.enable_connect_protocol));
+                try packet.writeVarInt(sw, 1);
+            }
+
+            if (s.h3_datagram) {
+                try packet.writeVarInt(sw, @intFromEnum(SettingsId.h3_datagram));
+                try packet.writeVarInt(sw, 1);
+            }
+
+            if (s.webtransport_max_sessions) |max_sessions| {
+                try packet.writeVarInt(sw, @intFromEnum(SettingsId.webtransport_max_sessions));
+                try packet.writeVarInt(sw, max_sessions);
             }
 
             const settings_payload = sfbs.getWritten();
@@ -354,6 +381,28 @@ test "H3Frame: empty SETTINGS" {
     try testing.expectEqual(H3FrameType.settings, std.meta.activeTag(result.frame));
     try testing.expectEqual(@as(u64, 0), result.frame.settings.qpack_max_table_capacity);
     try testing.expect(result.frame.settings.max_field_section_size == null);
+}
+
+test "H3Frame: write and parse SETTINGS with WebTransport fields" {
+    var buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+
+    const settings = Settings{
+        .qpack_max_table_capacity = 0,
+        .qpack_blocked_streams = 0,
+        .enable_connect_protocol = true,
+        .h3_datagram = true,
+        .webtransport_max_sessions = 1,
+    };
+    try write(.{ .settings = settings }, fbs.writer());
+
+    const written = fbs.getWritten();
+    const result = try parse(written);
+
+    try testing.expectEqual(H3FrameType.settings, std.meta.activeTag(result.frame));
+    try testing.expect(result.frame.settings.enable_connect_protocol);
+    try testing.expect(result.frame.settings.h3_datagram);
+    try testing.expectEqual(@as(u64, 1), result.frame.settings.webtransport_max_sessions.?);
 }
 
 test "UniStreamType: write and read" {
