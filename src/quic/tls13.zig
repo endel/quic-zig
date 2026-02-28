@@ -2,16 +2,20 @@
 //
 // Supports TLS_AES_128_GCM_SHA256 (0x1301) only.
 // ECDSA P-256 for signatures, X25519 for key exchange.
-// No certificate chain validation (accepts self-signed).
+// X.509 certificate chain validation via std.crypto.Certificate.
 
 const std = @import("std");
 const crypto = std.crypto;
 const quic_crypto = @import("crypto.zig");
 const transport_params = @import("transport_params.zig");
 
+const Certificate = std.crypto.Certificate;
+
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = crypto.hash.sha2.Sha256;
+const Sha384 = crypto.hash.sha2.Sha384;
+const Sha512 = crypto.hash.sha2.Sha512;
 const X25519 = crypto.dh.X25519;
 const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
@@ -54,6 +58,50 @@ const TLS13_VERSION: u16 = 0x0304;
 const CIPHER_SUITE_AES128_GCM_SHA256: u16 = 0x1301;
 
 pub const EncryptionLevel = quic_crypto.EncryptionLevel;
+
+// ─── CertificateVerify signature verification ────────────────────────
+
+fn verifyCertificateVerifySignature(
+    pub_key_bytes: []const u8,
+    pub_key_algo: Certificate.AlgorithmCategory,
+    sig_algo: u16,
+    sig_bytes: []const u8,
+    signed_content: []const u8,
+) HandshakeError!void {
+    switch (sig_algo) {
+        SIG_ECDSA_P256_SHA256 => {
+            if (pub_key_algo != .X9_62_id_ecPublicKey) return error.BadCertificateVerify;
+            const pub_key = EcdsaP256Sha256.PublicKey.fromSec1(pub_key_bytes) catch return error.BadCertificateVerify;
+            const sig = EcdsaP256Sha256.Signature.fromDer(sig_bytes) catch return error.BadCertificateVerify;
+            sig.verify(signed_content, pub_key) catch return error.BadCertificateVerify;
+        },
+        SIG_RSA_PSS_RSAE_SHA256 => verifyRsaPss(pub_key_bytes, pub_key_algo, sig_bytes, signed_content, Sha256) catch return error.BadCertificateVerify,
+        SIG_RSA_PSS_RSAE_SHA384 => verifyRsaPss(pub_key_bytes, pub_key_algo, sig_bytes, signed_content, Sha384) catch return error.BadCertificateVerify,
+        SIG_RSA_PSS_RSAE_SHA512 => verifyRsaPss(pub_key_bytes, pub_key_algo, sig_bytes, signed_content, Sha512) catch return error.BadCertificateVerify,
+        else => return error.BadCertificateVerify,
+    }
+}
+
+fn verifyRsaPss(
+    pub_key_bytes: []const u8,
+    pub_key_algo: Certificate.AlgorithmCategory,
+    sig_bytes: []const u8,
+    signed_content: []const u8,
+    comptime Hash: type,
+) !void {
+    if (pub_key_algo != .rsaEncryption) return error.BadCertificateVerify;
+    const rsa = Certificate.rsa;
+    const pk_components = rsa.PublicKey.parseDer(pub_key_bytes) catch return error.BadCertificateVerify;
+    const public_key = rsa.PublicKey.fromBytes(pk_components.exponent, pk_components.modulus) catch return error.BadCertificateVerify;
+
+    switch (pk_components.modulus.len) {
+        inline 128, 256, 384, 512 => |modulus_len| {
+            if (sig_bytes.len != modulus_len) return error.BadCertificateVerify;
+            rsa.PSSSignature.verify(modulus_len, sig_bytes[0..modulus_len].*, signed_content, public_key, Hash) catch return error.BadCertificateVerify;
+        },
+        else => return error.BadCertificateVerify,
+    }
+}
 
 // ─── TranscriptHash ──────────────────────────────────────────────────
 
@@ -179,6 +227,8 @@ pub const TlsConfig = struct {
     private_key_bytes: []const u8, // Raw ECDSA P-256 private key (32 bytes)
     alpn: []const []const u8,
     server_name: ?[]const u8 = null, // SNI (client only)
+    skip_cert_verify: bool = true, // Skip X.509 chain + CertificateVerify validation
+    ca_bundle: ?*Certificate.Bundle = null, // Caller-owned CA bundle for trust anchor verification
 };
 
 // ─── Handshake state machine ─────────────────────────────────────────
@@ -277,6 +327,11 @@ pub const Tls13Handshake = struct {
     // Server hello random
     server_random: [32]u8 = undefined,
 
+    // Leaf certificate public key (extracted during Certificate processing)
+    leaf_pub_key_buf: [600]u8 = undefined,
+    leaf_pub_key_len: u16 = 0,
+    leaf_pub_key_algo: Certificate.AlgorithmCategory = .X9_62_id_ecPublicKey,
+
     // Transcript hash at server Finished for app key derivation
     transcript_at_server_finished: [32]u8 = undefined,
 
@@ -299,6 +354,7 @@ pub const Tls13Handshake = struct {
         self.pending_install_app = false;
         self.handshake_keys_installed = false;
         self.app_keys_installed = false;
+        self.leaf_pub_key_len = 0;
 
         // Pre-encode transport params to avoid dangling slices after struct move
         var tp_fbs = std.io.fixedBufferStream(&self.tp_encoded);
@@ -335,6 +391,7 @@ pub const Tls13Handshake = struct {
         self.pending_install_app = false;
         self.handshake_keys_installed = false;
         self.app_keys_installed = false;
+        self.leaf_pub_key_len = 0;
 
         // Pre-encode transport params to avoid dangling slices after struct move
         var tp_fbs = std.io.fixedBufferStream(&self.tp_encoded);
@@ -541,8 +598,76 @@ pub const Tls13Handshake = struct {
 
         if (msg[0] != @intFromEnum(MsgType.certificate)) return error.UnexpectedMessage;
 
-        // We don't validate the certificate chain - just record in transcript
-        // In a production implementation, you would verify the chain here.
+        const body = msg[4..];
+        if (body.len < 4) return error.DecodeError;
+
+        // Parse Certificate message body (RFC 8446 §4.4.2)
+        const context_len = body[0];
+        var pos: usize = 1 + context_len;
+        if (pos + 3 > body.len) return error.DecodeError;
+
+        const cert_list_len = (@as(usize, body[pos]) << 16) | (@as(usize, body[pos + 1]) << 8) | @as(usize, body[pos + 2]);
+        pos += 3;
+
+        if (pos + cert_list_len > body.len) return error.DecodeError;
+
+        const cert_list_end = pos + cert_list_len;
+        var cert_index: usize = 0;
+        var prev_parsed: ?Certificate.Parsed = null;
+
+        while (pos < cert_list_end) {
+            if (pos + 3 > cert_list_end) return error.DecodeError;
+            const cert_data_len = (@as(usize, body[pos]) << 16) | (@as(usize, body[pos + 1]) << 8) | @as(usize, body[pos + 2]);
+            pos += 3;
+
+            if (pos + cert_data_len > cert_list_end) return error.DecodeError;
+            const cert_der = body[pos..][0..cert_data_len];
+            pos += cert_data_len;
+
+            // Skip per-certificate extensions
+            if (pos + 2 > cert_list_end) return error.DecodeError;
+            const ext_len = (@as(usize, body[pos]) << 8) | @as(usize, body[pos + 1]);
+            pos += 2 + ext_len;
+
+            if (!self.config.skip_cert_verify) {
+                const cert: Certificate = .{ .buffer = cert_der, .index = 0 };
+                const parsed = cert.parse() catch return error.BadCertificate;
+
+                if (cert_index == 0) {
+                    // Leaf cert: extract public key for CertificateVerify
+                    const pub_key = parsed.pubKey();
+                    if (pub_key.len <= self.leaf_pub_key_buf.len) {
+                        @memcpy(self.leaf_pub_key_buf[0..pub_key.len], pub_key);
+                        self.leaf_pub_key_len = @intCast(pub_key.len);
+                        self.leaf_pub_key_algo = std.meta.activeTag(parsed.pub_key_algo);
+                    }
+
+                    // Verify hostname if SNI was set
+                    if (self.config.server_name) |server_name| {
+                        parsed.verifyHostName(server_name) catch return error.BadCertificate;
+                    }
+                }
+
+                // Chain validation: verify each cert against its issuer
+                if (prev_parsed) |prev| {
+                    const now_sec = std.time.timestamp();
+                    prev.verify(parsed, now_sec) catch return error.BadCertificate;
+                }
+
+                // If this is the last cert, verify against CA bundle
+                if (pos >= cert_list_end) {
+                    if (self.config.ca_bundle) |bundle| {
+                        const now_sec = std.time.timestamp();
+                        bundle.verify(parsed, now_sec) catch return error.BadCertificate;
+                    }
+                }
+
+                prev_parsed = parsed;
+            }
+
+            cert_index += 1;
+        }
+
         self.transcript.update(msg);
         self.state = .client_wait_certificate_verify;
         return ._continue;
@@ -553,7 +678,35 @@ pub const Tls13Handshake = struct {
 
         if (msg[0] != @intFromEnum(MsgType.certificate_verify)) return error.UnexpectedMessage;
 
-        // We skip actual signature verification for now (no cert validation)
+        if (!self.config.skip_cert_verify and self.leaf_pub_key_len > 0) {
+            // Get transcript hash BEFORE updating with CertificateVerify
+            const transcript_hash = self.transcript.current();
+
+            const body = msg[4..];
+            if (body.len < 4) return error.DecodeError;
+
+            const sig_algo = (@as(u16, body[0]) << 8) | @as(u16, body[1]);
+            const sig_len = (@as(usize, body[2]) << 8) | @as(usize, body[3]);
+            if (body.len < 4 + sig_len) return error.DecodeError;
+            const sig_bytes = body[4..][0..sig_len];
+
+            // Build signed content: 64 spaces + label + 0x00 + transcript_hash
+            const label = "TLS 1.3, server CertificateVerify";
+            var signed_content: [64 + label.len + 1 + 32]u8 = undefined;
+            @memset(signed_content[0..64], 0x20);
+            @memcpy(signed_content[64..][0..label.len], label);
+            signed_content[64 + label.len] = 0x00;
+            @memcpy(signed_content[64 + label.len + 1 ..][0..32], &transcript_hash);
+
+            verifyCertificateVerifySignature(
+                self.leaf_pub_key_buf[0..self.leaf_pub_key_len],
+                self.leaf_pub_key_algo,
+                sig_algo,
+                sig_bytes,
+                &signed_content,
+            ) catch return error.BadCertificateVerify;
+        }
+
         self.transcript.update(msg);
         self.state = .client_wait_finished;
         return ._continue;
