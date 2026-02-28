@@ -215,4 +215,6 @@ test {
     _ = @import("quic/packet_packer.zig");
     _ = @import("quic/tls13.zig");
     _ = @import("quic/mtu.zig");
+    _ = @import("h3/frame.zig");
+    _ = @import("h3/qpack.zig");
 }
