@@ -19,6 +19,7 @@ const crypto_stream = @import("crypto_stream.zig");
 const transport_params = @import("transport_params.zig");
 const packet_packer = @import("packet_packer.zig");
 const quic_crypto = @import("crypto.zig");
+const mtu_mod = @import("mtu.zig");
 
 pub const State = enum(u8) {
     first_flight = 0,
@@ -265,6 +266,9 @@ pub const Connection = struct {
 
     // Key update manager for 1-RTT key rotation (RFC 9001 Section 6)
     key_update: ?quic_crypto.KeyUpdateManager = null,
+
+    // Path MTU Discovery (DPLPMTUD, RFC 8899)
+    mtu_discoverer: mtu_mod.MtuDiscoverer = .{},
 
     // Connection state
     got_peer_conn_id: bool = false,
@@ -543,8 +547,19 @@ pub const Connection = struct {
                     now,
                 );
 
-                // Notify congestion controller and track key update ACKs
+                // Notify congestion controller, track key update ACKs, and PMTUD
+                var has_non_probe_loss = false;
                 for (result.acked.constSlice()) |pkt| {
+                    // Check if this is an MTU probe ACK
+                    if (self.mtu_discoverer.onProbeAcked(pkt.pn, now)) {
+                        // Probe succeeded — update packet size and congestion controller
+                        const new_mtu = self.mtu_discoverer.current_mtu;
+                        self.packer.max_packet_size = new_mtu;
+                        self.cc.setMaxDatagramSize(new_mtu);
+                        self.pacer.max_datagram_size = new_mtu;
+                        std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
+                    }
+
                     self.cc.onPacketAcked(pkt.size, pkt.pn);
 
                     // Track whether a packet sent with current keys has been ACKed
@@ -559,7 +574,16 @@ pub const Connection = struct {
                     }
                 }
 
-                if (result.lost.len > 0) {
+                for (result.lost.constSlice()) |pkt| {
+                    // Check if this is an MTU probe loss — don't trigger CC
+                    if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {
+                        std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
+                    } else {
+                        has_non_probe_loss = true;
+                    }
+                }
+
+                if (has_non_probe_loss) {
                     if (self.pkt_handler.sent[@intFromEnum(enc_level)].largest_sent) |ls| {
                         self.cc.onCongestionEvent(ls);
                     }
@@ -948,6 +972,10 @@ pub const Connection = struct {
                             peer_tp.initial_max_data,
                         });
                     }
+
+                    // Start PMTUD now that the handshake is complete
+                    self.mtu_discoverer.start();
+
                     break;
                 },
                 ._continue => continue,
@@ -1088,6 +1116,32 @@ pub const Connection = struct {
             }
         }
 
+        // PMTUD: send a probe if it's time (separate datagram from regular data)
+        if (app_seal != null and bytes_written == 0) {
+            const srtt = self.pkt_handler.rtt_stats.smoothedRttOrDefault();
+            if (self.mtu_discoverer.shouldProbe(now, srtt)) {
+                const probe_size: usize = self.mtu_discoverer.nextProbeSize();
+                if (out_buf.len >= probe_size) {
+                    const result = try self.packer.packMtuProbe(
+                        out_buf,
+                        probe_size,
+                        &self.pkt_handler,
+                        app_seal.?,
+                        now,
+                    );
+                    if (result.bytes_written > 0) {
+                        self.mtu_discoverer.onProbeSent(result.pn, @intCast(probe_size), now);
+                        self.paths[self.active_path_idx].bytes_sent += result.bytes_written;
+                        std.log.info("PMTUD: sent probe size={d} pn={d}", .{ probe_size, result.pn });
+                        return result.bytes_written;
+                    }
+                }
+            }
+        }
+
+        // Check PMTUD raise timer
+        self.mtu_discoverer.checkRaiseTimer(now);
+
         return bytes_written;
     }
 
@@ -1128,13 +1182,15 @@ pub const Connection = struct {
         const challenge = self.paths[candidate_idx].validator.startChallenge();
         self.pending_frames.push(.{ .path_challenge = challenge });
 
-        // Reset CC/RTT if IP address changed (not just port — NAT rebinding preserves CC)
+        // Reset CC/RTT/MTU if IP address changed (not just port — NAT rebinding preserves CC)
         const old_path = &self.paths[1 - candidate_idx];
         if (!sockaddrSameIp(&new_peer_addr, &old_path.peer_addr)) {
             self.cc = congestion.NewReno.init();
             self.pacer = congestion.Pacer.init();
             self.pkt_handler.rtt_stats = rtt.RttStats{};
-            std.log.info("migration: IP changed, reset CC and RTT", .{});
+            self.mtu_discoverer.reset();
+            self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
+            std.log.info("migration: IP changed, reset CC, RTT and MTU", .{});
         } else {
             std.log.info("migration: port-only change (NAT rebinding), preserving CC", .{});
         }

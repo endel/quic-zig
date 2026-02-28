@@ -11,8 +11,11 @@ const ack_handler = @import("ack_handler.zig");
 const crypto_stream = @import("crypto_stream.zig");
 const stream_mod = @import("stream.zig");
 
-/// Maximum QUIC packet size (UDP payload).
-const MAX_PACKET_SIZE: usize = 1200;
+/// Default QUIC packet size (UDP payload).
+const DEFAULT_MAX_PACKET_SIZE: usize = 1200;
+
+/// Absolute maximum packet size we ever assemble (probes included).
+const ABSOLUTE_MAX_PACKET_SIZE: usize = 1500;
 
 /// Minimum Initial packet size for client.
 const MIN_INITIAL_PACKET_SIZE: usize = 1200;
@@ -56,6 +59,9 @@ pub const PacketPacker = struct {
 
     /// Current key phase bit for 1-RTT packets (toggled on key update).
     key_phase: bool = false,
+
+    /// Maximum packet size for regular (non-probe) packets.
+    max_packet_size: usize = DEFAULT_MAX_PACKET_SIZE,
 
     pub fn init(
         allocator: Allocator,
@@ -173,8 +179,9 @@ pub const PacketPacker = struct {
         if (buf.len < 64) return 0; // Not enough space
 
         // We build the packet in a temporary buffer, then encrypt into buf
-        var tmp: [MAX_PACKET_SIZE]u8 = undefined;
-        var fbs = io.fixedBufferStream(&tmp);
+        var tmp: [ABSOLUTE_MAX_PACKET_SIZE]u8 = undefined;
+        const effective_max = @min(self.max_packet_size, tmp.len);
+        var fbs = io.fixedBufferStream(tmp[0..effective_max]);
         const writer = fbs.writer();
 
         // Get packet number and encode it
@@ -256,7 +263,7 @@ pub const PacketPacker = struct {
             .application => 3,
         };
         const cs = crypto_mgr.getStream(crypto_level_idx);
-        const remaining = tmp.len - fbs.pos - AEAD_TAG_LEN - 4;
+        const remaining = effective_max - fbs.pos - AEAD_TAG_LEN - 4;
         if (remaining > 0) {
             if (cs.popCryptoFrame(remaining)) |crypto_frame| {
                 try crypto_frame.write(writer);
@@ -286,8 +293,8 @@ pub const PacketPacker = struct {
             var stream_it = streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| {
                 const s = s_ptr.*;
-                if (fbs.pos + AEAD_TAG_LEN + 16 >= tmp.len) break;
-                const max_stream_data = tmp.len - fbs.pos - AEAD_TAG_LEN - 8;
+                if (fbs.pos + AEAD_TAG_LEN + 16 >= effective_max) break;
+                const max_stream_data = effective_max - fbs.pos - AEAD_TAG_LEN - 8;
                 if (s.send.popStreamFrame(max_stream_data)) |stream_frame| {
                     const sf = stream_frame.stream;
                     std.log.info("packing STREAM frame: id={d}, offset={d}, len={d}, fin={}, data_len={d}", .{
@@ -381,6 +388,81 @@ pub const PacketPacker = struct {
         return total_packet_len;
     }
 
+    /// Pack an MTU probe packet (1-RTT PING + PADDING to target size).
+    /// Returns the total bytes written and the packet number used.
+    pub fn packMtuProbe(
+        self: *PacketPacker,
+        buf: []u8,
+        target_size: usize,
+        pkt_handler: *ack_handler.PacketHandler,
+        seal: crypto_mod.Seal,
+        now: i64,
+    ) !struct { bytes_written: usize, pn: u64 } {
+        if (buf.len < target_size or target_size < 64) return .{ .bytes_written = 0, .pn = 0 };
+
+        var tmp: [ABSOLUTE_MAX_PACKET_SIZE]u8 = undefined;
+        const effective_max = @min(target_size, tmp.len);
+        var fbs = io.fixedBufferStream(tmp[0..effective_max]);
+        const writer = fbs.writer();
+
+        const pn = pkt_handler.nextPacketNumber(.application);
+        const largest_acked = pkt_handler.getLargestAcked(.application);
+        var pn_buf: [4]u8 = undefined;
+        const pn_len = crypto_mod.encodePacketNumber(pn, largest_acked, &pn_buf);
+
+        // Short header (1-RTT)
+        var first_byte: u8 = packet_mod.FIXED_BIT;
+        if (self.key_phase) first_byte |= packet_mod.KEY_PHASE_BIT;
+        first_byte |= @as(u8, @intCast(pn_len - 1));
+        try writer.writeByte(first_byte);
+        try writer.writeAll(self.getDcid());
+
+        const pn_offset = fbs.pos;
+        try writer.writeAll(pn_buf[0..pn_len]);
+
+        const payload_start = fbs.pos;
+
+        // PING frame (makes it ACK-eliciting)
+        try packet_mod.writeVarInt(writer, 0x01);
+
+        // Fill remaining space with PADDING to reach target_size
+        const overhead = payload_start + AEAD_TAG_LEN;
+        if (target_size > overhead) {
+            const pad_needed = target_size - overhead - (fbs.pos - payload_start);
+            var p: usize = 0;
+            while (p < pad_needed) : (p += 1) {
+                try writer.writeByte(0x00);
+            }
+        }
+
+        const plaintext_payload = tmp[payload_start..fbs.pos];
+        const header_bytes = tmp[0..payload_start];
+
+        // Copy header
+        @memcpy(buf[0..header_bytes.len], header_bytes);
+        @memcpy(buf[pn_offset..][0..pn_len], pn_buf[0..pn_len]);
+
+        // Encrypt
+        const encrypted_start = pn_offset + pn_len;
+        const ad = buf[0..(pn_offset + pn_len)];
+        const encrypted_len = seal.encryptPayload(pn, ad, plaintext_payload, buf[encrypted_start..]);
+        const total_len = encrypted_start + encrypted_len;
+
+        // Apply header protection
+        crypto_mod.applyHeaderProtection(buf[0..total_len], pn_offset, pn_len, seal.hp_key);
+
+        // Record as sent (in_flight but special — caller handles probe loss separately)
+        try pkt_handler.onPacketSent(.{
+            .pn = pn,
+            .time_sent = now,
+            .size = @intCast(total_len),
+            .ack_eliciting = true,
+            .in_flight = true,
+            .enc_level = .application,
+        });
+
+        return .{ .bytes_written = total_len, .pn = pn };
+    }
 };
 
 // Tests
