@@ -37,6 +37,38 @@ pub fn build(b: *std.Build) void {
     const run_client_step = b.step("run-client", "Run QUIC client");
     run_client_step.dependOn(&run_client.step);
 
+    // WebTransport server
+    const exe_wt_server = b.addExecutable(.{
+        .name = "wt-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wt_server.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(exe_wt_server);
+
+    const run_wt_server = b.addRunArtifact(exe_wt_server);
+    run_wt_server.step.dependOn(b.getInstallStep());
+    const run_wt_server_step = b.step("run-wt-server", "Run WebTransport server");
+    run_wt_server_step.dependOn(&run_wt_server.step);
+
+    // WebTransport client
+    const exe_wt_client = b.addExecutable(.{
+        .name = "wt-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wt_client.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(exe_wt_client);
+
+    const run_wt_client = b.addRunArtifact(exe_wt_client);
+    run_wt_client.step.dependOn(b.getInstallStep());
+    const run_wt_client_step = b.step("run-wt-client", "Run WebTransport client");
+    run_wt_client_step.dependOn(&run_wt_client.step);
+
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/server.zig"),
