@@ -11,6 +11,7 @@ const h3 = @import("h3/connection.zig");
 const h3_frame = @import("h3/frame.zig");
 const qpack = @import("h3/qpack.zig");
 const wt = @import("webtransport/session.zig");
+const Certificate = std.crypto.Certificate;
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
 
@@ -31,10 +32,18 @@ pub fn main() !void {
     const alpn = try alloc.alloc([]const u8, 1);
     alpn[0] = "h3";
 
+    // Load CA bundle for certificate verification
+    var ca_bundle: Certificate.Bundle = .{};
+    defer ca_bundle.deinit(alloc);
+    try ca_bundle.addCertsFromFilePath(alloc, std.fs.cwd(), "interop/certs/ca.crt");
+
     const tls_config: tls13.TlsConfig = .{
         .cert_chain_der = &.{},
         .private_key_bytes = &.{},
         .alpn = alpn,
+        .server_name = "localhost",
+        .skip_cert_verify = false,
+        .ca_bundle = &ca_bundle,
     };
 
     // Create client connection with datagram support
