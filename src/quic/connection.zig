@@ -62,6 +62,76 @@ pub const NetworkPath = struct {
     }
 };
 
+pub const ConnectionIdEntry = struct {
+    cid_buf: [20]u8 = .{0} ** 20,
+    cid_len: u8 = 0,
+    seq_num: u64 = 0,
+    stateless_reset_token: [16]u8 = .{0} ** 16,
+    in_use: bool = false,
+    occupied: bool = false,
+
+    pub fn getCid(self: *const ConnectionIdEntry) []const u8 {
+        return self.cid_buf[0..self.cid_len];
+    }
+};
+
+pub const ConnectionIdPool = struct {
+    const MAX_POOL_SIZE: usize = 8;
+
+    entries: [MAX_POOL_SIZE]ConnectionIdEntry = .{ConnectionIdEntry{}} ** MAX_POOL_SIZE,
+
+    pub fn addPeerCid(self: *ConnectionIdPool, seq_num: u64, cid: []const u8, reset_token: [16]u8) void {
+        // Find a free slot
+        for (&self.entries) |*entry| {
+            if (!entry.occupied) {
+                entry.occupied = true;
+                entry.in_use = false;
+                entry.seq_num = seq_num;
+                entry.cid_len = @intCast(cid.len);
+                @memcpy(entry.cid_buf[0..cid.len], cid);
+                entry.stateless_reset_token = reset_token;
+                return;
+            }
+        }
+        // Pool full — drop silently
+    }
+
+    pub fn consumeUnused(self: *ConnectionIdPool) ?*ConnectionIdEntry {
+        for (&self.entries) |*entry| {
+            if (entry.occupied and !entry.in_use) {
+                entry.in_use = true;
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    pub fn retirePriorTo(self: *ConnectionIdPool, seq: u64) void {
+        for (&self.entries) |*entry| {
+            if (entry.occupied and entry.seq_num < seq) {
+                entry.* = ConnectionIdEntry{};
+            }
+        }
+    }
+
+    pub fn removeBySeq(self: *ConnectionIdPool, seq: u64) void {
+        for (&self.entries) |*entry| {
+            if (entry.occupied and entry.seq_num == seq) {
+                entry.* = ConnectionIdEntry{};
+                return;
+            }
+        }
+    }
+
+    pub fn count(self: *const ConnectionIdPool) usize {
+        var n: usize = 0;
+        for (&self.entries) |*entry| {
+            if (entry.occupied) n += 1;
+        }
+        return n;
+    }
+};
+
 pub const ConnectionError = struct {
     is_app: bool,
     code: u64,
@@ -130,6 +200,9 @@ pub const Connection = struct {
 
     // Pending control frames queue
     pending_frames: frame_mod.PendingFrameQueue = .{},
+
+    // Pool of peer-issued connection IDs for migration
+    peer_cid_pool: ConnectionIdPool = .{},
 
     // Key update manager for 1-RTT key rotation (RFC 9001 Section 6)
     key_update: ?quic_crypto.KeyUpdateManager = null,
@@ -501,7 +574,12 @@ pub const Connection = struct {
                         self.pending_frames.push(.{ .retire_connection_id = seq });
                     }
                     self.active_cid_seq = ncid.retire_prior_to;
+                    self.peer_cid_pool.retirePriorTo(ncid.retire_prior_to);
                 }
+
+                // Store CID in pool for future migration use
+                self.peer_cid_pool.addPeerCid(ncid.seq_num, ncid.conn_id, ncid.stateless_reset_token);
+                std.log.info("stored peer CID in pool from NEW_CONNECTION_ID seq={d}, pool_size={d}", .{ ncid.seq_num, self.peer_cid_pool.count() });
 
                 // Update DCID if this is a new active CID
                 if (ncid.seq_num >= self.active_cid_seq) {
@@ -511,8 +589,7 @@ pub const Connection = struct {
             },
 
             .retire_connection_id => |rcid| {
-                _ = rcid;
-                // TODO: retire old connection IDs
+                std.log.info("peer retired connection ID seq={d}", .{rcid.seq_num});
             },
 
             .path_challenge => |data| {
@@ -1167,4 +1244,60 @@ test "Connection: init and basic state" {
     try std.testing.expectEqual(conn.state, .first_flight);
     try std.testing.expect(!conn.isClosed());
     try std.testing.expect(!conn.isDraining());
+}
+
+// ConnectionIdPool tests
+test "ConnectionIdPool: add and consume" {
+    var pool = ConnectionIdPool{};
+    const cid1 = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const token1 = [_]u8{0xAA} ** 16;
+    pool.addPeerCid(1, &cid1, token1);
+
+    try std.testing.expectEqual(@as(usize, 1), pool.count());
+
+    const entry = pool.consumeUnused();
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualSlices(u8, &cid1, entry.?.getCid());
+    try std.testing.expect(entry.?.in_use);
+
+    // No more unused entries
+    try std.testing.expect(pool.consumeUnused() == null);
+}
+
+test "ConnectionIdPool: retire prior to" {
+    var pool = ConnectionIdPool{};
+    const token = [_]u8{0} ** 16;
+    pool.addPeerCid(0, &[_]u8{ 0x01, 0x02 }, token);
+    pool.addPeerCid(1, &[_]u8{ 0x03, 0x04 }, token);
+    pool.addPeerCid(2, &[_]u8{ 0x05, 0x06 }, token);
+
+    try std.testing.expectEqual(@as(usize, 3), pool.count());
+    pool.retirePriorTo(2);
+    try std.testing.expectEqual(@as(usize, 1), pool.count());
+
+    const entry = pool.consumeUnused();
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqual(@as(u64, 2), entry.?.seq_num);
+}
+
+test "ConnectionIdPool: remove by seq" {
+    var pool = ConnectionIdPool{};
+    const token = [_]u8{0} ** 16;
+    pool.addPeerCid(5, &[_]u8{ 0x01, 0x02, 0x03 }, token);
+    pool.addPeerCid(6, &[_]u8{ 0x04, 0x05, 0x06 }, token);
+
+    try std.testing.expectEqual(@as(usize, 2), pool.count());
+    pool.removeBySeq(5);
+    try std.testing.expectEqual(@as(usize, 1), pool.count());
+}
+
+test "ConnectionIdPool: pool full" {
+    var pool = ConnectionIdPool{};
+    const token = [_]u8{0} ** 16;
+    var i: u64 = 0;
+    while (i < ConnectionIdPool.MAX_POOL_SIZE + 2) : (i += 1) {
+        pool.addPeerCid(i, &[_]u8{@intCast(i)}, token);
+    }
+    // Should cap at MAX_POOL_SIZE
+    try std.testing.expectEqual(ConnectionIdPool.MAX_POOL_SIZE, pool.count());
 }

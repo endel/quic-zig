@@ -640,6 +640,7 @@ pub fn parseFrames(bytes: []u8, comptime handler: fn (Frame) anyerror!void) !voi
 /// Uses value types only (no slices) to avoid dangling references.
 pub const PendingControlFrame = union(enum) {
     ping: void,
+    path_challenge: [8]u8,
     path_response: [8]u8,
     retire_connection_id: u64,
     connection_close: struct {
@@ -657,6 +658,7 @@ pub const PendingControlFrame = union(enum) {
     pub fn toFrame(self: PendingControlFrame) Frame {
         return switch (self) {
             .ping => .{ .ping = {} },
+            .path_challenge => |data| .{ .path_challenge = data },
             .path_response => |data| .{ .path_response = data },
             .retire_connection_id => |seq| .{ .retire_connection_id = .{ .seq_num = seq } },
             .connection_close => |cc| if (cc.is_app)
