@@ -29,6 +29,61 @@ pub const State = enum(u8) {
     terminated = 5,
 };
 
+pub const PathValidationState = enum {
+    idle,
+    pending,
+    validated,
+    failed,
+};
+
+pub const PathValidator = struct {
+    challenge_data: [8]u8 = .{0} ** 8,
+    state: PathValidationState = .idle,
+    challenge_sent_time: i64 = 0,
+    retries: u8 = 0,
+
+    const MAX_RETRIES: u8 = 3;
+
+    pub fn startChallenge(self: *PathValidator) [8]u8 {
+        crypto.random.bytes(&self.challenge_data);
+        self.state = .pending;
+        self.challenge_sent_time = @intCast(std.time.nanoTimestamp());
+        self.retries = 0;
+        return self.challenge_data;
+    }
+
+    pub fn handleResponse(self: *PathValidator, data: [8]u8) bool {
+        if (self.state != .pending) return false;
+        if (std.mem.eql(u8, &data, &self.challenge_data)) {
+            self.state = .validated;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn checkTimeout(self: *PathValidator, now: i64, pto_ns: i64) void {
+        if (self.state != .pending) return;
+        if (self.retries >= MAX_RETRIES) {
+            const elapsed = now - self.challenge_sent_time;
+            if (elapsed > pto_ns) {
+                self.state = .failed;
+            }
+        }
+    }
+
+    pub fn needsRetry(self: *const PathValidator, now: i64, pto_ns: i64) bool {
+        if (self.state != .pending) return false;
+        if (self.retries >= MAX_RETRIES) return false;
+        const elapsed = now - self.challenge_sent_time;
+        return elapsed > pto_ns;
+    }
+
+    pub fn retry(self: *PathValidator) void {
+        self.retries += 1;
+        self.challenge_sent_time = @intCast(std.time.nanoTimestamp());
+    }
+};
+
 pub const NetworkPath = struct {
     local_addr: posix.sockaddr,
     peer_addr: posix.sockaddr,
@@ -42,6 +97,9 @@ pub const NetworkPath = struct {
 
     /// Whether the path has been validated (e.g., by Retry or handshake completion).
     is_validated: bool = false,
+
+    /// Path validation state machine.
+    validator: PathValidator = .{},
 
     pub fn init(
         local_addr: posix.sockaddr,
@@ -175,8 +233,9 @@ pub const Connection = struct {
     // TLS 1.3 handshake (null if not configured with TlsConfig)
     tls13_hs: ?tls13.Tls13Handshake = null,
 
-    // Network paths
-    paths: [1]NetworkPath = .{undefined},
+    // Network paths (active + candidate for migration)
+    paths: [2]NetworkPath = .{ undefined, undefined },
+    active_path_idx: u8 = 0,
 
     // Packet number spaces and crypto
     pkt_num_spaces: [3]packet.PacketNumSpace = .{
@@ -235,7 +294,7 @@ pub const Connection = struct {
             .allocator = allocator,
             .version = header.version,
             .is_server = is_server,
-            .paths = .{initial_path},
+            .paths = .{ initial_path, undefined },
             .creation_time = now,
             .last_packet_received_time = now,
 
@@ -387,7 +446,7 @@ pub const Connection = struct {
         }
 
         // Update network path stats
-        self.paths[0].bytes_received += @intCast(fbs.buffer.len);
+        self.paths[self.active_path_idx].bytes_received += @intCast(fbs.buffer.len);
 
         // Check for duplicate
         if (self.pkt_handler.recv[@intFromEnum(enc_level)].isDuplicate(header.packet_number)) {
@@ -596,7 +655,15 @@ pub const Connection = struct {
                 self.pending_frames.push(.{ .path_response = data });
             },
 
-            .path_response => {},
+            .path_response => |data| {
+                for (&self.paths) |*path| {
+                    if (path.validator.handleResponse(data)) {
+                        path.is_validated = true;
+                        std.log.info("path validated via PATH_RESPONSE", .{});
+                        break;
+                    }
+                }
+            },
 
             .connection_close => |cc| {
                 std.log.err("CONNECTION_CLOSE: error_code=0x{x}, frame_type=0x{x}, reason_len={d}, reason={s}", .{
@@ -813,7 +880,7 @@ pub const Connection = struct {
                 .complete => {
                     self.state = .connected;
                     self.handshake_confirmed = true;
-                    self.paths[0].is_validated = true;
+                    self.paths[self.active_path_idx].is_validated = true;
                     self.pkt_handler.dropSpace(.initial);
                     self.pkt_handler.dropSpace(.handshake);
 
@@ -987,7 +1054,7 @@ pub const Connection = struct {
         );
 
         if (bytes_written > 0) {
-            self.paths[0].bytes_sent += bytes_written;
+            self.paths[self.active_path_idx].bytes_sent += bytes_written;
             self.pacer.onPacketSent(bytes_written, now);
 
             // Track packets sent with current keys for key update
@@ -1028,6 +1095,16 @@ pub const Connection = struct {
                 self.pkt_handler.pto_count += 1;
                 self.pending_frames.push(.{ .ping = {} });
             }
+        }
+
+        // Check path validation timeouts
+        const pto_ns = self.pkt_handler.rtt_stats.pto();
+        for (&self.paths) |*path| {
+            if (path.validator.needsRetry(now, pto_ns)) {
+                path.validator.retry();
+                self.pending_frames.push(.{ .path_challenge = path.validator.challenge_data });
+            }
+            path.validator.checkTimeout(now, pto_ns);
         }
     }
 
@@ -1300,4 +1377,37 @@ test "ConnectionIdPool: pool full" {
     }
     // Should cap at MAX_POOL_SIZE
     try std.testing.expectEqual(ConnectionIdPool.MAX_POOL_SIZE, pool.count());
+}
+
+// PathValidator tests
+test "PathValidator: challenge and response" {
+    var validator = PathValidator{};
+    const challenge = validator.startChallenge();
+
+    try std.testing.expectEqual(PathValidationState.pending, validator.state);
+    try std.testing.expect(validator.handleResponse(challenge));
+    try std.testing.expectEqual(PathValidationState.validated, validator.state);
+}
+
+test "PathValidator: wrong response" {
+    var validator = PathValidator{};
+    _ = validator.startChallenge();
+
+    const wrong_data = [_]u8{0xFF} ** 8;
+    try std.testing.expect(!validator.handleResponse(wrong_data));
+    try std.testing.expectEqual(PathValidationState.pending, validator.state);
+}
+
+test "PathValidator: needs retry" {
+    var validator = PathValidator{};
+    _ = validator.startChallenge();
+    // Simulate time passing by setting challenge_sent_time far in the past
+    validator.challenge_sent_time = 0;
+
+    const now: i64 = 1_000_000_000; // 1s
+    const pto: i64 = 100_000_000; // 100ms
+    try std.testing.expect(validator.needsRetry(now, pto));
+
+    validator.retry();
+    try std.testing.expectEqual(@as(u8, 1), validator.retries);
 }
