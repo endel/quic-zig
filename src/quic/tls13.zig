@@ -24,6 +24,7 @@ const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 const MsgType = enum(u8) {
     client_hello = 1,
     server_hello = 2,
+    new_session_ticket = 4,
     encrypted_extensions = 8,
     certificate = 11,
     certificate_verify = 15,
@@ -36,7 +37,10 @@ const ExtType = enum(u16) {
     supported_groups = 10,
     signature_algorithms = 13,
     application_layer_protocol_negotiation = 16,
+    pre_shared_key = 41,
+    early_data = 42,
     supported_versions = 43,
+    psk_key_exchange_modes = 45,
     key_share = 51,
     quic_transport_parameters = 57,
     _,
@@ -134,6 +138,8 @@ pub const KeySchedule = struct {
     server_handshake_traffic_secret: [32]u8,
     client_app_traffic_secret: [32]u8,
     server_app_traffic_secret: [32]u8,
+    resumption_master_secret: [32]u8 = .{0} ** 32,
+    client_early_traffic_secret: [32]u8 = .{0} ** 32,
     computed_handshake: bool = false,
     computed_app: bool = false,
 
@@ -141,10 +147,34 @@ pub const KeySchedule = struct {
         var ks: KeySchedule = undefined;
         ks.computed_handshake = false;
         ks.computed_app = false;
+        ks.resumption_master_secret = .{0} ** 32;
+        ks.client_early_traffic_secret = .{0} ** 32;
         // early_secret = HKDF-Extract(salt=0, IKM=0)
         const zero_key: [32]u8 = .{0} ** 32;
         ks.early_secret = HkdfSha256.extract(&(.{0} ** 1), &zero_key);
         return ks;
+    }
+
+    // Initialize with a PSK (for session resumption)
+    pub fn initWithPsk(psk: [32]u8) KeySchedule {
+        var ks: KeySchedule = undefined;
+        ks.computed_handshake = false;
+        ks.computed_app = false;
+        ks.resumption_master_secret = .{0} ** 32;
+        ks.client_early_traffic_secret = .{0} ** 32;
+        // early_secret = HKDF-Extract(salt=0, IKM=PSK)
+        ks.early_secret = HkdfSha256.extract(&(.{0} ** 1), &psk);
+        return ks;
+    }
+
+    // Derive client early traffic secret for 0-RTT data
+    pub fn deriveEarlyDataSecret(self: *KeySchedule, transcript_hash: [32]u8) void {
+        self.client_early_traffic_secret = deriveSecret(self.early_secret, "c e traffic", transcript_hash);
+    }
+
+    // Derive resumption master secret (after full handshake transcript)
+    pub fn deriveResumptionMasterSecret(self: *KeySchedule, transcript_hash: [32]u8) void {
+        self.resumption_master_secret = deriveSecret(self.master_secret, "res master", transcript_hash);
     }
 
     // Derive handshake secrets from the shared secret and transcript hash.
@@ -220,6 +250,33 @@ pub const KeySchedule = struct {
     }
 };
 
+// ─── Session Ticket (0-RTT resumption) ───────────────────────────────
+
+pub const SessionTicket = struct {
+    psk: [32]u8, // Pre-shared key derived from resumption_master_secret
+    ticket: [512]u8 = .{0} ** 512, // Opaque ticket data (encrypted by server)
+    ticket_len: u16 = 0,
+    ticket_age_add: u32 = 0, // Age obfuscation value
+    creation_time: i64 = 0, // Seconds since epoch
+    lifetime: u32 = 0, // Seconds
+    max_early_data_size: u32 = 0, // From early_data extension
+    alpn: [16]u8 = .{0} ** 16, // Negotiated ALPN
+    alpn_len: u8 = 0,
+
+    pub fn getTicket(self: *const SessionTicket) []const u8 {
+        return self.ticket[0..self.ticket_len];
+    }
+
+    pub fn getAlpn(self: *const SessionTicket) []const u8 {
+        return self.alpn[0..self.alpn_len];
+    }
+
+    pub fn isExpired(self: *const SessionTicket) bool {
+        const now_sec = std.time.timestamp();
+        return (now_sec - self.creation_time) > @as(i64, self.lifetime);
+    }
+};
+
 // ─── TLS Config ──────────────────────────────────────────────────────
 
 pub const TlsConfig = struct {
@@ -229,6 +286,8 @@ pub const TlsConfig = struct {
     server_name: ?[]const u8 = null, // SNI (client only)
     skip_cert_verify: bool = true, // Skip X.509 chain + CertificateVerify validation
     ca_bundle: ?*Certificate.Bundle = null, // Caller-owned CA bundle for trust anchor verification
+    session_ticket: ?*const SessionTicket = null, // Stored ticket from previous connection (client)
+    ticket_key: ?[16]u8 = null, // AES-128-GCM key for encrypting/decrypting tickets (server)
 };
 
 // ─── Handshake state machine ─────────────────────────────────────────
@@ -283,6 +342,7 @@ const HandshakeState = enum {
     server_send_certificate_verify,
     server_send_finished,
     server_wait_client_finished,
+    server_send_ticket,
 
     // Shared
     connected,
@@ -335,6 +395,13 @@ pub const Tls13Handshake = struct {
     // Transcript hash at server Finished for app key derivation
     transcript_at_server_finished: [32]u8 = undefined,
 
+    // PSK / 0-RTT fields
+    using_psk: bool = false,
+    zero_rtt_accepted: bool = false,
+    pending_install_early: bool = false,
+    received_ticket: ?SessionTicket = null,
+    ticket_nonce_counter: u32 = 0,
+
     pub fn initClient(
         config: TlsConfig,
         local_tp: transport_params.TransportParams,
@@ -343,7 +410,10 @@ pub const Tls13Handshake = struct {
         self.state = .client_start;
         self.is_server = false;
         self.transcript = TranscriptHash.init();
-        self.key_schedule = KeySchedule.init();
+        self.key_schedule = if (config.session_ticket) |ticket|
+            KeySchedule.initWithPsk(ticket.psk)
+        else
+            KeySchedule.init();
         self.config = config;
         self.local_transport_params = local_tp;
         self.peer_transport_params = null;
@@ -352,9 +422,14 @@ pub const Tls13Handshake = struct {
         self.in_offset = 0;
         self.pending_install_handshake = false;
         self.pending_install_app = false;
+        self.pending_install_early = false;
         self.handshake_keys_installed = false;
         self.app_keys_installed = false;
         self.leaf_pub_key_len = 0;
+        self.using_psk = false;
+        self.zero_rtt_accepted = false;
+        self.received_ticket = null;
+        self.ticket_nonce_counter = 0;
 
         // Pre-encode transport params to avoid dangling slices after struct move
         var tp_fbs = std.io.fixedBufferStream(&self.tp_encoded);
@@ -389,9 +464,14 @@ pub const Tls13Handshake = struct {
         self.in_offset = 0;
         self.pending_install_handshake = false;
         self.pending_install_app = false;
+        self.pending_install_early = false;
         self.handshake_keys_installed = false;
         self.app_keys_installed = false;
         self.leaf_pub_key_len = 0;
+        self.using_psk = false;
+        self.zero_rtt_accepted = false;
+        self.received_ticket = null;
+        self.ticket_nonce_counter = 0;
 
         // Pre-encode transport params to avoid dangling slices after struct move
         var tp_fbs = std.io.fixedBufferStream(&self.tp_encoded);
@@ -419,6 +499,19 @@ pub const Tls13Handshake = struct {
     // Step the handshake state machine. Returns an action for the caller.
     // Call repeatedly until you get wait_for_data or complete.
     pub fn step(self: *Tls13Handshake) !Action {
+        // If we need to install early (0-RTT) keys, do that first
+        if (self.pending_install_early) {
+            self.pending_install_early = false;
+            const early_keys = KeySchedule.deriveQuicKeys(self.key_schedule.client_early_traffic_secret);
+            const early_open = quic_crypto.Open{ .key = early_keys.key, .nonce = early_keys.iv, .hp_key = early_keys.hp };
+            const early_seal = quic_crypto.Seal{ .key = early_keys.key, .nonce = early_keys.iv, .hp_key = early_keys.hp };
+            return Action{ .install_keys = .{
+                .level = .early_data,
+                .open = early_open,
+                .seal = early_seal,
+            } };
+        }
+
         // If we need to install handshake keys, do that first
         if (self.pending_install_handshake) {
             self.pending_install_handshake = false;
@@ -461,7 +554,14 @@ pub const Tls13Handshake = struct {
             .client_start => return self.clientBuildHello(),
             .client_wait_server_hello => return self.clientProcessServerHello(),
             .client_wait_encrypted_extensions => return self.clientProcessEncryptedExtensions(),
-            .client_wait_certificate => return self.clientProcessCertificate(),
+            .client_wait_certificate => {
+                // If PSK was accepted, skip certificate and certificate_verify
+                if (self.using_psk) {
+                    self.state = .client_wait_finished;
+                    return ._continue;
+                }
+                return self.clientProcessCertificate();
+            },
             .client_wait_certificate_verify => return self.clientProcessCertificateVerify(),
             .client_wait_finished => return self.clientProcessFinished(),
             .client_send_finished => return self.clientSendFinished(),
@@ -473,8 +573,20 @@ pub const Tls13Handshake = struct {
             .server_send_certificate_verify => return self.serverBuildCertificateVerify(),
             .server_send_finished => return self.serverBuildFinished(),
             .server_wait_client_finished => return self.serverProcessClientFinished(),
+            .server_send_ticket => return self.serverSendTicket(),
 
-            .connected => return .complete,
+            .connected => {
+                // Check for post-handshake messages (NewSessionTicket)
+                if (!self.is_server) {
+                    if (self.readHandshakeMsg()) |msg| {
+                        if (msg[0] == @intFromEnum(MsgType.new_session_ticket)) {
+                            self.parseNewSessionTicket(msg);
+                            return ._continue;
+                        }
+                    }
+                }
+                return .complete;
+            },
         }
     }
 
@@ -495,9 +607,18 @@ pub const Tls13Handshake = struct {
             self.config.alpn,
             self.config.server_name,
             self.tp_encoded[0..self.tp_encoded_len],
+            self.config.session_ticket,
+            &self.key_schedule,
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
+
+        // If we have a session ticket, derive early data secret for 0-RTT
+        if (self.config.session_ticket != null) {
+            const transcript_hash = self.transcript.current();
+            self.key_schedule.deriveEarlyDataSecret(transcript_hash);
+            self.pending_install_early = true;
+        }
 
         @memcpy(self.out_buf[0..msg.len], msg);
         self.out_len = msg.len;
@@ -558,6 +679,14 @@ pub const Tls13Handshake = struct {
                 if (kelen != 32) return error.NoKeyShare;
                 @memcpy(&self.peer_x25519_public, ext_data[ext_pos + 4 ..][0..32]);
                 found_key_share = true;
+            } else if (etype == @intFromEnum(ExtType.pre_shared_key)) {
+                // Server accepted PSK: selected_identity(2) = 0x0000
+                if (elen >= 2) {
+                    const selected = readU16(ext_data[ext_pos..]);
+                    if (selected == 0) {
+                        self.using_psk = true;
+                    }
+                }
             }
             ext_pos += elen;
         }
@@ -585,7 +714,7 @@ pub const Tls13Handshake = struct {
 
         if (msg[0] != @intFromEnum(MsgType.encrypted_extensions)) return error.UnexpectedMessage;
 
-        // Parse EncryptedExtensions to extract transport params + ALPN
+        // Parse EncryptedExtensions to extract transport params + ALPN + early_data
         self.parseEncryptedExtensions(msg[4..]) catch {};
 
         self.transcript.update(msg);
@@ -808,6 +937,8 @@ pub const Tls13Handshake = struct {
         pos += 2;
 
         var found_key_share = false;
+        var psk_ext_offset: ?usize = null; // offset into ext_data where PSK extension starts
+        var psk_ext_len: usize = 0;
         var ext_pos: usize = 0;
         const ext_data = body[pos..][0..@min(ext_len, body.len - pos)];
         while (ext_pos + 4 <= ext_data.len) {
@@ -837,14 +968,30 @@ pub const Tls13Handshake = struct {
             } else if (etype == @intFromEnum(ExtType.quic_transport_parameters)) {
                 const tp_data = ext_data[ext_pos..][0..elen];
                 self.peer_transport_params = transport_params.TransportParams.decode(tp_data) catch null;
+            } else if (etype == @intFromEnum(ExtType.pre_shared_key)) {
+                // PSK extension must be the last one (RFC 8446 §4.2.11)
+                psk_ext_offset = ext_pos;
+                psk_ext_len = elen;
             }
             ext_pos += elen;
         }
 
         if (!found_key_share) return error.NoKeyShare;
 
+        // Try to process PSK extension if present and we have a ticket key
+        if (psk_ext_offset != null and self.config.ticket_key != null) {
+            self.tryProcessPsk(msg, body, pos, ext_data, psk_ext_offset.?, psk_ext_len);
+        }
+
         // Update transcript with ClientHello
         self.transcript.update(msg);
+
+        // If PSK accepted, derive early data secret for 0-RTT decryption
+        if (self.using_psk) {
+            const transcript_hash = self.transcript.current();
+            self.key_schedule.deriveEarlyDataSecret(transcript_hash);
+            self.pending_install_early = true;
+        }
 
         self.state = .server_send_server_hello;
         return ._continue;
@@ -859,6 +1006,7 @@ pub const Tls13Handshake = struct {
             &self.server_random,
             &self.x25519_public,
             &self.client_random, // echo session_id as empty (we use 0-len)
+            self.using_psk,
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
@@ -888,6 +1036,7 @@ pub const Tls13Handshake = struct {
             &buf,
             self.config.alpn,
             self.tp_encoded[0..self.tp_encoded_len],
+            self.using_psk, // include early_data extension if PSK accepted
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
@@ -895,7 +1044,12 @@ pub const Tls13Handshake = struct {
         @memcpy(self.out_buf[0..msg.len], msg);
         self.out_len = msg.len;
 
-        self.state = .server_send_certificate;
+        // If PSK was accepted, skip certificate and certificate_verify
+        if (self.using_psk) {
+            self.state = .server_send_finished;
+        } else {
+            self.state = .server_send_certificate;
+        }
         return Action{ .send_data = .{
             .level = .handshake,
             .data = self.out_buf[0..self.out_len],
@@ -990,8 +1144,309 @@ pub const Tls13Handshake = struct {
         if (!std.mem.eql(u8, body, &expected)) return error.BadFinished;
 
         self.transcript.update(msg);
+
+        // If we have a ticket key, send a NewSessionTicket before completing
+        if (self.config.ticket_key != null) {
+            self.pending_install_app = true;
+            self.state = .server_send_ticket;
+            return ._continue;
+        }
+
         self.state = .connected;
         return .complete;
+    }
+
+    // ─── Server: Send NewSessionTicket ──────────────────────────────
+
+    fn serverSendTicket(self: *Tls13Handshake) !Action {
+        const ticket_key = self.config.ticket_key orelse return error.InternalError;
+
+        // Derive resumption master secret
+        const transcript_hash = self.transcript.current();
+        self.key_schedule.deriveResumptionMasterSecret(transcript_hash);
+
+        // Generate ticket nonce
+        var nonce_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &nonce_buf, self.ticket_nonce_counter, .big);
+        self.ticket_nonce_counter += 1;
+
+        // PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, 32)
+        const psk = quic_crypto.hkdfExpandLabel(self.key_schedule.resumption_master_secret, "resumption", &nonce_buf, 32);
+
+        // Generate random ticket_age_add
+        var ticket_age_add_bytes: [4]u8 = undefined;
+        crypto.random.bytes(&ticket_age_add_bytes);
+        const ticket_age_add = std.mem.readInt(u32, &ticket_age_add_bytes, .big);
+
+        // Build ticket plaintext: psk(32) || creation_time(8) || alpn_len(1) || alpn
+        var ticket_plain: [64]u8 = .{0} ** 64;
+        @memcpy(ticket_plain[0..32], &psk);
+        const now_sec = std.time.timestamp();
+        std.mem.writeInt(i64, ticket_plain[32..40], now_sec, .big);
+        const alpn_bytes = if (self.config.alpn.len > 0) self.config.alpn[0] else "";
+        const alpn_copy_len: u8 = @intCast(@min(alpn_bytes.len, 16));
+        ticket_plain[40] = alpn_copy_len;
+        @memcpy(ticket_plain[41..][0..alpn_copy_len], alpn_bytes[0..alpn_copy_len]);
+        const plaintext_len = 41 + @as(usize, alpn_copy_len);
+
+        // Encrypt ticket with AES-128-GCM using ticket_key
+        var nonce_for_ticket: [12]u8 = .{0} ** 12;
+        @memcpy(nonce_for_ticket[8..12], &nonce_buf);
+        var encrypted_ticket: [80]u8 = undefined; // plaintext + 16 tag
+        var tag: [16]u8 = undefined;
+        Aes128Gcm.encrypt(
+            encrypted_ticket[0..plaintext_len],
+            &tag,
+            ticket_plain[0..plaintext_len],
+            "",
+            nonce_for_ticket,
+            ticket_key,
+        );
+        @memcpy(encrypted_ticket[plaintext_len..][0..16], &tag);
+        const encrypted_len = plaintext_len + 16;
+
+        // Build NewSessionTicket message (RFC 8446 §4.6.1):
+        // type(1) + length(3) + lifetime(4) + ticket_age_add(4) + nonce_len(1) + nonce(4) +
+        // ticket_len(2) + ticket(N) + extensions_len(2) + early_data_ext(type=42, len=2+4, max=0xffffffff)
+        const lifetime: u32 = 7 * 24 * 3600; // 7 days
+        const ext_data_len: u16 = 4 + 4; // type(2) + len(2) + max_early_data(4)
+        const nst_body_len: u24 = @intCast(4 + 4 + 1 + 4 + 2 + encrypted_len + 2 + ext_data_len);
+
+        var nst: [256]u8 = undefined;
+        var nst_pos: usize = 0;
+
+        nst[0] = @intFromEnum(MsgType.new_session_ticket);
+        nst[1] = @intCast(nst_body_len >> 16);
+        nst[2] = @intCast((nst_body_len >> 8) & 0xff);
+        nst[3] = @intCast(nst_body_len & 0xff);
+        nst_pos = 4;
+
+        // lifetime
+        std.mem.writeInt(u32, nst[nst_pos..][0..4], lifetime, .big);
+        nst_pos += 4;
+
+        // ticket_age_add
+        std.mem.writeInt(u32, nst[nst_pos..][0..4], ticket_age_add, .big);
+        nst_pos += 4;
+
+        // nonce
+        nst[nst_pos] = 4; // nonce length
+        nst_pos += 1;
+        @memcpy(nst[nst_pos..][0..4], &nonce_buf);
+        nst_pos += 4;
+
+        // ticket
+        writeU16(nst[nst_pos..], @intCast(encrypted_len));
+        nst_pos += 2;
+        @memcpy(nst[nst_pos..][0..encrypted_len], encrypted_ticket[0..encrypted_len]);
+        nst_pos += encrypted_len;
+
+        // extensions: early_data with max_early_data_size = 0xffffffff
+        writeU16(nst[nst_pos..], ext_data_len);
+        nst_pos += 2;
+        writeU16(nst[nst_pos..], @intFromEnum(ExtType.early_data));
+        nst_pos += 2;
+        writeU16(nst[nst_pos..], 4); // extension data length
+        nst_pos += 2;
+        std.mem.writeInt(u32, nst[nst_pos..][0..4], 0xffffffff, .big);
+        nst_pos += 4;
+
+        @memcpy(self.out_buf[0..nst_pos], nst[0..nst_pos]);
+        self.out_len = nst_pos;
+
+        self.state = .connected;
+        return Action{ .send_data = .{
+            .level = .application,
+            .data = self.out_buf[0..self.out_len],
+        } };
+    }
+
+    // ─── Server: Try to process PSK from ClientHello ────────────────
+
+    fn tryProcessPsk(
+        self: *Tls13Handshake,
+        msg: []const u8,
+        body: []const u8,
+        ext_start_in_body: usize,
+        ext_data: []const u8,
+        psk_ext_offset: usize,
+        psk_ext_len: usize,
+    ) void {
+        const ticket_key = self.config.ticket_key orelse return;
+
+        if (psk_ext_len < 6) return;
+        const psk_data = ext_data[psk_ext_offset..][0..psk_ext_len];
+
+        // Parse identities list
+        const identities_len = readU16(psk_data[0..]);
+        if (2 + identities_len > psk_ext_len) return;
+
+        // Parse first identity
+        var id_pos: usize = 2;
+        if (id_pos + 2 > 2 + identities_len) return;
+        const identity_len = readU16(psk_data[id_pos..]);
+        id_pos += 2;
+        if (id_pos + identity_len + 4 > 2 + identities_len) return;
+        const identity = psk_data[id_pos..][0..identity_len];
+
+        // Parse binders list (after identities)
+        var binders_start: usize = 2 + identities_len;
+        if (binders_start + 2 > psk_ext_len) return;
+        const binders_len = readU16(psk_data[binders_start..]);
+        binders_start += 2;
+        if (binders_start + binders_len > psk_ext_len) return;
+
+        // First binder
+        if (binders_start >= psk_ext_len) return;
+        const binder_len = psk_data[binders_start];
+        if (binder_len != 32) return;
+        if (binders_start + 1 + 32 > psk_ext_len) return;
+        const received_binder = psk_data[binders_start + 1 ..][0..32];
+
+        // Decrypt ticket identity to get PSK
+        if (identity_len < 16 + 1) return; // at least tag + 1 byte
+        const ciphertext_len = identity_len - 16;
+
+        // Reconstruct nonce from ticket (we use the last 4 bytes of identity as hint)
+        var ticket_nonce: [12]u8 = .{0} ** 12;
+        // Use zeros as nonce — server encrypts with incrementing nonce_buf in [8..12]
+        // We need to try nonce counter values. For simplicity, try a few.
+        var decrypted: [64]u8 = undefined;
+        var psk_found = false;
+        var found_psk: [32]u8 = undefined;
+
+        for (0..256) |nonce_try| {
+            std.mem.writeInt(u32, ticket_nonce[8..12], @intCast(nonce_try), .big);
+            var ct_copy: [80]u8 = undefined;
+            @memcpy(ct_copy[0..identity_len], identity[0..identity_len]);
+            const tag_start = ciphertext_len;
+            const tag: [16]u8 = ct_copy[tag_start..][0..16].*;
+
+            Aes128Gcm.decrypt(
+                decrypted[0..ciphertext_len],
+                ct_copy[0..ciphertext_len],
+                tag,
+                "",
+                ticket_nonce,
+                ticket_key,
+            ) catch continue;
+
+            // Decrypted successfully
+            if (ciphertext_len >= 32) {
+                @memcpy(&found_psk, decrypted[0..32]);
+                psk_found = true;
+                break;
+            }
+        }
+
+        if (!psk_found) return;
+
+        // Re-initialize key schedule with PSK
+        self.key_schedule = KeySchedule.initWithPsk(found_psk);
+
+        // Verify binder
+        // binder_key = Derive-Secret(early_secret, "res binder", Hash(""))
+        var empty_hash: [32]u8 = undefined;
+        Sha256.hash("", &empty_hash, .{});
+        const binder_key = quic_crypto.hkdfExpandLabel(self.key_schedule.early_secret, "res binder", &empty_hash, 32);
+
+        // Compute partial ClientHello hash (everything except the binder value)
+        // The binder covers: msg[0 .. msg.len - binder_len]
+        // In the PSK extension, binders are at the end. The binder value is the last 32 bytes of the message.
+        // partial_ch = msg[0 .. msg.len - 32 - 1] (32 = binder, 1 = binder_len field)
+        // Actually: partial = everything before the binders_list content
+        // That is: msg[0 .. (4 + body offset of PSK ext offset + 2 + identities_len + 2)]
+        // = msg[0 .. msg.len - binders_len]
+        const partial_len = msg.len - @as(usize, binders_len);
+        _ = body;
+        _ = ext_start_in_body;
+
+        var partial_hash: Sha256 = Sha256.init(.{});
+        partial_hash.update(msg[0..partial_len]);
+        var partial_transcript = partial_hash.finalResult();
+
+        const expected_binder = KeySchedule.computeFinishedVerifyData(binder_key, partial_transcript);
+        _ = &partial_transcript;
+
+        if (!std.mem.eql(u8, received_binder, &expected_binder)) return;
+
+        self.using_psk = true;
+        self.zero_rtt_accepted = true;
+    }
+
+    // ─── Client: Parse NewSessionTicket ──────────────────────────────
+
+    fn parseNewSessionTicket(self: *Tls13Handshake, msg: []const u8) void {
+        const body = msg[4..];
+        if (body.len < 13) return; // minimum: lifetime(4) + age_add(4) + nonce_len(1) + nonce(>=0) + ticket_len(2)
+
+        var pos: usize = 0;
+        const lifetime = std.mem.readInt(u32, body[pos..][0..4], .big);
+        pos += 4;
+        const ticket_age_add = std.mem.readInt(u32, body[pos..][0..4], .big);
+        pos += 4;
+
+        const nonce_len = body[pos];
+        pos += 1;
+        if (pos + nonce_len > body.len) return;
+        const nonce_data = body[pos..][0..nonce_len];
+        pos += nonce_len;
+
+        if (pos + 2 > body.len) return;
+        const ticket_len = readU16(body[pos..]);
+        pos += 2;
+        if (pos + ticket_len > body.len) return;
+        const ticket_data = body[pos..][0..ticket_len];
+        pos += ticket_len;
+
+        // Parse extensions
+        var max_early_data: u32 = 0;
+        if (pos + 2 <= body.len) {
+            const ext_len = readU16(body[pos..]);
+            pos += 2;
+            var ext_pos: usize = 0;
+            const ext_end = @min(pos + ext_len, body.len);
+            const ext_buf = body[pos..ext_end];
+            while (ext_pos + 4 <= ext_buf.len) {
+                const etype = readU16(ext_buf[ext_pos..]);
+                ext_pos += 2;
+                const elen = readU16(ext_buf[ext_pos..]);
+                ext_pos += 2;
+                if (ext_pos + elen > ext_buf.len) break;
+                if (etype == @intFromEnum(ExtType.early_data) and elen >= 4) {
+                    max_early_data = std.mem.readInt(u32, ext_buf[ext_pos..][0..4], .big);
+                }
+                ext_pos += elen;
+            }
+        }
+
+        // Derive PSK from resumption_master_secret + nonce
+        // First compute resumption_master_secret if not yet done
+        if (!self.key_schedule.computed_app) return;
+        const full_transcript = self.transcript.current();
+        self.key_schedule.deriveResumptionMasterSecret(full_transcript);
+
+        const psk = quic_crypto.hkdfExpandLabel(self.key_schedule.resumption_master_secret, "resumption", nonce_data, 32);
+
+        var ticket: SessionTicket = .{ .psk = psk };
+        ticket.lifetime = lifetime;
+        ticket.ticket_age_add = ticket_age_add;
+        ticket.creation_time = std.time.timestamp();
+        ticket.max_early_data_size = max_early_data;
+
+        const copy_len: u16 = @intCast(@min(ticket_data.len, ticket.ticket.len));
+        @memcpy(ticket.ticket[0..copy_len], ticket_data[0..copy_len]);
+        ticket.ticket_len = copy_len;
+
+        // Store ALPN from config
+        if (self.config.alpn.len > 0) {
+            const alpn_src = self.config.alpn[0];
+            const alpn_copy: u8 = @intCast(@min(alpn_src.len, 16));
+            @memcpy(ticket.alpn[0..alpn_copy], alpn_src[0..alpn_copy]);
+            ticket.alpn_len = alpn_copy;
+        }
+
+        self.received_ticket = ticket;
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────
@@ -1036,6 +1491,9 @@ pub const Tls13Handshake = struct {
             if (etype == @intFromEnum(ExtType.quic_transport_parameters)) {
                 const tp_data = ext_data[ext_pos..][0..elen];
                 self.peer_transport_params = transport_params.TransportParams.decode(tp_data) catch null;
+            } else if (etype == @intFromEnum(ExtType.early_data)) {
+                // Server accepted early data (0-RTT)
+                self.zero_rtt_accepted = true;
             }
             ext_pos += elen;
         }
@@ -1051,6 +1509,8 @@ fn buildClientHello(
     alpn_list: []const []const u8,
     server_name: ?[]const u8,
     tp_encoded_data: []const u8,
+    session_ticket: ?*const SessionTicket,
+    key_schedule: *KeySchedule,
 ) ![]const u8 {
     // Build the body first, then wrap with type + length
     var pos: usize = 4; // reserve space for type + 3-byte length
@@ -1160,6 +1620,79 @@ fn buildClientHello(
     @memcpy(buf[pos..][0..tp_encoded_data.len], tp_encoded_data);
     pos += tp_encoded_data.len;
 
+    // PSK extensions (must be last, per RFC 8446 §4.2.11)
+    if (session_ticket) |ticket| {
+        // psk_key_exchange_modes extension (type=45)
+        // modes_list_len(1) + mode(1)=0x01 (psk_dhe_ke)
+        pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.psk_key_exchange_modes), 2);
+        buf[pos] = 1; // modes list length
+        pos += 1;
+        buf[pos] = 0x01; // psk_dhe_ke
+        pos += 1;
+
+        // pre_shared_key extension (type=41) - MUST be last
+        const ticket_bytes = ticket.getTicket();
+        const obfuscated_age: u32 = blk: {
+            const now_sec = std.time.timestamp();
+            const age_ms: u32 = @intCast(@as(u64, @intCast(@max(0, now_sec - ticket.creation_time))) * 1000);
+            break :blk age_ms +% ticket.ticket_age_add;
+        };
+
+        // identities: identities_len(2) + [identity_len(2) + identity + obfuscated_age(4)]
+        const identities_len: u16 = @intCast(2 + ticket_bytes.len + 4);
+        // binders: binders_len(2) + [binder_len(1) + binder(32)]
+        const binders_len: u16 = 1 + 32;
+        const psk_ext_total: u16 = 2 + identities_len + 2 + binders_len;
+
+        pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.pre_shared_key), psk_ext_total);
+
+        // Identities
+        writeU16(buf[pos..], identities_len);
+        pos += 2;
+        writeU16(buf[pos..], @intCast(ticket_bytes.len));
+        pos += 2;
+        @memcpy(buf[pos..][0..ticket_bytes.len], ticket_bytes);
+        pos += ticket_bytes.len;
+        std.mem.writeInt(u32, buf[pos..][0..4], obfuscated_age, .big);
+        pos += 4;
+
+        // Binders placeholder (32 zero bytes, will be replaced)
+        writeU16(buf[pos..], binders_len);
+        pos += 2;
+        buf[pos] = 32; // binder length
+        pos += 1;
+        const binder_value_offset = pos;
+        @memset(buf[pos..][0..32], 0);
+        pos += 32;
+
+        // Fill in extensions length and message header BEFORE computing binder
+        const ext_len: u16 = @intCast(pos - ext_start - 2);
+        writeU16(buf[ext_start..], ext_len);
+
+        const body_len: u24 = @intCast(pos - 4);
+        buf[0] = @intFromEnum(MsgType.client_hello);
+        buf[1] = @intCast(body_len >> 16);
+        buf[2] = @intCast((body_len >> 8) & 0xff);
+        buf[3] = @intCast(body_len & 0xff);
+
+        // Now compute the real binder
+        // binder_key = Derive-Secret(early_secret, "res binder", Hash(""))
+        var empty_hash: [32]u8 = undefined;
+        Sha256.hash("", &empty_hash, .{});
+        const binder_key = quic_crypto.hkdfExpandLabel(key_schedule.early_secret, "res binder", &empty_hash, 32);
+
+        // partial_ch_hash = Hash(message[0 .. message.len - 32])
+        const partial_len = pos - 32; // everything except the 32-byte binder value
+        var partial_hasher = Sha256.init(.{});
+        partial_hasher.update(buf[0..partial_len]);
+        const partial_hash = partial_hasher.finalResult();
+
+        const binder = KeySchedule.computeFinishedVerifyData(binder_key, partial_hash);
+        @memcpy(buf[binder_value_offset..][0..32], &binder);
+
+        return buf[0..pos];
+    }
+
     // Fill in extensions length
     const ext_len: u16 = @intCast(pos - ext_start - 2);
     writeU16(buf[ext_start..], ext_len);
@@ -1179,6 +1712,7 @@ fn buildServerHello(
     server_random: *const [32]u8,
     x25519_pub: *const [32]u8,
     _: *const [32]u8, // client_random (unused, was for session_id echo)
+    using_psk: bool,
 ) ![]const u8 {
     var pos: usize = 4; // reserve for header
 
@@ -1221,6 +1755,13 @@ fn buildServerHello(
     @memcpy(buf[pos..][0..32], x25519_pub);
     pos += 32;
 
+    // pre_shared_key extension (selected_identity = 0)
+    if (using_psk) {
+        pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.pre_shared_key), 2);
+        writeU16(buf[pos..], 0); // selected_identity = 0
+        pos += 2;
+    }
+
     // Fill in extensions length
     const ext_len: u16 = @intCast(pos - ext_start - 2);
     writeU16(buf[ext_start..], ext_len);
@@ -1239,6 +1780,7 @@ fn buildEncryptedExtensionsFromEncoded(
     buf: []u8,
     alpn_list: []const []const u8,
     tp_encoded_data: []const u8,
+    include_early_data: bool,
 ) ![]const u8 {
     var pos: usize = 4; // reserve for header
 
@@ -1267,6 +1809,11 @@ fn buildEncryptedExtensionsFromEncoded(
     pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.quic_transport_parameters), tp_encoded_data.len);
     @memcpy(buf[pos..][0..tp_encoded_data.len], tp_encoded_data);
     pos += tp_encoded_data.len;
+
+    // early_data extension (empty payload in EE, per RFC 8446 §4.2.10)
+    if (include_early_data) {
+        pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.early_data), 0);
+    }
 
     // Fill in extensions length
     const ext_len: u16 = @intCast(pos - ext_list_start - 2);
@@ -1573,6 +2120,7 @@ test "buildClientHello: produces valid message" {
     try tp.encode(tp_fbs.writer());
     const tp_encoded = tp_fbs.getWritten();
 
+    var ks = KeySchedule.init();
     var buf: [4096]u8 = undefined;
     const msg = try buildClientHello(
         &buf,
@@ -1581,6 +2129,8 @@ test "buildClientHello: produces valid message" {
         &[_][]const u8{"h3"},
         "example.com",
         tp_encoded,
+        null,
+        &ks,
     );
 
     // Check message type
@@ -1604,7 +2154,7 @@ test "buildServerHello: produces valid message" {
     @memset(&client_random, 0xAA);
 
     var buf: [512]u8 = undefined;
-    const msg = try buildServerHello(&buf, &random, &pub_key, &client_random);
+    const msg = try buildServerHello(&buf, &random, &pub_key, &client_random, false);
 
     try std.testing.expectEqual(@as(u8, @intFromEnum(MsgType.server_hello)), msg[0]);
     const body_len = (@as(usize, msg[1]) << 16) | (@as(usize, msg[2]) << 8) | @as(usize, msg[3]);
