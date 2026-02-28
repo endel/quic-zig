@@ -424,6 +424,7 @@ pub const Connection = struct {
 
                 // Update flow control
                 try self.conn_flow_ctrl.base.addBytesReceived(s.offset + s.data.len);
+                self.conn_flow_ctrl.addBytesRead(s.data.len);
             },
 
             .max_data => |max| {
@@ -753,6 +754,13 @@ pub const Connection = struct {
         std.log.info("installAppKeys: keys installed for space 2", .{});
     }
 
+    /// Check if connection-level flow control needs a MAX_DATA update.
+    fn queueFlowControlUpdates(self: *Connection) void {
+        if (self.conn_flow_ctrl.getWindowUpdate(&self.pkt_handler.rtt_stats)) |new_max| {
+            self.pending_frames.push(.{ .max_data = new_max });
+        }
+    }
+
     /// Build and send outgoing packets.
     pub fn send(self: *Connection, out_buf: []u8) !usize {
         // Draining: do not send anything
@@ -791,6 +799,9 @@ pub const Connection = struct {
             // Congestion limited - only send ACKs
             return try self.sendAckOnly(out_buf, now);
         }
+
+        // Queue flow control updates before packing
+        self.queueFlowControlUpdates();
 
         // Build coalesced packet with available encryption levels
         // Packet number space indices: 0=Initial, 1=Handshake, 2=Application
