@@ -214,4 +214,5 @@ test {
     _ = @import("quic/crypto_stream.zig");
     _ = @import("quic/packet_packer.zig");
     _ = @import("quic/tls13.zig");
+    _ = @import("quic/mtu.zig");
 }
