@@ -155,7 +155,9 @@ pub fn main() !void {
                     break;
                 };
                 if (bytes_written > 0) {
-                    _ = try posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size);
+                    // Use active path's peer address (may differ from remote_addr after migration)
+                    const send_addr = &conn.paths[conn.active_path_idx].peer_addr;
+                    _ = try posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr));
                     std.log.info("sent {d} bytes", .{bytes_written});
                 }
             }
@@ -188,7 +190,9 @@ pub fn main() !void {
                 continue;
             };
             if (bytes_written > 0) {
-                _ = try posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size);
+                // Use active path's peer address (may differ from remote_addr after migration)
+                const send_addr = &conn.paths[conn.active_path_idx].peer_addr;
+                _ = try posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr));
                 std.log.info("periodic sent {d} bytes", .{bytes_written});
             }
         }

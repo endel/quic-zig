@@ -387,8 +387,6 @@ pub const Connection = struct {
 
     /// Process a received packet.
     pub fn recv(self: *Connection, header: *packet.Header, fbs: anytype, info: RecvInfo) !void {
-        _ = info;
-
         const epoch = try packet.Epoch.fromPacketType(header.packet_type);
         std.log.info("recv: packet_type={s}, epoch={s}", .{ @tagName(header.packet_type), @tagName(epoch) });
 
@@ -465,6 +463,7 @@ pub const Connection = struct {
 
         // Process all frames from the decrypted payload
         var ack_eliciting = false;
+        var has_non_probing = false;
         var remaining = payload;
 
         while (remaining.len > 0) {
@@ -484,6 +483,9 @@ pub const Connection = struct {
             if (frame.isAckEliciting()) {
                 ack_eliciting = true;
             }
+            if (!frame.isProbing()) {
+                has_non_probing = true;
+            }
 
             try self.processFrame(frame, epoch, now);
 
@@ -501,6 +503,16 @@ pub const Connection = struct {
         // (critical for coalesced packets where multiple packets share a datagram)
         if (header.packet_number + 1 > self.pkt_num_spaces[space_idx].next_packet_number) {
             self.pkt_num_spaces[space_idx].next_packet_number = header.packet_number + 1;
+        }
+
+        // Detect connection migration (RFC 9000 Section 9)
+        // Only for 1-RTT packets after handshake is confirmed, with non-probing frames
+        if (epoch == .application and self.handshake_confirmed and has_non_probing) {
+            const active_path = &self.paths[self.active_path_idx];
+            if (!sockaddrEql(&info.from, &active_path.peer_addr)) {
+                std.log.info("connection migration detected from new peer address", .{});
+                self.handleMigration(info.from, info.to, now);
+            }
         }
 
         // Update connection state
@@ -1026,6 +1038,15 @@ pub const Connection = struct {
             }
         }
 
+        // Anti-amplification: servers must not send more than 3x bytes received
+        // before address validation (RFC 9000 Section 8.1)
+        if (self.is_server) {
+            const active_path = &self.paths[self.active_path_idx];
+            if (!active_path.canSend(1200)) {
+                return 0;
+            }
+        }
+
         // Build coalesced packet with available encryption levels
         // Packet number space indices: 0=Initial, 1=Handshake, 2=Application
         const initial_seal = self.pkt_num_spaces[0].crypto_seal;
@@ -1077,6 +1098,48 @@ pub const Connection = struct {
         _ = now;
         // TODO: pack ACK-only packets
         return 0;
+    }
+
+    /// Handle connection migration (RFC 9000 Section 9).
+    /// Called when a 1-RTT packet with non-probing frames arrives from a different address.
+    fn handleMigration(self: *Connection, new_peer_addr: posix.sockaddr, local_addr: posix.sockaddr, now: i64) void {
+        // Check if peer disabled active migration
+        if (self.peer_params) |pp| {
+            if (pp.disable_active_migration) {
+                std.log.info("migration: peer disabled active migration, ignoring", .{});
+                return;
+            }
+        }
+
+        // Set up candidate path at the alternate index
+        const candidate_idx: u8 = 1 - self.active_path_idx;
+        self.paths[candidate_idx] = NetworkPath.init(local_addr, new_peer_addr, false);
+
+        // Try to consume a fresh CID for the new path
+        if (self.peer_cid_pool.consumeUnused()) |entry| {
+            self.packer.updateDcid(entry.getCid());
+            std.log.info("migration: switched to new peer CID seq={d}", .{entry.seq_num});
+        }
+
+        // Switch active path
+        self.active_path_idx = candidate_idx;
+
+        // Start path validation via PATH_CHALLENGE
+        const challenge = self.paths[candidate_idx].validator.startChallenge();
+        self.pending_frames.push(.{ .path_challenge = challenge });
+
+        // Reset CC/RTT if IP address changed (not just port — NAT rebinding preserves CC)
+        const old_path = &self.paths[1 - candidate_idx];
+        if (!sockaddrSameIp(&new_peer_addr, &old_path.peer_addr)) {
+            self.cc = congestion.NewReno.init();
+            self.pacer = congestion.Pacer.init();
+            self.pkt_handler.rtt_stats = rtt.RttStats{};
+            std.log.info("migration: IP changed, reset CC and RTT", .{});
+        } else {
+            std.log.info("migration: port-only change (NAT rebinding), preserving CC", .{});
+        }
+
+        _ = now;
     }
 
     /// Check for timeouts and maintenance tasks.
@@ -1160,6 +1223,20 @@ pub const Connection = struct {
         };
     }
 };
+
+/// Compare two sockaddrs for equality (IPv4: port + address).
+pub fn sockaddrEql(a: *const posix.sockaddr, b: *const posix.sockaddr) bool {
+    const a_in: *const posix.sockaddr.in = @ptrCast(@alignCast(a));
+    const b_in: *const posix.sockaddr.in = @ptrCast(@alignCast(b));
+    return a_in.port == b_in.port and a_in.addr == b_in.addr;
+}
+
+/// Compare two sockaddrs for same IP address (ignoring port).
+pub fn sockaddrSameIp(a: *const posix.sockaddr, b: *const posix.sockaddr) bool {
+    const a_in: *const posix.sockaddr.in = @ptrCast(@alignCast(a));
+    const b_in: *const posix.sockaddr.in = @ptrCast(@alignCast(b));
+    return a_in.addr == b_in.addr;
+}
 
 /// Generates a new random connection ID of the given size into the provided buffer.
 pub fn generateConnectionId(buf: []u8) void {
