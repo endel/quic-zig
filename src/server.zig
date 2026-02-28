@@ -35,10 +35,15 @@ pub fn main() !void {
     const alpn = try alloc.alloc([]const u8, 1);
     alpn[0] = "h3";
 
+    // Generate random ticket key for session ticket encryption (0-RTT support)
+    var ticket_key: [16]u8 = undefined;
+    std.crypto.random.bytes(&ticket_key);
+
     const tls_config: tls13.TlsConfig = .{
         .cert_chain_der = cert_chain,
         .private_key_bytes = ec_private_key,
         .alpn = alpn,
+        .ticket_key = ticket_key,
     };
 
     // Create UDP socket

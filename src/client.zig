@@ -269,6 +269,11 @@ pub fn main() !void {
         std.log.warn("no H3 response received", .{});
     }
 
+    // Check for session ticket (for 0-RTT resumption on next connection)
+    if (conn.session_ticket) |ticket| {
+        std.log.info("received session ticket (len={d}, lifetime={d}s) - can use for 0-RTT resumption", .{ ticket.ticket_len, ticket.lifetime });
+    }
+
     // Close connection
     conn.close(0, "done");
     const final_bytes = conn.send(&out) catch 0;

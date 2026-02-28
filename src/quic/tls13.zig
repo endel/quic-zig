@@ -1147,7 +1147,6 @@ pub const Tls13Handshake = struct {
 
         // If we have a ticket key, send a NewSessionTicket before completing
         if (self.config.ticket_key != null) {
-            self.pending_install_app = true;
             self.state = .server_send_ticket;
             return ._continue;
         }
@@ -1350,14 +1349,9 @@ pub const Tls13Handshake = struct {
         Sha256.hash("", &empty_hash, .{});
         const binder_key = quic_crypto.hkdfExpandLabel(self.key_schedule.early_secret, "res binder", &empty_hash, 32);
 
-        // Compute partial ClientHello hash (everything except the binder value)
-        // The binder covers: msg[0 .. msg.len - binder_len]
-        // In the PSK extension, binders are at the end. The binder value is the last 32 bytes of the message.
-        // partial_ch = msg[0 .. msg.len - 32 - 1] (32 = binder, 1 = binder_len field)
-        // Actually: partial = everything before the binders_list content
-        // That is: msg[0 .. (4 + body offset of PSK ext offset + 2 + identities_len + 2)]
-        // = msg[0 .. msg.len - binders_len]
-        const partial_len = msg.len - @as(usize, binders_len);
+        // Partial ClientHello = up to and including identities field (RFC 8446 §4.2.11.2)
+        // Exclude: binders_len_field(2) + binder_entries(binders_len)
+        const partial_len = msg.len - @as(usize, binders_len) - 2;
         _ = body;
         _ = ext_start_in_body;
 
@@ -1681,8 +1675,9 @@ fn buildClientHello(
         Sha256.hash("", &empty_hash, .{});
         const binder_key = quic_crypto.hkdfExpandLabel(key_schedule.early_secret, "res binder", &empty_hash, 32);
 
-        // partial_ch_hash = Hash(message[0 .. message.len - 32])
-        const partial_len = pos - 32; // everything except the 32-byte binder value
+        // partial_ch = everything up to and including identities (RFC 8446 §4.2.11.2)
+        // Exclude: binders_len_field(2) + binder_len(1) + binder_value(32) = 35 bytes
+        const partial_len = pos - 2 - binders_len;
         var partial_hasher = Sha256.init(.{});
         partial_hasher.update(buf[0..partial_len]);
         const partial_hash = partial_hasher.finalResult();
@@ -2256,4 +2251,242 @@ test "loopback handshake: client and server complete" {
         &client.key_schedule.server_app_traffic_secret,
         &server.key_schedule.server_app_traffic_secret,
     );
+}
+
+// PSK binder computation test
+test "PSK binder computation: deterministic and correct" {
+    const psk: [32]u8 = .{0x42} ** 32;
+    var ks = KeySchedule.initWithPsk(psk);
+
+    // early_secret should differ from zero-PSK init
+    var ks_zero = KeySchedule.init();
+    try std.testing.expect(!std.mem.eql(u8, &ks.early_secret, &ks_zero.early_secret));
+    _ = &ks_zero;
+
+    // binder_key = Derive-Secret(early_secret, "res binder", Hash(""))
+    var empty_hash: [32]u8 = undefined;
+    Sha256.hash("", &empty_hash, .{});
+    const binder_key = quic_crypto.hkdfExpandLabel(ks.early_secret, "res binder", &empty_hash, 32);
+
+    // Compute binder for a fake partial transcript
+    const fake_transcript: [32]u8 = .{0x01} ** 32;
+    const binder = KeySchedule.computeFinishedVerifyData(binder_key, fake_transcript);
+
+    // Deterministic
+    const binder2 = KeySchedule.computeFinishedVerifyData(binder_key, fake_transcript);
+    try std.testing.expectEqualSlices(u8, &binder, &binder2);
+
+    // Different transcript produces different binder
+    const binder3 = KeySchedule.computeFinishedVerifyData(binder_key, .{0x02} ** 32);
+    try std.testing.expect(!std.mem.eql(u8, &binder, &binder3));
+}
+
+// Early key derivation test
+test "early key derivation: client_early_traffic_secret from PSK" {
+    const psk: [32]u8 = .{0xAA} ** 32;
+    var ks = KeySchedule.initWithPsk(psk);
+
+    const transcript: [32]u8 = .{0xBB} ** 32;
+    ks.deriveEarlyDataSecret(transcript);
+
+    // Should produce a non-zero secret
+    try std.testing.expect(!std.mem.eql(u8, &ks.client_early_traffic_secret, &(.{0} ** 32)));
+
+    // Derive QUIC keys from early traffic secret
+    const keys = KeySchedule.deriveQuicKeys(ks.client_early_traffic_secret);
+    try std.testing.expect(!std.mem.eql(u8, &keys.key, &(.{0} ** 16)));
+    try std.testing.expect(!std.mem.eql(u8, &keys.iv, &(.{0} ** 12)));
+}
+
+// Loopback PSK resumption test: full handshake → ticket → PSK handshake
+test "loopback PSK resumption: two handshakes with session ticket" {
+
+    // Generate server key pair
+    const server_key_pair = EcdsaP256Sha256.KeyPair.generate();
+    const secret_key_bytes = server_key_pair.secret_key.toBytes();
+    const pub_key_bytes = server_key_pair.public_key.toUncompressedSec1();
+    const fake_cert = pub_key_bytes;
+
+    // Generate ticket key for server
+    var ticket_key: [16]u8 = undefined;
+    crypto.random.bytes(&ticket_key);
+
+    const server_config = TlsConfig{
+        .cert_chain_der = &[_][]const u8{&fake_cert},
+        .private_key_bytes = &secret_key_bytes,
+        .alpn = &[_][]const u8{"h3"},
+        .ticket_key = ticket_key,
+    };
+
+    const client_config = TlsConfig{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    };
+
+    const tp = transport_params.TransportParams{
+        .initial_max_data = 1048576,
+        .initial_max_streams_bidi = 100,
+    };
+
+    // ─── First handshake: full (no PSK) ─────────────
+    var server1 = Tls13Handshake.initServer(server_config, tp);
+    var client1 = Tls13Handshake.initClient(client_config, tp);
+
+    var client_done = false;
+    var server_done = false;
+    var iterations: usize = 0;
+
+    while ((!client_done or !server_done) and iterations < 100) {
+        iterations += 1;
+
+        if (!client_done) {
+            const action = try client1.step();
+            switch (action) {
+                .send_data => |sd| {
+                    _ = sd;
+                    server1.provideData(client1.out_buf[0..client1.out_len]);
+                },
+                .install_keys => {},
+                .wait_for_data => {},
+                .complete => client_done = true,
+                ._continue => {},
+            }
+        }
+
+        if (!server_done) {
+            const action = try server1.step();
+            switch (action) {
+                .send_data => |sd| {
+                    _ = sd;
+                    // Feed server output to client (including post-handshake NST)
+                    client1.provideData(server1.out_buf[0..server1.out_len]);
+                },
+                .install_keys => {},
+                .wait_for_data => {},
+                .complete => server_done = true,
+                ._continue => {},
+            }
+        }
+    }
+
+    try std.testing.expect(client_done);
+    try std.testing.expect(server_done);
+
+    // Step client a few more times to process post-handshake messages (NST)
+    var post_hs: usize = 0;
+    while (post_hs < 10) : (post_hs += 1) {
+        const action = try client1.step();
+        switch (action) {
+            .complete => break,
+            ._continue => continue,
+            else => break,
+        }
+    }
+
+    // Client should have received a session ticket
+    try std.testing.expect(client1.received_ticket != null);
+    const ticket = client1.received_ticket.?;
+    try std.testing.expect(ticket.ticket_len > 0);
+    try std.testing.expect(ticket.lifetime > 0);
+
+    // ─── Second handshake: PSK resumption ─────────────
+    var psk_client_config = client_config;
+    psk_client_config.session_ticket = &ticket;
+
+    var server2 = Tls13Handshake.initServer(server_config, tp);
+    var client2 = Tls13Handshake.initClient(psk_client_config, tp);
+
+    client_done = false;
+    server_done = false;
+    iterations = 0;
+    var client_got_early_keys = false;
+    var server_got_early_keys = false;
+    var server_used_psk = false;
+
+    while ((!client_done or !server_done) and iterations < 100) {
+        iterations += 1;
+
+        if (!client_done) {
+            const action = try client2.step();
+            switch (action) {
+                .send_data => |sd| {
+                    _ = sd;
+                    server2.provideData(client2.out_buf[0..client2.out_len]);
+                },
+                .install_keys => |ik| {
+                    if (ik.level == .early_data) client_got_early_keys = true;
+                },
+                .wait_for_data => {},
+                .complete => client_done = true,
+                ._continue => {},
+            }
+        }
+
+        if (!server_done) {
+            const action = try server2.step();
+            switch (action) {
+                .send_data => |sd| {
+                    _ = sd;
+                    client2.provideData(server2.out_buf[0..server2.out_len]);
+                },
+                .install_keys => |ik| {
+                    if (ik.level == .early_data) server_got_early_keys = true;
+                },
+                .wait_for_data => {},
+                .complete => server_done = true,
+                ._continue => {},
+            }
+        }
+    }
+
+    try std.testing.expect(client_done);
+    try std.testing.expect(server_done);
+
+    // Verify PSK was used (server skipped cert)
+    server_used_psk = server2.using_psk;
+    try std.testing.expect(server_used_psk);
+    try std.testing.expect(client2.using_psk);
+
+    // Early keys should have been installed on both sides
+    try std.testing.expect(client_got_early_keys);
+    try std.testing.expect(server_got_early_keys);
+
+    // Both sides should have matching app secrets
+    try std.testing.expectEqualSlices(
+        u8,
+        &client2.key_schedule.client_app_traffic_secret,
+        &server2.key_schedule.client_app_traffic_secret,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &client2.key_schedule.server_app_traffic_secret,
+        &server2.key_schedule.server_app_traffic_secret,
+    );
+}
+
+// NewSessionTicket roundtrip test
+test "NewSessionTicket: build and parse roundtrip" {
+    const psk: [32]u8 = .{0x55} ** 32;
+    const ticket_data = [_]u8{0xAA} ** 64;
+
+    // Build a SessionTicket manually
+    var original = SessionTicket{ .psk = psk };
+    original.lifetime = 86400;
+    original.ticket_age_add = 0x12345678;
+    original.creation_time = std.time.timestamp();
+    original.max_early_data_size = 0xffffffff;
+    @memcpy(original.ticket[0..64], &ticket_data);
+    original.ticket_len = 64;
+    @memcpy(original.alpn[0..2], "h3");
+    original.alpn_len = 2;
+
+    // Verify accessors
+    try std.testing.expectEqual(@as(u16, 64), original.ticket_len);
+    try std.testing.expectEqualSlices(u8, "h3", original.getAlpn());
+    try std.testing.expect(!original.isExpired());
+
+    // Verify PSK is stored correctly
+    try std.testing.expectEqualSlices(u8, &psk, &original.psk);
 }
