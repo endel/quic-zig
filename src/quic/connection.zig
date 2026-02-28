@@ -311,6 +311,13 @@ pub const Connection = struct {
     datagram_send_queue: DatagramQueue = .{},
     datagrams_enabled: bool = false,
 
+    // 0-RTT (early data) keys
+    early_data_open: ?quic_crypto.Open = null, // Server: decrypt 0-RTT packets
+    early_data_seal: ?quic_crypto.Seal = null, // Client: encrypt 0-RTT packets
+
+    // Session ticket received from server (readable by application)
+    session_ticket: ?tls13.SessionTicket = null,
+
     // Connection state
     got_peer_conn_id: bool = false,
     peer_max_cid_seq: u64 = 0,
@@ -435,9 +442,52 @@ pub const Connection = struct {
         const epoch = try packet.Epoch.fromPacketType(header.packet_type);
         std.log.info("recv: packet_type={s}, epoch={s}", .{ @tagName(header.packet_type), @tagName(epoch) });
 
+        // 0-RTT packets use the application PN space but with early data keys
         if (epoch == packet.Epoch.zero_rtt) {
-            std.log.info("TODO: implement zero rtt", .{});
-            return error.NotImplemented;
+            if (self.early_data_open == null) {
+                std.log.info("recv: dropping 0-RTT packet (no early data keys)", .{});
+                return;
+            }
+
+            // 0-RTT uses pkt_num_spaces[2] (application) for PN tracking
+            var space = self.pkt_num_spaces[2];
+            var early_open = self.early_data_open.?;
+            // Temporarily install early keys in the space for decryption
+            const saved_open = space.crypto_open;
+            space.crypto_open = early_open;
+            const payload = packet.decrypt(header, fbs, space) catch |err| {
+                std.log.err("can't decrypt 0-RTT packet. {any}", .{err});
+                space.crypto_open = saved_open;
+                return error.InvalidPacket;
+            };
+            space.crypto_open = saved_open;
+            _ = &early_open;
+
+            if (payload.len == 0) return error.InvalidPacket;
+
+            const now: i64 = @intCast(std.time.nanoTimestamp());
+            self.last_packet_received_time = now;
+            self.paths[self.active_path_idx].bytes_received += @intCast(fbs.buffer.len);
+
+            // Process 0-RTT frames (STREAM, DATAGRAM etc. - no CRYPTO or HANDSHAKE_DONE)
+            var remaining = payload;
+            var ack_eliciting = false;
+            while (remaining.len > 0) {
+                if (remaining[0] == 0x00) { remaining = remaining[1..]; continue; }
+                const frame = Frame.parse(remaining) catch break;
+                if (frame.isAckEliciting()) ack_eliciting = true;
+                try self.processFrame(frame, .application, now);
+                const consumed = self.frameSize(frame, remaining);
+                if (consumed == 0) break;
+                remaining = remaining[consumed..];
+            }
+            try self.pkt_handler.onPacketReceived(.application, header.packet_number, ack_eliciting, now);
+            if (header.packet_number + 1 > self.pkt_num_spaces[2].next_packet_number) {
+                self.pkt_num_spaces[2].next_packet_number = header.packet_number + 1;
+            }
+            if (self.state == .first_flight) self.state = .handshake;
+            try self.advanceHandshake();
+            return;
         }
 
         const enc_level = epochToEncLevel(epoch);
@@ -933,8 +983,37 @@ pub const Connection = struct {
 
     /// Advance the TLS 1.3 handshake by reading contiguous crypto data.
     fn advanceHandshake(self: *Connection) !void {
-        if (self.handshake_confirmed) return;
+        // Allow post-handshake messages (NST) even after handshake_confirmed
         var hs = &(self.tls13_hs orelse return);
+
+        // If handshake is confirmed, only feed application-level crypto data for NST
+        if (self.handshake_confirmed) {
+            const cs = self.crypto_streams.getStream(3); // application level
+            var got_data = false;
+            while (cs.read()) |data| {
+                defer self.allocator.free(data);
+                hs.provideData(data);
+                got_data = true;
+            }
+            if (got_data) {
+                var nst_iters: usize = 0;
+                while (nst_iters < 10) : (nst_iters += 1) {
+                    const action = hs.step() catch break;
+                    switch (action) {
+                        .complete => {
+                            if (hs.received_ticket) |ticket| {
+                                self.session_ticket = ticket;
+                                std.log.info("stored session ticket from server (lifetime={d}s)", .{ticket.lifetime});
+                            }
+                            break;
+                        },
+                        ._continue => continue,
+                        else => break,
+                    }
+                }
+            }
+            return;
+        }
 
         std.log.info("advanceHandshake: state={}, iterations starting", .{@intFromEnum(hs.state)});
 
@@ -973,6 +1052,15 @@ pub const Connection = struct {
                 },
                 .install_keys => |ik| {
                     switch (ik.level) {
+                        .early_data => {
+                            if (self.is_server) {
+                                self.early_data_open = ik.open;
+                                std.log.info("installed 0-RTT decrypt keys (server)", .{});
+                            } else {
+                                self.early_data_seal = ik.seal;
+                                std.log.info("installed 0-RTT encrypt keys (client)", .{});
+                            }
+                        },
                         .handshake => self.installHandshakeKeys(ik.open, ik.seal),
                         .application => self.installAppKeys(ik.open, ik.seal),
                         else => {},
@@ -985,6 +1073,10 @@ pub const Connection = struct {
                     self.paths[self.active_path_idx].is_validated = true;
                     self.pkt_handler.dropSpace(.initial);
                     self.pkt_handler.dropSpace(.handshake);
+
+                    // Clear early data keys (0-RTT period is over)
+                    self.early_data_open = null;
+                    self.early_data_seal = null;
 
                     // Clear Initial encryption keys so we stop sending padded Initial packets
                     self.pkt_num_spaces[0].crypto_open = null;
@@ -999,6 +1091,12 @@ pub const Connection = struct {
                         self.packer.send_handshake_done = true;
                     }
                     // Client: Handshake keys cleared in client.zig after sending Finished
+
+                    // Store received session ticket if any
+                    if (hs.received_ticket) |ticket| {
+                        self.session_ticket = ticket;
+                        std.log.info("stored session ticket (lifetime={d}s)", .{ticket.lifetime});
+                    }
 
                     // Initialize KeyUpdateManager from TLS traffic secrets (RFC 9001 Section 6)
                     if (hs.key_schedule.computed_app) {
@@ -1106,6 +1204,7 @@ pub const Connection = struct {
                     &self.pending_frames,
                     null,
                     null,
+                    null,
                     app_seal,
                     now,
                     null,
@@ -1162,6 +1261,9 @@ pub const Connection = struct {
         else
             self.pkt_num_spaces[2].crypto_seal;
 
+        // 0-RTT seal (client only, before handshake completes)
+        const early_seal = if (!self.handshake_confirmed) self.early_data_seal else null;
+
         const has_initial = initial_seal != null;
         const has_handshake = handshake_seal != null;
         const has_app = app_seal != null;
@@ -1179,6 +1281,7 @@ pub const Connection = struct {
             &self.streams,
             &self.pending_frames,
             initial_seal,
+            early_seal,
             handshake_seal,
             app_seal,
             now,

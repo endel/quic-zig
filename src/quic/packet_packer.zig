@@ -96,7 +96,7 @@ pub const PacketPacker = struct {
         self.dcid_len = @intCast(new_dcid.len);
     }
 
-    /// Pack a coalesced packet (Initial + Handshake + 1-RTT).
+    /// Pack a coalesced packet (Initial + 0-RTT + Handshake + 1-RTT).
     /// Returns the number of bytes written to out_buf.
     pub fn packCoalesced(
         self: *PacketPacker,
@@ -106,6 +106,7 @@ pub const PacketPacker = struct {
         streams: *stream_mod.StreamsMap,
         pending_frames: *frame_mod.PendingFrameQueue,
         initial_seal: ?crypto_mod.Seal,
+        early_seal: ?crypto_mod.Seal,
         handshake_seal: ?crypto_mod.Seal,
         app_seal: ?crypto_mod.Seal,
         now: i64,
@@ -126,8 +127,27 @@ pub const PacketPacker = struct {
                 now,
                 true, // pad to minimum size
                 null,
+                false,
             );
             offset += initial_len;
+        }
+
+        // Try packing 0-RTT packet (Long Header, type 0x10)
+        if (early_seal != null and offset < out_buf.len) {
+            const early_len = try self.packSinglePacket(
+                out_buf[offset..],
+                .application,
+                pkt_handler,
+                crypto_mgr,
+                streams,
+                pending_frames,
+                early_seal.?,
+                now,
+                false,
+                datagram_queue,
+                true, // zero_rtt = true
+            );
+            offset += early_len;
         }
 
         // Try packing Handshake packet
@@ -143,6 +163,7 @@ pub const PacketPacker = struct {
                 now,
                 false,
                 null,
+                false,
             );
             offset += hs_len;
         }
@@ -160,6 +181,7 @@ pub const PacketPacker = struct {
                 now,
                 false,
                 datagram_queue,
+                false,
             );
             offset += app_len;
         }
@@ -169,6 +191,7 @@ pub const PacketPacker = struct {
 
     /// Pack a single packet at the given encryption level.
     /// Returns the total packet size including header, encrypted payload, and AEAD tag.
+    /// When zero_rtt=true, packs a 0-RTT Long Header packet (type 0x10) with only STREAM/DATAGRAM frames.
     fn packSinglePacket(
         self: *PacketPacker,
         buf: []u8,
@@ -181,6 +204,7 @@ pub const PacketPacker = struct {
         now: i64,
         pad_to_min: bool,
         datagram_queue: ?*conn_mod.DatagramQueue,
+        zero_rtt: bool,
     ) !usize {
         if (buf.len < 64) return 0; // Not enough space
 
@@ -198,7 +222,9 @@ pub const PacketPacker = struct {
 
         // Write header
         const header_start: usize = 0;
-        const pkt_type = switch (level) {
+        const pkt_type = if (zero_rtt)
+            packet_mod.PacketType.zero_rtt
+        else switch (level) {
             .initial => packet_mod.PacketType.initial,
             .handshake => packet_mod.PacketType.handshake,
             .application => packet_mod.PacketType.one_rtt,
@@ -256,45 +282,48 @@ pub const PacketPacker = struct {
         // Collect frames
         var ack_eliciting = false;
 
-        // 1. ACK frame (always first if pending)
-        const ack_delay_exp: u64 = 3;
-        if (pkt_handler.getAckFrame(level, now, ack_delay_exp)) |ack_frame| {
-            try ack_frame.write(writer);
-        }
+        // 0-RTT packets only contain STREAM and DATAGRAM frames — skip ACK, CRYPTO, control
+        if (!zero_rtt) {
+            // 1. ACK frame (always first if pending)
+            const ack_delay_exp: u64 = 3;
+            if (pkt_handler.getAckFrame(level, now, ack_delay_exp)) |ack_frame| {
+                try ack_frame.write(writer);
+            }
 
-        // 2. CRYPTO frames
-        const crypto_level_idx: u8 = switch (level) {
-            .initial => 0,
-            .handshake => 2,
-            .application => 3,
-        };
-        const cs = crypto_mgr.getStream(crypto_level_idx);
-        const remaining = effective_max - fbs.pos - AEAD_TAG_LEN - 4;
-        if (remaining > 0) {
-            if (cs.popCryptoFrame(remaining)) |crypto_frame| {
-                try crypto_frame.write(writer);
+            // 2. CRYPTO frames
+            const crypto_level_idx: u8 = switch (level) {
+                .initial => 0,
+                .handshake => 2,
+                .application => 3,
+            };
+            const cs = crypto_mgr.getStream(crypto_level_idx);
+            const remaining_space = effective_max - fbs.pos - AEAD_TAG_LEN - 4;
+            if (remaining_space > 0) {
+                if (cs.popCryptoFrame(remaining_space)) |crypto_frame| {
+                    try crypto_frame.write(writer);
+                    ack_eliciting = true;
+                }
+            }
+
+            // 3. HANDSHAKE_DONE frame (server only, 1-RTT)
+            if (level == .application and self.send_handshake_done) {
+                try writer.writeByte(0x1e); // HANDSHAKE_DONE frame type
+                self.send_handshake_done = false;
                 ack_eliciting = true;
+                std.log.info("packing HANDSHAKE_DONE frame", .{});
+            }
+
+            // 4. Pending control frames (only in 1-RTT)
+            if (level == .application) {
+                while (pending_frames.pop()) |pcf| {
+                    const ctrl_frame = pcf.toFrame();
+                    try ctrl_frame.write(writer);
+                    ack_eliciting = true;
+                }
             }
         }
 
-        // 3. HANDSHAKE_DONE frame (server only, 1-RTT)
-        if (level == .application and self.send_handshake_done) {
-            try writer.writeByte(0x1e); // HANDSHAKE_DONE frame type
-            self.send_handshake_done = false;
-            ack_eliciting = true;
-            std.log.info("packing HANDSHAKE_DONE frame", .{});
-        }
-
-        // 4. Pending control frames (only in 1-RTT)
-        if (level == .application) {
-            while (pending_frames.pop()) |pcf| {
-                const ctrl_frame = pcf.toFrame();
-                try ctrl_frame.write(writer);
-                ack_eliciting = true;
-            }
-        }
-
-        // 5. Stream frames (only in 1-RTT)
+        // 5. Stream frames (only in 1-RTT or 0-RTT)
         if (level == .application) {
             // Bidirectional streams
             var stream_it = streams.streams.valueIterator();
