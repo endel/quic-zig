@@ -1208,6 +1208,35 @@ pub const Connection = struct {
                     // Store peer transport parameters and apply stream limits
                     if (hs.peer_transport_params) |peer_tp| {
                         self.peer_params = peer_tp;
+
+                        // Client-side: validate ODCID and retry_scid transport params (RFC 9000 §7.3)
+                        if (!self.is_server) {
+                            // original_destination_connection_id must match the DCID we initially sent
+                            if (peer_tp.original_destination_connection_id) |peer_odcid| {
+                                if (!std.mem.eql(u8, peer_odcid, self.odcid_buf[0..self.odcid_len])) {
+                                    std.log.err("transport param validation failed: ODCID mismatch", .{});
+                                    return error.TransportParameterError;
+                                }
+                            } else {
+                                std.log.err("transport param validation failed: server must send ODCID", .{});
+                                return error.TransportParameterError;
+                            }
+
+                            // If Retry was used, retry_source_connection_id must be present
+                            // If not, it must be absent
+                            if (self.retry_received) {
+                                if (peer_tp.retry_source_connection_id == null) {
+                                    std.log.err("transport param validation failed: retry_scid missing after Retry", .{});
+                                    return error.TransportParameterError;
+                                }
+                            } else {
+                                if (peer_tp.retry_source_connection_id != null) {
+                                    std.log.err("transport param validation failed: retry_scid present without Retry", .{});
+                                    return error.TransportParameterError;
+                                }
+                            }
+                        }
+
                         self.streams.setMaxStreams(
                             peer_tp.initial_max_streams_bidi,
                             peer_tp.initial_max_streams_uni,
