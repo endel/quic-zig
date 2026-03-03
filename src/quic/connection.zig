@@ -325,6 +325,13 @@ pub const Connection = struct {
     local_err: ?ConnectionError = null,
     handshake_confirmed: bool = false,
 
+    // Retry state (client-side)
+    odcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
+    odcid_len: u8 = 0,
+    retry_received: bool = false,
+    retry_token_buf: [packet.TOKEN_MAX_LEN]u8 = .{0} ** packet.TOKEN_MAX_LEN,
+    retry_token_len: u16 = 0,
+
     // Timing
     last_packet_received_time: i64 = 0,
     creation_time: i64 = 0,
@@ -338,8 +345,14 @@ pub const Connection = struct {
         comptime is_server: bool,
         config: ConnectionConfig,
         tls_config: ?tls13.TlsConfig,
+        odcid: ?[]const u8,
+        retry_scid: ?[]const u8,
     ) !Connection {
-        const initial_path = NetworkPath.init(local, remote, true);
+        var initial_path = NetworkPath.init(local, remote, true);
+        // If Retry was used, the path is already validated
+        if (odcid != null) {
+            initial_path.is_validated = true;
+        }
         const now: i64 = @intCast(std.time.nanoTimestamp());
 
         var conn = Connection{
@@ -376,10 +389,14 @@ pub const Connection = struct {
             @memcpy(conn.scid[0..header.scid.len], header.scid);
         }
 
+        // For Retry: use the original DCID (before Retry) for the transport param
+        const tp_odcid = odcid orelse (if (is_server) header.dcid else null);
+
         // Build transport params AFTER CIDs are stored in conn (to avoid dangling slices)
         const local_params: transport_params.TransportParams = .{
-            .original_destination_connection_id = if (is_server) header.dcid else null,
+            .original_destination_connection_id = tp_odcid,
             .initial_source_connection_id = conn.scid[0..conn.scid_len],
+            .retry_source_connection_id = retry_scid,
             .max_idle_timeout = config.max_idle_timeout,
             .initial_max_data = config.initial_max_data,
             .initial_max_stream_data_bidi_local = config.initial_max_stream_data_bidi_local,
@@ -437,8 +454,74 @@ pub const Connection = struct {
         self.crypto_streams.deinit();
     }
 
+    /// Handle a Retry packet (client only).
+    /// Verifies the integrity tag, saves ODCID, re-derives Initial keys with new DCID,
+    /// and resets crypto stream so the same ClientHello is re-sent.
+    pub fn handleRetryPacket(self: *Connection, header: *const packet.Header, raw_packet: []const u8) !void {
+        // Only accept one Retry, only before handshake progresses
+        if (self.retry_received or self.state != .first_flight) {
+            std.log.warn("ignoring Retry: retry_received={}, state={}", .{ self.retry_received, @intFromEnum(self.state) });
+            return;
+        }
+
+        // Verify integrity tag using the ODCID (which is the initial DCID we sent to)
+        const odcid = self.odcid_buf[0..self.odcid_len];
+        const valid = packet.verifyRetryIntegrity(raw_packet, odcid, self.version) catch {
+            std.log.err("Retry integrity check error", .{});
+            return;
+        };
+        if (!valid) {
+            std.log.warn("Retry integrity tag verification failed", .{});
+            return;
+        }
+
+        // Update DCID to the Retry packet's SCID
+        self.dcid_len = @intCast(header.scid.len);
+        @memcpy(self.dcid[0..header.scid.len], header.scid);
+        self.packer.updateDcid(header.scid);
+
+        // Store the Retry token for inclusion in the next Initial packet
+        if (header.token) |token| {
+            if (token.len <= self.retry_token_buf.len) {
+                @memcpy(self.retry_token_buf[0..token.len], token);
+                self.retry_token_len = @intCast(token.len);
+                // Point the packer's initial_token to our owned buffer
+                self.packer.initial_token = self.retry_token_buf[0..self.retry_token_len];
+            }
+        }
+
+        // Re-derive Initial keys with the new DCID (Retry SCID)
+        try self.pkt_num_spaces[0].setupInitial(
+            self.dcid[0..self.dcid_len],
+            self.version,
+            false, // client
+        );
+
+        // Reset packet number so the next Initial starts from 0
+        self.pkt_num_spaces[0].next_packet_number = 0;
+
+        // Reset the crypto stream send offset to re-send the same ClientHello
+        self.crypto_streams.getStream(0).resetSendOffset();
+
+        self.retry_received = true;
+        self.got_peer_conn_id = false; // will pick up server's SCID from ServerHello
+
+        std.log.info("Retry handled: new DCID={any}, token_len={d}", .{
+            self.dcid[0..self.dcid_len],
+            self.retry_token_len,
+        });
+    }
+
     /// Process a received packet.
     pub fn recv(self: *Connection, header: *packet.Header, fbs: anytype, info: RecvInfo) !void {
+        // Intercept Retry packets before normal processing (client only)
+        if (header.packet_type == .retry) {
+            if (!self.is_server) {
+                try self.handleRetryPacket(header, fbs.buffer[header.packet_start..fbs.buffer.len]);
+            }
+            return;
+        }
+
         const epoch = try packet.Epoch.fromPacketType(header.packet_type);
         std.log.info("recv: packet_type={s}, epoch={s}", .{ @tagName(header.packet_type), @tagName(epoch) });
 
@@ -1552,6 +1635,10 @@ pub fn connect(
     @memcpy(conn.scid[0..8], &scid);
     conn.dcid_len = 8;
     @memcpy(conn.dcid[0..8], &dcid);
+
+    // Save the initial DCID as the Original Destination CID (needed for Retry handling)
+    conn.odcid_len = 8;
+    @memcpy(conn.odcid_buf[0..8], &dcid);
 
     std.log.info("connection.connect: dcid={any}, scid={any}", .{ dcid, scid });
 

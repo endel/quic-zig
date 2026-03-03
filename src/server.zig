@@ -39,6 +39,10 @@ pub fn main() !void {
     var ticket_key: [16]u8 = undefined;
     std.crypto.random.bytes(&ticket_key);
 
+    // Generate random key for Retry token encryption
+    var retry_token_key: [16]u8 = undefined;
+    std.crypto.random.bytes(&retry_token_key);
+
     const tls_config: tls13.TlsConfig = .{
         .cert_chain_der = cert_chain,
         .private_key_bytes = ec_private_key,
@@ -123,12 +127,63 @@ pub fn main() !void {
                     break;
                 }
 
-                // Accept connection on first Initial (skip retry)
+                // Accept connection on first Initial with Retry
                 if (conn_state == null) {
                     if (header.packet_type != .initial) {
                         std.log.warn("ignoring non-initial before connection established", .{});
                         break;
                     }
+
+                    if (header.token == null or header.token.?.len == 0) {
+                        // No token: send Retry packet
+                        var retry_scid: [8]u8 = undefined;
+                        std.crypto.random.bytes(&retry_scid);
+
+                        var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
+                        const token_len = packet.generateRetryToken(
+                            &token_buf,
+                            header.dcid,
+                            &retry_scid,
+                            remote_addr,
+                            retry_token_key,
+                        ) catch |err| {
+                            std.log.err("failed to generate retry token: {any}", .{err});
+                            break;
+                        };
+
+                        var retry_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                        var retry_fbs = io.fixedBufferStream(&retry_buf);
+                        packet.retry(
+                            header,
+                            &retry_scid,
+                            token_buf[0..token_len],
+                            &retry_fbs,
+                        ) catch |err| {
+                            std.log.err("failed to build retry packet: {any}", .{err});
+                            break;
+                        };
+                        const retry_bytes = retry_fbs.getWritten();
+                        _ = try posix.sendto(sockfd, retry_bytes, 0, &remote_addr, addr_size);
+                        std.log.info("sent Retry packet ({d} bytes)", .{retry_bytes.len});
+                        break;
+                    }
+
+                    // Has token: validate it
+                    const validated = packet.validateRetryToken(
+                        header.token.?,
+                        remote_addr,
+                        retry_token_key,
+                    ) catch {
+                        std.log.warn("token validation error, dropping", .{});
+                        break;
+                    };
+
+                    if (validated == null) {
+                        std.log.warn("invalid retry token, dropping", .{});
+                        break;
+                    }
+
+                    const vt = validated.?;
                     conn_state = try connection.Connection.accept(
                         alloc,
                         header,
@@ -137,8 +192,10 @@ pub fn main() !void {
                         true,
                         .{},
                         tls_config,
+                        vt.getOdcid(),
+                        vt.getRetryScid(),
                     );
-                    std.log.info("accepted new connection", .{});
+                    std.log.info("accepted new connection (after Retry validation)", .{});
                 }
 
                 var conn = &conn_state.?;

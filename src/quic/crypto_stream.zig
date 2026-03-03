@@ -62,6 +62,12 @@ pub const CryptoStream = struct {
         self.write_offset += data.len;
     }
 
+    /// Reset the send offset so previously-sent data is re-sent.
+    /// Used after Retry to re-send the same ClientHello.
+    pub fn resetSendOffset(self: *CryptoStream) void {
+        self.send_offset = 0;
+    }
+
     /// Check if there's data to send.
     pub fn hasData(self: *const CryptoStream) bool {
         return self.send_offset < self.write_offset;
