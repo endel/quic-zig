@@ -325,6 +325,12 @@ pub const Connection = struct {
     local_err: ?ConnectionError = null,
     handshake_confirmed: bool = false,
 
+    // Connection close state (RFC 9000 Section 10)
+    closing_start_time: i64 = 0,
+    close_pkt_buf: [256]u8 = undefined,
+    close_pkt_len: u16 = 0,
+    needs_close_retransmit: bool = false,
+
     // Retry state (client-side)
     odcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
     odcid_len: u8 = 0,
@@ -514,6 +520,18 @@ pub const Connection = struct {
 
     /// Process a received packet.
     pub fn recv(self: *Connection, header: *packet.Header, fbs: anytype, info: RecvInfo) !void {
+        // Guard: don't process packets in terminal states (RFC 9000 §10)
+        if (self.state == .terminated) return;
+        if (self.state == .draining) {
+            self.last_packet_received_time = @intCast(std.time.nanoTimestamp());
+            return;
+        }
+        if (self.state == .closing) {
+            self.needs_close_retransmit = true;
+            self.last_packet_received_time = @intCast(std.time.nanoTimestamp());
+            return;
+        }
+
         // Intercept Retry packets before normal processing (client only)
         if (header.packet_type == .retry) {
             if (!self.is_server) {
@@ -890,6 +908,7 @@ pub const Connection = struct {
                     if (cc.reason.len > 0) cc.reason else "none",
                 });
                 self.state = .draining;
+                self.closing_start_time = now;
                 self.local_err = .{
                     .is_app = false,
                     .code = cc.error_code,
@@ -899,6 +918,7 @@ pub const Connection = struct {
 
             .application_close => |ac| {
                 self.state = .draining;
+                self.closing_start_time = now;
                 self.local_err = .{
                     .is_app = true,
                     .code = ac.error_code,
@@ -1252,6 +1272,15 @@ pub const Connection = struct {
                             });
                         }
 
+                        // Negotiate idle timeout: use min of local and peer when both non-zero (RFC 9000 §10.1)
+                        if (peer_tp.max_idle_timeout > 0 and self.local_params.max_idle_timeout > 0) {
+                            const effective_ms = @min(peer_tp.max_idle_timeout, self.local_params.max_idle_timeout);
+                            self.idle_timeout_ns = @as(i64, @intCast(effective_ms)) * 1_000_000;
+                        } else if (peer_tp.max_idle_timeout > 0) {
+                            self.idle_timeout_ns = @as(i64, @intCast(peer_tp.max_idle_timeout)) * 1_000_000;
+                        }
+                        // else: keep local timeout (already set)
+
                         std.log.info("applied peer transport params: max_bidi={d}, max_uni={d}, max_data={d}", .{
                             peer_tp.initial_max_streams_bidi,
                             peer_tp.initial_max_streams_uni,
@@ -1296,35 +1325,58 @@ pub const Connection = struct {
 
     /// Build and send outgoing packets.
     pub fn send(self: *Connection, out_buf: []u8) !usize {
-        // Draining: do not send anything
-        if (self.state == .draining) return 0;
+        // Draining/terminated: do not send anything
+        if (self.state == .draining or self.state == .terminated) return 0;
 
         const now: i64 = @intCast(std.time.nanoTimestamp());
 
-        // Closing: send one packet with CONNECTION_CLOSE, then transition to draining
+        // Closing: retransmit saved close packet on each incoming packet (RFC 9000 §10.2.1)
         if (self.state == .closing) {
+            if (self.close_pkt_len > 0) {
+                // Already built the close packet
+                if (self.needs_close_retransmit) {
+                    // Retransmit saved close packet
+                    self.needs_close_retransmit = false;
+                    const len = self.close_pkt_len;
+                    @memcpy(out_buf[0..len], self.close_pkt_buf[0..len]);
+                    return len;
+                }
+                // Not triggered by incoming packet — just waiting for timeout
+                return 0;
+            }
+
+            // First time: build close packet at best available encryption level
             const app_seal: ?quic_crypto.Seal = if (self.key_update) |*ku|
                 ku.current_seal
             else
                 self.pkt_num_spaces[2].crypto_seal;
-            if (app_seal != null) {
+            const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
+            const initial_seal = self.pkt_num_spaces[0].crypto_seal;
+
+            // Try 1-RTT, then Handshake, then Initial
+            const seal = app_seal orelse handshake_seal orelse initial_seal;
+            if (seal != null) {
                 const bytes_written = try self.packer.packCoalesced(
                     out_buf,
                     &self.pkt_handler,
                     &self.crypto_streams,
                     &self.streams,
                     &self.pending_frames,
+                    if (app_seal == null and handshake_seal == null) initial_seal else null,
                     null,
-                    null,
-                    null,
+                    if (app_seal == null) handshake_seal else null,
                     app_seal,
                     now,
                     null,
                 );
-                self.state = .draining;
+                if (bytes_written > 0) {
+                    // Save close packet for retransmission
+                    const save_len: u16 = @intCast(@min(bytes_written, self.close_pkt_buf.len));
+                    @memcpy(self.close_pkt_buf[0..save_len], out_buf[0..save_len]);
+                    self.close_pkt_len = save_len;
+                }
                 return bytes_written;
             }
-            self.state = .draining;
             return 0;
         }
 
@@ -1498,7 +1550,22 @@ pub const Connection = struct {
 
     /// Check for timeouts and maintenance tasks.
     pub fn onTimeout(self: *Connection) !void {
+        if (self.state == .terminated) return;
+
         const now: i64 = @intCast(std.time.nanoTimestamp());
+
+        // Closing/draining: wait 3×PTO then terminate (RFC 9000 §10.2)
+        if (self.state == .closing or self.state == .draining) {
+            if (self.closing_start_time > 0) {
+                const pto_ns = self.pkt_handler.rtt_stats.pto();
+                const drain_timeout = 3 * pto_ns;
+                if (now - self.closing_start_time > drain_timeout) {
+                    self.state = .terminated;
+                    std.log.info("connection terminated after draining period", .{});
+                }
+            }
+            return;
+        }
 
         // Check idle timeout
         if (now - self.last_packet_received_time > self.idle_timeout_ns) {
@@ -1525,9 +1592,11 @@ pub const Connection = struct {
         }
     }
 
-    /// Close the connection gracefully.
+    /// Close the connection gracefully with an application error.
     pub fn close(self: *Connection, error_code: u64, reason: []const u8) void {
+        if (self.state == .closing or self.state == .draining or self.state == .terminated) return;
         self.state = .closing;
+        self.closing_start_time = @intCast(std.time.nanoTimestamp());
         self.local_err = .{
             .is_app = true,
             .code = error_code,
@@ -1537,6 +1606,23 @@ pub const Connection = struct {
             .error_code = error_code,
             .frame_type = 0,
             .is_app = true,
+        } });
+    }
+
+    /// Close the connection with a transport error (RFC 9000 §10.2).
+    pub fn closeWithTransportError(self: *Connection, error_code: u64, frame_type: u64, reason: []const u8) void {
+        if (self.state == .closing or self.state == .draining or self.state == .terminated) return;
+        self.state = .closing;
+        self.closing_start_time = @intCast(std.time.nanoTimestamp());
+        self.local_err = .{
+            .is_app = false,
+            .code = error_code,
+            .reason = reason,
+        };
+        self.pending_frames.push(.{ .connection_close = .{
+            .error_code = error_code,
+            .frame_type = frame_type,
+            .is_app = false,
         } });
     }
 

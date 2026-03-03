@@ -280,4 +280,36 @@ pub fn main() !void {
     if (final_bytes > 0) {
         _ = try posix.sendto(sockfd, out[0..final_bytes], 0, &remote_addr, addr_size);
     }
+
+    // Wait for draining period to complete
+    var drain_iter: usize = 0;
+    while (!conn.isClosed() and drain_iter < 100) : (drain_iter += 1) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        conn.onTimeout() catch break;
+
+        // Read and discard any incoming packets (triggers close retransmit)
+        while (true) {
+            var bytes: [8192]u8 = undefined;
+            addr_size = @sizeOf(posix.sockaddr);
+            const pkt_len = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch break;
+
+            var fbs = io.fixedBufferStream(bytes[0..pkt_len]);
+            while (fbs.pos < pkt_len) {
+                if (bytes[fbs.pos] & 0x40 == 0) break;
+                const pkt_start = fbs.pos;
+                var header = packet.Header.parse(&fbs, conn.scid_len) catch break;
+                const full_size = fbs.pos - pkt_start + header.remainder_len;
+                conn.recv(&header, &fbs, .{ .to = local_addr.any, .from = remote_addr }) catch break;
+                const next_pos = pkt_start + full_size;
+                if (fbs.pos < next_pos) fbs.pos = next_pos;
+            }
+        }
+
+        // Send retransmit if triggered
+        const retransmit_bytes = conn.send(&out) catch 0;
+        if (retransmit_bytes > 0) {
+            _ = posix.sendto(sockfd, out[0..retransmit_bytes], 0, &remote_addr, addr_size) catch {};
+        }
+    }
+    std.log.info("connection closed cleanly", .{});
 }

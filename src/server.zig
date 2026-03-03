@@ -296,6 +296,20 @@ pub fn main() !void {
                 }
             }
 
+            // Check timeouts (idle, PTO, closing/draining timer)
+            conn.onTimeout() catch |err| {
+                std.log.err("onTimeout error: {any}", .{err});
+            };
+
+            // Check if connection has terminated
+            if (conn.isClosed()) {
+                std.log.info("connection terminated, ready for new connection", .{});
+                conn_state = null;
+                h3_conn = null;
+                h3_initialized = false;
+                continue;
+            }
+
             // Periodic send for retransmissions/ACKs/stream data
             const bytes_written = conn.send(&out) catch |err| {
                 std.log.err("periodic send error: {any}", .{err});
