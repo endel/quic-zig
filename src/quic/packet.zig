@@ -30,7 +30,7 @@ pub const CONNECTION_ID_MAX_SIZE: u8 = 20;
 const PACKET_NUM_MASK: u8 = 0x03;
 
 pub const STATELESS_RESET_TOKEN_SIZE = 16; // aren't these 2 the same?
-const RETRY_INTEGRITY_TAG_SIZE = 16;
+pub const RETRY_INTEGRITY_TAG_SIZE = 16;
 const RETRY_INTEGRITY_KEY_V1: [crypto.key_len]u8 = .{ 0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e };
 const RETRY_INTEGRITY_NONCE_V1: [crypto.nonce_len]u8 = .{ 0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb };
 
@@ -201,11 +201,10 @@ pub const Header = struct {
         // Only Initial and Retry packets have a token.
         switch (self.packet_type) {
             PacketType.initial => {
-                if (self.token == null or self.token.?.len == 0) {
-                    try writeVarInt(writer, self.token.?.len);
-                    try writer.writeAll(self.token.?);
+                if (self.token) |t| {
+                    try writeVarInt(writer, t.len);
+                    try writer.writeAll(t);
                 } else {
-                    // no token, 0 length
                     try writeVarInt(writer, 0);
                 }
             },
@@ -492,6 +491,11 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
             },
 
             PacketType.retry => {
+                // Retry packet: everything after header, before 16-byte integrity tag, is the token
+                const remaining = fbs.buffer.len - fbs.pos;
+                if (remaining > RETRY_INTEGRITY_TAG_SIZE) {
+                    header.token = fbs.buffer[fbs.pos .. fbs.buffer.len - RETRY_INTEGRITY_TAG_SIZE];
+                }
                 header.remainder_len = 0;
             },
 
@@ -598,41 +602,24 @@ pub fn packetNumberLength(pn: u64) !usize {
 /// - Retry Packets: https://datatracker.ietf.org/doc/html/rfc9000#section-17.2.5
 /// - Retry Packet Integrity: https://datatracker.ietf.org/doc/html/rfc9001#section-5.8
 ///
-fn computeRetryIntegrityTag(
-    packet_bytes_without_tag: []u8,
+pub fn computeRetryIntegrityTag(
+    packet_bytes_without_tag: []const u8,
     odcid: []const u8,
     version: u32,
 ) ![crypto.Aead.tag_length]u8 {
     _ = version;
 
-    //
-    // The secret key and the nonce are values derived by calling HKDF-
-    // Expand-Label using
-    // 0xd9c9943e6101fd200021506bcc02814c73030f25c79d71ce876eca876e6fca8e as
-    // the secret, with labels being "quic key" and "quic iv" (Section 5.1).
-    //
-    // https://datatracker.ietf.org/doc/html/rfc9001#section-5.8
-    //
-
-    // Implementation references
-    // - aiortc/aioquic: https://github.com/aiortc/aioquic/blob/444be09157aed3c81881d18647484165dd07139c/src/aioquic/quic/packet.py#L92-L116
-    // - lucas-clemente/quic-go: https://github.com/lucas-clemente/quic-go/blob/2de4af00d06891b8b110965a2aa44b0a84dcc71b/internal/handshake/retry.go#L43-L62
-
     const key = RETRY_INTEGRITY_KEY_V1;
     const nonce = RETRY_INTEGRITY_NONCE_V1;
 
-    // TODO: avoid using dynamic allocation
-    const allocator = std.heap.page_allocator;
-    const buf = try allocator.alloc(u8, odcid.len + packet_bytes_without_tag.len + 1);
-    defer allocator.free(buf);
-
-    var inner_fbs = io.fixedBufferStream(buf);
+    // Use stack buffer: 1 (odcid_len) + 20 (max odcid) + ~1300 (max packet) = 1321
+    var buf: [1400]u8 = undefined;
+    var inner_fbs = io.fixedBufferStream(&buf);
     const buf_writer = inner_fbs.writer();
     try buf_writer.writeByte(@intCast(odcid.len));
     try buf_writer.writeAll(odcid);
     try buf_writer.writeAll(packet_bytes_without_tag);
 
-    // encrypt with associated data only
     const m = "";
     var c: [m.len]u8 = undefined;
     var tag: [crypto.Aead.tag_length]u8 = undefined;
@@ -641,58 +628,143 @@ fn computeRetryIntegrityTag(
     return tag;
 }
 
-///
-///
-pub fn generateRetryToken(
-    header: Header,
-    new_scid: []u8,
-    addr: posix.sockaddr,
-) ![]u8 {
-    var buf: [512]u8 = undefined;
-    var fbs = io.fixedBufferStream(&buf);
-    var writer = fbs.writer();
-
-    try writer.writeAll(encodeAddr(addr));
-
-    // original destination connection id
-    try writer.writeByte(@intCast(header.dcid.len));
-    try writer.writeAll(header.dcid);
-
-    try writer.writeByte(@intCast(new_scid.len));
-    try writer.writeAll(new_scid);
-
-    return fbs.getWritten();
-
-    // buf = Buffer(capacity=512)
-    // push_opaque(buf, 1, encode_address(addr))
-    // push_opaque(buf, 1, original_destination_connection_id)
-    // push_opaque(buf, 1, retry_source_connection_id)
-    // return self._key.public_key().encrypt(
-    //     buf.data,
-    //     padding.OAEP(
-    //         mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None
-    //     ),
-    // )
-
-    // data, err := asn1.Marshal(token{
-    //     IsRetryToken:             true,
-    //     RemoteAddr:               encodeRemoteAddr(raddr),
-    //     OriginalDestConnectionID: origDestConnID.Bytes(),
-    //     RetrySrcConnectionID:     retrySrcConnID.Bytes(),
-    //     Timestamp:                time.Now().UnixNano(),
-    // })
-    // if err != nil {
-    //     return nil, err
-    // }
-    // return g.tokenProtector.NewToken(data)
+// Verify the integrity tag of a received Retry packet.
+pub fn verifyRetryIntegrity(
+    raw_packet: []const u8,
+    odcid: []const u8,
+    version: u32,
+) !bool {
+    if (raw_packet.len < RETRY_INTEGRITY_TAG_SIZE) return false;
+    const packet_without_tag = raw_packet[0 .. raw_packet.len - RETRY_INTEGRITY_TAG_SIZE];
+    const received_tag = raw_packet[raw_packet.len - RETRY_INTEGRITY_TAG_SIZE ..];
+    const expected_tag = try computeRetryIntegrityTag(packet_without_tag, odcid, version);
+    return std.mem.eql(u8, received_tag, &expected_tag);
 }
 
-fn encodeAddr(addr: posix.sockaddr) []const u8 {
-    return switch (addr.family) {
-        posix.AF.INET => &addr.data,
-        posix.AF.INET6 => &addr.data,
-        else => unreachable,
-    };
+// Encrypted Retry token format:
+// nonce(12) || AES-128-GCM-encrypt(plaintext) || tag(16)
+// Plaintext: odcid_len(1) + odcid(<=20) + retry_scid_len(1) + retry_scid(<=20) + timestamp_ns(8) + addr_data(14)
+pub const TOKEN_NONCE_LEN = 12;
+pub const TOKEN_TAG_LEN = 16;
+pub const TOKEN_MAX_PLAINTEXT_LEN = 1 + 20 + 1 + 20 + 8 + 14; // 64
+pub const TOKEN_MAX_LEN = TOKEN_NONCE_LEN + TOKEN_MAX_PLAINTEXT_LEN + TOKEN_TAG_LEN; // 92
+
+pub fn generateRetryToken(
+    out: []u8,
+    odcid: []const u8,
+    retry_scid: []const u8,
+    client_addr: posix.sockaddr,
+    token_key: [crypto.key_len]u8,
+) !usize {
+    if (out.len < TOKEN_MAX_LEN) return error.BufferTooSmall;
+
+    // Generate random nonce
+    var nonce: [TOKEN_NONCE_LEN]u8 = undefined;
+    random.bytes(&nonce);
+    @memcpy(out[0..TOKEN_NONCE_LEN], &nonce);
+
+    // Build plaintext
+    var plaintext: [TOKEN_MAX_PLAINTEXT_LEN]u8 = undefined;
+    var pt_fbs = io.fixedBufferStream(&plaintext);
+    const pt_writer = pt_fbs.writer();
+    try pt_writer.writeByte(@intCast(odcid.len));
+    try pt_writer.writeAll(odcid);
+    try pt_writer.writeByte(@intCast(retry_scid.len));
+    try pt_writer.writeAll(retry_scid);
+    const now: i64 = @intCast(time.nanoTimestamp());
+    try pt_writer.writeInt(i64, now, ENDIAN);
+    // Write first 14 bytes of sockaddr.data (covers IPv4 port+addr)
+    try pt_writer.writeAll(client_addr.data[0..14]);
+
+    const pt_len = pt_fbs.pos;
+    const pt_data = plaintext[0..pt_len];
+
+    // Encrypt: no AD, just nonce+key
+    var ciphertext_buf: [TOKEN_MAX_PLAINTEXT_LEN]u8 = undefined;
+    var tag: [TOKEN_TAG_LEN]u8 = undefined;
+    crypto.Aead.encrypt(
+        ciphertext_buf[0..pt_len],
+        &tag,
+        pt_data,
+        "",
+        nonce,
+        token_key,
+    );
+
+    @memcpy(out[TOKEN_NONCE_LEN..][0..pt_len], ciphertext_buf[0..pt_len]);
+    @memcpy(out[TOKEN_NONCE_LEN + pt_len ..][0..TOKEN_TAG_LEN], &tag);
+
+    return TOKEN_NONCE_LEN + pt_len + TOKEN_TAG_LEN;
+}
+
+pub const ValidatedToken = struct {
+    odcid_buf: [20]u8 = .{0} ** 20,
+    odcid_len: u8 = 0,
+    retry_scid_buf: [20]u8 = .{0} ** 20,
+    retry_scid_len: u8 = 0,
+
+    pub fn getOdcid(self: *const ValidatedToken) []const u8 {
+        return self.odcid_buf[0..self.odcid_len];
+    }
+
+    pub fn getRetryScid(self: *const ValidatedToken) []const u8 {
+        return self.retry_scid_buf[0..self.retry_scid_len];
+    }
+};
+
+// Token validity duration: 60 seconds
+const TOKEN_MAX_AGE_NS: i64 = 60 * std.time.ns_per_s;
+
+pub fn validateRetryToken(
+    token_data: []const u8,
+    client_addr: posix.sockaddr,
+    token_key: [crypto.key_len]u8,
+) !?ValidatedToken {
+    if (token_data.len < TOKEN_NONCE_LEN + TOKEN_TAG_LEN + 2) return null;
+
+    const nonce = token_data[0..TOKEN_NONCE_LEN].*;
+    const ct_len = token_data.len - TOKEN_NONCE_LEN - TOKEN_TAG_LEN;
+    const ciphertext = token_data[TOKEN_NONCE_LEN..][0..ct_len];
+    const tag = token_data[token_data.len - TOKEN_TAG_LEN ..][0..TOKEN_TAG_LEN].*;
+
+    // Decrypt
+    var plaintext: [TOKEN_MAX_PLAINTEXT_LEN]u8 = undefined;
+    crypto.Aead.decrypt(
+        plaintext[0..ct_len],
+        ciphertext,
+        tag,
+        "",
+        nonce,
+        token_key,
+    ) catch return null; // decryption failed = invalid token
+
+    // Parse plaintext
+    var pt_fbs = io.fixedBufferStream(plaintext[0..ct_len]);
+    const pt_reader = pt_fbs.reader();
+
+    var result = ValidatedToken{};
+
+    // Read ODCID
+    result.odcid_len = pt_reader.readByte() catch return null;
+    if (result.odcid_len > 20) return null;
+    _ = pt_reader.readAll(result.odcid_buf[0..result.odcid_len]) catch return null;
+
+    // Read retry SCID
+    result.retry_scid_len = pt_reader.readByte() catch return null;
+    if (result.retry_scid_len > 20) return null;
+    _ = pt_reader.readAll(result.retry_scid_buf[0..result.retry_scid_len]) catch return null;
+
+    // Read timestamp and check age
+    const timestamp = pt_reader.readInt(i64, ENDIAN) catch return null;
+    const now: i64 = @intCast(time.nanoTimestamp());
+    if (now - timestamp > TOKEN_MAX_AGE_NS or timestamp > now) return null;
+
+    // Check address
+    var addr_data: [14]u8 = undefined;
+    _ = pt_reader.readAll(&addr_data) catch return null;
+    if (!std.mem.eql(u8, &addr_data, client_addr.data[0..14])) return null;
+
+    return result;
 }
 
 pub fn readVarInt(reader: anytype) !u64 {
@@ -832,4 +904,116 @@ fn decodePacketNumber(expected_pkt_num: u64, truncated_pkt_num: u64, num_bits: u
     }
 
     return candidate;
+}
+
+// Retry token roundtrip test
+test "Retry token: generate and validate roundtrip" {
+    var token_key: [crypto.key_len]u8 = undefined;
+    random.bytes(&token_key);
+
+    const odcid = &[_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const retry_scid = &[_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    var addr: posix.sockaddr = std.mem.zeroes(posix.sockaddr);
+    addr.family = posix.AF.INET;
+    addr.data[0] = 0x11; // port high byte
+    addr.data[1] = 0x51; // port low byte
+    addr.data[2] = 127;
+    addr.data[3] = 0;
+    addr.data[4] = 0;
+    addr.data[5] = 1;
+
+    var out: [TOKEN_MAX_LEN]u8 = undefined;
+    const token_len = try generateRetryToken(&out, odcid, retry_scid, addr, token_key);
+    try std.testing.expect(token_len > TOKEN_NONCE_LEN + TOKEN_TAG_LEN);
+
+    const validated = try validateRetryToken(out[0..token_len], addr, token_key);
+    try std.testing.expect(validated != null);
+    const v = validated.?;
+    try std.testing.expectEqualSlices(u8, odcid, v.getOdcid());
+    try std.testing.expectEqualSlices(u8, retry_scid, v.getRetryScid());
+}
+
+// Retry token: wrong address should fail
+test "Retry token: wrong address rejected" {
+    var token_key: [crypto.key_len]u8 = undefined;
+    random.bytes(&token_key);
+
+    const odcid = &[_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const retry_scid = &[_]u8{ 0x11, 0x12, 0x13, 0x14 };
+    var addr1: posix.sockaddr = std.mem.zeroes(posix.sockaddr);
+    addr1.family = posix.AF.INET;
+    addr1.data[2] = 127;
+    addr1.data[5] = 1;
+
+    var out: [TOKEN_MAX_LEN]u8 = undefined;
+    const token_len = try generateRetryToken(&out, odcid, retry_scid, addr1, token_key);
+
+    // Different address
+    var addr2 = addr1;
+    addr2.data[2] = 10;
+    const validated = try validateRetryToken(out[0..token_len], addr2, token_key);
+    try std.testing.expect(validated == null);
+}
+
+// Retry token: wrong key should fail
+test "Retry token: wrong key rejected" {
+    var token_key: [crypto.key_len]u8 = undefined;
+    random.bytes(&token_key);
+
+    const odcid = &[_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const retry_scid = &[_]u8{ 0x11, 0x12, 0x13, 0x14 };
+    var addr: posix.sockaddr = std.mem.zeroes(posix.sockaddr);
+    addr.family = posix.AF.INET;
+
+    var out: [TOKEN_MAX_LEN]u8 = undefined;
+    const token_len = try generateRetryToken(&out, odcid, retry_scid, addr, token_key);
+
+    // Different key
+    var wrong_key: [crypto.key_len]u8 = undefined;
+    random.bytes(&wrong_key);
+    const validated = try validateRetryToken(out[0..token_len], addr, wrong_key);
+    try std.testing.expect(validated == null);
+}
+
+// Retry integrity tag verification
+test "Retry: integrity tag compute and verify" {
+    const odcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+
+    // Build a minimal Retry-like packet (header only, no tag yet)
+    var pkt_buf: [128]u8 = undefined;
+    var pkt_fbs = io.fixedBufferStream(&pkt_buf);
+    const pkt_writer = pkt_fbs.writer();
+
+    // First byte: Retry packet type
+    try pkt_writer.writeByte(@intFromEnum(PacketType.retry));
+    // Version
+    try pkt_writer.writeInt(u32, 0x00000001, ENDIAN);
+    // DCID
+    try pkt_writer.writeByte(4);
+    try pkt_writer.writeAll(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+    // SCID
+    try pkt_writer.writeByte(4);
+    try pkt_writer.writeAll(&[_]u8{ 0x05, 0x06, 0x07, 0x08 });
+    // Token
+    try pkt_writer.writeAll("some_token_data");
+
+    const pkt_without_tag = pkt_fbs.getWritten();
+
+    // Compute tag
+    const tag = try computeRetryIntegrityTag(pkt_without_tag, odcid, 0x00000001);
+
+    // Build full packet with tag
+    var full_pkt: [256]u8 = undefined;
+    @memcpy(full_pkt[0..pkt_without_tag.len], pkt_without_tag);
+    @memcpy(full_pkt[pkt_without_tag.len..][0..RETRY_INTEGRITY_TAG_SIZE], &tag);
+    const full_len = pkt_without_tag.len + RETRY_INTEGRITY_TAG_SIZE;
+
+    // Verify
+    const valid = try verifyRetryIntegrity(full_pkt[0..full_len], odcid, 0x00000001);
+    try std.testing.expect(valid);
+
+    // Tamper with packet and verify fails
+    full_pkt[10] ^= 0xFF;
+    const invalid = try verifyRetryIntegrity(full_pkt[0..full_len], odcid, 0x00000001);
+    try std.testing.expect(!invalid);
 }
