@@ -19,16 +19,34 @@ pub fn main() !void {
     const alloc = arena.allocator();
 
     // Read cert files at runtime
-    const server_cert_pem = try std.fs.cwd().readFileAlloc(alloc, "interop/certs/server.crt", 8192);
-    const server_key_pem = try std.fs.cwd().readFileAlloc(alloc, "interop/certs/server.key", 8192);
+    const server_cert_pem = try std.fs.cwd().readFileAlloc(alloc, "interop/browser/certs/server.crt", 8192);
+    const server_key_pem = try std.fs.cwd().readFileAlloc(alloc, "interop/browser/certs/server.key", 8192);
 
-    // Parse PEM → DER
+    // Parse PEM -> DER
     var cert_der_buf: [4096]u8 = undefined;
     const cert_der = try tls13.parsePemCert(server_cert_pem, &cert_der_buf);
 
     var key_der_buf: [4096]u8 = undefined;
     const key_der = try tls13.parsePemPrivateKey(server_key_pem, &key_der_buf);
     const ec_private_key = try tls13.extractEcPrivateKey(key_der);
+
+    // Compute and print SHA-256 hash of DER certificate
+    var cert_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(cert_der, &cert_hash, .{});
+    std.debug.print("\n=== Browser WebTransport Server ===\n", .{});
+    std.debug.print("Certificate SHA-256: ", .{});
+    for (cert_hash) |byte| {
+        std.debug.print("{x:0>2}", .{byte});
+    }
+    std.debug.print("\n", .{});
+
+    // Print as JS Uint8Array for easy copy-paste
+    std.debug.print("JS: new Uint8Array([", .{});
+    for (cert_hash, 0..) |byte, idx| {
+        if (idx > 0) std.debug.print(", ", .{});
+        std.debug.print("{d}", .{byte});
+    }
+    std.debug.print("])\n\n", .{});
 
     // Build TLS config
     const cert_chain = try alloc.alloc([]const u8, 1);
@@ -50,13 +68,13 @@ pub fn main() !void {
     var static_reset_key: [16]u8 = undefined;
     std.crypto.random.bytes(&static_reset_key);
 
-    // Create UDP socket
-    const local_addr = try std.net.Address.parseIp4("127.0.0.1", 4434);
+    // Create UDP socket - listen on 0.0.0.0 for browser connections
+    const local_addr = try std.net.Address.parseIp4("0.0.0.0", 4433);
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
     ecn_socket.enableEcnRecv(sockfd) catch {};
-    std.debug.print("WebTransport server listening on 127.0.0.1:4434\n", .{});
+    std.debug.print("Listening on https://0.0.0.0:4433\n\n", .{});
 
     var conn_mgr = connection_manager.ConnectionManager.init(
         alloc,
@@ -132,7 +150,7 @@ pub fn main() !void {
                         break;
                     }
 
-                    // No Retry for local dev server — accept immediately
+                    // No Retry for browser dev server — accept immediately
                     // Pass null odcid so anti-amplification is enforced (address not validated)
                     entry = conn_mgr.acceptConnection(
                         header,
@@ -144,7 +162,7 @@ pub fn main() !void {
                         std.log.err("accept error: {any}", .{err});
                         break;
                     };
-                    std.log.info("accepted new connection (total: {d})", .{conn_mgr.connectionCount()});
+                    std.debug.print("accepted new connection (total: {d})\n", .{conn_mgr.connectionCount()});
                 }
 
                 const e = entry.?;
@@ -265,7 +283,7 @@ pub fn main() !void {
 
             // Check if connection has terminated
             if (conn.isClosed()) {
-                std.log.info("connection terminated (remaining: {d})", .{conn_mgr.connectionCount() - 1});
+                std.debug.print("connection terminated (remaining: {d})\n", .{conn_mgr.connectionCount() - 1});
                 conn_mgr.removeConnection(entry);
                 continue;
             }

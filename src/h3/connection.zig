@@ -323,8 +323,27 @@ pub const H3Connection = struct {
                         try self.stream_bufs.put(stream_id, buf);
                     }
                 },
-                .qpack_encoder => self.peer_qpack_enc_stream_id = stream_id,
-                .qpack_decoder => self.peer_qpack_dec_stream_id = stream_id,
+                .qpack_encoder => {
+                    self.peer_qpack_enc_stream_id = stream_id;
+                    // Buffer remaining data (encoder instructions after type byte)
+                    if (fbs.pos < data.len) {
+                        const remaining = data[fbs.pos..];
+                        std.log.info("QPACK encoder stream {d}: buffering {d} bytes of encoder instructions", .{ stream_id, remaining.len });
+                        self.qpack_decoder.processEncoderInstruction(remaining) catch |err| {
+                            std.log.err("QPACK encoder instruction error (initial): {}", .{err});
+                        };
+                    }
+                },
+                .qpack_decoder => {
+                    self.peer_qpack_dec_stream_id = stream_id;
+                    // Buffer remaining data (decoder instructions after type byte)
+                    if (fbs.pos < data.len) {
+                        const remaining = data[fbs.pos..];
+                        self.qpack_encoder.processDecoderInstruction(remaining) catch |err| {
+                            std.log.err("QPACK decoder instruction error (initial): {}", .{err});
+                        };
+                    }
+                },
                 .push => {}, // ignore server push
             }
         }
@@ -416,7 +435,7 @@ pub const H3Connection = struct {
             }
 
             // Try to parse H3 frames from buffered data (even without new recv data)
-            var buf = self.stream_bufs.getPtr(stream_id) orelse continue;
+            const buf = self.stream_bufs.getPtr(stream_id) orelse continue;
 
             // Try to parse H3 frames from buffered data
             while (buf.items.len > 0) {
@@ -425,24 +444,21 @@ pub const H3Connection = struct {
                     return err;
                 };
 
-                // Consume the parsed frame
-                const remaining = buf.items.len - result.consumed;
-                if (remaining > 0) {
-                    std.mem.copyForwards(u8, buf.items[0..remaining], buf.items[result.consumed..]);
-                }
-                buf.items.len = remaining;
-
+                // Process the frame BEFORE consuming from buffer
+                // (frame data slices point into buf.items)
                 switch (result.frame) {
                     .headers => |qpack_data| {
-                        const count = self.qpack_decoder.decode(qpack_data, &self.headers_buf, stream_id) catch {
+                        var hdr_count: usize = 0;
+                        if (self.qpack_decoder.decode(qpack_data, &self.headers_buf, stream_id)) |c| {
+                            hdr_count = c;
+                        } else |_| {
                             // Fallback to static-only decoder for compatibility
-                            _ = qpack.decodeHeaders(qpack_data, &self.headers_buf) catch |err2| {
+                            hdr_count = qpack.decodeHeaders(qpack_data, &self.headers_buf) catch |err2| {
                                 std.log.err("QPACK decode error on stream {d}: {}", .{ stream_id, err2 });
                                 continue;
                             };
-                            continue;
-                        };
-                        const hdrs = self.headers_buf[0..count];
+                        }
+                        const hdrs = self.headers_buf[0..hdr_count];
 
                         // Flush decoder instructions (header ack)
                         self.flushDecoderInstructions() catch {};
@@ -458,6 +474,9 @@ pub const H3Connection = struct {
                             if (std.mem.eql(u8, h_item.name, ":authority")) authority = h_item.value;
                             if (std.mem.eql(u8, h_item.name, ":path")) path = h_item.value;
                         }
+
+                        // Consume frame from buffer AFTER processing
+                        self.consumeFrameFromBuf(buf, result.consumed);
 
                         if (method != null and std.mem.eql(u8, method.?, "CONNECT") and proto != null) {
                             return .{ .connect_request = .{
@@ -475,17 +494,34 @@ pub const H3Connection = struct {
                         } };
                     },
                     .data => |payload| {
+                        if (payload.len == 0) {
+                            self.consumeFrameFromBuf(buf, result.consumed);
+                            continue; // Skip GREASE/unknown frames
+                        }
+                        self.consumeFrameFromBuf(buf, result.consumed);
                         return .{ .data = .{
                             .stream_id = stream_id,
                             .data = payload,
                         } };
                     },
-                    else => continue, // ignore unexpected frames on bidi streams
+                    else => {
+                        self.consumeFrameFromBuf(buf, result.consumed);
+                        continue;
+                    },
                 }
             }
         }
 
         return null;
+    }
+
+    /// Consume `consumed` bytes from the front of a stream buffer.
+    fn consumeFrameFromBuf(_: *H3Connection, buf: *std.ArrayList(u8), consumed: usize) void {
+        const remaining = buf.items.len - consumed;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, buf.items[0..remaining], buf.items[consumed..]);
+        }
+        buf.items.len = remaining;
     }
 
     /// Process data from peer's QPACK encoder and decoder streams.

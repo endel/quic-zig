@@ -447,7 +447,7 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
     header.packet_start = packet_start_pos;
 
     if (isLongHeader(first_byte)) {
-        log.debug("LONG HEADER", .{});
+        // Long header packet
 
         const version = try reader.readInt(u32, ENDIAN);
         header.version = version;
@@ -528,7 +528,7 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
             },
         }
     } else {
-        log.debug("SHORT HEADER", .{});
+        // Short header (1-RTT) packet
 
         header.packet_type = PacketType.one_rtt;
 

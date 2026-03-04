@@ -1850,11 +1850,6 @@ pub const Connection = struct {
         // 0-RTT seal (client only, before handshake completes)
         const early_seal = if (!self.handshake_confirmed) self.early_data_seal else null;
 
-        const has_initial = initial_seal != null;
-        const has_handshake = handshake_seal != null;
-        const has_app = app_seal != null;
-        std.log.debug("send: packing coalesced packet, has_initial={} has_handshake={} has_app={}", .{ has_initial, has_handshake, has_app });
-
         const dq: ?*DatagramQueue = if (self.datagrams_enabled and !self.datagram_send_queue.isEmpty())
             &self.datagram_send_queue
         else

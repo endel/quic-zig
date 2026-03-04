@@ -69,6 +69,22 @@ pub fn build(b: *std.Build) void {
     const run_wt_client_step = b.step("run-wt-client", "Run WebTransport client");
     run_wt_client_step.dependOn(&run_wt_client.step);
 
+    // WebTransport browser server
+    const exe_wt_browser_server = b.addExecutable(.{
+        .name = "wt-browser-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wt_browser_server.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(exe_wt_browser_server);
+
+    const run_wt_browser_server = b.addRunArtifact(exe_wt_browser_server);
+    run_wt_browser_server.step.dependOn(b.getInstallStep());
+    const run_wt_browser_server_step = b.step("run-wt-browser-server", "Run WebTransport browser server");
+    run_wt_browser_server_step.dependOn(&run_wt_browser_server.step);
+
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/server.zig"),

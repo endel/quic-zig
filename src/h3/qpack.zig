@@ -205,17 +205,22 @@ fn decodeString(data: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usiz
 
     if (is_huffman) {
         // Decode Huffman-encoded string into scratch buffer at current position
-        const remaining = scratch[scratch_pos.*..];
         var temp_buf: [4096]u8 = undefined;
         const decoded_len = huffman.decode(raw, &temp_buf) catch return error.InvalidEncoding;
         if (scratch_pos.* + decoded_len > scratch.len) return error.BufferTooSmall;
-        @memcpy(remaining[0..decoded_len], temp_buf[0..decoded_len]);
+        @memcpy(scratch[scratch_pos.*..][0..decoded_len], temp_buf[0..decoded_len]);
         const result = scratch[scratch_pos.*..][0..decoded_len];
         scratch_pos.* += decoded_len;
         return result;
     }
 
-    return raw;
+    // Copy raw string to scratch buffer for lifetime safety
+    // (source data buffer may be reused/shifted by caller)
+    if (scratch_pos.* + len > scratch.len) return error.BufferTooSmall;
+    @memcpy(scratch[scratch_pos.*..][0..len], raw);
+    const result = scratch[scratch_pos.*..][0..len];
+    scratch_pos.* += len;
+    return result;
 }
 
 // ── Dynamic Table (RFC 9204 §3.2) ──────────────────────────────────────
@@ -672,28 +677,31 @@ pub const QpackDecoder = struct {
                 scratch_pos += v.len;
                 headers_buf[count] = .{ .name = name_slice, .value = value_slice };
                 count += 1;
-            } else if (first & 0xf0 == 0x50) {
-                // Literal with static name ref: 0101NNNN
-                const index = try decodeInteger(data, &pos, 4);
-                if (index >= static_table.len) return error.InvalidIndex;
-                const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
-                headers_buf[count] = .{
-                    .name = static_table[index].name,
-                    .value = value,
-                };
-                count += 1;
-            } else if (first & 0xf0 == 0x40) {
-                // Literal with dynamic name ref: 0100NNNN
-                const rel_idx = try decodeInteger(data, &pos, 4);
-                const entry = self.dynamic.getRelative(base, rel_idx) orelse return error.InvalidIndex;
-                const n = entry.getName();
-                if (scratch_pos + n.len > huffman_scratch.len) return error.BufferTooSmall;
-                @memcpy(huffman_scratch[scratch_pos..][0..n.len], n);
-                const name_slice = huffman_scratch[scratch_pos..][0..n.len];
-                scratch_pos += n.len;
-                const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
-                headers_buf[count] = .{ .name = name_slice, .value = value };
-                count += 1;
+            } else if (first & 0xc0 == 0x40) {
+                // Literal Field Line with Name Reference: 01NTNNNN (RFC 9204 §4.5.4)
+                // N = never-indexed (bit 5), T = table type (bit 4): 1=static, 0=dynamic
+                const is_static = (first & 0x10) != 0;
+                if (is_static) {
+                    const index = try decodeInteger(data, &pos, 4);
+                    if (index >= static_table.len) return error.InvalidIndex;
+                    const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+                    headers_buf[count] = .{
+                        .name = static_table[index].name,
+                        .value = value,
+                    };
+                    count += 1;
+                } else {
+                    const rel_idx = try decodeInteger(data, &pos, 4);
+                    const entry = self.dynamic.getRelative(base, rel_idx) orelse return error.InvalidIndex;
+                    const n = entry.getName();
+                    if (scratch_pos + n.len > huffman_scratch.len) return error.BufferTooSmall;
+                    @memcpy(huffman_scratch[scratch_pos..][0..n.len], n);
+                    const name_slice = huffman_scratch[scratch_pos..][0..n.len];
+                    scratch_pos += n.len;
+                    const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+                    headers_buf[count] = .{ .name = name_slice, .value = value };
+                    count += 1;
+                }
             } else if (first & 0xe0 == 0x20) {
                 // Literal with literal name: 001NHNNN
                 const is_name_huffman = (first & 0x08) != 0;
@@ -708,7 +716,11 @@ pub const QpackDecoder = struct {
                     name = huffman_scratch[scratch_pos..][0..decoded_len];
                     scratch_pos += decoded_len;
                 } else {
-                    name = data[pos..][0..name_len];
+                    // Copy raw name to scratch for lifetime safety
+                    if (scratch_pos + name_len > huffman_scratch.len) return error.BufferTooSmall;
+                    @memcpy(huffman_scratch[scratch_pos..][0..name_len], data[pos..][0..name_len]);
+                    name = huffman_scratch[scratch_pos..][0..name_len];
+                    scratch_pos += name_len;
                 }
                 pos += name_len;
                 const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
@@ -909,26 +921,21 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
                 .value = static_table[index].value,
             };
             count += 1;
-        } else if (first & 0xf0 == 0x50) {
-            // Literal with name reference (static): 0101NNNN
+        } else if (first & 0xc0 == 0x40) {
+            // Literal Field Line with Name Reference: 01NTNNNN (RFC 9204 §4.5.4)
+            // N = never-indexed (bit 5), T = table type (bit 4): 1=static, 0=dynamic
+            const is_static = (first & 0x10) != 0;
             const index = try decodeInteger(data, &pos, 4);
-            if (index >= static_table.len) return error.InvalidIndex;
             const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
-            headers_buf[count] = .{
-                .name = static_table[index].name,
-                .value = value,
-            };
-            count += 1;
-        } else if (first & 0xf0 == 0x40) {
-            // Literal with name reference (static, never-indexed): 0100NNNN
-            const index = try decodeInteger(data, &pos, 4);
-            if (index >= static_table.len) return error.InvalidIndex;
-            const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
-            headers_buf[count] = .{
-                .name = static_table[index].name,
-                .value = value,
-            };
-            count += 1;
+            if (is_static) {
+                if (index >= static_table.len) return error.InvalidIndex;
+                headers_buf[count] = .{
+                    .name = static_table[index].name,
+                    .value = value,
+                };
+                count += 1;
+            }
+            // Dynamic refs (T=0): skip — value already consumed above
         } else if (first & 0xe0 == 0x20) {
             // Literal with literal name: 001NHNNN
             // H bit (bit 3) indicates Huffman for name, 3-bit name length prefix
@@ -944,7 +951,11 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
                 name = huffman_scratch[scratch_pos..][0..decoded_len];
                 scratch_pos += decoded_len;
             } else {
-                name = data[pos..][0..name_len];
+                // Copy raw name to scratch for lifetime safety
+                if (scratch_pos + name_len > huffman_scratch.len) return error.BufferTooSmall;
+                @memcpy(huffman_scratch[scratch_pos..][0..name_len], data[pos..][0..name_len]);
+                name = huffman_scratch[scratch_pos..][0..name_len];
+                scratch_pos += name_len;
             }
             pos += name_len;
             const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);

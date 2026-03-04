@@ -6,6 +6,7 @@ const connection = @import("connection.zig");
 const packet = @import("packet.zig");
 const tls13 = @import("tls13.zig");
 const h3 = @import("../h3/connection.zig");
+const wt = @import("../webtransport/session.zig");
 
 /// Fixed-size CID key for use in HashMap lookups.
 pub const CidKey = struct {
@@ -41,6 +42,7 @@ pub const ConnEntry = struct {
     conn: *connection.Connection,
     h3_conn: ?h3.H3Connection = null,
     h3_initialized: bool = false,
+    wt_conn: ?wt.WebTransportConnection = null,
 
     // Track which CIDs are registered in the routing map for this connection.
     // Max 8 from LocalCidPool + 1 initial client DCID = 9.

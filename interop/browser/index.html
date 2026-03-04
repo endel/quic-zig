@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebTransport Test</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #0f1117; color: #e1e4e8; padding: 24px; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin-bottom: 20px; color: #58a6ff; }
+  h2 { font-size: 1rem; margin-bottom: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+
+  label { display: block; font-size: 0.85rem; color: #8b949e; margin-bottom: 4px; }
+  input[type="text"] {
+    width: 100%; padding: 8px 12px; background: #0d1117; border: 1px solid #30363d;
+    border-radius: 6px; color: #e1e4e8; font-family: monospace; font-size: 0.9rem; margin-bottom: 10px;
+  }
+  input:focus { outline: none; border-color: #58a6ff; }
+
+  .row { display: flex; gap: 10px; align-items: flex-end; }
+  .row input { flex: 1; margin-bottom: 0; }
+
+  button {
+    padding: 8px 16px; border: none; border-radius: 6px; font-size: 0.85rem;
+    cursor: pointer; font-weight: 500; transition: background 0.15s;
+  }
+  .btn-primary { background: #238636; color: #fff; }
+  .btn-primary:hover { background: #2ea043; }
+  .btn-primary:disabled { background: #1a3a2a; color: #4a7a5a; cursor: default; }
+  .btn-danger { background: #da3633; color: #fff; }
+  .btn-danger:hover { background: #f85149; }
+  .btn-send { background: #1f6feb; color: #fff; }
+  .btn-send:hover { background: #388bfd; }
+  .btn-send:disabled { background: #152a4a; color: #3a6a9a; cursor: default; }
+
+  .status { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.8rem; font-weight: 500; margin-left: 10px; }
+  .status-disconnected { background: #3d1f20; color: #f85149; }
+  .status-connecting { background: #3d2f00; color: #d29922; }
+  .status-connected { background: #1a3a2a; color: #3fb950; }
+
+  .tests { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+  #log {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+    padding: 12px; height: 260px; overflow-y: auto; font-family: monospace;
+    font-size: 0.8rem; line-height: 1.5;
+  }
+  .log-time { color: #484f58; }
+  .log-info { color: #58a6ff; }
+  .log-send { color: #3fb950; }
+  .log-recv { color: #d2a8ff; }
+  .log-error { color: #f85149; }
+  .log-warn { color: #d29922; }
+
+  .response { margin-top: 8px; padding: 8px; background: #0d1117; border-radius: 4px; font-family: monospace; font-size: 0.85rem; min-height: 32px; color: #d2a8ff; word-break: break-all; }
+</style>
+</head>
+<body>
+
+<h1>WebTransport Test Client</h1>
+
+<div class="panel">
+  <h2>Connection <span id="status" class="status status-disconnected">Disconnected</span></h2>
+  <label for="url">Server URL</label>
+  <input type="text" id="url" value="https://127.0.0.1:4433">
+  <label for="hash">Certificate SHA-256 (hex)</label>
+  <input type="text" id="hash" placeholder="paste hex hash from server output">
+  <div style="display:flex;gap:10px;margin-top:4px;">
+    <button id="btnConnect" class="btn-primary" onclick="doConnect()">Connect</button>
+    <button id="btnDisconnect" class="btn-danger" onclick="doDisconnect()" disabled>Disconnect</button>
+  </div>
+</div>
+
+<div class="tests">
+  <div class="panel">
+    <h2>Bidi Stream</h2>
+    <div class="row">
+      <input type="text" id="bidiMsg" placeholder="message" value="Hello from browser!">
+      <button id="btnBidi" class="btn-send" onclick="sendBidi()" disabled>Send</button>
+    </div>
+    <div class="response" id="bidiResp">&mdash;</div>
+  </div>
+  <div class="panel">
+    <h2>Datagram</h2>
+    <div class="row">
+      <input type="text" id="dgMsg" placeholder="message" value="Datagram ping!">
+      <button id="btnDg" class="btn-send" onclick="sendDatagram()" disabled>Send</button>
+    </div>
+    <div class="response" id="dgResp">&mdash;</div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Event Log</h2>
+  <div id="log"></div>
+</div>
+
+<script>
+let transport = null;
+
+function log(msg, cls = 'info') {
+  const el = document.getElementById('log');
+  const t = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 3 });
+  el.innerHTML += `<div><span class="log-time">${t}</span> <span class="log-${cls}">${msg}</span></div>`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(s) {
+  const el = document.getElementById('status');
+  el.textContent = s.charAt(0).toUpperCase() + s.slice(1);
+  el.className = 'status status-' + s;
+}
+
+function setConnected(connected) {
+  document.getElementById('btnConnect').disabled = connected;
+  document.getElementById('btnDisconnect').disabled = !connected;
+  document.getElementById('btnBidi').disabled = !connected;
+  document.getElementById('btnDg').disabled = !connected;
+}
+
+function hexToBytes(hex) {
+  hex = hex.replace(/\s+/g, '');
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return bytes;
+}
+
+async function doConnect() {
+  const url = document.getElementById('url').value.trim();
+  const hashHex = document.getElementById('hash').value.trim();
+
+  if (!hashHex || hashHex.length !== 64) {
+    log('Certificate hash must be 64 hex characters (SHA-256)', 'error');
+    return;
+  }
+
+  const hashBytes = hexToBytes(hashHex);
+  setStatus('connecting');
+  log(`Connecting to ${url}...`);
+
+  try {
+    transport = new WebTransport(url, {
+      serverCertificateHashes: [{
+        algorithm: 'sha-256',
+        value: hashBytes.buffer
+      }]
+    });
+
+    transport.closed.then(() => {
+      log('Connection closed', 'warn');
+      setStatus('disconnected');
+      setConnected(false);
+      transport = null;
+    }).catch(err => {
+      log(`Connection closed with error: ${err}`, 'error');
+      setStatus('disconnected');
+      setConnected(false);
+      transport = null;
+    });
+
+    await transport.ready;
+    setStatus('connected');
+    setConnected(true);
+    log('Connected!', 'info');
+
+    // Listen for incoming datagrams
+    readDatagrams();
+    // Listen for incoming bidi streams
+    readIncomingStreams();
+  } catch (err) {
+    log(`Connection failed: ${err}`, 'error');
+    setStatus('disconnected');
+    setConnected(false);
+    transport = null;
+  }
+}
+
+async function doDisconnect() {
+  if (transport) {
+    try { transport.close(); } catch {}
+    transport = null;
+  }
+  setStatus('disconnected');
+  setConnected(false);
+  log('Disconnected');
+}
+
+async function sendBidi() {
+  if (!transport) return;
+  const msg = document.getElementById('bidiMsg').value;
+  document.getElementById('bidiResp').textContent = 'waiting...';
+  log(`Bidi send: "${msg}"`, 'send');
+
+  try {
+    const stream = await transport.createBidirectionalStream();
+    const writer = stream.writable.getWriter();
+    await writer.write(new TextEncoder().encode(msg));
+    await writer.close();
+
+    const reader = stream.readable.getReader();
+    let response = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      response += new TextDecoder().decode(value);
+    }
+    document.getElementById('bidiResp').textContent = response;
+    log(`Bidi recv: "${response}"`, 'recv');
+  } catch (err) {
+    log(`Bidi error: ${err}`, 'error');
+    document.getElementById('bidiResp').textContent = 'Error: ' + err;
+  }
+}
+
+async function sendDatagram() {
+  if (!transport) return;
+  const msg = document.getElementById('dgMsg').value;
+  document.getElementById('dgResp').textContent = 'waiting...';
+  log(`Datagram send: "${msg}"`, 'send');
+
+  try {
+    const writer = transport.datagrams.writable.getWriter();
+    await writer.write(new TextEncoder().encode(msg));
+    writer.releaseLock();
+    log('Datagram sent', 'send');
+  } catch (err) {
+    log(`Datagram send error: ${err}`, 'error');
+    document.getElementById('dgResp').textContent = 'Error: ' + err;
+  }
+}
+
+async function readDatagrams() {
+  if (!transport) return;
+  try {
+    const reader = transport.datagrams.readable.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = new TextDecoder().decode(value);
+      document.getElementById('dgResp').textContent = text;
+      log(`Datagram recv: "${text}"`, 'recv');
+    }
+  } catch (err) {
+    if (transport) log(`Datagram reader error: ${err}`, 'error');
+  }
+}
+
+async function readIncomingStreams() {
+  if (!transport) return;
+  try {
+    const reader = transport.incomingBidirectionalStreams.getReader();
+    while (true) {
+      const { value: stream, done } = await reader.read();
+      if (done) break;
+      handleIncomingStream(stream);
+    }
+  } catch (err) {
+    if (transport) log(`Incoming stream reader error: ${err}`, 'error');
+  }
+}
+
+async function handleIncomingStream(stream) {
+  try {
+    const reader = stream.readable.getReader();
+    let data = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      data += new TextDecoder().decode(value);
+    }
+    log(`Incoming stream data: "${data}"`, 'recv');
+  } catch (err) {
+    log(`Incoming stream error: ${err}`, 'error');
+  }
+}
+</script>
+</body>
+</html>
