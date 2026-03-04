@@ -120,7 +120,7 @@
 | 17.2 | Long Header Packets | ✅ Done | Version, DCID, SCID fields |
 | 17.2.1 | Version Negotiation Packet | ✅ Done | Parsing + generation |
 | 17.2.2 | Initial Packet | ✅ Done | Token field, 1200 byte padding |
-| 17.2.3 | 0-RTT | ⚠️ Partial | Packet parsing/decryption works; sending 0-RTT data not implemented |
+| 17.2.3 | 0-RTT | ✅ Done | Packet parsing, decryption, and sending |
 | 17.2.4 | Handshake Packet | ✅ Done | Full support |
 | 17.2.5 | Retry Packet | ✅ Done | Integrity tag + token |
 | 17.3 | Short Header Packets | ✅ Done | 1-RTT with key phase + spin bit |
@@ -161,8 +161,8 @@
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Done | 87 | ~84% |
-| ⚠️ Partial | 12 | ~12% |
+| ✅ Done | 88 | ~85% |
+| ⚠️ Partial | 11 | ~11% |
 | ❌ Missing | 7 | ~4% |
 | ❌ N/A | 2 | — |
 
@@ -180,7 +180,7 @@
 | P3 | §13.2.4 | ACK range pruning via ACK-of-ACK tracking | Small |
 | P3 | §14.2.1/14.3.3 | ICMP message handling for PMTUD | Small (platform-limited) |
 | P3 | §14.4.1 | PMTU probes with SCID | Small |
-| P3 | §17.2.3 | 0-RTT data sending | Medium |
+| ~~P3~~ | ~~§17.2.3~~ | ~~0-RTT data sending~~ | ~~Done~~ |
 | P3 | §18.1 | Transport parameter greasing | Small |
 
 ---
@@ -195,9 +195,9 @@
 | 4.1 | Interface to TLS | ✅ Done | Action-based step() pattern |
 | 4.2 | TLS Version | ✅ Done | TLS 1.3 only |
 | 4.3 | ClientHello Size | ⚠️ Partial | Padded Initial to 1200; no explicit ClientHello padding |
-| 4.4 | Peer Authentication | ⚠️ Partial | No cert chain validation (accepts self-signed) |
-| 4.5 | Session Resumption | ❌ Missing | No PSK/session ticket support |
-| 4.6 | 0-RTT | ⚠️ Partial | Parsing/decryption only; no sending |
+| 4.4 | Peer Authentication | ✅ Done | Chain validation, hostname verify |
+| 4.5 | Session Resumption | ✅ Done | PSK/tickets, binder, NewSessionTicket |
+| 4.6 | 0-RTT | ✅ Done | Early key install, 0-RTT packing |
 | 4.7 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager |
 | 4.8 | TLS Errors | ⚠️ Partial | Basic error propagation |
 | 4.9 | Discarding Unused Keys | ✅ Done | Initial/Handshake keys cleared post-handshake |
@@ -209,7 +209,7 @@
 | 5.4.1 | Header Protection Application | ✅ Done | |
 | 5.4.2 | Header Protection Sample | ✅ Done | |
 | 5.5 | Receiving Protected Packets | ✅ Done | |
-| 5.6 | Use of 0-RTT Keys | ⚠️ Partial | Decryption works; sending not impl |
+| 5.6 | Use of 0-RTT Keys | ✅ Done | Early key install + 0-RTT packing |
 | 5.7 | Receiving Out-of-Order Protected Packets | ✅ Done | Packet number window |
 | 5.8 | Retry Packet Integrity | ✅ Done | AES-128-GCM tag verification |
 | 6 | Key Update | ✅ Done | 3-generation keys, phase bit, 2^23 limit |
@@ -230,17 +230,15 @@
 
 | Status | Count |
 |--------|-------|
-| ✅ Done | 28 |
-| ⚠️ Partial | 5 |
-| ❌ Missing | 1 |
+| ✅ Done | 31 |
+| ⚠️ Partial | 2 |
+| ❌ Missing | 0 |
 
 ### Remaining Work — RFC 9001
 
 | Priority | Section | Item | Effort |
 |----------|---------|------|--------|
-| P2 | §4.4 | Certificate chain validation | Medium |
-| P2 | §4.5 | Session resumption (PSK/tickets) | Large |
-| P2 | §4.6/5.6 | 0-RTT data sending | Medium |
+| P3 | §4.3 | Explicit ClientHello padding | Small |
 | P3 | §4.8 | Comprehensive TLS error mapping | Small |
 
 ---
@@ -362,32 +360,32 @@
 | 2 | Compression Overview | ✅ Done | Static table encoding/decoding |
 | 3 | Reference Tables | | |
 | 3.1 | Static Table | ✅ Done | 99-entry table per RFC 9204 Appendix A |
-| 3.2 | Dynamic Table | ❌ Missing | Static-only; dynamic refs gracefully skipped |
-| 3.2.1 | Dynamic Table Size | ❌ Missing | |
-| 3.2.2 | Dynamic Table Capacity | ❌ Missing | |
-| 3.2.3 | Absolute and Relative Indices | ❌ Missing | |
+| 3.2 | Dynamic Table | ✅ Done | FIFO ring buffer, insert/evict/lookup |
+| 3.2.1 | Dynamic Table Size | ✅ Done | name.len + value.len + 32 per entry |
+| 3.2.2 | Dynamic Table Capacity | ✅ Done | Set via SETTINGS, eviction on overflow |
+| 3.2.3 | Absolute and Relative Indices | ✅ Done | Absolute, relative, post-base indexing |
 | 4 | Wire Format | | |
-| 4.1 | Encoder Instructions | ❌ Missing | |
-| 4.2 | Decoder Instructions | ❌ Missing | |
-| 4.3 | Encoder Stream | ⚠️ Partial | Stream opened but no instructions sent |
-| 4.4 | Decoder Stream | ⚠️ Partial | Stream opened but no instructions sent |
-| 4.5 | Field Line Representations | ✅ Done | Indexed, literal-with-name-ref, literal |
-| 5 | Configuration | ⚠️ Partial | QPACK_MAX_TABLE_CAPACITY=0 (static only) |
+| 4.1 | Encoder Instructions | ✅ Done | Insert with name ref, literal name, duplicate, set capacity |
+| 4.2 | Decoder Instructions | ✅ Done | Header ack, stream cancellation, insert count increment |
+| 4.3 | Encoder Stream | ✅ Done | Sends insert instructions after encoding |
+| 4.4 | Decoder Stream | ✅ Done | Sends header ack after decoding |
+| 4.5 | Field Line Representations | ✅ Done | Static + dynamic indexed, literal-with-name-ref, literal |
+| 5 | Configuration | ✅ Done | QPACK_MAX_TABLE_CAPACITY=4096 advertised |
 
 ### Summary — RFC 9204
 
 | Status | Count |
 |--------|-------|
-| ✅ Done | 3 |
-| ⚠️ Partial | 3 |
-| ❌ Missing | 5 |
+| ✅ Done | 11 |
+| ⚠️ Partial | 0 |
+| ❌ Missing | 0 |
 
 ### Remaining Work — RFC 9204
 
-| Priority | Section | Item | Effort |
-|----------|---------|------|--------|
-| P3 | §3.2 | Dynamic table (insertion, eviction, capacity mgmt) | Large |
-| P3 | §4.1-4.2 | Encoder/decoder instructions | Medium |
+No remaining work — all sections implemented. Optional improvements:
+- Huffman encoding in encoder instructions (currently plain only)
+- Stream blocking support (qpack_blocked_streams > 0)
+- Conservative insertion heuristics for large header values
 
 ---
 
@@ -442,11 +440,11 @@
 
 | RFC | Done | Partial | Missing | Completion |
 |-----|------|---------|---------|------------|
-| RFC 9000 (QUIC) | 87 | 12 | 7 | ~93% |
-| RFC 9001 (TLS) | 28 | 5 | 1 | ~91% |
+| RFC 9000 (QUIC) | 88 | 11 | 7 | ~93% |
+| RFC 9001 (TLS) | 31 | 2 | 0 | ~97% |
 | RFC 9002 (Loss/CC) | 22 | 2 | 0 | ~92% |
 | RFC 9114 (HTTP/3) | 18 | 4 | 5 | ~74% |
-| RFC 9204 (QPACK) | 3 | 3 | 5 | ~41% |
+| RFC 9204 (QPACK) | 11 | 0 | 0 | 100% |
 | RFC 9297 (Datagrams) | 3 | 0 | 1 | ~88% |
 | RFC 9221 (QUIC DG) | 3 | 0 | 0 | 100% |
 | WebTransport | 6 | 2 | 0 | ~88% |
@@ -456,12 +454,12 @@
 | # | Item | RFC | Effort | Impact |
 |---|------|-----|--------|--------|
 | ~~1~~ | ~~Multi-connection server~~ | ~~9000 §5.2~~ | ~~Done~~ | ~~Done~~ |
-| 2 | Certificate chain validation | 9001 §4.4 | Medium | Security |
-| 3 | Session resumption (PSK/tickets) | 9001 §4.5 | Large | Performance (0-RTT) |
-| 4 | 0-RTT data sending | 9001 §4.6 | Medium | Performance |
+| ~~2~~ | ~~Certificate chain validation~~ | ~~9001 §4.4~~ | ~~Done~~ | ~~Done~~ |
+| ~~3~~ | ~~Session resumption (PSK/tickets)~~ | ~~9001 §4.5~~ | ~~Done~~ | ~~Done~~ |
+| ~~4~~ | ~~0-RTT data sending~~ | ~~9001 §4.6~~ | ~~Done~~ | ~~Done~~ |
 | 5 | ECN IP-level marking | 9000 §13.4 | Medium | Congestion signal quality |
 | 6 | Server's Preferred Address | 9000 §9.6 | Medium | Migration feature |
-| 7 | QPACK dynamic table | 9204 §3.2 | Large | H3 compression efficiency |
+| ~~7~~ | ~~QPACK dynamic table~~ | ~~9204 §3.2~~ | ~~Done~~ | ~~Done~~ |
 | 8 | Server Push (H3) | 9114 §4.6 | Large | H3 feature completeness |
 | 9 | Graceful H3 shutdown | 9114 §5.2 | Medium | Connection lifecycle |
 | 10 | Capsule Protocol | 9297 §4 | Medium | WT/proxy completeness |

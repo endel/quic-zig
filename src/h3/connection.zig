@@ -89,8 +89,12 @@ pub const H3Connection = struct {
     // Bidi streams excluded from H3 processing (owned by WT layer)
     excluded_bidi_streams: std.AutoHashMap(u64, void),
 
+    // QPACK encoder/decoder with dynamic table support
+    qpack_encoder: qpack.QpackEncoder = .{},
+    qpack_decoder: qpack.QpackDecoder = .{},
+
     pub fn init(allocator: Allocator, quic_conn: *quic_connection.Connection, is_server: bool) H3Connection {
-        return .{
+        var conn = H3Connection{
             .allocator = allocator,
             .quic_conn = quic_conn,
             .is_server = is_server,
@@ -98,6 +102,11 @@ pub const H3Connection = struct {
             .finished_streams = std.AutoHashMap(u64, void).init(allocator),
             .excluded_bidi_streams = std.AutoHashMap(u64, void).init(allocator),
         };
+        // Advertise dynamic table capacity in local settings
+        conn.local_settings.qpack_max_table_capacity = 4096;
+        // Set decoder's local max capacity
+        conn.qpack_decoder.setCapacity(4096);
+        return conn;
     }
 
     pub fn deinit(self: *H3Connection) void {
@@ -153,14 +162,17 @@ pub const H3Connection = struct {
         const stream = try self.quic_conn.openStream();
         const stream_id = stream.stream_id;
 
-        // Encode HEADERS frame
+        // Encode HEADERS frame using QPACK encoder (with dynamic table)
         var qpack_buf: [4096]u8 = undefined;
-        const qpack_len = try qpack.encodeHeaders(headers, &qpack_buf);
+        const qpack_len = try self.qpack_encoder.encode(headers, &qpack_buf);
 
         var frame_buf: [4096 + 16]u8 = undefined;
         var fbs = io.fixedBufferStream(&frame_buf);
         try h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer());
         try stream.send.writeData(fbs.getWritten());
+
+        // Send encoder instructions on QPACK encoder stream
+        try self.flushEncoderInstructions();
 
         // Send DATA frame if body provided
         if (body) |b| {
@@ -190,12 +202,14 @@ pub const H3Connection = struct {
         };
 
         var qpack_buf: [4096]u8 = undefined;
-        const qpack_len = try qpack.encodeHeaders(&req_headers, &qpack_buf);
+        const qpack_len = try self.qpack_encoder.encode(&req_headers, &qpack_buf);
 
         var frame_buf: [4096 + 16]u8 = undefined;
         var fbs = io.fixedBufferStream(&frame_buf);
         try h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer());
         try stream.send.writeData(fbs.getWritten());
+
+        try self.flushEncoderInstructions();
 
         // Do NOT close the stream — session stays open
         return stream_id;
@@ -211,12 +225,14 @@ pub const H3Connection = struct {
         };
 
         var qpack_buf: [4096]u8 = undefined;
-        const qpack_len = try qpack.encodeHeaders(&resp_headers, &qpack_buf);
+        const qpack_len = try self.qpack_encoder.encode(&resp_headers, &qpack_buf);
 
         var frame_buf: [4096 + 16]u8 = undefined;
         var fbs = io.fixedBufferStream(&frame_buf);
         try h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer());
         try stream.send.writeData(fbs.getWritten());
+
+        try self.flushEncoderInstructions();
 
         // Do NOT close the stream — session stays open
     }
@@ -230,14 +246,17 @@ pub const H3Connection = struct {
     ) !void {
         const stream = self.quic_conn.streams.getStream(stream_id) orelse return error.StreamNotFound;
 
-        // Encode HEADERS frame
+        // Encode HEADERS frame using QPACK encoder (with dynamic table)
         var qpack_buf: [4096]u8 = undefined;
-        const qpack_len = try qpack.encodeHeaders(headers, &qpack_buf);
+        const qpack_len = try self.qpack_encoder.encode(headers, &qpack_buf);
 
         var frame_buf: [4096 + 16]u8 = undefined;
         var fbs = io.fixedBufferStream(&frame_buf);
         try h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer());
         try stream.send.writeData(fbs.getWritten());
+
+        // Send encoder instructions on QPACK encoder stream
+        try self.flushEncoderInstructions();
 
         // Send DATA frame if body provided
         if (body) |b| {
@@ -262,6 +281,9 @@ pub const H3Connection = struct {
         if (try self.pollControlStream()) |event| {
             return event;
         }
+
+        // Process QPACK encoder/decoder streams
+        try self.pollQpackStreams();
 
         // Check bidirectional streams for request/response data
         if (try self.pollBidiStreams()) |event| {
@@ -349,6 +371,12 @@ pub const H3Connection = struct {
                 }
                 self.peer_settings_received = true;
                 self.peer_settings = settings;
+                // Configure QPACK encoder with peer's advertised capacity
+                if (settings.qpack_max_table_capacity > 0) {
+                    self.qpack_encoder.setCapacity(@intCast(settings.qpack_max_table_capacity));
+                    // Send the Set Capacity encoder instruction
+                    try self.flushEncoderInstructions();
+                }
                 return .{ .settings = settings };
             },
             .goaway => |id| {
@@ -406,11 +434,18 @@ pub const H3Connection = struct {
 
                 switch (result.frame) {
                     .headers => |qpack_data| {
-                        const count = qpack.decodeHeaders(qpack_data, &self.headers_buf) catch |err| {
-                            std.log.err("QPACK decode error on stream {d}: {}", .{ stream_id, err });
+                        const count = self.qpack_decoder.decode(qpack_data, &self.headers_buf, stream_id) catch {
+                            // Fallback to static-only decoder for compatibility
+                            _ = qpack.decodeHeaders(qpack_data, &self.headers_buf) catch |err2| {
+                                std.log.err("QPACK decode error on stream {d}: {}", .{ stream_id, err2 });
+                                continue;
+                            };
                             continue;
                         };
                         const hdrs = self.headers_buf[0..count];
+
+                        // Flush decoder instructions (header ack)
+                        self.flushDecoderInstructions() catch {};
 
                         // Check for Extended CONNECT (:method=CONNECT + :protocol)
                         var method: ?[]const u8 = null;
@@ -451,6 +486,53 @@ pub const H3Connection = struct {
         }
 
         return null;
+    }
+
+    /// Process data from peer's QPACK encoder and decoder streams.
+    fn pollQpackStreams(self: *H3Connection) !void {
+        // Read from peer's encoder stream → feed to our decoder
+        if (self.peer_qpack_enc_stream_id) |enc_id| {
+            if (self.quic_conn.streams.recv_streams.get(enc_id)) |recv_stream| {
+                if (recv_stream.read()) |data| {
+                    if (data.len > 0) {
+                        self.qpack_decoder.processEncoderInstruction(data) catch |err| {
+                            std.log.err("QPACK encoder instruction error: {}", .{err});
+                        };
+                    }
+                }
+            }
+        }
+
+        // Read from peer's decoder stream → feed to our encoder
+        if (self.peer_qpack_dec_stream_id) |dec_id| {
+            if (self.quic_conn.streams.recv_streams.get(dec_id)) |recv_stream| {
+                if (recv_stream.read()) |data| {
+                    if (data.len > 0) {
+                        self.qpack_encoder.processDecoderInstruction(data) catch |err| {
+                            std.log.err("QPACK decoder instruction error: {}", .{err});
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send pending encoder instructions on the QPACK encoder stream.
+    fn flushEncoderInstructions(self: *H3Connection) !void {
+        const enc_stream = self.local_qpack_enc_stream orelse return;
+        const instructions = self.qpack_encoder.getInstructions();
+        if (instructions.len > 0) {
+            try enc_stream.writeData(instructions);
+        }
+    }
+
+    /// Send pending decoder instructions on the QPACK decoder stream.
+    fn flushDecoderInstructions(self: *H3Connection) !void {
+        const dec_stream = self.local_qpack_dec_stream orelse return;
+        const instructions = self.qpack_decoder.getInstructions();
+        if (instructions.len > 0) {
+            try dec_stream.writeData(instructions);
+        }
     }
 };
 
