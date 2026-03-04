@@ -8,6 +8,7 @@ const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
 const stateless_reset = @import("quic/stateless_reset.zig");
+const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
 const qpack = @import("h3/qpack.zig");
 const Certificate = std.crypto.Certificate;
@@ -26,6 +27,7 @@ pub fn main() !void {
     // Create a local socket with any available port
     const local_addr = try net.Address.parseIp4("127.0.0.1", 0);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
+    ecn_socket.enableEcnRecv(sockfd) catch {};
     std.log.info("QUIC H3 client connecting to 127.0.0.1:4434", .{});
 
     // Create TLS config for the client
@@ -76,6 +78,7 @@ pub fn main() !void {
             };
             if (bytes_written > 0) {
                 send_count += 1;
+                ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                 const sent = posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size) catch |err| {
                     std.log.err("sendto failed: {any}", .{err});
                     continue;
@@ -87,11 +90,13 @@ pub fn main() !void {
         // Try to read response packets
         read_loop: while (true) {
             var bytes: [8192]u8 = undefined;
-            addr_size = @sizeOf(posix.sockaddr);
 
-            const packet_length = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch {
+            const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch {
                 break :read_loop;
             };
+            const packet_length = recv_result.bytes_read;
+            remote_addr = recv_result.from_addr;
+            addr_size = recv_result.addr_len;
 
             var fbs = io.fixedBufferStream(bytes[0..packet_length]);
 
@@ -112,6 +117,7 @@ pub fn main() !void {
                 conn.recv(&header, &fbs, .{
                     .to = local_addr.any,
                     .from = remote_addr,
+                    .ecn = recv_result.ecn,
                 }) catch |err| {
                     std.log.err("recv error: {any}", .{err});
                     break;
@@ -142,6 +148,7 @@ pub fn main() !void {
         return;
     };
     if (hs_bytes > 0) {
+        ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
         _ = try posix.sendto(sockfd, out[0..hs_bytes], 0, &remote_addr, addr_size);
         std.log.info("sent {d} bytes (handshake completion)", .{hs_bytes});
     }
@@ -178,6 +185,7 @@ pub fn main() !void {
         return;
     };
     if (data_bytes > 0) {
+        ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
         _ = try posix.sendto(sockfd, out[0..data_bytes], 0, &remote_addr, addr_size);
         std.log.info("sent {d} bytes with H3 data", .{data_bytes});
     }
@@ -187,6 +195,7 @@ pub fn main() !void {
     while (flush_count < 10) : (flush_count += 1) {
         const more = conn.send(&out) catch break;
         if (more == 0) break;
+        ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
         _ = posix.sendto(sockfd, out[0..more], 0, &remote_addr, addr_size) catch break;
         std.log.info("sent {d} more bytes (flush #{d})", .{ more, flush_count + 1 });
     }
@@ -202,9 +211,11 @@ pub fn main() !void {
         // Read QUIC packets
         while (true) {
             var bytes: [8192]u8 = undefined;
-            addr_size = @sizeOf(posix.sockaddr);
 
-            const packet_length = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch break;
+            const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
+            const packet_length = recv_result.bytes_read;
+            remote_addr = recv_result.from_addr;
+            addr_size = recv_result.addr_len;
 
             var fbs = io.fixedBufferStream(bytes[0..packet_length]);
 
@@ -220,6 +231,7 @@ pub fn main() !void {
                 conn.recv(&header, &fbs, .{
                     .to = local_addr.any,
                     .from = remote_addr,
+                    .ecn = recv_result.ecn,
                 }) catch {
                     // Check if this is a stateless reset (RFC 9000 §10.3)
                     if (conn.matchesStatelessReset(bytes[0..packet_length])) {
@@ -243,6 +255,7 @@ pub fn main() !void {
         // Send ACKs
         const ack_bytes = conn.send(&out) catch continue;
         if (ack_bytes > 0) {
+            ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
             _ = posix.sendto(sockfd, out[0..ack_bytes], 0, &remote_addr, addr_size) catch {};
         }
 
@@ -303,16 +316,17 @@ pub fn main() !void {
         // Read and discard any incoming packets (triggers close retransmit)
         while (true) {
             var bytes: [8192]u8 = undefined;
-            addr_size = @sizeOf(posix.sockaddr);
-            const pkt_len = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch break;
+            const drain_recv = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
+            remote_addr = drain_recv.from_addr;
+            addr_size = drain_recv.addr_len;
 
-            var fbs = io.fixedBufferStream(bytes[0..pkt_len]);
-            while (fbs.pos < pkt_len) {
+            var fbs = io.fixedBufferStream(bytes[0..drain_recv.bytes_read]);
+            while (fbs.pos < drain_recv.bytes_read) {
                 if (bytes[fbs.pos] & 0x40 == 0) break;
                 const pkt_start = fbs.pos;
                 var header = packet.Header.parse(&fbs, conn.scid_len) catch break;
                 const full_size = fbs.pos - pkt_start + header.remainder_len;
-                conn.recv(&header, &fbs, .{ .to = local_addr.any, .from = remote_addr }) catch break;
+                conn.recv(&header, &fbs, .{ .to = local_addr.any, .from = remote_addr, .ecn = drain_recv.ecn }) catch break;
                 const next_pos = pkt_start + full_size;
                 if (fbs.pos < next_pos) fbs.pos = next_pos;
             }

@@ -42,6 +42,7 @@ pub const SentPacket = struct {
     in_flight: bool,
     enc_level: EncLevel,
     largest_acked: ?u64 = null,
+    ecn_marked: bool = false,
 };
 
 /// Fixed-capacity list of SentPackets for ACK results.

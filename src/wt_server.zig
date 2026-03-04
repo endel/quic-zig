@@ -6,6 +6,7 @@ const connection = @import("quic/connection.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
+const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
 const wt = @import("webtransport/session.zig");
 
@@ -50,6 +51,7 @@ pub fn main() !void {
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
+    ecn_socket.enableEcnRecv(sockfd) catch {};
     std.debug.print("WebTransport server listening on 127.0.0.1:4434\n", .{});
 
     var conn_state: ?connection.Connection = null;
@@ -68,11 +70,14 @@ pub fn main() !void {
             var bytes: [8192]u8 = undefined;
             addr_size = @sizeOf(posix.sockaddr);
 
-            const packet_length = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch |err| {
+            const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch |err| {
                 if (err == error.WouldBlock) break :read_loop;
-                std.log.err("recvfrom error: {any}", .{err});
+                std.log.err("recvmsg error: {any}", .{err});
                 break :read_loop;
             };
+            const packet_length = recv_result.bytes_read;
+            remote_addr = recv_result.from_addr;
+            addr_size = recv_result.addr_len;
 
             var fbs = io.fixedBufferStream(bytes[0..packet_length]);
 
@@ -124,6 +129,7 @@ pub fn main() !void {
                 conn.recv(&header, &fbs, .{
                     .to = local_addr.any,
                     .from = remote_addr,
+                    .ecn = recv_result.ecn,
                 }) catch |err| {
                     std.log.err("recv error: {any}", .{err});
                     break;
@@ -137,6 +143,7 @@ pub fn main() !void {
                     break;
                 };
                 if (bytes_written > 0) {
+                    ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                     const send_addr = &conn.paths[conn.active_path_idx].peer_addr;
                     _ = try posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr));
                 }
@@ -228,6 +235,7 @@ pub fn main() !void {
                 continue;
             };
             if (bytes_written > 0) {
+                ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                 const send_addr = &conn.paths[conn.active_path_idx].peer_addr;
                 _ = try posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr));
             }

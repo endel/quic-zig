@@ -21,6 +21,7 @@ const packet_packer = @import("packet_packer.zig");
 const quic_crypto = @import("crypto.zig");
 const mtu_mod = @import("mtu.zig");
 const stateless_reset = @import("stateless_reset.zig");
+const ecn = @import("ecn.zig");
 
 pub const State = enum(u8) {
     first_flight = 0,
@@ -432,6 +433,9 @@ pub const Connection = struct {
     peer_ecn_ect0: [3]u64 = .{ 0, 0, 0 },
     peer_ecn_ect1: [3]u64 = .{ 0, 0, 0 },
     peer_ecn_ce: [3]u64 = .{ 0, 0, 0 },
+
+    // ECN validation state machine (RFC 9000 §13.4.2.1)
+    ecn_validator: ecn.EcnValidator = .{},
 
     // Connection state
     got_peer_conn_id: bool = false,
@@ -1009,8 +1013,25 @@ pub const Connection = struct {
                 }
 
                 // ECN validation (RFC 9000 §13.4.2.1):
-                // If CE count increased, treat as congestion event
-                if (ack.ecn_ce > self.peer_ecn_ce[space_idx]) {
+                // Count how many newly-acked packets were ECN-marked
+                var newly_acked_ect0: u64 = 0;
+                for (result.acked.constSlice()) |pkt| {
+                    if (pkt.ecn_marked) newly_acked_ect0 += 1;
+                }
+
+                // Validate ECN counts from peer
+                const ecn_valid = self.ecn_validator.validate(
+                    ack.ecn_ect0,
+                    ack.ecn_ect1,
+                    ack.ecn_ce,
+                    self.peer_ecn_ect0[space_idx],
+                    self.peer_ecn_ect1[space_idx],
+                    self.peer_ecn_ce[space_idx],
+                    newly_acked_ect0,
+                );
+
+                // If valid and CE count increased, treat as congestion event
+                if (ecn_valid and ack.ecn_ce > self.peer_ecn_ce[space_idx]) {
                     std.log.info("ECN: CE count increased {d} -> {d}, congestion signal", .{ self.peer_ecn_ce[space_idx], ack.ecn_ce });
                     if (self.pkt_handler.sent[space_idx].largest_sent) |ls| {
                         self.cc.onCongestionEvent(ls);
@@ -1210,6 +1231,7 @@ pub const Connection = struct {
             .handshake_done => {
                 self.handshake_confirmed = true;
                 self.state = .connected;
+                self.ecn_validator.start();
 
                 // Drop Initial and Handshake packet number spaces
                 self.pkt_handler.dropSpace(.initial);
@@ -1454,6 +1476,7 @@ pub const Connection = struct {
                 .complete => {
                     self.state = .connected;
                     self.handshake_confirmed = true;
+                    self.ecn_validator.start();
                     self.paths[self.active_path_idx].is_validated = true;
                     self.pkt_handler.dropSpace(.initial);
                     self.pkt_handler.dropSpace(.handshake);
@@ -1814,6 +1837,11 @@ pub const Connection = struct {
                     if (pn > 0) ku.onPacketSent(pn - 1);
                 }
             }
+
+            // Track ECN marking for sent packets
+            if (self.ecn_validator.shouldMark() and app_seal != null) {
+                self.ecn_validator.onPacketSent();
+            }
         }
 
         // PMTUD: send a probe if it's time (separate datagram from regular data)
@@ -1918,7 +1946,7 @@ pub const Connection = struct {
         const challenge = self.paths[candidate_idx].validator.startChallenge();
         self.pending_frames.push(.{ .path_challenge = challenge });
 
-        // Reset CC/RTT/MTU if IP address changed (not just port — NAT rebinding preserves CC)
+        // Reset CC/RTT/MTU/ECN if IP address changed (not just port — NAT rebinding preserves CC)
         const old_path = &self.paths[1 - candidate_idx];
         if (!sockaddrSameIp(&new_peer_addr, &old_path.peer_addr)) {
             self.cc = congestion.NewReno.init();
@@ -1926,7 +1954,8 @@ pub const Connection = struct {
             self.pkt_handler.rtt_stats = rtt.RttStats{};
             self.mtu_discoverer.reset();
             self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
-            std.log.info("migration: IP changed, reset CC, RTT and MTU", .{});
+            self.ecn_validator.reset();
+            std.log.info("migration: IP changed, reset CC, RTT, MTU and ECN", .{});
         } else {
             std.log.info("migration: port-only change (NAT rebinding), preserving CC", .{});
         }
@@ -2075,6 +2104,12 @@ pub const Connection = struct {
 
     pub fn isEstablished(self: *const Connection) bool {
         return self.state == .connected;
+    }
+
+    /// Return the ECN codepoint to mark on outgoing packets.
+    /// Returns ECT(0) if ECN validation allows it, else Not-ECT.
+    pub fn getEcnMark(self: *const Connection) u2 {
+        return if (self.ecn_validator.shouldMark()) ECN_ECT0 else ECN_NOT_ECT;
     }
 
     // Get the NEW_TOKEN received from the server (for reuse in future connections).

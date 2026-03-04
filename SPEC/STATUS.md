@@ -100,9 +100,9 @@
 | 13.2.6 | ACK Frames and Packet Protection | ✅ Done | ACKs at correct encryption level |
 | 13.2.7 | PADDING Frames Consume Congestion Window | ✅ Done | Counted as in-flight bytes |
 | 13.3 | Retransmission of Information | ✅ Done | Frame-level retransmission (not packet) |
-| 13.4 | Explicit Congestion Notification | ⚠️ Partial | Protocol-level counters; no IP-level marking/reading |
+| 13.4 | Explicit Congestion Notification | ✅ Done | IP-level ECT(0) marking + reading via recvmsg |
 | 13.4.1 | Reporting ECN Counts | ✅ Done | ACK_ECN frames with counters |
-| 13.4.2 | ECN Validation | ⚠️ Partial | No full validation state machine per §13.4.2.1 |
+| 13.4.2 | ECN Validation | ✅ Done | Full validation state machine (ecn.zig) |
 | **14** | **Datagram Size** | | |
 | 14.1 | Initial Datagram Size | ✅ Done | 1200 byte minimum for Initial |
 | 14.2 | Path Maximum Transmission Unit | ✅ Done | PMTUD binary search |
@@ -161,8 +161,8 @@
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Done | 88 | ~85% |
-| ⚠️ Partial | 11 | ~11% |
+| ✅ Done | 90 | ~87% |
+| ⚠️ Partial | 9 | ~9% |
 | ❌ Missing | 7 | ~4% |
 | ❌ N/A | 2 | — |
 
@@ -176,7 +176,7 @@
 | P3 | §7.4.1 | 0-RTT transport parameter remember/restore | Medium |
 | P2 | §9.6 | Server's Preferred Address | Medium |
 | P3 | §10.3.3 | Stateless Reset loop detection | Small |
-| P2 | §13.4 | ECN IP-level marking + full validation | Medium |
+| ~~P2~~ | ~~§13.4~~ | ~~ECN IP-level marking + full validation~~ | ~~Done~~ |
 | P3 | §13.2.4 | ACK range pruning via ACK-of-ACK tracking | Small |
 | P3 | §14.2.1/14.3.3 | ICMP message handling for PMTUD | Small (platform-limited) |
 | P3 | §14.4.1 | PMTU probes with SCID | Small |
@@ -264,7 +264,7 @@
 | 6.3 | Handling Retry Packets | ✅ Done | Reset RTT + congestion state |
 | 6.4 | Discarding Keys and Packet State | ✅ Done | Clear PN space on key discard |
 | 7 | Congestion Control | | |
-| 7.1 | Explicit Congestion Notification | ⚠️ Partial | Protocol-level only |
+| 7.1 | Explicit Congestion Notification | ✅ Done | IP-level ECT(0) marking + CE→congestion response |
 | 7.2 | Initial and Minimum Congestion Window | ✅ Done | 14720 bytes initial, 2×MSS min |
 | 7.3 | Slow Start | ✅ Done | Exponential growth |
 | 7.3.1 | Recovery | ✅ Done | Single reduction per RTT |
@@ -280,15 +280,15 @@
 
 | Status | Count |
 |--------|-------|
-| ✅ Done | 22 |
-| ⚠️ Partial | 2 |
+| ✅ Done | 23 |
+| ⚠️ Partial | 1 |
 | ❌ Missing | 0 |
 
 ### Remaining Work — RFC 9002
 
 | Priority | Section | Item | Effort |
 |----------|---------|------|--------|
-| P2 | §7.1 | ECN IP-level marking + CE response | Medium |
+| ~~P2~~ | ~~§7.1~~ | ~~ECN IP-level marking + CE response~~ | ~~Done~~ |
 | P3 | §7.8 | Application-limited cwnd tracking | Small |
 
 ---
@@ -440,9 +440,9 @@ No remaining work — all sections implemented. Optional improvements:
 
 | RFC | Done | Partial | Missing | Completion |
 |-----|------|---------|---------|------------|
-| RFC 9000 (QUIC) | 88 | 11 | 7 | ~93% |
+| RFC 9000 (QUIC) | 90 | 9 | 7 | ~94% |
 | RFC 9001 (TLS) | 31 | 2 | 0 | ~97% |
-| RFC 9002 (Loss/CC) | 22 | 2 | 0 | ~92% |
+| RFC 9002 (Loss/CC) | 23 | 1 | 0 | ~96% |
 | RFC 9114 (HTTP/3) | 18 | 4 | 5 | ~74% |
 | RFC 9204 (QPACK) | 11 | 0 | 0 | 100% |
 | RFC 9297 (Datagrams) | 3 | 0 | 1 | ~88% |
@@ -457,7 +457,7 @@ No remaining work — all sections implemented. Optional improvements:
 | ~~2~~ | ~~Certificate chain validation~~ | ~~9001 §4.4~~ | ~~Done~~ | ~~Done~~ |
 | ~~3~~ | ~~Session resumption (PSK/tickets)~~ | ~~9001 §4.5~~ | ~~Done~~ | ~~Done~~ |
 | ~~4~~ | ~~0-RTT data sending~~ | ~~9001 §4.6~~ | ~~Done~~ | ~~Done~~ |
-| 5 | ECN IP-level marking | 9000 §13.4 | Medium | Congestion signal quality |
+| ~~5~~ | ~~ECN IP-level marking~~ | ~~9000 §13.4~~ | ~~Done~~ | ~~Done~~ |
 | 6 | Server's Preferred Address | 9000 §9.6 | Medium | Migration feature |
 | ~~7~~ | ~~QPACK dynamic table~~ | ~~9204 §3.2~~ | ~~Done~~ | ~~Done~~ |
 | 8 | Server Push (H3) | 9114 §4.6 | Large | H3 feature completeness |
