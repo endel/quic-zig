@@ -153,6 +153,9 @@ pub fn main() !void {
         std.log.info("sent {d} bytes (handshake completion)", .{hs_bytes});
     }
 
+    // Sync remote_addr from active path (may have changed due to preferred address migration)
+    remote_addr = conn.paths[conn.active_path_idx].peer_addr;
+
     // Clear Initial and Handshake keys so subsequent sends only use 1-RTT
     conn.pkt_num_spaces[0].crypto_open = null;
     conn.pkt_num_spaces[0].crypto_seal = null;

@@ -342,6 +342,7 @@ pub const ConnectionConfig = struct {
     initial_max_streams_bidi: u64 = 100,
     initial_max_streams_uni: u64 = 100,
     max_datagram_frame_size: ?u64 = null,
+    preferred_address: ?transport_params.PreferredAddress = null,
     // Key for NEW_TOKEN generation (server) — should match the Retry token key
     token_key: ?[16]u8 = null,
 };
@@ -543,6 +544,8 @@ pub const Connection = struct {
             .initial_max_streams_bidi = config.initial_max_streams_bidi,
             .initial_max_streams_uni = config.initial_max_streams_uni,
             .max_datagram_frame_size = config.max_datagram_frame_size,
+            // Server's preferred address (RFC 9000 §9.6) — only for servers, must not coexist with disable_active_migration
+            .preferred_address = if (is_server and config.preferred_address != null) config.preferred_address else null,
         };
         conn.local_params = local_params;
 
@@ -1597,6 +1600,53 @@ pub const Connection = struct {
                             peer_tp.initial_max_streams_uni,
                             peer_tp.initial_max_data,
                         });
+
+                        // Client: migrate to server's preferred address (RFC 9000 §9.6)
+                        if (!self.is_server) {
+                            if (peer_tp.preferred_address) |pref| {
+                                if (!peer_tp.disable_active_migration) {
+                                    // Store preferred CID + reset token in peer CID pool
+                                    self.peer_cid_pool.addPeerCid(1, pref.getCid(), pref.stateless_reset_token);
+
+                                    // Build sockaddr from preferred IPv4 (prefer v4 for now)
+                                    const pref_addr = if (pref.hasIpv4()) pref.toSockaddrV4() else pref.toSockaddrV6();
+
+                                    // Set up candidate path
+                                    const candidate_idx: u8 = 1 - self.active_path_idx;
+                                    self.paths[candidate_idx] = NetworkPath.init(
+                                        self.paths[self.active_path_idx].local_addr,
+                                        pref_addr,
+                                        false,
+                                    );
+
+                                    // Switch active path
+                                    self.active_path_idx = candidate_idx;
+
+                                    // Update packer DCID to preferred CID
+                                    if (self.peer_cid_pool.consumeUnused()) |entry| {
+                                        self.packer.updateDcid(entry.getCid());
+                                        std.log.info("preferred_address: using CID seq={d}", .{entry.seq_num});
+                                    }
+
+                                    // Start PATH_CHALLENGE
+                                    const challenge = self.paths[candidate_idx].validator.startChallenge();
+                                    self.pending_frames.push(.{ .path_challenge = challenge });
+
+                                    // Reset CC/RTT/MTU/ECN for new IP
+                                    self.cc = congestion.NewReno.init();
+                                    self.pacer = congestion.Pacer.init();
+                                    self.pkt_handler.rtt_stats = rtt.RttStats{};
+                                    self.mtu_discoverer.reset();
+                                    self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
+                                    self.ecn_validator.reset();
+
+                                    std.log.info("preferred_address: migrating to {s} port {d}", .{
+                                        if (pref.hasIpv4()) "IPv4" else "IPv6",
+                                        if (pref.hasIpv4()) pref.ipv4_port else pref.ipv6_port,
+                                    });
+                                }
+                            }
+                        }
                     }
 
                     // Issue NEW_CONNECTION_ID frames up to peer's active_connection_id_limit (RFC 9000 §5.1)

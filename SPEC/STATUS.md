@@ -63,10 +63,10 @@
 | 9.3.3 | Off-Path Packet Forwarding | ⚠️ Partial | No explicit countermeasures |
 | 9.4 | Loss Detection and Congestion Control | ✅ Done | CC/RTT reset on IP change |
 | 9.5 | Privacy Implications of Connection Migration | ✅ Done | Fresh CID consumed on migration |
-| 9.6 | Server's Preferred Address | ❌ Missing | Transport param parsed but not acted upon |
-| 9.6.1 | Communicating a Preferred Address | ❌ Missing | Not sent by server |
-| 9.6.2 | Migration to a Preferred Address | ❌ Missing | Client doesn't migrate to preferred addr |
-| 9.6.3 | Interaction of Client Migration and Preferred Address | ❌ Missing | — |
+| 9.6 | Server's Preferred Address | ✅ Done | PreferredAddress struct, encode/decode, client migration |
+| 9.6.1 | Communicating a Preferred Address | ✅ Done | Server sends via transport params (ConnectionConfig.preferred_address) |
+| 9.6.2 | Migration to a Preferred Address | ✅ Done | Client migrates post-handshake with PATH_CHALLENGE |
+| 9.6.3 | Interaction of Client Migration and Preferred Address | ✅ Done | Reuses existing migration infrastructure |
 | 9.7 | Use of IPv6 Flow Label and Migration | ❌ N/A | Not applicable (IPv6 flow label is OS-level) |
 | **10** | **Connection Termination** | | |
 | 10.1 | Idle Timeout | ✅ Done | Negotiated min(local, peer), 30s default |
@@ -161,9 +161,9 @@
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Done | 90 | ~87% |
+| ✅ Done | 94 | ~90% |
 | ⚠️ Partial | 9 | ~9% |
-| ❌ Missing | 7 | ~4% |
+| ❌ Missing | 3 | ~1% |
 | ❌ N/A | 2 | — |
 
 ### Remaining Work — RFC 9000
@@ -174,7 +174,7 @@
 | ~~P2~~ | ~~§5.2.2~~ | ~~Multi-connection server (CID-based demux)~~ | ~~Done~~ |
 | P3 | §6.2-6.3 | Version Negotiation client retry + greasing | Small |
 | P3 | §7.4.1 | 0-RTT transport parameter remember/restore | Medium |
-| P2 | §9.6 | Server's Preferred Address | Medium |
+| ~~P2~~ | ~~§9.6~~ | ~~Server's Preferred Address~~ | ~~Done~~ |
 | P3 | §10.3.3 | Stateless Reset loop detection | Small |
 | ~~P2~~ | ~~§13.4~~ | ~~ECN IP-level marking + full validation~~ | ~~Done~~ |
 | P3 | §13.2.4 | ACK range pruning via ACK-of-ACK tracking | Small |
@@ -440,7 +440,7 @@ No remaining work — all sections implemented. Optional improvements:
 
 | RFC | Done | Partial | Missing | Completion |
 |-----|------|---------|---------|------------|
-| RFC 9000 (QUIC) | 90 | 9 | 7 | ~94% |
+| RFC 9000 (QUIC) | 94 | 9 | 3 | ~96% |
 | RFC 9001 (TLS) | 31 | 2 | 0 | ~97% |
 | RFC 9002 (Loss/CC) | 23 | 1 | 0 | ~96% |
 | RFC 9114 (HTTP/3) | 18 | 4 | 5 | ~74% |
@@ -458,7 +458,7 @@ No remaining work — all sections implemented. Optional improvements:
 | ~~3~~ | ~~Session resumption (PSK/tickets)~~ | ~~9001 §4.5~~ | ~~Done~~ | ~~Done~~ |
 | ~~4~~ | ~~0-RTT data sending~~ | ~~9001 §4.6~~ | ~~Done~~ | ~~Done~~ |
 | ~~5~~ | ~~ECN IP-level marking~~ | ~~9000 §13.4~~ | ~~Done~~ | ~~Done~~ |
-| 6 | Server's Preferred Address | 9000 §9.6 | Medium | Migration feature |
+| ~~6~~ | ~~Server's Preferred Address~~ | ~~9000 §9.6~~ | ~~Done~~ | ~~Done~~ |
 | ~~7~~ | ~~QPACK dynamic table~~ | ~~9204 §3.2~~ | ~~Done~~ | ~~Done~~ |
 | 8 | Server Push (H3) | 9114 §4.6 | Large | H3 feature completeness |
 | 9 | Graceful H3 shutdown | 9114 §5.2 | Medium | Connection lifecycle |

@@ -119,6 +119,9 @@ pub fn main() !void {
         _ = try posix.sendto(sockfd, out[0..hs_bytes], 0, &remote_addr, addr_size);
     }
 
+    // Sync remote_addr from active path (may have changed due to preferred address migration)
+    remote_addr = conn.paths[conn.active_path_idx].peer_addr;
+
     // Clear Initial and Handshake keys
     conn.pkt_num_spaces[0].crypto_open = null;
     conn.pkt_num_spaces[0].crypto_seal = null;

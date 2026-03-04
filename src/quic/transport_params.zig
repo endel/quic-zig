@@ -1,6 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
 
+const posix = std.posix;
+
 const packet = @import("packet.zig");
 
 /// QUIC Transport Parameter IDs (RFC 9000 Section 18.2).
@@ -26,6 +28,44 @@ pub const ParamId = enum(u64) {
     _,
 };
 
+/// Server's Preferred Address (RFC 9000 §9.6, §18.2).
+pub const PreferredAddress = struct {
+    ipv4_addr: [4]u8 = .{0} ** 4,
+    ipv4_port: u16 = 0,
+    ipv6_addr: [16]u8 = .{0} ** 16,
+    ipv6_port: u16 = 0,
+    cid_buf: [20]u8 = .{0} ** 20,
+    cid_len: u8 = 0,
+    stateless_reset_token: [16]u8 = .{0} ** 16,
+
+    pub fn hasIpv4(self: *const PreferredAddress) bool {
+        return self.ipv4_port != 0;
+    }
+
+    pub fn hasIpv6(self: *const PreferredAddress) bool {
+        return self.ipv6_port != 0;
+    }
+
+    pub fn getCid(self: *const PreferredAddress) []const u8 {
+        return self.cid_buf[0..self.cid_len];
+    }
+
+    pub fn toSockaddrV4(self: *const PreferredAddress) posix.sockaddr {
+        const addr: posix.sockaddr.in = .{
+            .port = std.mem.nativeToBig(u16, self.ipv4_port),
+            .addr = @bitCast(self.ipv4_addr),
+        };
+        return @as(*const posix.sockaddr, @ptrCast(&addr)).*;
+    }
+
+    pub fn toSockaddrV6(self: *const PreferredAddress) posix.sockaddr {
+        var addr: posix.sockaddr.in6 = std.mem.zeroes(posix.sockaddr.in6);
+        addr.port = std.mem.nativeToBig(u16, self.ipv6_port);
+        addr.addr = self.ipv6_addr;
+        return @as(*const posix.sockaddr, @ptrCast(&addr)).*;
+    }
+};
+
 /// QUIC Transport Parameters (RFC 9000 Section 18).
 pub const TransportParams = struct {
     original_destination_connection_id: ?[]const u8 = null,
@@ -41,6 +81,7 @@ pub const TransportParams = struct {
     ack_delay_exponent: u64 = 3,
     max_ack_delay: u64 = 25,
     disable_active_migration: bool = false,
+    preferred_address: ?PreferredAddress = null,
     active_connection_id_limit: u64 = 2,
     initial_source_connection_id: ?[]const u8 = null,
     retry_source_connection_id: ?[]const u8 = null,
@@ -123,6 +164,20 @@ pub const TransportParams = struct {
             try Helper.writeParamEmpty(writer, .disable_active_migration);
         }
 
+        if (self.preferred_address) |pref| {
+            try packet.writeVarInt(writer, @intFromEnum(ParamId.preferred_address));
+            // Length: 4+2 + 16+2 + 1+cid_len + 16 = 41 + cid_len
+            const pref_len: u64 = 41 + @as(u64, pref.cid_len);
+            try packet.writeVarInt(writer, pref_len);
+            try writer.writeAll(&pref.ipv4_addr);
+            try writer.writeAll(&std.mem.toBytes(std.mem.nativeToBig(u16, pref.ipv4_port)));
+            try writer.writeAll(&pref.ipv6_addr);
+            try writer.writeAll(&std.mem.toBytes(std.mem.nativeToBig(u16, pref.ipv6_port)));
+            try writer.writeByte(pref.cid_len);
+            try writer.writeAll(pref.cid_buf[0..pref.cid_len]);
+            try writer.writeAll(&pref.stateless_reset_token);
+        }
+
         if (self.active_connection_id_limit != 2) {
             try Helper.writeParam(writer, .active_connection_id_limit, self.active_connection_id_limit);
         }
@@ -194,6 +249,23 @@ pub const TransportParams = struct {
                 },
                 @intFromEnum(ParamId.disable_active_migration) => {
                     params.disable_active_migration = true;
+                },
+                @intFromEnum(ParamId.preferred_address) => {
+                    // IPv4 addr (4) + port (2) + IPv6 addr (16) + port (2) + CID len (1) + CID + reset token (16)
+                    var pref = PreferredAddress{};
+                    _ = try reader.readAll(&pref.ipv4_addr);
+                    var ipv4_port_bytes: [2]u8 = undefined;
+                    _ = try reader.readAll(&ipv4_port_bytes);
+                    pref.ipv4_port = std.mem.bigToNative(u16, @bitCast(ipv4_port_bytes));
+                    _ = try reader.readAll(&pref.ipv6_addr);
+                    var ipv6_port_bytes: [2]u8 = undefined;
+                    _ = try reader.readAll(&ipv6_port_bytes);
+                    pref.ipv6_port = std.mem.bigToNative(u16, @bitCast(ipv6_port_bytes));
+                    pref.cid_len = try reader.readByte();
+                    if (pref.cid_len > 20) return error.TransportParameterError;
+                    _ = try reader.readAll(pref.cid_buf[0..pref.cid_len]);
+                    _ = try reader.readAll(&pref.stateless_reset_token);
+                    params.preferred_address = pref;
                 },
                 @intFromEnum(ParamId.active_connection_id_limit) => {
                     params.active_connection_id_limit = try packet.readVarInt(reader);
@@ -277,4 +349,52 @@ test "TransportParams: encode empty params" {
 
     try testing.expectEqual(@as(u64, 65527), decoded.max_udp_payload_size);
     try testing.expectEqual(@as(u64, 3), decoded.ack_delay_exponent);
+}
+
+// PreferredAddress encode/decode roundtrip
+test "TransportParams: preferred_address roundtrip" {
+    var pref = PreferredAddress{};
+    pref.ipv4_addr = .{ 10, 0, 0, 1 };
+    pref.ipv4_port = 4433;
+    pref.ipv6_addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 };
+    pref.ipv6_port = 4434;
+    pref.cid_len = 8;
+    @memset(pref.cid_buf[0..8], 0xAB);
+    @memset(&pref.stateless_reset_token, 0xCD);
+
+    const original = TransportParams{
+        .max_idle_timeout = 30000,
+        .preferred_address = pref,
+    };
+
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try original.encode(fbs.writer());
+
+    const decoded = try TransportParams.decode(fbs.getWritten());
+    try testing.expect(decoded.preferred_address != null);
+
+    const dp = decoded.preferred_address.?;
+    try testing.expectEqualSlices(u8, &pref.ipv4_addr, &dp.ipv4_addr);
+    try testing.expectEqual(pref.ipv4_port, dp.ipv4_port);
+    try testing.expectEqualSlices(u8, &pref.ipv6_addr, &dp.ipv6_addr);
+    try testing.expectEqual(pref.ipv6_port, dp.ipv6_port);
+    try testing.expectEqual(pref.cid_len, dp.cid_len);
+    try testing.expectEqualSlices(u8, pref.cid_buf[0..8], dp.cid_buf[0..8]);
+    try testing.expectEqualSlices(u8, &pref.stateless_reset_token, &dp.stateless_reset_token);
+}
+
+// PreferredAddress sockaddr helpers
+test "PreferredAddress: toSockaddrV4" {
+    var pref = PreferredAddress{};
+    pref.ipv4_addr = .{ 127, 0, 0, 1 };
+    pref.ipv4_port = 4433;
+
+    try testing.expect(pref.hasIpv4());
+    try testing.expect(!pref.hasIpv6());
+
+    const sa = pref.toSockaddrV4();
+    const sa_in: posix.sockaddr.in = @bitCast(sa);
+    try testing.expectEqual(posix.AF.INET, sa_in.family);
+    try testing.expectEqual(std.mem.nativeToBig(u16, 4433), sa_in.port);
 }
