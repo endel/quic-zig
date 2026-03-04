@@ -4,7 +4,13 @@
 - Final objective is the implementation of core QUIC Spec: https://www.rfc-editor.org/rfc/rfc9000.txt
 - Use ./interop/ client and server implementations as reference when testing
   specific features.
-- Keep code and architecture clean, optimized and maintainable
+
+## Iteration over QUIC specifications
+- Keep code and architecture clean, covered with tests, optimized and maintainable
+- Document the state of each implementation, with their caveats of the spec under ./SPEC/[RFC_NUMBER]_[SECTION].md
+- ./Keep the SPEC/STATUS.md up-to-date.
+- When required to re-visit the implementation of documented pieces of
+  implementation, update it under ./SPEC/[RFC_NUMBER]_[SECTION].md
 
 ## Secondary Objectives
 - QUIC Loss Detection and Congestion Control (https://www.rfc-editor.org/rfc/rfc9002.txt)

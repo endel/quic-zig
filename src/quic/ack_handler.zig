@@ -82,6 +82,7 @@ const PnList = struct {
 pub const AckResult = struct {
     acked: SentPacketList = .{},
     lost: SentPacketList = .{},
+    persistent_congestion: bool = false,
 };
 
 /// Tracks sent packets and handles loss detection for a single packet number space.
@@ -179,6 +180,11 @@ pub const SentPacketTracker = struct {
 
         var to_remove: PnList = .{};
 
+        // Track earliest and latest send times of lost ack-eliciting packets
+        // for persistent congestion detection (RFC 9002 §7.6.2)
+        var earliest_lost_time: ?i64 = null;
+        var latest_lost_time: ?i64 = null;
+
         var it = self.sent_packets.iterator();
         while (it.next()) |entry| {
             const pkt = entry.value_ptr.*;
@@ -189,6 +195,14 @@ pub const SentPacketTracker = struct {
             if (pkt.time_sent <= lost_send_time) {
                 result.lost.append(pkt);
                 to_remove.append(pkt.pn);
+                if (pkt.ack_eliciting) {
+                    if (earliest_lost_time == null or pkt.time_sent < earliest_lost_time.?) {
+                        earliest_lost_time = pkt.time_sent;
+                    }
+                    if (latest_lost_time == null or pkt.time_sent > latest_lost_time.?) {
+                        latest_lost_time = pkt.time_sent;
+                    }
+                }
                 continue;
             }
 
@@ -197,6 +211,14 @@ pub const SentPacketTracker = struct {
             {
                 result.lost.append(pkt);
                 to_remove.append(pkt.pn);
+                if (pkt.ack_eliciting) {
+                    if (earliest_lost_time == null or pkt.time_sent < earliest_lost_time.?) {
+                        earliest_lost_time = pkt.time_sent;
+                    }
+                    if (latest_lost_time == null or pkt.time_sent > latest_lost_time.?) {
+                        latest_lost_time = pkt.time_sent;
+                    }
+                }
                 continue;
             }
 
@@ -208,6 +230,15 @@ pub const SentPacketTracker = struct {
 
         for (to_remove.constSlice()) |pn| {
             _ = self.sent_packets.remove(pn);
+        }
+
+        // Persistent congestion: if the time span of lost ack-eliciting packets
+        // exceeds the persistent congestion threshold (RFC 9002 §7.6.2)
+        if (earliest_lost_time != null and latest_lost_time != null) {
+            const span = latest_lost_time.? - earliest_lost_time.?;
+            if (span > rtt_stats.persistentCongestionThreshold()) {
+                result.persistent_congestion = true;
+            }
         }
     }
 };
@@ -236,13 +267,21 @@ pub const ReceivedPacketTracker = struct {
         self.received.deinit();
     }
 
-    pub fn onPacketReceived(self: *ReceivedPacketTracker, pn: u64, ack_eliciting: bool, now: i64) !void {
+    pub fn onPacketReceived(self: *ReceivedPacketTracker, pn: u64, ack_eliciting: bool, now: i64, ecn: u2) !void {
         if (self.received.contains(pn)) return;
         try self.received.add(pn);
 
         if (self.largest_received == null or pn > self.largest_received.?) {
             self.largest_received = pn;
             self.largest_received_time = now;
+        }
+
+        // Increment ECN counters (RFC 9000 §13.4.2)
+        switch (ecn) {
+            0b10 => self.ecn_ect0 += 1, // ECT(0)
+            0b01 => self.ecn_ect1 += 1, // ECT(1)
+            0b11 => self.ecn_ce += 1, // CE
+            0b00 => {}, // Not-ECT
         }
 
         if (ack_eliciting) {
@@ -299,6 +338,22 @@ pub const ReceivedPacketTracker = struct {
                 ack_ranges[ack_range_count] = .{ .start = r.start, .end = r.end };
                 ack_range_count += 1;
             }
+        }
+
+        // Use ACK_ECN when any ECN counter is non-zero (RFC 9000 §13.4.2)
+        if (self.ecn_ect0 > 0 or self.ecn_ect1 > 0 or self.ecn_ce > 0) {
+            return Frame{
+                .ack_ecn = .{
+                    .largest_ack = largest,
+                    .ack_delay = ack_delay_encoded,
+                    .first_ack_range = first_ack_range,
+                    .ack_range_count = ack_range_count,
+                    .ack_ranges = ack_ranges,
+                    .ecn_ect0 = self.ecn_ect0,
+                    .ecn_ect1 = self.ecn_ect1,
+                    .ecn_ce = self.ecn_ce,
+                },
+            };
         }
 
         return Frame{
@@ -365,9 +420,9 @@ pub const PacketHandler = struct {
         }
     }
 
-    pub fn onPacketReceived(self: *PacketHandler, level: EncLevel, pn: u64, ack_eliciting: bool, now: i64) !void {
+    pub fn onPacketReceived(self: *PacketHandler, level: EncLevel, pn: u64, ack_eliciting: bool, now: i64, ecn: u2) !void {
         const idx = @intFromEnum(level);
-        try self.recv[idx].onPacketReceived(pn, ack_eliciting, now);
+        try self.recv[idx].onPacketReceived(pn, ack_eliciting, now, ecn);
     }
 
     pub fn onAckReceived(
@@ -448,6 +503,36 @@ pub const PacketHandler = struct {
         return earliest;
     }
 
+    /// Get the encryption level where PTO should fire (the one with earliest timeout).
+    pub fn getPtoSpace(self: *PacketHandler) ?EncLevel {
+        var earliest: ?i64 = null;
+        var result: ?EncLevel = null;
+
+        for (self.sent, 0..) |tracker, idx| {
+            if (tracker.loss_time != null) continue;
+            if (tracker.ack_eliciting_in_flight == 0) continue;
+
+            const largest_sent = tracker.largest_sent orelse continue;
+            const sent_pkt = tracker.sent_packets.get(largest_sent) orelse continue;
+
+            var pto_duration = if (idx == @intFromEnum(EncLevel.application))
+                self.rtt_stats.pto()
+            else
+                self.rtt_stats.ptoNoAckDelay();
+
+            pto_duration = pto_duration << @intCast(self.pto_count);
+            pto_duration = @min(pto_duration, MAX_PTO);
+
+            const timeout = sent_pkt.time_sent + pto_duration;
+            if (earliest == null or timeout < earliest.?) {
+                earliest = timeout;
+                result = @enumFromInt(idx);
+            }
+        }
+
+        return result;
+    }
+
     pub fn dropSpace(self: *PacketHandler, level: EncLevel) void {
         const idx = @intFromEnum(level);
 
@@ -500,8 +585,8 @@ test "ReceivedPacketTracker: immediate ACK on reorder" {
 
     const now: i64 = 1_000_000_000;
 
-    try tracker.onPacketReceived(0, true, now);
-    try tracker.onPacketReceived(1, true, now + 1_000_000);
+    try tracker.onPacketReceived(0, true, now, 0);
+    try tracker.onPacketReceived(1, true, now + 1_000_000, 0);
 
     try testing.expect(tracker.ack_queued);
 }
@@ -524,11 +609,59 @@ test "PacketHandler: integration" {
 
     try testing.expectEqual(@as(u64, 1200), handler.bytes_in_flight);
 
-    try handler.onPacketReceived(.initial, 0, true, now);
+    try handler.onPacketReceived(.initial, 0, true, now, 0);
 
     const ack_time = now + 50_000_000;
     const result = try handler.onAckReceived(.initial, 0, 0, 3, &.{}, 0, ack_time);
 
     _ = result;
     try testing.expectEqual(@as(u64, 0), handler.bytes_in_flight);
+}
+
+test "ReceivedPacketTracker: ECN counters and ACK_ECN generation" {
+    var tracker = ReceivedPacketTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    const now: i64 = 1_000_000_000;
+
+    // Receive packets with ECN marks
+    try tracker.onPacketReceived(0, true, now, 0b10); // ECT(0)
+    try tracker.onPacketReceived(1, true, now + 1_000_000, 0b10); // ECT(0)
+    try tracker.onPacketReceived(2, true, now + 2_000_000, 0b11); // CE
+
+    try testing.expectEqual(@as(u64, 2), tracker.ecn_ect0);
+    try testing.expectEqual(@as(u64, 0), tracker.ecn_ect1);
+    try testing.expectEqual(@as(u64, 1), tracker.ecn_ce);
+
+    // getAckFrame should return ACK_ECN when ECN counters are non-zero
+    const frame = tracker.getAckFrame(now + 3_000_000, 3);
+    try testing.expect(frame != null);
+    switch (frame.?) {
+        .ack_ecn => |ack_ecn| {
+            try testing.expectEqual(@as(u64, 2), ack_ecn.largest_ack);
+            try testing.expectEqual(@as(u64, 2), ack_ecn.ecn_ect0);
+            try testing.expectEqual(@as(u64, 0), ack_ecn.ecn_ect1);
+            try testing.expectEqual(@as(u64, 1), ack_ecn.ecn_ce);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ReceivedPacketTracker: no ECN returns plain ACK" {
+    var tracker = ReceivedPacketTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    const now: i64 = 1_000_000_000;
+
+    // Receive packets without ECN marks
+    try tracker.onPacketReceived(0, true, now, 0); // Not-ECT
+    try tracker.onPacketReceived(1, true, now + 1_000_000, 0); // Not-ECT
+
+    // getAckFrame should return plain ACK
+    const frame = tracker.getAckFrame(now + 2_000_000, 3);
+    try testing.expect(frame != null);
+    switch (frame.?) {
+        .ack => {},
+        else => return error.TestUnexpectedResult,
+    }
 }

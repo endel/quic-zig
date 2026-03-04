@@ -101,6 +101,16 @@ pub const RttStats = struct {
         if (!self.has_measurement) return DEFAULT_INITIAL_RTT;
         return self.smoothed_rtt;
     }
+
+    // Persistent congestion threshold (RFC 9002 §7.6.1).
+    // Duration = 3 * (smoothed_rtt + max(4*rttvar, granularity) + max_ack_delay)
+    // This equals 3 * PTO (without backoff).
+    pub fn persistentCongestionThreshold(self: *const RttStats) i64 {
+        if (!self.has_measurement) {
+            return 3 * 2 * DEFAULT_INITIAL_RTT;
+        }
+        return 3 * (self.smoothed_rtt + @max(4 * self.rtt_var, TIMER_GRANULARITY) + self.max_ack_delay);
+    }
 };
 
 // Tests
@@ -155,4 +165,13 @@ test "RttStats: loss delay" {
     const delay = rtt.lossDelay();
     // 9/8 * 100ms = 112.5ms
     try testing.expectEqual(@as(i64, 112_500_000), delay);
+}
+
+test "RttStats: persistent congestion threshold" {
+    var rtt = RttStats{};
+    rtt.updateRtt(100_000_000, 0, false); // 100ms, rtt_var = 50ms
+
+    // 3 * (100ms + max(4*50ms, 1ms) + 25ms) = 3 * 325ms = 975ms
+    const threshold = rtt.persistentCongestionThreshold();
+    try testing.expectEqual(@as(i64, 975_000_000), threshold);
 }

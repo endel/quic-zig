@@ -180,6 +180,9 @@ pub const SendStream = struct {
     /// Maximum data the peer allows us to send on this stream.
     send_window: u64 = std.math.maxInt(u64),
 
+    // Track the limit at which we last sent STREAM_DATA_BLOCKED (avoid duplicates)
+    blocked_at: ?u64 = null,
+
     /// Whether FIN has been queued.
     fin_queued: bool = false,
 
@@ -221,7 +224,20 @@ pub const SendStream = struct {
     pub fn updateSendWindow(self: *SendStream, new_max: u64) void {
         if (new_max > self.send_window) {
             self.send_window = new_max;
+            self.blocked_at = null;
         }
+    }
+
+    // Check if we should send STREAM_DATA_BLOCKED. Returns the limit if yes.
+    // Only triggers once per limit to avoid duplicates.
+    pub fn shouldSendBlocked(self: *SendStream) ?u64 {
+        if (self.send_offset >= self.send_window and self.hasData()) {
+            if (self.blocked_at == null or self.blocked_at.? != self.send_window) {
+                self.blocked_at = self.send_window;
+                return self.send_window;
+            }
+        }
+        return null;
     }
 
     /// Check if there's data available to send.
@@ -316,6 +332,14 @@ pub const StreamsMap = struct {
     /// Number of open streams.
     open_bidi_streams: u64 = 0,
     open_uni_streams: u64 = 0,
+
+    /// Number of consumed (fully closed) incoming streams, for MAX_STREAMS sliding window.
+    consumed_bidi_streams: u64 = 0,
+    consumed_uni_streams: u64 = 0,
+
+    /// Last MAX_STREAMS values sent, to avoid redundant frames.
+    last_sent_max_bidi: u64 = 0,
+    last_sent_max_uni: u64 = 0,
 
     pub fn init(allocator: Allocator, is_server: bool) StreamsMap {
         // Stream IDs: client bidi = 0, 4, 8, ...; server bidi = 1, 5, 9, ...
@@ -441,6 +465,62 @@ pub const StreamsMap = struct {
     pub fn getStream(self: *StreamsMap, stream_id: u64) ?*Stream {
         return self.streams.get(stream_id);
     }
+
+    /// Mark a stream as fully closed and update consumed counters.
+    /// Only counts peer-initiated streams (those count against our MAX_STREAMS limit).
+    pub fn closeStream(self: *StreamsMap, stream_id: u64) void {
+        const peer_initiated = !isLocal(stream_id, self.is_server);
+        if (isBidi(stream_id)) {
+            if (self.open_bidi_streams > 0) self.open_bidi_streams -= 1;
+            if (peer_initiated) self.consumed_bidi_streams += 1;
+        } else {
+            if (self.open_uni_streams > 0) self.open_uni_streams -= 1;
+            if (peer_initiated) self.consumed_uni_streams += 1;
+        }
+    }
+
+    /// Check if MAX_STREAMS updates should be sent (sliding window pattern).
+    /// Returns new limits when consumed streams reach half the current max.
+    pub const MaxStreamsUpdate = struct {
+        bidi: ?u64 = null,
+        uni: ?u64 = null,
+    };
+
+    pub fn getMaxStreamsUpdates(self: *StreamsMap) MaxStreamsUpdate {
+        var result = MaxStreamsUpdate{};
+
+        // Bidi: send update when consumed >= half of current max
+        if (self.max_incoming_bidi_streams > 0) {
+            const threshold = self.max_incoming_bidi_streams / 2;
+            if (self.consumed_bidi_streams >= threshold) {
+                const new_max = self.consumed_bidi_streams + self.max_incoming_bidi_streams;
+                if (new_max > self.last_sent_max_bidi) {
+                    result.bidi = new_max;
+                    self.last_sent_max_bidi = new_max;
+                    // Update our internal limit to allow the new streams
+                    self.max_incoming_bidi_streams = new_max;
+                    // Reset consumed so window slides
+                    self.consumed_bidi_streams = 0;
+                }
+            }
+        }
+
+        // Uni: same sliding window
+        if (self.max_incoming_uni_streams > 0) {
+            const threshold = self.max_incoming_uni_streams / 2;
+            if (self.consumed_uni_streams >= threshold) {
+                const new_max = self.consumed_uni_streams + self.max_incoming_uni_streams;
+                if (new_max > self.last_sent_max_uni) {
+                    result.uni = new_max;
+                    self.last_sent_max_uni = new_max;
+                    self.max_incoming_uni_streams = new_max;
+                    self.consumed_uni_streams = 0;
+                }
+            }
+        }
+
+        return result;
+    }
 };
 
 // Tests
@@ -565,4 +645,180 @@ test "streamType" {
     try testing.expectEqual(StreamType.server_uni, streamType(3));
     try testing.expectEqual(StreamType.client_bidi, streamType(4));
     try testing.expectEqual(StreamType.server_bidi, streamType(5));
+}
+
+test "StreamsMap: closeStream decrements open count for peer-initiated bidi" {
+    // Server perspective: client-initiated bidi stream (id=0) is peer-initiated
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    sm.setMaxIncomingStreams(10, 10);
+
+    // Simulate peer opening a bidi stream
+    _ = try sm.getOrCreateStream(0); // client bidi id=0
+    try testing.expectEqual(@as(u64, 1), sm.open_bidi_streams);
+    try testing.expectEqual(@as(u64, 0), sm.consumed_bidi_streams);
+
+    // Close the stream
+    sm.closeStream(0);
+    try testing.expectEqual(@as(u64, 0), sm.open_bidi_streams);
+    try testing.expectEqual(@as(u64, 1), sm.consumed_bidi_streams);
+}
+
+test "StreamsMap: closeStream does not count locally-initiated streams as consumed" {
+    // Client perspective: client-initiated bidi stream is local
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+
+    sm.setMaxStreams(10, 10);
+    sm.setMaxIncomingStreams(10, 10);
+
+    _ = try sm.openBidiStream(); // id=0 (local)
+    try testing.expectEqual(@as(u64, 1), sm.open_bidi_streams);
+
+    sm.closeStream(0);
+    try testing.expectEqual(@as(u64, 0), sm.open_bidi_streams);
+    // Not consumed because it's locally-initiated
+    try testing.expectEqual(@as(u64, 0), sm.consumed_bidi_streams);
+}
+
+test "StreamsMap: closeStream for uni streams" {
+    // Server perspective: client uni stream (id=2) is peer-initiated
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    sm.setMaxIncomingStreams(10, 10);
+
+    _ = try sm.getOrCreateRecvStream(2); // client uni id=2
+    try testing.expectEqual(@as(u64, 1), sm.open_uni_streams);
+
+    sm.closeStream(2);
+    try testing.expectEqual(@as(u64, 0), sm.open_uni_streams);
+    try testing.expectEqual(@as(u64, 1), sm.consumed_uni_streams);
+}
+
+test "StreamsMap: getMaxStreamsUpdates returns null below threshold" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    sm.setMaxIncomingStreams(10, 10);
+
+    // Consume 4 streams (< half of 10), no update should be sent
+    sm.consumed_bidi_streams = 4;
+    sm.consumed_uni_streams = 4;
+
+    const update = sm.getMaxStreamsUpdates();
+    try testing.expect(update.bidi == null);
+    try testing.expect(update.uni == null);
+}
+
+test "StreamsMap: getMaxStreamsUpdates triggers at threshold" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    sm.setMaxIncomingStreams(10, 10);
+
+    // Consume 5 streams (= half of 10), update should trigger
+    sm.consumed_bidi_streams = 5;
+
+    const update = sm.getMaxStreamsUpdates();
+    // New max = consumed(5) + max_incoming(10) = 15
+    try testing.expectEqual(@as(u64, 15), update.bidi.?);
+    try testing.expect(update.uni == null);
+
+    // consumed should be reset after update
+    try testing.expectEqual(@as(u64, 0), sm.consumed_bidi_streams);
+    // max_incoming should be updated
+    try testing.expectEqual(@as(u64, 15), sm.max_incoming_bidi_streams);
+    // last_sent tracked
+    try testing.expectEqual(@as(u64, 15), sm.last_sent_max_bidi);
+}
+
+test "StreamsMap: getMaxStreamsUpdates sliding window advances" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    sm.setMaxIncomingStreams(4, 4);
+
+    // First round: consume 2 (>= 4/2=2)
+    sm.consumed_bidi_streams = 2;
+    const upd1 = sm.getMaxStreamsUpdates();
+    try testing.expectEqual(@as(u64, 6), upd1.bidi.?); // 2 + 4 = 6
+
+    // After first update: max_incoming=6, consumed=0
+    // Second round: consume 3 (>= 6/2=3)
+    sm.consumed_bidi_streams = 3;
+    const upd2 = sm.getMaxStreamsUpdates();
+    try testing.expectEqual(@as(u64, 9), upd2.bidi.?); // 3 + 6 = 9
+
+    // No redundant update if consumed hasn't reached threshold
+    sm.consumed_bidi_streams = 1;
+    const upd3 = sm.getMaxStreamsUpdates();
+    try testing.expect(upd3.bidi == null);
+}
+
+test "StreamsMap: getMaxStreamsUpdates no duplicate sends" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    sm.setMaxIncomingStreams(4, 0);
+
+    sm.consumed_bidi_streams = 2;
+    const upd_a = sm.getMaxStreamsUpdates();
+    try testing.expect(upd_a.bidi != null);
+
+    // Calling again without consuming more should not re-send
+    const upd_b = sm.getMaxStreamsUpdates();
+    try testing.expect(upd_b.bidi == null);
+}
+
+test "StreamsMap: getMaxStreamsUpdates uni direction" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    sm.setMaxIncomingStreams(0, 6);
+
+    sm.consumed_uni_streams = 3; // >= 6/2=3
+    const update = sm.getMaxStreamsUpdates();
+    try testing.expect(update.bidi == null);
+    try testing.expectEqual(@as(u64, 9), update.uni.?); // 3 + 6 = 9
+}
+
+test "StreamsMap: getMaxStreamsUpdates both directions simultaneously" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    sm.setMaxIncomingStreams(4, 6);
+
+    sm.consumed_bidi_streams = 2;
+    sm.consumed_uni_streams = 4;
+
+    const update = sm.getMaxStreamsUpdates();
+    try testing.expectEqual(@as(u64, 6), update.bidi.?);
+    try testing.expectEqual(@as(u64, 10), update.uni.?);
+}
+
+test "StreamsMap: closeStream and getMaxStreamsUpdates integration" {
+    // Server: client opens 4 bidi streams, we close them, MAX_STREAMS should trigger
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    sm.setMaxIncomingStreams(4, 0);
+
+    // Client opens 4 bidi streams (ids 0, 4, 8, 12)
+    _ = try sm.getOrCreateStream(0);
+    _ = try sm.getOrCreateStream(4);
+
+    try testing.expectEqual(@as(u64, 2), sm.open_bidi_streams);
+
+    // Close both — peer-initiated so consumed increments
+    sm.closeStream(0);
+    sm.closeStream(4);
+
+    try testing.expectEqual(@as(u64, 0), sm.open_bidi_streams);
+    try testing.expectEqual(@as(u64, 2), sm.consumed_bidi_streams);
+
+    // 2 >= 4/2=2, so MAX_STREAMS update should fire
+    const update = sm.getMaxStreamsUpdates();
+    try testing.expectEqual(@as(u64, 6), update.bidi.?); // 2 + 4 = 6
 }

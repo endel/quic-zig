@@ -20,6 +20,7 @@ const transport_params = @import("transport_params.zig");
 const packet_packer = @import("packet_packer.zig");
 const quic_crypto = @import("crypto.zig");
 const mtu_mod = @import("mtu.zig");
+const stateless_reset = @import("stateless_reset.zig");
 
 pub const State = enum(u8) {
     first_flight = 0,
@@ -191,6 +192,90 @@ pub const ConnectionIdPool = struct {
     }
 };
 
+/// Tracks a locally-issued connection ID (RFC 9000 §5.1).
+pub const LocalCidEntry = struct {
+    cid_buf: [20]u8 = .{0} ** 20,
+    cid_len: u8 = 0,
+    seq_num: u64 = 0,
+    stateless_reset_token: [16]u8 = .{0} ** 16,
+    occupied: bool = false,
+    retired: bool = false,
+
+    pub fn getCid(self: *const LocalCidEntry) []const u8 {
+        return self.cid_buf[0..self.cid_len];
+    }
+};
+
+/// Pool of locally-issued connection IDs (RFC 9000 §5.1).
+/// Seq 0 = initial SCID. New CIDs issued via issueNewCid().
+pub const LocalCidPool = struct {
+    const MAX_POOL_SIZE: usize = 8;
+
+    entries: [MAX_POOL_SIZE]LocalCidEntry = .{LocalCidEntry{}} ** MAX_POOL_SIZE,
+    next_seq_num: u64 = 1,
+    retire_prior_to: u64 = 0,
+
+    /// Register the initial SCID as sequence number 0.
+    /// If static_key is provided, compute a deterministic reset token; otherwise random.
+    pub fn registerInitialCid(self: *LocalCidPool, cid: []const u8, static_key: ?[16]u8) void {
+        self.entries[0] = LocalCidEntry{
+            .occupied = true,
+            .retired = false,
+            .seq_num = 0,
+            .cid_len = @intCast(cid.len),
+        };
+        @memcpy(self.entries[0].cid_buf[0..cid.len], cid);
+        if (static_key) |key| {
+            self.entries[0].stateless_reset_token = stateless_reset.computeToken(key, cid);
+        } else {
+            crypto.random.bytes(&self.entries[0].stateless_reset_token);
+        }
+    }
+
+    /// Issue a new CID with the given length. Returns the entry or null if pool full.
+    /// If static_key is provided, compute a deterministic reset token; otherwise random.
+    pub fn issueNewCid(self: *LocalCidPool, cid_len: u8, static_key: ?[16]u8) ?*const LocalCidEntry {
+        // Find a free slot
+        for (&self.entries) |*entry| {
+            if (!entry.occupied) {
+                entry.occupied = true;
+                entry.retired = false;
+                entry.seq_num = self.next_seq_num;
+                entry.cid_len = cid_len;
+                generateConnectionId(entry.cid_buf[0..cid_len]);
+                if (static_key) |key| {
+                    entry.stateless_reset_token = stateless_reset.computeToken(key, entry.cid_buf[0..cid_len]);
+                } else {
+                    crypto.random.bytes(&entry.stateless_reset_token);
+                }
+                self.next_seq_num += 1;
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    /// Mark an entry as retired by sequence number.
+    pub fn retireBySeq(self: *LocalCidPool, seq: u64) void {
+        for (&self.entries) |*entry| {
+            if (entry.occupied and entry.seq_num == seq) {
+                entry.occupied = false;
+                entry.retired = true;
+                return;
+            }
+        }
+    }
+
+    /// Count active (occupied, non-retired) entries.
+    pub fn activeCount(self: *const LocalCidPool) usize {
+        var n: usize = 0;
+        for (&self.entries) |*entry| {
+            if (entry.occupied and !entry.retired) n += 1;
+        }
+        return n;
+    }
+};
+
 /// Fixed-capacity queue for QUIC DATAGRAM frames (RFC 9221).
 /// Stores up to 16 datagrams, each up to MAX_DATAGRAM_SIZE bytes.
 pub const DatagramQueue = struct {
@@ -233,9 +318,17 @@ pub const ConnectionError = struct {
     reason: []const u8,
 };
 
+// ECN codepoint values from IP TOS field (2 low bits)
+pub const ECN_NOT_ECT: u2 = 0b00;
+pub const ECN_ECT1: u2 = 0b01;
+pub const ECN_ECT0: u2 = 0b10;
+pub const ECN_CE: u2 = 0b11;
+
 pub const RecvInfo = struct {
     to: posix.sockaddr,
     from: posix.sockaddr,
+    // ECN codepoint from IP header (0=Not-ECT, 1=ECT(1), 2=ECT(0), 3=CE)
+    ecn: u2 = ECN_NOT_ECT,
 };
 
 /// Configuration for a QUIC connection.
@@ -248,6 +341,8 @@ pub const ConnectionConfig = struct {
     initial_max_streams_bidi: u64 = 100,
     initial_max_streams_uni: u64 = 100,
     max_datagram_frame_size: ?u64 = null,
+    // Key for NEW_TOKEN generation (server) — should match the Retry token key
+    token_key: ?[16]u8 = null,
 };
 
 /// A QUIC connection.
@@ -273,6 +368,7 @@ pub const Connection = struct {
     // Network paths (active + candidate for migration)
     paths: [2]NetworkPath = .{ undefined, undefined },
     active_path_idx: u8 = 0,
+    path_initialized: bool = false,
 
     // Packet number spaces and crypto
     pkt_num_spaces: [3]packet.PacketNumSpace = .{
@@ -300,6 +396,12 @@ pub const Connection = struct {
     // Pool of peer-issued connection IDs for migration
     peer_cid_pool: ConnectionIdPool = .{},
 
+    // Pool of locally-issued connection IDs (RFC 9000 §5.1)
+    local_cid_pool: LocalCidPool = .{},
+
+    // Static key for deterministic stateless reset tokens (RFC 9000 §10.3)
+    static_reset_key: [16]u8 = .{0} ** 16,
+
     // Key update manager for 1-RTT key rotation (RFC 9001 Section 6)
     key_update: ?quic_crypto.KeyUpdateManager = null,
 
@@ -318,12 +420,27 @@ pub const Connection = struct {
     // Session ticket received from server (readable by application)
     session_ticket: ?tls13.SessionTicket = null,
 
+    // NEW_TOKEN received from server (client stores for reuse in future connections)
+    new_token_buf: [packet.TOKEN_MAX_LEN]u8 = .{0} ** packet.TOKEN_MAX_LEN,
+    new_token_len: u8 = 0,
+
+    // Token key for NEW_TOKEN generation (server, shared with retry_token_key)
+    token_key: [16]u8 = .{0} ** 16,
+
+    // ECN validation: peer-reported ECN counts from ACK_ECN frames (RFC 9000 §13.4.2.1)
+    // Track per-space to detect increases; only Application space matters in practice
+    peer_ecn_ect0: [3]u64 = .{ 0, 0, 0 },
+    peer_ecn_ect1: [3]u64 = .{ 0, 0, 0 },
+    peer_ecn_ce: [3]u64 = .{ 0, 0, 0 },
+
     // Connection state
     got_peer_conn_id: bool = false,
     peer_max_cid_seq: u64 = 0,
     active_cid_seq: u64 = 0,
     local_err: ?ConnectionError = null,
     handshake_confirmed: bool = false,
+    spin_bit: bool = false, // Spin bit for passive RTT measurement (RFC 9000 §17.4)
+    largest_pn_received: ?u64 = null, // Tracks largest 1-RTT PN for spin bit toggling
 
     // Connection close state (RFC 9000 Section 10)
     closing_start_time: i64 = 0,
@@ -366,6 +483,7 @@ pub const Connection = struct {
             .version = header.version,
             .is_server = is_server,
             .paths = .{ initial_path, undefined },
+            .path_initialized = true,
             .creation_time = now,
             .last_packet_received_time = now,
 
@@ -395,14 +513,24 @@ pub const Connection = struct {
             @memcpy(conn.scid[0..header.scid.len], header.scid);
         }
 
+        // Generate static reset key for deterministic tokens
+        crypto.random.bytes(&conn.static_reset_key);
+
+        // Register initial SCID in local CID pool with deterministic token
+        conn.local_cid_pool.registerInitialCid(conn.scid[0..conn.scid_len], conn.static_reset_key);
+
         // For Retry: use the original DCID (before Retry) for the transport param
         const tp_odcid = odcid orelse (if (is_server) header.dcid else null);
+
+        // Server SHOULD include stateless_reset_token for the initial SCID (RFC 9000 §18.2)
+        const reset_token: ?[16]u8 = if (is_server) conn.local_cid_pool.entries[0].stateless_reset_token else null;
 
         // Build transport params AFTER CIDs are stored in conn (to avoid dangling slices)
         const local_params: transport_params.TransportParams = .{
             .original_destination_connection_id = tp_odcid,
             .initial_source_connection_id = conn.scid[0..conn.scid_len],
             .retry_source_connection_id = retry_scid,
+            .stateless_reset_token = reset_token,
             .max_idle_timeout = config.max_idle_timeout,
             .initial_max_data = config.initial_max_data,
             .initial_max_stream_data_bidi_local = config.initial_max_stream_data_bidi_local,
@@ -437,6 +565,11 @@ pub const Connection = struct {
             conn.dcid[0..conn.dcid_len],
             header.version,
         );
+
+        // Set token key for NEW_TOKEN generation (server)
+        if (config.token_key) |tk| {
+            conn.token_key = tk;
+        }
 
         // Configure stream limits
         conn.streams.setMaxIncomingStreams(
@@ -576,13 +709,18 @@ pub const Connection = struct {
             while (remaining.len > 0) {
                 if (remaining[0] == 0x00) { remaining = remaining[1..]; continue; }
                 const frame = Frame.parse(remaining) catch break;
+                // Enforce frame-in-correct-space (RFC 9000 §12.5)
+                if (!frame.isAllowedIn(.zero_rtt)) {
+                    std.log.warn("frame {s} not allowed in 0-RTT packet, closing", .{@tagName(frame)});
+                    return error.ProtocolViolation;
+                }
                 if (frame.isAckEliciting()) ack_eliciting = true;
                 try self.processFrame(frame, .application, now);
                 const consumed = self.frameSize(frame, remaining);
                 if (consumed == 0) break;
                 remaining = remaining[consumed..];
             }
-            try self.pkt_handler.onPacketReceived(.application, header.packet_number, ack_eliciting, now);
+            try self.pkt_handler.onPacketReceived(.application, header.packet_number, ack_eliciting, now, info.ecn);
             if (header.packet_number + 1 > self.pkt_num_spaces[2].next_packet_number) {
                 self.pkt_num_spaces[2].next_packet_number = header.packet_number + 1;
             }
@@ -639,6 +777,22 @@ pub const Connection = struct {
             }
         }
 
+        // Spin bit handling (RFC 9000 §17.4) for 1-RTT packets only
+        if (epoch == .application) {
+            const is_new_largest = self.largest_pn_received == null or header.packet_number > self.largest_pn_received.?;
+            if (is_new_largest) {
+                self.largest_pn_received = header.packet_number;
+                if (self.is_server) {
+                    // Server: reflect the spin bit from the client
+                    self.spin_bit = header.spin_bit;
+                } else {
+                    // Client: invert the spin bit on each new largest PN
+                    self.spin_bit = !header.spin_bit;
+                }
+                self.packer.spin_bit = self.spin_bit;
+            }
+        }
+
         // Update network path stats
         self.paths[self.active_path_idx].bytes_received += @intCast(fbs.buffer.len);
 
@@ -676,6 +830,12 @@ pub const Connection = struct {
 
             std.log.info("recv: parsed frame type={s}", .{@tagName(frame)});
 
+            // Enforce frame-in-correct-space (RFC 9000 §12.5)
+            if (!frame.isAllowedIn(header.packet_type)) {
+                std.log.warn("frame {s} not allowed in {s} packet, closing", .{ @tagName(frame), @tagName(header.packet_type) });
+                return error.ProtocolViolation;
+            }
+
             if (frame.isAckEliciting()) {
                 ack_eliciting = true;
             }
@@ -693,12 +853,18 @@ pub const Connection = struct {
         }
 
         // Record receipt for ACK generation
-        try self.pkt_handler.onPacketReceived(enc_level, header.packet_number, ack_eliciting, now);
+        try self.pkt_handler.onPacketReceived(enc_level, header.packet_number, ack_eliciting, now, info.ecn);
 
         // Update expected packet number for correct decoding of subsequent packets
         // (critical for coalesced packets where multiple packets share a datagram)
         if (header.packet_number + 1 > self.pkt_num_spaces[space_idx].next_packet_number) {
             self.pkt_num_spaces[space_idx].next_packet_number = header.packet_number + 1;
+        }
+
+        // Initialize path on first received packet (client-side: connect() doesn't know server addr)
+        if (!self.path_initialized) {
+            self.paths[self.active_path_idx] = NetworkPath.init(info.to, info.from, true);
+            self.path_initialized = true;
         }
 
         // Detect connection migration (RFC 9000 Section 9)
@@ -776,7 +942,10 @@ pub const Connection = struct {
                 }
 
                 if (has_non_probe_loss) {
-                    if (self.pkt_handler.sent[@intFromEnum(enc_level)].largest_sent) |ls| {
+                    if (result.persistent_congestion) {
+                        self.cc.onPersistentCongestion();
+                        std.log.info("persistent congestion detected, window reduced to minimum", .{});
+                    } else if (self.pkt_handler.sent[@intFromEnum(enc_level)].largest_sent) |ls| {
                         self.cc.onCongestionEvent(ls);
                     }
                 }
@@ -786,13 +955,82 @@ pub const Connection = struct {
             },
 
             .ack_ecn => |ack| {
-                // Process same as ACK but with ECN
-                _ = ack;
+                const enc_level = epochToEncLevel(epoch);
+                const space_idx = @intFromEnum(enc_level);
+                const peer_tp = self.peer_params orelse transport_params.TransportParams{};
+                const result = try self.pkt_handler.onAckReceived(
+                    enc_level,
+                    ack.largest_ack,
+                    ack.ack_delay,
+                    @intCast(peer_tp.ack_delay_exponent),
+                    ack.ack_ranges[0..ack.ack_range_count],
+                    ack.first_ack_range,
+                    now,
+                );
+
+                // Notify congestion controller, track key update ACKs, and PMTUD
+                var has_non_probe_loss = false;
+                for (result.acked.constSlice()) |pkt| {
+                    if (self.mtu_discoverer.onProbeAcked(pkt.pn, now)) {
+                        const new_mtu = self.mtu_discoverer.current_mtu;
+                        self.packer.max_packet_size = new_mtu;
+                        self.cc.setMaxDatagramSize(new_mtu);
+                        self.pacer.max_datagram_size = new_mtu;
+                        std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
+                    }
+                    self.cc.onPacketAcked(pkt.size, pkt.pn);
+
+                    if (enc_level == .application) {
+                        if (self.key_update) |*ku| {
+                            if (ku.first_sent_with_current) |first_pn| {
+                                if (pkt.pn >= first_pn) {
+                                    ku.first_acked_with_current = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (result.lost.constSlice()) |pkt| {
+                    if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {
+                        std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
+                    } else {
+                        has_non_probe_loss = true;
+                    }
+                }
+
+                if (has_non_probe_loss) {
+                    if (result.persistent_congestion) {
+                        self.cc.onPersistentCongestion();
+                        std.log.info("persistent congestion detected, window reduced to minimum", .{});
+                    } else if (self.pkt_handler.sent[@intFromEnum(enc_level)].largest_sent) |ls| {
+                        self.cc.onCongestionEvent(ls);
+                    }
+                }
+
+                // ECN validation (RFC 9000 §13.4.2.1):
+                // If CE count increased, treat as congestion event
+                if (ack.ecn_ce > self.peer_ecn_ce[space_idx]) {
+                    std.log.info("ECN: CE count increased {d} -> {d}, congestion signal", .{ self.peer_ecn_ce[space_idx], ack.ecn_ce });
+                    if (self.pkt_handler.sent[space_idx].largest_sent) |ls| {
+                        self.cc.onCongestionEvent(ls);
+                    }
+                }
+                self.peer_ecn_ect0[space_idx] = ack.ecn_ect0;
+                self.peer_ecn_ect1[space_idx] = ack.ecn_ect1;
+                self.peer_ecn_ce[space_idx] = ack.ecn_ce;
+
+                // Update pacer
+                self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
             },
 
             .reset_stream => |rs| {
                 if (self.streams.getStream(rs.stream_id)) |s| {
                     s.recv.handleResetStream(rs.error_code, rs.final_size);
+                    // If send side is also done, stream is fully closed
+                    if (s.send.fin_sent or s.send.reset_err != null) {
+                        self.streams.closeStream(rs.stream_id);
+                    }
                 }
             },
 
@@ -809,7 +1047,14 @@ pub const Connection = struct {
                 // Handshake advancement happens after all frames are processed
             },
 
-            .new_token => {},
+            .new_token => |token| {
+                // Client stores the token for reuse in future connections (RFC 9000 §8.1.3)
+                if (!self.is_server and token.len <= self.new_token_buf.len) {
+                    @memcpy(self.new_token_buf[0..token.len], token);
+                    self.new_token_len = @intCast(token.len);
+                    std.log.info("stored NEW_TOKEN from server ({d} bytes)", .{token.len});
+                }
+            },
 
             .stream => |s| {
                 if (stream_mod.isBidi(s.stream_id)) {
@@ -819,6 +1064,11 @@ pub const Connection = struct {
                         return;
                     };
                     try strm.recv.handleStreamFrame(s.offset, s.data, s.fin);
+
+                    // Check if stream is fully closed (both directions done)
+                    if (s.fin and (strm.send.fin_sent or strm.send.reset_err != null)) {
+                        self.streams.closeStream(s.stream_id);
+                    }
                 } else {
                     // Unidirectional stream — route to recv_streams
                     const recv_strm = self.streams.getOrCreateRecvStream(s.stream_id) catch |err| {
@@ -826,6 +1076,11 @@ pub const Connection = struct {
                         return;
                     };
                     try recv_strm.handleStreamFrame(s.offset, s.data, s.fin);
+
+                    // For incoming uni streams, FIN means the stream is done
+                    if (s.fin) {
+                        self.streams.closeStream(s.stream_id);
+                    }
                 }
 
                 // Update flow control
@@ -853,8 +1108,18 @@ pub const Connection = struct {
 
             .data_blocked => {},
             .stream_data_blocked => {},
-            .streams_blocked_bidi => {},
-            .streams_blocked_uni => {},
+            .streams_blocked_bidi => {
+                // Peer is blocked — respond with our current MAX_STREAMS limit
+                if (self.streams.max_incoming_bidi_streams > 0) {
+                    self.pending_frames.push(.{ .max_streams_bidi = self.streams.max_incoming_bidi_streams });
+                }
+            },
+            .streams_blocked_uni => {
+                // Peer is blocked — respond with our current MAX_STREAMS limit
+                if (self.streams.max_incoming_uni_streams > 0) {
+                    self.pending_frames.push(.{ .max_streams_uni = self.streams.max_incoming_uni_streams });
+                }
+            },
 
             .new_connection_id => |ncid| {
                 if (ncid.seq_num > self.peer_max_cid_seq) {
@@ -884,6 +1149,22 @@ pub const Connection = struct {
 
             .retire_connection_id => |rcid| {
                 std.log.info("peer retired connection ID seq={d}", .{rcid.seq_num});
+                self.local_cid_pool.retireBySeq(rcid.seq_num);
+
+                // Issue a replacement CID to stay at the peer's limit
+                const peer_limit = if (self.peer_params) |pp| pp.active_connection_id_limit else 2;
+                if (self.local_cid_pool.activeCount() < peer_limit) {
+                    if (self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key)) |entry| {
+                        self.pending_frames.push(.{ .new_connection_id = .{
+                            .seq_num = entry.seq_num,
+                            .retire_prior_to = self.local_cid_pool.retire_prior_to,
+                            .cid_buf = entry.cid_buf,
+                            .cid_len = entry.cid_len,
+                            .stateless_reset_token = entry.stateless_reset_token,
+                        } });
+                        std.log.info("issued replacement NEW_CONNECTION_ID seq={d}", .{entry.seq_num});
+                    }
+                }
             },
 
             .path_challenge => |data| {
@@ -1281,11 +1562,52 @@ pub const Connection = struct {
                         }
                         // else: keep local timeout (already set)
 
+                        // Store peer's stateless reset token for initial CID (RFC 9000 §10.3.1)
+                        // Server sends this in transport params; client stores it for detection
+                        if (peer_tp.stateless_reset_token) |token| {
+                            self.peer_cid_pool.addPeerCid(0, self.dcid[0..self.dcid_len], token);
+                            std.log.info("stored peer stateless reset token from transport params", .{});
+                        }
+
                         std.log.info("applied peer transport params: max_bidi={d}, max_uni={d}, max_data={d}", .{
                             peer_tp.initial_max_streams_bidi,
                             peer_tp.initial_max_streams_uni,
                             peer_tp.initial_max_data,
                         });
+                    }
+
+                    // Issue NEW_CONNECTION_ID frames up to peer's active_connection_id_limit (RFC 9000 §5.1)
+                    {
+                        const peer_limit = if (self.peer_params) |pp| pp.active_connection_id_limit else 2;
+                        while (self.local_cid_pool.activeCount() < peer_limit) {
+                            if (self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key)) |entry| {
+                                self.pending_frames.push(.{ .new_connection_id = .{
+                                    .seq_num = entry.seq_num,
+                                    .retire_prior_to = self.local_cid_pool.retire_prior_to,
+                                    .cid_buf = entry.cid_buf,
+                                    .cid_len = entry.cid_len,
+                                    .stateless_reset_token = entry.stateless_reset_token,
+                                } });
+                                std.log.info("issued NEW_CONNECTION_ID seq={d}, cid_len={d}", .{ entry.seq_num, entry.cid_len });
+                            } else break; // pool full
+                        }
+                    }
+
+                    // Server: issue NEW_TOKEN for client address validation (RFC 9000 §8.1.3)
+                    if (self.is_server) {
+                        var nt_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
+                        const nt_len = packet.generateNewToken(
+                            &nt_buf,
+                            self.paths[self.active_path_idx].peer_addr,
+                            self.token_key,
+                        ) catch 0;
+                        if (nt_len > 0) {
+                            var pcf: frame_mod.PendingControlFrame = .{ .new_token = .{} };
+                            @memcpy(pcf.new_token.token_buf[0..nt_len], nt_buf[0..nt_len]);
+                            pcf.new_token.token_len = @intCast(nt_len);
+                            self.pending_frames.push(pcf);
+                            std.log.info("issued NEW_TOKEN ({d} bytes)", .{nt_len});
+                        }
                     }
 
                     // Start PMTUD now that the handshake is complete
@@ -1316,10 +1638,36 @@ pub const Connection = struct {
         std.log.info("installAppKeys: keys installed for space 2", .{});
     }
 
-    /// Check if connection-level flow control needs a MAX_DATA update.
+    /// Check if connection-level flow control needs a MAX_DATA or MAX_STREAMS update.
     fn queueFlowControlUpdates(self: *Connection) void {
         if (self.conn_flow_ctrl.getWindowUpdate(&self.pkt_handler.rtt_stats)) |new_max| {
             self.pending_frames.push(.{ .max_data = new_max });
+        }
+
+        // Check if MAX_STREAMS updates are needed (sliding window)
+        const ms_update = self.streams.getMaxStreamsUpdates();
+        if (ms_update.bidi) |new_max| {
+            self.pending_frames.push(.{ .max_streams_bidi = new_max });
+        }
+        if (ms_update.uni) |new_max| {
+            self.pending_frames.push(.{ .max_streams_uni = new_max });
+        }
+
+        // DATA_BLOCKED: signal peer when connection-level flow control blocks sending (RFC 9000 §4.1)
+        if (self.conn_flow_ctrl.base.shouldSendBlocked()) |limit| {
+            self.pending_frames.push(.{ .data_blocked = limit });
+        }
+
+        // STREAM_DATA_BLOCKED: signal peer when stream-level flow control blocks sending
+        var stream_it = self.streams.streams.valueIterator();
+        while (stream_it.next()) |s_ptr| {
+            const s: *stream_mod.Stream = s_ptr.*;
+            if (s.send.shouldSendBlocked()) |limit| {
+                self.pending_frames.push(.{ .stream_data_blocked = .{
+                    .stream_id = s.stream_id,
+                    .limit = limit,
+                } });
+            }
         }
     }
 
@@ -1368,6 +1716,7 @@ pub const Connection = struct {
                     app_seal,
                     now,
                     null,
+                    false, // not ack_only — sending CONNECTION_CLOSE
                 );
                 if (bytes_written > 0) {
                     // Save close packet for retransmission
@@ -1450,6 +1799,7 @@ pub const Connection = struct {
             app_seal,
             now,
             dq,
+            false, // ack_only
         );
 
         if (bytes_written > 0) {
@@ -1496,12 +1846,48 @@ pub const Connection = struct {
     }
 
     /// Send ACK-only packets (when congestion limited).
+    /// ACKs are NOT congestion-controlled per RFC 9000 §13.2.
     fn sendAckOnly(self: *Connection, out_buf: []u8, now: i64) !usize {
-        _ = self;
-        _ = out_buf;
-        _ = now;
-        // TODO: pack ACK-only packets
-        return 0;
+        // Piggyback flow control updates (MAX_DATA, MAX_STREAMS)
+        self.queueFlowControlUpdates();
+
+        // Anti-amplification: servers must not send more than 3x bytes received
+        if (self.is_server) {
+            const active_path = &self.paths[self.active_path_idx];
+            if (!active_path.canSend(1200)) {
+                return 0;
+            }
+        }
+
+        // Gather seals at all encryption levels
+        const initial_seal = self.pkt_num_spaces[0].crypto_seal;
+        const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
+        const app_seal: ?quic_crypto.Seal = if (self.key_update) |*ku|
+            ku.current_seal
+        else
+            self.pkt_num_spaces[2].crypto_seal;
+
+        const bytes_written = try self.packer.packCoalesced(
+            out_buf,
+            &self.pkt_handler,
+            &self.crypto_streams,
+            &self.streams,
+            &self.pending_frames,
+            initial_seal,
+            null, // no 0-RTT for ACK-only
+            handshake_seal,
+            app_seal,
+            now,
+            null, // no datagrams
+            true, // ack_only
+        );
+
+        if (bytes_written > 0) {
+            self.paths[self.active_path_idx].bytes_sent += bytes_written;
+            // Don't update pacer — ACKs are not paced
+        }
+
+        return bytes_written;
     }
 
     /// Handle connection migration (RFC 9000 Section 9).
@@ -1573,11 +1959,41 @@ pub const Connection = struct {
             return;
         }
 
-        // Check PTO
+        // Check PTO — prefer retransmitting data over PING (RFC 9002 §6.2.4)
         if (self.pkt_handler.getPtoTimeout()) |pto_time| {
             if (now >= pto_time) {
                 self.pkt_handler.pto_count += 1;
-                self.pending_frames.push(.{ .ping = {} });
+
+                // Check if there's retransmittable data in the PTO space
+                var has_data = false;
+                if (self.pkt_handler.getPtoSpace()) |pto_level| {
+                    switch (pto_level) {
+                        .initial, .handshake => {
+                            // Check crypto stream for retransmittable data
+                            const crypto_idx: u8 = if (pto_level == .initial) 0 else 2;
+                            if (self.crypto_streams.getStream(crypto_idx).hasData()) {
+                                has_data = true;
+                            }
+                        },
+                        .application => {
+                            // Check if any stream has data to send
+                            var stream_it = self.streams.streams.valueIterator();
+                            while (stream_it.next()) |s_ptr| {
+                                if (s_ptr.*.send.hasData()) {
+                                    has_data = true;
+                                    break;
+                                }
+                            }
+                        },
+                    }
+                }
+
+                // Only send PING as last resort when no data available
+                if (!has_data) {
+                    self.pending_frames.push(.{ .ping = {} });
+                }
+                // If has_data is true, the packer will naturally pick up the
+                // stream/crypto data and produce an ack-eliciting probe packet
             }
         }
 
@@ -1661,6 +2077,28 @@ pub const Connection = struct {
         return self.state == .connected;
     }
 
+    // Get the NEW_TOKEN received from the server (for reuse in future connections).
+    // Returns null if no token was received.
+    pub fn getNewToken(self: *const Connection) ?[]const u8 {
+        if (self.new_token_len == 0) return null;
+        return self.new_token_buf[0..self.new_token_len];
+    }
+
+    // Check if a received packet is a stateless reset (RFC 9000 §10.3).
+    // Collects all known peer reset tokens and checks the packet's last 16 bytes.
+    pub fn matchesStatelessReset(self: *const Connection, data: []const u8) bool {
+        var tokens: [ConnectionIdPool.MAX_POOL_SIZE][stateless_reset.TOKEN_LEN]u8 = undefined;
+        var count: usize = 0;
+        for (&self.peer_cid_pool.entries) |*entry| {
+            if (entry.occupied) {
+                tokens[count] = entry.stateless_reset_token;
+                count += 1;
+            }
+        }
+        if (count == 0) return false;
+        return stateless_reset.isStatelessReset(data, tokens[0..count]);
+    }
+
     fn setInitialDCID(self: *Connection, cid: []const u8) void {
         self.dcid_len = @intCast(cid.len);
         @memcpy(self.dcid[0..cid.len], cid);
@@ -1678,16 +2116,38 @@ pub const Connection = struct {
 };
 
 /// Compare two sockaddrs for equality (IPv4: port + address).
+/// Uses byte-level reads to avoid alignment issues with posix.sockaddr (align=1).
 pub fn sockaddrEql(a: *const posix.sockaddr, b: *const posix.sockaddr) bool {
-    const a_in: *const posix.sockaddr.in = @ptrCast(@alignCast(a));
-    const b_in: *const posix.sockaddr.in = @ptrCast(@alignCast(b));
+    if (a.family != b.family) return false;
+    if (a.family == posix.AF.INET6) {
+        const a_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(a);
+        const b_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(b);
+        const a6 = std.mem.bytesToValue(posix.sockaddr.in6, a_bytes);
+        const b6 = std.mem.bytesToValue(posix.sockaddr.in6, b_bytes);
+        return a6.port == b6.port and std.mem.eql(u8, &a6.addr, &b6.addr) and a6.scope_id == b6.scope_id;
+    }
+    const a_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(a);
+    const b_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(b);
+    const a_in = std.mem.bytesToValue(posix.sockaddr.in, a_bytes);
+    const b_in = std.mem.bytesToValue(posix.sockaddr.in, b_bytes);
     return a_in.port == b_in.port and a_in.addr == b_in.addr;
 }
 
 /// Compare two sockaddrs for same IP address (ignoring port).
+/// Uses byte-level reads to avoid alignment issues with posix.sockaddr (align=1).
 pub fn sockaddrSameIp(a: *const posix.sockaddr, b: *const posix.sockaddr) bool {
-    const a_in: *const posix.sockaddr.in = @ptrCast(@alignCast(a));
-    const b_in: *const posix.sockaddr.in = @ptrCast(@alignCast(b));
+    if (a.family != b.family) return false;
+    if (a.family == posix.AF.INET6) {
+        const a_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(a);
+        const b_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(b);
+        const a6 = std.mem.bytesToValue(posix.sockaddr.in6, a_bytes);
+        const b6 = std.mem.bytesToValue(posix.sockaddr.in6, b_bytes);
+        return std.mem.eql(u8, &a6.addr, &b6.addr);
+    }
+    const a_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(a);
+    const b_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(b);
+    const a_in = std.mem.bytesToValue(posix.sockaddr.in, a_bytes);
+    const b_in = std.mem.bytesToValue(posix.sockaddr.in, b_bytes);
     return a_in.addr == b_in.addr;
 }
 
@@ -1707,6 +2167,7 @@ pub fn connect(
     server_name: []const u8,
     config: ConnectionConfig,
     tls_config: ?tls13.TlsConfig,
+    initial_token: ?[]const u8,
 ) !Connection {
     const now: i64 = @intCast(std.time.nanoTimestamp());
     var scid: [8]u8 = undefined;
@@ -1755,6 +2216,10 @@ pub fn connect(
     conn.odcid_len = 8;
     @memcpy(conn.odcid_buf[0..8], &dcid);
 
+    // Generate static reset key and register initial SCID with deterministic token
+    crypto.random.bytes(&conn.static_reset_key);
+    conn.local_cid_pool.registerInitialCid(conn.scid[0..conn.scid_len], conn.static_reset_key);
+
     std.log.info("connection.connect: dcid={any}, scid={any}", .{ dcid, scid });
 
     // Derive Initial encryption keys from the DCID we chose
@@ -1772,6 +2237,15 @@ pub fn connect(
         conn.dcid[0..conn.dcid_len],
         conn.version,
     );
+
+    // If a token from NEW_TOKEN was provided, include it in the Initial packet
+    if (initial_token) |token| {
+        const len = @min(token.len, conn.retry_token_buf.len);
+        @memcpy(conn.retry_token_buf[0..len], token[0..len]);
+        conn.retry_token_len = @intCast(len);
+        conn.packer.initial_token = conn.retry_token_buf[0..len];
+        std.log.info("using NEW_TOKEN from previous connection ({d} bytes)", .{len});
+    }
 
     // Configure stream limits
     conn.streams.setMaxIncomingStreams(
@@ -1807,7 +2281,7 @@ pub fn connect(
 }
 
 test "connect: create client connection" {
-    var conn = try connect(std.testing.allocator, "example.com", .{}, null);
+    var conn = try connect(std.testing.allocator, "example.com", .{}, null, null);
     defer conn.deinit();
 
     try std.testing.expect(!conn.is_server);
@@ -1944,4 +2418,60 @@ test "PathValidator: needs retry" {
 
     validator.retry();
     try std.testing.expectEqual(@as(u8, 1), validator.retries);
+}
+
+// LocalCidPool tests
+test "LocalCidPool: register and issue" {
+    var pool = LocalCidPool{};
+    const initial_cid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    pool.registerInitialCid(&initial_cid, null);
+
+    // Seq 0 should be registered
+    try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
+    try std.testing.expectEqual(@as(u64, 1), pool.next_seq_num);
+
+    // Issue a new CID
+    const entry1 = pool.issueNewCid(8, null).?;
+    try std.testing.expectEqual(@as(u64, 1), entry1.seq_num);
+    try std.testing.expectEqual(@as(u8, 8), entry1.cid_len);
+    try std.testing.expectEqual(@as(usize, 2), pool.activeCount());
+
+    // Issue another
+    const entry2 = pool.issueNewCid(8, null).?;
+    try std.testing.expectEqual(@as(u64, 2), entry2.seq_num);
+    try std.testing.expectEqual(@as(usize, 3), pool.activeCount());
+}
+
+test "LocalCidPool: retire and replace" {
+    var pool = LocalCidPool{};
+    pool.registerInitialCid(&[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, null);
+
+    // Issue 2 more CIDs (seq 1, 2)
+    _ = pool.issueNewCid(8, null);
+    _ = pool.issueNewCid(8, null);
+    try std.testing.expectEqual(@as(usize, 3), pool.activeCount());
+
+    // Retire seq 0
+    pool.retireBySeq(0);
+    try std.testing.expectEqual(@as(usize, 2), pool.activeCount());
+
+    // Can issue a replacement into the freed slot
+    const replacement = pool.issueNewCid(8, null).?;
+    try std.testing.expectEqual(@as(u64, 3), replacement.seq_num);
+    try std.testing.expectEqual(@as(usize, 3), pool.activeCount());
+}
+
+test "LocalCidPool: pool full" {
+    var pool = LocalCidPool{};
+    pool.registerInitialCid(&[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, null);
+
+    // Fill remaining 7 slots
+    var i: usize = 0;
+    while (i < LocalCidPool.MAX_POOL_SIZE - 1) : (i += 1) {
+        try std.testing.expect(pool.issueNewCid(8, null) != null);
+    }
+    try std.testing.expectEqual(@as(usize, LocalCidPool.MAX_POOL_SIZE), pool.activeCount());
+
+    // Pool full — should return null
+    try std.testing.expect(pool.issueNewCid(8, null) == null);
 }

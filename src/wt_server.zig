@@ -41,6 +41,10 @@ pub fn main() !void {
         .alpn = alpn,
     };
 
+    // Generate random key for token encryption (Retry + NEW_TOKEN)
+    var token_key: [16]u8 = undefined;
+    std.crypto.random.bytes(&token_key);
+
     // Create UDP socket
     const local_addr = try std.net.Address.parseIp4("127.0.0.1", 4434);
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
@@ -107,6 +111,7 @@ pub fn main() !void {
                         true,
                         .{
                             .max_datagram_frame_size = 65536,
+                            .token_key = token_key,
                         },
                         tls_config,
                         null,

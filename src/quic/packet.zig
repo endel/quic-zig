@@ -143,6 +143,10 @@ pub const Header = struct {
     /// protection is removed.
     key_phase: bool = false,
 
+    /// The spin bit for passive RTT measurement (RFC 9000 §17.4).
+    /// Only meaningful for short (1-RTT) headers.
+    spin_bit: bool = false,
+
     /// The offset of this packet's first byte within the buffer.
     /// Used to correctly handle coalesced packets.
     packet_start: usize = 0,
@@ -290,9 +294,10 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
         first_byte ^= (mask[0] & 0x1f);
     }
 
-    // Extract key phase bit from unprotected short header (RFC 9001 Section 5.4.1)
+    // Extract key phase and spin bits from unprotected short header (RFC 9001 §5.4.1, RFC 9000 §17.4)
     if (!isLongHeader(first_byte)) {
         header.key_phase = (first_byte & KEY_PHASE_BIT) != 0;
+        header.spin_bit = (first_byte & PACKET_SPIN_BIT) != 0;
     }
 
     // Calculate packet number length from the unprotected first byte BEFORE using it
@@ -376,8 +381,9 @@ pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *PacketNumSpac
     // Short header unmasking
     first_byte ^= (mask[0] & 0x1f);
 
-    // Extract key phase from unprotected first byte
+    // Extract key phase and spin bits from unprotected first byte
     header.key_phase = (first_byte & KEY_PHASE_BIT) != 0;
+    header.spin_bit = (first_byte & PACKET_SPIN_BIT) != 0;
 
     header.packet_number_len = @as(usize, @intCast(first_byte & PACKET_NUM_MASK)) + 1;
 
@@ -765,6 +771,83 @@ pub fn validateRetryToken(
     if (!std.mem.eql(u8, &addr_data, client_addr.data[0..14])) return null;
 
     return result;
+}
+
+// NEW_TOKEN token format (RFC 9000 §8.1.3):
+// nonce(12) || AES-128-GCM-encrypt(plaintext) || tag(16)
+// Plaintext: timestamp_ns(8) + addr_data(14) = 22 bytes
+// Distinguishable from Retry tokens by shorter ciphertext.
+const NEW_TOKEN_PLAINTEXT_LEN: usize = 8 + 14; // timestamp + addr
+const NEW_TOKEN_MAX_LEN: usize = TOKEN_NONCE_LEN + NEW_TOKEN_PLAINTEXT_LEN + TOKEN_TAG_LEN; // 50
+
+pub fn generateNewToken(
+    out: []u8,
+    client_addr: posix.sockaddr,
+    token_key: [crypto.key_len]u8,
+) !usize {
+    if (out.len < NEW_TOKEN_MAX_LEN) return error.BufferTooSmall;
+
+    var nonce: [TOKEN_NONCE_LEN]u8 = undefined;
+    random.bytes(&nonce);
+    @memcpy(out[0..TOKEN_NONCE_LEN], &nonce);
+
+    var plaintext: [NEW_TOKEN_PLAINTEXT_LEN]u8 = undefined;
+    var pt_fbs = io.fixedBufferStream(&plaintext);
+    const pt_writer = pt_fbs.writer();
+    const now: i64 = @intCast(time.nanoTimestamp());
+    try pt_writer.writeInt(i64, now, ENDIAN);
+    try pt_writer.writeAll(client_addr.data[0..14]);
+
+    var ciphertext_buf: [NEW_TOKEN_PLAINTEXT_LEN]u8 = undefined;
+    var tag: [TOKEN_TAG_LEN]u8 = undefined;
+    crypto.Aead.encrypt(
+        &ciphertext_buf,
+        &tag,
+        &plaintext,
+        "",
+        nonce,
+        token_key,
+    );
+
+    @memcpy(out[TOKEN_NONCE_LEN..][0..NEW_TOKEN_PLAINTEXT_LEN], &ciphertext_buf);
+    @memcpy(out[TOKEN_NONCE_LEN + NEW_TOKEN_PLAINTEXT_LEN ..][0..TOKEN_TAG_LEN], &tag);
+
+    return NEW_TOKEN_MAX_LEN;
+}
+
+pub fn validateNewToken(
+    token_data: []const u8,
+    client_addr: posix.sockaddr,
+    token_key: [crypto.key_len]u8,
+) bool {
+    if (token_data.len != NEW_TOKEN_MAX_LEN) return false;
+
+    const nonce = token_data[0..TOKEN_NONCE_LEN].*;
+    const ciphertext = token_data[TOKEN_NONCE_LEN..][0..NEW_TOKEN_PLAINTEXT_LEN];
+    const tag = token_data[token_data.len - TOKEN_TAG_LEN ..][0..TOKEN_TAG_LEN].*;
+
+    var plaintext: [NEW_TOKEN_PLAINTEXT_LEN]u8 = undefined;
+    crypto.Aead.decrypt(
+        &plaintext,
+        ciphertext,
+        tag,
+        "",
+        nonce,
+        token_key,
+    ) catch return false;
+
+    var pt_fbs = io.fixedBufferStream(&plaintext);
+    const pt_reader = pt_fbs.reader();
+
+    const timestamp = pt_reader.readInt(i64, ENDIAN) catch return false;
+    const now: i64 = @intCast(time.nanoTimestamp());
+    if (now - timestamp > TOKEN_MAX_AGE_NS or timestamp > now) return false;
+
+    var addr_data: [14]u8 = undefined;
+    _ = pt_reader.readAll(&addr_data) catch return false;
+    if (!std.mem.eql(u8, &addr_data, client_addr.data[0..14])) return false;
+
+    return true;
 }
 
 pub fn readVarInt(reader: anytype) !u64 {

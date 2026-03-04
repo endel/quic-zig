@@ -638,6 +638,28 @@ pub const Frame = union(FrameType) {
             else => false,
         };
     }
+
+    /// Check if this frame type is allowed in the given packet type (RFC 9000 §12.5, Table 3).
+    pub fn isAllowedIn(self: Frame, pkt_type: packet.PacketType) bool {
+        return switch (self) {
+            // PADDING, PING: all packet types
+            .padding, .ping => true,
+            // ACK, ACK_ECN: Initial, Handshake, 1-RTT (NOT 0-RTT)
+            .ack, .ack_ecn => pkt_type != .zero_rtt,
+            // CRYPTO: Initial, Handshake, 1-RTT (NOT 0-RTT)
+            .crypto => pkt_type != .zero_rtt,
+            // CONNECTION_CLOSE: Initial, Handshake, 1-RTT (NOT 0-RTT)
+            .connection_close => pkt_type != .zero_rtt,
+            // NEW_TOKEN, NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, HANDSHAKE_DONE: 1-RTT only
+            .new_token, .new_connection_id, .retire_connection_id, .handshake_done => pkt_type == .one_rtt,
+            // All others: 0-RTT and 1-RTT only
+            .reset_stream, .stop_sending, .stream, .max_data, .max_stream_data,
+            .max_streams_bidi, .max_streams_uni, .data_blocked, .stream_data_blocked,
+            .streams_blocked_bidi, .streams_blocked_uni, .path_challenge, .path_response,
+            .application_close, .datagram, .datagram_with_length,
+            => pkt_type == .one_rtt or pkt_type == .zero_rtt,
+        };
+    }
 };
 
 /// Parse multiple frames from a payload buffer. Calls handler for each frame.
@@ -688,6 +710,50 @@ pub const PendingControlFrame = union(enum) {
         stream_id: u64,
         max: u64,
     },
+    max_streams_bidi: u64,
+    max_streams_uni: u64,
+    streams_blocked_bidi: u64,
+    streams_blocked_uni: u64,
+    data_blocked: u64,
+    stream_data_blocked: struct {
+        stream_id: u64,
+        limit: u64,
+    },
+    new_token: struct {
+        token_buf: [92]u8 = .{0} ** 92,
+        token_len: u8 = 0,
+    },
+    new_connection_id: struct {
+        seq_num: u64,
+        retire_prior_to: u64,
+        cid_buf: [20]u8,
+        cid_len: u8,
+        stateless_reset_token: [16]u8,
+    },
+
+    /// Write this pending control frame directly on the wire.
+    /// For new_connection_id we serialize directly (avoids dangling slice from toFrame()).
+    pub fn write(self: PendingControlFrame, writer: anytype) !void {
+        switch (self) {
+            .new_token => |nt| {
+                try packet.writeVarInt(writer, 0x07);
+                try packet.writeVarInt(writer, nt.token_len);
+                try writer.writeAll(nt.token_buf[0..nt.token_len]);
+            },
+            .new_connection_id => |ncid| {
+                try packet.writeVarInt(writer, 0x18);
+                try packet.writeVarInt(writer, ncid.seq_num);
+                try packet.writeVarInt(writer, ncid.retire_prior_to);
+                try writer.writeByte(ncid.cid_len);
+                try writer.writeAll(ncid.cid_buf[0..ncid.cid_len]);
+                try writer.writeAll(&ncid.stateless_reset_token);
+            },
+            else => {
+                const f = self.toFrame();
+                try f.write(writer);
+            },
+        }
+    }
 
     /// Convert to a Frame for writing on the wire.
     pub fn toFrame(self: PendingControlFrame) Frame {
@@ -702,6 +768,14 @@ pub const PendingControlFrame = union(enum) {
                 .{ .connection_close = .{ .error_code = cc.error_code, .frame_type = cc.frame_type, .reason = &.{} } },
             .max_data => |max| .{ .max_data = max },
             .max_stream_data => |msd| .{ .max_stream_data = .{ .stream_id = msd.stream_id, .max = msd.max } },
+            .max_streams_bidi => |max| .{ .max_streams_bidi = max },
+            .max_streams_uni => |max| .{ .max_streams_uni = max },
+            .streams_blocked_bidi => |max| .{ .streams_blocked_bidi = max },
+            .streams_blocked_uni => |max| .{ .streams_blocked_uni = max },
+            .data_blocked => |limit| .{ .data_blocked = limit },
+            .stream_data_blocked => |sdb| .{ .stream_data_blocked = .{ .stream_id = sdb.stream_id, .limit = sdb.limit } },
+            .new_token => unreachable, // handled directly in write()
+            .new_connection_id => unreachable, // handled directly in write()
         };
     }
 };
@@ -1090,4 +1164,135 @@ test "write and parse max_data frame roundtrip" {
         .max_data => |val| try std.testing.expectEqual(@as(u64, 999999), val),
         else => unreachable,
     }
+}
+
+test "PendingControlFrame: max_streams_bidi write and parse roundtrip" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const pcf = PendingControlFrame{ .max_streams_bidi = 42 };
+    try pcf.write(fbs.writer());
+    const written = fbs.getWritten();
+    var written_mut: [64]u8 = undefined;
+    @memcpy(written_mut[0..written.len], written);
+    const parsed = try Frame.parse(written_mut[0..written.len]);
+    switch (parsed) {
+        .max_streams_bidi => |val| try std.testing.expectEqual(@as(u64, 42), val),
+        else => unreachable,
+    }
+}
+
+test "PendingControlFrame: max_streams_uni write and parse roundtrip" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const pcf = PendingControlFrame{ .max_streams_uni = 100 };
+    try pcf.write(fbs.writer());
+    const written = fbs.getWritten();
+    var written_mut: [64]u8 = undefined;
+    @memcpy(written_mut[0..written.len], written);
+    const parsed = try Frame.parse(written_mut[0..written.len]);
+    switch (parsed) {
+        .max_streams_uni => |val| try std.testing.expectEqual(@as(u64, 100), val),
+        else => unreachable,
+    }
+}
+
+test "PendingControlFrame: streams_blocked_bidi write and parse roundtrip" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const pcf = PendingControlFrame{ .streams_blocked_bidi = 7 };
+    try pcf.write(fbs.writer());
+    const written = fbs.getWritten();
+    var written_mut: [64]u8 = undefined;
+    @memcpy(written_mut[0..written.len], written);
+    const parsed = try Frame.parse(written_mut[0..written.len]);
+    switch (parsed) {
+        .streams_blocked_bidi => |val| try std.testing.expectEqual(@as(u64, 7), val),
+        else => unreachable,
+    }
+}
+
+test "PendingControlFrame: streams_blocked_uni write and parse roundtrip" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const pcf = PendingControlFrame{ .streams_blocked_uni = 3 };
+    try pcf.write(fbs.writer());
+    const written = fbs.getWritten();
+    var written_mut: [64]u8 = undefined;
+    @memcpy(written_mut[0..written.len], written);
+    const parsed = try Frame.parse(written_mut[0..written.len]);
+    switch (parsed) {
+        .streams_blocked_uni => |val| try std.testing.expectEqual(@as(u64, 3), val),
+        else => unreachable,
+    }
+}
+
+test "PendingControlFrame: toFrame mapping for new variants" {
+    // max_streams_bidi
+    const pcf1 = PendingControlFrame{ .max_streams_bidi = 50 };
+    const f1 = pcf1.toFrame();
+    switch (f1) {
+        .max_streams_bidi => |val| try std.testing.expectEqual(@as(u64, 50), val),
+        else => unreachable,
+    }
+
+    // max_streams_uni
+    const pcf2 = PendingControlFrame{ .max_streams_uni = 25 };
+    const f2 = pcf2.toFrame();
+    switch (f2) {
+        .max_streams_uni => |val| try std.testing.expectEqual(@as(u64, 25), val),
+        else => unreachable,
+    }
+
+    // streams_blocked_bidi
+    const pcf3 = PendingControlFrame{ .streams_blocked_bidi = 10 };
+    const f3 = pcf3.toFrame();
+    switch (f3) {
+        .streams_blocked_bidi => |val| try std.testing.expectEqual(@as(u64, 10), val),
+        else => unreachable,
+    }
+
+    // streams_blocked_uni
+    const pcf4 = PendingControlFrame{ .streams_blocked_uni = 5 };
+    const f4 = pcf4.toFrame();
+    switch (f4) {
+        .streams_blocked_uni => |val| try std.testing.expectEqual(@as(u64, 5), val),
+        else => unreachable,
+    }
+}
+
+test "PendingFrameQueue: push and pop max_streams variants" {
+    var queue = PendingFrameQueue{};
+
+    queue.push(.{ .max_streams_bidi = 100 });
+    queue.push(.{ .max_streams_uni = 50 });
+    queue.push(.{ .streams_blocked_bidi = 10 });
+    queue.push(.{ .streams_blocked_uni = 5 });
+
+    try std.testing.expectEqual(@as(u8, 4), queue.len);
+
+    const f1 = queue.pop().?;
+    switch (f1) {
+        .max_streams_bidi => |val| try std.testing.expectEqual(@as(u64, 100), val),
+        else => unreachable,
+    }
+
+    const f2 = queue.pop().?;
+    switch (f2) {
+        .max_streams_uni => |val| try std.testing.expectEqual(@as(u64, 50), val),
+        else => unreachable,
+    }
+
+    const f3 = queue.pop().?;
+    switch (f3) {
+        .streams_blocked_bidi => |val| try std.testing.expectEqual(@as(u64, 10), val),
+        else => unreachable,
+    }
+
+    const f4 = queue.pop().?;
+    switch (f4) {
+        .streams_blocked_uni => |val| try std.testing.expectEqual(@as(u64, 5), val),
+        else => unreachable,
+    }
+
+    try std.testing.expect(queue.pop() == null);
 }

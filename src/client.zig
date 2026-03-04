@@ -7,6 +7,7 @@ const connection = @import("quic/connection.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
+const stateless_reset = @import("quic/stateless_reset.zig");
 const h3 = @import("h3/connection.zig");
 const qpack = @import("h3/qpack.zig");
 const Certificate = std.crypto.Certificate;
@@ -51,6 +52,7 @@ pub fn main() !void {
         "localhost",
         .{},
         tls_config,
+        null, // no NEW_TOKEN from previous connection
     );
 
     var remote_addr = server_addr.any;
@@ -218,13 +220,24 @@ pub fn main() !void {
                 conn.recv(&header, &fbs, .{
                     .to = local_addr.any,
                     .from = remote_addr,
-                }) catch break;
+                }) catch {
+                    // Check if this is a stateless reset (RFC 9000 §10.3)
+                    if (conn.matchesStatelessReset(bytes[0..packet_length])) {
+                        std.log.info("received stateless reset, closing connection", .{});
+                        conn.state = .draining;
+                        got_response = true;
+                        break;
+                    }
+                    break;
+                };
 
                 const expected_next_pos = packet_start_pos + full_packet_size;
                 if (fbs.pos < expected_next_pos) {
                     fbs.pos = expected_next_pos;
                 }
             }
+
+            if (conn.state == .draining) break;
         }
 
         // Send ACKs

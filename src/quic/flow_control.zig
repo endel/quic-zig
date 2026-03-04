@@ -16,6 +16,8 @@ pub const BaseFlowController = struct {
     // Send-side state
     bytes_sent: u64 = 0,
     send_window: u64 = 0,
+    // Track the limit at which we last sent a blocked frame (avoid duplicates)
+    blocked_at: ?u64 = null,
 
     // Receive-side state
     bytes_read: u64 = 0,
@@ -40,6 +42,8 @@ pub const BaseFlowController = struct {
     pub fn updateSendWindow(self: *BaseFlowController, new_window: u64) void {
         if (new_window > self.send_window) {
             self.send_window = new_window;
+            // Clear blocked_at so we can send a new blocked frame if we hit the new limit
+            self.blocked_at = null;
         }
     }
 
@@ -57,6 +61,19 @@ pub const BaseFlowController = struct {
     /// Check if sending is blocked.
     pub fn isBlocked(self: *const BaseFlowController) bool {
         return self.bytes_sent >= self.send_window;
+    }
+
+    // Check if we should send a BLOCKED frame and mark it as sent.
+    // Returns the limit if a blocked frame should be sent, null otherwise.
+    // Only triggers once per limit to avoid duplicates.
+    pub fn shouldSendBlocked(self: *BaseFlowController) ?u64 {
+        if (self.bytes_sent >= self.send_window) {
+            if (self.blocked_at == null or self.blocked_at.? != self.send_window) {
+                self.blocked_at = self.send_window;
+                return self.send_window;
+            }
+        }
+        return null;
     }
 
     /// Record bytes received from the peer.

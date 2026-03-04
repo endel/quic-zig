@@ -106,6 +106,15 @@ pub const NewReno = struct {
         self.bytes_acked_in_round = 0;
     }
 
+    // Persistent congestion detected (RFC 9002 §7.6.2).
+    // Aggressively reduce to minimum window (2 * max_datagram_size).
+    pub fn onPersistentCongestion(self: *NewReno) void {
+        self.congestion_window = MIN_WINDOW_PACKETS * self.max_datagram_size;
+        self.ssthresh = self.congestion_window;
+        self.largest_sent_at_last_cutback = null;
+        self.bytes_acked_in_round = 0;
+    }
+
     /// Called when the PTO fires (probe timeout).
     pub fn onPtoExpired(self: *NewReno) void {
         _ = self;
@@ -264,6 +273,20 @@ test "NewReno: minimum window enforced" {
     cc.onCongestionEvent(100);
 
     try testing.expect(cc.congestion_window >= MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE);
+}
+
+test "NewReno: persistent congestion resets to minimum" {
+    var cc = NewReno.init();
+    const initial_window = cc.congestion_window;
+    try testing.expect(initial_window > MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE);
+
+    cc.onPersistentCongestion();
+
+    // Window should be at minimum (2 * MSS)
+    try testing.expectEqual(MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE, cc.congestion_window);
+    try testing.expectEqual(MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE, cc.ssthresh);
+    // Recovery period should be cleared so window can grow again
+    try testing.expect(cc.largest_sent_at_last_cutback == null);
 }
 
 test "Pacer: initial burst allowed" {

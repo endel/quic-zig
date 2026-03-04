@@ -3,9 +3,11 @@ const posix = std.posix;
 const io = std.io;
 
 const connection = @import("quic/connection.zig");
+const connection_manager = @import("quic/connection_manager.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
+const stateless_reset = @import("quic/stateless_reset.zig");
 const h3 = @import("h3/connection.zig");
 const qpack = @import("h3/qpack.zig");
 
@@ -43,6 +45,10 @@ pub fn main() !void {
     var retry_token_key: [16]u8 = undefined;
     std.crypto.random.bytes(&retry_token_key);
 
+    // Generate static key for stateless reset tokens (RFC 9000 §10.3)
+    var static_reset_key: [16]u8 = undefined;
+    std.crypto.random.bytes(&static_reset_key);
+
     const tls_config: tls13.TlsConfig = .{
         .cert_chain_der = cert_chain,
         .private_key_bytes = ec_private_key,
@@ -65,9 +71,15 @@ pub fn main() !void {
         std.log.debug("First recvfrom (expected WouldBlock): {any}", .{err});
     };
 
-    var conn_state: ?connection.Connection = null;
-    var h3_conn: ?h3.H3Connection = null;
-    var h3_initialized = false;
+    var conn_mgr = connection_manager.ConnectionManager.init(
+        alloc,
+        tls_config,
+        .{ .token_key = retry_token_key },
+        retry_token_key,
+        static_reset_key,
+    );
+    defer conn_mgr.deinit();
+
     var remote_addr: posix.sockaddr = undefined;
     var addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
@@ -77,7 +89,7 @@ pub fn main() !void {
         std.Thread.sleep(1 * std.time.ns_per_ms);
         loop_count += 1;
         if (loop_count % 1000 == 0) {
-            std.log.debug("server loop iteration {d}", .{loop_count});
+            std.log.debug("server loop iteration {d} ({d} connections)", .{ loop_count, conn_mgr.connectionCount() });
         }
 
         // Read loop: process all available UDP packets
@@ -86,11 +98,9 @@ pub fn main() !void {
             addr_size = @sizeOf(posix.sockaddr);
 
             const packet_length = posix.recvfrom(sockfd, &bytes, 0, &remote_addr, &addr_size) catch |err| {
-                // WouldBlock is expected on non-blocking socket when no data available
                 if (err == error.WouldBlock) {
                     break :read_loop;
                 }
-                // Other errors are unexpected
                 std.log.err("recvfrom error: {any}", .{err});
                 break :read_loop;
             };
@@ -104,7 +114,7 @@ pub fn main() !void {
                 if (bytes[fbs.pos] & 0x40 == 0) break;
 
                 const packet_start_pos = fbs.pos;
-                var header = packet.Header.parse(&fbs, if (conn_state) |*cs| cs.scid_len else 8) catch |err| {
+                var header = packet.Header.parse(&fbs, conn_mgr.local_cid_len) catch |err| {
                     std.log.err("header parse error: {any}", .{err});
                     break;
                 };
@@ -127,10 +137,23 @@ pub fn main() !void {
                     break;
                 }
 
-                // Accept connection on first Initial with Retry
-                if (conn_state == null) {
+                // Route packet to existing connection by DCID
+                var entry = conn_mgr.findByDcid(header.dcid);
+
+                if (entry == null) {
                     if (header.packet_type != .initial) {
-                        std.log.warn("ignoring non-initial before connection established", .{});
+                        // Short-header packet for unknown CID: send stateless reset (RFC 9000 §10.3)
+                        if (header.packet_type == .one_rtt) {
+                            var sr_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                            const sr_max = @min(full_packet_size, sr_buf.len);
+                            const sr_len = stateless_reset.generatePacket(&sr_buf, sr_max, conn_mgr.static_reset_key, header.dcid);
+                            if (sr_len > 0) {
+                                _ = posix.sendto(sockfd, sr_buf[0..sr_len], 0, &remote_addr, addr_size) catch {};
+                                std.log.info("sent stateless reset ({d} bytes) for unknown CID", .{sr_len});
+                            }
+                        } else {
+                            std.log.warn("ignoring non-initial for unknown connection", .{});
+                        }
                         break;
                     }
 
@@ -168,37 +191,45 @@ pub fn main() !void {
                         break;
                     }
 
-                    // Has token: validate it
+                    // Has token: try Retry token first, then NEW_TOKEN
                     const validated = packet.validateRetryToken(
                         header.token.?,
                         remote_addr,
                         retry_token_key,
-                    ) catch {
-                        std.log.warn("token validation error, dropping", .{});
-                        break;
-                    };
+                    ) catch null;
 
-                    if (validated == null) {
-                        std.log.warn("invalid retry token, dropping", .{});
+                    if (validated) |vt| {
+                        entry = conn_mgr.acceptConnection(
+                            header,
+                            local_addr.any,
+                            remote_addr,
+                            vt.getOdcid(),
+                            vt.getRetryScid(),
+                        ) catch |err| {
+                            std.log.err("accept error: {any}", .{err});
+                            break;
+                        };
+                        std.log.info("accepted new connection (after Retry validation)", .{});
+                    } else if (packet.validateNewToken(header.token.?, remote_addr, retry_token_key)) {
+                        entry = conn_mgr.acceptConnection(
+                            header,
+                            local_addr.any,
+                            remote_addr,
+                            header.dcid, // ODCID = DCID (no Retry)
+                            null,
+                        ) catch |err| {
+                            std.log.err("accept error: {any}", .{err});
+                            break;
+                        };
+                        std.log.info("accepted new connection (NEW_TOKEN validated)", .{});
+                    } else {
+                        std.log.warn("invalid token, dropping", .{});
                         break;
                     }
-
-                    const vt = validated.?;
-                    conn_state = try connection.Connection.accept(
-                        alloc,
-                        header,
-                        local_addr.any,
-                        remote_addr,
-                        true,
-                        .{},
-                        tls_config,
-                        vt.getOdcid(),
-                        vt.getRetryScid(),
-                    );
-                    std.log.info("accepted new connection (after Retry validation)", .{});
                 }
 
-                var conn = &conn_state.?;
+                const e = entry.?;
+                const conn = e.conn;
                 const recv_info: connection.RecvInfo = .{
                     .to = local_addr.any,
                     .from = remote_addr,
@@ -208,6 +239,9 @@ pub fn main() !void {
                     std.log.err("recv error: {any}", .{err});
                     break;
                 };
+
+                // Sync CIDs after recv (may have processed NEW_CONNECTION_ID / RETIRE)
+                conn_mgr.syncCids(e);
 
                 // Ensure fbs is positioned at the start of the next packet
                 const expected_next_pos = packet_start_pos + full_packet_size;
@@ -228,24 +262,27 @@ pub fn main() !void {
             }
         }
 
-        // HTTP/3 processing
-        if (conn_state != null) {
-            var conn = &conn_state.?;
+        // Per-connection processing: H3, timeouts, periodic sends
+        var i: usize = 0;
+        while (i < conn_mgr.entries.items.len) {
+            const entry = conn_mgr.entries.items[i];
+            const conn = entry.conn;
 
-            if (conn.isEstablished() and !h3_initialized) {
-                h3_conn = h3.H3Connection.init(alloc, conn, true);
-                h3_conn.?.initConnection() catch |err| {
+            // Initialize H3 once handshake completes
+            if (conn.isEstablished() and !entry.h3_initialized) {
+                entry.h3_conn = h3.H3Connection.init(alloc, conn, true);
+                entry.h3_conn.?.initConnection() catch |err| {
                     std.log.err("H3 init error: {any}", .{err});
+                    i += 1;
                     continue;
                 };
-                h3_initialized = true;
-                std.log.info("HTTP/3 connection initialized", .{});
+                entry.h3_initialized = true;
+                std.log.info("HTTP/3 connection initialized (total: {d})", .{conn_mgr.connectionCount()});
             }
 
-            if (h3_conn != null) {
-                var h3c = &h3_conn.?;
-
-                // Poll for H3 events
+            // Poll for H3 events
+            if (entry.h3_conn != null) {
+                var h3c = &entry.h3_conn.?;
                 while (true) {
                     const event = h3c.poll() catch |err| {
                         std.log.err("H3 poll error: {any}", .{err});
@@ -268,15 +305,16 @@ pub fn main() !void {
                                 if (std.mem.eql(u8, h_item.name, ":path")) path = h_item.value;
                             }
 
-                            // Send HTTP response
-                            const body = std.fmt.allocPrint(alloc, "Hello from Zig HTTP/3 server! You requested {s} {s}\n", .{ method, path }) catch continue;
+                            const body = std.fmt.allocPrint(alloc, "Hello from Zig HTTP/3 server! You requested {s} {s}\n", .{ method, path }) catch {
+                                i += 1;
+                                continue;
+                            };
                             const resp_headers = [_]qpack.Header{
                                 .{ .name = ":status", .value = "200" },
                                 .{ .name = "content-type", .value = "text/plain" },
                             };
                             h3c.sendResponse(hdr.stream_id, &resp_headers, body) catch |err| {
                                 std.log.err("H3 sendResponse error: {any}", .{err});
-                                continue;
                             };
                             std.log.info("H3: sent 200 response on stream {d} ({d} bytes body)", .{ hdr.stream_id, body.len });
                         },
@@ -296,23 +334,23 @@ pub fn main() !void {
                 }
             }
 
-            // Check timeouts (idle, PTO, closing/draining timer)
+            // Check timeouts
             conn.onTimeout() catch |err| {
                 std.log.err("onTimeout error: {any}", .{err});
             };
 
             // Check if connection has terminated
             if (conn.isClosed()) {
-                std.log.info("connection terminated, ready for new connection", .{});
-                conn_state = null;
-                h3_conn = null;
-                h3_initialized = false;
+                std.log.info("connection terminated (remaining: {d})", .{conn_mgr.connectionCount() - 1});
+                conn_mgr.removeConnection(entry);
+                // Don't increment i — swap-remove moved last entry into this slot
                 continue;
             }
 
             // Periodic send for retransmissions/ACKs/stream data
             const bytes_written = conn.send(&out) catch |err| {
                 std.log.err("periodic send error: {any}", .{err});
+                i += 1;
                 continue;
             };
             if (bytes_written > 0) {
@@ -320,6 +358,8 @@ pub fn main() !void {
                 _ = try posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr));
                 std.log.info("periodic sent {d} bytes", .{bytes_written});
             }
+
+            i += 1;
         }
     }
 }
@@ -340,6 +380,8 @@ test {
     _ = @import("quic/packet_packer.zig");
     _ = @import("quic/tls13.zig");
     _ = @import("quic/mtu.zig");
+    _ = @import("quic/stateless_reset.zig");
+    _ = @import("quic/connection_manager.zig");
     _ = @import("h3/frame.zig");
     _ = @import("h3/qpack.zig");
     _ = @import("h3/huffman.zig");

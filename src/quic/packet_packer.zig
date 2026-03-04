@@ -61,6 +61,9 @@ pub const PacketPacker = struct {
     /// Current key phase bit for 1-RTT packets (toggled on key update).
     key_phase: bool = false,
 
+    /// Spin bit for passive RTT measurement (RFC 9000 §17.4).
+    spin_bit: bool = false,
+
     /// Maximum packet size for regular (non-probe) packets.
     max_packet_size: usize = DEFAULT_MAX_PACKET_SIZE,
 
@@ -98,6 +101,7 @@ pub const PacketPacker = struct {
 
     /// Pack a coalesced packet (Initial + 0-RTT + Handshake + 1-RTT).
     /// Returns the number of bytes written to out_buf.
+    /// When ack_only is true, only ACK/CRYPTO/HANDSHAKE_DONE/control frames are packed (no stream/datagram data).
     pub fn packCoalesced(
         self: *PacketPacker,
         out_buf: []u8,
@@ -111,6 +115,7 @@ pub const PacketPacker = struct {
         app_seal: ?crypto_mod.Seal,
         now: i64,
         datagram_queue: ?*conn_mod.DatagramQueue,
+        ack_only: bool,
     ) !usize {
         var offset: usize = 0;
 
@@ -128,12 +133,13 @@ pub const PacketPacker = struct {
                 true, // pad to minimum size
                 null,
                 false,
+                ack_only,
             );
             offset += initial_len;
         }
 
         // Try packing 0-RTT packet (Long Header, type 0x10)
-        if (early_seal != null and offset < out_buf.len) {
+        if (early_seal != null and offset < out_buf.len and !ack_only) {
             const early_len = try self.packSinglePacket(
                 out_buf[offset..],
                 .application,
@@ -146,6 +152,7 @@ pub const PacketPacker = struct {
                 false,
                 datagram_queue,
                 true, // zero_rtt = true
+                false,
             );
             offset += early_len;
         }
@@ -164,6 +171,7 @@ pub const PacketPacker = struct {
                 false,
                 null,
                 false,
+                ack_only,
             );
             offset += hs_len;
         }
@@ -182,6 +190,7 @@ pub const PacketPacker = struct {
                 false,
                 datagram_queue,
                 false,
+                ack_only,
             );
             offset += app_len;
         }
@@ -192,6 +201,7 @@ pub const PacketPacker = struct {
     /// Pack a single packet at the given encryption level.
     /// Returns the total packet size including header, encrypted payload, and AEAD tag.
     /// When zero_rtt=true, packs a 0-RTT Long Header packet (type 0x10) with only STREAM/DATAGRAM frames.
+    /// When ack_only=true, skips stream and datagram frames (used when congestion-limited).
     fn packSinglePacket(
         self: *PacketPacker,
         buf: []u8,
@@ -205,6 +215,7 @@ pub const PacketPacker = struct {
         pad_to_min: bool,
         datagram_queue: ?*conn_mod.DatagramQueue,
         zero_rtt: bool,
+        ack_only: bool,
     ) !usize {
         if (buf.len < 64) return 0; // Not enough space
 
@@ -236,6 +247,7 @@ pub const PacketPacker = struct {
             // Short header: 1 byte + DCID
             var first_byte: u8 = packet_mod.FIXED_BIT;
             if (self.key_phase) first_byte |= packet_mod.KEY_PHASE_BIT;
+            if (self.spin_bit) first_byte |= packet_mod.PACKET_SPIN_BIT;
             first_byte |= @as(u8, @intCast(pn_len - 1));
             try writer.writeByte(first_byte);
             try writer.writeAll(self.getDcid());
@@ -316,15 +328,14 @@ pub const PacketPacker = struct {
             // 4. Pending control frames (only in 1-RTT)
             if (level == .application) {
                 while (pending_frames.pop()) |pcf| {
-                    const ctrl_frame = pcf.toFrame();
-                    try ctrl_frame.write(writer);
+                    try pcf.write(writer);
                     ack_eliciting = true;
                 }
             }
         }
 
-        // 5. Stream frames (only in 1-RTT or 0-RTT)
-        if (level == .application) {
+        // 5. Stream frames (only in 1-RTT or 0-RTT, skip when ack_only)
+        if (level == .application and !ack_only) {
             // Bidirectional streams
             var stream_it = streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| {
@@ -357,7 +368,7 @@ pub const PacketPacker = struct {
                 }
             }
 
-            // 6. DATAGRAM frames (RFC 9221)
+            // 6. DATAGRAM frames (RFC 9221, skip when ack_only)
             if (datagram_queue) |dq| {
                 var dgram_buf: [conn_mod.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
                 while (fbs.pos + AEAD_TAG_LEN + 16 < effective_max) {
@@ -479,6 +490,7 @@ pub const PacketPacker = struct {
         // Short header (1-RTT)
         var first_byte: u8 = packet_mod.FIXED_BIT;
         if (self.key_phase) first_byte |= packet_mod.KEY_PHASE_BIT;
+        if (self.spin_bit) first_byte |= packet_mod.PACKET_SPIN_BIT;
         first_byte |= @as(u8, @intCast(pn_len - 1));
         try writer.writeByte(first_byte);
         try writer.writeAll(self.getDcid());
