@@ -4,12 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Link libc on platforms that need it (Linux requires explicit libc for std.c.recvmsg).
+    const need_libc: ?bool = if (target.result.os.tag == .windows) null else true;
+
     const exe_server = b.addExecutable(.{
         .name = "server",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/server.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = need_libc,
         }),
     });
     b.installArtifact(exe_server);
@@ -20,6 +24,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/client.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = need_libc,
         }),
     });
     b.installArtifact(exe_client);
@@ -44,6 +49,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/wt_server.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = need_libc,
         }),
     });
     b.installArtifact(exe_wt_server);
@@ -60,6 +66,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/wt_client.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = need_libc,
         }),
     });
     b.installArtifact(exe_wt_client);
@@ -76,6 +83,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/wt_browser_server.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = need_libc,
         }),
     });
     b.installArtifact(exe_wt_browser_server);
@@ -90,6 +98,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/server.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = need_libc,
         }),
     });
 

@@ -2,25 +2,31 @@ const std = @import("std");
 const posix = std.posix;
 const builtin = @import("builtin");
 
+const is_windows = builtin.os.tag == .windows;
+
 // Platform-specific constants for ECN socket options (IPv4).
 const IPPROTO_IP: u32 = 0;
 
 const IP_TOS: u32 = switch (builtin.os.tag) {
     .macos => 3,
     .linux => 1,
+    .windows => 3, // unused — ECN not supported on Windows
     else => @compileError("unsupported OS for ECN"),
 };
 
 const IP_RECVTOS: u32 = switch (builtin.os.tag) {
     .macos => 27,
     .linux => 13,
+    .windows => 0, // unused — ECN not supported on Windows
     else => @compileError("unsupported OS for ECN"),
 };
 
 // cmsg header — Zig std doesn't expose this on macOS.
+// Not used on Windows.
 const CmsgHdr = extern struct {
     cmsg_len: switch (builtin.os.tag) {
         .macos => u32,
+        .windows => u32,
         else => usize,
     },
     cmsg_level: i32,
@@ -34,13 +40,17 @@ const CMSG_SPACE = (CMSG_HDR_SIZE + 4 + @alignOf(CmsgHdr) - 1) & ~@as(usize, @al
 const CMSG_BUF_SIZE = CMSG_SPACE * 2; // room for at least 2 cmsgs
 
 /// Enable receiving ECN/TOS info on incoming packets.
+/// No-op on Windows (ECN ancillary data not supported).
 pub fn enableEcnRecv(sockfd: posix.socket_t) !void {
+    if (comptime is_windows) return;
     const val: u32 = 1;
     try posix.setsockopt(sockfd, IPPROTO_IP, IP_RECVTOS, std.mem.asBytes(&val));
 }
 
 /// Set the ECN codepoint for outgoing packets (low 2 bits of IP TOS).
+/// No-op on Windows.
 pub fn setEcnMark(sockfd: posix.socket_t, ecn_mark: u2) !void {
+    if (comptime is_windows) return;
     const tos: u32 = @as(u32, ecn_mark);
     try posix.setsockopt(sockfd, IPPROTO_IP, IP_TOS, std.mem.asBytes(&tos));
 }
@@ -53,7 +63,21 @@ pub const RecvResult = struct {
 };
 
 /// Receive a UDP datagram and extract the ECN codepoint from ancillary data.
+/// On Windows, falls back to recvfrom with ecn=0 (no ancillary data support).
 pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
+    if (comptime is_windows) {
+        // Windows fallback: plain recvfrom, no ECN info.
+        var from_addr: posix.sockaddr = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        const bytes_read = try posix.recvfrom(sockfd, buf, 0, &from_addr, &addr_len);
+        return .{
+            .bytes_read = bytes_read,
+            .from_addr = from_addr,
+            .addr_len = addr_len,
+            .ecn = 0,
+        };
+    }
+
     var iov = [1]posix.iovec{
         .{
             .base = buf.ptr,
@@ -117,8 +141,9 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
     };
 }
 
-// Tests
+// Tests — ECN ancillary data tests only run on POSIX platforms.
 test "enableEcnRecv on a real socket" {
+    if (comptime is_windows) return error.SkipZigTest;
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
 
@@ -129,6 +154,7 @@ test "enableEcnRecv on a real socket" {
 }
 
 test "setEcnMark on a real socket" {
+    if (comptime is_windows) return error.SkipZigTest;
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
 
@@ -142,6 +168,7 @@ test "setEcnMark on a real socket" {
 }
 
 test "recvmsgEcn returns WouldBlock on empty socket" {
+    if (comptime is_windows) return error.SkipZigTest;
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
 
