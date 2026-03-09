@@ -15,6 +15,7 @@ const net = std.net;
 const mem = std.mem;
 
 const connection = @import("quic/connection.zig");
+const quic_crypto = @import("quic/crypto.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
@@ -34,6 +35,9 @@ const TestCase = enum {
     zerortt,
     http3,
     keyupdate,
+    ecn,
+    connectionmigration,
+    chacha20,
     unsupported,
 };
 
@@ -46,6 +50,9 @@ fn parseTestCase(name: []const u8) TestCase {
     if (mem.eql(u8, name, "zerortt")) return .zerortt;
     if (mem.eql(u8, name, "http3")) return .http3;
     if (mem.eql(u8, name, "keyupdate")) return .keyupdate;
+    if (mem.eql(u8, name, "ecn")) return .ecn;
+    if (mem.eql(u8, name, "connectionmigration")) return .connectionmigration;
+    if (mem.eql(u8, name, "chacha20")) return .chacha20;
     return .unsupported;
 }
 
@@ -125,47 +132,41 @@ pub fn main() !void {
     }
 
     const use_h3 = (testcase == .http3);
+    const cipher_only: ?quic_crypto.CipherSuite = if (testcase == .chacha20) .chacha20_poly1305_sha256 else null;
 
     switch (testcase) {
-        .handshake, .transfer, .keyupdate => {
-            // Single connection, download all files
-            try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir);
+        .handshake, .transfer, .ecn, .connectionmigration, .chacha20 => {
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only);
+        },
+        .keyupdate => {
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, true, cipher_only);
         },
         .retry => {
-            // Same as transfer (server handles Retry)
-            try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only);
         },
         .multiconnect => {
-            // One connection per file, sequential
             for (urls.items) |url| {
                 const single = [_]ParsedUrl{url};
-                try downloadAll(alloc, &single, use_h3, keylog_file, download_dir);
+                _ = try downloadAll(alloc, &single, use_h3, keylog_file, download_dir, null, false, cipher_only);
             }
         },
-        .resumption => {
-            // Download first file, get session ticket, reconnect for rest
+        .resumption, .zerortt => {
             if (urls.items.len > 0) {
                 const first = [_]ParsedUrl{urls.items[0]};
-                try downloadAll(alloc, &first, use_h3, keylog_file, download_dir);
-                // TODO: Implement session ticket storage and resumption
+                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only);
                 if (urls.items.len > 1) {
-                    try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir);
-                }
-            }
-        },
-        .zerortt => {
-            // Like resumption but with 0-RTT on second connection
-            if (urls.items.len > 0) {
-                const first = [_]ParsedUrl{urls.items[0]};
-                try downloadAll(alloc, &first, use_h3, keylog_file, download_dir);
-                // TODO: Implement 0-RTT with stored session ticket
-                if (urls.items.len > 1) {
-                    try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir);
+                    if (ticket) |*t| {
+                        std.log.info("resuming with session ticket (lifetime={d}s)", .{t.lifetime});
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only);
+                    } else {
+                        std.log.warn("no session ticket received, falling back to full handshake", .{});
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only);
+                    }
                 }
             }
         },
         .http3 => {
-            try downloadAll(alloc, urls.items, true, keylog_file, download_dir);
+            _ = try downloadAll(alloc, urls.items, true, keylog_file, download_dir, null, false, cipher_only);
         },
         .unsupported => unreachable,
     }
@@ -179,8 +180,11 @@ fn downloadAll(
     use_h3: bool,
     keylog_file: ?std.fs.File,
     download_dir: []const u8,
-) !void {
-    if (urls.len == 0) return;
+    session_ticket: ?*const tls13.SessionTicket,
+    force_key_update: bool,
+    cipher_suite_only: ?quic_crypto.CipherSuite,
+) !?tls13.SessionTicket {
+    if (urls.len == 0) return null;
 
     const host = urls[0].host;
     const port = urls[0].port;
@@ -221,6 +225,8 @@ fn downloadAll(
         .server_name = host,
         .skip_cert_verify = true,
         .keylog_file = keylog_file,
+        .session_ticket = session_ticket,
+        .cipher_suite_only = cipher_suite_only,
     };
 
     var conn = try connection.connect(alloc, host, .{}, tls_config, null);
@@ -298,10 +304,26 @@ fn downloadAll(
     std.Thread.sleep(50 * std.time.ns_per_ms);
 
     if (use_h3) {
-        try downloadH3(alloc, &conn, sockfd, &remote_addr, addr_size, local_addr, urls, download_dir);
+        try downloadH3(alloc, &conn, sockfd, &remote_addr, addr_size, local_addr, urls, download_dir, force_key_update);
     } else {
-        try downloadH0(alloc, &conn, sockfd, &remote_addr, addr_size, local_addr, urls, download_dir);
+        try downloadH0(alloc, &conn, sockfd, &remote_addr, addr_size, local_addr, urls, download_dir, force_key_update);
     }
+
+    // Wait briefly for NewSessionTicket if we don't have one yet
+    if (conn.session_ticket == null) {
+        var ticket_iter: usize = 0;
+        while (conn.session_ticket == null and ticket_iter < 100) : (ticket_iter += 1) {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+            drainRecv(&conn, sockfd, local_addr, &remote_addr, &addr_size);
+            const more = conn.send(&out) catch 0;
+            if (more > 0) {
+                _ = posix.sendto(sockfd, out[0..more], 0, &remote_addr, addr_size) catch {};
+            }
+        }
+    }
+
+    // Capture session ticket before closing
+    const result_ticket = conn.session_ticket;
 
     // Close connection
     conn.close(0, "done");
@@ -321,6 +343,8 @@ fn downloadAll(
             _ = posix.sendto(sockfd, out[0..retransmit_bytes], 0, &remote_addr, addr_size) catch {};
         }
     }
+
+    return result_ticket;
 }
 
 fn downloadH0(
@@ -332,6 +356,7 @@ fn downloadH0(
     local_addr: net.Address,
     urls: []const ParsedUrl,
     download_dir: []const u8,
+    force_key_update: bool,
 ) !void {
     var h0c = h0.H0Connection.init(alloc, conn, false);
     defer h0c.deinit();
@@ -375,6 +400,8 @@ fn downloadH0(
     var completed: usize = 0;
     var resp_iter: usize = 0;
     const max_resp_iters: usize = 5000;
+    var total_bytes_received: usize = 0;
+    var key_update_done = false;
 
     while (completed < urls.len and resp_iter < max_resp_iters) : (resp_iter += 1) {
         std.Thread.sleep(1 * std.time.ns_per_ms);
@@ -399,6 +426,20 @@ fn downloadH0(
             }
         }
 
+        // Force key update early in the connection for keyupdate test
+        if (force_key_update and !key_update_done and total_bytes_received > 0) {
+            if (conn.key_update) |*ku| {
+                if (ku.canUpdate()) {
+                    const now = @as(i64, @intCast(std.time.nanoTimestamp()));
+                    const pto_ns = conn.pkt_handler.rtt_stats.pto();
+                    ku.rollKeys(now, pto_ns);
+                    conn.packer.key_phase = ku.key_phase;
+                    key_update_done = true;
+                    std.log.info("key update: forced for interop test, new key_phase={}", .{ku.key_phase});
+                }
+            }
+        }
+
         // Send ACKs
         const ack_bytes = conn.send(&out) catch continue;
         if (ack_bytes > 0) {
@@ -415,6 +456,7 @@ fn downloadH0(
                 .data => |d| {
                     if (downloads.getPtr(d.stream_id)) |buf| {
                         buf.appendSlice(alloc, d.data) catch {};
+                        total_bytes_received += d.data.len;
                     }
                 },
                 .finished => |stream_id| {
@@ -444,6 +486,7 @@ fn downloadH3(
     local_addr: net.Address,
     urls: []const ParsedUrl,
     download_dir: []const u8,
+    force_key_update: bool,
 ) !void {
     var h3c = h3.H3Connection.init(alloc, conn, false);
     defer h3c.deinit();
@@ -492,6 +535,8 @@ fn downloadH3(
     var completed: usize = 0;
     var resp_iter: usize = 0;
     const max_resp_iters: usize = 5000;
+    var total_bytes_received: usize = 0;
+    var key_update_done = false;
 
     while (completed < urls.len and resp_iter < max_resp_iters) : (resp_iter += 1) {
         std.Thread.sleep(1 * std.time.ns_per_ms);
@@ -516,6 +561,20 @@ fn downloadH3(
             }
         }
 
+        // Force key update early in the connection for keyupdate test
+        if (force_key_update and !key_update_done and total_bytes_received > 0) {
+            if (conn.key_update) |*ku| {
+                if (ku.canUpdate()) {
+                    const now = @as(i64, @intCast(std.time.nanoTimestamp()));
+                    const pto_ns = conn.pkt_handler.rtt_stats.pto();
+                    ku.rollKeys(now, pto_ns);
+                    conn.packer.key_phase = ku.key_phase;
+                    key_update_done = true;
+                    std.log.info("key update: forced for interop test, new key_phase={}", .{ku.key_phase});
+                }
+            }
+        }
+
         // Send ACKs
         const ack_bytes = conn.send(&out) catch continue;
         if (ack_bytes > 0) {
@@ -532,6 +591,7 @@ fn downloadH3(
                 .data => |d| {
                     if (downloads.getPtr(d.stream_id)) |buf| {
                         buf.appendSlice(alloc, d.data) catch {};
+                        total_bytes_received += d.data.len;
                     }
                 },
                 .finished => |stream_id| {

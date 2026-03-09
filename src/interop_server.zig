@@ -15,6 +15,7 @@ const io = std.io;
 
 const connection = @import("quic/connection.zig");
 const connection_manager = @import("quic/connection_manager.zig");
+const quic_crypto = @import("quic/crypto.zig");
 const packet = @import("quic/packet.zig");
 const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
@@ -35,6 +36,9 @@ const TestCase = enum {
     zerortt,
     http3,
     keyupdate,
+    ecn,
+    connectionmigration,
+    chacha20,
     unsupported,
 };
 
@@ -47,6 +51,9 @@ fn parseTestCase(name: []const u8) TestCase {
     if (std.mem.eql(u8, name, "zerortt")) return .zerortt;
     if (std.mem.eql(u8, name, "http3")) return .http3;
     if (std.mem.eql(u8, name, "keyupdate")) return .keyupdate;
+    if (std.mem.eql(u8, name, "ecn")) return .ecn;
+    if (std.mem.eql(u8, name, "connectionmigration")) return .connectionmigration;
+    if (std.mem.eql(u8, name, "chacha20")) return .chacha20;
     return .unsupported;
 }
 
@@ -60,6 +67,8 @@ pub fn main() !void {
     const testcase = parseTestCase(testcase_str);
     const sslkeylogfile_path = std.posix.getenv("SSLKEYLOGFILE");
     const www_dir = std.posix.getenv("WWW") orelse "/www";
+    const certs_dir = std.posix.getenv("CERTS") orelse "/certs";
+    const port_str = std.posix.getenv("PORT") orelse "443";
 
     std.log.info("interop server: testcase={s}", .{testcase_str});
 
@@ -76,12 +85,17 @@ pub fn main() !void {
     defer if (keylog_file) |f| f.close();
 
     // Load certificates
-    const cert_pem = loadFile(alloc, "/certs/cert.pem") catch |err| {
-        std.log.err("failed to load /certs/cert.pem: {any}", .{err});
+    var cert_path_buf: [256]u8 = undefined;
+    const cert_path = std.fmt.bufPrint(&cert_path_buf, "{s}/cert.pem", .{certs_dir}) catch "/certs/cert.pem";
+    var key_path_buf: [256]u8 = undefined;
+    const key_path = std.fmt.bufPrint(&key_path_buf, "{s}/priv.key", .{certs_dir}) catch "/certs/priv.key";
+
+    const cert_pem = loadFile(alloc, cert_path) catch |err| {
+        std.log.err("failed to load {s}: {any}", .{ cert_path, err });
         return err;
     };
-    const key_pem = loadFile(alloc, "/certs/priv.key") catch |err| {
-        std.log.err("failed to load /certs/priv.key: {any}", .{err});
+    const key_pem = loadFile(alloc, key_path) catch |err| {
+        std.log.err("failed to load {s}: {any}", .{ key_path, err });
         return err;
     };
 
@@ -109,16 +123,19 @@ pub fn main() !void {
     var static_reset_key: [16]u8 = undefined;
     std.crypto.random.bytes(&static_reset_key);
 
+    const cipher_only: ?quic_crypto.CipherSuite = if (testcase == .chacha20) .chacha20_poly1305_sha256 else null;
+
     const tls_config: tls13.TlsConfig = .{
         .cert_chain_der = cert_chain,
         .private_key_bytes = ec_private_key,
         .alpn = alpn,
         .ticket_key = ticket_key,
         .keylog_file = keylog_file,
+        .cipher_suite_only = cipher_only,
     };
 
     // Create UDP socket
-    const listen_port: u16 = 443;
+    const listen_port: u16 = std.fmt.parseInt(u16, port_str, 10) catch 443;
     const local_addr = try std.net.Address.parseIp4("0.0.0.0", listen_port);
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);

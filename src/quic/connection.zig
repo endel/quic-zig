@@ -773,8 +773,11 @@ pub const Connection = struct {
         // Handle key phase change for 1-RTT packets (RFC 9001 Section 6)
         if (epoch == .application) {
             if (self.key_update) |*ku| {
-                if (header.key_phase != ku.key_phase) {
-                    // Peer initiated a key update
+                if (header.key_phase != ku.key_phase and ku.first_acked_with_current) {
+                    // Peer initiated a key update (RFC 9001 §6.1)
+                    // Only roll if we've confirmed the peer has our current keys
+                    // (first_acked_with_current=true). Otherwise the mismatch is
+                    // just an in-flight packet from before our own key update.
                     const pto_ns = self.pkt_handler.rtt_stats.pto();
                     ku.rollKeys(now, pto_ns);
                     self.packer.key_phase = ku.key_phase;
@@ -1523,11 +1526,12 @@ pub const Connection = struct {
                         const app_open = self.pkt_num_spaces[2].crypto_open.?;
                         const app_seal = self.pkt_num_spaces[2].crypto_seal.?;
 
-                        self.key_update = quic_crypto.KeyUpdateManager.init(
+                        self.key_update = quic_crypto.KeyUpdateManager.initWithCipherSuite(
                             recv_secret,
                             send_secret,
                             app_open.hp_key,
                             app_seal.hp_key,
+                            hs.negotiated_cipher_suite,
                         );
                         std.log.info("KeyUpdateManager initialized for 1-RTT key rotation", .{});
                     }

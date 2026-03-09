@@ -4,12 +4,13 @@ const packet = @import("packet.zig");
 const assert = std.debug.assert;
 
 const crypto = std.crypto;
-// const tls = std.crypto.tls;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 const Aes128 = crypto.core.aes.Aes128;
 const Aes256 = crypto.core.aes.Aes256;
+const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
+const ChaCha20IETF = crypto.stream.chacha.ChaCha20IETF;
 
 // binascii.unhexlify("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
 const INITIAL_SALT_VERSION_1 = [_]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0xc, 0xad, 0xcc, 0xbb, 0x7f, 0xa };
@@ -18,20 +19,33 @@ const INITIAL_SALT_VERSION_1 = [_]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 
 pub const SAMPLE_LEN = 16;
 pub const MASK_LEN = 5;
 
-// during this experimentational phase, only AES128_GCM is supported.
 pub const Aead = Aes128Gcm;
 const Hmac = HmacSha256;
 
-// TODO: sizes differ per algorithm. Currently using `Aes128`
+// AES-128-GCM key length (used for initial keys which are always AES)
 pub const key_len = 16;
 pub const nonce_len = 12;
+// Max key length across all cipher suites (ChaCha20 = 32 bytes)
+pub const max_key_len = 32;
 
-// // TODO: support the 3 algorithms below (only AES128_GCM currently supported)
-// pub const Algorithm = enum {
-//     AES128_GCM,
-//     AES256_GCM,
-//     ChaCha20_Poly1305,
-// };
+pub const CipherSuite = enum(u16) {
+    aes_128_gcm_sha256 = 0x1301,
+    chacha20_poly1305_sha256 = 0x1303,
+
+    pub fn keyLen(self: CipherSuite) usize {
+        return switch (self) {
+            .aes_128_gcm_sha256 => 16,
+            .chacha20_poly1305_sha256 => 32,
+        };
+    }
+
+    pub fn hpKeyLen(self: CipherSuite) usize {
+        return switch (self) {
+            .aes_128_gcm_sha256 => 16,
+            .chacha20_poly1305_sha256 => 32,
+        };
+    }
+};
 
 // TODO: merge this structure with "packet.Epoch" [??] they're basically the same!
 pub const EncryptionLevel = enum(u8) {
@@ -42,21 +56,14 @@ pub const EncryptionLevel = enum(u8) {
 };
 
 pub const Open = struct {
-    // alg: Algorithm,
-    // ctx: anytype, // EVP_AEAD_CTX
-    // hp_key: aead.HeaderProtectionKey,
-
-    key: [key_len]u8, // KEY
-    hp_key: [key_len]u8, // HP key
-    nonce: [nonce_len]u8, // IV
+    key: [max_key_len]u8 = .{0} ** max_key_len,
+    hp_key: [max_key_len]u8 = .{0} ** max_key_len,
+    nonce: [nonce_len]u8,
+    cipher_suite: CipherSuite = .aes_128_gcm_sha256,
 
     /// Generate a new QUIC Header Protection mask.
-    ///
     pub fn newMask(self: *const Open, sample: *const [SAMPLE_LEN]u8) [MASK_LEN]u8 {
-        const ctx = Aes128.initEnc(self.hp_key);
-        var encrypted_out: [SAMPLE_LEN]u8 = .{0x00} ** SAMPLE_LEN;
-        ctx.encrypt(&encrypted_out, sample);
-        return encrypted_out[0..MASK_LEN].*;
+        return computeHpMask(sample, self.hp_key, self.cipher_suite);
     }
 
     pub fn decryptPayload(
@@ -65,7 +72,7 @@ pub const Open = struct {
         associated_data: []const u8,
         payload: []u8,
     ) error{ AuthenticationFailed, OutOfMemory }![]u8 {
-        const tag_len = Aead.tag_length;
+        const tag_len = 16; // Same for both AES-128-GCM and ChaCha20-Poly1305
         const payload_len = payload.len;
 
         assert(payload_len >= tag_len);
@@ -79,33 +86,34 @@ pub const Open = struct {
         const aead_nonce = makeNonce(self.nonce, packet_number);
         const bytes = payload[0..(payload_len - tag_len)];
 
-        Aead.decrypt(
-            bytes, // output
-            bytes, // input
-            tag,
-            associated_data,
-            aead_nonce,
-            self.key,
-        ) catch |err| {
-            std.log.err("AEAD decryption failed: {any}", .{err});
-            return err;
-        };
+        switch (self.cipher_suite) {
+            .aes_128_gcm_sha256 => {
+                Aes128Gcm.decrypt(bytes, bytes, tag, associated_data, aead_nonce, self.key[0..16].*) catch |err| {
+                    std.log.err("AES-128-GCM decryption failed: {any}", .{err});
+                    return err;
+                };
+            },
+            .chacha20_poly1305_sha256 => {
+                ChaCha20Poly1305.decrypt(bytes, bytes, tag, associated_data, aead_nonce, self.key) catch |err| {
+                    std.log.err("ChaCha20-Poly1305 decryption failed: {any}", .{err});
+                    return err;
+                };
+            },
+        }
 
         return bytes;
     }
 };
 
 pub const Seal = struct {
-    key: [key_len]u8,
-    hp_key: [key_len]u8,
+    key: [max_key_len]u8 = .{0} ** max_key_len,
+    hp_key: [max_key_len]u8 = .{0} ** max_key_len,
     nonce: [nonce_len]u8,
+    cipher_suite: CipherSuite = .aes_128_gcm_sha256,
 
     /// Generate a new QUIC Header Protection mask.
     pub fn newMask(self: *const Seal, sample: *const [SAMPLE_LEN]u8) [MASK_LEN]u8 {
-        const ctx = Aes128.initEnc(self.hp_key);
-        var encrypted_out: [SAMPLE_LEN]u8 = undefined;
-        ctx.encrypt(&encrypted_out, sample);
-        return encrypted_out[0..MASK_LEN].*;
+        return computeHpMask(sample, self.hp_key, self.cipher_suite);
     }
 
     /// Encrypt a QUIC packet payload using AEAD.
@@ -119,19 +127,19 @@ pub const Seal = struct {
         out: []u8,
     ) usize {
         const aead_nonce = makeNonce(self.nonce, packet_number);
-        const tag_len = Aead.tag_length;
+        const tag_len = 16; // Same for both
 
         assert(out.len >= plaintext.len + tag_len);
 
         var tag: [tag_len]u8 = undefined;
-        Aead.encrypt(
-            out[0..plaintext.len],
-            &tag,
-            plaintext,
-            associated_data,
-            aead_nonce,
-            self.key,
-        );
+        switch (self.cipher_suite) {
+            .aes_128_gcm_sha256 => {
+                Aes128Gcm.encrypt(out[0..plaintext.len], &tag, plaintext, associated_data, aead_nonce, self.key[0..16].*);
+            },
+            .chacha20_poly1305_sha256 => {
+                ChaCha20Poly1305.encrypt(out[0..plaintext.len], &tag, plaintext, associated_data, aead_nonce, self.key);
+            },
+        }
         @memcpy(out[plaintext.len..][0..tag_len], &tag);
 
         return plaintext.len + tag_len;
@@ -150,27 +158,43 @@ fn makeNonce(iv: [nonce_len]u8, packet_number: u64) [nonce_len]u8 {
     return n;
 }
 
+/// Compute a QUIC Header Protection mask from a sample.
+/// AES: AES-ECB encrypt the sample, take first 5 bytes.
+/// ChaCha20: counter=sample[0..4] LE, nonce=sample[4..16], encrypt 5 zero bytes.
+pub fn computeHpMask(sample: *const [SAMPLE_LEN]u8, hp_key: [max_key_len]u8, cipher_suite: CipherSuite) [MASK_LEN]u8 {
+    switch (cipher_suite) {
+        .aes_128_gcm_sha256 => {
+            const ctx = Aes128.initEnc(hp_key[0..16].*);
+            var encrypted_out: [SAMPLE_LEN]u8 = undefined;
+            ctx.encrypt(&encrypted_out, sample);
+            return encrypted_out[0..MASK_LEN].*;
+        },
+        .chacha20_poly1305_sha256 => {
+            // RFC 9001 §5.4.4: counter=sample[0..4] LE, nonce=sample[4..16]
+            const counter = std.mem.readInt(u32, sample[0..4], .little);
+            const nonce: [12]u8 = sample[4..16].*;
+            var zeros: [MASK_LEN]u8 = .{0} ** MASK_LEN;
+            var mask: [MASK_LEN]u8 = undefined;
+            ChaCha20IETF.xor(&mask, &zeros, counter, hp_key, nonce);
+            return mask;
+        },
+    }
+}
+
 /// Apply header protection to an outgoing packet.
 /// RFC 9001 Section 5.4.
-///
-/// `packet` is the full serialized packet (header + encrypted payload + tag).
-/// `pn_offset` is the byte offset where the packet number starts.
-/// `pn_len` is the length of the encoded packet number (1-4).
 pub fn applyHeaderProtection(
     pkt_buf: []u8,
     pn_offset: usize,
     pn_len: usize,
-    hp_key: [key_len]u8,
+    hp_key: [max_key_len]u8,
+    cipher_suite: CipherSuite,
 ) void {
-    // RFC 9001 Section 5.4.2: Sample starts 4 bytes after the START of packet number field
     const sample_offset = pn_offset + 4;
     if (sample_offset + SAMPLE_LEN > pkt_buf.len) return;
 
     const sample: *const [SAMPLE_LEN]u8 = pkt_buf[sample_offset..][0..SAMPLE_LEN];
-    const ctx = Aes128.initEnc(hp_key);
-    var encrypted: [SAMPLE_LEN]u8 = undefined;
-    ctx.encrypt(&encrypted, sample);
-    const mask = encrypted[0..MASK_LEN];
+    const mask = computeHpMask(sample, hp_key, cipher_suite);
 
     // Apply mask to first byte
     if (isLongHeader(pkt_buf[0])) {
@@ -190,17 +214,14 @@ pub fn applyHeaderProtection(
 pub fn removeHeaderProtection(
     pkt_buf: []u8,
     pn_offset: usize,
-    hp_key: [key_len]u8,
+    hp_key: [max_key_len]u8,
+    cipher_suite: CipherSuite,
 ) usize {
-    // Sample starts 4 bytes after the start of the packet number field
     const sample_offset = pn_offset + 4;
     if (sample_offset + SAMPLE_LEN > pkt_buf.len) return 0;
 
     const sample: *const [SAMPLE_LEN]u8 = pkt_buf[sample_offset..][0..SAMPLE_LEN];
-    const ctx = Aes128.initEnc(hp_key);
-    var encrypted: [SAMPLE_LEN]u8 = undefined;
-    ctx.encrypt(&encrypted, sample);
-    const mask = encrypted[0..MASK_LEN];
+    const mask = computeHpMask(sample, hp_key, cipher_suite);
 
     // Unmask first byte
     if (isLongHeader(pkt_buf[0])) {
@@ -273,17 +294,25 @@ pub fn deriveInitialKeyMaterial(
     const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, cid);
     var secret: [32]u8 = undefined;
 
-    // Client
+    // Client (Initial keys are always AES-128-GCM)
     secret = hkdfExpandLabel(initial_secret, "client in", "", Hmac.key_length);
-    const client_key = hkdfExpandLabel(secret, "quic key", "", key_len);
+    const client_key_16 = hkdfExpandLabel(secret, "quic key", "", key_len);
     const client_iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
-    const client_hp_key = hkdfExpandLabel(secret, "quic hp", "", key_len); //header protection key
+    const client_hp_16 = hkdfExpandLabel(secret, "quic hp", "", key_len);
+    var client_key: [max_key_len]u8 = .{0} ** max_key_len;
+    @memcpy(client_key[0..key_len], &client_key_16);
+    var client_hp_key: [max_key_len]u8 = .{0} ** max_key_len;
+    @memcpy(client_hp_key[0..key_len], &client_hp_16);
 
     // Server
     secret = hkdfExpandLabel(initial_secret, "server in", "", Hmac.key_length);
-    const server_key = hkdfExpandLabel(secret, "quic key", "", key_len);
+    const server_key_16 = hkdfExpandLabel(secret, "quic key", "", key_len);
     const server_iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
-    const server_hp_key = hkdfExpandLabel(secret, "quic hp", "", key_len); //header protection key
+    const server_hp_16 = hkdfExpandLabel(secret, "quic hp", "", key_len);
+    var server_key: [max_key_len]u8 = .{0} ** max_key_len;
+    @memcpy(server_key[0..key_len], &server_key_16);
+    var server_hp_key: [max_key_len]u8 = .{0} ** max_key_len;
+    @memcpy(server_hp_key[0..key_len], &server_hp_16);
 
     return if (is_server) .{
         Open{ .key = client_key, .hp_key = client_hp_key, .nonce = client_iv },
@@ -463,6 +492,31 @@ pub fn hkdfExpandLabel(
     return out[0..length].*;
 }
 
+/// Derive a QUIC key and pad to max_key_len.
+/// `actual_len` is the real key length (16 for AES, 32 for ChaCha20).
+pub fn deriveKeyPadded(secret: [32]u8, actual_len: usize) [max_key_len]u8 {
+    var result: [max_key_len]u8 = .{0} ** max_key_len;
+    if (actual_len == 32) {
+        result = hkdfExpandLabel(secret, "quic key", "", 32);
+    } else {
+        const k16 = hkdfExpandLabel(secret, "quic key", "", 16);
+        @memcpy(result[0..16], &k16);
+    }
+    return result;
+}
+
+/// Derive a QUIC HP key and pad to max_key_len.
+pub fn deriveHpKeyPadded(secret: [32]u8, actual_len: usize) [max_key_len]u8 {
+    var result: [max_key_len]u8 = .{0} ** max_key_len;
+    if (actual_len == 32) {
+        result = hkdfExpandLabel(secret, "quic hp", "", 32);
+    } else {
+        const k16 = hkdfExpandLabel(secret, "quic hp", "", 16);
+        @memcpy(result[0..16], &k16);
+    }
+    return result;
+}
+
 /// AES-128-GCM confidentiality limit: 2^23 packets (~8M).
 /// After this many packets, keys must be rotated to maintain security.
 pub const CONFIDENTIALITY_LIMIT: u64 = 1 << 23;
@@ -495,8 +549,11 @@ pub const KeyUpdateManager = struct {
     key_phase: bool = false,
 
     // Header protection keys (never change across updates)
-    hp_open: [key_len]u8,
-    hp_seal: [key_len]u8,
+    hp_open: [max_key_len]u8,
+    hp_seal: [max_key_len]u8,
+
+    // Cipher suite for this key generation
+    cipher_suite: CipherSuite = .aes_128_gcm_sha256,
 
     // Traffic secrets for deriving next-generation keys
     recv_secret: [32]u8,
@@ -517,28 +574,35 @@ pub const KeyUpdateManager = struct {
     /// Initialize the key update manager from initial traffic secrets.
     /// `recv_secret` is the peer's traffic secret (for decryption).
     /// `send_secret` is our traffic secret (for encryption).
-    pub fn init(recv_secret: [32]u8, send_secret: [32]u8, recv_hp: [key_len]u8, send_hp: [key_len]u8) KeyUpdateManager {
+    pub fn init(recv_secret: [32]u8, send_secret: [32]u8, recv_hp: [max_key_len]u8, send_hp: [max_key_len]u8) KeyUpdateManager {
+        return initWithCipherSuite(recv_secret, send_secret, recv_hp, send_hp, .aes_128_gcm_sha256);
+    }
+
+    pub fn initWithCipherSuite(recv_secret: [32]u8, send_secret: [32]u8, recv_hp: [max_key_len]u8, send_hp: [max_key_len]u8, cipher_suite: CipherSuite) KeyUpdateManager {
+        const kl = cipher_suite.keyLen();
+
         // Derive current Open/Seal from the initial secrets
-        const recv_key = hkdfExpandLabel(recv_secret, "quic key", "", key_len);
+        const recv_key = deriveKeyPadded(recv_secret, kl);
         const recv_iv = hkdfExpandLabel(recv_secret, "quic iv", "", nonce_len);
-        const send_key = hkdfExpandLabel(send_secret, "quic key", "", key_len);
+        const send_key = deriveKeyPadded(send_secret, kl);
         const send_iv = hkdfExpandLabel(send_secret, "quic iv", "", nonce_len);
 
         // Pre-compute next generation secrets and keys
         const next_recv_secret = deriveNextTrafficSecret(recv_secret);
         const next_send_secret = deriveNextTrafficSecret(send_secret);
-        const next_recv_key = hkdfExpandLabel(next_recv_secret, "quic key", "", key_len);
+        const next_recv_key = deriveKeyPadded(next_recv_secret, kl);
         const next_recv_iv = hkdfExpandLabel(next_recv_secret, "quic iv", "", nonce_len);
-        const next_send_key = hkdfExpandLabel(next_send_secret, "quic key", "", key_len);
+        const next_send_key = deriveKeyPadded(next_send_secret, kl);
         const next_send_iv = hkdfExpandLabel(next_send_secret, "quic iv", "", nonce_len);
 
         return .{
-            .current_open = .{ .key = recv_key, .hp_key = recv_hp, .nonce = recv_iv },
-            .current_seal = .{ .key = send_key, .hp_key = send_hp, .nonce = send_iv },
-            .next_open = .{ .key = next_recv_key, .hp_key = recv_hp, .nonce = next_recv_iv },
-            .next_seal = .{ .key = next_send_key, .hp_key = send_hp, .nonce = next_send_iv },
+            .current_open = .{ .key = recv_key, .hp_key = recv_hp, .nonce = recv_iv, .cipher_suite = cipher_suite },
+            .current_seal = .{ .key = send_key, .hp_key = send_hp, .nonce = send_iv, .cipher_suite = cipher_suite },
+            .next_open = .{ .key = next_recv_key, .hp_key = recv_hp, .nonce = next_recv_iv, .cipher_suite = cipher_suite },
+            .next_seal = .{ .key = next_send_key, .hp_key = send_hp, .nonce = next_send_iv, .cipher_suite = cipher_suite },
             .hp_open = recv_hp,
             .hp_seal = send_hp,
+            .cipher_suite = cipher_suite,
             .recv_secret = recv_secret,
             .send_secret = send_secret,
         };
@@ -560,17 +624,20 @@ pub const KeyUpdateManager = struct {
         self.send_secret = deriveNextTrafficSecret(self.send_secret);
 
         // Pre-compute new next-generation keys
+        const kl = self.cipher_suite.keyLen();
         const next_recv_secret = deriveNextTrafficSecret(self.recv_secret);
         const next_send_secret = deriveNextTrafficSecret(self.send_secret);
         self.next_open = .{
-            .key = hkdfExpandLabel(next_recv_secret, "quic key", "", key_len),
+            .key = deriveKeyPadded(next_recv_secret, kl),
             .hp_key = self.hp_open,
             .nonce = hkdfExpandLabel(next_recv_secret, "quic iv", "", nonce_len),
+            .cipher_suite = self.cipher_suite,
         };
         self.next_seal = .{
-            .key = hkdfExpandLabel(next_send_secret, "quic key", "", key_len),
+            .key = deriveKeyPadded(next_send_secret, kl),
             .hp_key = self.hp_seal,
             .nonce = hkdfExpandLabel(next_send_secret, "quic iv", "", nonce_len),
+            .cipher_suite = self.cipher_suite,
         };
 
         // Toggle key phase
@@ -588,11 +655,13 @@ pub const KeyUpdateManager = struct {
         if (key_phase_bit == self.key_phase) {
             return &self.current_open;
         }
-        // Key phase differs from current → either previous or next generation
+        // Key phase differs from current:
+        // 1. If prev_open exists → reordered packet from previous generation
+        // 2. Otherwise → peer-initiated key update, use next_open (RFC 9001 §6.1)
         if (self.prev_open != null) {
             return &self.prev_open.?;
         }
-        return null;
+        return &self.next_open;
     }
 
     /// Get the current Seal keys and key phase bit for encrypting a packet.
@@ -657,8 +726,8 @@ test "deriveNextTrafficSecret produces different secret" {
 test "KeyUpdateManager: init and basic operations" {
     const recv_secret = [_]u8{0xAA} ** 32;
     const send_secret = [_]u8{0xBB} ** 32;
-    const recv_hp = [_]u8{0xCC} ** 16;
-    const send_hp = [_]u8{0xDD} ** 16;
+    const recv_hp = [_]u8{0xCC} ** max_key_len;
+    const send_hp = [_]u8{0xDD} ** max_key_len;
 
     var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
 
@@ -685,8 +754,8 @@ test "KeyUpdateManager: init and basic operations" {
 test "KeyUpdateManager: roll keys" {
     const recv_secret = [_]u8{0xAA} ** 32;
     const send_secret = [_]u8{0xBB} ** 32;
-    const recv_hp = [_]u8{0xCC} ** 16;
-    const send_hp = [_]u8{0xDD} ** 16;
+    const recv_hp = [_]u8{0xCC} ** max_key_len;
+    const send_hp = [_]u8{0xDD} ** max_key_len;
 
     var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
     const orig_open_key = mgr.current_open.key;
@@ -724,8 +793,8 @@ test "KeyUpdateManager: roll keys" {
 test "KeyUpdateManager: prev key expiry" {
     const recv_secret = [_]u8{0xAA} ** 32;
     const send_secret = [_]u8{0xBB} ** 32;
-    const recv_hp = [_]u8{0xCC} ** 16;
-    const send_hp = [_]u8{0xDD} ** 16;
+    const recv_hp = [_]u8{0xCC} ** max_key_len;
+    const send_hp = [_]u8{0xDD} ** max_key_len;
 
     var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
 
@@ -747,8 +816,8 @@ test "KeyUpdateManager: encrypt/decrypt roundtrip across key update" {
     // Simulate two sides: client and server with swapped secrets
     const client_recv = [_]u8{0x11} ** 32; // = server_send
     const client_send = [_]u8{0x22} ** 32; // = server_recv
-    const hp_a = [_]u8{0x33} ** 16;
-    const hp_b = [_]u8{0x44} ** 16;
+    const hp_a = [_]u8{0x33} ** max_key_len;
+    const hp_b = [_]u8{0x44} ** max_key_len;
 
     var client = KeyUpdateManager.init(client_recv, client_send, hp_a, hp_b);
     var server = KeyUpdateManager.init(client_send, client_recv, hp_b, hp_a);
@@ -827,13 +896,13 @@ test "header protection roundtrip" {
     @memcpy(&orig_pn, pkt[pn_offset..][0..4]);
 
     // Apply header protection
-    applyHeaderProtection(&pkt, pn_offset, pn_len, seal_key.hp_key);
+    applyHeaderProtection(&pkt, pn_offset, pn_len, seal_key.hp_key, seal_key.cipher_suite);
 
     // Verify something changed
     try std.testing.expect(pkt[0] != orig_first or !std.mem.eql(u8, &orig_pn, pkt[pn_offset..][0..4]));
 
     // Remove header protection
-    const recovered_pn_len = removeHeaderProtection(&pkt, pn_offset, open_key.hp_key);
+    const recovered_pn_len = removeHeaderProtection(&pkt, pn_offset, open_key.hp_key, open_key.cipher_suite);
     try std.testing.expectEqual(pn_len, recovered_pn_len);
 
     // Verify we got back the original values
@@ -883,11 +952,11 @@ test "RFC 9001 A.2: Client Initial packet protection" {
     const keys = try deriveInitialKeyMaterial(&dcid, 0x00000001, false);
     const seal = keys[1]; // client seal keys
 
-    // Verify derived keys match RFC 9001 A.1
+    // Verify derived keys match RFC 9001 A.1 (AES-128-GCM: 16-byte keys padded to 32)
     try std.testing.expectEqualSlices(u8, &[_]u8{
         0x1f, 0x36, 0x96, 0x13, 0xdd, 0x76, 0xd5, 0x46,
         0x77, 0x30, 0xef, 0xcb, 0xe3, 0xb1, 0xa2, 0x2d,
-    }, &seal.key);
+    }, seal.key[0..16]);
     try std.testing.expectEqualSlices(u8, &[_]u8{
         0xfa, 0x04, 0x4b, 0x2f, 0x42, 0xa3, 0xfd, 0x3b,
         0x46, 0xfb, 0x25, 0x5c,
@@ -895,7 +964,7 @@ test "RFC 9001 A.2: Client Initial packet protection" {
     try std.testing.expectEqualSlices(u8, &[_]u8{
         0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10,
         0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2,
-    }, &seal.hp_key);
+    }, seal.hp_key[0..16]);
 
     // Build the Client Initial header (RFC 9001 A.2)
     // First byte: 0xc0 (long header, Initial type, 0-length pn encoding)
@@ -1017,7 +1086,7 @@ test "RFC 9001 A.2: Client Initial packet protection" {
     const total_len = payload_start + enc_len;
 
     // Apply header protection
-    applyHeaderProtection(pkt_buf[0..total_len], pn_offset, 4, seal.hp_key);
+    applyHeaderProtection(pkt_buf[0..total_len], pn_offset, 4, seal.hp_key, seal.cipher_suite);
 
     // Verify the first few bytes of the protected packet match the RFC output
     // RFC 9001 A.2 encrypted packet starts with: c000000001088394c8f03e5157080000
@@ -1034,7 +1103,7 @@ test "RFC 9001 A.2: Client Initial packet protection" {
     var server_open = server_keys[0]; // opens client packets
 
     // Remove header protection
-    const recovered_pn_len = removeHeaderProtection(pkt_buf[0..total_len], pn_offset, server_open.hp_key);
+    const recovered_pn_len = removeHeaderProtection(pkt_buf[0..total_len], pn_offset, server_open.hp_key, server_open.cipher_suite);
     try std.testing.expectEqual(@as(usize, 4), recovered_pn_len);
 
     // Read packet number

@@ -450,6 +450,7 @@ pub const PacketPacker = struct {
             pn_offset - header_start,
             pn_len,
             seal.hp_key,
+            seal.cipher_suite,
         );
 
         // Record the packet as sent
@@ -527,7 +528,7 @@ pub const PacketPacker = struct {
         const total_len = encrypted_start + encrypted_len;
 
         // Apply header protection
-        crypto_mod.applyHeaderProtection(buf[0..total_len], pn_offset, pn_len, seal.hp_key);
+        crypto_mod.applyHeaderProtection(buf[0..total_len], pn_offset, pn_len, seal.hp_key, seal.cipher_suite);
 
         // Record as sent (in_flight but special — caller handles probe loss separately)
         try pkt_handler.onPacketSent(.{

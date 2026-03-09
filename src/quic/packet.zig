@@ -372,11 +372,9 @@ pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *PacketNumSpac
     var sample_buf: [crypto.SAMPLE_LEN]u8 = undefined;
     @memcpy(&sample_buf, fbs.buffer[sample_offset..][0..crypto.SAMPLE_LEN]);
 
-    // Generate mask using the invariant HP key
-    const hp_ctx = std.crypto.core.aes.Aes128.initEnc(ku.hp_open);
-    var encrypted: [crypto.SAMPLE_LEN]u8 = undefined;
-    hp_ctx.encrypt(&encrypted, &sample_buf);
-    const mask = encrypted[0..crypto.MASK_LEN];
+    // Generate mask using the invariant HP key (cipher-suite-aware)
+    const mask_arr = crypto.computeHpMask(&sample_buf, ku.hp_open, ku.cipher_suite);
+    const mask = &mask_arr;
 
     // Short header unmasking
     first_byte ^= (mask[0] & 0x1f);

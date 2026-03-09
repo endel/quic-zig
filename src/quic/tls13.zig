@@ -58,8 +58,9 @@ const GROUP_X25519: u16 = 0x001d;
 // TLS 1.3 version
 const TLS13_VERSION: u16 = 0x0304;
 
-// Cipher suite: TLS_AES_128_GCM_SHA256
+// Cipher suites
 const CIPHER_SUITE_AES128_GCM_SHA256: u16 = 0x1301;
+const CIPHER_SUITE_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
 pub const EncryptionLevel = quic_crypto.EncryptionLevel;
 
@@ -216,7 +217,7 @@ pub const KeySchedule = struct {
         self.computed_app = true;
     }
 
-    // Derive QUIC Open/Seal keys from a traffic secret.
+    // Derive QUIC Open/Seal keys from a traffic secret (AES-128-GCM, 16-byte keys).
     pub fn deriveQuicKeys(traffic_secret: [32]u8) struct { key: [16]u8, iv: [12]u8, hp: [16]u8 } {
         return .{
             .key = quic_crypto.hkdfExpandLabel(traffic_secret, "quic key", "", 16),
@@ -226,13 +227,31 @@ pub const KeySchedule = struct {
     }
 
     pub fn makeOpen(traffic_secret: [32]u8) quic_crypto.Open {
-        const keys = deriveQuicKeys(traffic_secret);
-        return .{ .key = keys.key, .nonce = keys.iv, .hp_key = keys.hp };
+        return makeOpenWithCipher(traffic_secret, .aes_128_gcm_sha256);
     }
 
     pub fn makeSeal(traffic_secret: [32]u8) quic_crypto.Seal {
-        const keys = deriveQuicKeys(traffic_secret);
-        return .{ .key = keys.key, .nonce = keys.iv, .hp_key = keys.hp };
+        return makeSealWithCipher(traffic_secret, .aes_128_gcm_sha256);
+    }
+
+    pub fn makeOpenWithCipher(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite) quic_crypto.Open {
+        const kl = cipher.keyLen();
+        return .{
+            .key = quic_crypto.deriveKeyPadded(traffic_secret, kl),
+            .nonce = quic_crypto.hkdfExpandLabel(traffic_secret, "quic iv", "", 12),
+            .hp_key = quic_crypto.deriveHpKeyPadded(traffic_secret, cipher.hpKeyLen()),
+            .cipher_suite = cipher,
+        };
+    }
+
+    pub fn makeSealWithCipher(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite) quic_crypto.Seal {
+        const kl = cipher.keyLen();
+        return .{
+            .key = quic_crypto.deriveKeyPadded(traffic_secret, kl),
+            .nonce = quic_crypto.hkdfExpandLabel(traffic_secret, "quic iv", "", 12),
+            .hp_key = quic_crypto.deriveHpKeyPadded(traffic_secret, cipher.hpKeyLen()),
+            .cipher_suite = cipher,
+        };
     }
 
     // Compute the Finished verify_data.
@@ -289,6 +308,7 @@ pub const TlsConfig = struct {
     session_ticket: ?*const SessionTicket = null, // Stored ticket from previous connection (client)
     ticket_key: ?[16]u8 = null, // AES-128-GCM key for encrypting/decrypting tickets (server)
     keylog_file: ?std.fs.File = null, // SSLKEYLOGFILE output (NSS Key Log format)
+    cipher_suite_only: ?quic_crypto.CipherSuite = null, // If set, offer ONLY this cipher suite
 };
 
 // ─── SSLKEYLOGFILE support (NSS Key Log format) ─────────────────────
@@ -434,6 +454,9 @@ pub const Tls13Handshake = struct {
     // Transcript hash at server Finished for app key derivation
     transcript_at_server_finished: [32]u8 = undefined,
 
+    // Negotiated cipher suite (set during ServerHello processing)
+    negotiated_cipher_suite: quic_crypto.CipherSuite = .aes_128_gcm_sha256,
+
     // PSK / 0-RTT fields
     using_psk: bool = false,
     zero_rtt_accepted: bool = false,
@@ -465,6 +488,7 @@ pub const Tls13Handshake = struct {
         self.handshake_keys_installed = false;
         self.app_keys_installed = false;
         self.leaf_pub_key_len = 0;
+        self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
@@ -507,6 +531,7 @@ pub const Tls13Handshake = struct {
         self.handshake_keys_installed = false;
         self.app_keys_installed = false;
         self.leaf_pub_key_len = 0;
+        self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
@@ -541,17 +566,16 @@ pub const Tls13Handshake = struct {
         // If we need to install early (0-RTT) keys, do that first
         if (self.pending_install_early) {
             self.pending_install_early = false;
-            const early_keys = KeySchedule.deriveQuicKeys(self.key_schedule.client_early_traffic_secret);
-            const early_open = quic_crypto.Open{ .key = early_keys.key, .nonce = early_keys.iv, .hp_key = early_keys.hp };
-            const early_seal = quic_crypto.Seal{ .key = early_keys.key, .nonce = early_keys.iv, .hp_key = early_keys.hp };
+            const cs = self.negotiated_cipher_suite;
             return Action{ .install_keys = .{
                 .level = .early_data,
-                .open = early_open,
-                .seal = early_seal,
+                .open = KeySchedule.makeOpenWithCipher(self.key_schedule.client_early_traffic_secret, cs),
+                .seal = KeySchedule.makeSealWithCipher(self.key_schedule.client_early_traffic_secret, cs),
             } };
         }
 
         // If we need to install handshake keys, do that first
+        // Handshake keys always use AES-128-GCM (same as Initial)
         if (self.pending_install_handshake) {
             self.pending_install_handshake = false;
             self.handshake_keys_installed = true;
@@ -570,21 +594,22 @@ pub const Tls13Handshake = struct {
             }
         }
 
-        // If we need to install app keys, do that
+        // If we need to install app keys, use the negotiated cipher suite
         if (self.pending_install_app) {
             self.pending_install_app = false;
             self.app_keys_installed = true;
+            const cs = self.negotiated_cipher_suite;
             if (self.is_server) {
                 return Action{ .install_keys = .{
                     .level = .application,
-                    .open = KeySchedule.makeOpen(self.key_schedule.client_app_traffic_secret),
-                    .seal = KeySchedule.makeSeal(self.key_schedule.server_app_traffic_secret),
+                    .open = KeySchedule.makeOpenWithCipher(self.key_schedule.client_app_traffic_secret, cs),
+                    .seal = KeySchedule.makeSealWithCipher(self.key_schedule.server_app_traffic_secret, cs),
                 } };
             } else {
                 return Action{ .install_keys = .{
                     .level = .application,
-                    .open = KeySchedule.makeOpen(self.key_schedule.server_app_traffic_secret),
-                    .seal = KeySchedule.makeSeal(self.key_schedule.client_app_traffic_secret),
+                    .open = KeySchedule.makeOpenWithCipher(self.key_schedule.server_app_traffic_secret, cs),
+                    .seal = KeySchedule.makeSealWithCipher(self.key_schedule.client_app_traffic_secret, cs),
                 } };
             }
         }
@@ -648,6 +673,7 @@ pub const Tls13Handshake = struct {
             self.tp_encoded[0..self.tp_encoded_len],
             self.config.session_ticket,
             &self.key_schedule,
+            self.config.cipher_suite_only,
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
@@ -694,9 +720,15 @@ pub const Tls13Handshake = struct {
         pos += session_id_len; // skip session_id echo
 
         if (pos + 3 > body.len) return error.DecodeError;
-        const cipher_suite = readU16(body[pos..]);
+        const cipher_suite_raw = readU16(body[pos..]);
         pos += 2;
-        if (cipher_suite != CIPHER_SUITE_AES128_GCM_SHA256) return error.UnsupportedVersion;
+        if (cipher_suite_raw == CIPHER_SUITE_AES128_GCM_SHA256) {
+            self.negotiated_cipher_suite = .aes_128_gcm_sha256;
+        } else if (cipher_suite_raw == CIPHER_SUITE_CHACHA20_POLY1305_SHA256) {
+            self.negotiated_cipher_suite = .chacha20_poly1305_sha256;
+        } else {
+            return error.UnsupportedVersion;
+        }
 
         pos += 1; // compression_method = 0
 
@@ -975,11 +1007,35 @@ pub const Tls13Handshake = struct {
         pos += 1;
         pos += session_id_len; // skip session_id
 
-        // Cipher suites
+        // Cipher suites — select the best one we support
         if (pos + 2 > body.len) return error.DecodeError;
         const cs_len = readU16(body[pos..]);
         pos += 2;
-        pos += cs_len; // skip cipher suites
+        {
+            var cs_found = false;
+            var cs_pos: usize = 0;
+            while (cs_pos + 2 <= cs_len) : (cs_pos += 2) {
+                const cs_id = readU16(body[pos + cs_pos ..]);
+                // If cipher_suite_only is set, only accept that cipher
+                if (self.config.cipher_suite_only) |required| {
+                    if (cs_id == @intFromEnum(required)) {
+                        self.negotiated_cipher_suite = required;
+                        cs_found = true;
+                        break;
+                    }
+                } else {
+                    if (cs_id == CIPHER_SUITE_AES128_GCM_SHA256 and !cs_found) {
+                        self.negotiated_cipher_suite = .aes_128_gcm_sha256;
+                        cs_found = true;
+                    } else if (cs_id == CIPHER_SUITE_CHACHA20_POLY1305_SHA256 and !cs_found) {
+                        self.negotiated_cipher_suite = .chacha20_poly1305_sha256;
+                        cs_found = true;
+                    }
+                }
+            }
+            if (!cs_found) return error.UnsupportedVersion;
+        }
+        pos += cs_len;
 
         // Compression methods
         if (pos >= body.len) return error.DecodeError;
@@ -1068,6 +1124,7 @@ pub const Tls13Handshake = struct {
             &self.x25519_public,
             &self.client_random, // echo session_id as empty (we use 0-len)
             self.using_psk,
+            self.negotiated_cipher_suite,
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
@@ -1578,6 +1635,7 @@ fn buildClientHello(
     tp_encoded_data: []const u8,
     session_ticket: ?*const SessionTicket,
     key_schedule: *KeySchedule,
+    cipher_suite_only: ?quic_crypto.CipherSuite,
 ) ![]const u8 {
     // Build the body first, then wrap with type + length
     var pos: usize = 4; // reserve space for type + 3-byte length
@@ -1596,11 +1654,22 @@ fn buildClientHello(
     buf[pos] = 0; // session_id_len = 0
     pos += 1;
 
-    // cipher_suites: 2 bytes length + TLS_AES_128_GCM_SHA256
-    writeU16(buf[pos..], 2);
-    pos += 2;
-    writeU16(buf[pos..], CIPHER_SUITE_AES128_GCM_SHA256);
-    pos += 2;
+    // cipher_suites
+    if (cipher_suite_only) |cs| {
+        // Offer only the specified cipher suite (e.g., for chacha20 interop test)
+        writeU16(buf[pos..], 2);
+        pos += 2;
+        writeU16(buf[pos..], @intFromEnum(cs));
+        pos += 2;
+    } else {
+        // Offer both AES-128-GCM and ChaCha20-Poly1305
+        writeU16(buf[pos..], 4);
+        pos += 2;
+        writeU16(buf[pos..], CIPHER_SUITE_AES128_GCM_SHA256);
+        pos += 2;
+        writeU16(buf[pos..], CIPHER_SUITE_CHACHA20_POLY1305_SHA256);
+        pos += 2;
+    }
 
     // compression_methods: 1 byte length + null compression
     buf[pos] = 1;
@@ -1781,6 +1850,7 @@ fn buildServerHello(
     x25519_pub: *const [32]u8,
     _: *const [32]u8, // client_random (unused, was for session_id echo)
     using_psk: bool,
+    cipher_suite: quic_crypto.CipherSuite,
 ) ![]const u8 {
     var pos: usize = 4; // reserve for header
 
@@ -1797,8 +1867,8 @@ fn buildServerHello(
     buf[pos] = 0;
     pos += 1;
 
-    // cipher_suite
-    writeU16(buf[pos..], CIPHER_SUITE_AES128_GCM_SHA256);
+    // cipher_suite (use negotiated from ClientHello)
+    writeU16(buf[pos..], @intFromEnum(cipher_suite));
     pos += 2;
 
     // compression_method
@@ -2199,6 +2269,7 @@ test "buildClientHello: produces valid message" {
         tp_encoded,
         null,
         &ks,
+        null,
     );
 
     // Check message type
@@ -2222,7 +2293,7 @@ test "buildServerHello: produces valid message" {
     @memset(&client_random, 0xAA);
 
     var buf: [512]u8 = undefined;
-    const msg = try buildServerHello(&buf, &random, &pub_key, &client_random, false);
+    const msg = try buildServerHello(&buf, &random, &pub_key, &client_random, false, .aes_128_gcm_sha256);
 
     try std.testing.expectEqual(@as(u8, @intFromEnum(MsgType.server_hello)), msg[0]);
     const body_len = (@as(usize, msg[1]) << 16) | (@as(usize, msg[2]) << 8) | @as(usize, msg[3]);
