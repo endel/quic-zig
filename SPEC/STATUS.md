@@ -113,7 +113,7 @@
 | 14.3.3 | Handling of ICMP Messages by DPLPMTUD | ❌ Missing | No ICMP processing |
 | 14.4 | Sending QUIC PMTU Probes | ✅ Done | PING + PADDING probes |
 | 14.4.1 | PMTU Probes Containing Source Connection ID | ❌ Missing | Probes don't include SCID |
-| **15** | **Versions** | ✅ Done | Version 1 (0x00000001) supported |
+| **15** | **Versions** | ✅ Done | Version 1 (0x00000001) + Version 2 (0x6b3343cf) supported |
 | **16** | **Variable-Length Integer Encoding** | ✅ Done | 1/2/4/8 byte varint |
 | **17** | **Packet Formats** | | |
 | 17.1 | Packet Number Encoding and Decoding | ✅ Done | Truncated PN with window decoding |
@@ -172,7 +172,7 @@
 |----------|---------|------|--------|
 | P3 | §2.3 | Stream Prioritization (RFC 9218) | Medium |
 | ~~P2~~ | ~~§5.2.2~~ | ~~Multi-connection server (CID-based demux)~~ | ~~Done~~ |
-| P3 | §6.2-6.3 | Version Negotiation client retry + greasing | Small |
+| ~~P2~~ | ~~§6.2-6.3~~ | ~~Compatible Version Negotiation (RFC 9368/9369)~~ | ~~Done~~ |
 | P3 | §7.4.1 | 0-RTT transport parameter remember/restore | Medium |
 | ~~P2~~ | ~~§9.6~~ | ~~Server's Preferred Address~~ | ~~Done~~ |
 | P3 | §10.3.3 | Stateless Reset loop detection | Small |
@@ -436,6 +436,35 @@ No remaining work — all sections implemented. Optional improvements:
 
 ---
 
+## RFC 9369 — QUIC Version 2
+
+| § | Section | Status | Notes |
+|---|---------|--------|-------|
+| 3 | Version Field Values | ✅ Done | 0x6b3343cf wire version |
+| 4 | Version Negotiation Considerations | ✅ Done | Compatible VN via version_information (0x11) transport param |
+| 5 | QUIC v2 Differences | | |
+| 5.1 | Long Header Packet Types | ✅ Done | Remapped type bits (encode + decode) |
+| 5.2 | Initial Salt | ✅ Done | v2 salt for initial key derivation |
+| 5.3 | HKDF Labels | ✅ Done | "quicv2 key/iv/hp/ku" labels |
+| 5.4 | Retry Integrity Tag | ✅ Done | v2-specific key/nonce |
+| 6 | Version Negotiation | ✅ Done | version_information transport param (RFC 9368) |
+
+### Summary — RFC 9369: ✅ Complete
+
+---
+
+## RFC 9368 — Compatible Version Negotiation for QUIC
+
+| § | Section | Status | Notes |
+|---|---------|--------|-------|
+| 2 | Version Negotiation Mechanism | ✅ Done | Client advertises v1+v2, server selects v2 |
+| 3 | version_information Transport Parameter (0x11) | ✅ Done | chosen_version + available_versions encode/decode |
+| 4 | Asymmetric Key Switching | ✅ Done | Server keeps v1 open + v2 seal; client keeps v1 seal + v2 open |
+
+### Summary — RFC 9368: ✅ Complete
+
+---
+
 ## Overall Progress
 
 | RFC | Done | Partial | Missing | Completion |
@@ -447,6 +476,8 @@ No remaining work — all sections implemented. Optional improvements:
 | RFC 9204 (QPACK) | 11 | 0 | 0 | 100% |
 | RFC 9297 (Datagrams) | 3 | 0 | 1 | ~88% |
 | RFC 9221 (QUIC DG) | 3 | 0 | 0 | 100% |
+| RFC 9368 (Version Neg) | 3 | 0 | 0 | 100% |
+| RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
 | WebTransport | 6 | 2 | 0 | ~88% |
 
 ### Top Priority Items Across All RFCs
