@@ -31,8 +31,12 @@ const PACKET_NUM_MASK: u8 = 0x03;
 
 pub const STATELESS_RESET_TOKEN_SIZE = 16; // aren't these 2 the same?
 pub const RETRY_INTEGRITY_TAG_SIZE = 16;
+// RFC 9001 §5.8: QUIC v1 Retry integrity key/nonce
 const RETRY_INTEGRITY_KEY_V1: [crypto.key_len]u8 = .{ 0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e };
 const RETRY_INTEGRITY_NONCE_V1: [crypto.nonce_len]u8 = .{ 0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb };
+// RFC 9369 §3.2: QUIC v2 Retry integrity key/nonce
+const RETRY_INTEGRITY_KEY_V2: [crypto.key_len]u8 = .{ 0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92 };
+const RETRY_INTEGRITY_NONCE_V2: [crypto.nonce_len]u8 = .{ 0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a };
 
 pub const PacketType = enum(u8) {
     /// Initial packet
@@ -55,6 +59,49 @@ pub const PacketType = enum(u8) {
 
     _,
 };
+
+/// Map the 2-bit long header packet type field to a logical PacketType,
+/// accounting for version-specific bit assignments.
+/// RFC 9369 §5.1: v2 uses different bit patterns than v1.
+pub fn longHeaderPacketType(first_byte: u8, version: u32) PacketType {
+    const type_bits = (first_byte >> 4) & 0x03; // bits 4-5
+    if (protocol.isV2(version)) {
+        // v2: 0b00=Retry, 0b01=Initial, 0b10=0-RTT, 0b11=Handshake
+        return switch (type_bits) {
+            0b00 => PacketType.retry,
+            0b01 => PacketType.initial,
+            0b10 => PacketType.zero_rtt,
+            0b11 => PacketType.handshake,
+            else => unreachable,
+        };
+    }
+    // v1: 0b00=Initial, 0b01=0-RTT, 0b10=Handshake, 0b11=Retry
+    return switch (type_bits) {
+        0b00 => PacketType.initial,
+        0b01 => PacketType.zero_rtt,
+        0b10 => PacketType.handshake,
+        0b11 => PacketType.retry,
+        else => unreachable,
+    };
+}
+
+/// Encode the 2-bit long header packet type field for a given version.
+pub fn encodeLongHeaderTypeBits(pkt_type: PacketType, version: u32) u8 {
+    const bits: u8 = if (protocol.isV2(version)) switch (pkt_type) {
+        PacketType.retry => 0b00,
+        PacketType.initial => 0b01,
+        PacketType.zero_rtt => 0b10,
+        PacketType.handshake => 0b11,
+        else => 0,
+    } else switch (pkt_type) {
+        PacketType.initial => 0b00,
+        PacketType.zero_rtt => 0b01,
+        PacketType.handshake => 0b10,
+        PacketType.retry => 0b11,
+        else => 0,
+    };
+    return LONG_HEADER_BIT | FIXED_BIT | (bits << 4);
+}
 
 pub const Epoch = enum(u8) {
     initial = 0,
@@ -182,16 +229,9 @@ pub const Header = struct {
             return;
         }
 
-        // encode long header https://datatracker.ietf.org/doc/html/rfc9000#long-packet-types
-        const ty: u8 = switch (self.packet_type) {
-            PacketType.initial => 0x00,
-            PacketType.zero_rtt => 0x01,
-            PacketType.handshake => 0x02,
-            PacketType.retry => 0x03,
-            else => return error.InvalidPacket,
-        };
-
-        first |= LONG_HEADER_BIT | FIXED_BIT | (ty << 4);
+        // encode long header (version-aware type bits)
+        // first already has pn_len bits from line 207; OR in the type+fixed+long bits
+        first |= encodeLongHeaderTypeBits(self.packet_type, self.version);
 
         try writer.writeByte(@intCast(first));
         try writer.writeInt(u32, self.version, ENDIAN);
@@ -477,7 +517,12 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
             return error.InvalidPacket;
         }
 
-        header.packet_type = @enumFromInt(first_byte & PACKET_TYPE_MASK);
+        // Use version-aware packet type mapping (v1 vs v2 bit patterns differ)
+        if (version == 0) {
+            header.packet_type = PacketType.version_negotiation;
+        } else {
+            header.packet_type = longHeaderPacketType(first_byte, version);
+        }
 
         switch (header.packet_type) {
             PacketType.initial => {
@@ -611,10 +656,8 @@ pub fn computeRetryIntegrityTag(
     odcid: []const u8,
     version: u32,
 ) ![crypto.Aead.tag_length]u8 {
-    _ = version;
-
-    const key = RETRY_INTEGRITY_KEY_V1;
-    const nonce = RETRY_INTEGRITY_NONCE_V1;
+    const key = if (protocol.isV2(version)) RETRY_INTEGRITY_KEY_V2 else RETRY_INTEGRITY_KEY_V1;
+    const nonce = if (protocol.isV2(version)) RETRY_INTEGRITY_NONCE_V2 else RETRY_INTEGRITY_NONCE_V1;
 
     // Use stack buffer: 1 (odcid_len) + 20 (max odcid) + ~1300 (max packet) = 1321
     var buf: [1400]u8 = undefined;

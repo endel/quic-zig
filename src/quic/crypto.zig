@@ -12,8 +12,10 @@ const Aes256 = crypto.core.aes.Aes256;
 const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
 const ChaCha20IETF = crypto.stream.chacha.ChaCha20IETF;
 
-// binascii.unhexlify("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
-const INITIAL_SALT_VERSION_1 = [_]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0xc, 0xad, 0xcc, 0xbb, 0x7f, 0xa };
+// RFC 9001 §5.2: QUIC v1 initial salt
+const INITIAL_SALT_V1 = [_]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a };
+// RFC 9369 §3.1: QUIC v2 initial salt
+const INITIAL_SALT_V2 = [_]u8{ 0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9 };
 
 // Header protection sample length
 pub const SAMPLE_LEN = 16;
@@ -284,21 +286,25 @@ pub fn deriveInitialKeyMaterial(
     version: u32,
     comptime is_server: bool,
 ) !std.meta.Tuple(&.{ Open, Seal }) {
-    if (version != protocol.SUPPORTED_VERSIONS[0]) {
-        std.log.err("only version 1 is supported right now.", .{});
+    if (!protocol.isSupportedVersion(version)) {
+        std.log.err("unsupported QUIC version: 0x{x:0>8}", .{version});
         return error.InvalidVersion;
     }
 
-    // https://datatracker.ietf.org/doc/html/rfc9001#section-5.1
+    // RFC 9001 §5.2 / RFC 9369 §3.1: version-specific initial salt
+    const salt = if (protocol.isV2(version)) &INITIAL_SALT_V2 else &INITIAL_SALT_V1;
+    const label_key = protocol.quicLabel(version, .key);
+    const label_iv = protocol.quicLabel(version, .iv);
+    const label_hp = protocol.quicLabel(version, .hp);
 
-    const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, cid);
+    const initial_secret = HkdfSha256.extract(salt, cid);
     var secret: [32]u8 = undefined;
 
     // Client (Initial keys are always AES-128-GCM)
     secret = hkdfExpandLabel(initial_secret, "client in", "", Hmac.key_length);
-    const client_key_16 = hkdfExpandLabel(secret, "quic key", "", key_len);
-    const client_iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
-    const client_hp_16 = hkdfExpandLabel(secret, "quic hp", "", key_len);
+    const client_key_16 = hkdfExpandLabelRuntime(secret, label_key, "", key_len);
+    const client_iv = hkdfExpandLabelRuntime(secret, label_iv, "", nonce_len);
+    const client_hp_16 = hkdfExpandLabelRuntime(secret, label_hp, "", key_len);
     var client_key: [max_key_len]u8 = .{0} ** max_key_len;
     @memcpy(client_key[0..key_len], &client_key_16);
     var client_hp_key: [max_key_len]u8 = .{0} ** max_key_len;
@@ -306,9 +312,9 @@ pub fn deriveInitialKeyMaterial(
 
     // Server
     secret = hkdfExpandLabel(initial_secret, "server in", "", Hmac.key_length);
-    const server_key_16 = hkdfExpandLabel(secret, "quic key", "", key_len);
-    const server_iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
-    const server_hp_16 = hkdfExpandLabel(secret, "quic hp", "", key_len);
+    const server_key_16 = hkdfExpandLabelRuntime(secret, label_key, "", key_len);
+    const server_iv = hkdfExpandLabelRuntime(secret, label_iv, "", nonce_len);
+    const server_hp_16 = hkdfExpandLabelRuntime(secret, label_hp, "", key_len);
     var server_key: [max_key_len]u8 = .{0} ** max_key_len;
     @memcpy(server_key[0..key_len], &server_key_16);
     var server_hp_key: [max_key_len]u8 = .{0} ** max_key_len;
@@ -328,13 +334,13 @@ test "a.1: keys - initial secret" {
     {
         const expected = [_]u8{ 0x7d, 0xb5, 0xdf, 0x06, 0xe7, 0xa6, 0x9e, 0x43, 0x24, 0x96, 0xad, 0xed, 0xb0, 0x08, 0x51, 0x92, 0x35, 0x95, 0x22, 0x15, 0x96, 0xae, 0x2a, 0xe9, 0xfb, 0x81, 0x15, 0xc1, 0xe9, 0xed, 0x0a, 0x44 };
         const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-        const out = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        const out = HkdfSha256.extract(&INITIAL_SALT_V1, &dcid);
         try std.testing.expectEqualSlices(u8, &expected, &out);
     }
     {
         const expected = [_]u8{ 0xf0, 0x16, 0xbb, 0x2d, 0xc9, 0x97, 0x6d, 0xea, 0x27, 0x26, 0xc4, 0xe6, 0x1e, 0x73, 0x8a, 0x1e, 0x36, 0x80, 0xa2, 0x48, 0x75, 0x91, 0xdc, 0x76, 0xb2, 0xae, 0xe2, 0xed, 0x75, 0x98, 0x22, 0xf6 };
         const dcid = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
-        const out = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        const out = HkdfSha256.extract(&INITIAL_SALT_V1, &dcid);
         try std.testing.expectEqualSlices(u8, &expected, &out);
     }
 }
@@ -344,7 +350,7 @@ test "a.1: keys - server initial secret" {
     {
         const expected = [_]u8{ 0x3c, 0x19, 0x98, 0x28, 0xfd, 0x13, 0x9e, 0xfd, 0x21, 0x6c, 0x15, 0x5a, 0xd8, 0x44, 0xcc, 0x81, 0xfb, 0x82, 0xfa, 0x8d, 0x74, 0x46, 0xfa, 0x7d, 0x78, 0xbe, 0x80, 0x3a, 0xcd, 0xda, 0x95, 0x1b };
         const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_V1, &dcid);
         var out = hkdfExpandLabel(initial_secret, "server in", "", Hmac.key_length);
         try std.testing.expectEqualSlices(u8, &expected, &out);
     }
@@ -352,7 +358,7 @@ test "a.1: keys - server initial secret" {
         // This test case is brought from https://quic.xargs.org/
         const expected = [_]u8{ 0xad, 0xc1, 0x99, 0x5b, 0x5c, 0xee, 0x8f, 0x03, 0x74, 0x6b, 0xf8, 0x30, 0x9d, 0x02, 0xd5, 0xea, 0x27, 0x15, 0x9c, 0x1e, 0xd6, 0x91, 0x54, 0x03, 0xb3, 0x63, 0x18, 0xd5, 0xa0, 0x3a, 0xfe, 0xb8 };
         const dcid = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
-        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_V1, &dcid);
         var out = hkdfExpandLabel(initial_secret, "server in", "", Hmac.key_length);
         try std.testing.expectEqualSlices(u8, &expected, &out);
     }
@@ -362,7 +368,7 @@ test "a.1: keys - client initial secret" {
     {
         const expected = [_]u8{ 0xc0, 0x0c, 0xf1, 0x51, 0xca, 0x5b, 0xe0, 0x75, 0xed, 0x0e, 0xbf, 0xb5, 0xc8, 0x03, 0x23, 0xc4, 0x2d, 0x6b, 0x7d, 0xb6, 0x78, 0x81, 0x28, 0x9a, 0xf4, 0x00, 0x8f, 0x1f, 0x6c, 0x35, 0x7a, 0xea };
         const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_V1, &dcid);
         var out = hkdfExpandLabel(initial_secret, "client in", "", Hmac.key_length);
         try std.testing.expectEqualSlices(u8, &expected, &out);
     }
@@ -371,7 +377,7 @@ test "a.1: keys - client initial secret" {
         // This test case is brought from https://quic.xargs.org/
         const expected = [_]u8{ 0x47, 0xc6, 0xa6, 0x38, 0xd4, 0x96, 0x85, 0x95, 0xcc, 0x20, 0xb7, 0xc8, 0xbc, 0x5f, 0xbf, 0xbf, 0xd0, 0x2d, 0x7c, 0x17, 0xcc, 0x67, 0xfa, 0x54, 0x8c, 0x04, 0x3e, 0xcb, 0x54, 0x7b, 0x0e, 0xaa };
         const dcid = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
-        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_VERSION_1, &dcid);
+        const initial_secret = HkdfSha256.extract(&INITIAL_SALT_V1, &dcid);
         var out = hkdfExpandLabel(initial_secret, "client in", "", Hmac.key_length);
         try std.testing.expectEqualSlices(u8, &expected, &out);
     }
@@ -492,14 +498,51 @@ pub fn hkdfExpandLabel(
     return out[0..length].*;
 }
 
+/// Runtime version of hkdfExpandLabel for version-dependent labels.
+pub fn hkdfExpandLabelRuntime(
+    secret: [32]u8,
+    label: []const u8,
+    context: []const u8,
+    comptime length: u16,
+) [length]u8 {
+    std.debug.assert(label.len <= 249 and label.len > 0);
+    std.debug.assert(context.len <= 255);
+
+    var buf: [2 + 1 + 6 + 249 + 1 + 255]u8 = undefined;
+    std.mem.writeInt(u16, buf[0..2], length, .big);
+    // "tls13 " prefix (6 bytes) + label
+    const prefix = "tls13 ";
+    const full_len: u8 = @intCast(prefix.len + label.len);
+    buf[2] = full_len;
+    @memcpy(buf[3..][0..prefix.len], prefix);
+    @memcpy(buf[3 + prefix.len ..][0..label.len], label);
+    const label_end = 3 + prefix.len + label.len;
+    buf[label_end] = @intCast(context.len);
+    @memcpy(buf[label_end + 1 ..][0..context.len], context);
+    const actual_context = buf[0 .. label_end + 1 + context.len];
+
+    var out: [32]u8 = undefined;
+    HkdfSha256.expand(&out, actual_context, secret);
+    return out[0..length].*;
+}
+
 /// Derive a QUIC key and pad to max_key_len.
 /// `actual_len` is the real key length (16 for AES, 32 for ChaCha20).
 pub fn deriveKeyPadded(secret: [32]u8, actual_len: usize) [max_key_len]u8 {
+    return deriveKeyPaddedV(secret, actual_len, protocol.QUIC_V1);
+}
+
+pub fn deriveKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_key_len]u8 {
+    return deriveKeyPaddedL(secret, actual_len, protocol.quicLabel(version, .key));
+}
+
+// Derive key with an explicit label string (runtime).
+fn deriveKeyPaddedL(secret: [32]u8, actual_len: usize, label: []const u8) [max_key_len]u8 {
     var result: [max_key_len]u8 = .{0} ** max_key_len;
     if (actual_len == 32) {
-        result = hkdfExpandLabel(secret, "quic key", "", 32);
+        result = hkdfExpandLabelRuntime(secret, label, "", 32);
     } else {
-        const k16 = hkdfExpandLabel(secret, "quic key", "", 16);
+        const k16 = hkdfExpandLabelRuntime(secret, label, "", 16);
         @memcpy(result[0..16], &k16);
     }
     return result;
@@ -507,11 +550,16 @@ pub fn deriveKeyPadded(secret: [32]u8, actual_len: usize) [max_key_len]u8 {
 
 /// Derive a QUIC HP key and pad to max_key_len.
 pub fn deriveHpKeyPadded(secret: [32]u8, actual_len: usize) [max_key_len]u8 {
+    return deriveHpKeyPaddedV(secret, actual_len, protocol.QUIC_V1);
+}
+
+pub fn deriveHpKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_key_len]u8 {
+    const label = protocol.quicLabel(version, .hp);
     var result: [max_key_len]u8 = .{0} ** max_key_len;
     if (actual_len == 32) {
-        result = hkdfExpandLabel(secret, "quic hp", "", 32);
+        result = hkdfExpandLabelRuntime(secret, label, "", 32);
     } else {
-        const k16 = hkdfExpandLabel(secret, "quic hp", "", 16);
+        const k16 = hkdfExpandLabelRuntime(secret, label, "", 16);
         @memcpy(result[0..16], &k16);
     }
     return result;
@@ -525,7 +573,11 @@ pub const CONFIDENTIALITY_LIMIT: u64 = 1 << 23;
 /// RFC 9001 Section 6.1:
 ///   secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", 32)
 pub fn deriveNextTrafficSecret(current: [32]u8) [32]u8 {
-    return hkdfExpandLabel(current, "quic ku", "", 32);
+    return deriveNextTrafficSecretV(current, protocol.QUIC_V1);
+}
+
+pub fn deriveNextTrafficSecretV(current: [32]u8, version: u32) [32]u8 {
+    return hkdfExpandLabelRuntime(current, protocol.quicLabel(version, .ku), "", 32);
 }
 
 /// Manages QUIC key update (RFC 9001 Section 6).
@@ -555,6 +607,9 @@ pub const KeyUpdateManager = struct {
     // Cipher suite for this key generation
     cipher_suite: CipherSuite = .aes_128_gcm_sha256,
 
+    // QUIC version (affects HKDF labels: "quic ku" vs "quicv2 ku")
+    version: u32 = protocol.QUIC_V1,
+
     // Traffic secrets for deriving next-generation keys
     recv_secret: [32]u8,
     send_secret: [32]u8,
@@ -579,21 +634,27 @@ pub const KeyUpdateManager = struct {
     }
 
     pub fn initWithCipherSuite(recv_secret: [32]u8, send_secret: [32]u8, recv_hp: [max_key_len]u8, send_hp: [max_key_len]u8, cipher_suite: CipherSuite) KeyUpdateManager {
+        return initFull(recv_secret, send_secret, recv_hp, send_hp, cipher_suite, protocol.QUIC_V1);
+    }
+
+    pub fn initFull(recv_secret: [32]u8, send_secret: [32]u8, recv_hp: [max_key_len]u8, send_hp: [max_key_len]u8, cipher_suite: CipherSuite, version: u32) KeyUpdateManager {
         const kl = cipher_suite.keyLen();
+        const label_key = protocol.quicLabel(version, .key);
+        const label_iv = protocol.quicLabel(version, .iv);
 
         // Derive current Open/Seal from the initial secrets
-        const recv_key = deriveKeyPadded(recv_secret, kl);
-        const recv_iv = hkdfExpandLabel(recv_secret, "quic iv", "", nonce_len);
-        const send_key = deriveKeyPadded(send_secret, kl);
-        const send_iv = hkdfExpandLabel(send_secret, "quic iv", "", nonce_len);
+        const recv_key = deriveKeyPaddedL(recv_secret, kl, label_key);
+        const recv_iv = hkdfExpandLabelRuntime(recv_secret, label_iv, "", nonce_len);
+        const send_key = deriveKeyPaddedL(send_secret, kl, label_key);
+        const send_iv = hkdfExpandLabelRuntime(send_secret, label_iv, "", nonce_len);
 
         // Pre-compute next generation secrets and keys
-        const next_recv_secret = deriveNextTrafficSecret(recv_secret);
-        const next_send_secret = deriveNextTrafficSecret(send_secret);
-        const next_recv_key = deriveKeyPadded(next_recv_secret, kl);
-        const next_recv_iv = hkdfExpandLabel(next_recv_secret, "quic iv", "", nonce_len);
-        const next_send_key = deriveKeyPadded(next_send_secret, kl);
-        const next_send_iv = hkdfExpandLabel(next_send_secret, "quic iv", "", nonce_len);
+        const next_recv_secret = deriveNextTrafficSecretV(recv_secret, version);
+        const next_send_secret = deriveNextTrafficSecretV(send_secret, version);
+        const next_recv_key = deriveKeyPaddedL(next_recv_secret, kl, label_key);
+        const next_recv_iv = hkdfExpandLabelRuntime(next_recv_secret, label_iv, "", nonce_len);
+        const next_send_key = deriveKeyPaddedL(next_send_secret, kl, label_key);
+        const next_send_iv = hkdfExpandLabelRuntime(next_send_secret, label_iv, "", nonce_len);
 
         return .{
             .current_open = .{ .key = recv_key, .hp_key = recv_hp, .nonce = recv_iv, .cipher_suite = cipher_suite },
@@ -603,6 +664,7 @@ pub const KeyUpdateManager = struct {
             .hp_open = recv_hp,
             .hp_seal = send_hp,
             .cipher_suite = cipher_suite,
+            .version = version,
             .recv_secret = recv_secret,
             .send_secret = send_secret,
         };
@@ -619,24 +681,26 @@ pub const KeyUpdateManager = struct {
         self.current_open = self.next_open;
         self.current_seal = self.next_seal;
 
-        // Advance secrets
-        self.recv_secret = deriveNextTrafficSecret(self.recv_secret);
-        self.send_secret = deriveNextTrafficSecret(self.send_secret);
+        // Advance secrets (version-aware labels)
+        self.recv_secret = deriveNextTrafficSecretV(self.recv_secret, self.version);
+        self.send_secret = deriveNextTrafficSecretV(self.send_secret, self.version);
 
         // Pre-compute new next-generation keys
         const kl = self.cipher_suite.keyLen();
-        const next_recv_secret = deriveNextTrafficSecret(self.recv_secret);
-        const next_send_secret = deriveNextTrafficSecret(self.send_secret);
+        const label_key = protocol.quicLabel(self.version, .key);
+        const label_iv = protocol.quicLabel(self.version, .iv);
+        const next_recv_secret = deriveNextTrafficSecretV(self.recv_secret, self.version);
+        const next_send_secret = deriveNextTrafficSecretV(self.send_secret, self.version);
         self.next_open = .{
-            .key = deriveKeyPadded(next_recv_secret, kl),
+            .key = deriveKeyPaddedL(next_recv_secret, kl, label_key),
             .hp_key = self.hp_open,
-            .nonce = hkdfExpandLabel(next_recv_secret, "quic iv", "", nonce_len),
+            .nonce = hkdfExpandLabelRuntime(next_recv_secret, label_iv, "", nonce_len),
             .cipher_suite = self.cipher_suite,
         };
         self.next_seal = .{
-            .key = deriveKeyPadded(next_send_secret, kl),
+            .key = deriveKeyPaddedL(next_send_secret, kl, label_key),
             .hp_key = self.hp_seal,
-            .nonce = hkdfExpandLabel(next_send_secret, "quic iv", "", nonce_len),
+            .nonce = hkdfExpandLabelRuntime(next_send_secret, label_iv, "", nonce_len),
             .cipher_suite = self.cipher_suite,
         };
 

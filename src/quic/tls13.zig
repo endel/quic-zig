@@ -7,6 +7,7 @@
 const std = @import("std");
 const crypto = std.crypto;
 const quic_crypto = @import("crypto.zig");
+const protocol = @import("protocol.zig");
 const transport_params = @import("transport_params.zig");
 
 const Certificate = std.crypto.Certificate;
@@ -235,21 +236,31 @@ pub const KeySchedule = struct {
     }
 
     pub fn makeOpenWithCipher(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite) quic_crypto.Open {
+        return makeOpenFull(traffic_secret, cipher, protocol.QUIC_V1);
+    }
+
+    pub fn makeSealWithCipher(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite) quic_crypto.Seal {
+        return makeSealFull(traffic_secret, cipher, protocol.QUIC_V1);
+    }
+
+    pub fn makeOpenFull(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite, version: u32) quic_crypto.Open {
         const kl = cipher.keyLen();
+        const label_iv = protocol.quicLabel(version, .iv);
         return .{
-            .key = quic_crypto.deriveKeyPadded(traffic_secret, kl),
-            .nonce = quic_crypto.hkdfExpandLabel(traffic_secret, "quic iv", "", 12),
-            .hp_key = quic_crypto.deriveHpKeyPadded(traffic_secret, cipher.hpKeyLen()),
+            .key = quic_crypto.deriveKeyPaddedV(traffic_secret, kl, version),
+            .nonce = quic_crypto.hkdfExpandLabelRuntime(traffic_secret, label_iv, "", 12),
+            .hp_key = quic_crypto.deriveHpKeyPaddedV(traffic_secret, cipher.hpKeyLen(), version),
             .cipher_suite = cipher,
         };
     }
 
-    pub fn makeSealWithCipher(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite) quic_crypto.Seal {
+    pub fn makeSealFull(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite, version: u32) quic_crypto.Seal {
         const kl = cipher.keyLen();
+        const label_iv = protocol.quicLabel(version, .iv);
         return .{
-            .key = quic_crypto.deriveKeyPadded(traffic_secret, kl),
-            .nonce = quic_crypto.hkdfExpandLabel(traffic_secret, "quic iv", "", 12),
-            .hp_key = quic_crypto.deriveHpKeyPadded(traffic_secret, cipher.hpKeyLen()),
+            .key = quic_crypto.deriveKeyPaddedV(traffic_secret, kl, version),
+            .nonce = quic_crypto.hkdfExpandLabelRuntime(traffic_secret, label_iv, "", 12),
+            .hp_key = quic_crypto.deriveHpKeyPaddedV(traffic_secret, cipher.hpKeyLen(), version),
             .cipher_suite = cipher,
         };
     }
@@ -309,6 +320,7 @@ pub const TlsConfig = struct {
     ticket_key: ?[16]u8 = null, // AES-128-GCM key for encrypting/decrypting tickets (server)
     keylog_file: ?std.fs.File = null, // SSLKEYLOGFILE output (NSS Key Log format)
     cipher_suite_only: ?quic_crypto.CipherSuite = null, // If set, offer ONLY this cipher suite
+    quic_version: u32 = protocol.QUIC_V1, // QUIC version (affects HKDF labels)
 };
 
 // ─── SSLKEYLOGFILE support (NSS Key Log format) ─────────────────────
@@ -567,29 +579,31 @@ pub const Tls13Handshake = struct {
         if (self.pending_install_early) {
             self.pending_install_early = false;
             const cs = self.negotiated_cipher_suite;
+            const qv = self.config.quic_version;
             return Action{ .install_keys = .{
                 .level = .early_data,
-                .open = KeySchedule.makeOpenWithCipher(self.key_schedule.client_early_traffic_secret, cs),
-                .seal = KeySchedule.makeSealWithCipher(self.key_schedule.client_early_traffic_secret, cs),
+                .open = KeySchedule.makeOpenFull(self.key_schedule.client_early_traffic_secret, cs, qv),
+                .seal = KeySchedule.makeSealFull(self.key_schedule.client_early_traffic_secret, cs, qv),
             } };
         }
 
         // If we need to install handshake keys, do that first
-        // Handshake keys always use AES-128-GCM (same as Initial)
+        // Handshake keys always use AES-128-GCM (same cipher as Initial)
         if (self.pending_install_handshake) {
             self.pending_install_handshake = false;
             self.handshake_keys_installed = true;
+            const qv = self.config.quic_version;
             if (self.is_server) {
                 return Action{ .install_keys = .{
                     .level = .handshake,
-                    .open = KeySchedule.makeOpen(self.key_schedule.client_handshake_traffic_secret),
-                    .seal = KeySchedule.makeSeal(self.key_schedule.server_handshake_traffic_secret),
+                    .open = KeySchedule.makeOpenFull(self.key_schedule.client_handshake_traffic_secret, .aes_128_gcm_sha256, qv),
+                    .seal = KeySchedule.makeSealFull(self.key_schedule.server_handshake_traffic_secret, .aes_128_gcm_sha256, qv),
                 } };
             } else {
                 return Action{ .install_keys = .{
                     .level = .handshake,
-                    .open = KeySchedule.makeOpen(self.key_schedule.server_handshake_traffic_secret),
-                    .seal = KeySchedule.makeSeal(self.key_schedule.client_handshake_traffic_secret),
+                    .open = KeySchedule.makeOpenFull(self.key_schedule.server_handshake_traffic_secret, .aes_128_gcm_sha256, qv),
+                    .seal = KeySchedule.makeSealFull(self.key_schedule.client_handshake_traffic_secret, .aes_128_gcm_sha256, qv),
                 } };
             }
         }
@@ -599,17 +613,18 @@ pub const Tls13Handshake = struct {
             self.pending_install_app = false;
             self.app_keys_installed = true;
             const cs = self.negotiated_cipher_suite;
+            const qv = self.config.quic_version;
             if (self.is_server) {
                 return Action{ .install_keys = .{
                     .level = .application,
-                    .open = KeySchedule.makeOpenWithCipher(self.key_schedule.client_app_traffic_secret, cs),
-                    .seal = KeySchedule.makeSealWithCipher(self.key_schedule.server_app_traffic_secret, cs),
+                    .open = KeySchedule.makeOpenFull(self.key_schedule.client_app_traffic_secret, cs, qv),
+                    .seal = KeySchedule.makeSealFull(self.key_schedule.server_app_traffic_secret, cs, qv),
                 } };
             } else {
                 return Action{ .install_keys = .{
                     .level = .application,
-                    .open = KeySchedule.makeOpenWithCipher(self.key_schedule.server_app_traffic_secret, cs),
-                    .seal = KeySchedule.makeSealWithCipher(self.key_schedule.client_app_traffic_secret, cs),
+                    .open = KeySchedule.makeOpenFull(self.key_schedule.server_app_traffic_secret, cs, qv),
+                    .seal = KeySchedule.makeSealFull(self.key_schedule.client_app_traffic_secret, cs, qv),
                 } };
             }
         }

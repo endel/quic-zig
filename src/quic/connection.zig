@@ -551,10 +551,12 @@ pub const Connection = struct {
 
         // Initialize TLS 1.3 handshake if config provided
         if (tls_config) |tc| {
+            var tc_versioned = tc;
+            tc_versioned.quic_version = conn.version;
             conn.tls13_hs = if (is_server)
-                tls13.Tls13Handshake.initServer(tc, local_params)
+                tls13.Tls13Handshake.initServer(tc_versioned, local_params)
             else
-                tls13.Tls13Handshake.initClient(tc, local_params);
+                tls13.Tls13Handshake.initClient(tc_versioned, local_params);
         }
 
         // Set up initial crypto keys (always use header.dcid for key derivation)
@@ -1526,12 +1528,13 @@ pub const Connection = struct {
                         const app_open = self.pkt_num_spaces[2].crypto_open.?;
                         const app_seal = self.pkt_num_spaces[2].crypto_seal.?;
 
-                        self.key_update = quic_crypto.KeyUpdateManager.initWithCipherSuite(
+                        self.key_update = quic_crypto.KeyUpdateManager.initFull(
                             recv_secret,
                             send_secret,
                             app_open.hp_key,
                             app_seal.hp_key,
                             hs.negotiated_cipher_suite,
+                            self.version,
                         );
                         std.log.info("KeyUpdateManager initialized for 1-RTT key rotation", .{});
                     }
@@ -2347,6 +2350,7 @@ pub fn connect(
     if (tls_config) |tc| {
         var tc_with_sni = tc;
         tc_with_sni.server_name = server_name;
+        tc_with_sni.quic_version = conn.version;
         conn.tls13_hs = tls13.Tls13Handshake.initClient(tc_with_sni, local_params);
 
         // Step the handshake to generate the ClientHello
