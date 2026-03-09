@@ -1,0 +1,7 @@
+{
+  "quic-zig": {
+    "image": "quic-zig-interop:latest",
+    "url": "https://github.com/endel/quic-zig",
+    "role": "both"
+  }
+}

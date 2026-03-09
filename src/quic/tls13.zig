@@ -288,7 +288,46 @@ pub const TlsConfig = struct {
     ca_bundle: ?*Certificate.Bundle = null, // Caller-owned CA bundle for trust anchor verification
     session_ticket: ?*const SessionTicket = null, // Stored ticket from previous connection (client)
     ticket_key: ?[16]u8 = null, // AES-128-GCM key for encrypting/decrypting tickets (server)
+    keylog_file: ?std.fs.File = null, // SSLKEYLOGFILE output (NSS Key Log format)
 };
+
+// ─── SSLKEYLOGFILE support (NSS Key Log format) ─────────────────────
+
+fn hexByte(b: u8) [2]u8 {
+    const hex = "0123456789abcdef";
+    return .{ hex[b >> 4], hex[b & 0x0f] };
+}
+
+fn writeKeylogLine(file: std.fs.File, label: []const u8, client_random: *const [32]u8, secret: *const [32]u8) void {
+    // Format: "LABEL <client_random_hex> <secret_hex>\n"
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+
+    @memcpy(buf[pos..][0..label.len], label);
+    pos += label.len;
+    buf[pos] = ' ';
+    pos += 1;
+
+    for (client_random) |b| {
+        const h = hexByte(b);
+        buf[pos] = h[0];
+        buf[pos + 1] = h[1];
+        pos += 2;
+    }
+    buf[pos] = ' ';
+    pos += 1;
+
+    for (secret) |b| {
+        const h = hexByte(b);
+        buf[pos] = h[0];
+        buf[pos + 1] = h[1];
+        pos += 2;
+    }
+    buf[pos] = '\n';
+    pos += 1;
+
+    _ = file.write(buf[0..pos]) catch {};
+}
 
 // ─── Handshake state machine ─────────────────────────────────────────
 
@@ -618,6 +657,11 @@ pub const Tls13Handshake = struct {
             const transcript_hash = self.transcript.current();
             self.key_schedule.deriveEarlyDataSecret(transcript_hash);
             self.pending_install_early = true;
+
+            // SSLKEYLOGFILE: write early traffic secret
+            if (self.config.keylog_file) |f| {
+                writeKeylogLine(f, "CLIENT_EARLY_TRAFFIC_SECRET", &self.client_random, &self.key_schedule.client_early_traffic_secret);
+            }
         }
 
         @memcpy(self.out_buf[0..msg.len], msg);
@@ -702,6 +746,12 @@ pub const Tls13Handshake = struct {
         // Derive handshake secrets
         const transcript_hash = self.transcript.current();
         self.key_schedule.deriveHandshakeSecrets(&shared_secret, transcript_hash);
+
+        // SSLKEYLOGFILE: write handshake traffic secrets
+        if (self.config.keylog_file) |f| {
+            writeKeylogLine(f, "CLIENT_HANDSHAKE_TRAFFIC_SECRET", &self.client_random, &self.key_schedule.client_handshake_traffic_secret);
+            writeKeylogLine(f, "SERVER_HANDSHAKE_TRAFFIC_SECRET", &self.client_random, &self.key_schedule.server_handshake_traffic_secret);
+        }
 
         // Signal to install handshake keys
         self.pending_install_handshake = true;
@@ -868,6 +918,12 @@ pub const Tls13Handshake = struct {
         self.key_schedule.deriveAppSecrets(self.transcript_at_server_finished);
         self.pending_install_app = true;
 
+        // SSLKEYLOGFILE: write application traffic secrets
+        if (self.config.keylog_file) |f| {
+            writeKeylogLine(f, "CLIENT_TRAFFIC_SECRET_0", &self.client_random, &self.key_schedule.client_app_traffic_secret);
+            writeKeylogLine(f, "SERVER_TRAFFIC_SECRET_0", &self.client_random, &self.key_schedule.server_app_traffic_secret);
+        }
+
         self.state = .client_send_finished;
         return ._continue;
     }
@@ -991,6 +1047,11 @@ pub const Tls13Handshake = struct {
             const transcript_hash = self.transcript.current();
             self.key_schedule.deriveEarlyDataSecret(transcript_hash);
             self.pending_install_early = true;
+
+            // SSLKEYLOGFILE: write early traffic secret
+            if (self.config.keylog_file) |f| {
+                writeKeylogLine(f, "CLIENT_EARLY_TRAFFIC_SECRET", &self.client_random, &self.key_schedule.client_early_traffic_secret);
+            }
         }
 
         self.state = .server_send_server_hello;
@@ -1017,6 +1078,12 @@ pub const Tls13Handshake = struct {
         // Derive handshake secrets
         const transcript_hash = self.transcript.current();
         self.key_schedule.deriveHandshakeSecrets(&shared_secret, transcript_hash);
+
+        // SSLKEYLOGFILE: write handshake traffic secrets
+        if (self.config.keylog_file) |f| {
+            writeKeylogLine(f, "CLIENT_HANDSHAKE_TRAFFIC_SECRET", &self.client_random, &self.key_schedule.client_handshake_traffic_secret);
+            writeKeylogLine(f, "SERVER_HANDSHAKE_TRAFFIC_SECRET", &self.client_random, &self.key_schedule.server_handshake_traffic_secret);
+        }
 
         @memcpy(self.out_buf[0..msg.len], msg);
         self.out_len = msg.len;
@@ -1115,6 +1182,12 @@ pub const Tls13Handshake = struct {
         self.transcript_at_server_finished = self.transcript.current();
         self.key_schedule.deriveAppSecrets(self.transcript_at_server_finished);
         self.pending_install_app = true;
+
+        // SSLKEYLOGFILE: write application traffic secrets
+        if (self.config.keylog_file) |f| {
+            writeKeylogLine(f, "CLIENT_TRAFFIC_SECRET_0", &self.client_random, &self.key_schedule.client_app_traffic_secret);
+            writeKeylogLine(f, "SERVER_TRAFFIC_SECRET_0", &self.client_random, &self.key_schedule.server_app_traffic_secret);
+        }
 
         @memcpy(self.out_buf[0..36], &msg);
         self.out_len = 36;

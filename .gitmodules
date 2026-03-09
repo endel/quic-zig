@@ -1,0 +1,3 @@
+[submodule "interop/quic-interop-runner"]
+	path = interop/quic-interop-runner
+	url = https://github.com/quic-interop/quic-interop-runner
