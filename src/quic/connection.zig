@@ -345,6 +345,8 @@ pub const ConnectionConfig = struct {
     preferred_address: ?transport_params.PreferredAddress = null,
     // Key for NEW_TOKEN generation (server) — should match the Retry token key
     token_key: ?[16]u8 = null,
+    // Enable Compatible Version Negotiation to QUIC v2 (RFC 9368/9369)
+    enable_v2: bool = false,
 };
 
 /// A QUIC connection.
@@ -446,6 +448,10 @@ pub const Connection = struct {
     handshake_confirmed: bool = false,
     spin_bit: bool = false, // Spin bit for passive RTT measurement (RFC 9000 §17.4)
     largest_pn_received: ?u64 = null, // Tracks largest 1-RTT PN for spin bit toggling
+    enable_v2: bool = false, // Compatible Version Negotiation (RFC 9368/9369)
+    // DCID used for initial key derivation (needed for v2 re-derivation)
+    initial_dcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
+    initial_dcid_len: u8 = 0,
 
     // Connection close state (RFC 9000 Section 10)
     closing_start_time: i64 = 0,
@@ -531,7 +537,7 @@ pub const Connection = struct {
         const reset_token: ?[16]u8 = if (is_server) conn.local_cid_pool.entries[0].stateless_reset_token else null;
 
         // Build transport params AFTER CIDs are stored in conn (to avoid dangling slices)
-        const local_params: transport_params.TransportParams = .{
+        var local_params: transport_params.TransportParams = .{
             .original_destination_connection_id = tp_odcid,
             .initial_source_connection_id = conn.scid[0..conn.scid_len],
             .retry_source_connection_id = retry_scid,
@@ -547,7 +553,16 @@ pub const Connection = struct {
             // Server's preferred address (RFC 9000 §9.6) — only for servers, must not coexist with disable_active_migration
             .preferred_address = if (is_server and config.preferred_address != null) config.preferred_address else null,
         };
+
+        // RFC 9368: Include version_information transport parameter when v2 is enabled
+        if (config.enable_v2) {
+            local_params.version_info_chosen = header.version; // v1 for client, may be updated by server
+            local_params.version_info_available = .{ protocol.QUIC_V2, protocol.QUIC_V1, 0, 0, 0, 0, 0, 0 };
+            local_params.version_info_available_count = 2;
+        }
+
         conn.local_params = local_params;
+        conn.enable_v2 = config.enable_v2;
 
         // Initialize TLS 1.3 handshake if config provided
         if (tls_config) |tc| {
@@ -558,6 +573,10 @@ pub const Connection = struct {
             else
                 tls13.Tls13Handshake.initClient(tc_versioned, local_params);
         }
+
+        // Store the DCID used for initial key derivation (needed for v2 re-derivation)
+        conn.initial_dcid_len = @intCast(header.dcid.len);
+        @memcpy(conn.initial_dcid_buf[0..header.dcid.len], header.dcid);
 
         // Set up initial crypto keys (always use header.dcid for key derivation)
         try conn.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].setupInitial(
@@ -684,6 +703,16 @@ pub const Connection = struct {
 
         const epoch = try packet.Epoch.fromPacketType(header.packet_type);
         std.log.info("recv: packet_type={s}, epoch={s}", .{ @tagName(header.packet_type), @tagName(epoch) });
+
+        // RFC 9368: Client-side Compatible Version Negotiation detection
+        // If we receive an Initial/Handshake from the server with a different version
+        // than what we sent, and we advertised that version, switch to it.
+        if (!self.is_server and self.enable_v2 and header.version != 0 and header.version != self.version) {
+            if (protocol.isSupportedVersion(header.version)) {
+                std.log.info("recv: compatible version negotiation detected, switching to 0x{x:0>8}", .{header.version});
+                try self.switchVersion(header.version);
+            }
+        }
 
         // 0-RTT packets use the application PN space but with early data keys
         if (epoch == packet.Epoch.zero_rtt) {
@@ -1475,7 +1504,15 @@ pub const Connection = struct {
                                 std.log.info("installed 0-RTT encrypt keys (client)", .{});
                             }
                         },
-                        .handshake => self.installHandshakeKeys(ik.open, ik.seal),
+                        .handshake => {
+                            self.installHandshakeKeys(ik.open, ik.seal);
+                            // RFC 9368: After TLS negotiation, check if version switched
+                            if (self.is_server and self.enable_v2) {
+                                if (hs.config.quic_version != self.version) {
+                                    try self.switchVersion(hs.config.quic_version);
+                                }
+                            }
+                        },
                         .application => self.installAppKeys(ik.open, ik.seal),
                         else => {},
                     }
@@ -1702,6 +1739,43 @@ pub const Connection = struct {
 
     /// Install handshake-level encryption keys.
     /// Called when the TLS handshake produces Handshake-level secrets.
+    /// Switch the connection to a new QUIC version (Compatible Version Negotiation, RFC 9368).
+    /// Re-derives Initial keys asymmetrically:
+    /// - Server: keeps v1 open keys (to decrypt client retransmissions), switches seal to v2
+    /// - Client: switches open keys to v2 (to decrypt server's v2 response), keeps v1 seal
+    /// Handshake/Application keys are already correct (TLS derives them with the new version's labels).
+    pub fn switchVersion(self: *Connection, new_version: u32) !void {
+        const old_version = self.version;
+        self.version = new_version;
+
+        // Re-derive Initial keys with the new version's salt
+        const dcid = self.initial_dcid_buf[0..self.initial_dcid_len];
+        const space = &self.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)];
+        if (self.is_server) {
+            // Server: only switch seal keys to v2 (keep v1 open for client retransmissions)
+            const saved_open = space.crypto_open;
+            const keys = try quic_crypto.deriveInitialKeyMaterial(dcid, new_version, true);
+            space.crypto_open = saved_open; // restore v1 open
+            space.crypto_seal = keys[1]; // v2 seal
+        } else {
+            // Client: only switch open keys to v2 (keep v1 seal, though we won't send more Initials)
+            const saved_seal = space.crypto_seal;
+            const keys = try quic_crypto.deriveInitialKeyMaterial(dcid, new_version, false);
+            space.crypto_open = keys[0]; // v2 open
+            space.crypto_seal = saved_seal; // restore v1 seal
+        }
+
+        // Update packet packer version
+        self.packer.version = new_version;
+
+        // Update TLS config version so handshake/app key derivation uses v2 HKDF labels
+        if (self.tls13_hs) |*hs| {
+            hs.config.quic_version = new_version;
+        }
+
+        std.log.info("switchVersion: 0x{x:0>8} -> 0x{x:0>8}", .{ old_version, new_version });
+    }
+
     pub fn installHandshakeKeys(self: *Connection, open: quic_crypto.Open, seal: quic_crypto.Seal) void {
         // Packet number space index 1 = Handshake
         self.pkt_num_spaces[1].crypto_open = open;
@@ -2262,7 +2336,7 @@ pub fn connect(
     generateConnectionId(&scid);
     generateConnectionId(&dcid);
 
-    const local_params: transport_params.TransportParams = .{
+    var local_params: transport_params.TransportParams = .{
         .max_idle_timeout = config.max_idle_timeout,
         .initial_max_data = config.initial_max_data,
         .initial_max_stream_data_bidi_local = config.initial_max_stream_data_bidi_local,
@@ -2273,6 +2347,13 @@ pub fn connect(
         .max_datagram_frame_size = config.max_datagram_frame_size,
         .initial_source_connection_id = &scid,
     };
+
+    // RFC 9368: Include version_information when v2 is enabled
+    if (config.enable_v2) {
+        local_params.version_info_chosen = protocol.QUIC_V1; // Client starts with v1
+        local_params.version_info_available = .{ protocol.QUIC_V2, protocol.QUIC_V1, 0, 0, 0, 0, 0, 0 };
+        local_params.version_info_available_count = 2;
+    }
 
     var conn = Connection{
         .allocator = allocator,
@@ -2302,6 +2383,11 @@ pub fn connect(
     // Save the initial DCID as the Original Destination CID (needed for Retry handling)
     conn.odcid_len = 8;
     @memcpy(conn.odcid_buf[0..8], &dcid);
+
+    // Store DCID for v2 re-derivation and enable_v2 flag
+    conn.initial_dcid_len = 8;
+    @memcpy(conn.initial_dcid_buf[0..8], &dcid);
+    conn.enable_v2 = config.enable_v2;
 
     // Generate static reset key and register initial SCID with deterministic token
     crypto.random.bytes(&conn.static_reset_key);

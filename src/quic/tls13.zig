@@ -1125,6 +1125,22 @@ pub const Tls13Handshake = struct {
             }
         }
 
+        // RFC 9368: Compatible Version Negotiation
+        // If client sent version_information advertising v2 and we support v2, switch.
+        if (self.peer_transport_params) |peer_tp| {
+            if (peer_tp.version_info_chosen != null and self.local_transport_params.version_info_chosen != null) {
+                // Check if client supports v2 and we do too
+                if (peer_tp.hasAvailableVersion(protocol.QUIC_V2) and
+                    self.local_transport_params.hasAvailableVersion(protocol.QUIC_V2))
+                {
+                    std.log.info("compatible version negotiation: switching to QUIC v2", .{});
+                    self.config.quic_version = protocol.QUIC_V2;
+                    // Update our version_information to reflect the chosen version
+                    self.local_transport_params.version_info_chosen = protocol.QUIC_V2;
+                }
+            }
+        }
+
         self.state = .server_send_server_hello;
         return ._continue;
     }

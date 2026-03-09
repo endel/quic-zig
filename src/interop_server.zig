@@ -39,6 +39,7 @@ const TestCase = enum {
     ecn,
     connectionmigration,
     chacha20,
+    v2,
     unsupported,
 };
 
@@ -54,6 +55,7 @@ fn parseTestCase(name: []const u8) TestCase {
     if (std.mem.eql(u8, name, "ecn")) return .ecn;
     if (std.mem.eql(u8, name, "connectionmigration")) return .connectionmigration;
     if (std.mem.eql(u8, name, "chacha20")) return .chacha20;
+    if (std.mem.eql(u8, name, "v2")) return .v2;
     return .unsupported;
 }
 
@@ -146,7 +148,7 @@ pub fn main() !void {
     var conn_mgr = connection_manager.ConnectionManager.init(
         alloc,
         tls_config,
-        .{ .token_key = retry_token_key },
+        .{ .token_key = retry_token_key, .enable_v2 = (testcase == .v2) },
         retry_token_key,
         static_reset_key,
     );

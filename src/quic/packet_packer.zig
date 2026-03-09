@@ -253,13 +253,7 @@ pub const PacketPacker = struct {
             try writer.writeAll(self.getDcid());
         } else {
             // Long header
-            var first_byte: u8 = packet_mod.LONG_HEADER_BIT | packet_mod.FIXED_BIT;
-            first_byte |= switch (pkt_type) {
-                .initial => @as(u8, 0x00),
-                .handshake => @as(u8, 0x20),
-                .zero_rtt => @as(u8, 0x10),
-                else => @as(u8, 0x00),
-            };
+            var first_byte: u8 = packet_mod.encodeLongHeaderTypeBits(pkt_type, self.version);
             first_byte |= @as(u8, @intCast(pn_len - 1));
             try writer.writeByte(first_byte);
             try writer.writeInt(u32, self.version, .big);

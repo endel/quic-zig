@@ -38,6 +38,7 @@ const TestCase = enum {
     ecn,
     connectionmigration,
     chacha20,
+    v2,
     unsupported,
 };
 
@@ -53,6 +54,7 @@ fn parseTestCase(name: []const u8) TestCase {
     if (mem.eql(u8, name, "ecn")) return .ecn;
     if (mem.eql(u8, name, "connectionmigration")) return .connectionmigration;
     if (mem.eql(u8, name, "chacha20")) return .chacha20;
+    if (mem.eql(u8, name, "v2")) return .v2;
     return .unsupported;
 }
 
@@ -134,39 +136,43 @@ pub fn main() !void {
     const use_h3 = (testcase == .http3);
     const cipher_only: ?quic_crypto.CipherSuite = if (testcase == .chacha20) .chacha20_poly1305_sha256 else null;
 
+    const v2 = (testcase == .v2);
     switch (testcase) {
         .handshake, .transfer, .ecn, .connectionmigration, .chacha20 => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false);
         },
         .keyupdate => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, true, cipher_only);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, true, cipher_only, false);
         },
         .retry => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false);
         },
         .multiconnect => {
             for (urls.items) |url| {
                 const single = [_]ParsedUrl{url};
-                _ = try downloadAll(alloc, &single, use_h3, keylog_file, download_dir, null, false, cipher_only);
+                _ = try downloadAll(alloc, &single, use_h3, keylog_file, download_dir, null, false, cipher_only, false);
             }
         },
         .resumption, .zerortt => {
             if (urls.items.len > 0) {
                 const first = [_]ParsedUrl{urls.items[0]};
-                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only);
+                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only, false);
                 if (urls.items.len > 1) {
                     if (ticket) |*t| {
                         std.log.info("resuming with session ticket (lifetime={d}s)", .{t.lifetime});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false);
                     } else {
                         std.log.warn("no session ticket received, falling back to full handshake", .{});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only, false);
                     }
                 }
             }
         },
+        .v2 => {
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, v2);
+        },
         .http3 => {
-            _ = try downloadAll(alloc, urls.items, true, keylog_file, download_dir, null, false, cipher_only);
+            _ = try downloadAll(alloc, urls.items, true, keylog_file, download_dir, null, false, cipher_only, false);
         },
         .unsupported => unreachable,
     }
@@ -183,6 +189,7 @@ fn downloadAll(
     session_ticket: ?*const tls13.SessionTicket,
     force_key_update: bool,
     cipher_suite_only: ?quic_crypto.CipherSuite,
+    enable_v2: bool,
 ) !?tls13.SessionTicket {
     if (urls.len == 0) return null;
 
@@ -229,7 +236,7 @@ fn downloadAll(
         .cipher_suite_only = cipher_suite_only,
     };
 
-    var conn = try connection.connect(alloc, host, .{}, tls_config, null);
+    var conn = try connection.connect(alloc, host, .{ .enable_v2 = enable_v2 }, tls_config, null);
 
     var remote_addr = server_addr.any;
     var addr_size: posix.socklen_t = server_addr.getOsSockLen();

@@ -4,6 +4,7 @@ const testing = std.testing;
 const posix = std.posix;
 
 const packet = @import("packet.zig");
+const protocol = @import("protocol.zig");
 
 /// QUIC Transport Parameter IDs (RFC 9000 Section 18.2).
 pub const ParamId = enum(u64) {
@@ -24,6 +25,7 @@ pub const ParamId = enum(u64) {
     active_connection_id_limit = 0x0e,
     initial_source_connection_id = 0x0f,
     retry_source_connection_id = 0x10,
+    version_information = 0x11, // RFC 9368
     max_datagram_frame_size = 0x20,
     _,
 };
@@ -86,6 +88,21 @@ pub const TransportParams = struct {
     initial_source_connection_id: ?[]const u8 = null,
     retry_source_connection_id: ?[]const u8 = null,
     max_datagram_frame_size: ?u64 = null,
+
+    /// RFC 9368 version_information transport parameter.
+    /// chosen_version: the version used for this connection.
+    /// available_versions: list of all supported versions (up to 8).
+    version_info_chosen: ?u32 = null,
+    version_info_available: [8]u32 = .{0} ** 8,
+    version_info_available_count: u8 = 0,
+
+    /// Check if a version is listed in the peer's available versions.
+    pub fn hasAvailableVersion(self: *const TransportParams, version: u32) bool {
+        for (0..self.version_info_available_count) |i| {
+            if (self.version_info_available[i] == version) return true;
+        }
+        return false;
+    }
 
     /// Encode transport parameters into a buffer.
     pub fn encode(self: *const TransportParams, writer: anytype) !void {
@@ -193,6 +210,18 @@ pub const TransportParams = struct {
         if (self.max_datagram_frame_size) |size| {
             try Helper.writeParam(writer, .max_datagram_frame_size, size);
         }
+
+        // RFC 9368: version_information
+        if (self.version_info_chosen) |chosen| {
+            const n = self.version_info_available_count;
+            const param_len: u64 = 4 + @as(u64, n) * 4; // chosen(4) + available(n*4)
+            try packet.writeVarInt(writer, @intFromEnum(ParamId.version_information));
+            try packet.writeVarInt(writer, param_len);
+            try writer.writeInt(u32, chosen, .big);
+            for (0..n) |i| {
+                try writer.writeInt(u32, self.version_info_available[i], .big);
+            }
+        }
     }
 
     /// Decode transport parameters from a buffer.
@@ -280,6 +309,23 @@ pub const TransportParams = struct {
                 },
                 @intFromEnum(ParamId.max_datagram_frame_size) => {
                     params.max_datagram_frame_size = try packet.readVarInt(reader);
+                },
+                @intFromEnum(ParamId.version_information) => {
+                    if (param_len < 4 or (param_len % 4) != 0) {
+                        fbs.pos = param_start + param_len;
+                    } else {
+                        params.version_info_chosen = try reader.readInt(u32, .big);
+                        const avail_count = (param_len - 4) / 4;
+                        const n: u8 = @intCast(@min(avail_count, 8));
+                        for (0..n) |i| {
+                            params.version_info_available[i] = try reader.readInt(u32, .big);
+                        }
+                        params.version_info_available_count = n;
+                        // Skip any extra versions beyond our buffer
+                        if (avail_count > 8) {
+                            fbs.pos = param_start + param_len;
+                        }
+                    }
                 },
                 else => {
                     // Unknown parameter - skip
