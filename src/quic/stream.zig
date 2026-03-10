@@ -444,6 +444,9 @@ pub const Stream = struct {
     stream_id: u64,
     send: SendStream,
     recv: ReceiveStream,
+    /// Set when closeStream has been called for consumed stream counting.
+    /// Prevents double-counting while keeping the stream in the map for retransmission.
+    closed_for_gc: bool = false,
 
     pub fn init(allocator: Allocator, stream_id: u64) Stream {
         return .{
@@ -505,6 +508,10 @@ pub const StreamsMap = struct {
     last_sent_max_bidi: u64 = 0,
     last_sent_max_uni: u64 = 0,
 
+    /// Initial stream limits (fixed threshold for MAX_STREAMS sliding window).
+    initial_max_incoming_bidi: u64 = 0,
+    initial_max_incoming_uni: u64 = 0,
+
     pub fn init(allocator: Allocator, is_server: bool) StreamsMap {
         // Stream IDs: client bidi = 0, 4, 8, ...; server bidi = 1, 5, 9, ...
         // Client uni = 2, 6, 10, ...; server uni = 3, 7, 11, ...
@@ -563,11 +570,22 @@ pub const StreamsMap = struct {
     pub fn setMaxIncomingStreams(self: *StreamsMap, max_bidi: u64, max_uni: u64) void {
         self.max_incoming_bidi_streams = max_bidi;
         self.max_incoming_uni_streams = max_uni;
+        // Record initial limits for fixed-threshold MAX_STREAMS sliding window.
+        // Also set last_sent since the initial limit is conveyed in transport params.
+        if (self.initial_max_incoming_bidi == 0) {
+            self.initial_max_incoming_bidi = max_bidi;
+            self.last_sent_max_bidi = max_bidi;
+        }
+        if (self.initial_max_incoming_uni == 0) {
+            self.initial_max_incoming_uni = max_uni;
+            self.last_sent_max_uni = max_uni;
+        }
     }
 
     /// Open a new bidirectional stream. Returns error if stream limit reached.
     pub fn openBidiStream(self: *StreamsMap) !*Stream {
-        if (self.open_bidi_streams >= self.max_bidi_streams) {
+        // MAX_STREAMS is cumulative: check total streams opened, not concurrent count
+        if (self.next_bidi_stream_id / 4 >= self.max_bidi_streams) {
             return error.StreamLimitError;
         }
 
@@ -585,7 +603,8 @@ pub const StreamsMap = struct {
 
     /// Open a new unidirectional send stream. Returns error if stream limit reached.
     pub fn openUniStream(self: *StreamsMap) !*SendStream {
-        if (self.open_uni_streams >= self.max_uni_streams) {
+        // MAX_STREAMS is cumulative: check total streams opened, not concurrent count
+        if (self.next_uni_stream_id / 4 >= self.max_uni_streams) {
             return error.StreamLimitError;
         }
 
@@ -644,6 +663,24 @@ pub const StreamsMap = struct {
 
     /// Mark a stream as fully closed and update consumed counters.
     /// Only counts peer-initiated streams (those count against our MAX_STREAMS limit).
+    /// Scan bidi streams for ones that are fully closed (both FIN sent and FIN received)
+    /// and call closeStream for each. This ensures consumed_*_streams advances even when
+    /// the close was never triggered by a received STREAM/RESET_STREAM frame.
+    pub fn collectClosedStreams(self: *StreamsMap) void {
+        // Mark fully-closed streams for consumed counting. Streams stay in the map
+        // so that loss detection can still find them for retransmission.
+        var it = self.streams.iterator();
+        while (it.next()) |kv| {
+            const s = kv.value_ptr.*;
+            if (!s.closed_for_gc and s.recv.finished and s.send.fin_sent and
+                s.send.retransmit_count == 0 and !s.send.fin_lost)
+            {
+                s.closed_for_gc = true;
+                self.closeStream(s.stream_id);
+            }
+        }
+    }
+
     pub fn closeStream(self: *StreamsMap, stream_id: u64) void {
         const peer_initiated = !isLocal(stream_id, self.is_server);
         if (isBidi(stream_id)) {
@@ -665,27 +702,26 @@ pub const StreamsMap = struct {
     pub fn getMaxStreamsUpdates(self: *StreamsMap) MaxStreamsUpdate {
         var result = MaxStreamsUpdate{};
 
-        // Bidi: send update when consumed >= half of current max
+        // Use fixed threshold based on initial limit (not growing max_incoming).
+        // This prevents the threshold from outgrowing batch sizes and stalling.
         if (self.max_incoming_bidi_streams > 0) {
-            const threshold = self.max_incoming_bidi_streams / 2;
+            const threshold = @max(self.initial_max_incoming_bidi / 2, 1);
             if (self.consumed_bidi_streams >= threshold) {
-                const new_max = self.consumed_bidi_streams + self.max_incoming_bidi_streams;
+                const new_max = self.last_sent_max_bidi + self.consumed_bidi_streams;
                 if (new_max > self.last_sent_max_bidi) {
                     result.bidi = new_max;
                     self.last_sent_max_bidi = new_max;
-                    // Update our internal limit to allow the new streams
                     self.max_incoming_bidi_streams = new_max;
-                    // Reset consumed so window slides
                     self.consumed_bidi_streams = 0;
                 }
             }
         }
 
-        // Uni: same sliding window
+        // Uni: same fixed-threshold sliding window
         if (self.max_incoming_uni_streams > 0) {
-            const threshold = self.max_incoming_uni_streams / 2;
+            const threshold = @max(self.initial_max_incoming_uni / 2, 1);
             if (self.consumed_uni_streams >= threshold) {
-                const new_max = self.consumed_uni_streams + self.max_incoming_uni_streams;
+                const new_max = self.last_sent_max_uni + self.consumed_uni_streams;
                 if (new_max > self.last_sent_max_uni) {
                     result.uni = new_max;
                     self.last_sent_max_uni = new_max;

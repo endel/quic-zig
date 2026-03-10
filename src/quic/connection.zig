@@ -1192,7 +1192,8 @@ pub const Connection = struct {
                     try strm.recv.handleStreamFrame(s.offset, s.data, s.fin);
 
                     // Check if stream is fully closed (both directions done)
-                    if (s.fin and (strm.send.fin_sent or strm.send.reset_err != null)) {
+                    if (s.fin and (strm.send.fin_sent or strm.send.reset_err != null) and !strm.closed_for_gc) {
+                        strm.closed_for_gc = true;
                         self.streams.closeStream(s.stream_id);
                     }
                 } else {
@@ -1879,6 +1880,10 @@ pub const Connection = struct {
 
     /// Check if connection-level flow control needs a MAX_DATA or MAX_STREAMS update.
     fn queueFlowControlUpdates(self: *Connection) void {
+        // Garbage-collect fully-closed bidi streams so consumed count advances
+        // and MAX_STREAMS updates can fire.
+        self.streams.collectClosedStreams();
+
         if (self.conn_flow_ctrl.getWindowUpdate(&self.pkt_handler.rtt_stats)) |new_max| {
             self.pending_frames.push(.{ .max_data = new_max });
         }
@@ -1974,10 +1979,8 @@ pub const Connection = struct {
             return 0;
         }
 
-        // Check congestion window
+        // Check congestion window — only send ACKs + control frames when congestion-limited
         if (self.pkt_handler.bytes_in_flight >= self.cc.sendWindow()) {
-            // Congestion limited - only send ACKs
-            std.log.info("send: congestion-limited bif={d} cwnd={d}", .{ self.pkt_handler.bytes_in_flight, self.cc.sendWindow() });
             return try self.sendAckOnly(out_buf, now);
         }
 

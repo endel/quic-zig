@@ -423,6 +423,9 @@ fn downloadH0(
     var stream_paths = std.AutoHashMap(u64, []const u8).init(alloc);
     defer stream_paths.deinit();
 
+    // Track how many URLs have been opened as streams
+    var next_url_idx: usize = 0;
+
     if (requests_already_sent) {
         // 0-RTT: streams were already opened before handshake; register them for tracking
         for (urls, 0..) |url, idx| {
@@ -431,30 +434,31 @@ fn downloadH0(
             try stream_paths.put(stream_id, url.path);
             std.log.info("H0: tracking 0-RTT stream {d} for {s}", .{ stream_id, url.path });
         }
+        next_url_idx = urls.len;
     } else {
-        // Send all requests normally
-        for (urls) |url| {
-            const stream_id = h0c.sendRequest(url.path) catch |err| {
-                std.log.err("H0: sendRequest error for {s}: {any}", .{ url.path, err });
-                continue;
-            };
+        // Open streams up to the server's stream limit
+        while (next_url_idx < urls.len) {
+            const url = urls[next_url_idx];
+            const stream_id = h0c.sendRequest(url.path) catch break; // break on limit
             try downloads.put(stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 });
             try stream_paths.put(stream_id, url.path);
-            std.log.info("H0: requested {s} on stream {d}", .{ url.path, stream_id });
+            next_url_idx += 1;
         }
     }
 
     // Flush
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
-    var flush_count: usize = 0;
-    while (flush_count < 10) : (flush_count += 1) {
-        const more = conn.send(&out) catch break;
-        if (more == 0) break;
-        ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = posix.sendto(sockfd, out[0..more], 0, remote_addr, addr_size) catch break;
+    {
+        var flush_count: usize = 0;
+        while (flush_count < 10) : (flush_count += 1) {
+            const more = conn.send(&out) catch break;
+            if (more == 0) break;
+            ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
+            _ = posix.sendto(sockfd, out[0..more], 0, remote_addr, addr_size) catch break;
+        }
     }
 
-    // Read responses — use time-based timeout (60s) instead of iteration count
+    // Read responses — use time-based timeout (60s)
     var completed: usize = 0;
     var total_bytes_received: usize = 0;
     var key_update_done = false;
@@ -463,6 +467,15 @@ fn downloadH0(
     const download_timeout_ns: i128 = 60 * std.time.ns_per_s;
 
     while (completed < urls.len and (std.time.nanoTimestamp() - download_start) < download_timeout_ns) {
+        // Try to open more streams as the limit increases (MAX_STREAMS from server)
+        while (next_url_idx < urls.len) {
+            const url = urls[next_url_idx];
+            const stream_id = h0c.sendRequest(url.path) catch break; // break on limit
+            downloads.put(stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 }) catch break;
+            stream_paths.put(stream_id, url.path) catch break;
+            next_url_idx += 1;
+        }
+
         // Read packets (batch up to 100 datagrams per loop)
         var packets_received: usize = 0;
         {
