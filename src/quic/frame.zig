@@ -514,15 +514,16 @@ pub const Frame = union(FrameType) {
             },
 
             .stream => |s| {
-                var type_byte: u8 = 0x08;
+                // Always set the LEN flag to prevent subsequent frames from being
+                // misinterpreted as stream data (RFC 9000 §19.8)
+                var type_byte: u8 = 0x08 | 0x02; // LEN always set
                 if (s.offset > 0) type_byte |= 0x04;
-                if (s.length > 0) type_byte |= 0x02;
                 if (s.fin) type_byte |= 0x01;
 
                 try packet.writeVarInt(writer, type_byte);
                 try packet.writeVarInt(writer, s.stream_id);
                 if (s.offset > 0) try packet.writeVarInt(writer, s.offset);
-                if (s.length > 0) try packet.writeVarInt(writer, s.length);
+                try packet.writeVarInt(writer, s.length); // always write length
                 try writer.writeAll(s.data);
             },
 

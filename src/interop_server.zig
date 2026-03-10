@@ -148,7 +148,7 @@ pub fn main() !void {
     var conn_mgr = connection_manager.ConnectionManager.init(
         alloc,
         tls_config,
-        .{ .token_key = retry_token_key, .enable_v2 = (testcase == .v2) },
+        .{ .token_key = retry_token_key, .enable_v2 = (testcase == .v2), .disable_pmtud = true },
         retry_token_key,
         static_reset_key,
     );

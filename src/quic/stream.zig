@@ -404,8 +404,13 @@ pub const SendStream = struct {
         else
             0;
         const data_len = @min(unsent_len, @min(max_len, window_remaining));
-        const data = if (data_len > 0) buffered[unsent_start..][0..data_len] else &[_]u8{};
         const fin = self.fin_queued and !self.fin_sent and (unsent_start + data_len == self.write_offset);
+
+        // Don't produce useless zero-length non-FIN frames — they lack the LEN flag
+        // and would cause the receiver to interpret following frame bytes as stream data
+        if (data_len == 0 and !fin) return null;
+
+        const data = if (data_len > 0) buffered[unsent_start..][0..data_len] else &[_]u8{};
 
         self.send_offset += data_len;
         if (fin) self.fin_sent = true;
@@ -476,6 +481,14 @@ pub const StreamsMap = struct {
     max_bidi_streams: u64 = 0,
     max_uni_streams: u64 = 0,
 
+    /// Peer's initial max stream data limits (from transport parameters).
+    /// These set the send_window on newly created streams.
+    /// "bidi_local" = peer's limit for streams THEY initiated (we send on peer-initiated bidi)
+    /// "bidi_remote" = peer's limit for streams WE initiated (we send on our-initiated bidi)
+    peer_initial_max_stream_data_bidi_local: u64 = std.math.maxInt(u64),
+    peer_initial_max_stream_data_bidi_remote: u64 = std.math.maxInt(u64),
+    peer_initial_max_stream_data_uni: u64 = std.math.maxInt(u64),
+
     /// Maximum stream IDs from peer.
     max_incoming_bidi_streams: u64 = 0,
     max_incoming_uni_streams: u64 = 0,
@@ -539,6 +552,13 @@ pub const StreamsMap = struct {
         self.max_uni_streams = max_uni;
     }
 
+    /// Set the peer's initial max stream data limits (from their transport parameters).
+    pub fn setPeerInitialMaxStreamData(self: *StreamsMap, bidi_local: u64, bidi_remote: u64, uni: u64) void {
+        self.peer_initial_max_stream_data_bidi_local = bidi_local;
+        self.peer_initial_max_stream_data_bidi_remote = bidi_remote;
+        self.peer_initial_max_stream_data_uni = uni;
+    }
+
     /// Set the maximum incoming stream limits (our advertised limits).
     pub fn setMaxIncomingStreams(self: *StreamsMap, max_bidi: u64, max_uni: u64) void {
         self.max_incoming_bidi_streams = max_bidi;
@@ -557,6 +577,8 @@ pub const StreamsMap = struct {
 
         const s = try self.allocator.create(Stream);
         s.* = Stream.init(self.allocator, id);
+        // We initiated this stream → peer's "bidi_remote" limit applies to our sends
+        s.send.send_window = self.peer_initial_max_stream_data_bidi_remote;
         try self.streams.put(id, s);
         return s;
     }
@@ -573,6 +595,7 @@ pub const StreamsMap = struct {
 
         const s = try self.allocator.create(SendStream);
         s.* = SendStream.init(self.allocator, id);
+        s.send_window = self.peer_initial_max_stream_data_uni;
         try self.send_streams.put(id, s);
         return s;
     }
@@ -594,6 +617,8 @@ pub const StreamsMap = struct {
 
         const s = try self.allocator.create(Stream);
         s.* = Stream.init(self.allocator, stream_id);
+        // Peer initiated this stream → peer's "bidi_local" limit applies to our sends
+        s.send.send_window = self.peer_initial_max_stream_data_bidi_local;
         try self.streams.put(stream_id, s);
         self.open_bidi_streams += 1;
         return s;

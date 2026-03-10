@@ -347,6 +347,8 @@ pub const ConnectionConfig = struct {
     token_key: ?[16]u8 = null,
     // Enable Compatible Version Negotiation to QUIC v2 (RFC 9368/9369)
     enable_v2: bool = false,
+    // Disable Path MTU Discovery (PMTUD)
+    disable_pmtud: bool = false,
 };
 
 /// A QUIC connection.
@@ -409,6 +411,9 @@ pub const Connection = struct {
     // Key update manager for 1-RTT key rotation (RFC 9001 Section 6)
     key_update: ?quic_crypto.KeyUpdateManager = null,
 
+    // Whether PMTUD is disabled
+    disable_pmtud: bool = false,
+
     // Path MTU Discovery (DPLPMTUD, RFC 8899)
     mtu_discoverer: mtu_mod.MtuDiscoverer = .{},
 
@@ -463,7 +468,7 @@ pub const Connection = struct {
     odcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
     odcid_len: u8 = 0,
     retry_received: bool = false,
-    retry_token_buf: [packet.TOKEN_MAX_LEN]u8 = .{0} ** packet.TOKEN_MAX_LEN,
+    retry_token_buf: [256]u8 = .{0} ** 256,
     retry_token_len: u16 = 0,
 
     // Timing
@@ -563,6 +568,7 @@ pub const Connection = struct {
 
         conn.local_params = local_params;
         conn.enable_v2 = config.enable_v2;
+        conn.disable_pmtud = config.disable_pmtud;
 
         // Initialize TLS 1.3 handshake if config provided
         if (tls_config) |tc| {
@@ -654,7 +660,11 @@ pub const Connection = struct {
                 self.retry_token_len = @intCast(token.len);
                 // Point the packer's initial_token to our owned buffer
                 self.packer.initial_token = self.retry_token_buf[0..self.retry_token_len];
+            } else {
+                std.log.err("Retry token too large ({d} bytes, max {d})", .{ token.len, self.retry_token_buf.len });
             }
+        } else {
+            std.log.warn("Retry packet has no token", .{});
         }
 
         // Re-derive Initial keys with the new DCID (Retry SCID)
@@ -986,6 +996,7 @@ pub const Connection = struct {
 
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
+                var earliest_lost_sent_time: ?i64 = null;
                 for (result.acked.constSlice()) |pkt| {
                     // Check if this is an MTU probe ACK
                     if (self.mtu_discoverer.onProbeAcked(pkt.pn, now)) {
@@ -997,7 +1008,7 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
                     }
 
-                    self.cc.onPacketAcked(pkt.size, pkt.pn);
+                    self.cc.onPacketAcked(pkt.size, pkt.time_sent);
 
                     // Track whether a packet sent with current keys has been ACKed
                     if (enc_level == .application) {
@@ -1017,6 +1028,9 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
                         has_non_probe_loss = true;
+                        if (earliest_lost_sent_time == null or pkt.time_sent < earliest_lost_sent_time.?) {
+                            earliest_lost_sent_time = pkt.time_sent;
+                        }
                     }
 
                     // Queue stream data retransmission for lost packets
@@ -1032,8 +1046,8 @@ pub const Connection = struct {
                     if (result.persistent_congestion) {
                         self.cc.onPersistentCongestion();
                         std.log.info("persistent congestion detected, window reduced to minimum", .{});
-                    } else if (self.pkt_handler.sent[@intFromEnum(enc_level)].largest_sent) |ls| {
-                        self.cc.onCongestionEvent(ls);
+                    } else if (earliest_lost_sent_time) |lost_time| {
+                        self.cc.onCongestionEvent(lost_time, now);
                     }
                 }
 
@@ -1057,6 +1071,7 @@ pub const Connection = struct {
 
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
+                var earliest_lost_sent_time_ecn: ?i64 = null;
                 for (result.acked.constSlice()) |pkt| {
                     if (self.mtu_discoverer.onProbeAcked(pkt.pn, now)) {
                         const new_mtu = self.mtu_discoverer.current_mtu;
@@ -1065,7 +1080,7 @@ pub const Connection = struct {
                         self.pacer.max_datagram_size = new_mtu;
                         std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
                     }
-                    self.cc.onPacketAcked(pkt.size, pkt.pn);
+                    self.cc.onPacketAcked(pkt.size, pkt.time_sent);
 
                     if (enc_level == .application) {
                         if (self.key_update) |*ku| {
@@ -1083,6 +1098,9 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
                         has_non_probe_loss = true;
+                        if (earliest_lost_sent_time_ecn == null or pkt.time_sent < earliest_lost_sent_time_ecn.?) {
+                            earliest_lost_sent_time_ecn = pkt.time_sent;
+                        }
                     }
 
                     // Queue stream data retransmission for lost packets
@@ -1098,8 +1116,8 @@ pub const Connection = struct {
                     if (result.persistent_congestion) {
                         self.cc.onPersistentCongestion();
                         std.log.info("persistent congestion detected, window reduced to minimum", .{});
-                    } else if (self.pkt_handler.sent[@intFromEnum(enc_level)].largest_sent) |ls| {
-                        self.cc.onCongestionEvent(ls);
+                    } else if (earliest_lost_sent_time_ecn) |lost_time| {
+                        self.cc.onCongestionEvent(lost_time, now);
                     }
                 }
 
@@ -1124,9 +1142,7 @@ pub const Connection = struct {
                 // If valid and CE count increased, treat as congestion event
                 if (ecn_valid and ack.ecn_ce > self.peer_ecn_ce[space_idx]) {
                     std.log.info("ECN: CE count increased {d} -> {d}, congestion signal", .{ self.peer_ecn_ce[space_idx], ack.ecn_ce });
-                    if (self.pkt_handler.sent[space_idx].largest_sent) |ls| {
-                        self.cc.onCongestionEvent(ls);
-                    }
+                    self.cc.onCongestionEvent(now, now);
                 }
                 self.peer_ecn_ect0[space_idx] = ack.ecn_ect0;
                 self.peer_ecn_ect1[space_idx] = ack.ecn_ect1;
@@ -1666,6 +1682,11 @@ pub const Connection = struct {
                             peer_tp.initial_max_streams_bidi,
                             peer_tp.initial_max_streams_uni,
                         );
+                        self.streams.setPeerInitialMaxStreamData(
+                            peer_tp.initial_max_stream_data_bidi_local,
+                            peer_tp.initial_max_stream_data_bidi_remote,
+                            peer_tp.initial_max_stream_data_uni,
+                        );
                         self.conn_flow_ctrl.base.send_window = peer_tp.initial_max_data;
 
                         // Enable DATAGRAM support if both sides advertise max_datagram_frame_size
@@ -1782,7 +1803,7 @@ pub const Connection = struct {
                     }
 
                     // Start PMTUD now that the handshake is complete
-                    self.mtu_discoverer.start();
+                    if (!self.disable_pmtud) self.mtu_discoverer.start();
 
                     break;
                 },
@@ -1993,6 +2014,7 @@ pub const Connection = struct {
         else
             null;
 
+        self.packer.conn_flow_ctrl = &self.conn_flow_ctrl;
         const bytes_written = try self.packer.packCoalesced(
             out_buf,
             &self.pkt_handler,
@@ -2449,6 +2471,7 @@ pub fn connect(
     conn.initial_dcid_len = 8;
     @memcpy(conn.initial_dcid_buf[0..8], &dcid);
     conn.enable_v2 = config.enable_v2;
+    conn.disable_pmtud = config.disable_pmtud;
 
     // Generate static reset key and register initial SCID with deterministic token
     crypto.random.bytes(&conn.static_reset_key);

@@ -545,7 +545,8 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
                 if (remaining > RETRY_INTEGRITY_TAG_SIZE) {
                     header.token = fbs.buffer[fbs.pos .. fbs.buffer.len - RETRY_INTEGRITY_TAG_SIZE];
                 }
-                header.remainder_len = 0;
+                // Retry packets have no Length field — they consume the entire datagram
+                header.remainder_len = remaining;
             },
 
             PacketType.version_negotiation => {},

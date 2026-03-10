@@ -174,12 +174,16 @@ pub const H3Connection = struct {
         // Send encoder instructions on QPACK encoder stream
         try self.flushEncoderInstructions();
 
-        // Send DATA frame if body provided
+        // Send DATA frame if body provided — write header + body separately
+        // to avoid copying large payloads into a fixed stack buffer
         if (body) |b| {
-            var data_buf: [8192]u8 = undefined;
-            var dfbs = io.fixedBufferStream(&data_buf);
-            try h3_frame.write(.{ .data = b }, dfbs.writer());
-            try stream.send.writeData(dfbs.getWritten());
+            var hdr_buf: [16]u8 = undefined;
+            var hdr_fbs = io.fixedBufferStream(&hdr_buf);
+            const hdr_writer = hdr_fbs.writer();
+            packet.writeVarInt(hdr_writer, 0x00) catch unreachable; // DATA frame type
+            packet.writeVarInt(hdr_writer, b.len) catch unreachable;
+            try stream.send.writeData(hdr_fbs.getWritten());
+            try stream.send.writeData(b);
         }
 
         stream.send.close();
@@ -258,12 +262,16 @@ pub const H3Connection = struct {
         // Send encoder instructions on QPACK encoder stream
         try self.flushEncoderInstructions();
 
-        // Send DATA frame if body provided
+        // Send DATA frame if body provided — write header + body separately
+        // to avoid copying large payloads into a fixed stack buffer
         if (body) |b| {
-            var data_buf: [8192]u8 = undefined;
-            var dfbs = io.fixedBufferStream(&data_buf);
-            try h3_frame.write(.{ .data = b }, dfbs.writer());
-            try stream.send.writeData(dfbs.getWritten());
+            var hdr_buf: [16]u8 = undefined;
+            var hdr_fbs = io.fixedBufferStream(&hdr_buf);
+            const hdr_writer = hdr_fbs.writer();
+            packet.writeVarInt(hdr_writer, 0x00) catch unreachable; // DATA frame type
+            packet.writeVarInt(hdr_writer, b.len) catch unreachable;
+            try stream.send.writeData(hdr_fbs.getWritten());
+            try stream.send.writeData(b);
         }
 
         stream.send.close();

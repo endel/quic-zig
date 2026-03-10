@@ -252,7 +252,7 @@ fn downloadAll(
         .cipher_suite_only = cipher_suite_only,
     };
 
-    var conn = try connection.connect(alloc, host, .{ .enable_v2 = enable_v2 }, tls_config, null);
+    var conn = try connection.connect(alloc, host, .{ .enable_v2 = enable_v2, .disable_pmtud = true }, tls_config, null);
 
     var remote_addr = server_addr.any;
     var addr_size: posix.socklen_t = server_addr.getOsSockLen();
@@ -292,6 +292,12 @@ fn downloadAll(
                 if (bytes_written == 0) break;
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                 _ = posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size) catch break;
+                // After the first send (Initial+0-RTT coalesced), give the server
+                // time to process the Initial and create the connection before
+                // standalone 0-RTT packets arrive. Without this delay, quic-go
+                // queues standalone 0-RTT packets (no matching connection yet)
+                // and drops them when 0-RTT keys are discarded after handshake.
+                if (sc == 0 and early_data_sent) std.Thread.sleep(5 * std.time.ns_per_ms);
             }
         }
 
@@ -502,7 +508,10 @@ fn downloadH0(
             }
         }
 
-        // Burst send ACKs + any queued data
+        // Fire PTO timer for loss detection and retransmission
+        conn.onTimeout() catch {};
+
+        // Burst send ACKs + any queued data (including retransmissions)
         {
             var sc: usize = 0;
             while (sc < 10) : (sc += 1) {
@@ -651,7 +660,10 @@ fn downloadH3(
             }
         }
 
-        // Burst send ACKs + any queued data
+        // Fire PTO timer for loss detection and retransmission
+        conn.onTimeout() catch {};
+
+        // Burst send ACKs + any queued data (including retransmissions)
         {
             var sc: usize = 0;
             while (sc < 10) : (sc += 1) {

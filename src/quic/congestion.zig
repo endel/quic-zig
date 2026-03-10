@@ -40,9 +40,9 @@ pub const NewReno = struct {
     /// Maximum datagram size (affects window calculations).
     max_datagram_size: u64 = DEFAULT_MAX_DATAGRAM_SIZE,
 
-    /// Largest packet number sent at the time of the last congestion event.
-    /// Used to detect recovery period.
-    largest_sent_at_last_cutback: ?u64 = null,
+    /// Time at which the current recovery period started (RFC 9002 §B.7).
+    /// Losses of packets sent before this time don't trigger new recovery.
+    congestion_recovery_start_time: ?i64 = null,
 
     /// Bytes acknowledged in the current round trip (for congestion avoidance).
     bytes_acked_in_round: u64 = 0,
@@ -50,6 +50,14 @@ pub const NewReno = struct {
     /// Whether we are in slow start.
     pub fn inSlowStart(self: *const NewReno) bool {
         return self.congestion_window < self.ssthresh;
+    }
+
+    /// Check if a packet sent at `sent_time` is from the current recovery period.
+    pub fn inCongestionRecovery(self: *const NewReno, sent_time: i64) bool {
+        if (self.congestion_recovery_start_time) |start| {
+            return sent_time <= start;
+        }
+        return false;
     }
 
     /// Initialize with default values.
@@ -68,11 +76,9 @@ pub const NewReno = struct {
     }
 
     /// Called when a packet is acknowledged.
-    pub fn onPacketAcked(self: *NewReno, acked_bytes: u64, pn: u64) void {
+    pub fn onPacketAcked(self: *NewReno, acked_bytes: u64, sent_time: i64) void {
         // Don't grow window during recovery
-        if (self.largest_sent_at_last_cutback) |cutback_pn| {
-            if (pn <= cutback_pn) return;
-        }
+        if (self.inCongestionRecovery(sent_time)) return;
 
         if (self.inSlowStart()) {
             // Slow start: increase by acked_bytes
@@ -89,13 +95,13 @@ pub const NewReno = struct {
     }
 
     /// Called on congestion event (packet loss detected).
-    pub fn onCongestionEvent(self: *NewReno, largest_sent_pn: u64) void {
-        // Avoid multiple cutbacks in the same recovery period
-        if (self.largest_sent_at_last_cutback) |cutback_pn| {
-            if (largest_sent_pn <= cutback_pn) return;
-        }
+    /// `sent_time` is the sent time of the lost packet.
+    /// `now` is the current time (becomes the new recovery start time).
+    pub fn onCongestionEvent(self: *NewReno, sent_time: i64, now: i64) void {
+        // Don't trigger new recovery for packets sent during current recovery (RFC 9002 §B.7)
+        if (self.inCongestionRecovery(sent_time)) return;
 
-        self.largest_sent_at_last_cutback = largest_sent_pn;
+        self.congestion_recovery_start_time = now;
 
         // Multiplicative decrease
         self.ssthresh = self.congestion_window * NEWRENO_BETA / NEWRENO_BETA_DENOM;
@@ -111,7 +117,7 @@ pub const NewReno = struct {
     pub fn onPersistentCongestion(self: *NewReno) void {
         self.congestion_window = MIN_WINDOW_PACKETS * self.max_datagram_size;
         self.ssthresh = self.congestion_window;
-        self.largest_sent_at_last_cutback = null;
+        self.congestion_recovery_start_time = null;
         self.bytes_acked_in_round = 0;
     }
 
@@ -231,8 +237,8 @@ test "NewReno: slow start growth" {
     var cc = NewReno.init();
     const initial_window = cc.congestion_window;
 
-    // ACK 1200 bytes
-    cc.onPacketAcked(1200, 0);
+    // ACK 1200 bytes (sent at time 100)
+    cc.onPacketAcked(1200, 100);
     try testing.expectEqual(initial_window + 1200, cc.congestion_window);
     try testing.expect(cc.inSlowStart());
 }
@@ -241,7 +247,8 @@ test "NewReno: congestion event reduces window" {
     var cc = NewReno.init();
     const initial_window = cc.congestion_window;
 
-    cc.onCongestionEvent(10);
+    // Lost packet sent at time 100, detected at time 200
+    cc.onCongestionEvent(100, 200);
 
     // Window should be reduced by beta (0.7)
     const expected = initial_window * NEWRENO_BETA / NEWRENO_BETA_DENOM;
@@ -252,15 +259,16 @@ test "NewReno: congestion event reduces window" {
 test "NewReno: recovery period prevents double cutback" {
     var cc = NewReno.init();
 
-    cc.onCongestionEvent(10);
+    // First loss: packet sent at time 100, detected at time 200
+    cc.onCongestionEvent(100, 200);
     const after_first = cc.congestion_window;
 
-    // Second loss in recovery should not reduce further
-    cc.onCongestionEvent(5);
+    // Second loss of a packet also sent before recovery (time 150 < 200) — should NOT cut
+    cc.onCongestionEvent(150, 250);
     try testing.expectEqual(after_first, cc.congestion_window);
 
-    // Loss after recovery should reduce
-    cc.onCongestionEvent(15);
+    // Loss of packet sent AFTER recovery started (time 300 > 200) — should cut
+    cc.onCongestionEvent(300, 400);
     try testing.expect(cc.congestion_window < after_first);
 }
 
@@ -269,8 +277,8 @@ test "NewReno: minimum window enforced" {
 
     // Force tiny window
     cc.congestion_window = 3000;
-    cc.largest_sent_at_last_cutback = null;
-    cc.onCongestionEvent(100);
+    cc.congestion_recovery_start_time = null;
+    cc.onCongestionEvent(100, 200);
 
     try testing.expect(cc.congestion_window >= MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE);
 }
@@ -286,7 +294,7 @@ test "NewReno: persistent congestion resets to minimum" {
     try testing.expectEqual(MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE, cc.congestion_window);
     try testing.expectEqual(MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE, cc.ssthresh);
     // Recovery period should be cleared so window can grow again
-    try testing.expect(cc.largest_sent_at_last_cutback == null);
+    try testing.expect(cc.congestion_recovery_start_time == null);
 }
 
 test "Pacer: initial burst allowed" {

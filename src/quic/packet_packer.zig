@@ -11,6 +11,14 @@ const ack_handler = @import("ack_handler.zig");
 const crypto_stream = @import("crypto_stream.zig");
 const stream_mod = @import("stream.zig");
 const conn_mod = @import("connection.zig");
+const flow_control = @import("flow_control.zig");
+
+/// Calculate the overhead of a STREAM frame header (type + stream_id + offset + length varints).
+/// This accounts for the LEN flag always being set.
+fn streamFrameHeaderOverhead(stream_id: u64, offset: u64, max_data_len: u64) usize {
+    return 1 // type byte (always 1 byte, value 0x08-0x0F)
+    + packet_mod.varIntLength(stream_id) + (if (offset > 0) packet_mod.varIntLength(offset) else 0) + packet_mod.varIntLength(max_data_len); // length field (always present with LEN flag)
+}
 
 /// Default QUIC packet size (UDP payload).
 const DEFAULT_MAX_PACKET_SIZE: usize = 1200;
@@ -67,6 +75,9 @@ pub const PacketPacker = struct {
     /// Maximum packet size for regular (non-probe) packets.
     max_packet_size: usize = DEFAULT_MAX_PACKET_SIZE,
 
+    /// Connection-level flow controller (for send-side limit enforcement).
+    conn_flow_ctrl: ?*flow_control.ConnectionFlowController = null,
+
     pub fn init(
         allocator: Allocator,
         is_server: bool,
@@ -121,8 +132,9 @@ pub const PacketPacker = struct {
 
         // Try packing Initial packet
         // When coalescing with 0-RTT, don't pad the Initial — let 0-RTT use the space
+        // Server never pads Initial (RFC 9000 §14.1 only requires client padding)
         if (initial_seal != null) {
-            const pad_target: usize = if (early_seal == null) MIN_INITIAL_PACKET_SIZE else 0;
+            const pad_target: usize = if (early_seal == null and !self.is_server) MIN_INITIAL_PACKET_SIZE else 0;
             const initial_len = try self.packSinglePacket(
                 out_buf[offset..],
                 .initial,
@@ -345,25 +357,38 @@ pub const PacketPacker = struct {
         var stream_frame_info_count: u8 = 0;
 
         if (level == .application and !ack_only) {
+            // Connection-level flow control budget for this packet
+            var conn_budget: u64 = if (self.conn_flow_ctrl) |cfc| cfc.sendWindowSize() else std.math.maxInt(u64);
+
             // Bidirectional streams
             var stream_it = streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| {
                 const s = s_ptr.*;
                 if (fbs.pos + AEAD_TAG_LEN + 16 >= effective_max) break;
-                const max_stream_data = effective_max - fbs.pos - AEAD_TAG_LEN - 8;
+                if (conn_budget == 0) break;
+                if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
+                const remaining = effective_max - fbs.pos - AEAD_TAG_LEN;
+                const header_overhead = streamFrameHeaderOverhead(s.send.stream_id, s.send.send_offset, remaining);
+                if (remaining <= header_overhead) break;
+                const max_stream_data = @min(remaining - header_overhead, conn_budget);
+                const prev_send_offset = s.send.send_offset;
                 if (s.send.popStreamFrame(max_stream_data)) |stream_frame| {
                     try stream_frame.write(writer);
                     ack_eliciting = true;
-                    // Record for retransmission tracking
-                    if (stream_frame_info_count < ack_handler.MAX_STREAM_FRAMES_PER_PACKET) {
-                        stream_frame_infos[stream_frame_info_count] = .{
-                            .stream_id = stream_frame.stream.stream_id,
-                            .offset = stream_frame.stream.offset,
-                            .length = stream_frame.stream.length,
-                            .fin = stream_frame.stream.fin,
-                        };
-                        stream_frame_info_count += 1;
+                    // Only count NEW data against connection flow control (not retransmissions)
+                    const new_bytes = s.send.send_offset - prev_send_offset;
+                    if (new_bytes > 0) {
+                        conn_budget -= @min(conn_budget, new_bytes);
+                        if (self.conn_flow_ctrl) |cfc| cfc.base.addBytesSent(new_bytes);
                     }
+                    // Record for retransmission tracking
+                    stream_frame_infos[stream_frame_info_count] = .{
+                        .stream_id = stream_frame.stream.stream_id,
+                        .offset = stream_frame.stream.offset,
+                        .length = stream_frame.stream.length,
+                        .fin = stream_frame.stream.fin,
+                    };
+                    stream_frame_info_count += 1;
                 }
             }
 
@@ -372,20 +397,30 @@ pub const PacketPacker = struct {
             while (uni_it.next()) |s_ptr| {
                 const s = s_ptr.*;
                 if (fbs.pos + AEAD_TAG_LEN + 16 >= effective_max) break;
-                const max_stream_data = effective_max - fbs.pos - AEAD_TAG_LEN - 8;
+                if (conn_budget == 0) break;
+                if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
+                const remaining_uni = effective_max - fbs.pos - AEAD_TAG_LEN;
+                const uni_header_overhead = streamFrameHeaderOverhead(s.stream_id, s.send_offset, remaining_uni);
+                if (remaining_uni <= uni_header_overhead) break;
+                const max_stream_data = @min(remaining_uni - uni_header_overhead, conn_budget);
+                const prev_uni_offset = s.send_offset;
                 if (s.popStreamFrame(max_stream_data)) |stream_frame| {
                     try stream_frame.write(writer);
                     ack_eliciting = true;
-                    // Record for retransmission tracking
-                    if (stream_frame_info_count < ack_handler.MAX_STREAM_FRAMES_PER_PACKET) {
-                        stream_frame_infos[stream_frame_info_count] = .{
-                            .stream_id = stream_frame.stream.stream_id,
-                            .offset = stream_frame.stream.offset,
-                            .length = stream_frame.stream.length,
-                            .fin = stream_frame.stream.fin,
-                        };
-                        stream_frame_info_count += 1;
+                    // Only count NEW data against connection flow control
+                    const new_bytes_uni = s.send_offset - prev_uni_offset;
+                    if (new_bytes_uni > 0) {
+                        conn_budget -= @min(conn_budget, new_bytes_uni);
+                        if (self.conn_flow_ctrl) |cfc| cfc.base.addBytesSent(new_bytes_uni);
                     }
+                    // Record for retransmission tracking
+                    stream_frame_infos[stream_frame_info_count] = .{
+                        .stream_id = stream_frame.stream.stream_id,
+                        .offset = stream_frame.stream.offset,
+                        .length = stream_frame.stream.length,
+                        .fin = stream_frame.stream.fin,
+                    };
+                    stream_frame_info_count += 1;
                 }
             }
 
@@ -407,6 +442,9 @@ pub const PacketPacker = struct {
         // Check if we have any payload
         var payload_len = fbs.pos - payload_start;
         if (payload_len == 0 and pad_target == 0) {
+            // Roll back the packet number we consumed — no packet will be sent
+            const idx = @intFromEnum(level);
+            pkt_handler.next_pn[idx] -= 1;
             return 0; // Nothing to send
         }
 

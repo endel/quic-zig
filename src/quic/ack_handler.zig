@@ -34,7 +34,8 @@ const MAX_PTO: i64 = 60_000_000_000;
 const MAX_ACK_RESULT: usize = 256;
 
 /// Maximum number of stream frame records per sent packet.
-pub const MAX_STREAM_FRAMES_PER_PACKET: usize = 4;
+/// Must be large enough to track all stream frames in a packet (e.g., many small 0-RTT streams).
+pub const MAX_STREAM_FRAMES_PER_PACKET: usize = 48;
 
 /// Tracks which stream data was carried in a sent packet for retransmission on loss.
 pub const StreamFrameInfo = struct {
