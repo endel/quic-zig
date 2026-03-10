@@ -795,7 +795,6 @@ pub const Connection = struct {
             // (unchanging) HP key, then select the right AEAD key based on key phase
             payload = packet.decryptWithKeyUpdate(header, fbs, &space, &self.key_update.?) catch {
                 // Undecryptable 1-RTT packets are silently dropped (RFC 9001 §6.3).
-                std.log.warn("silently dropping 1-RTT packet (key update decrypt failed) pn_space_next={d}", .{space.next_packet_number});
                 return;
             };
         } else {
@@ -816,11 +815,12 @@ pub const Connection = struct {
         // Handle key phase change for 1-RTT packets (RFC 9001 Section 6)
         if (epoch == .application) {
             if (self.key_update) |*ku| {
-                if (header.key_phase != ku.key_phase and ku.first_acked_with_current) {
+                if (header.key_phase != ku.key_phase and ku.first_acked_with_current and ku.prev_open == null) {
                     // Peer initiated a key update (RFC 9001 §6.1)
-                    // Only roll if we've confirmed the peer has our current keys
-                    // (first_acked_with_current=true). Otherwise the mismatch is
-                    // just an in-flight packet from before our own key update.
+                    // Only roll if:
+                    // 1. first_acked_with_current: peer has our current keys
+                    // 2. prev_open is null: no recent self-initiated update whose
+                    //    old-generation packets could still be in flight
                     const pto_ns = self.pkt_handler.rtt_stats.pto();
                     ku.rollKeys(now, pto_ns);
                     self.packer.key_phase = ku.key_phase;

@@ -450,15 +450,18 @@ pub const PacketPacker = struct {
             return 0; // Nothing to send
         }
 
-        // RFC 9001 Section 5.4: ensure long-header packets have at least 5 bytes plaintext for header protection
-        // (5 bytes plaintext + 16 bytes AEAD tag = 21 bytes encrypted minimum >= 20 required for sample)
-        if (pkt_type != .one_rtt and payload_len < 5) {
-            const min_pad = 5 - payload_len;
+        // RFC 9001 §5.4.2: The header protection sample starts 4 bytes after the PN offset.
+        // We need pn_offset + 4 + SAMPLE_LEN(16) <= total packet length.
+        // Equivalently: plaintext_payload >= 4 - pn_len (minimum to place the sample).
+        // For safety, ensure at least 4 bytes of plaintext regardless of PN length.
+        const min_plaintext: usize = 4;
+        if (payload_len < min_plaintext) {
+            const min_pad = min_plaintext - payload_len;
             var p: usize = 0;
             while (p < min_pad) : (p += 1) {
                 try writer.writeByte(0x00); // PADDING frame
             }
-            payload_len = 5;
+            payload_len = min_plaintext;
         }
 
         // Pad to target size for Initial or 0-RTT packets (client only, RFC 9000 §14.1)

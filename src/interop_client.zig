@@ -480,11 +480,12 @@ fn downloadH0(
         }
         if (packets_received == 0) std.Thread.sleep(1 * std.time.ns_per_ms);
 
-        // Force key update early in the connection for keyupdate test
-        if (force_key_update and !key_update_done and total_bytes_received > 0) {
+        // Force key update after receiving some data (not too early, so in-flight
+        // old-key packets don't confuse tshark's QUIC decryption)
+        if (force_key_update and !key_update_done and total_bytes_received > 100 * 1024) {
             if (conn.initiateKeyUpdate()) {
                 key_update_done = true;
-                std.log.info("key update: forced for interop test", .{});
+                std.log.info("key update: forced for interop test after {d} bytes", .{total_bytes_received});
             }
         }
 
@@ -626,11 +627,12 @@ fn downloadH3(
         }
         if (packets_received == 0) std.Thread.sleep(1 * std.time.ns_per_ms);
 
-        // Force key update early in the connection for keyupdate test
-        if (force_key_update and !key_update_done and total_bytes_received > 0) {
+        // Force key update after receiving some data (not too early, so in-flight
+        // old-key packets don't confuse tshark's QUIC decryption)
+        if (force_key_update and !key_update_done and total_bytes_received > 100 * 1024) {
             if (conn.initiateKeyUpdate()) {
                 key_update_done = true;
-                std.log.info("key update: forced for interop test", .{});
+                std.log.info("key update: forced for interop test after {d} bytes", .{total_bytes_received});
             }
         }
 
