@@ -156,11 +156,9 @@ pub fn main() !void {
     // Sync remote_addr from active path (may have changed due to preferred address migration)
     remote_addr = conn.paths[conn.active_path_idx].peer_addr;
 
-    // Clear Initial and Handshake keys so subsequent sends only use 1-RTT
+    // Clear Initial keys — Handshake keys kept until HANDSHAKE_DONE (RFC 9001 §4.9.2)
     conn.pkt_num_spaces[0].crypto_open = null;
     conn.pkt_num_spaces[0].crypto_seal = null;
-    conn.pkt_num_spaces[1].crypto_open = null;
-    conn.pkt_num_spaces[1].crypto_seal = null;
 
     // Small delay for the server to process the Finished
     std.Thread.sleep(50 * std.time.ns_per_ms);

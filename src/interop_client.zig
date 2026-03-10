@@ -139,31 +139,31 @@ pub fn main() !void {
     const v2 = (testcase == .v2);
     switch (testcase) {
         .handshake, .transfer, .ecn, .connectionmigration, .chacha20 => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
         },
         .keyupdate => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, true, cipher_only, false, false);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, true, cipher_only, false, false, false);
         },
         .retry => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
         },
         .multiconnect => {
             for (urls.items) |url| {
                 const single = [_]ParsedUrl{url};
-                _ = try downloadAll(alloc, &single, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false);
+                _ = try downloadAll(alloc, &single, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, true);
             }
         },
         .resumption => {
             if (urls.items.len > 0) {
                 const first = [_]ParsedUrl{urls.items[0]};
-                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false);
+                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
                 if (urls.items.len > 1) {
                     if (ticket) |*t| {
                         std.log.info("resuming with session ticket (lifetime={d}s)", .{t.lifetime});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false, false);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false, false, false);
                     } else {
                         std.log.warn("no session ticket received, falling back to full handshake", .{});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only, false, false);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
                     }
                 }
             }
@@ -171,23 +171,23 @@ pub fn main() !void {
         .zerortt => {
             if (urls.items.len > 0) {
                 const first = [_]ParsedUrl{urls.items[0]};
-                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false);
+                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
                 if (urls.items.len > 1) {
                     if (ticket) |*t| {
                         std.log.info("resuming with 0-RTT (lifetime={d}s)", .{t.lifetime});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false, true);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false, true, false);
                     } else {
                         std.log.warn("no session ticket received, falling back to full handshake", .{});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only, false, false);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
                     }
                 }
             }
         },
         .v2 => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, v2, false);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, v2, false, false);
         },
         .http3 => {
-            _ = try downloadAll(alloc, urls.items, true, keylog_file, download_dir, null, false, cipher_only, false, false);
+            _ = try downloadAll(alloc, urls.items, true, keylog_file, download_dir, null, false, cipher_only, false, false, false);
         },
         .unsupported => unreachable,
     }
@@ -206,6 +206,7 @@ fn downloadAll(
     cipher_suite_only: ?quic_crypto.CipherSuite,
     enable_v2: bool,
     allow_0rtt: bool,
+    skip_ticket_and_drain: bool,
 ) !?tls13.SessionTicket {
     if (urls.len == 0) return null;
 
@@ -253,6 +254,7 @@ fn downloadAll(
     };
 
     var conn = try connection.connect(alloc, host, .{ .enable_v2 = enable_v2, .disable_pmtud = true }, tls_config, null);
+    defer conn.deinit();
 
     var remote_addr = server_addr.any;
     var addr_size: posix.socklen_t = server_addr.getOsSockLen();
@@ -278,24 +280,28 @@ fn downloadAll(
     const handshake_timeout_ns: i128 = 30 * std.time.ns_per_s;
 
     while (!handshake_complete and (std.time.nanoTimestamp() - handshake_start) < handshake_timeout_ns) {
-        std.Thread.sleep(1 * std.time.ns_per_ms);
-
         // Fire PTO timer for handshake retransmissions
         conn.onTimeout() catch {};
 
-        // Send packets
+        // Send packets (burst up to 10 to handle coalesced Initial+Handshake)
+        var sent_any = false;
         {
-            const bytes_written = conn.send(&out) catch 0;
-            if (bytes_written > 0) {
+            var sc: usize = 0;
+            while (sc < 10) : (sc += 1) {
+                const bytes_written = conn.send(&out) catch break;
+                if (bytes_written == 0) break;
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                 _ = posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size) catch {};
+                sent_any = true;
             }
         }
 
         // Read response packets
+        var received_any = false;
         while (true) {
             var bytes: [8192]u8 = undefined;
             const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
+            received_any = true;
             const packet_length = recv_result.bytes_read;
             remote_addr = recv_result.from_addr;
             addr_size = recv_result.addr_len;
@@ -319,6 +325,9 @@ fn downloadAll(
 
             if (conn.state == .connected) handshake_complete = true;
         }
+
+        // Only sleep when idle (nothing to send or receive)
+        if (!sent_any and !received_any) std.Thread.sleep(1 * std.time.ns_per_ms);
     }
 
     if (!handshake_complete) {
@@ -339,18 +348,16 @@ fn downloadAll(
     // Sync remote_addr from active path
     remote_addr = conn.paths[conn.active_path_idx].peer_addr;
 
-    std.Thread.sleep(50 * std.time.ns_per_ms);
-
     if (use_h3) {
         try downloadH3(alloc, &conn, sockfd, &remote_addr, addr_size, local_addr, urls, download_dir, force_key_update);
     } else {
         try downloadH0(alloc, &conn, sockfd, &remote_addr, addr_size, local_addr, urls, download_dir, force_key_update, early_data_sent);
     }
 
-    // Wait for NewSessionTicket if we don't have one yet
-    if (conn.session_ticket == null) {
+    // Wait for NewSessionTicket if we don't have one yet.
+    if (!skip_ticket_and_drain and conn.session_ticket == null) {
         var ticket_iter: usize = 0;
-        while (conn.session_ticket == null and ticket_iter < 400) : (ticket_iter += 1) {
+        while (conn.session_ticket == null and ticket_iter < 100) : (ticket_iter += 1) {
             std.Thread.sleep(5 * std.time.ns_per_ms);
             drainRecv(&conn, sockfd, local_addr, &remote_addr, &addr_size);
             const more = conn.send(&out) catch 0;
@@ -370,15 +377,17 @@ fn downloadAll(
         _ = posix.sendto(sockfd, out[0..final_bytes], 0, &remote_addr, addr_size) catch {};
     }
 
-    // Drain
-    var drain_iter: usize = 0;
-    while (!conn.isClosed() and drain_iter < 50) : (drain_iter += 1) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-        conn.onTimeout() catch break;
-        drainRecv(&conn, sockfd, local_addr, &remote_addr, &addr_size);
-        const retransmit_bytes = conn.send(&out) catch 0;
-        if (retransmit_bytes > 0) {
-            _ = posix.sendto(sockfd, out[0..retransmit_bytes], 0, &remote_addr, addr_size) catch {};
+    if (!skip_ticket_and_drain) {
+        // Drain — brief drain to send CONNECTION_CLOSE, don't wait for full 3×PTO
+        var drain_iter: usize = 0;
+        while (!conn.isClosed() and drain_iter < 10) : (drain_iter += 1) {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+            conn.onTimeout() catch break;
+            drainRecv(&conn, sockfd, local_addr, &remote_addr, &addr_size);
+            const retransmit_bytes = conn.send(&out) catch 0;
+            if (retransmit_bytes > 0) {
+                _ = posix.sendto(sockfd, out[0..retransmit_bytes], 0, &remote_addr, addr_size) catch {};
+            }
         }
     }
 
@@ -445,15 +454,15 @@ fn downloadH0(
         _ = posix.sendto(sockfd, out[0..more], 0, remote_addr, addr_size) catch break;
     }
 
-    // Read responses
+    // Read responses — use time-based timeout (60s) instead of iteration count
     var completed: usize = 0;
-    var resp_iter: usize = 0;
-    const max_resp_iters: usize = 30000;
     var total_bytes_received: usize = 0;
     var key_update_done = false;
     var h0_last_progress: usize = 0;
+    const download_start = std.time.nanoTimestamp();
+    const download_timeout_ns: i128 = 60 * std.time.ns_per_s;
 
-    while (completed < urls.len and resp_iter < max_resp_iters) : (resp_iter += 1) {
+    while (completed < urls.len and (std.time.nanoTimestamp() - download_start) < download_timeout_ns) {
         // Read packets (batch up to 100 datagrams per loop)
         var packets_received: usize = 0;
         {
@@ -505,7 +514,7 @@ fn downloadH0(
 
         // Log progress periodically
         if (total_bytes_received > h0_last_progress + 1_000_000) {
-            std.log.info("H0 download progress: {d} bytes received, {d}/{d} complete, iter={d}", .{ total_bytes_received, completed, urls.len, resp_iter });
+            std.log.info("H0 download progress: {d} bytes received, {d}/{d} complete", .{ total_bytes_received, completed, urls.len });
             h0_last_progress = total_bytes_received;
         }
 
@@ -536,6 +545,10 @@ fn downloadH0(
                 .request => {},
             }
         }
+    }
+
+    if (completed < urls.len) {
+        std.log.warn("H0: download timeout, completed {d}/{d}", .{ completed, urls.len });
     }
 }
 
@@ -593,14 +606,14 @@ fn downloadH3(
         _ = posix.sendto(sockfd, out[0..more], 0, remote_addr, addr_size) catch break;
     }
 
-    // Read responses
+    // Read responses — use time-based timeout (60s)
     var completed: usize = 0;
-    var resp_iter: usize = 0;
-    const max_resp_iters: usize = 30000;
     var total_bytes_received: usize = 0;
     var key_update_done = false;
+    const h3_download_start = std.time.nanoTimestamp();
+    const h3_download_timeout_ns: i128 = 60 * std.time.ns_per_s;
 
-    while (completed < urls.len and resp_iter < max_resp_iters) : (resp_iter += 1) {
+    while (completed < urls.len and (std.time.nanoTimestamp() - h3_download_start) < h3_download_timeout_ns) {
         // Read packets (batch up to 100 datagrams per loop)
         var packets_received: usize = 0;
         {

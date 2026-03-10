@@ -1338,9 +1338,13 @@ pub const Connection = struct {
                 self.state = .connected;
                 self.ecn_validator.start();
 
-                // Drop Initial and Handshake packet number spaces
+                // Drop Initial and Handshake packet number spaces and encryption keys
                 self.pkt_handler.dropSpace(.initial);
                 self.pkt_handler.dropSpace(.handshake);
+                self.pkt_num_spaces[0].crypto_open = null;
+                self.pkt_num_spaces[0].crypto_seal = null;
+                self.pkt_num_spaces[1].crypto_open = null;
+                self.pkt_num_spaces[1].crypto_seal = null;
             },
 
             .datagram => |d| {
@@ -1591,30 +1595,34 @@ pub const Connection = struct {
                 },
                 .wait_for_data => break,
                 .complete => {
+                    // Skip if already connected (duplicate .complete from post-handshake messages)
+                    if (self.state == .connected) break;
+
                     self.state = .connected;
-                    self.handshake_confirmed = true;
                     self.ecn_validator.start();
                     self.paths[self.active_path_idx].is_validated = true;
+
+                    // Drop Initial space and keys (both client and server)
                     self.pkt_handler.dropSpace(.initial);
-                    self.pkt_handler.dropSpace(.handshake);
+                    self.pkt_num_spaces[0].crypto_open = null;
+                    self.pkt_num_spaces[0].crypto_seal = null;
 
                     // Clear early data keys (0-RTT period is over)
                     self.early_data_open = null;
                     self.early_data_seal = null;
 
-                    // Clear Initial encryption keys so we stop sending padded Initial packets
-                    self.pkt_num_spaces[0].crypto_open = null;
-                    self.pkt_num_spaces[0].crypto_seal = null;
-
                     if (self.is_server) {
-                        // Server clears Handshake keys (Finished already sent)
+                        // Server confirms handshake immediately and clears Handshake keys
+                        self.handshake_confirmed = true;
+                        self.pkt_handler.dropSpace(.handshake);
                         self.pkt_num_spaces[1].crypto_open = null;
                         self.pkt_num_spaces[1].crypto_seal = null;
 
                         // Server must send HANDSHAKE_DONE to the client (RFC 9001 Section 4.1.2)
                         self.packer.send_handshake_done = true;
                     }
-                    // Client: Handshake keys cleared in client.zig after sending Finished
+                    // Client: Keep Handshake keys until HANDSHAKE_DONE received (RFC 9001 §4.9.2)
+                    // This allows the client to ACK server's Handshake retransmissions under loss
 
                     // Store received session ticket if any
                     if (hs.received_ticket) |ticket| {
@@ -2214,9 +2222,20 @@ pub const Connection = struct {
                     switch (pto_level) {
                         .initial, .handshake => {
                             // Re-queue crypto data for retransmission on PTO (RFC 9002 §6.2.4)
+                            // When Handshake PTO fires, also re-queue Initial if it has
+                            // outstanding data — the peer needs ServerHello before it can
+                            // decrypt Handshake packets.
                             self.queueCryptoRetransmission(pto_level);
-                            const crypto_idx: u8 = if (pto_level == .initial) 0 else 2;
-                            if (self.crypto_streams.getStream(crypto_idx).hasData()) {
+                            if (pto_level == .handshake) {
+                                // Also retransmit Initial crypto data if still outstanding
+                                if (self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.initial)].ack_eliciting_in_flight > 0) {
+                                    self.queueCryptoRetransmission(.initial);
+                                }
+                            }
+                            // Check both levels for data
+                            if (self.crypto_streams.getStream(0).hasData() or
+                                self.crypto_streams.getStream(2).hasData())
+                            {
                                 has_data = true;
                             }
                         },
@@ -2231,6 +2250,22 @@ pub const Connection = struct {
                                 if (s_ptr.*.send.hasData()) {
                                     has_data = true;
                                     break;
+                                }
+                            }
+                            // If no data queued, check in-flight packets for stream data
+                            // to retransmit (RFC 9002 §6.2.4: prefer data over PING)
+                            if (!has_data) {
+                                const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
+                                if (app_tracker.ack_eliciting_in_flight > 0) {
+                                    var pkt_it = app_tracker.sent_packets.iterator();
+                                    while (pkt_it.next()) |entry| {
+                                        const pkt = entry.value_ptr;
+                                        if (pkt.in_flight and pkt.getStreamFrames().len > 0) {
+                                            self.queueStreamRetransmissions(pkt);
+                                            has_data = true;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         },

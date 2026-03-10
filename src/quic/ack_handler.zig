@@ -524,7 +524,8 @@ pub const PacketHandler = struct {
             else
                 self.rtt_stats.ptoNoAckDelay();
 
-            pto_duration = pto_duration << @intCast(self.pto_count);
+            const shift: u6 = @intCast(@min(self.pto_count, 62));
+            pto_duration = pto_duration << shift;
             pto_duration = @min(pto_duration, MAX_PTO);
 
             const timeout = sent_pkt.time_sent + pto_duration;
@@ -553,7 +554,8 @@ pub const PacketHandler = struct {
             else
                 self.rtt_stats.ptoNoAckDelay();
 
-            pto_duration = pto_duration << @intCast(self.pto_count);
+            const shift2: u6 = @intCast(@min(self.pto_count, 62));
+            pto_duration = pto_duration << shift2;
             pto_duration = @min(pto_duration, MAX_PTO);
 
             const timeout = sent_pkt.time_sent + pto_duration;
