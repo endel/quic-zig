@@ -21,6 +21,16 @@ const IP_RECVTOS: u32 = switch (builtin.os.tag) {
     else => @compileError("unsupported OS for ECN"),
 };
 
+// cmsg_type returned by recvmsg for TOS/ECN ancillary data.
+// On macOS, the kernel returns IP_RECVTOS as the cmsg_type.
+// On Linux, the kernel returns IP_TOS as the cmsg_type.
+const CMSG_TYPE_TOS: u32 = switch (builtin.os.tag) {
+    .macos => 27, // IP_RECVTOS
+    .linux => 1, // IP_TOS
+    .windows => 0,
+    else => @compileError("unsupported OS for ECN"),
+};
+
 // cmsg header — Zig std doesn't expose this on macOS.
 // Not used on Windows.
 const CmsgHdr = extern struct {
@@ -121,7 +131,7 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
         const data_offset = offset + CMSG_HDR_SIZE;
         const data_len = @as(usize, hdr.cmsg_len) -| CMSG_HDR_SIZE;
         if (hdr.cmsg_level == @as(i32, @intCast(IPPROTO_IP)) and
-            hdr.cmsg_type == @as(i32, @intCast(IP_RECVTOS)) and
+            hdr.cmsg_type == @as(i32, @intCast(CMSG_TYPE_TOS)) and
             data_len >= 1 and data_offset < CMSG_BUF_SIZE)
         {
             ecn = @truncate(cmsg_buf[data_offset] & 0x03);

@@ -1571,7 +1571,11 @@ pub const Connection = struct {
                                 std.log.info("installed 0-RTT decrypt keys (server)", .{});
                             } else {
                                 self.early_data_seal = ik.seal;
-                                std.log.info("installed 0-RTT encrypt keys (client)", .{});
+                                // Pre-set stream limits for 0-RTT (RFC 9000 §7.4.1: use remembered
+                                // transport params). Since we don't persist transport params across
+                                // connections yet, use reasonable defaults so the app can open streams.
+                                self.streams.setMaxStreams(100, 100);
+                                std.log.info("installed 0-RTT encrypt keys (client), set default stream limits", .{});
                             }
                         },
                         .handshake => {
@@ -2034,6 +2038,14 @@ pub const Connection = struct {
             self.paths[self.active_path_idx].bytes_sent += bytes_written;
             self.pacer.onPacketSent(bytes_written, now);
 
+            // Client: auto-clear Handshake keys once Finished has been packed and sent
+            // (RFC 9001 §4.9.2: discard Handshake keys when handshake is confirmed)
+            if (!self.is_server and self.handshake_confirmed and self.pkt_num_spaces[1].crypto_seal != null) {
+                if (!self.crypto_streams.getStream(1).hasData()) {
+                    self.dropHandshakeKeys();
+                }
+            }
+
             // Track packets sent with current keys for key update
             if (self.key_update) |*ku| {
                 if (app_seal != null) {
@@ -2313,6 +2325,34 @@ pub const Connection = struct {
 
     pub fn isEstablished(self: *const Connection) bool {
         return self.state == .connected;
+    }
+
+    /// Drop Initial and Handshake encryption keys (RFC 9001 §4.9).
+    /// Called automatically for server in advanceHandshake, and for client
+    /// after the Handshake Finished has been sent. Applications should not
+    /// need to call this directly.
+    pub fn dropHandshakeKeys(self: *Connection) void {
+        self.pkt_num_spaces[0].crypto_open = null;
+        self.pkt_num_spaces[0].crypto_seal = null;
+        self.pkt_num_spaces[1].crypto_open = null;
+        self.pkt_num_spaces[1].crypto_seal = null;
+    }
+
+    /// Initiate a key update (RFC 9001 §6).
+    /// The next 1-RTT packet will use the new key phase.
+    /// Returns true if the key update was initiated, false if not possible
+    /// (e.g., no key update manager, or update already in progress).
+    pub fn initiateKeyUpdate(self: *Connection) bool {
+        if (self.key_update) |*ku| {
+            if (ku.canUpdate()) {
+                const now = @as(i64, @intCast(std.time.nanoTimestamp()));
+                const pto_ns = self.pkt_handler.rtt_stats.pto();
+                ku.rollKeys(now, pto_ns);
+                self.packer.key_phase = ku.key_phase;
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Return the ECN codepoint to mark on outgoing packets.

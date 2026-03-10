@@ -261,9 +261,6 @@ fn downloadAll(
     // Send 0-RTT early data if we have a session ticket (before handshake completes)
     var early_data_sent = false;
     if (allow_0rtt and session_ticket != null and conn.early_data_seal != null and !use_h3) {
-        // Pre-set stream limits for 0-RTT (RFC 9000 §7.4.1: use remembered transport params).
-        // We don't persist transport params across connections, so use reasonable defaults.
-        conn.streams.setMaxStreams(100, 100);
         // Open streams and send requests as 0-RTT data
         for (urls) |url| {
             const s = conn.openStream() catch break;
@@ -283,21 +280,12 @@ fn downloadAll(
     while (!handshake_complete and iteration < max_iterations) : (iteration += 1) {
         std.Thread.sleep(1 * std.time.ns_per_ms);
 
-        // Send packets (burst for 0-RTT, single otherwise)
+        // Send packets
         {
-            const max_send = if (early_data_sent and iteration == 0) @as(usize, 10) else @as(usize, 1);
-            var sc: usize = 0;
-            while (sc < max_send) : (sc += 1) {
-                const bytes_written = conn.send(&out) catch break;
-                if (bytes_written == 0) break;
+            const bytes_written = conn.send(&out) catch 0;
+            if (bytes_written > 0) {
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-                _ = posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size) catch break;
-                // After the first send (Initial+0-RTT coalesced), give the server
-                // time to process the Initial and create the connection before
-                // standalone 0-RTT packets arrive. Without this delay, quic-go
-                // queues standalone 0-RTT packets (no matching connection yet)
-                // and drops them when 0-RTT keys are discarded after handshake.
-                if (sc == 0 and early_data_sent) std.Thread.sleep(5 * std.time.ns_per_ms);
+                _ = posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size) catch {};
             }
         }
 
@@ -346,12 +334,6 @@ fn downloadAll(
 
     // Sync remote_addr from active path
     remote_addr = conn.paths[conn.active_path_idx].peer_addr;
-
-    // Clear Initial and Handshake keys
-    conn.pkt_num_spaces[0].crypto_open = null;
-    conn.pkt_num_spaces[0].crypto_seal = null;
-    conn.pkt_num_spaces[1].crypto_open = null;
-    conn.pkt_num_spaces[1].crypto_seal = null;
 
     std.Thread.sleep(50 * std.time.ns_per_ms);
 
@@ -496,15 +478,9 @@ fn downloadH0(
 
         // Force key update early in the connection for keyupdate test
         if (force_key_update and !key_update_done and total_bytes_received > 0) {
-            if (conn.key_update) |*ku| {
-                if (ku.canUpdate()) {
-                    const now = @as(i64, @intCast(std.time.nanoTimestamp()));
-                    const pto_ns = conn.pkt_handler.rtt_stats.pto();
-                    ku.rollKeys(now, pto_ns);
-                    conn.packer.key_phase = ku.key_phase;
-                    key_update_done = true;
-                    std.log.info("key update: forced for interop test, new key_phase={}", .{ku.key_phase});
-                }
+            if (conn.initiateKeyUpdate()) {
+                key_update_done = true;
+                std.log.info("key update: forced for interop test", .{});
             }
         }
 
@@ -648,15 +624,9 @@ fn downloadH3(
 
         // Force key update early in the connection for keyupdate test
         if (force_key_update and !key_update_done and total_bytes_received > 0) {
-            if (conn.key_update) |*ku| {
-                if (ku.canUpdate()) {
-                    const now = @as(i64, @intCast(std.time.nanoTimestamp()));
-                    const pto_ns = conn.pkt_handler.rtt_stats.pto();
-                    ku.rollKeys(now, pto_ns);
-                    conn.packer.key_phase = ku.key_phase;
-                    key_update_done = true;
-                    std.log.info("key update: forced for interop test, new key_phase={}", .{ku.key_phase});
-                }
+            if (conn.initiateKeyUpdate()) {
+                key_update_done = true;
+                std.log.info("key update: forced for interop test", .{});
             }
         }
 
