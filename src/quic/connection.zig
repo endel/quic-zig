@@ -950,7 +950,6 @@ pub const Connection = struct {
         const cs = self.crypto_streams.getStream(crypto_idx);
         if (cs.write_offset > 0) {
             cs.resetSendOffset();
-            std.log.info("CRYPTO retransmit: reset send offset for level {s}", .{@tagName(level)});
         }
     }
 
@@ -1170,7 +1169,6 @@ pub const Connection = struct {
 
             .crypto => |crypto_frame| {
                 const level: u8 = @intFromEnum(epoch);
-                std.log.info("processFrame: CRYPTO frame level={} offset={d} data_len={d}", .{ level, crypto_frame.offset, crypto_frame.data.len });
                 try self.crypto_streams.handleCryptoFrame(level, crypto_frame.offset, crypto_frame.data);
                 // Handshake advancement happens after all frames are processed
             },
@@ -2215,7 +2213,8 @@ pub const Connection = struct {
                 if (self.pkt_handler.getPtoSpace()) |pto_level| {
                     switch (pto_level) {
                         .initial, .handshake => {
-                            // Check crypto stream for retransmittable data
+                            // Re-queue crypto data for retransmission on PTO (RFC 9002 §6.2.4)
+                            self.queueCryptoRetransmission(pto_level);
                             const crypto_idx: u8 = if (pto_level == .initial) 0 else 2;
                             if (self.crypto_streams.getStream(crypto_idx).hasData()) {
                                 has_data = true;

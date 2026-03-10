@@ -441,8 +441,10 @@ pub const PacketPacker = struct {
 
         // Check if we have any payload
         var payload_len = fbs.pos - payload_start;
-        if (payload_len == 0 and pad_target == 0) {
-            // Roll back the packet number we consumed — no packet will be sent
+        if (payload_len == 0) {
+            // Roll back the packet number we consumed — no packet will be sent.
+            // This applies even with pad_target > 0: sending a padded Initial with
+            // no ACK/CRYPTO content just wastes PNs and pushes the PTO forward.
             const idx = @intFromEnum(level);
             pkt_handler.next_pn[idx] -= 1;
             return 0; // Nothing to send

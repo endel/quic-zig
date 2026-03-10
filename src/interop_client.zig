@@ -272,13 +272,16 @@ fn downloadAll(
         early_data_sent = true;
     }
 
-    // Handshake phase
+    // Handshake phase — use time-based timeout (30s) to handle high-RTT networks
     var handshake_complete = false;
-    var iteration: usize = 0;
-    const max_iterations: usize = 2000;
+    const handshake_start = std.time.nanoTimestamp();
+    const handshake_timeout_ns: i128 = 30 * std.time.ns_per_s;
 
-    while (!handshake_complete and iteration < max_iterations) : (iteration += 1) {
+    while (!handshake_complete and (std.time.nanoTimestamp() - handshake_start) < handshake_timeout_ns) {
         std.Thread.sleep(1 * std.time.ns_per_ms);
+
+        // Fire PTO timer for handshake retransmissions
+        conn.onTimeout() catch {};
 
         // Send packets
         {
@@ -319,7 +322,8 @@ fn downloadAll(
     }
 
     if (!handshake_complete) {
-        std.log.err("handshake failed after {d} iterations", .{iteration});
+        const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - handshake_start, std.time.ns_per_ms);
+        std.log.err("handshake failed after {d}ms", .{elapsed_ms});
         std.process.exit(1);
     }
 
