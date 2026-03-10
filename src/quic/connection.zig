@@ -335,10 +335,10 @@ pub const RecvInfo = struct {
 /// Configuration for a QUIC connection.
 pub const ConnectionConfig = struct {
     max_idle_timeout: u64 = 30_000, // ms
-    initial_max_data: u64 = 1_048_576, // 1MB
-    initial_max_stream_data_bidi_local: u64 = 65536,
-    initial_max_stream_data_bidi_remote: u64 = 65536,
-    initial_max_stream_data_uni: u64 = 65536,
+    initial_max_data: u64 = 16_777_216, // 16MB
+    initial_max_stream_data_bidi_local: u64 = 6_291_456, // 6MB
+    initial_max_stream_data_bidi_remote: u64 = 6_291_456, // 6MB
+    initial_max_stream_data_uni: u64 = 1_048_576, // 1MB
     initial_max_streams_bidi: u64 = 100,
     initial_max_streams_uni: u64 = 100,
     max_datagram_frame_size: ?u64 = null,
@@ -702,7 +702,7 @@ pub const Connection = struct {
         }
 
         const epoch = try packet.Epoch.fromPacketType(header.packet_type);
-        std.log.info("recv: packet_type={s}, epoch={s}", .{ @tagName(header.packet_type), @tagName(epoch) });
+        std.log.debug("recv: packet_type={s}, epoch={s}", .{ @tagName(header.packet_type), @tagName(epoch) });
 
         // RFC 9368: Client-side Compatible Version Negotiation detection
         // If we receive an Initial/Handshake from the server with a different version
@@ -783,14 +783,16 @@ pub const Connection = struct {
         if (epoch == .application and self.key_update != null) {
             // Decrypt using KeyUpdateManager: first do header unprotection with the
             // (unchanging) HP key, then select the right AEAD key based on key phase
-            payload = packet.decryptWithKeyUpdate(header, fbs, &space, &self.key_update.?) catch |err| {
-                std.log.err("can't decrypt 1-RTT packet with key update. {any}", .{err});
-                return error.InvalidPacket;
+            payload = packet.decryptWithKeyUpdate(header, fbs, &space, &self.key_update.?) catch {
+                // Undecryptable 1-RTT packets are silently dropped (RFC 9001 §6.3).
+                std.log.warn("silently dropping 1-RTT packet (key update decrypt failed) pn_space_next={d}", .{space.next_packet_number});
+                return;
             };
         } else {
-            payload = packet.decrypt(header, fbs, space) catch |err| {
-                std.log.err("can't decrypt packet. {any}", .{err});
-                return error.InvalidPacket;
+            payload = packet.decrypt(header, fbs, space) catch {
+                // Silently drop undecryptable packets
+                std.log.warn("silently dropping packet enc_level={s}", .{@tagName(enc_level)});
+                return;
             };
         }
 
@@ -869,7 +871,7 @@ pub const Connection = struct {
                 break;
             };
 
-            std.log.info("recv: parsed frame type={s}", .{@tagName(frame)});
+            std.log.debug("recv: parsed frame type={s}", .{@tagName(frame)});
 
             // Enforce frame-in-correct-space (RFC 9000 §12.5)
             if (!frame.isAllowedIn(header.packet_type)) {
@@ -927,6 +929,42 @@ pub const Connection = struct {
         try self.advanceHandshake();
     }
 
+    /// Queue CRYPTO frame retransmission by resetting the crypto stream's send offset.
+    /// This causes the packer to re-send all crypto data at the given level (RFC 9002 §6.2).
+    fn queueCryptoRetransmission(self: *Connection, level: ack_handler.EncLevel) void {
+        const crypto_idx: u8 = switch (level) {
+            .initial => 0,
+            .handshake => 2,
+            .application => 3,
+        };
+        const cs = self.crypto_streams.getStream(crypto_idx);
+        if (cs.write_offset > 0) {
+            cs.resetSendOffset();
+            std.log.info("CRYPTO retransmit: reset send offset for level {s}", .{@tagName(level)});
+        }
+    }
+
+    /// Queue retransmission for stream frames that were in a lost packet.
+    fn queueStreamRetransmissions(self: *Connection, pkt: *const ack_handler.SentPacket) void {
+        for (pkt.getStreamFrames()) |sf| {
+            // Look up the stream and queue the retransmission
+            if (stream_mod.isBidi(sf.stream_id)) {
+                if (self.streams.getStream(sf.stream_id)) |s| {
+                    if (s.send.reset_err == null) {
+                        s.send.queueRetransmit(sf.offset, sf.length, sf.fin);
+                    }
+                }
+            } else {
+                // Unidirectional send stream
+                if (self.streams.send_streams.get(sf.stream_id)) |s| {
+                    if (s.reset_err == null) {
+                        s.queueRetransmit(sf.offset, sf.length, sf.fin);
+                    }
+                }
+            }
+        }
+    }
+
     /// Process a single frame.
     pub fn processFrame(self: *Connection, frame: Frame, epoch: packet.Epoch, now: i64) !void {
         switch (frame) {
@@ -979,6 +1017,14 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
                         has_non_probe_loss = true;
+                    }
+
+                    // Queue stream data retransmission for lost packets
+                    self.queueStreamRetransmissions(&pkt);
+
+                    // Queue CRYPTO frame retransmission for lost packets (RFC 9002 §6.2)
+                    if (pkt.has_crypto_data) {
+                        self.queueCryptoRetransmission(pkt.enc_level);
                     }
                 }
 
@@ -1037,6 +1083,14 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
                         has_non_probe_loss = true;
+                    }
+
+                    // Queue stream data retransmission for lost packets
+                    self.queueStreamRetransmissions(&pkt);
+
+                    // Queue CRYPTO frame retransmission for lost packets (RFC 9002 §6.2)
+                    if (pkt.has_crypto_data) {
+                        self.queueCryptoRetransmission(pkt.enc_level);
                     }
                 }
 
@@ -1885,11 +1939,14 @@ pub const Connection = struct {
 
         // Check if pacer allows sending
         const pacer_delay = self.pacer.timeUntilSend(now);
-        if (pacer_delay > 0) return 0;
+        if (pacer_delay > 0) {
+            return 0;
+        }
 
         // Check congestion window
         if (self.pkt_handler.bytes_in_flight >= self.cc.sendWindow()) {
             // Congestion limited - only send ACKs
+            std.log.info("send: congestion-limited bif={d} cwnd={d}", .{ self.pkt_handler.bytes_in_flight, self.cc.sendWindow() });
             return try self.sendAckOnly(out_buf, now);
         }
 
@@ -2131,6 +2188,10 @@ pub const Connection = struct {
                             }
                         },
                         .application => {
+                            // Check application-level crypto stream (e.g. NewSessionTicket)
+                            if (self.crypto_streams.getStream(3).hasData()) {
+                                has_data = true;
+                            }
                             // Check if any stream has data to send
                             var stream_it = self.streams.streams.valueIterator();
                             while (stream_it.next()) |s_ptr| {

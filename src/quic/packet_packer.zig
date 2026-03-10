@@ -120,7 +120,9 @@ pub const PacketPacker = struct {
         var offset: usize = 0;
 
         // Try packing Initial packet
+        // When coalescing with 0-RTT, don't pad the Initial — let 0-RTT use the space
         if (initial_seal != null) {
+            const pad_target: usize = if (early_seal == null) MIN_INITIAL_PACKET_SIZE else 0;
             const initial_len = try self.packSinglePacket(
                 out_buf[offset..],
                 .initial,
@@ -130,7 +132,7 @@ pub const PacketPacker = struct {
                 pending_frames,
                 initial_seal.?,
                 now,
-                true, // pad to minimum size
+                pad_target,
                 null,
                 false,
                 ack_only,
@@ -139,7 +141,13 @@ pub const PacketPacker = struct {
         }
 
         // Try packing 0-RTT packet (Long Header, type 0x10)
+        // When coalesced after an unpadded Initial, pad the 0-RTT so the
+        // total datagram reaches the 1200-byte minimum (RFC 9000 §14.1)
         if (early_seal != null and offset < out_buf.len and !ack_only) {
+            const pad_target: usize = if (initial_seal != null and offset > 0)
+                MIN_INITIAL_PACKET_SIZE -| offset
+            else
+                0;
             const early_len = try self.packSinglePacket(
                 out_buf[offset..],
                 .application,
@@ -149,7 +157,7 @@ pub const PacketPacker = struct {
                 pending_frames,
                 early_seal.?,
                 now,
-                false,
+                pad_target,
                 datagram_queue,
                 true, // zero_rtt = true
                 false,
@@ -168,7 +176,7 @@ pub const PacketPacker = struct {
                 pending_frames,
                 handshake_seal.?,
                 now,
-                false,
+                0,
                 null,
                 false,
                 ack_only,
@@ -187,7 +195,7 @@ pub const PacketPacker = struct {
                 pending_frames,
                 app_seal.?,
                 now,
-                false,
+                0,
                 datagram_queue,
                 false,
                 ack_only,
@@ -212,7 +220,7 @@ pub const PacketPacker = struct {
         pending_frames: *frame_mod.PendingFrameQueue,
         seal: crypto_mod.Seal,
         now: i64,
-        pad_to_min: bool,
+        pad_target: usize, // 0 = no padding, >0 = target packet size for this packet
         datagram_queue: ?*conn_mod.DatagramQueue,
         zero_rtt: bool,
         ack_only: bool,
@@ -221,7 +229,8 @@ pub const PacketPacker = struct {
 
         // We build the packet in a temporary buffer, then encrypt into buf
         var tmp: [ABSOLUTE_MAX_PACKET_SIZE]u8 = undefined;
-        const effective_max = @min(self.max_packet_size, tmp.len);
+        // Account for output buffer size: encrypted output = fbs.pos + AEAD_TAG_LEN
+        const effective_max = @min(self.max_packet_size, @min(tmp.len, buf.len -| AEAD_TAG_LEN));
         var fbs = io.fixedBufferStream(tmp[0..effective_max]);
         const writer = fbs.writer();
 
@@ -287,6 +296,7 @@ pub const PacketPacker = struct {
 
         // Collect frames
         var ack_eliciting = false;
+        var has_crypto_data = false;
 
         // 0-RTT packets only contain STREAM and DATAGRAM frames — skip ACK, CRYPTO, control
         if (!zero_rtt) {
@@ -308,6 +318,7 @@ pub const PacketPacker = struct {
                 if (cs.popCryptoFrame(remaining_space)) |crypto_frame| {
                     try crypto_frame.write(writer);
                     ack_eliciting = true;
+                    has_crypto_data = true;
                 }
             }
 
@@ -329,6 +340,10 @@ pub const PacketPacker = struct {
         }
 
         // 5. Stream frames (only in 1-RTT or 0-RTT, skip when ack_only)
+        // Track stream frames for retransmission on loss
+        var stream_frame_infos: [ack_handler.MAX_STREAM_FRAMES_PER_PACKET]ack_handler.StreamFrameInfo = undefined;
+        var stream_frame_info_count: u8 = 0;
+
         if (level == .application and !ack_only) {
             // Bidirectional streams
             var stream_it = streams.streams.valueIterator();
@@ -337,12 +352,18 @@ pub const PacketPacker = struct {
                 if (fbs.pos + AEAD_TAG_LEN + 16 >= effective_max) break;
                 const max_stream_data = effective_max - fbs.pos - AEAD_TAG_LEN - 8;
                 if (s.send.popStreamFrame(max_stream_data)) |stream_frame| {
-                    const sf = stream_frame.stream;
-                    std.log.info("packing STREAM frame: id={d}, offset={d}, len={d}, fin={}, data_len={d}", .{
-                        sf.stream_id, sf.offset, sf.length, sf.fin, sf.data.len,
-                    });
                     try stream_frame.write(writer);
                     ack_eliciting = true;
+                    // Record for retransmission tracking
+                    if (stream_frame_info_count < ack_handler.MAX_STREAM_FRAMES_PER_PACKET) {
+                        stream_frame_infos[stream_frame_info_count] = .{
+                            .stream_id = stream_frame.stream.stream_id,
+                            .offset = stream_frame.stream.offset,
+                            .length = stream_frame.stream.length,
+                            .fin = stream_frame.stream.fin,
+                        };
+                        stream_frame_info_count += 1;
+                    }
                 }
             }
 
@@ -353,12 +374,18 @@ pub const PacketPacker = struct {
                 if (fbs.pos + AEAD_TAG_LEN + 16 >= effective_max) break;
                 const max_stream_data = effective_max - fbs.pos - AEAD_TAG_LEN - 8;
                 if (s.popStreamFrame(max_stream_data)) |stream_frame| {
-                    const sf = stream_frame.stream;
-                    std.log.info("packing UNI STREAM frame: id={d}, offset={d}, len={d}, fin={}, data_len={d}", .{
-                        sf.stream_id, sf.offset, sf.length, sf.fin, sf.data.len,
-                    });
                     try stream_frame.write(writer);
                     ack_eliciting = true;
+                    // Record for retransmission tracking
+                    if (stream_frame_info_count < ack_handler.MAX_STREAM_FRAMES_PER_PACKET) {
+                        stream_frame_infos[stream_frame_info_count] = .{
+                            .stream_id = stream_frame.stream.stream_id,
+                            .offset = stream_frame.stream.offset,
+                            .length = stream_frame.stream.length,
+                            .fin = stream_frame.stream.fin,
+                        };
+                        stream_frame_info_count += 1;
+                    }
                 }
             }
 
@@ -379,13 +406,13 @@ pub const PacketPacker = struct {
 
         // Check if we have any payload
         var payload_len = fbs.pos - payload_start;
-        if (payload_len == 0 and !pad_to_min) {
+        if (payload_len == 0 and pad_target == 0) {
             return 0; // Nothing to send
         }
 
-        // RFC 9001 Section 5.4: ensure Initial packets have at least 5 bytes plaintext for header protection
-        // (5 bytes plaintext + 16 bytes AEAD tag = 21 bytes encrypted minimum >= 20 required)
-        if (pkt_type == .initial and payload_len < 5) {
+        // RFC 9001 Section 5.4: ensure long-header packets have at least 5 bytes plaintext for header protection
+        // (5 bytes plaintext + 16 bytes AEAD tag = 21 bytes encrypted minimum >= 20 required for sample)
+        if (pkt_type != .one_rtt and payload_len < 5) {
             const min_pad = 5 - payload_len;
             var p: usize = 0;
             while (p < min_pad) : (p += 1) {
@@ -394,14 +421,14 @@ pub const PacketPacker = struct {
             payload_len = 5;
         }
 
-        // Pad to minimum size for Initial packets (client only)
-        if (pad_to_min and pkt_type == .initial and !self.is_server) {
+        // Pad to target size for Initial or 0-RTT packets (client only, RFC 9000 §14.1)
+        if (pad_target > 0 and (pkt_type == .initial or pkt_type == .zero_rtt) and !self.is_server) {
             const current_total = fbs.pos - header_start + AEAD_TAG_LEN;
-            if (current_total < MIN_INITIAL_PACKET_SIZE) {
-                const pad_needed = MIN_INITIAL_PACKET_SIZE - current_total;
+            if (current_total < pad_target) {
+                const pad_needed = pad_target - current_total;
                 var p: usize = 0;
                 while (p < pad_needed) : (p += 1) {
-                    try writer.writeByte(0x00); // PADDING frame
+                    writer.writeByte(0x00) catch break; // PADDING frame (best-effort)
                 }
             }
         }
@@ -447,15 +474,21 @@ pub const PacketPacker = struct {
             seal.cipher_suite,
         );
 
-        // Record the packet as sent
-        try pkt_handler.onPacketSent(.{
+        // Record the packet as sent, including stream frame info for retransmission
+        var sent_pkt = ack_handler.SentPacket{
             .pn = pn,
             .time_sent = now,
             .size = @intCast(total_packet_len),
             .ack_eliciting = ack_eliciting,
             .in_flight = ack_eliciting,
             .enc_level = level,
-        });
+            .has_crypto_data = has_crypto_data,
+        };
+        // Copy stream frame records into the SentPacket
+        for (stream_frame_infos[0..stream_frame_info_count]) |info| {
+            sent_pkt.addStreamFrame(info);
+        }
+        try pkt_handler.onPacketSent(sent_pkt);
 
         return total_packet_len;
     }

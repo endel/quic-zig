@@ -33,6 +33,17 @@ const MAX_PTO: i64 = 60_000_000_000;
 /// Maximum number of packets tracked per ACK result.
 const MAX_ACK_RESULT: usize = 256;
 
+/// Maximum number of stream frame records per sent packet.
+pub const MAX_STREAM_FRAMES_PER_PACKET: usize = 4;
+
+/// Tracks which stream data was carried in a sent packet for retransmission on loss.
+pub const StreamFrameInfo = struct {
+    stream_id: u64,
+    offset: u64,
+    length: u64,
+    fin: bool,
+};
+
 /// Metadata stored for each sent packet.
 pub const SentPacket = struct {
     pn: u64,
@@ -43,6 +54,26 @@ pub const SentPacket = struct {
     enc_level: EncLevel,
     largest_acked: ?u64 = null,
     ecn_marked: bool = false,
+
+    /// Stream frames carried by this packet (for retransmission on loss).
+    stream_frames: [MAX_STREAM_FRAMES_PER_PACKET]StreamFrameInfo = undefined,
+    stream_frame_count: u8 = 0,
+
+    /// Whether this packet contains CRYPTO frame data (for retransmission on loss).
+    has_crypto_data: bool = false,
+
+    /// Record a stream frame carried by this packet.
+    pub fn addStreamFrame(self: *SentPacket, info: StreamFrameInfo) void {
+        if (self.stream_frame_count < MAX_STREAM_FRAMES_PER_PACKET) {
+            self.stream_frames[self.stream_frame_count] = info;
+            self.stream_frame_count += 1;
+        }
+    }
+
+    /// Get the recorded stream frames.
+    pub fn getStreamFrames(self: *const SentPacket) []const StreamFrameInfo {
+        return self.stream_frames[0..self.stream_frame_count];
+    }
 };
 
 /// Fixed-capacity list of SentPackets for ACK results.
@@ -665,4 +696,51 @@ test "ReceivedPacketTracker: no ECN returns plain ACK" {
         .ack => {},
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "SentPacket: stream frame tracking" {
+    var pkt = SentPacket{
+        .pn = 0,
+        .time_sent = 0,
+        .size = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .enc_level = .application,
+    };
+
+    pkt.addStreamFrame(.{ .stream_id = 0, .offset = 0, .length = 100, .fin = false });
+    pkt.addStreamFrame(.{ .stream_id = 4, .offset = 50, .length = 200, .fin = true });
+
+    try testing.expectEqual(@as(u8, 2), pkt.stream_frame_count);
+    const frames = pkt.getStreamFrames();
+    try testing.expectEqual(@as(usize, 2), frames.len);
+    try testing.expectEqual(@as(u64, 0), frames[0].stream_id);
+    try testing.expectEqual(@as(u64, 0), frames[0].offset);
+    try testing.expectEqual(@as(u64, 100), frames[0].length);
+    try testing.expect(!frames[0].fin);
+    try testing.expectEqual(@as(u64, 4), frames[1].stream_id);
+    try testing.expectEqual(@as(u64, 50), frames[1].offset);
+    try testing.expectEqual(@as(u64, 200), frames[1].length);
+    try testing.expect(frames[1].fin);
+}
+
+test "SentPacket: stream frame capacity limit" {
+    var pkt = SentPacket{
+        .pn = 0,
+        .time_sent = 0,
+        .size = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .enc_level = .application,
+    };
+
+    // Add MAX_STREAM_FRAMES_PER_PACKET frames
+    var i: u64 = 0;
+    while (i < MAX_STREAM_FRAMES_PER_PACKET) : (i += 1) {
+        pkt.addStreamFrame(.{ .stream_id = i * 4, .offset = 0, .length = 10, .fin = false });
+    }
+
+    // Adding one more should be silently ignored (no crash)
+    pkt.addStreamFrame(.{ .stream_id = 100, .offset = 0, .length = 10, .fin = false });
+    try testing.expectEqual(@as(u8, MAX_STREAM_FRAMES_PER_PACKET), pkt.stream_frame_count);
 }

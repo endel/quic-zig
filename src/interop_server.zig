@@ -164,12 +164,12 @@ pub fn main() !void {
 
     var loop_count: usize = 0;
     while (true) {
-        std.Thread.sleep(1 * std.time.ns_per_ms);
         loop_count += 1;
 
         // Read loop: process all available UDP packets
+        var packets_received: usize = 0;
         read_loop: while (true) {
-            var bytes: [8192]u8 = undefined;
+            var bytes: [MAX_DATAGRAM_SIZE]u8 = undefined;
             addr_size = @sizeOf(posix.sockaddr);
 
             const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch |err| {
@@ -177,6 +177,7 @@ pub fn main() !void {
                 std.log.err("recvmsg error: {any}", .{err});
                 break :read_loop;
             };
+            packets_received += 1;
             const packet_length = recv_result.bytes_read;
             remote_addr = recv_result.from_addr;
             addr_size = recv_result.addr_len;
@@ -288,7 +289,7 @@ pub fn main() !void {
                 if (bytes_written > 0) {
                     ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                     const send_addr = &conn.paths[conn.active_path_idx].peer_addr;
-                    _ = try posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr));
+                    _ = posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr)) catch break;
                 }
             }
         }
@@ -344,12 +345,11 @@ pub fn main() !void {
                 continue;
             }
 
-            // Periodic send
-            const bytes_written = conn.send(&out) catch {
-                i += 1;
-                continue;
-            };
-            if (bytes_written > 0) {
+            // Burst send — drain queued data up to congestion/pacer limits
+            var send_count: usize = 0;
+            while (send_count < 100) : (send_count += 1) {
+                const bytes_written = conn.send(&out) catch break;
+                if (bytes_written == 0) break;
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                 const send_addr = &conn.paths[conn.active_path_idx].peer_addr;
                 _ = posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr)) catch {};
@@ -357,6 +357,9 @@ pub fn main() !void {
 
             i += 1;
         }
+
+        // Only sleep when idle (no packets received and no sends happened)
+        if (packets_received == 0) std.Thread.sleep(200 * std.time.ns_per_us);
     }
 }
 

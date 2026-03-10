@@ -138,6 +138,7 @@ pub const H0Connection = struct {
         };
         defer self.allocator.free(file_data);
 
+        std.log.info("H0: serving {d} bytes on stream {d}", .{ file_data.len, stream_id });
         try self.sendResponse(stream_id, file_data);
     }
 

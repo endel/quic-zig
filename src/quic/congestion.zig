@@ -82,8 +82,8 @@ pub const NewReno = struct {
             // Accumulate bytes and increase by MSS when a full window is acked
             self.bytes_acked_in_round += acked_bytes;
             if (self.bytes_acked_in_round >= self.congestion_window) {
-                self.congestion_window += self.max_datagram_size;
                 self.bytes_acked_in_round -= self.congestion_window;
+                self.congestion_window += self.max_datagram_size;
             }
         }
     }

@@ -163,6 +163,16 @@ pub const ReceiveStream = struct {
     }
 };
 
+/// Maximum number of retransmit ranges per SendStream.
+const MAX_RETRANSMIT_RANGES: usize = 16;
+
+/// A range of stream data that needs to be retransmitted.
+const RetransmitRange = struct {
+    offset: u64,
+    length: u64,
+    fin: bool,
+};
+
 /// A QUIC send stream.
 pub const SendStream = struct {
     stream_id: u64,
@@ -191,6 +201,13 @@ pub const SendStream = struct {
 
     /// Whether the stream has been reset.
     reset_err: ?u64 = null,
+
+    /// Retransmission queue: ranges of data that were lost and need resending.
+    retransmit_ranges: [MAX_RETRANSMIT_RANGES]RetransmitRange = undefined,
+    retransmit_count: u8 = 0,
+
+    /// Whether a FIN that was previously sent was lost and needs retransmission.
+    fin_lost: bool = false,
 
     pub fn init(allocator: Allocator, stream_id: u64) SendStream {
         return .{
@@ -240,17 +257,139 @@ pub const SendStream = struct {
         return null;
     }
 
-    /// Check if there's data available to send.
+    /// Queue a range of stream data for retransmission (called when a packet is declared lost).
+    pub fn queueRetransmit(self: *SendStream, offset: u64, length: u64, fin: bool) void {
+        if (self.reset_err != null) return;
+
+        // If FIN was in the lost packet, mark it for retransmission
+        if (fin) {
+            self.fin_lost = true;
+            self.fin_sent = false; // Allow FIN to be re-sent
+        }
+
+        // Don't queue zero-length ranges (unless it was a FIN-only frame, handled above)
+        if (length == 0) return;
+
+        // Check if this range overlaps with or is adjacent to an existing retransmit range
+        // and merge if possible
+        for (self.retransmit_ranges[0..self.retransmit_count]) |*existing| {
+            const e_end = existing.offset + existing.length;
+            const n_end = offset + length;
+
+            // Check overlap or adjacency
+            if (offset <= e_end and existing.offset <= n_end) {
+                const new_start = @min(existing.offset, offset);
+                const new_end = @max(e_end, n_end);
+                existing.offset = new_start;
+                existing.length = new_end - new_start;
+                if (fin) existing.fin = true;
+                return;
+            }
+        }
+
+        // Add as a new range if there's space
+        if (self.retransmit_count < MAX_RETRANSMIT_RANGES) {
+            self.retransmit_ranges[self.retransmit_count] = .{
+                .offset = offset,
+                .length = length,
+                .fin = fin,
+            };
+            self.retransmit_count += 1;
+        }
+    }
+
+    /// Check if there's data available to send (including retransmissions).
     pub fn hasData(self: *const SendStream) bool {
-        return self.send_offset < self.write_offset or
+        return self.retransmit_count > 0 or
+            self.fin_lost or
+            self.send_offset < self.write_offset or
             (self.fin_queued and !self.fin_sent);
     }
 
     /// Pop a STREAM frame with at most max_len bytes of payload.
+    /// Prioritizes retransmissions over new data.
     /// Returns null if there's nothing to send.
     pub fn popStreamFrame(self: *SendStream, max_len: u64) ?Frame {
         if (self.reset_err != null) return null;
 
+        // Priority 1: Retransmissions
+        if (self.retransmit_count > 0) {
+            return self.popRetransmitFrame(max_len);
+        }
+
+        // Priority 2: FIN-only retransmission (FIN was lost but no data range to retransmit)
+        if (self.fin_lost and self.retransmit_count == 0) {
+            self.fin_lost = false;
+            self.fin_sent = true;
+            return Frame{
+                .stream = .{
+                    .stream_id = self.stream_id,
+                    .offset = self.write_offset,
+                    .length = 0,
+                    .fin = true,
+                    .data = @constCast(&[_]u8{}),
+                },
+            };
+        }
+
+        // Priority 3: New data
+        return self.popNewDataFrame(max_len);
+    }
+
+    /// Pop a retransmission frame from the retransmit queue.
+    fn popRetransmitFrame(self: *SendStream, max_len: u64) ?Frame {
+        if (self.retransmit_count == 0) return null;
+
+        const range = &self.retransmit_ranges[0];
+        const buffered = self.write_buffer.items;
+
+        // Clamp to available buffer and max_len
+        const available = if (range.offset < buffered.len)
+            @min(range.length, buffered.len - range.offset)
+        else
+            0;
+        const data_len = @min(available, max_len);
+
+        if (data_len == 0 and !range.fin) {
+            // Nothing useful to retransmit - remove this range
+            self.removeRetransmitRange(0);
+            return null;
+        }
+
+        // Save the original offset before modifying the range
+        const frame_offset = range.offset;
+        const data = if (data_len > 0) buffered[frame_offset..][0..data_len] else &[_]u8{};
+        // FIN should be set if this range had FIN and we're sending all of its data
+        const fin = range.fin and (frame_offset + data_len == self.write_offset);
+
+        // Update or remove the range
+        if (data_len >= range.length) {
+            // Fully consumed this range
+            self.removeRetransmitRange(0);
+        } else {
+            // Partially consumed - advance the range
+            range.offset += data_len;
+            range.length -= data_len;
+        }
+
+        if (fin) {
+            self.fin_sent = true;
+            self.fin_lost = false;
+        }
+
+        return Frame{
+            .stream = .{
+                .stream_id = self.stream_id,
+                .offset = frame_offset,
+                .length = data_len,
+                .fin = fin,
+                .data = @constCast(data),
+            },
+        };
+    }
+
+    /// Pop a new data frame (original send path).
+    fn popNewDataFrame(self: *SendStream, max_len: u64) ?Frame {
         const buffered = self.write_buffer.items;
         const unsent_start = self.send_offset;
         const unsent_len = self.write_offset - self.send_offset;
@@ -280,6 +419,18 @@ pub const SendStream = struct {
                 .data = @constCast(data),
             },
         };
+    }
+
+    /// Remove a retransmit range by index, shifting remaining ranges down.
+    fn removeRetransmitRange(self: *SendStream, idx: usize) void {
+        if (idx >= self.retransmit_count) return;
+        const count = self.retransmit_count;
+        // Shift remaining ranges down
+        var i = idx;
+        while (i + 1 < count) : (i += 1) {
+            self.retransmit_ranges[i] = self.retransmit_ranges[i + 1];
+        }
+        self.retransmit_count -= 1;
     }
 };
 
@@ -821,4 +972,194 @@ test "StreamsMap: closeStream and getMaxStreamsUpdates integration" {
     // 2 >= 4/2=2, so MAX_STREAMS update should fire
     const update = sm.getMaxStreamsUpdates();
     try testing.expectEqual(@as(u64, 6), update.bidi.?); // 2 + 4 = 6
+}
+
+// Retransmission tests
+
+test "SendStream: retransmit prioritized over new data" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    // Write 10 bytes of data
+    try ss.writeData("helloworld");
+    // Pop the first 5 bytes (simulating they were sent)
+    const frame1 = ss.popStreamFrame(5);
+    try testing.expect(frame1 != null);
+    try testing.expectEqualSlices(u8, "hello", frame1.?.stream.data);
+    try testing.expectEqual(@as(u64, 0), frame1.?.stream.offset);
+
+    // Now simulate packet loss for the first 5 bytes
+    ss.queueRetransmit(0, 5, false);
+
+    // The next popStreamFrame should return the retransmitted data, not new data
+    const frame2 = ss.popStreamFrame(100);
+    try testing.expect(frame2 != null);
+    try testing.expectEqualSlices(u8, "hello", frame2.?.stream.data);
+    try testing.expectEqual(@as(u64, 0), frame2.?.stream.offset);
+    try testing.expect(!frame2.?.stream.fin);
+
+    // Now new data should be returned
+    const frame3 = ss.popStreamFrame(100);
+    try testing.expect(frame3 != null);
+    try testing.expectEqualSlices(u8, "world", frame3.?.stream.data);
+    try testing.expectEqual(@as(u64, 5), frame3.?.stream.offset);
+}
+
+test "SendStream: FIN retransmission" {
+    var ss = SendStream.init(testing.allocator, 4);
+    defer ss.deinit();
+
+    try ss.writeData("data");
+    ss.close();
+
+    // Pop the frame with FIN
+    const frame1 = ss.popStreamFrame(100);
+    try testing.expect(frame1 != null);
+    try testing.expect(frame1.?.stream.fin);
+    try testing.expectEqualSlices(u8, "data", frame1.?.stream.data);
+    try testing.expect(ss.fin_sent);
+
+    // Nothing more to send
+    try testing.expect(!ss.hasData());
+
+    // Simulate packet loss - the entire frame (data + FIN) was lost
+    ss.queueRetransmit(0, 4, true);
+
+    // Should have data to send again
+    try testing.expect(ss.hasData());
+
+    // Retransmission should include FIN
+    const frame2 = ss.popStreamFrame(100);
+    try testing.expect(frame2 != null);
+    try testing.expectEqualSlices(u8, "data", frame2.?.stream.data);
+    try testing.expectEqual(@as(u64, 0), frame2.?.stream.offset);
+    try testing.expect(frame2.?.stream.fin);
+}
+
+test "SendStream: FIN-only retransmission" {
+    var ss = SendStream.init(testing.allocator, 4);
+    defer ss.deinit();
+
+    try ss.writeData("data");
+
+    // Pop data first (no FIN yet)
+    const frame1 = ss.popStreamFrame(100);
+    try testing.expect(frame1 != null);
+    try testing.expect(!frame1.?.stream.fin);
+
+    // Close stream and pop FIN
+    ss.close();
+    const frame2 = ss.popStreamFrame(100);
+    try testing.expect(frame2 != null);
+    try testing.expect(frame2.?.stream.fin);
+    try testing.expectEqual(@as(u64, 0), frame2.?.stream.length);
+    try testing.expectEqual(@as(u64, 4), frame2.?.stream.offset);
+
+    // Simulate FIN-only frame loss (zero-length range with fin=true)
+    ss.queueRetransmit(4, 0, true);
+
+    try testing.expect(ss.hasData());
+
+    // Should retransmit just the FIN
+    const frame3 = ss.popStreamFrame(100);
+    try testing.expect(frame3 != null);
+    try testing.expect(frame3.?.stream.fin);
+    try testing.expectEqual(@as(u64, 0), frame3.?.stream.length);
+    try testing.expectEqual(@as(u64, 4), frame3.?.stream.offset);
+}
+
+test "SendStream: retransmit range merging" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("helloworldtest");
+    // Send all the data
+    _ = ss.popStreamFrame(100);
+
+    // Queue two adjacent retransmit ranges - they should merge
+    ss.queueRetransmit(0, 5, false); // "hello"
+    ss.queueRetransmit(5, 5, false); // "world"
+
+    // Should have merged into a single range
+    try testing.expectEqual(@as(u8, 1), ss.retransmit_count);
+
+    const frame = ss.popStreamFrame(100);
+    try testing.expect(frame != null);
+    try testing.expectEqual(@as(u64, 0), frame.?.stream.offset);
+    try testing.expectEqual(@as(u64, 10), frame.?.stream.length);
+    try testing.expectEqualSlices(u8, "helloworld", frame.?.stream.data);
+}
+
+test "SendStream: multiple retransmit ranges" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("helloworldtest!!");
+    // Send all the data
+    _ = ss.popStreamFrame(100);
+
+    // Queue two non-adjacent ranges
+    ss.queueRetransmit(0, 5, false); // "hello"
+    ss.queueRetransmit(10, 4, false); // "test"
+
+    try testing.expectEqual(@as(u8, 2), ss.retransmit_count);
+
+    // First retransmit
+    const frame1 = ss.popStreamFrame(100);
+    try testing.expect(frame1 != null);
+    try testing.expectEqual(@as(u64, 0), frame1.?.stream.offset);
+    try testing.expectEqualSlices(u8, "hello", frame1.?.stream.data);
+
+    // Second retransmit
+    const frame2 = ss.popStreamFrame(100);
+    try testing.expect(frame2 != null);
+    try testing.expectEqual(@as(u64, 10), frame2.?.stream.offset);
+    try testing.expectEqualSlices(u8, "test", frame2.?.stream.data);
+
+    // No more retransmits, no new data
+    try testing.expect(!ss.hasData());
+}
+
+test "SendStream: retransmit ignored after reset" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("hello");
+    _ = ss.popStreamFrame(100);
+
+    // Reset the stream
+    ss.reset(0x01);
+
+    // Queue retransmit - should be ignored
+    ss.queueRetransmit(0, 5, false);
+    try testing.expectEqual(@as(u8, 0), ss.retransmit_count);
+
+    // No data to send
+    try testing.expect(ss.popStreamFrame(100) == null);
+}
+
+test "SendStream: partial retransmit due to max_len" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("helloworld");
+    // Send all the data
+    _ = ss.popStreamFrame(100);
+
+    // Queue retransmit of all 10 bytes
+    ss.queueRetransmit(0, 10, false);
+
+    // Pop with max_len=5 - should get partial retransmit
+    const frame1 = ss.popStreamFrame(5);
+    try testing.expect(frame1 != null);
+    try testing.expectEqual(@as(u64, 0), frame1.?.stream.offset);
+    try testing.expectEqualSlices(u8, "hello", frame1.?.stream.data);
+
+    // Remaining retransmit
+    const frame2 = ss.popStreamFrame(100);
+    try testing.expect(frame2 != null);
+    try testing.expectEqual(@as(u64, 5), frame2.?.stream.offset);
+    try testing.expectEqualSlices(u8, "world", frame2.?.stream.data);
+
+    try testing.expect(!ss.hasData());
 }
