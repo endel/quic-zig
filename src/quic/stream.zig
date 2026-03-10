@@ -112,6 +112,9 @@ pub const FrameSorter = struct {
     }
 };
 
+/// Fraction of receive window that triggers a MAX_STREAM_DATA update.
+const STREAM_WINDOW_UPDATE_FRACTION: u64 = 4; // send update when 1/4 consumed
+
 /// A QUIC receive stream.
 pub const ReceiveStream = struct {
     stream_id: u64,
@@ -126,10 +129,24 @@ pub const ReceiveStream = struct {
     /// Whether all data has been read.
     finished: bool = false,
 
+    // Receive-side flow control (for generating MAX_STREAM_DATA)
+    bytes_read: u64 = 0,
+    receive_window: u64 = 0,
+    receive_window_size: u64 = 0,
+
     pub fn init(allocator: Allocator, stream_id: u64) ReceiveStream {
         return .{
             .stream_id = stream_id,
             .sorter = FrameSorter.init(allocator),
+        };
+    }
+
+    pub fn initWithWindow(allocator: Allocator, stream_id: u64, window: u64) ReceiveStream {
+        return .{
+            .stream_id = stream_id,
+            .sorter = FrameSorter.init(allocator),
+            .receive_window = window,
+            .receive_window_size = window,
         };
     }
 
@@ -156,10 +173,30 @@ pub const ReceiveStream = struct {
         if (self.reset_err != null) return null;
 
         const data = self.sorter.pop();
-        if (data == null and self.sorter.isComplete()) {
+        if (data) |d| {
+            self.bytes_read += d.len;
+        } else if (self.sorter.isComplete()) {
             self.finished = true;
         }
         return data;
+    }
+
+    /// Check if a MAX_STREAM_DATA update should be sent.
+    /// Returns the new window offset, or null if no update needed.
+    pub fn getWindowUpdate(self: *ReceiveStream) ?u64 {
+        if (self.receive_window == 0) return null; // no flow control configured
+        if (self.fin_received) return null; // no point updating after FIN
+
+        // Send update when consumed portion exceeds threshold
+        const threshold = self.receive_window_size / STREAM_WINDOW_UPDATE_FRACTION;
+        if (self.bytes_read + threshold > self.receive_window) {
+            const new_window = self.bytes_read + self.receive_window_size;
+            if (new_window > self.receive_window) {
+                self.receive_window = new_window;
+                return new_window;
+            }
+        }
+        return null;
     }
 };
 
@@ -492,6 +529,11 @@ pub const StreamsMap = struct {
     peer_initial_max_stream_data_bidi_remote: u64 = std.math.maxInt(u64),
     peer_initial_max_stream_data_uni: u64 = std.math.maxInt(u64),
 
+    /// Local receive window limits (our advertised limits, for MAX_STREAM_DATA generation).
+    local_max_stream_data_bidi_local: u64 = 0,
+    local_max_stream_data_bidi_remote: u64 = 0,
+    local_max_stream_data_uni: u64 = 0,
+
     /// Maximum stream IDs from peer.
     max_incoming_bidi_streams: u64 = 0,
     max_incoming_uni_streams: u64 = 0,
@@ -597,6 +639,9 @@ pub const StreamsMap = struct {
         s.* = Stream.init(self.allocator, id);
         // We initiated this stream → peer's "bidi_remote" limit applies to our sends
         s.send.send_window = self.peer_initial_max_stream_data_bidi_remote;
+        // Our local receive window for streams we initiated
+        s.recv.receive_window = self.local_max_stream_data_bidi_local;
+        s.recv.receive_window_size = self.local_max_stream_data_bidi_local;
         try self.streams.put(id, s);
         return s;
     }
@@ -638,6 +683,9 @@ pub const StreamsMap = struct {
         s.* = Stream.init(self.allocator, stream_id);
         // Peer initiated this stream → peer's "bidi_local" limit applies to our sends
         s.send.send_window = self.peer_initial_max_stream_data_bidi_local;
+        // Our local receive window for peer-initiated streams
+        s.recv.receive_window = self.local_max_stream_data_bidi_remote;
+        s.recv.receive_window_size = self.local_max_stream_data_bidi_remote;
         try self.streams.put(stream_id, s);
         self.open_bidi_streams += 1;
         return s;
@@ -650,7 +698,7 @@ pub const StreamsMap = struct {
         }
 
         const s = try self.allocator.create(ReceiveStream);
-        s.* = ReceiveStream.init(self.allocator, stream_id);
+        s.* = ReceiveStream.initWithWindow(self.allocator, stream_id, self.local_max_stream_data_uni);
         try self.recv_streams.put(stream_id, s);
         self.open_uni_streams += 1;
         return s;

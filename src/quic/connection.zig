@@ -458,6 +458,9 @@ pub const Connection = struct {
     initial_dcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
     initial_dcid_len: u8 = 0,
 
+    // PTO probe pending — bypass congestion control for one packet (RFC 9002 §6.2.4)
+    pto_probe_pending: bool = false,
+
     // Connection close state (RFC 9000 Section 10)
     closing_start_time: i64 = 0,
     close_pkt_buf: [256]u8 = undefined,
@@ -610,6 +613,9 @@ pub const Connection = struct {
             config.initial_max_streams_bidi,
             config.initial_max_streams_uni,
         );
+        conn.streams.local_max_stream_data_bidi_local = config.initial_max_stream_data_bidi_local;
+        conn.streams.local_max_stream_data_bidi_remote = config.initial_max_stream_data_bidi_remote;
+        conn.streams.local_max_stream_data_uni = config.initial_max_stream_data_uni;
 
         // Set initial send window from connection flow control
         conn.conn_flow_ctrl.base.send_window = config.initial_max_data;
@@ -1897,20 +1903,36 @@ pub const Connection = struct {
             self.pending_frames.push(.{ .max_streams_uni = new_max });
         }
 
+        // MAX_STREAM_DATA: update peer's send window as we consume stream data
+        {
+            var stream_it = self.streams.streams.valueIterator();
+            while (stream_it.next()) |s_ptr| {
+                const s: *stream_mod.Stream = s_ptr.*;
+                if (s.recv.getWindowUpdate()) |new_max| {
+                    self.pending_frames.push(.{ .max_stream_data = .{
+                        .stream_id = s.stream_id,
+                        .max = new_max,
+                    } });
+                }
+            }
+        }
+
         // DATA_BLOCKED: signal peer when connection-level flow control blocks sending (RFC 9000 §4.1)
         if (self.conn_flow_ctrl.base.shouldSendBlocked()) |limit| {
             self.pending_frames.push(.{ .data_blocked = limit });
         }
 
         // STREAM_DATA_BLOCKED: signal peer when stream-level flow control blocks sending
-        var stream_it = self.streams.streams.valueIterator();
-        while (stream_it.next()) |s_ptr| {
-            const s: *stream_mod.Stream = s_ptr.*;
-            if (s.send.shouldSendBlocked()) |limit| {
-                self.pending_frames.push(.{ .stream_data_blocked = .{
-                    .stream_id = s.stream_id,
-                    .limit = limit,
-                } });
+        {
+            var stream_it = self.streams.streams.valueIterator();
+            while (stream_it.next()) |s_ptr| {
+                const s: *stream_mod.Stream = s_ptr.*;
+                if (s.send.shouldSendBlocked()) |limit| {
+                    self.pending_frames.push(.{ .stream_data_blocked = .{
+                        .stream_id = s.stream_id,
+                        .limit = limit,
+                    } });
+                }
             }
         }
     }
@@ -1980,7 +2002,8 @@ pub const Connection = struct {
         }
 
         // Check congestion window — only send ACKs + control frames when congestion-limited
-        if (self.pkt_handler.bytes_in_flight >= self.cc.sendWindow()) {
+        // Exception: PTO probes MUST bypass congestion control (RFC 9002 §6.2.4)
+        if (self.pkt_handler.bytes_in_flight >= self.cc.sendWindow() and !self.pto_probe_pending) {
             return try self.sendAckOnly(out_buf, now);
         }
 
@@ -2044,6 +2067,7 @@ pub const Connection = struct {
         );
 
         if (bytes_written > 0) {
+            self.pto_probe_pending = false;
             self.paths[self.active_path_idx].bytes_sent += bytes_written;
             self.pacer.onPacketSent(bytes_written, now);
 
@@ -2137,6 +2161,7 @@ pub const Connection = struct {
         );
 
         if (bytes_written > 0) {
+            self.pto_probe_pending = false;
             self.paths[self.active_path_idx].bytes_sent += bytes_written;
             // Don't update pacer — ACKs are not paced
         }
@@ -2275,12 +2300,12 @@ pub const Connection = struct {
                     }
                 }
 
-                // Only send PING as last resort when no data available
-                if (!has_data) {
-                    self.pending_frames.push(.{ .ping = {} });
-                }
-                // If has_data is true, the packer will naturally pick up the
-                // stream/crypto data and produce an ack-eliciting probe packet
+                // Always push PING for PTO probes. When congestion-limited, send()
+                // calls sendAckOnly(ack_only=true) which skips stream frames.
+                // Without a PING, the PTO probe would never get sent, stalling
+                // recovery after blackhole/persistent congestion events.
+                self.pending_frames.push(.{ .ping = {} });
+                self.pto_probe_pending = true;
             }
         }
 
@@ -2586,6 +2611,9 @@ pub fn connect(
         config.initial_max_streams_bidi,
         config.initial_max_streams_uni,
     );
+    conn.streams.local_max_stream_data_bidi_local = config.initial_max_stream_data_bidi_local;
+    conn.streams.local_max_stream_data_bidi_remote = config.initial_max_stream_data_bidi_remote;
+    conn.streams.local_max_stream_data_uni = config.initial_max_stream_data_uni;
 
     conn.conn_flow_ctrl.base.send_window = config.initial_max_data;
 

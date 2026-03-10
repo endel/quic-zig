@@ -113,10 +113,12 @@ pub const NewReno = struct {
     }
 
     // Persistent congestion detected (RFC 9002 §7.6.2).
-    // Aggressively reduce to minimum window (2 * max_datagram_size).
+    // Reset to minimum window with slow start (exponential) recovery,
+    // similar to TCP RTO behavior (RFC 5681): cwnd = minimum, ssthresh = infinity
+    // so that slow start can quickly probe available capacity.
     pub fn onPersistentCongestion(self: *NewReno) void {
         self.congestion_window = MIN_WINDOW_PACKETS * self.max_datagram_size;
-        self.ssthresh = self.congestion_window;
+        self.ssthresh = std.math.maxInt(u64);
         self.congestion_recovery_start_time = null;
         self.bytes_acked_in_round = 0;
     }
@@ -292,7 +294,10 @@ test "NewReno: persistent congestion resets to minimum" {
 
     // Window should be at minimum (2 * MSS)
     try testing.expectEqual(MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE, cc.congestion_window);
-    try testing.expectEqual(MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE, cc.ssthresh);
+    // ssthresh should be maxInt to allow slow start recovery (exponential growth)
+    try testing.expectEqual(std.math.maxInt(u64), cc.ssthresh);
+    // Should be in slow start after persistent congestion
+    try testing.expect(cc.inSlowStart());
     // Recovery period should be cleared so window can grow again
     try testing.expect(cc.congestion_recovery_start_time == null);
 }
