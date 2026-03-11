@@ -64,15 +64,21 @@ const CMSG_HDR_SIZE = @sizeOf(CmsgHdr);
 const CMSG_SPACE = (CMSG_HDR_SIZE + 4 + @alignOf(CmsgHdr) - 1) & ~@as(usize, @alignOf(CmsgHdr) - 1);
 const CMSG_BUF_SIZE = CMSG_SPACE * 2; // room for at least 2 cmsgs
 
+/// Raw setsockopt that doesn't panic on EINVAL (needed for trying IPv6 opts on IPv4 sockets).
+fn rawSetsockopt(sockfd: posix.socket_t, level: i32, optname: u32, optval: []const u8) void {
+    _ = std.c.setsockopt(sockfd, level, @intCast(optname), optval.ptr, @intCast(optval.len));
+}
+
 /// Enable receiving ECN/TOS info on incoming packets.
 /// No-op on Windows (ECN ancillary data not supported).
 pub fn enableEcnRecv(sockfd: posix.socket_t) !void {
     if (comptime is_windows) return;
     const val: u32 = 1;
-    // Enable for IPv4
-    posix.setsockopt(sockfd, IPPROTO_IP, IP_RECVTOS, std.mem.asBytes(&val)) catch {};
-    // Enable for IPv6 (IPV6_RECVTCLASS)
-    posix.setsockopt(sockfd, posix.IPPROTO.IPV6, IPV6_RECVTCLASS, std.mem.asBytes(&val)) catch {};
+    const val_bytes = std.mem.asBytes(&val);
+    // Enable for IPv4 (may fail on IPv6-only sockets — that's OK)
+    rawSetsockopt(sockfd, IPPROTO_IP, IP_RECVTOS, val_bytes);
+    // Enable for IPv6 (may fail on IPv4-only sockets — that's OK)
+    rawSetsockopt(sockfd, @intCast(posix.IPPROTO.IPV6), IPV6_RECVTCLASS, val_bytes);
 }
 
 /// Set the ECN codepoint for outgoing packets (low 2 bits of IP TOS).
@@ -80,9 +86,10 @@ pub fn enableEcnRecv(sockfd: posix.socket_t) !void {
 pub fn setEcnMark(sockfd: posix.socket_t, ecn_mark: u2) !void {
     if (comptime is_windows) return;
     const tos: u32 = @as(u32, ecn_mark);
-    // Try IPv4 first, then IPv6
-    posix.setsockopt(sockfd, IPPROTO_IP, IP_TOS, std.mem.asBytes(&tos)) catch {};
-    posix.setsockopt(sockfd, posix.IPPROTO.IPV6, IPV6_TCLASS, std.mem.asBytes(&tos)) catch {};
+    const tos_bytes = std.mem.asBytes(&tos);
+    // Try both IPv4 and IPv6 — one will fail silently depending on socket family
+    rawSetsockopt(sockfd, IPPROTO_IP, IP_TOS, tos_bytes);
+    rawSetsockopt(sockfd, @intCast(posix.IPPROTO.IPV6), IPV6_TCLASS, tos_bytes);
 }
 
 pub const RecvResult = struct {
