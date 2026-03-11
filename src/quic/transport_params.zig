@@ -52,19 +52,22 @@ pub const PreferredAddress = struct {
         return self.cid_buf[0..self.cid_len];
     }
 
-    pub fn toSockaddrV4(self: *const PreferredAddress) posix.sockaddr {
-        const addr: posix.sockaddr.in = .{
+    pub fn toSockaddrV4(self: *const PreferredAddress) posix.sockaddr.storage {
+        var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+        const addr_in: *posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+        addr_in.* = .{
             .port = std.mem.nativeToBig(u16, self.ipv4_port),
             .addr = @bitCast(self.ipv4_addr),
         };
-        return @as(*const posix.sockaddr, @ptrCast(&addr)).*;
+        return storage;
     }
 
-    pub fn toSockaddrV6(self: *const PreferredAddress) posix.sockaddr {
-        var addr: posix.sockaddr.in6 = std.mem.zeroes(posix.sockaddr.in6);
-        addr.port = std.mem.nativeToBig(u16, self.ipv6_port);
-        addr.addr = self.ipv6_addr;
-        return @as(*const posix.sockaddr, @ptrCast(&addr)).*;
+    pub fn toSockaddrV6(self: *const PreferredAddress) posix.sockaddr.storage {
+        var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+        const addr_in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+        addr_in6.port = std.mem.nativeToBig(u16, self.ipv6_port);
+        addr_in6.addr = self.ipv6_addr;
+        return storage;
     }
 };
 
@@ -440,7 +443,7 @@ test "PreferredAddress: toSockaddrV4" {
     try testing.expect(!pref.hasIpv6());
 
     const sa = pref.toSockaddrV4();
-    const sa_in: posix.sockaddr.in = @bitCast(sa);
+    const sa_in: *const posix.sockaddr.in = @ptrCast(@alignCast(&sa));
     try testing.expectEqual(posix.AF.INET, sa_in.family);
     try testing.expectEqual(std.mem.nativeToBig(u16, 4433), sa_in.port);
 }

@@ -433,8 +433,8 @@ pub const Tls13Handshake = struct {
     x25519_public: [32]u8 = undefined,
     peer_x25519_public: [32]u8 = undefined,
 
-    // Output buffer for built messages
-    out_buf: [4096]u8 = undefined,
+    // Output buffer for built messages (32KB for large cert chains, e.g. 9-cert amplificationlimit test)
+    out_buf: [32768]u8 = undefined,
     out_len: usize = 0,
 
     // Pending actions returned by step()
@@ -1212,7 +1212,7 @@ pub const Tls13Handshake = struct {
     }
 
     fn serverBuildCertificate(self: *Tls13Handshake) !Action {
-        var buf: [4096]u8 = undefined;
+        var buf: [32768]u8 = undefined;
         const msg = buildCertificate(&buf, self.config.cert_chain_der) catch return error.InternalError;
 
         self.transcript.update(msg);
@@ -2116,6 +2116,57 @@ fn writeU16(buf: []u8, val: u16) void {
 
 pub fn parsePemCert(pem_data: []const u8, out: []u8) ![]const u8 {
     return parsePemSection(pem_data, "CERTIFICATE", out);
+}
+
+/// Parse all PEM certificates from a PEM file containing a certificate chain.
+/// Returns a slice of DER-encoded certificates using the provided allocator.
+pub fn parsePemCertChain(alloc: std.mem.Allocator, pem_data: []const u8) ![][]const u8 {
+    const begin_marker = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+
+    // Count certificates
+    var count: usize = 0;
+    {
+        var search: usize = 0;
+        while (std.mem.indexOf(u8, pem_data[search..], begin_marker)) |idx| {
+            count += 1;
+            search += idx + begin_marker.len;
+            search += std.mem.indexOf(u8, pem_data[search..], end_marker) orelse break;
+            search += end_marker.len;
+        }
+    }
+
+    if (count == 0) return error.DecodeError;
+
+    const chain = try alloc.alloc([]u8, count);
+    var search: usize = 0;
+    for (0..count) |i| {
+        const begin_idx = std.mem.indexOf(u8, pem_data[search..], begin_marker) orelse return error.DecodeError;
+        const abs_begin = search + begin_idx + begin_marker.len;
+        const end_idx = std.mem.indexOf(u8, pem_data[abs_begin..], end_marker) orelse return error.DecodeError;
+        const base64_data = pem_data[abs_begin..][0..end_idx];
+
+        // Strip whitespace and decode base64
+        var clean: [8192]u8 = undefined;
+        var clean_len: usize = 0;
+        for (base64_data) |c| {
+            if (c != '\n' and c != '\r' and c != ' ' and c != '\t') {
+                if (clean_len >= clean.len) return error.DecodeError;
+                clean[clean_len] = c;
+                clean_len += 1;
+            }
+        }
+
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(clean[0..clean_len]) catch return error.DecodeError;
+        const cert_buf = try alloc.alloc(u8, decoded_len);
+        std.base64.standard.Decoder.decode(cert_buf, clean[0..clean_len]) catch return error.DecodeError;
+        chain[i] = cert_buf;
+
+        search = abs_begin + end_idx + end_marker.len;
+    }
+
+    // Return as [][]const u8
+    return @ptrCast(chain);
 }
 
 pub fn parsePemPrivateKey(pem_data: []const u8, out: []u8) ![]const u8 {

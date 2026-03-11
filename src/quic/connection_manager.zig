@@ -141,8 +141,8 @@ pub const ConnectionManager = struct {
     pub fn acceptConnection(
         self: *ConnectionManager,
         header: packet.Header,
-        local: posix.sockaddr,
-        remote: posix.sockaddr,
+        local: posix.sockaddr.storage,
+        remote: posix.sockaddr.storage,
         odcid: ?[]const u8,
         retry_scid: ?[]const u8,
     ) !*ConnEntry {
@@ -249,8 +249,8 @@ pub const ConnectionManager = struct {
     pub fn recvDatagram(
         self: *ConnectionManager,
         bytes: []u8,
-        from: posix.sockaddr,
-        local: posix.sockaddr,
+        from: posix.sockaddr.storage,
+        local: posix.sockaddr.storage,
         ecn_val: u2,
         out_buf: []u8,
     ) RecvAction {

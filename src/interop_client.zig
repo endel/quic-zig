@@ -228,10 +228,15 @@ fn downloadAll(
         };
     };
 
-    const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    // Create socket matching the resolved address family (IPv4 or IPv6)
+    const is_ipv6 = server_addr.any.family == posix.AF.INET6;
+    const sockfd = try posix.socket(if (is_ipv6) posix.AF.INET6 else posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
 
-    const local_addr = try net.Address.parseIp4("0.0.0.0", 0);
+    const local_addr = if (is_ipv6)
+        try net.Address.parseIp6("::", 0)
+    else
+        try net.Address.parseIp4("0.0.0.0", 0);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
     ecn_socket.enableEcnRecv(sockfd) catch {};
 
@@ -253,8 +258,8 @@ fn downloadAll(
     var conn = try connection.connect(alloc, host, .{ .enable_v2 = enable_v2, .disable_pmtud = true }, tls_config, null);
     defer conn.deinit();
 
-    var remote_addr = server_addr.any;
-    var addr_size: posix.socklen_t = server_addr.getOsSockLen();
+    var remote_addr = connection.sockaddrToStorage(&server_addr.any);
+    var addr_size: posix.socklen_t = connection.sockaddrLen(&remote_addr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
 
     // Send 0-RTT early data if we have a session ticket (before handshake completes)
@@ -274,7 +279,7 @@ fn downloadAll(
     // Handshake phase — use time-based timeout (30s) to handle high-RTT networks
     var handshake_complete = false;
     const handshake_start = std.time.nanoTimestamp();
-    const handshake_timeout_ns: i128 = 30 * std.time.ns_per_s;
+    const handshake_timeout_ns: i128 = 120 * std.time.ns_per_s;
 
     while (!handshake_complete and (std.time.nanoTimestamp() - handshake_start) < handshake_timeout_ns) {
         // Fire PTO timer for handshake retransmissions
@@ -288,7 +293,7 @@ fn downloadAll(
                 const bytes_written = conn.send(&out) catch break;
                 if (bytes_written == 0) break;
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-                _ = posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size) catch {};
+                _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(&remote_addr), addr_size) catch {};
                 sent_any = true;
             }
         }
@@ -303,7 +308,7 @@ fn downloadAll(
             addr_size = recv_result.addr_len;
 
             conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-                .to = local_addr.any,
+                .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
             });
@@ -327,7 +332,7 @@ fn downloadAll(
     const hs_bytes = conn.send(&out) catch 0;
     if (hs_bytes > 0) {
         ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = posix.sendto(sockfd, out[0..hs_bytes], 0, &remote_addr, addr_size) catch {};
+        _ = posix.sendto(sockfd, out[0..hs_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
     }
 
     // Sync remote_addr from active path
@@ -347,7 +352,7 @@ fn downloadAll(
             drainRecv(&conn, sockfd, local_addr, &remote_addr, &addr_size);
             const more = conn.send(&out) catch 0;
             if (more > 0) {
-                _ = posix.sendto(sockfd, out[0..more], 0, &remote_addr, addr_size) catch {};
+                _ = posix.sendto(sockfd, out[0..more], 0, @ptrCast(&remote_addr), addr_size) catch {};
             }
         }
     }
@@ -359,7 +364,7 @@ fn downloadAll(
     conn.close(0, "done");
     const final_bytes = conn.send(&out) catch 0;
     if (final_bytes > 0) {
-        _ = posix.sendto(sockfd, out[0..final_bytes], 0, &remote_addr, addr_size) catch {};
+        _ = posix.sendto(sockfd, out[0..final_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
     }
 
     if (!skip_ticket_and_drain) {
@@ -371,7 +376,7 @@ fn downloadAll(
             drainRecv(&conn, sockfd, local_addr, &remote_addr, &addr_size);
             const retransmit_bytes = conn.send(&out) catch 0;
             if (retransmit_bytes > 0) {
-                _ = posix.sendto(sockfd, out[0..retransmit_bytes], 0, &remote_addr, addr_size) catch {};
+                _ = posix.sendto(sockfd, out[0..retransmit_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
             }
         }
     }
@@ -383,7 +388,7 @@ fn downloadH0(
     alloc: std.mem.Allocator,
     conn: *connection.Connection,
     sockfd: posix.fd_t,
-    remote_addr: *posix.sockaddr,
+    remote_addr: *posix.sockaddr.storage,
     addr_size: posix.socklen_t,
     local_addr: net.Address,
     urls: []const ParsedUrl,
@@ -439,7 +444,7 @@ fn downloadH0(
             const more = conn.send(&out) catch break;
             if (more == 0) break;
             ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-            _ = posix.sendto(sockfd, out[0..more], 0, remote_addr, addr_size) catch break;
+            _ = posix.sendto(sockfd, out[0..more], 0, @ptrCast(remote_addr), addr_size) catch break;
         }
     }
 
@@ -470,7 +475,7 @@ fn downloadH0(
                 const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
                 packets_received += 1;
                 conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-                    .to = local_addr.any,
+                    .to = connection.sockaddrToStorage(&local_addr.any),
                     .from = recv_result.from_addr,
                     .ecn = recv_result.ecn,
                 });
@@ -497,7 +502,7 @@ fn downloadH0(
                 const ack_bytes = conn.send(&out) catch break;
                 if (ack_bytes == 0) break;
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-                _ = posix.sendto(sockfd, out[0..ack_bytes], 0, remote_addr, addr_size) catch {};
+                _ = posix.sendto(sockfd, out[0..ack_bytes], 0, @ptrCast(remote_addr), addr_size) catch {};
             }
         }
 
@@ -545,7 +550,7 @@ fn downloadH3(
     alloc: std.mem.Allocator,
     conn: *connection.Connection,
     sockfd: posix.fd_t,
-    remote_addr: *posix.sockaddr,
+    remote_addr: *posix.sockaddr.storage,
     addr_size: posix.socklen_t,
     local_addr: net.Address,
     urls: []const ParsedUrl,
@@ -592,7 +597,7 @@ fn downloadH3(
         const more = conn.send(&out) catch break;
         if (more == 0) break;
         ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = posix.sendto(sockfd, out[0..more], 0, remote_addr, addr_size) catch break;
+        _ = posix.sendto(sockfd, out[0..more], 0, @ptrCast(remote_addr), addr_size) catch break;
     }
 
     // Read responses — use time-based timeout (60s)
@@ -612,7 +617,7 @@ fn downloadH3(
                 const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
                 packets_received += 1;
                 conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-                    .to = local_addr.any,
+                    .to = connection.sockaddrToStorage(&local_addr.any),
                     .from = recv_result.from_addr,
                     .ecn = recv_result.ecn,
                 });
@@ -639,7 +644,7 @@ fn downloadH3(
                 const ack_bytes = conn.send(&out) catch break;
                 if (ack_bytes == 0) break;
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-                _ = posix.sendto(sockfd, out[0..ack_bytes], 0, remote_addr, addr_size) catch {};
+                _ = posix.sendto(sockfd, out[0..ack_bytes], 0, @ptrCast(remote_addr), addr_size) catch {};
             }
         }
 
@@ -698,7 +703,7 @@ fn drainRecv(
     conn: *connection.Connection,
     sockfd: posix.fd_t,
     local_addr: net.Address,
-    remote_addr: *posix.sockaddr,
+    remote_addr: *posix.sockaddr.storage,
     addr_size: *posix.socklen_t,
 ) void {
     while (true) {
@@ -707,7 +712,7 @@ fn drainRecv(
         remote_addr.* = recv_result.from_addr;
         addr_size.* = recv_result.addr_len;
         conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-            .to = local_addr.any,
+            .to = connection.sockaddrToStorage(&local_addr.any),
             .from = recv_result.from_addr,
             .ecn = recv_result.ecn,
         });

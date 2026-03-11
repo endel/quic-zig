@@ -85,7 +85,7 @@ pub fn main() !void {
     );
     defer conn_mgr.deinit();
 
-    var remote_addr: posix.sockaddr = undefined;
+    var remote_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
     var addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
 
@@ -110,18 +110,18 @@ pub fn main() !void {
             remote_addr = recv_result.from_addr;
             addr_size = recv_result.addr_len;
 
-            switch (conn_mgr.recvDatagram(bytes[0..recv_result.bytes_read], remote_addr, local_addr.any, recv_result.ecn, &out)) {
+            switch (conn_mgr.recvDatagram(bytes[0..recv_result.bytes_read], remote_addr, connection.sockaddrToStorage(&local_addr.any), recv_result.ecn, &out)) {
                 .processed => |entry| {
                     const conn = entry.conn;
                     const bytes_written = conn.send(&out) catch continue;
                     if (bytes_written > 0) {
                         ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                         const send_addr = conn.peerAddress();
-                        _ = posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr)) catch {};
+                        _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(send_addr), connection.sockaddrLen(send_addr)) catch {};
                     }
                 },
                 .send_response => |data| {
-                    _ = posix.sendto(sockfd, data, 0, &remote_addr, addr_size) catch {};
+                    _ = posix.sendto(sockfd, data, 0, @ptrCast(&remote_addr), addr_size) catch {};
                 },
                 .dropped => {},
             }
@@ -217,7 +217,7 @@ pub fn main() !void {
                 if (bytes_written == 0) break;
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                 const send_addr = conn.peerAddress();
-                _ = posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr)) catch {};
+                _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(send_addr), connection.sockaddrLen(send_addr)) catch {};
             }
 
             i += 1;

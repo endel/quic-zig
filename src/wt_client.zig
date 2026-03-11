@@ -55,8 +55,8 @@ pub fn main() !void {
         null,
     );
 
-    var remote_addr = server_addr.any;
-    var addr_size: posix.socklen_t = server_addr.getOsSockLen();
+    var remote_addr = connection.sockaddrToStorage(&server_addr.any);
+    var addr_size: posix.socklen_t = connection.sockaddrLen(&remote_addr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
 
     // Handshake loop
@@ -70,7 +70,7 @@ pub fn main() !void {
         const bytes_written = conn.send(&out) catch break;
         if (bytes_written > 0) {
             ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-            _ = posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size) catch continue;
+            _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(&remote_addr), addr_size) catch continue;
         }
 
         while (true) {
@@ -80,7 +80,7 @@ pub fn main() !void {
             addr_size = recv_result.addr_len;
 
             conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-                .to = local_addr.any,
+                .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
             });
@@ -100,7 +100,7 @@ pub fn main() !void {
     const hs_bytes = conn.send(&out) catch 0;
     if (hs_bytes > 0) {
         ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = try posix.sendto(sockfd, out[0..hs_bytes], 0, &remote_addr, addr_size);
+        _ = try posix.sendto(sockfd, out[0..hs_bytes], 0, @ptrCast(&remote_addr), addr_size);
     }
 
     // Sync remote_addr from active path (may have changed due to preferred address migration)
@@ -132,7 +132,7 @@ pub fn main() !void {
         const more = conn.send(&out) catch break;
         if (more == 0) break;
         ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = posix.sendto(sockfd, out[0..more], 0, &remote_addr, addr_size) catch break;
+        _ = posix.sendto(sockfd, out[0..more], 0, @ptrCast(&remote_addr), addr_size) catch break;
     }
 
     // Wait for session to be accepted
@@ -151,7 +151,7 @@ pub fn main() !void {
             addr_size = recv_result.addr_len;
 
             conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-                .to = local_addr.any,
+                .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
             });
@@ -161,7 +161,7 @@ pub fn main() !void {
         const ack_bytes = conn.send(&out) catch continue;
         if (ack_bytes > 0) {
             ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-            _ = posix.sendto(sockfd, out[0..ack_bytes], 0, &remote_addr, addr_size) catch {};
+            _ = posix.sendto(sockfd, out[0..ack_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
         }
 
         // Poll for WT events
@@ -211,7 +211,7 @@ pub fn main() !void {
         const more = conn.send(&out) catch break;
         if (more == 0) break;
         ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = posix.sendto(sockfd, out[0..more], 0, &remote_addr, addr_size) catch break;
+        _ = posix.sendto(sockfd, out[0..more], 0, @ptrCast(&remote_addr), addr_size) catch break;
     }
 
     // Read echo response
@@ -228,7 +228,7 @@ pub fn main() !void {
             addr_size = recv_result.addr_len;
 
             conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-                .to = local_addr.any,
+                .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
             });
@@ -237,7 +237,7 @@ pub fn main() !void {
         const ack_bytes = conn.send(&out) catch continue;
         if (ack_bytes > 0) {
             ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-            _ = posix.sendto(sockfd, out[0..ack_bytes], 0, &remote_addr, addr_size) catch {};
+            _ = posix.sendto(sockfd, out[0..ack_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
         }
 
         // Poll for WT events
@@ -270,6 +270,6 @@ pub fn main() !void {
     conn.close(0, "done");
     const final_bytes = conn.send(&out) catch 0;
     if (final_bytes > 0) {
-        _ = try posix.sendto(sockfd, out[0..final_bytes], 0, &remote_addr, addr_size);
+        _ = try posix.sendto(sockfd, out[0..final_bytes], 0, @ptrCast(&remote_addr), addr_size);
     }
 }

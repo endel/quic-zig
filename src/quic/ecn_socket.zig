@@ -21,6 +21,21 @@ const IP_RECVTOS: u32 = switch (builtin.os.tag) {
     else => @compileError("unsupported OS for ECN"),
 };
 
+// IPv6 ECN constants
+const IPV6_TCLASS: u32 = switch (builtin.os.tag) {
+    .macos => 36,
+    .linux => 67,
+    .windows => 0,
+    else => @compileError("unsupported OS for ECN"),
+};
+
+const IPV6_RECVTCLASS: u32 = switch (builtin.os.tag) {
+    .macos => 35,
+    .linux => 66,
+    .windows => 0,
+    else => @compileError("unsupported OS for ECN"),
+};
+
 // cmsg_type returned by recvmsg for TOS/ECN ancillary data.
 // On macOS, the kernel returns IP_RECVTOS as the cmsg_type.
 // On Linux, the kernel returns IP_TOS as the cmsg_type.
@@ -54,7 +69,10 @@ const CMSG_BUF_SIZE = CMSG_SPACE * 2; // room for at least 2 cmsgs
 pub fn enableEcnRecv(sockfd: posix.socket_t) !void {
     if (comptime is_windows) return;
     const val: u32 = 1;
-    try posix.setsockopt(sockfd, IPPROTO_IP, IP_RECVTOS, std.mem.asBytes(&val));
+    // Enable for IPv4
+    posix.setsockopt(sockfd, IPPROTO_IP, IP_RECVTOS, std.mem.asBytes(&val)) catch {};
+    // Enable for IPv6 (IPV6_RECVTCLASS)
+    posix.setsockopt(sockfd, posix.IPPROTO.IPV6, IPV6_RECVTCLASS, std.mem.asBytes(&val)) catch {};
 }
 
 /// Set the ECN codepoint for outgoing packets (low 2 bits of IP TOS).
@@ -62,12 +80,14 @@ pub fn enableEcnRecv(sockfd: posix.socket_t) !void {
 pub fn setEcnMark(sockfd: posix.socket_t, ecn_mark: u2) !void {
     if (comptime is_windows) return;
     const tos: u32 = @as(u32, ecn_mark);
-    try posix.setsockopt(sockfd, IPPROTO_IP, IP_TOS, std.mem.asBytes(&tos));
+    // Try IPv4 first, then IPv6
+    posix.setsockopt(sockfd, IPPROTO_IP, IP_TOS, std.mem.asBytes(&tos)) catch {};
+    posix.setsockopt(sockfd, posix.IPPROTO.IPV6, IPV6_TCLASS, std.mem.asBytes(&tos)) catch {};
 }
 
 pub const RecvResult = struct {
     bytes_read: usize,
-    from_addr: posix.sockaddr,
+    from_addr: posix.sockaddr.storage,
     addr_len: posix.socklen_t,
     ecn: u2,
 };
@@ -77,9 +97,9 @@ pub const RecvResult = struct {
 pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
     if (comptime is_windows) {
         // Windows fallback: plain recvfrom, no ECN info.
-        var from_addr: posix.sockaddr = undefined;
-        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-        const bytes_read = try posix.recvfrom(sockfd, buf, 0, &from_addr, &addr_len);
+        var from_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        const bytes_read = try posix.recvfrom(sockfd, buf, 0, @ptrCast(&from_addr), &addr_len);
         return .{
             .bytes_read = bytes_read,
             .from_addr = from_addr,
@@ -96,11 +116,11 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
     };
 
     var cmsg_buf: [CMSG_BUF_SIZE]u8 align(@alignOf(CmsgHdr)) = .{0} ** CMSG_BUF_SIZE;
-    var from_addr: posix.sockaddr = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    var from_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
 
     var msg = std.c.msghdr{
-        .name = &from_addr,
+        .name = @ptrCast(&from_addr),
         .namelen = addr_len,
         .iov = &iov,
         .iovlen = 1,
@@ -130,8 +150,11 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
         const hdr: *const CmsgHdr = @ptrCast(@alignCast(&cmsg_buf[offset]));
         const data_offset = offset + CMSG_HDR_SIZE;
         const data_len = @as(usize, hdr.cmsg_len) -| CMSG_HDR_SIZE;
-        if (hdr.cmsg_level == @as(i32, @intCast(IPPROTO_IP)) and
-            hdr.cmsg_type == @as(i32, @intCast(CMSG_TYPE_TOS)) and
+        const is_ipv4_tos = hdr.cmsg_level == @as(i32, @intCast(IPPROTO_IP)) and
+            hdr.cmsg_type == @as(i32, @intCast(CMSG_TYPE_TOS));
+        const is_ipv6_tclass = hdr.cmsg_level == @as(i32, @intCast(posix.IPPROTO.IPV6)) and
+            hdr.cmsg_type == @as(i32, @intCast(IPV6_TCLASS));
+        if ((is_ipv4_tos or is_ipv6_tclass) and
             data_len >= 1 and data_offset < CMSG_BUF_SIZE)
         {
             ecn = @truncate(cmsg_buf[data_offset] & 0x03);

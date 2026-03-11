@@ -53,8 +53,8 @@ pub fn main() !void {
         null, // no NEW_TOKEN from previous connection
     );
 
-    var remote_addr = server_addr.any;
-    var addr_size: posix.socklen_t = server_addr.getOsSockLen();
+    var remote_addr = connection.sockaddrToStorage(&server_addr.any);
+    var addr_size: posix.socklen_t = connection.sockaddrLen(&remote_addr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
 
     // Send initial packets and wait for handshake to complete
@@ -75,7 +75,7 @@ pub fn main() !void {
             if (bytes_written > 0) {
                 send_count += 1;
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-                const sent = posix.sendto(sockfd, out[0..bytes_written], 0, &remote_addr, addr_size) catch |err| {
+                const sent = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(&remote_addr), addr_size) catch |err| {
                     std.log.err("sendto failed: {any}", .{err});
                     continue;
                 };
@@ -94,7 +94,7 @@ pub fn main() !void {
             addr_size = recv_result.addr_len;
 
             conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-                .to = local_addr.any,
+                .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
             });
@@ -119,7 +119,7 @@ pub fn main() !void {
     };
     if (hs_bytes > 0) {
         ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = try posix.sendto(sockfd, out[0..hs_bytes], 0, &remote_addr, addr_size);
+        _ = try posix.sendto(sockfd, out[0..hs_bytes], 0, @ptrCast(&remote_addr), addr_size);
         std.log.info("sent {d} bytes (handshake completion)", .{hs_bytes});
     }
 
@@ -153,7 +153,7 @@ pub fn main() !void {
     };
     if (data_bytes > 0) {
         ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = try posix.sendto(sockfd, out[0..data_bytes], 0, &remote_addr, addr_size);
+        _ = try posix.sendto(sockfd, out[0..data_bytes], 0, @ptrCast(&remote_addr), addr_size);
         std.log.info("sent {d} bytes with H3 data", .{data_bytes});
     }
 
@@ -163,7 +163,7 @@ pub fn main() !void {
         const more = conn.send(&out) catch break;
         if (more == 0) break;
         ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = posix.sendto(sockfd, out[0..more], 0, &remote_addr, addr_size) catch break;
+        _ = posix.sendto(sockfd, out[0..more], 0, @ptrCast(&remote_addr), addr_size) catch break;
         std.log.info("sent {d} more bytes (flush #{d})", .{ more, flush_count + 1 });
     }
 
@@ -184,7 +184,7 @@ pub fn main() !void {
             addr_size = recv_result.addr_len;
 
             conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-                .to = local_addr.any,
+                .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
             });
@@ -196,7 +196,7 @@ pub fn main() !void {
         const ack_bytes = conn.send(&out) catch continue;
         if (ack_bytes > 0) {
             ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-            _ = posix.sendto(sockfd, out[0..ack_bytes], 0, &remote_addr, addr_size) catch {};
+            _ = posix.sendto(sockfd, out[0..ack_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
         }
 
         // Poll for H3 events
@@ -244,7 +244,7 @@ pub fn main() !void {
     conn.close(0, "done");
     const final_bytes = conn.send(&out) catch 0;
     if (final_bytes > 0) {
-        _ = try posix.sendto(sockfd, out[0..final_bytes], 0, &remote_addr, addr_size);
+        _ = try posix.sendto(sockfd, out[0..final_bytes], 0, @ptrCast(&remote_addr), addr_size);
     }
 
     // Wait for draining period to complete
@@ -260,7 +260,7 @@ pub fn main() !void {
             remote_addr = drain_recv.from_addr;
             addr_size = drain_recv.addr_len;
             conn.handleDatagram(bytes[0..drain_recv.bytes_read], .{
-                .to = local_addr.any,
+                .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = drain_recv.ecn,
             });
@@ -269,7 +269,7 @@ pub fn main() !void {
         // Send retransmit if triggered
         const retransmit_bytes = conn.send(&out) catch 0;
         if (retransmit_bytes > 0) {
-            _ = posix.sendto(sockfd, out[0..retransmit_bytes], 0, &remote_addr, addr_size) catch {};
+            _ = posix.sendto(sockfd, out[0..retransmit_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
         }
     }
     std.log.info("connection closed cleanly", .{});

@@ -88,8 +88,8 @@ pub const PathValidator = struct {
 };
 
 pub const NetworkPath = struct {
-    local_addr: posix.sockaddr,
-    peer_addr: posix.sockaddr,
+    local_addr: posix.sockaddr.storage,
+    peer_addr: posix.sockaddr.storage,
     is_initial: bool,
 
     /// Bytes received on this path (for amplification limit).
@@ -105,8 +105,8 @@ pub const NetworkPath = struct {
     validator: PathValidator = .{},
 
     pub fn init(
-        local_addr: posix.sockaddr,
-        peer_addr: posix.sockaddr,
+        local_addr: posix.sockaddr.storage,
+        peer_addr: posix.sockaddr.storage,
         is_initial: bool,
     ) NetworkPath {
         return .{
@@ -326,8 +326,8 @@ pub const ECN_ECT0: u2 = 0b10;
 pub const ECN_CE: u2 = 0b11;
 
 pub const RecvInfo = struct {
-    to: posix.sockaddr,
-    from: posix.sockaddr,
+    to: posix.sockaddr.storage,
+    from: posix.sockaddr.storage,
     // ECN codepoint from IP header (0=Not-ECT, 1=ECT(1), 2=ECT(0), 3=CE)
     ecn: u2 = ECN_NOT_ECT,
 };
@@ -482,8 +482,8 @@ pub const Connection = struct {
     pub fn accept(
         allocator: std.mem.Allocator,
         header: packet.Header,
-        local: posix.sockaddr,
-        remote: posix.sockaddr,
+        local: posix.sockaddr.storage,
+        remote: posix.sockaddr.storage,
         comptime is_server: bool,
         config: ConnectionConfig,
         tls_config: ?tls13.TlsConfig,
@@ -2171,7 +2171,7 @@ pub const Connection = struct {
 
     /// Handle connection migration (RFC 9000 Section 9).
     /// Called when a 1-RTT packet with non-probing frames arrives from a different address.
-    fn handleMigration(self: *Connection, new_peer_addr: posix.sockaddr, local_addr: posix.sockaddr, now: i64) void {
+    fn handleMigration(self: *Connection, new_peer_addr: posix.sockaddr.storage, local_addr: posix.sockaddr.storage, now: i64) void {
         // Check if peer disabled active migration
         if (self.peer_params) |pp| {
             if (pp.disable_active_migration) {
@@ -2425,7 +2425,7 @@ pub const Connection = struct {
 
     /// Return the peer address on the active path.
     /// This may change after connection migration or preferred address selection.
-    pub fn peerAddress(self: *const Connection) *const posix.sockaddr {
+    pub fn peerAddress(self: *const Connection) *const posix.sockaddr.storage {
         return &self.paths[self.active_path_idx].peer_addr;
     }
 
@@ -2490,7 +2490,7 @@ pub const Connection = struct {
 
 /// Compare two sockaddrs for equality (IPv4: port + address).
 /// Uses byte-level reads to avoid alignment issues with posix.sockaddr (align=1).
-pub fn sockaddrEql(a: *const posix.sockaddr, b: *const posix.sockaddr) bool {
+pub fn sockaddrEql(a: *const posix.sockaddr.storage, b: *const posix.sockaddr.storage) bool {
     if (a.family != b.family) return false;
     if (a.family == posix.AF.INET6) {
         const a_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(a);
@@ -2508,7 +2508,7 @@ pub fn sockaddrEql(a: *const posix.sockaddr, b: *const posix.sockaddr) bool {
 
 /// Compare two sockaddrs for same IP address (ignoring port).
 /// Uses byte-level reads to avoid alignment issues with posix.sockaddr (align=1).
-pub fn sockaddrSameIp(a: *const posix.sockaddr, b: *const posix.sockaddr) bool {
+pub fn sockaddrSameIp(a: *const posix.sockaddr.storage, b: *const posix.sockaddr.storage) bool {
     if (a.family != b.family) return false;
     if (a.family == posix.AF.INET6) {
         const a_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(a);
@@ -2522,6 +2522,21 @@ pub fn sockaddrSameIp(a: *const posix.sockaddr, b: *const posix.sockaddr) bool {
     const a_in = std.mem.bytesToValue(posix.sockaddr.in, a_bytes);
     const b_in = std.mem.bytesToValue(posix.sockaddr.in, b_bytes);
     return a_in.addr == b_in.addr;
+}
+
+/// Get the correct address length for sendto() based on the address family.
+pub fn sockaddrLen(addr: *const posix.sockaddr.storage) posix.socklen_t {
+    return if (addr.family == posix.AF.INET6) @sizeOf(posix.sockaddr.in6) else @sizeOf(posix.sockaddr.in);
+}
+
+/// Convert a posix.sockaddr (from std.net.Address.any) to posix.sockaddr.storage.
+pub fn sockaddrToStorage(addr: *const posix.sockaddr) posix.sockaddr.storage {
+    var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    const src_bytes: [*]const u8 = @ptrCast(addr);
+    const dst_bytes: [*]u8 = @ptrCast(&storage);
+    const len: usize = if (addr.family == posix.AF.INET6) @sizeOf(posix.sockaddr.in6) else @sizeOf(posix.sockaddr.in);
+    @memcpy(dst_bytes[0..len], src_bytes[0..len]);
+    return storage;
 }
 
 /// Generates a new random connection ID of the given size into the provided buffer.

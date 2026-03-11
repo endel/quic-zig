@@ -97,16 +97,12 @@ pub fn main() !void {
         return err;
     };
 
-    var cert_der_buf: [4096]u8 = undefined;
-    const cert_der = try tls13.parsePemCert(cert_pem, &cert_der_buf);
+    const cert_chain = try tls13.parsePemCertChain(alloc, cert_pem);
+    std.log.info("loaded {d} certificate(s)", .{cert_chain.len});
 
     var key_der_buf: [4096]u8 = undefined;
     const key_der = try tls13.parsePemPrivateKey(key_pem, &key_der_buf);
     const ec_private_key = try tls13.extractEcPrivateKey(key_der);
-
-    // Build TLS config
-    const cert_chain = try alloc.alloc([]const u8, 1);
-    cert_chain[0] = cert_der;
 
     const use_h3 = (testcase == .http3);
     const alpn = try alloc.alloc([]const u8, 1);
@@ -132,14 +128,41 @@ pub fn main() !void {
         .cipher_suite_only = cipher_only,
     };
 
-    // Create UDP socket
+    // Create UDP socket (dual-stack: try IPv6 first, fall back to IPv4)
     const listen_port: u16 = std.fmt.parseInt(u16, port_str, 10) catch 443;
-    const local_addr = try std.net.Address.parseIp4("0.0.0.0", listen_port);
-    const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sockfd, const local_addr = blk: {
+        // Try IPv6 dual-stack socket first (handles both IPv4 and IPv6)
+        const addr6 = try std.net.Address.parseIp6("::", listen_port);
+        const fd6 = posix.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0) catch {
+            // Fall back to IPv4-only
+            const addr4 = try std.net.Address.parseIp4("0.0.0.0", listen_port);
+            const fd4 = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+            posix.bind(fd4, &addr4.any, addr4.getOsSockLen()) catch {
+                posix.close(fd4);
+                return error.BindFailed;
+            };
+            break :blk .{ fd4, addr4 };
+        };
+        // Allow dual-stack (disable IPV6_V6ONLY)
+        const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
+        const zero: c_int = 0;
+        posix.setsockopt(fd6, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero)) catch {};
+        posix.bind(fd6, &addr6.any, addr6.getOsSockLen()) catch {
+            posix.close(fd6);
+            // Fall back to IPv4-only
+            const addr4 = try std.net.Address.parseIp4("0.0.0.0", listen_port);
+            const fd4 = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+            posix.bind(fd4, &addr4.any, addr4.getOsSockLen()) catch {
+                posix.close(fd4);
+                return error.BindFailed;
+            };
+            break :blk .{ fd4, addr4 };
+        };
+        break :blk .{ fd6, addr6 };
+    };
     defer posix.close(sockfd);
-    try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
     ecn_socket.enableEcnRecv(sockfd) catch {};
-    std.log.info("interop server listening on 0.0.0.0:{d} (ALPN={s})", .{ listen_port, alpn[0] });
+    std.log.info("interop server listening on [::]:{d} (ALPN={s})", .{ listen_port, alpn[0] });
 
     var conn_mgr = connection_manager.ConnectionManager.init(
         alloc,
@@ -155,7 +178,7 @@ pub fn main() !void {
     var h0_conns = std.AutoHashMap(usize, *h0.H0Connection).init(alloc);
     defer h0_conns.deinit();
 
-    var remote_addr: posix.sockaddr = undefined;
+    var remote_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
     var addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
 
@@ -178,18 +201,18 @@ pub fn main() !void {
             remote_addr = recv_result.from_addr;
             addr_size = recv_result.addr_len;
 
-            switch (conn_mgr.recvDatagram(bytes[0..recv_result.bytes_read], remote_addr, local_addr.any, recv_result.ecn, &out)) {
+            switch (conn_mgr.recvDatagram(bytes[0..recv_result.bytes_read], remote_addr, connection.sockaddrToStorage(&local_addr.any), recv_result.ecn, &out)) {
                 .processed => |entry| {
                     // Send response packets
                     const bytes_written = entry.conn.send(&out) catch continue;
                     if (bytes_written > 0) {
                         ecn_socket.setEcnMark(sockfd, entry.conn.getEcnMark()) catch {};
                         const send_addr = entry.conn.peerAddress();
-                        _ = posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr)) catch {};
+                        _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(send_addr), connection.sockaddrLen(send_addr)) catch {};
                     }
                 },
                 .send_response => |data| {
-                    _ = posix.sendto(sockfd, data, 0, &remote_addr, addr_size) catch {};
+                    _ = posix.sendto(sockfd, data, 0, @ptrCast(&remote_addr), addr_size) catch {};
                 },
                 .dropped => {},
             }
@@ -248,7 +271,7 @@ pub fn main() !void {
                 if (bytes_written == 0) break;
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                 const send_addr = conn.peerAddress();
-                _ = posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr)) catch {};
+                _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(send_addr), connection.sockaddrLen(send_addr)) catch {};
             }
 
             i += 1;
