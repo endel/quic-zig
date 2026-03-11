@@ -233,6 +233,24 @@ pub const LocalCidPool = struct {
         }
     }
 
+    /// Register the preferred_address CID at sequence number 1 (RFC 9000 §5.1.1).
+    pub fn registerPreferredCid(self: *LocalCidPool, cid: []const u8, reset_token: [16]u8) void {
+        // Find a free slot for seq 1
+        for (&self.entries) |*entry| {
+            if (!entry.occupied) {
+                entry.occupied = true;
+                entry.retired = false;
+                entry.seq_num = 1;
+                entry.cid_len = @intCast(cid.len);
+                @memcpy(entry.cid_buf[0..cid.len], cid);
+                entry.stateless_reset_token = reset_token;
+                // Ensure next_seq_num is at least 2
+                if (self.next_seq_num <= 1) self.next_seq_num = 2;
+                return;
+            }
+        }
+    }
+
     /// Issue a new CID with the given length. Returns the entry or null if pool full.
     /// If static_key is provided, compute a deterministic reset token; otherwise random.
     pub fn issueNewCid(self: *LocalCidPool, cid_len: u8, static_key: ?[16]u8) ?*const LocalCidEntry {
@@ -602,6 +620,16 @@ pub const Connection = struct {
             conn.dcid[0..conn.dcid_len],
             header.version,
         );
+
+        // Register the preferred_address CID in local CID pool (RFC 9000 §5.1.1: seq=1)
+        if (is_server) {
+            if (config.preferred_address) |pref| {
+                const pref_cid = pref.getCid();
+                if (pref_cid.len > 0) {
+                    conn.local_cid_pool.registerPreferredCid(pref_cid, pref.stateless_reset_token);
+                }
+            }
+        }
 
         // Set token key for NEW_TOKEN generation (server)
         if (config.token_key) |tk| {
@@ -1744,8 +1772,13 @@ pub const Connection = struct {
                                     // Store preferred CID + reset token in peer CID pool
                                     self.peer_cid_pool.addPeerCid(1, pref.getCid(), pref.stateless_reset_token);
 
-                                    // Build sockaddr from preferred IPv4 (prefer v4 for now)
-                                    const pref_addr = if (pref.hasIpv4()) pref.toSockaddrV4() else pref.toSockaddrV6();
+                                    // Pick preferred address of the OTHER family to ensure a real path change.
+                                    // Detects IPv4-mapped IPv6 (::ffff:x.x.x.x) as effectively IPv4.
+                                    const current_is_v4 = isEffectivelyV4(&self.paths[self.active_path_idx].peer_addr);
+                                    const pref_addr = if (current_is_v4)
+                                        (if (pref.hasIpv6()) pref.toSockaddrV6() else pref.toSockaddrV4())
+                                    else
+                                        (if (pref.hasIpv4()) pref.toSockaddrV4() else pref.toSockaddrV6());
 
                                     // Set up candidate path
                                     const candidate_idx: u8 = 1 - self.active_path_idx;
@@ -1776,9 +1809,11 @@ pub const Connection = struct {
                                     self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
                                     self.ecn_validator.reset();
 
-                                    std.log.info("preferred_address: migrating to {s} port {d}", .{
-                                        if (pref.hasIpv4()) "IPv4" else "IPv6",
-                                        if (pref.hasIpv4()) pref.ipv4_port else pref.ipv6_port,
+                                    const migrating_to_v6 = !current_is_v4;
+                                    std.log.info("preferred_address: migrating from {s} to {s} port {d}", .{
+                                        if (current_is_v4) "IPv4" else "IPv6",
+                                        if (migrating_to_v6) "IPv6" else "IPv4",
+                                        if (migrating_to_v6) pref.ipv6_port else pref.ipv4_port,
                                     });
                                 }
                             }
@@ -2505,6 +2540,22 @@ pub const Connection = struct {
 
 /// Compare two sockaddrs for equality (IPv4: port + address).
 /// Uses byte-level reads to avoid alignment issues with posix.sockaddr (align=1).
+/// Check if an AF_INET6 address is IPv4-mapped (::ffff:a.b.c.d).
+pub fn isV4Mapped(addr: *const posix.sockaddr.storage) bool {
+    if (addr.family != posix.AF.INET6) return false;
+    const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
+    // ::ffff:0:0/96 — first 10 bytes zero, bytes 10-11 are 0xff
+    for (0..10) |i| {
+        if (in6.addr[i] != 0) return false;
+    }
+    return in6.addr[10] == 0xff and in6.addr[11] == 0xff;
+}
+
+/// Check if an address is effectively IPv4 (AF_INET or IPv4-mapped AF_INET6).
+pub fn isEffectivelyV4(addr: *const posix.sockaddr.storage) bool {
+    return addr.family == posix.AF.INET or isV4Mapped(addr);
+}
+
 pub fn sockaddrEql(a: *const posix.sockaddr.storage, b: *const posix.sockaddr.storage) bool {
     if (a.family != b.family) return false;
     if (a.family == posix.AF.INET6) {

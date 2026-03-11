@@ -181,6 +181,23 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
     };
 }
 
+/// Convert an AF_INET sockaddr to IPv4-mapped AF_INET6 (::ffff:a.b.c.d) in-place.
+/// No-op if already AF_INET6. Useful for dual-stack IPv6 sockets that need to sendto IPv4 addresses.
+pub fn mapV4ToV6(storage: *posix.sockaddr.storage) void {
+    if (storage.family != posix.AF.INET) return;
+    const in_addr: *const posix.sockaddr.in = @ptrCast(@alignCast(storage));
+    const v4_bytes: [4]u8 = @bitCast(in_addr.addr);
+    const port = in_addr.port;
+    var result: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    result.family = posix.AF.INET6;
+    const in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(&result));
+    in6.addr[10] = 0xff;
+    in6.addr[11] = 0xff;
+    @memcpy(in6.addr[12..16], &v4_bytes);
+    in6.port = port;
+    storage.* = result;
+}
+
 // Tests — ECN ancillary data tests only run on POSIX platforms.
 test "enableEcnRecv on a real socket" {
     if (comptime is_windows) return error.SkipZigTest;

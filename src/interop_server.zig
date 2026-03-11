@@ -21,6 +21,8 @@ const h3 = @import("h3/connection.zig");
 const h0 = @import("h0/connection.zig");
 const qpack = @import("h3/qpack.zig");
 
+const transport_params = @import("quic/transport_params.zig");
+
 const MAX_DATAGRAM_SIZE: usize = 1500;
 
 const TestCase = enum {
@@ -164,10 +166,44 @@ pub fn main() !void {
     ecn_socket.enableEcnRecv(sockfd) catch {};
     std.log.info("interop server listening on [::]:{d} (ALPN={s})", .{ listen_port, alpn[0] });
 
+    // Build preferred_address for connectionmigration test case
+    var preferred_addr: ?transport_params.PreferredAddress = null;
+    if (testcase == .connectionmigration) {
+        const addrs = getServerAddresses();
+        if (addrs.ipv4 != null or addrs.ipv6 != null) {
+            var pref = transport_params.PreferredAddress{};
+            if (addrs.ipv4) |v4| {
+                pref.ipv4_addr = v4;
+                pref.ipv4_port = listen_port;
+            }
+            if (addrs.ipv6) |v6| {
+                pref.ipv6_addr = v6;
+                pref.ipv6_port = listen_port;
+            }
+            // Generate a CID for the preferred address
+            pref.cid_len = 8;
+            std.crypto.random.bytes(pref.cid_buf[0..8]);
+            // Generate stateless reset token for this CID
+            const stateless_reset = @import("quic/stateless_reset.zig");
+            pref.stateless_reset_token = stateless_reset.computeToken(static_reset_key, pref.cid_buf[0..8]);
+            preferred_addr = pref;
+            std.log.info("connectionmigration: preferred_address ipv4={any} ipv6={any} cid_len={d}", .{
+                addrs.ipv4, addrs.ipv6, pref.cid_len,
+            });
+        } else {
+            std.log.warn("connectionmigration: could not determine server addresses for preferred_address", .{});
+        }
+    }
+
     var conn_mgr = connection_manager.ConnectionManager.init(
         alloc,
         tls_config,
-        .{ .token_key = retry_token_key, .enable_v2 = (testcase == .v2), .disable_pmtud = true },
+        .{
+            .token_key = retry_token_key,
+            .enable_v2 = (testcase == .v2),
+            .disable_pmtud = true,
+            .preferred_address = preferred_addr,
+        },
         retry_token_key,
         static_reset_key,
     );
@@ -355,4 +391,63 @@ fn readFileFromWww(alloc: std.mem.Allocator, www_dir: []const u8, path: []const 
 
 fn loadFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.fs.cwd().readFileAlloc(alloc, path, 65536);
+}
+
+/// Discover the server's non-loopback IPv4 and IPv6 addresses from network interfaces.
+/// Uses C getifaddrs() which works on Linux (Docker containers).
+fn getServerAddresses() struct { ipv4: ?[4]u8, ipv6: ?[16]u8 } {
+    const IfAddrs = extern struct {
+        ifa_next: ?*@This(),
+        ifa_name: [*:0]const u8,
+        ifa_flags: c_uint,
+        ifa_addr: ?*posix.sockaddr.storage,
+        ifa_netmask: ?*posix.sockaddr.storage,
+        ifa_ifu: ?*posix.sockaddr.storage,
+        ifa_data: ?*anyopaque,
+    };
+
+    const getifaddrs_c = struct {
+        extern "c" fn getifaddrs(ifap: *?*IfAddrs) c_int;
+        extern "c" fn freeifaddrs(ifa: *IfAddrs) void;
+    };
+
+    var ifap: ?*IfAddrs = null;
+    if (getifaddrs_c.getifaddrs(&ifap) != 0) return .{ .ipv4 = null, .ipv6 = null };
+    defer if (ifap) |p| getifaddrs_c.freeifaddrs(p);
+
+    var ipv4: ?[4]u8 = null;
+    var ipv6: ?[16]u8 = null;
+
+    var ifa = ifap;
+    while (ifa) |a| {
+        defer ifa = a.ifa_next;
+        const addr = a.ifa_addr orelse continue;
+        if (addr.family == posix.AF.INET) {
+            const in_addr: *const posix.sockaddr.in = @ptrCast(@alignCast(addr));
+            const bytes: [4]u8 = @bitCast(in_addr.addr);
+            if (bytes[0] != 127) { // skip loopback
+                ipv4 = bytes;
+            }
+        } else if (addr.family == posix.AF.INET6) {
+            const in6_addr: *const posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
+            // Skip loopback (::1) and link-local (fe80::)
+            if (in6_addr.addr[0] == 0 and in6_addr.addr[1] == 0 and
+                in6_addr.addr[2] == 0 and in6_addr.addr[3] == 0 and
+                in6_addr.addr[4] == 0 and in6_addr.addr[5] == 0 and
+                in6_addr.addr[6] == 0 and in6_addr.addr[7] == 0 and
+                in6_addr.addr[8] == 0 and in6_addr.addr[9] == 0 and
+                in6_addr.addr[10] == 0 and in6_addr.addr[11] == 0 and
+                in6_addr.addr[12] == 0 and in6_addr.addr[13] == 0 and
+                in6_addr.addr[14] == 0)
+            {
+                continue; // ::0 or ::1
+            }
+            if (in6_addr.addr[0] == 0xfe and (in6_addr.addr[1] & 0xc0) == 0x80) {
+                continue; // link-local fe80::
+            }
+            ipv6 = in6_addr.addr;
+        }
+    }
+
+    return .{ .ipv4 = ipv4, .ipv6 = ipv6 };
 }

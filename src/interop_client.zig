@@ -228,15 +228,16 @@ fn downloadAll(
         };
     };
 
-    // Create socket matching the resolved address family (IPv4 or IPv6)
-    const is_ipv6 = server_addr.any.family == posix.AF.INET6;
-    const sockfd = try posix.socket(if (is_ipv6) posix.AF.INET6 else posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    // Always create IPv6 dual-stack socket to support preferred_address migration across families.
+    // If the initial server address is IPv4, sendto converts it to IPv4-mapped IPv6 automatically.
+    const sockfd = try posix.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
+    // Disable IPV6_V6ONLY to allow dual-stack (IPv4 and IPv6 on same socket)
+    const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
+    const zero: c_int = 0;
+    posix.setsockopt(sockfd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero)) catch {};
 
-    const local_addr = if (is_ipv6)
-        try net.Address.parseIp6("::", 0)
-    else
-        try net.Address.parseIp4("0.0.0.0", 0);
+    const local_addr = try net.Address.parseIp6("::", 0);
     try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
     ecn_socket.enableEcnRecv(sockfd) catch {};
 
@@ -259,6 +260,8 @@ fn downloadAll(
     defer conn.deinit();
 
     var remote_addr = connection.sockaddrToStorage(&server_addr.any);
+    // Convert IPv4 to IPv4-mapped IPv6 for dual-stack socket compatibility
+    mapV4ToV6(&remote_addr);
     var addr_size: posix.socklen_t = connection.sockaddrLen(&remote_addr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
 
@@ -335,8 +338,10 @@ fn downloadAll(
         _ = posix.sendto(sockfd, out[0..hs_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
     }
 
-    // Sync remote_addr from active path
+    // Sync remote_addr from active path (may have changed due to preferred_address migration)
     remote_addr = conn.peerAddress().*;
+    mapV4ToV6(&remote_addr);
+    addr_size = connection.sockaddrLen(&remote_addr);
 
     if (use_h3) {
         try downloadH3(alloc, &conn, sockfd, &remote_addr, addr_size, local_addr, urls, download_dir, force_key_update);
@@ -718,3 +723,5 @@ fn drainRecv(
         });
     }
 }
+
+const mapV4ToV6 = ecn_socket.mapV4ToV6;
