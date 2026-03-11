@@ -2024,11 +2024,20 @@ pub const Connection = struct {
         }
 
         // Anti-amplification: servers must not send more than 3x bytes received
-        // before address validation (RFC 9000 Section 8.1)
+        // before address validation (RFC 9000 Section 8.1).
+        // Instead of a binary canSend(1200) check, calculate remaining budget
+        // and limit the output buffer size. This allows sending smaller packets
+        // when the full MTU isn't available, using every byte of the 3x budget.
+        var send_buf = out_buf;
         if (self.is_server) {
             const active_path = &self.paths[self.active_path_idx];
-            if (!active_path.canSend(1200)) {
-                return 0;
+            if (!active_path.is_validated) {
+                const budget = 3 * active_path.bytes_received;
+                if (active_path.bytes_sent >= budget) return 0;
+                const remaining = budget - active_path.bytes_sent;
+                if (remaining < out_buf.len) {
+                    send_buf = out_buf[0..remaining];
+                }
             }
         }
 
@@ -2052,7 +2061,7 @@ pub const Connection = struct {
 
         self.packer.conn_flow_ctrl = &self.conn_flow_ctrl;
         const bytes_written = try self.packer.packCoalesced(
-            out_buf,
+            send_buf,
             &self.pkt_handler,
             &self.crypto_streams,
             &self.streams,
@@ -2129,11 +2138,17 @@ pub const Connection = struct {
         // Piggyback flow control updates (MAX_DATA, MAX_STREAMS)
         self.queueFlowControlUpdates();
 
-        // Anti-amplification: servers must not send more than 3x bytes received
+        // Anti-amplification: limit output to remaining budget
+        var send_buf = out_buf;
         if (self.is_server) {
             const active_path = &self.paths[self.active_path_idx];
-            if (!active_path.canSend(1200)) {
-                return 0;
+            if (!active_path.is_validated) {
+                const budget = 3 * active_path.bytes_received;
+                if (active_path.bytes_sent >= budget) return 0;
+                const remaining = budget - active_path.bytes_sent;
+                if (remaining < out_buf.len) {
+                    send_buf = out_buf[0..remaining];
+                }
             }
         }
 
@@ -2146,7 +2161,7 @@ pub const Connection = struct {
             self.pkt_num_spaces[2].crypto_seal;
 
         const bytes_written = try self.packer.packCoalesced(
-            out_buf,
+            send_buf,
             &self.pkt_handler,
             &self.crypto_streams,
             &self.streams,

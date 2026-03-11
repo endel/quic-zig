@@ -447,8 +447,8 @@ pub const Tls13Handshake = struct {
     tp_encoded: [256]u8 = undefined,
     tp_encoded_len: usize = 0,
 
-    // Buffered incoming data
-    in_buf: [8192]u8 = undefined,
+    // Buffered incoming data (16KB for large cert chains, e.g. 9-cert amplificationlimit test)
+    in_buf: [16384]u8 = undefined,
     in_len: usize = 0,
     in_offset: usize = 0,
 
@@ -566,6 +566,15 @@ pub const Tls13Handshake = struct {
 
     // Provide incoming crypto stream data to the handshake.
     pub fn provideData(self: *Tls13Handshake, data: []const u8) void {
+        // Compact buffer if we've consumed some data and need space
+        if (self.in_offset > 0 and self.in_len - self.in_offset + data.len > self.in_buf.len - self.in_offset) {
+            const remaining = self.in_len - self.in_offset;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, self.in_buf[0..remaining], self.in_buf[self.in_offset..self.in_len]);
+            }
+            self.in_len = remaining;
+            self.in_offset = 0;
+        }
         const available = self.in_buf.len - self.in_len;
         const copy_len = @min(data.len, available);
         @memcpy(self.in_buf[self.in_len..][0..copy_len], data[0..copy_len]);
