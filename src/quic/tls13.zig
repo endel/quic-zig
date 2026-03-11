@@ -597,22 +597,23 @@ pub const Tls13Handshake = struct {
         }
 
         // If we need to install handshake keys, do that first
-        // Handshake keys always use AES-128-GCM (same cipher as Initial)
+        // Handshake keys use the negotiated cipher suite (only Initial keys use AES-128-GCM)
         if (self.pending_install_handshake) {
             self.pending_install_handshake = false;
             self.handshake_keys_installed = true;
+            const cs = self.negotiated_cipher_suite;
             const qv = self.config.quic_version;
             if (self.is_server) {
                 return Action{ .install_keys = .{
                     .level = .handshake,
-                    .open = KeySchedule.makeOpenFull(self.key_schedule.client_handshake_traffic_secret, .aes_128_gcm_sha256, qv),
-                    .seal = KeySchedule.makeSealFull(self.key_schedule.server_handshake_traffic_secret, .aes_128_gcm_sha256, qv),
+                    .open = KeySchedule.makeOpenFull(self.key_schedule.client_handshake_traffic_secret, cs, qv),
+                    .seal = KeySchedule.makeSealFull(self.key_schedule.server_handshake_traffic_secret, cs, qv),
                 } };
             } else {
                 return Action{ .install_keys = .{
                     .level = .handshake,
-                    .open = KeySchedule.makeOpenFull(self.key_schedule.server_handshake_traffic_secret, .aes_128_gcm_sha256, qv),
-                    .seal = KeySchedule.makeSealFull(self.key_schedule.client_handshake_traffic_secret, .aes_128_gcm_sha256, qv),
+                    .open = KeySchedule.makeOpenFull(self.key_schedule.server_handshake_traffic_secret, cs, qv),
+                    .seal = KeySchedule.makeSealFull(self.key_schedule.client_handshake_traffic_secret, cs, qv),
                 } };
             }
         }

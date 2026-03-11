@@ -131,10 +131,10 @@ pub const PacketPacker = struct {
         var offset: usize = 0;
 
         // Try packing Initial packet
-        // When coalescing with 0-RTT, don't pad the Initial — let 0-RTT use the space
-        // Server never pads Initial (RFC 9000 §14.1 only requires client padding)
+        // Client MUST pad Initial datagrams to >= 1200 bytes (RFC 9000 §14.1)
+        // Always pad the Initial — 0-RTT data (if any) goes in the next datagram
         if (initial_seal != null) {
-            const pad_target: usize = if (early_seal == null and !self.is_server) MIN_INITIAL_PACKET_SIZE else 0;
+            const pad_target: usize = if (!self.is_server) MIN_INITIAL_PACKET_SIZE else 0;
             const initial_len = try self.packSinglePacket(
                 out_buf[offset..],
                 .initial,
@@ -153,8 +153,7 @@ pub const PacketPacker = struct {
         }
 
         // Try packing 0-RTT packet (Long Header, type 0x10)
-        // When coalesced after an unpadded Initial, pad the 0-RTT so the
-        // total datagram reaches the 1200-byte minimum (RFC 9000 §14.1)
+        // If coalesced after a padded Initial, no extra padding needed (already >= 1200)
         if (early_seal != null and offset < out_buf.len and !ack_only) {
             const pad_target: usize = if (initial_seal != null and offset > 0)
                 MIN_INITIAL_PACKET_SIZE -| offset
