@@ -116,10 +116,12 @@ pub const NewReno = struct {
     // Reset to minimum window with slow start (exponential) recovery,
     // similar to TCP RTO behavior (RFC 5681): cwnd = minimum, ssthresh = infinity
     // so that slow start can quickly probe available capacity.
-    pub fn onPersistentCongestion(self: *NewReno) void {
+    // Sets congestion_recovery_start_time = now so that subsequent loss events
+    // for old packets (sent before this point) are suppressed via inCongestionRecovery.
+    pub fn onPersistentCongestion(self: *NewReno, now: i64) void {
         self.congestion_window = MIN_WINDOW_PACKETS * self.max_datagram_size;
         self.ssthresh = std.math.maxInt(u64);
-        self.congestion_recovery_start_time = null;
+        self.congestion_recovery_start_time = now;
         self.bytes_acked_in_round = 0;
     }
 
@@ -290,7 +292,8 @@ test "NewReno: persistent congestion resets to minimum" {
     const initial_window = cc.congestion_window;
     try testing.expect(initial_window > MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE);
 
-    cc.onPersistentCongestion();
+    const now: i64 = 1_000_000_000;
+    cc.onPersistentCongestion(now);
 
     // Window should be at minimum (2 * MSS)
     try testing.expectEqual(MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE, cc.congestion_window);
@@ -298,8 +301,12 @@ test "NewReno: persistent congestion resets to minimum" {
     try testing.expectEqual(std.math.maxInt(u64), cc.ssthresh);
     // Should be in slow start after persistent congestion
     try testing.expect(cc.inSlowStart());
-    // Recovery period should be cleared so window can grow again
-    try testing.expect(cc.congestion_recovery_start_time == null);
+    // Recovery start time should be set to prevent re-triggering for old packets
+    try testing.expectEqual(@as(?i64, now), cc.congestion_recovery_start_time);
+    // Packets sent after 'now' should NOT be in recovery (can grow window)
+    try testing.expect(!cc.inCongestionRecovery(now + 1));
+    // Packets sent at or before 'now' SHOULD be in recovery (suppressed)
+    try testing.expect(cc.inCongestionRecovery(now));
 }
 
 test "Pacer: initial burst allowed" {

@@ -537,6 +537,37 @@ pub const PacketHandler = struct {
         return earliest;
     }
 
+    /// Check if any loss_time has expired. Returns the enc level if so.
+    /// RFC 9002 §6.2.1: loss timers fire before PTO and should run loss
+    /// detection without incrementing pto_count.
+    pub fn getExpiredLossTime(self: *PacketHandler, now: i64) ?EncLevel {
+        var earliest: ?i64 = null;
+        var result: ?EncLevel = null;
+        for (self.sent, 0..) |tracker, idx| {
+            if (tracker.loss_time) |lt| {
+                if (lt <= now and (earliest == null or lt < earliest.?)) {
+                    earliest = lt;
+                    result = @enumFromInt(idx);
+                }
+            }
+        }
+        return result;
+    }
+
+    /// Run loss detection for a specific packet number space (called when loss_time fires).
+    /// Returns the lost packets for congestion control processing.
+    pub fn detectLossesForSpace(self: *PacketHandler, level: EncLevel, now: i64) AckResult {
+        const idx = @intFromEnum(level);
+        var result = AckResult{};
+        self.sent[idx].detectLostPackets(&self.rtt_stats, now, &result);
+        for (result.lost.constSlice()) |pkt| {
+            if (pkt.in_flight) {
+                self.bytes_in_flight -|= pkt.size;
+            }
+        }
+        return result;
+    }
+
     /// Get the encryption level where PTO should fire (the one with earliest timeout).
     pub fn getPtoSpace(self: *PacketHandler) ?EncLevel {
         var earliest: ?i64 = null;

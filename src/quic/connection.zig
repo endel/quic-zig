@@ -1077,8 +1077,16 @@ pub const Connection = struct {
 
                 if (has_non_probe_loss) {
                     if (result.persistent_congestion) {
-                        self.cc.onPersistentCongestion();
-                        std.log.info("persistent congestion detected, window reduced to minimum", .{});
+                        // Only trigger persistent congestion if the lost packets
+                        // are from outside the current recovery epoch. This prevents
+                        // repeated resets when old packets are gradually declared lost
+                        // across multiple ACK events after a blackhole.
+                        if (earliest_lost_sent_time) |lost_time| {
+                            if (!self.cc.inCongestionRecovery(lost_time)) {
+                                self.cc.onPersistentCongestion(now);
+                                std.log.info("persistent congestion detected, window reduced to minimum", .{});
+                            }
+                        }
                     } else if (earliest_lost_sent_time) |lost_time| {
                         self.cc.onCongestionEvent(lost_time, now);
                     }
@@ -1147,8 +1155,12 @@ pub const Connection = struct {
 
                 if (has_non_probe_loss) {
                     if (result.persistent_congestion) {
-                        self.cc.onPersistentCongestion();
-                        std.log.info("persistent congestion detected, window reduced to minimum", .{});
+                        if (earliest_lost_sent_time_ecn) |lost_time| {
+                            if (!self.cc.inCongestionRecovery(lost_time)) {
+                                self.cc.onPersistentCongestion(now);
+                                std.log.info("persistent congestion detected, window reduced to minimum", .{});
+                            }
+                        }
                     } else if (earliest_lost_sent_time_ecn) |lost_time| {
                         self.cc.onCongestionEvent(lost_time, now);
                     }
@@ -2289,8 +2301,42 @@ pub const Connection = struct {
             return;
         }
 
+        // Loss detection timer: check loss_time BEFORE PTO (RFC 9002 §6.2.1).
+        // Loss timers don't increment pto_count — they run loss detection directly.
+        if (self.pkt_handler.getExpiredLossTime(now)) |loss_level| {
+            const loss_result = self.pkt_handler.detectLossesForSpace(loss_level, now);
+            var has_non_probe_loss_lt = false;
+            var earliest_lost_sent_time_lt: ?i64 = null;
+            for (loss_result.lost.constSlice()) |pkt| {
+                if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {} else {
+                    has_non_probe_loss_lt = true;
+                    if (earliest_lost_sent_time_lt == null or pkt.time_sent < earliest_lost_sent_time_lt.?) {
+                        earliest_lost_sent_time_lt = pkt.time_sent;
+                    }
+                }
+                self.queueStreamRetransmissions(&pkt);
+                if (pkt.has_crypto_data) {
+                    self.queueCryptoRetransmission(pkt.enc_level);
+                }
+            }
+            if (has_non_probe_loss_lt) {
+                if (loss_result.persistent_congestion) {
+                    if (earliest_lost_sent_time_lt) |lost_time| {
+                        if (!self.cc.inCongestionRecovery(lost_time)) {
+                            self.cc.onPersistentCongestion(now);
+                            std.log.info("persistent congestion detected (loss timer), window reduced to minimum", .{});
+                        }
+                    }
+                } else if (earliest_lost_sent_time_lt) |lost_time| {
+                    self.cc.onCongestionEvent(lost_time, now);
+                }
+            }
+            self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
+        }
+
         // Check PTO — prefer retransmitting data over PING (RFC 9002 §6.2.4)
-        if (self.pkt_handler.getPtoTimeout()) |pto_time| {
+        // Only fires when no loss_time triggered above.
+        else if (self.pkt_handler.getPtoTimeout()) |pto_time| {
             if (now >= pto_time) {
                 self.pkt_handler.pto_count += 1;
 
