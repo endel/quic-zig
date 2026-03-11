@@ -10,14 +10,11 @@
 
 const std = @import("std");
 const posix = std.posix;
-const io = std.io;
 const net = std.net;
 const mem = std.mem;
 
 const connection = @import("quic/connection.zig");
 const quic_crypto = @import("quic/crypto.zig");
-const packet = @import("quic/packet.zig");
-const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
@@ -302,26 +299,14 @@ fn downloadAll(
             var bytes: [8192]u8 = undefined;
             const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
             received_any = true;
-            const packet_length = recv_result.bytes_read;
             remote_addr = recv_result.from_addr;
             addr_size = recv_result.addr_len;
 
-            var fbs = io.fixedBufferStream(bytes[0..packet_length]);
-            while (fbs.pos < packet_length) {
-                if (bytes[fbs.pos] & 0x40 == 0) break;
-                const packet_start_pos = fbs.pos;
-                var header = packet.Header.parse(&fbs, conn.scid_len) catch break;
-                const full_packet_size = fbs.pos - packet_start_pos + header.remainder_len;
-
-                conn.recv(&header, &fbs, .{
-                    .to = local_addr.any,
-                    .from = remote_addr,
-                    .ecn = recv_result.ecn,
-                }) catch break;
-
-                const expected_next_pos = packet_start_pos + full_packet_size;
-                if (fbs.pos < expected_next_pos) fbs.pos = expected_next_pos;
-            }
+            conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
+                .to = local_addr.any,
+                .from = remote_addr,
+                .ecn = recv_result.ecn,
+            });
 
             if (conn.state == .connected) handshake_complete = true;
         }
@@ -346,7 +331,7 @@ fn downloadAll(
     }
 
     // Sync remote_addr from active path
-    remote_addr = conn.paths[conn.active_path_idx].peer_addr;
+    remote_addr = conn.peerAddress().*;
 
     if (use_h3) {
         try downloadH3(alloc, &conn, sockfd, &remote_addr, addr_size, local_addr, urls, download_dir, force_key_update);
@@ -484,20 +469,11 @@ fn downloadH0(
                 var bytes: [MAX_DATAGRAM_SIZE]u8 = undefined;
                 const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
                 packets_received += 1;
-                var fbs = io.fixedBufferStream(bytes[0..recv_result.bytes_read]);
-                while (fbs.pos < recv_result.bytes_read) {
-                    if (bytes[fbs.pos] & 0x40 == 0) break;
-                    const pkt_start = fbs.pos;
-                    var header = packet.Header.parse(&fbs, conn.scid_len) catch break;
-                    const full_size = fbs.pos - pkt_start + header.remainder_len;
-                    conn.recv(&header, &fbs, .{
-                        .to = local_addr.any,
-                        .from = recv_result.from_addr,
-                        .ecn = recv_result.ecn,
-                    }) catch break;
-                    const next_pos = pkt_start + full_size;
-                    if (fbs.pos < next_pos) fbs.pos = next_pos;
-                }
+                conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
+                    .to = local_addr.any,
+                    .from = recv_result.from_addr,
+                    .ecn = recv_result.ecn,
+                });
             }
         }
         if (packets_received == 0) std.Thread.sleep(1 * std.time.ns_per_ms);
@@ -635,20 +611,11 @@ fn downloadH3(
                 var bytes: [MAX_DATAGRAM_SIZE]u8 = undefined;
                 const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
                 packets_received += 1;
-                var fbs = io.fixedBufferStream(bytes[0..recv_result.bytes_read]);
-                while (fbs.pos < recv_result.bytes_read) {
-                    if (bytes[fbs.pos] & 0x40 == 0) break;
-                    const pkt_start = fbs.pos;
-                    var header = packet.Header.parse(&fbs, conn.scid_len) catch break;
-                    const full_size = fbs.pos - pkt_start + header.remainder_len;
-                    conn.recv(&header, &fbs, .{
-                        .to = local_addr.any,
-                        .from = recv_result.from_addr,
-                        .ecn = recv_result.ecn,
-                    }) catch break;
-                    const next_pos = pkt_start + full_size;
-                    if (fbs.pos < next_pos) fbs.pos = next_pos;
-                }
+                conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
+                    .to = local_addr.any,
+                    .from = recv_result.from_addr,
+                    .ecn = recv_result.ecn,
+                });
             }
         }
         if (packets_received == 0) std.Thread.sleep(1 * std.time.ns_per_ms);
@@ -739,20 +706,10 @@ fn drainRecv(
         const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
         remote_addr.* = recv_result.from_addr;
         addr_size.* = recv_result.addr_len;
-
-        var fbs = io.fixedBufferStream(bytes[0..recv_result.bytes_read]);
-        while (fbs.pos < recv_result.bytes_read) {
-            if (bytes[fbs.pos] & 0x40 == 0) break;
-            const pkt_start = fbs.pos;
-            var header = packet.Header.parse(&fbs, conn.scid_len) catch break;
-            const full_size = fbs.pos - pkt_start + header.remainder_len;
-            conn.recv(&header, &fbs, .{
-                .to = local_addr.any,
-                .from = recv_result.from_addr,
-                .ecn = recv_result.ecn,
-            }) catch break;
-            const next_pos = pkt_start + full_size;
-            if (fbs.pos < next_pos) fbs.pos = next_pos;
-        }
+        conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
+            .to = local_addr.any,
+            .from = recv_result.from_addr,
+            .ecn = recv_result.ecn,
+        });
     }
 }

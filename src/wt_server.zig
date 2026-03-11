@@ -1,11 +1,8 @@
 const std = @import("std");
 const posix = std.posix;
-const io = std.io;
 
 const connection = @import("quic/connection.zig");
 const connection_manager = @import("quic/connection_manager.zig");
-const packet = @import("quic/packet.zig");
-const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
@@ -92,89 +89,23 @@ pub fn main() !void {
                 std.log.err("recvmsg error: {any}", .{err});
                 break :read_loop;
             };
-            const packet_length = recv_result.bytes_read;
             remote_addr = recv_result.from_addr;
             addr_size = recv_result.addr_len;
 
-            var fbs = io.fixedBufferStream(bytes[0..packet_length]);
-
-            // Process all coalesced packets in the UDP datagram
-            while (fbs.pos < packet_length) {
-                if (bytes[fbs.pos] & 0x40 == 0) break;
-
-                const packet_start_pos = fbs.pos;
-                var header = packet.Header.parse(&fbs, conn_mgr.local_cid_len) catch |err| {
-                    std.log.err("header parse error: {any}", .{err});
-                    break;
-                };
-
-                const header_end_pos = fbs.pos;
-                const encrypted_payload_size = header.remainder_len;
-                const full_packet_size = header_end_pos - packet_start_pos + encrypted_payload_size;
-
-                // Version negotiation
-                if (header.version != 0 and !protocol.isSupportedVersion(header.version)) {
-                    var vn_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-                    var vn_fbs = io.fixedBufferStream(&vn_buf);
-                    const vn_writer = vn_fbs.writer();
-                    try packet.negotiateVersion(header, &vn_writer);
-                    const vn_bytes = vn_fbs.getWritten();
-                    _ = try posix.sendto(sockfd, vn_bytes, 0, &remote_addr, addr_size);
-                    break;
-                }
-
-                // Route packet to existing connection by DCID
-                var entry = conn_mgr.findByDcid(header.dcid);
-
-                if (entry == null) {
-                    if (header.packet_type != .initial) {
-                        std.log.warn("ignoring non-initial for unknown connection", .{});
-                        break;
+            switch (conn_mgr.recvDatagram(bytes[0..recv_result.bytes_read], remote_addr, local_addr.any, recv_result.ecn, &out)) {
+                .processed => |entry| {
+                    const conn = entry.conn;
+                    const bytes_written = conn.send(&out) catch continue;
+                    if (bytes_written > 0) {
+                        ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
+                        const send_addr = conn.peerAddress();
+                        _ = posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr)) catch {};
                     }
-
-                    // No Retry for local dev server — accept immediately
-                    // Pass null odcid so anti-amplification is enforced (address not validated)
-                    entry = conn_mgr.acceptConnection(
-                        header,
-                        local_addr.any,
-                        remote_addr,
-                        null,
-                        null,
-                    ) catch |err| {
-                        std.log.err("accept error: {any}", .{err});
-                        break;
-                    };
-                    std.log.info("accepted new connection (total: {d})", .{conn_mgr.connectionCount()});
-                }
-
-                const e = entry.?;
-                const conn = e.conn;
-                const recv_info: connection.RecvInfo = .{
-                    .to = local_addr.any,
-                    .from = remote_addr,
-                    .ecn = recv_result.ecn,
-                };
-
-                conn.recv(&header, &fbs, recv_info) catch |err| {
-                    std.log.err("recv error: {any}", .{err});
-                    break;
-                };
-
-                conn_mgr.syncCids(e);
-
-                const expected_next_pos = packet_start_pos + full_packet_size;
-                if (fbs.pos < expected_next_pos) fbs.pos = expected_next_pos;
-
-                // Send response packets
-                const bytes_written = conn.send(&out) catch |err| {
-                    std.log.err("send error: {any}", .{err});
-                    break;
-                };
-                if (bytes_written > 0) {
-                    ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-                    const send_addr = &conn.paths[conn.active_path_idx].peer_addr;
-                    _ = try posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr));
-                }
+                },
+                .send_response => |data| {
+                    _ = posix.sendto(sockfd, data, 0, &remote_addr, addr_size) catch {};
+                },
+                .dropped => {},
             }
         }
 
@@ -258,28 +189,17 @@ pub fn main() !void {
                 }
             }
 
-            // Check timeouts
-            conn.onTimeout() catch |err| {
-                std.log.err("onTimeout error: {any}", .{err});
-            };
+            // Timeouts + close check
+            if (!conn_mgr.tickEntry(entry)) continue;
 
-            // Check if connection has terminated
-            if (conn.isClosed()) {
-                std.log.info("connection terminated (remaining: {d})", .{conn_mgr.connectionCount() - 1});
-                conn_mgr.removeConnection(entry);
-                continue;
-            }
-
-            // Periodic send for retransmissions/ACKs/stream data
-            const bytes_written = conn.send(&out) catch |err| {
-                std.log.err("periodic send error: {any}", .{err});
-                i += 1;
-                continue;
-            };
-            if (bytes_written > 0) {
+            // Burst send — drain queued data
+            var send_count: usize = 0;
+            while (send_count < 100) : (send_count += 1) {
+                const bytes_written = conn.send(&out) catch break;
+                if (bytes_written == 0) break;
                 ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-                const send_addr = &conn.paths[conn.active_path_idx].peer_addr;
-                _ = try posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr));
+                const send_addr = conn.peerAddress();
+                _ = posix.sendto(sockfd, out[0..bytes_written], 0, send_addr, @sizeOf(posix.sockaddr)) catch {};
             }
 
             i += 1;

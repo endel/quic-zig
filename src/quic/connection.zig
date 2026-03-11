@@ -2423,6 +2423,12 @@ pub const Connection = struct {
         return if (self.ecn_validator.shouldMark()) ECN_ECT0 else ECN_NOT_ECT;
     }
 
+    /// Return the peer address on the active path.
+    /// This may change after connection migration or preferred address selection.
+    pub fn peerAddress(self: *const Connection) *const posix.sockaddr {
+        return &self.paths[self.active_path_idx].peer_addr;
+    }
+
     // Get the NEW_TOKEN received from the server (for reuse in future connections).
     // Returns null if no token was received.
     pub fn getNewToken(self: *const Connection) ?[]const u8 {
@@ -2458,6 +2464,27 @@ pub const Connection = struct {
             .zero_rtt, .handshake => .handshake,
             .application => .application,
         };
+    }
+
+    /// Process a raw UDP datagram containing one or more coalesced QUIC packets.
+    /// Handles header parsing, coalesced packet boundaries (RFC 9000 §12.2),
+    /// and dispatches each packet through recv().
+    pub fn handleDatagram(self: *Connection, bytes: []u8, info: RecvInfo) void {
+        var fbs = std.io.fixedBufferStream(bytes);
+        while (fbs.pos < bytes.len) {
+            // All valid QUIC packets have the fixed bit (0x40) set.
+            // If not set, remaining bytes are padding — stop parsing.
+            if (bytes[fbs.pos] & 0x40 == 0) break;
+
+            const pkt_start = fbs.pos;
+            var header = packet.Header.parse(&fbs, self.scid_len) catch break;
+            const full_size = fbs.pos - pkt_start + header.remainder_len;
+
+            self.recv(&header, &fbs, info) catch break;
+
+            const next_pos = pkt_start + full_size;
+            if (fbs.pos < next_pos) fbs.pos = next_pos;
+        }
     }
 };
 

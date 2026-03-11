@@ -1,13 +1,9 @@
 const std = @import("std");
 const posix = std.posix;
-const io = std.io;
 const net = std.net;
 
 const connection = @import("quic/connection.zig");
-const packet = @import("quic/packet.zig");
-const protocol = @import("quic/protocol.zig");
 const tls13 = @import("quic/tls13.zig");
-const stateless_reset = @import("quic/stateless_reset.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
 const qpack = @import("h3/qpack.zig");
@@ -94,40 +90,14 @@ pub fn main() !void {
             const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch {
                 break :read_loop;
             };
-            const packet_length = recv_result.bytes_read;
             remote_addr = recv_result.from_addr;
             addr_size = recv_result.addr_len;
 
-            var fbs = io.fixedBufferStream(bytes[0..packet_length]);
-
-            // Process all coalesced packets in the UDP datagram
-            while (fbs.pos < packet_length) {
-                if (bytes[fbs.pos] & 0x40 == 0) break;
-
-                const packet_start_pos = fbs.pos;
-                var header = packet.Header.parse(&fbs, conn.scid_len) catch |err| {
-                    std.log.err("header parse error: {any}", .{err});
-                    break;
-                };
-
-                const header_end_pos = fbs.pos;
-                const encrypted_payload_size = header.remainder_len;
-                const full_packet_size = header_end_pos - packet_start_pos + encrypted_payload_size;
-
-                conn.recv(&header, &fbs, .{
-                    .to = local_addr.any,
-                    .from = remote_addr,
-                    .ecn = recv_result.ecn,
-                }) catch |err| {
-                    std.log.err("recv error: {any}", .{err});
-                    break;
-                };
-
-                const expected_next_pos = packet_start_pos + full_packet_size;
-                if (fbs.pos < expected_next_pos) {
-                    fbs.pos = expected_next_pos;
-                }
-            }
+            conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
+                .to = local_addr.any,
+                .from = remote_addr,
+                .ecn = recv_result.ecn,
+            });
 
             if (conn.state == .connected) {
                 handshake_complete = true;
@@ -154,11 +124,7 @@ pub fn main() !void {
     }
 
     // Sync remote_addr from active path (may have changed due to preferred address migration)
-    remote_addr = conn.paths[conn.active_path_idx].peer_addr;
-
-    // Clear Initial keys — Handshake keys kept until HANDSHAKE_DONE (RFC 9001 §4.9.2)
-    conn.pkt_num_spaces[0].crypto_open = null;
-    conn.pkt_num_spaces[0].crypto_seal = null;
+    remote_addr = conn.peerAddress().*;
 
     // Small delay for the server to process the Finished
     std.Thread.sleep(50 * std.time.ns_per_ms);
@@ -214,41 +180,14 @@ pub fn main() !void {
             var bytes: [8192]u8 = undefined;
 
             const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
-            const packet_length = recv_result.bytes_read;
             remote_addr = recv_result.from_addr;
             addr_size = recv_result.addr_len;
 
-            var fbs = io.fixedBufferStream(bytes[0..packet_length]);
-
-            while (fbs.pos < packet_length) {
-                if (bytes[fbs.pos] & 0x40 == 0) break;
-
-                const packet_start_pos = fbs.pos;
-                var header = packet.Header.parse(&fbs, conn.scid_len) catch break;
-
-                const header_end_pos = fbs.pos;
-                const full_packet_size = header_end_pos - packet_start_pos + header.remainder_len;
-
-                conn.recv(&header, &fbs, .{
-                    .to = local_addr.any,
-                    .from = remote_addr,
-                    .ecn = recv_result.ecn,
-                }) catch {
-                    // Check if this is a stateless reset (RFC 9000 §10.3)
-                    if (conn.matchesStatelessReset(bytes[0..packet_length])) {
-                        std.log.info("received stateless reset, closing connection", .{});
-                        conn.state = .draining;
-                        got_response = true;
-                        break;
-                    }
-                    break;
-                };
-
-                const expected_next_pos = packet_start_pos + full_packet_size;
-                if (fbs.pos < expected_next_pos) {
-                    fbs.pos = expected_next_pos;
-                }
-            }
+            conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
+                .to = local_addr.any,
+                .from = remote_addr,
+                .ecn = recv_result.ecn,
+            });
 
             if (conn.state == .draining) break;
         }
@@ -314,23 +253,17 @@ pub fn main() !void {
         std.Thread.sleep(10 * std.time.ns_per_ms);
         conn.onTimeout() catch break;
 
-        // Read and discard any incoming packets (triggers close retransmit)
+        // Read and process any incoming packets (triggers close retransmit)
         while (true) {
             var bytes: [8192]u8 = undefined;
             const drain_recv = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
             remote_addr = drain_recv.from_addr;
             addr_size = drain_recv.addr_len;
-
-            var fbs = io.fixedBufferStream(bytes[0..drain_recv.bytes_read]);
-            while (fbs.pos < drain_recv.bytes_read) {
-                if (bytes[fbs.pos] & 0x40 == 0) break;
-                const pkt_start = fbs.pos;
-                var header = packet.Header.parse(&fbs, conn.scid_len) catch break;
-                const full_size = fbs.pos - pkt_start + header.remainder_len;
-                conn.recv(&header, &fbs, .{ .to = local_addr.any, .from = remote_addr, .ecn = drain_recv.ecn }) catch break;
-                const next_pos = pkt_start + full_size;
-                if (fbs.pos < next_pos) fbs.pos = next_pos;
-            }
+            conn.handleDatagram(bytes[0..drain_recv.bytes_read], .{
+                .to = local_addr.any,
+                .from = remote_addr,
+                .ecn = drain_recv.ecn,
+            });
         }
 
         // Send retransmit if triggered

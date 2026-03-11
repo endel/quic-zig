@@ -1,9 +1,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
+const io = std.io;
 
 const connection = @import("connection.zig");
 const packet = @import("packet.zig");
+const protocol = @import("protocol.zig");
+const stateless_reset = @import("stateless_reset.zig");
 const tls13 = @import("tls13.zig");
 const h3 = @import("../h3/connection.zig");
 const wt = @import("../webtransport/session.zig");
@@ -94,6 +97,9 @@ pub const ConnectionManager = struct {
     retry_token_key: [16]u8,
     static_reset_key: [16]u8,
     local_cid_len: u8 = 8,
+
+    /// When true, Initial packets without a valid token get a Retry response.
+    require_retry: bool = false,
 
     pub fn init(
         allocator: Allocator,
@@ -222,6 +228,140 @@ pub const ConnectionManager = struct {
         entry.conn.deinit();
         self.allocator.destroy(entry.conn);
         self.allocator.destroy(entry);
+    }
+
+    /// Result of processing a received UDP datagram.
+    pub const RecvAction = union(enum) {
+        /// Datagram was delivered to an existing or newly accepted connection.
+        processed: *ConnEntry,
+        /// A response packet (VN, Retry, or Stateless Reset) was written to
+        /// out_buf and should be sent back to the source address.
+        send_response: []const u8,
+        /// Datagram was unroutable or invalid; no action needed.
+        dropped: void,
+    };
+
+    /// Process a raw UDP datagram: route by DCID, handle version negotiation,
+    /// retry tokens, stateless reset, accept new connections, and parse
+    /// coalesced packets (RFC 9000 §12.2).
+    ///
+    /// The application should send `send_response` data back to the source.
+    pub fn recvDatagram(
+        self: *ConnectionManager,
+        bytes: []u8,
+        from: posix.sockaddr,
+        local: posix.sockaddr,
+        ecn_val: u2,
+        out_buf: []u8,
+    ) RecvAction {
+        var fbs = io.fixedBufferStream(bytes);
+        var current_entry: ?*ConnEntry = null;
+
+        while (fbs.pos < bytes.len) {
+            // All valid QUIC packets have the fixed bit (0x40) set.
+            if (bytes[fbs.pos] & 0x40 == 0) break;
+
+            const pkt_start = fbs.pos;
+            var header = packet.Header.parse(&fbs, self.local_cid_len) catch break;
+            const full_size = fbs.pos - pkt_start + header.remainder_len;
+
+            // Version negotiation (RFC 9000 §6)
+            if (header.version != 0 and !protocol.isSupportedVersion(header.version)) {
+                var vn_fbs = io.fixedBufferStream(out_buf);
+                const vn_writer = vn_fbs.writer();
+                packet.negotiateVersion(header, &vn_writer) catch return .{ .dropped = {} };
+                return .{ .send_response = vn_fbs.getWritten() };
+            }
+
+            // Route to existing connection by DCID
+            var entry = current_entry orelse self.findByDcid(header.dcid);
+
+            if (entry == null) {
+                if (header.packet_type != .initial) {
+                    // Short-header for unknown CID: stateless reset (RFC 9000 §10.3)
+                    if (header.packet_type == .one_rtt) {
+                        const sr_max = @min(full_size, out_buf.len);
+                        const sr_len = stateless_reset.generatePacket(out_buf, sr_max, self.static_reset_key, header.dcid);
+                        if (sr_len > 0) {
+                            return .{ .send_response = out_buf[0..sr_len] };
+                        }
+                    }
+                    return .{ .dropped = {} };
+                }
+
+                // Initial packet — check retry requirement
+                if (self.require_retry) {
+                    if (header.token == null or header.token.?.len == 0) {
+                        // No token: send Retry
+                        var retry_scid: [8]u8 = undefined;
+                        std.crypto.random.bytes(&retry_scid);
+
+                        var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
+                        const token_len = packet.generateRetryToken(
+                            &token_buf,
+                            header.dcid,
+                            &retry_scid,
+                            from,
+                            self.retry_token_key,
+                        ) catch return .{ .dropped = {} };
+
+                        var retry_fbs = io.fixedBufferStream(out_buf);
+                        packet.retry(header, &retry_scid, token_buf[0..token_len], &retry_fbs) catch
+                            return .{ .dropped = {} };
+                        return .{ .send_response = retry_fbs.getWritten() };
+                    }
+
+                    // Has token: validate as Retry token
+                    const validated = packet.validateRetryToken(
+                        header.token.?,
+                        from,
+                        self.retry_token_key,
+                    ) catch null;
+
+                    if (validated) |vt| {
+                        entry = self.acceptConnection(header, local, from, vt.getOdcid(), vt.getRetryScid()) catch
+                            return .{ .dropped = {} };
+                    } else if (packet.validateNewToken(header.token.?, from, self.retry_token_key)) {
+                        // Valid NEW_TOKEN — accept without retry
+                        entry = self.acceptConnection(header, local, from, header.dcid, null) catch
+                            return .{ .dropped = {} };
+                    } else {
+                        return .{ .dropped = {} };
+                    }
+                } else {
+                    // No retry required — accept directly
+                    entry = self.acceptConnection(header, local, from, null, null) catch
+                        return .{ .dropped = {} };
+                }
+            }
+
+            const e = entry.?;
+            current_entry = e;
+            const recv_info: connection.RecvInfo = .{ .to = local, .from = from, .ecn = ecn_val };
+            e.conn.recv(&header, &fbs, recv_info) catch break;
+            self.syncCids(e);
+
+            const next_pos = pkt_start + full_size;
+            if (fbs.pos < next_pos) fbs.pos = next_pos;
+        }
+
+        if (current_entry) |e| {
+            return .{ .processed = e };
+        }
+        return .{ .dropped = {} };
+    }
+
+    /// Process timeouts and remove a closed connection.
+    /// Call this per-entry after app-specific polling (H3, WT, etc.).
+    /// Returns true if the connection is still alive, false if it was removed
+    /// (caller should `continue` without incrementing the index).
+    pub fn tickEntry(self: *ConnectionManager, entry: *ConnEntry) bool {
+        entry.conn.onTimeout() catch {};
+        if (entry.conn.isClosed()) {
+            self.removeConnection(entry);
+            return false;
+        }
+        return true;
     }
 
     /// Return the number of active connections.
