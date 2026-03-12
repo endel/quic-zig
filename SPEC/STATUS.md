@@ -305,8 +305,8 @@
 | 3.3 | Connection Reuse | ❌ Missing | Single connection per session |
 | 4 | Expressing HTTP Semantics | | |
 | 4.1 | HTTP Message Framing | ✅ Done | HEADERS + DATA frames |
-| 4.2 | Request Cancellation | ⚠️ Partial | RESET_STREAM exists; no H3 cancel logic |
-| 4.3 | Malformed Requests and Responses | ⚠️ Partial | Basic validation only |
+| 4.2 | Request Cancellation | ✅ Done | cancelRequest/rejectRequest, RESET_STREAM+STOP_SENDING emission, request_cancelled event |
+| 4.3 | Malformed Requests and Responses | ✅ Done | Pseudo-header validation, lowercase check, te header, CONNECT/extended CONNECT rules |
 | 4.4 | The CONNECT Method | ✅ Done | Extended CONNECT (RFC 9220) for WT |
 | 4.5 | HTTP Upgrade | ❌ N/A | Not applicable to H3 |
 | 4.6 | Server Push | ❌ Missing | PUSH_PROMISE not implemented |
@@ -338,8 +338,8 @@
 
 | Status | Count |
 |--------|-------|
-| ✅ Done | 19 |
-| ⚠️ Partial | 3 |
+| ✅ Done | 21 |
+| ⚠️ Partial | 1 |
 | ❌ Missing | 5 |
 | ❌ N/A | 3 |
 
@@ -349,7 +349,7 @@
 |----------|---------|------|--------|
 | P3 | §4.6 | Server Push (PUSH_PROMISE, CANCEL_PUSH, MAX_PUSH_ID) | Large |
 | ~~P3~~ | ~~§5.2~~ | ~~Graceful shutdown (GOAWAY stream ID tracking)~~ | ~~Done~~ |
-| P3 | §4.2-4.3 | Request cancellation + malformed request handling | Small |
+| ~~P3~~ | ~~§4.2-4.3~~ | ~~Request cancellation + malformed request handling~~ | ~~Done~~ |
 | P3 | §8 | Comprehensive H3 error handling | Small |
 
 ---

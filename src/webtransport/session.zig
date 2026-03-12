@@ -462,6 +462,7 @@ pub const WebTransportConnection = struct {
             },
             .goaway => {},
             .shutdown_complete => {},
+            .request_cancelled => {},
         }
 
         return null;

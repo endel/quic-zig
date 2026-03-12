@@ -192,6 +192,7 @@ pub fn main() !void {
                             std.log.info("H3: received CONNECT request on stream {d} (protocol={s})", .{ req.stream_id, req.protocol });
                         },
                         .shutdown_complete => {},
+                        .request_cancelled => {},
                     }
                 }
             }

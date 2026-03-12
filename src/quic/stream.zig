@@ -139,6 +139,12 @@ pub const ReceiveStream = struct {
     /// Error code from RESET_STREAM.
     reset_err: ?u64 = null,
 
+    /// Error code for STOP_SENDING frame to send to peer.
+    stop_sending_err: ?u64 = null,
+
+    /// Whether the STOP_SENDING frame has been queued.
+    stop_sending_sent: bool = false,
+
     /// Whether all data has been read.
     finished: bool = false,
 
@@ -211,6 +217,11 @@ pub const ReceiveStream = struct {
         }
         return null;
     }
+
+    /// Request that the peer stop sending on this stream (sends STOP_SENDING).
+    pub fn stopSending(self: *ReceiveStream, error_code: u64) void {
+        self.stop_sending_err = error_code;
+    }
 };
 
 /// Maximum number of retransmit ranges per SendStream.
@@ -257,6 +268,9 @@ pub const SendStream = struct {
 
     /// Whether the stream has been reset.
     reset_err: ?u64 = null,
+
+    /// Whether a RESET_STREAM frame has been queued for sending.
+    reset_stream_sent: bool = false,
 
     /// Retransmission queue: ranges of data that were lost and need resending.
     retransmit_ranges: [MAX_RETRANSMIT_RANGES]RetransmitRange = undefined,

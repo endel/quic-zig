@@ -348,7 +348,7 @@ fn pollH3Server(h3c: *h3.H3Connection, alloc: std.mem.Allocator, www_dir: []cons
                 };
                 h3c.sendResponse(hdr.stream_id, &resp_headers, file_data) catch {};
             },
-            .settings, .data, .finished, .goaway, .connect_request, .shutdown_complete => {},
+            .settings, .data, .finished, .goaway, .connect_request, .shutdown_complete, .request_cancelled => {},
         }
     }
 }

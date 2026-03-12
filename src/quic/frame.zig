@@ -724,6 +724,15 @@ pub const PendingControlFrame = union(enum) {
         token_buf: [92]u8 = .{0} ** 92,
         token_len: u8 = 0,
     },
+    reset_stream: struct {
+        stream_id: u64,
+        error_code: u64,
+        final_size: u64,
+    },
+    stop_sending: struct {
+        stream_id: u64,
+        error_code: u64,
+    },
     new_connection_id: struct {
         seq_num: u64,
         retire_prior_to: u64,
@@ -775,6 +784,8 @@ pub const PendingControlFrame = union(enum) {
             .streams_blocked_uni => |max| .{ .streams_blocked_uni = max },
             .data_blocked => |limit| .{ .data_blocked = limit },
             .stream_data_blocked => |sdb| .{ .stream_data_blocked = .{ .stream_id = sdb.stream_id, .limit = sdb.limit } },
+            .reset_stream => |rs| .{ .reset_stream = .{ .stream_id = rs.stream_id, .error_code = rs.error_code, .final_size = rs.final_size } },
+            .stop_sending => |ss| .{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = ss.error_code } },
             .new_token => unreachable, // handled directly in write()
             .new_connection_id => unreachable, // handled directly in write()
         };

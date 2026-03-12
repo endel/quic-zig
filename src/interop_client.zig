@@ -693,7 +693,7 @@ fn downloadH3(
                 .headers => |hdr| {
                     std.log.info("H3: response headers on stream {d}", .{hdr.stream_id});
                 },
-                .settings, .goaway, .connect_request, .shutdown_complete => {},
+                .settings, .goaway, .connect_request, .shutdown_complete, .request_cancelled => {},
             }
         }
     }

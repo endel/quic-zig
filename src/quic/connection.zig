@@ -2122,6 +2122,37 @@ pub const Connection = struct {
                 }
             }
         }
+
+        // RESET_STREAM: send for streams with reset_err set
+        {
+            var stream_it = self.streams.streams.valueIterator();
+            while (stream_it.next()) |s_ptr| {
+                const s: *stream_mod.Stream = s_ptr.*;
+                if (s.send.reset_err != null and !s.send.reset_stream_sent) {
+                    s.send.reset_stream_sent = true;
+                    self.pending_frames.push(.{ .reset_stream = .{
+                        .stream_id = s.stream_id,
+                        .error_code = s.send.reset_err.?,
+                        .final_size = s.send.write_offset,
+                    } });
+                }
+            }
+        }
+
+        // STOP_SENDING: send for streams requesting peer to stop
+        {
+            var stream_it = self.streams.streams.valueIterator();
+            while (stream_it.next()) |s_ptr| {
+                const s: *stream_mod.Stream = s_ptr.*;
+                if (s.recv.stop_sending_err != null and !s.recv.stop_sending_sent) {
+                    s.recv.stop_sending_sent = true;
+                    self.pending_frames.push(.{ .stop_sending = .{
+                        .stream_id = s.stream_id,
+                        .error_code = s.recv.stop_sending_err.?,
+                    } });
+                }
+            }
+        }
     }
 
     /// Build and send outgoing packets.

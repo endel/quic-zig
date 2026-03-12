@@ -228,6 +228,7 @@ pub fn main() !void {
                 },
                 .connect_request => {},
                 .shutdown_complete => {},
+                .request_cancelled => {},
             }
         }
     }

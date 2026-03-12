@@ -60,6 +60,7 @@ pub const H3Event = union(enum) {
         headers: []const qpack.Header,
     },
     shutdown_complete: void,
+    request_cancelled: struct { stream_id: u64, error_code: u64 },
 };
 
 /// Maximum number of headers we'll decode from a single HEADERS frame.
@@ -398,6 +399,21 @@ pub const H3Connection = struct {
         return true;
     }
 
+    /// Cancel a request (RFC 9114 §4.1.1).
+    /// Sends RESET_STREAM + STOP_SENDING with the given H3 error code.
+    pub fn cancelRequest(self: *H3Connection, stream_id: u64, error_code: u64) void {
+        if (self.quic_conn.streams.getStream(stream_id)) |stream| {
+            stream.send.reset(error_code);
+            stream.recv.stopSending(error_code);
+        }
+    }
+
+    /// Reject a request with H3_REQUEST_REJECTED (RFC 9114 §4.1.1).
+    /// Used during graceful shutdown for streams above the GOAWAY ID.
+    pub fn rejectRequest(self: *H3Connection, stream_id: u64) void {
+        self.cancelRequest(stream_id, @intFromEnum(H3Error.request_rejected));
+    }
+
     /// Send a PRIORITY_UPDATE frame on the control stream (RFC 9218).
     /// Used by clients to dynamically reprioritize a request stream.
     pub fn sendPriorityUpdate(self: *H3Connection, stream_id: u64, prio: priority.StreamPriority) !void {
@@ -578,6 +594,85 @@ pub const H3Connection = struct {
         }
     }
 
+    /// Validate request pseudo-headers per RFC 9114 §4.1.2, §4.3.
+    fn validateRequestHeaders(headers: []const qpack.Header) bool {
+        var method_count: u8 = 0;
+        var scheme_count: u8 = 0;
+        var path_count: u8 = 0;
+        var path_empty = false;
+        var has_status = false;
+        var pseudo_done = false;
+        var is_connect = false;
+        var has_protocol = false;
+
+        for (headers) |h| {
+            if (h.name.len > 0 and h.name[0] == ':') {
+                if (pseudo_done) return false; // pseudo after regular
+                if (std.mem.eql(u8, h.name, ":method")) {
+                    method_count += 1;
+                    is_connect = std.mem.eql(u8, h.value, "CONNECT");
+                } else if (std.mem.eql(u8, h.name, ":scheme")) {
+                    scheme_count += 1;
+                } else if (std.mem.eql(u8, h.name, ":path")) {
+                    path_count += 1;
+                    if (h.value.len == 0) path_empty = true;
+                } else if (std.mem.eql(u8, h.name, ":status")) {
+                    has_status = true;
+                } else if (std.mem.eql(u8, h.name, ":protocol")) {
+                    has_protocol = true;
+                }
+            } else {
+                pseudo_done = true;
+                // Header names must be lowercase
+                for (h.name) |c| {
+                    if (c >= 'A' and c <= 'Z') return false;
+                }
+                // te header: only "trailers" allowed
+                if (std.mem.eql(u8, h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) {
+                    return false;
+                }
+            }
+        }
+
+        if (has_status) return false; // request must not have :status
+        if (method_count != 1) return false;
+        if (method_count > 1 or scheme_count > 1 or path_count > 1) return false;
+
+        // Plain CONNECT: no :scheme/:path required
+        // Extended CONNECT (with :protocol): all pseudo-headers required
+        if (is_connect and !has_protocol) return true;
+
+        if (scheme_count != 1) return false;
+        if (path_count != 1) return false;
+        if (path_empty) return false;
+
+        return true;
+    }
+
+    /// Validate response pseudo-headers per RFC 9114 §4.1, §4.3.
+    fn validateResponseHeaders(headers: []const qpack.Header) bool {
+        var status_count: u8 = 0;
+        var pseudo_done = false;
+
+        for (headers) |h| {
+            if (h.name.len > 0 and h.name[0] == ':') {
+                if (pseudo_done) return false;
+                if (std.mem.eql(u8, h.name, ":status")) {
+                    status_count += 1;
+                } else {
+                    return false; // responses must only have :status
+                }
+            } else {
+                pseudo_done = true;
+                for (h.name) |c| {
+                    if (c >= 'A' and c <= 'Z') return false;
+                }
+            }
+        }
+
+        return status_count == 1;
+    }
+
     /// Poll bidirectional streams for HEADERS/DATA frames.
     fn pollBidiStreams(self: *H3Connection) !?H3Event {
         var stream_it = self.quic_conn.streams.streams.iterator();
@@ -646,6 +741,18 @@ pub const H3Connection = struct {
                         // Flush decoder instructions (header ack)
                         self.flushDecoderInstructions() catch {};
 
+                        // RFC 9114 §4.1.2, §4.3: validate pseudo-headers
+                        const valid = if (self.is_server)
+                            validateRequestHeaders(hdrs)
+                        else
+                            validateResponseHeaders(hdrs);
+                        if (!valid) {
+                            self.consumeFrameFromBuf(buf, result.consumed);
+                            stream.send.reset(@intFromEnum(H3Error.message_error));
+                            stream.recv.stopSending(@intFromEnum(H3Error.message_error));
+                            continue;
+                        }
+
                         // Check for Extended CONNECT (:method=CONNECT + :protocol)
                         var method: ?[]const u8 = null;
                         var proto: ?[]const u8 = null;
@@ -706,6 +813,16 @@ pub const H3Connection = struct {
                         self.consumeFrameFromBuf(buf, result.consumed);
                         continue;
                     },
+                }
+            }
+
+            // RFC 9114 §4.1.1: detect peer cancellation after processing any buffered frames.
+            // Only report if no more H3 data is buffered (stream was truly cancelled, not just reset after completion).
+            if (stream.recv.reset_err) |err_code| {
+                const has_buffered = if (self.stream_bufs.getPtr(stream_id)) |b| b.items.len > 0 else false;
+                if (!has_buffered) {
+                    try self.finished_streams.put(stream_id, {});
+                    return .{ .request_cancelled = .{ .stream_id = stream_id, .error_code = err_code } };
                 }
             }
         }
@@ -871,4 +988,185 @@ test "ShutdownState: state transitions" {
 
     conn.shutdown_state = .drain_complete;
     try testing.expectEqual(ShutdownState.drain_complete, conn.shutdown_state);
+}
+
+// RFC 9114 §4.1.2, §4.3: Header validation tests
+
+test "validateRequestHeaders: valid GET" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: valid POST with body headers" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/submit" },
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: missing method" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: missing scheme" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: missing path" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: empty path" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: status in request" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":status", .value = "200" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: pseudo after regular" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = "host", .value = "example.com" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: uppercase header name" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "Content-Type", .value = "text/html" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: invalid te header" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "te", .value = "gzip" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: valid te trailers" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "te", .value = "trailers" },
+    };
+    try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: CONNECT without scheme/path" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "proxy.example.com:443" },
+    };
+    try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: extended CONNECT requires scheme/path" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    // Extended CONNECT needs :scheme and :path
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: valid extended CONNECT" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: valid 200" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/html" },
+    };
+    try testing.expect(H3Connection.validateResponseHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: missing status" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = "content-type", .value = "text/html" },
+    };
+    try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: method in response" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = ":method", .value = "GET" },
+    };
+    try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: duplicate status" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = ":status", .value = "404" },
+    };
+    try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: pseudo after regular" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = "server", .value = "zig" },
+        .{ .name = ":status", .value = "200" },
+    };
+    try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: uppercase header" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "Server", .value = "zig" },
+    };
+    try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
 }
