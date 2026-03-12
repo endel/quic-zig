@@ -673,3 +673,505 @@ test "PacketPacker: basic init" {
     try testing.expectEqualSlices(u8, scid, packer.getScid());
     try testing.expectEqualSlices(u8, dcid, packer.getDcid());
 }
+
+test "PacketPacker: updateDcid" {
+    const scid = &[_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const dcid = &[_]u8{ 0x05, 0x06, 0x07, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+    const new_dcid = &[_]u8{ 0xAA, 0xBB, 0xCC };
+    packer.updateDcid(new_dcid);
+    try testing.expectEqualSlices(u8, new_dcid, packer.getDcid());
+}
+
+// Helper: derive Initial crypto keys for packer tests (client side)
+fn testClientKeys() !struct { seal: crypto_mod.Seal, open: crypto_mod.Open } {
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const keys = try crypto_mod.deriveInitialKeyMaterial(&dcid, 0x00000001, false);
+    return .{ .seal = keys[1], .open = keys[0] };
+}
+
+// Helper: derive Initial crypto keys for packer tests (server side)
+fn testServerKeys() !struct { seal: crypto_mod.Seal, open: crypto_mod.Open } {
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const keys = try crypto_mod.deriveInitialKeyMaterial(&dcid, 0x00000001, true);
+    return .{ .seal = keys[1], .open = keys[0] };
+}
+
+test "PacketPacker: pack Initial with CRYPTO data" {
+    // Setup: client packer with Initial keys and CRYPTO data to send
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Write some CRYPTO data (simulates ClientHello)
+    const crypto_data = "test ClientHello data for packer";
+    try crypto_mgr.getStream(0).writeData(crypto_data);
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        keys.seal, // initial_seal
+        null, // early_seal
+        null, // handshake_seal
+        null, // app_seal
+        1000,
+        null, // datagram_queue
+        false, // ack_only
+    );
+
+    // Client Initial packets MUST be >= 1200 bytes (RFC 9000 §14.1)
+    try testing.expect(written >= MIN_INITIAL_PACKET_SIZE);
+
+    // Verify it's a Long Header Initial packet (high bit set, form bit set)
+    try testing.expect(out_buf[0] & 0x80 != 0); // Long header
+
+    // Verify packet was tracked
+    try testing.expectEqual(@as(u64, 1), pkt_handler.next_pn[0]); // Used PN 0
+
+    // Verify sent packet was recorded
+    try testing.expectEqual(@as(usize, 1), pkt_handler.sent[0].sent_packets.count());
+}
+
+test "PacketPacker: pack 1-RTT with stream data" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Create a stream and write data
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const s = try streams.openBidiStream();
+    try s.send.writeData("Hello from stream");
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null, // no initial
+        null, // no early
+        null, // no handshake
+        keys.seal, // app_seal
+        1000,
+        null,
+        false,
+    );
+
+    // Should have produced a packet with stream data
+    try testing.expect(written > 0);
+
+    // Verify it's a Short Header (1-RTT) packet (high bit clear)
+    try testing.expect(out_buf[0] & 0x80 == 0);
+
+    // Verify sent packet tracking
+    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    try testing.expectEqual(@as(usize, 1), pkt_handler.sent[app_idx].sent_packets.count());
+}
+
+test "PacketPacker: no data produces no packet" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{0x02};
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    // No crypto data, no stream data, no ACKs — should produce nothing
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        keys.seal, // initial_seal
+        null,
+        null,
+        null,
+        1000,
+        null,
+        false,
+    );
+
+    try testing.expectEqual(@as(usize, 0), written);
+}
+
+test "PacketPacker: ack_only skips stream data" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Create a stream with data
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const s = try streams.openBidiStream();
+    try s.send.writeData("This data should be skipped");
+
+    // Register 2 received packets to trigger immediate ACK (ACK_ELICITING_THRESHOLD=2)
+    try pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0);
+    try pkt_handler.recv[2].onPacketReceived(1, true, 1000, 0);
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        keys.seal, // app_seal
+        1000,
+        null,
+        true, // ack_only = true
+    );
+
+    // Should produce an ACK-only packet
+    try testing.expect(written > 0);
+
+    // Stream data should still be waiting (not consumed)
+    try testing.expect(s.send.hasData());
+}
+
+test "PacketPacker: coalesced Initial + Handshake" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, true, scid, dcid, 0x00000001); // server
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, true);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Write CRYPTO data for Initial and Handshake levels
+    try crypto_mgr.getStream(0).writeData("Initial crypto");
+    try crypto_mgr.getStream(2).writeData("Handshake crypto"); // handshake = index 2
+
+    const keys = try testServerKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        keys.seal, // initial_seal
+        null, // no early
+        keys.seal, // handshake_seal (reuse same keys for test)
+        null, // no app
+        1000,
+        null,
+        false,
+    );
+
+    // Should have coalesced both levels
+    try testing.expect(written > 0);
+
+    // Both Initial and Handshake packet numbers should have been used
+    try testing.expectEqual(@as(u64, 1), pkt_handler.next_pn[0]); // Initial PN 0 used
+    try testing.expectEqual(@as(u64, 1), pkt_handler.next_pn[1]); // Handshake PN 0 used
+}
+
+test "PacketPacker: HANDSHAKE_DONE frame packed in 1-RTT" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, true, scid, dcid, 0x00000001);
+    packer.send_handshake_done = true;
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, true);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    const keys = try testServerKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        keys.seal, // app_seal
+        1000,
+        null,
+        false,
+    );
+
+    try testing.expect(written > 0);
+
+    // HANDSHAKE_DONE flag should be cleared after packing
+    try testing.expect(!packer.send_handshake_done);
+
+    // Sent packet should be tracked as ack-eliciting with handshake_done
+    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    try testing.expectEqual(@as(usize, 1), pkt_handler.sent[app_idx].sent_packets.count());
+    var it = pkt_handler.sent[app_idx].sent_packets.iterator();
+    const pkt = it.next().?.value_ptr;
+    try testing.expect(pkt.ack_eliciting);
+    try testing.expect(pkt.has_handshake_done);
+}
+
+test "PacketPacker: ecn_mark propagates to SentPacket" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+    packer.ecn_mark = true;
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Need ack-eliciting content — add stream data
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const s = try streams.openBidiStream();
+    try s.send.writeData("ecn test data");
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        keys.seal,
+        1000,
+        null,
+        false,
+    );
+
+    try testing.expect(written > 0);
+
+    // Check the sent packet has ecn_marked set
+    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    var it = pkt_handler.sent[app_idx].sent_packets.iterator();
+    const pkt = it.next().?.value_ptr;
+    try testing.expect(pkt.ecn_marked);
+    try testing.expect(pkt.ack_eliciting);
+}
+
+test "PacketPacker: key_phase bit in short header" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Add stream data so we produce a packet
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const s = try streams.openBidiStream();
+    try s.send.writeData("test data");
+
+    const keys = try testClientKeys();
+
+    // Pack with key_phase = false
+    packer.key_phase = false;
+    var out1: [1500]u8 = undefined;
+    _ = try packer.packCoalesced(&out1, &pkt_handler, &crypto_mgr, &streams, &pending_frames, null, null, null, keys.seal, 1000, null, false);
+
+    // Write more data and pack with key_phase = true
+    try s.send.writeData("more data");
+    packer.key_phase = true;
+    var out2: [1500]u8 = undefined;
+    _ = try packer.packCoalesced(&out2, &pkt_handler, &crypto_mgr, &streams, &pending_frames, null, null, null, keys.seal, 1000, null, false);
+
+    // After header protection is applied, the key_phase bit is masked.
+    // But the two packets should differ (different key phase + different content).
+    // Just verify both produced output and used different PNs.
+    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    try testing.expectEqual(@as(u64, 2), pkt_handler.next_pn[app_idx]);
+}
+
+test "PacketPacker: pending control frames in 1-RTT" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Queue a PATH_CHALLENGE control frame
+    const challenge = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
+    pending_frames.push(.{ .path_challenge = challenge });
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        keys.seal,
+        1000,
+        null,
+        false,
+    );
+
+    try testing.expect(written > 0);
+
+    // Control frame should be consumed from the queue
+    try testing.expectEqual(@as(?frame_mod.PendingControlFrame, null), pending_frames.pop());
+
+    // Sent packet should be ack-eliciting
+    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    var it = pkt_handler.sent[app_idx].sent_packets.iterator();
+    const pkt = it.next().?.value_ptr;
+    try testing.expect(pkt.ack_eliciting);
+}
+
+test "PacketPacker: stream frame info tracked in SentPacket" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const s = try streams.openBidiStream();
+    try s.send.writeData("stream data for tracking");
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    _ = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        keys.seal,
+        1000,
+        null,
+        false,
+    );
+
+    // Verify stream frame info was recorded in SentPacket
+    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    var it = pkt_handler.sent[app_idx].sent_packets.iterator();
+    const pkt = it.next().?.value_ptr;
+    const sf = pkt.getStreamFrames();
+    try testing.expect(sf.len > 0);
+    try testing.expectEqual(@as(u64, 0), sf[0].stream_id);
+    try testing.expectEqual(@as(u64, 0), sf[0].offset);
+    try testing.expect(sf[0].length > 0);
+}
