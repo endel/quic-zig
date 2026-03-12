@@ -71,7 +71,7 @@
 | **10** | **Connection Termination** | | |
 | 10.1 | Idle Timeout | ✅ Done | Negotiated min(local, peer), 30s default |
 | 10.1.1 | Liveness Testing | ✅ Done | PING frames |
-| 10.1.2 | Deferring Idle Timeout | ⚠️ Partial | Reset on ack-eliciting recv; may not cover all cases |
+| 10.1.2 | Deferring Idle Timeout | ✅ Done | Reset on recv + sent ack-eliciting during handshake |
 | 10.2 | Immediate Close | ✅ Done | CONNECTION_CLOSE frame |
 | 10.2.1 | Closing Connection State | ✅ Done | Retransmits CONNECTION_CLOSE, 3×PTO drain |
 | 10.2.2 | Draining Connection State | ✅ Done | Proper draining state after close |
@@ -161,8 +161,8 @@
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Done | 100 | ~97% |
-| ⚠️ Partial | 3 | ~3% |
+| ✅ Done | 101 | ~98% |
+| ⚠️ Partial | 2 | ~2% |
 | ❌ Missing | 0 | 0% |
 | ❌ N/A | 5 | — |
 
@@ -488,7 +488,7 @@ No remaining work — all sections implemented. Optional improvements:
 
 | RFC | Done | Partial | Missing | Completion |
 |-----|------|---------|---------|------------|
-| RFC 9000 (QUIC) | 100 | 3 | 0 | ~97% |
+| RFC 9000 (QUIC) | 101 | 2 | 0 | ~98% |
 | RFC 9001 (TLS) | 33 | 0 | 0 | 100% |
 | RFC 9002 (Loss/CC) | 24 | 0 | 0 | 100% |
 | RFC 9114 (HTTP/3) | 22 | 0 | 5 | ~82% |

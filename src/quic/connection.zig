@@ -503,6 +503,7 @@ pub const Connection = struct {
 
     // Timing
     last_packet_received_time: i64 = 0,
+    last_packet_sent_time: i64 = 0,
     last_keepalive_time: i64 = 0,
     creation_time: i64 = 0,
     idle_timeout_ns: i64 = 30_000_000_000, // 30s default
@@ -2410,6 +2411,7 @@ pub const Connection = struct {
             self.pto_probe_pending -|= 1;
             self.paths[self.active_path_idx].bytes_sent += bytes_written;
             self.pacer.onPacketSent(bytes_written, now);
+            self.last_packet_sent_time = now;
 
             // Client: auto-clear Handshake keys once Finished has been packed and sent
             // (RFC 9001 §4.9.2: discard Handshake keys when handshake is confirmed)
@@ -2587,7 +2589,7 @@ pub const Connection = struct {
             return;
         }
 
-        // Check idle timeout (RFC 9000 §10.1)
+        // Check idle timeout (RFC 9000 §10.1, §10.1.2)
         // The effective idle timeout MUST be at least 3× the current PTO (with backoff)
         // to avoid terminating the connection while waiting for backed-off retransmissions.
         {
@@ -2595,7 +2597,15 @@ pub const Connection = struct {
             const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 62));
             current_pto = @min(current_pto << shift, 60_000_000_000); // cap at 60s
             const effective_idle = @max(self.idle_timeout_ns, 3 * current_pto);
-            if (now - self.last_packet_received_time > effective_idle) {
+            // RFC 9000 §10.1.2: Before handshake confirmed, also defer idle timeout
+            // when sending ack-eliciting packets (to avoid premature timeout during
+            // handshake retransmission). After handshake confirmed, only received
+            // packets reset the idle timer.
+            const last_activity = if (!self.handshake_confirmed)
+                @max(self.last_packet_received_time, self.last_packet_sent_time)
+            else
+                self.last_packet_received_time;
+            if (now - last_activity > effective_idle) {
                 self.state = .terminated;
                 return;
             }
