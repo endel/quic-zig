@@ -198,6 +198,71 @@ pub fn mapV4ToV6(storage: *posix.sockaddr.storage) void {
     storage.* = result;
 }
 
+/// Batch sender that collects outgoing packets and flushes them together.
+/// Reduces syscall overhead by batching sendto calls and caching ECN marks.
+pub const SendBatch = struct {
+    const MAX_BATCH: usize = 64;
+
+    sockfd: posix.socket_t,
+    count: usize = 0,
+    current_ecn: u2 = 0,
+
+    // Per-packet data
+    addrs: [MAX_BATCH]posix.sockaddr.storage = undefined,
+    addr_lens: [MAX_BATCH]posix.socklen_t = undefined,
+    offsets: [MAX_BATCH]u32 = undefined, // offset into data_buf
+    lengths: [MAX_BATCH]u32 = undefined, // length of each packet
+    ecn_marks: [MAX_BATCH]u2 = undefined,
+
+    // Contiguous buffer holding all packet data
+    data_buf: [MAX_BATCH * 1500]u8 = undefined,
+    data_len: usize = 0,
+
+    pub fn init(sockfd: posix.socket_t) SendBatch {
+        return .{ .sockfd = sockfd };
+    }
+
+    /// Add a packet to the batch. Flushes automatically when full.
+    pub fn add(self: *SendBatch, data: []const u8, addr: *const posix.sockaddr, addr_len: posix.socklen_t, ecn: u2) void {
+        if (self.count >= MAX_BATCH or self.data_len + data.len > self.data_buf.len) {
+            self.flush();
+        }
+        const idx = self.count;
+        self.offsets[idx] = @intCast(self.data_len);
+        self.lengths[idx] = @intCast(data.len);
+        @memcpy(self.data_buf[self.data_len..][0..data.len], data);
+        self.data_len += data.len;
+        self.addrs[idx] = @as(*const posix.sockaddr.storage, @ptrCast(@alignCast(addr))).*;
+        self.addr_lens[idx] = addr_len;
+        self.ecn_marks[idx] = ecn;
+        self.count += 1;
+    }
+
+    /// Send all queued packets. Caches ECN marks to avoid redundant setsockopt calls.
+    pub fn flush(self: *SendBatch) void {
+        if (self.count == 0) return;
+
+        for (0..self.count) |i| {
+            // Only call setsockopt when ECN mark changes (saves 2 syscalls per packet)
+            if (self.ecn_marks[i] != self.current_ecn) {
+                self.current_ecn = self.ecn_marks[i];
+                setEcnMark(self.sockfd, self.current_ecn) catch {};
+            }
+            const data = self.data_buf[self.offsets[i]..][0..self.lengths[i]];
+            _ = posix.sendto(
+                self.sockfd,
+                data,
+                0,
+                @ptrCast(&self.addrs[i]),
+                self.addr_lens[i],
+            ) catch {};
+        }
+
+        self.count = 0;
+        self.data_len = 0;
+    }
+};
+
 // Tests — ECN ancillary data tests only run on POSIX platforms.
 test "enableEcnRecv on a real socket" {
     if (comptime is_windows) return error.SkipZigTest;

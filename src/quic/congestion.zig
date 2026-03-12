@@ -418,8 +418,9 @@ pub const Pacer = struct {
     /// Last time a packet was sent (nanoseconds).
     last_sent_time: i64 = 0,
 
-    /// Adjusted bandwidth in bytes per second.
-    bandwidth: u64 = 0,
+    /// Bandwidth in bytes per nanosecond, left-shifted by BANDWIDTH_SHIFT for precision.
+    /// This avoids u128 arithmetic on the hot send path.
+    bandwidth_shifted: u64 = 0,
 
     /// Max datagram size.
     max_datagram_size: u64 = DEFAULT_MAX_DATAGRAM_SIZE,
@@ -432,17 +433,19 @@ pub const Pacer = struct {
         };
     }
 
+    const BANDWIDTH_SHIFT: u6 = 20; // Fixed-point precision bits
+
     /// Update the pacer's bandwidth based on the congestion window and RTT.
     pub fn setBandwidth(self: *Pacer, cwnd: u64, rtt_stats: *const RttStats) void {
         const srtt = rtt_stats.smoothedRttOrDefault();
         if (srtt <= 0) return;
 
-        // bandwidth = cwnd / srtt (bytes per nanosecond)
-        // Multiply by 1.25 to prevent underutilization
-        // Store as bytes per second for easier computation
-        self.bandwidth = @intCast(@divTrunc(
-            @as(i128, @intCast(cwnd)) * 1_000_000_000 * PACER_BANDWIDTH_NUM,
-            @as(i128, @intCast(srtt)) * PACER_BANDWIDTH_DENOM,
+        // bandwidth = cwnd / srtt * 1.25 (bytes per nanosecond)
+        // Store left-shifted by BANDWIDTH_SHIFT for fixed-point precision.
+        // Use u128 only here (called infrequently on RTT updates, not per-packet).
+        self.bandwidth_shifted = @intCast(@divTrunc(
+            @as(u128, cwnd) * PACER_BANDWIDTH_NUM * (@as(u128, 1) << BANDWIDTH_SHIFT),
+            @as(u128, @intCast(srtt)) * PACER_BANDWIDTH_DENOM,
         ));
     }
 
@@ -460,20 +463,16 @@ pub const Pacer = struct {
             return 0; // Can send now
         }
 
-        if (self.bandwidth == 0) return 0;
+        if (self.bandwidth_shifted == 0) return 0;
 
-        // Time to accumulate enough budget for one packet
+        // Time (ns) = deficit / bandwidth_bpns = (deficit << SHIFT) / bandwidth_shifted
         const deficit = self.max_datagram_size - self.budget;
-        const delay_ns: i64 = @intCast(@divTrunc(
-            @as(u128, deficit) * 1_000_000_000,
-            @as(u128, self.bandwidth),
-        ));
-        return delay_ns;
+        return @intCast((deficit << BANDWIDTH_SHIFT) / self.bandwidth_shifted);
     }
 
     /// Replenish budget based on elapsed time.
     fn replenish(self: *Pacer, now: i64) void {
-        if (self.last_sent_time == 0 or self.bandwidth == 0) {
+        if (self.last_sent_time == 0 or self.bandwidth_shifted == 0) {
             self.budget = self.max_burst;
             return;
         }
@@ -481,10 +480,8 @@ pub const Pacer = struct {
         const elapsed = now - self.last_sent_time;
         if (elapsed <= 0) return;
 
-        const new_budget: u64 = @intCast(@divTrunc(
-            @as(u128, self.bandwidth) * @as(u128, @intCast(elapsed)),
-            1_000_000_000,
-        ));
+        // new_budget = bandwidth_bpns * elapsed = (bandwidth_shifted * elapsed) >> SHIFT
+        const new_budget = (self.bandwidth_shifted *| @as(u64, @intCast(elapsed))) >> BANDWIDTH_SHIFT;
         self.budget = @min(self.budget + new_budget, self.max_burst);
     }
 };
