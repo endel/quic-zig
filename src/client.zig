@@ -97,6 +97,7 @@ pub fn main() !void {
                 .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
+                .datagram_size = recv_result.bytes_read,
             });
 
             if (conn.state == .connected) {
@@ -187,6 +188,7 @@ pub fn main() !void {
                 .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
+                .datagram_size = recv_result.bytes_read,
             });
 
             if (conn.state == .draining) break;
@@ -265,6 +267,7 @@ pub fn main() !void {
                 .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = drain_recv.ecn,
+                .datagram_size = drain_recv.bytes_read,
             });
         }
 

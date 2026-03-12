@@ -83,6 +83,7 @@ pub fn main() !void {
                 .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
+                .datagram_size = recv_result.bytes_read,
             });
 
             if (conn.state == .connected) handshake_complete = true;
@@ -154,6 +155,7 @@ pub fn main() !void {
                 .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
+                .datagram_size = recv_result.bytes_read,
             });
         }
 
@@ -231,6 +233,7 @@ pub fn main() !void {
                 .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
+                .datagram_size = recv_result.bytes_read,
             });
         }
 

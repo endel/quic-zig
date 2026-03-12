@@ -349,6 +349,9 @@ pub const RecvInfo = struct {
     from: posix.sockaddr.storage,
     // ECN codepoint from IP header (0=Not-ECT, 1=ECT(1), 2=ECT(0), 3=CE)
     ecn: u2 = ECN_NOT_ECT,
+    // Size of the UDP datagram (for amplification limit accounting).
+    // Set to the datagram size for the first packet; 0 for subsequent coalesced packets.
+    datagram_size: u64 = 0,
 };
 
 /// Configuration for a QUIC connection.
@@ -861,7 +864,9 @@ pub const Connection = struct {
 
             const now: i64 = @intCast(std.time.nanoTimestamp());
             self.last_packet_received_time = now;
-            self.paths[self.active_path_idx].bytes_received += @intCast(fbs.buffer.len);
+            if (info.datagram_size > 0) {
+                self.paths[self.active_path_idx].bytes_received += info.datagram_size;
+            }
 
             // Process 0-RTT frames (STREAM, DATAGRAM etc. - no CRYPTO or HANDSHAKE_DONE)
             var remaining = payload;
@@ -966,8 +971,10 @@ pub const Connection = struct {
             }
         }
 
-        // Update network path stats
-        self.paths[self.active_path_idx].bytes_received += @intCast(fbs.buffer.len);
+        // Update network path stats (only once per datagram, not per coalesced packet)
+        if (info.datagram_size > 0) {
+            self.paths[self.active_path_idx].bytes_received += info.datagram_size;
+        }
 
         // Check for duplicate
         if (self.pkt_handler.recv[@intFromEnum(enc_level)].isDuplicate(header.packet_number)) {
@@ -1082,7 +1089,9 @@ pub const Connection = struct {
                 std.log.info("connection migration detected from new peer address", .{});
                 self.handleMigration(info.from, info.to, now);
                 // Credit this packet's bytes to the new path (already counted on old path above)
-                self.paths[self.active_path_idx].bytes_received += @intCast(fbs.buffer.len);
+                if (info.datagram_size > 0) {
+                    self.paths[self.active_path_idx].bytes_received += info.datagram_size;
+                }
             }
         }
 
@@ -3015,6 +3024,7 @@ pub const Connection = struct {
     /// and dispatches each packet through recv().
     pub fn handleDatagram(self: *Connection, bytes: []u8, info: RecvInfo) void {
         var fbs = std.io.fixedBufferStream(bytes);
+        var first_packet = true;
         while (fbs.pos < bytes.len) {
             // All valid QUIC packets have the fixed bit (0x40) set.
             // If not set, remaining bytes are padding — stop parsing.
@@ -3024,7 +3034,12 @@ pub const Connection = struct {
             var header = packet.Header.parse(&fbs, self.scid_len) catch break;
             const full_size = fbs.pos - pkt_start + header.remainder_len;
 
-            self.recv(&header, &fbs, info) catch break;
+            // Only count datagram_size for the first packet to avoid
+            // double-counting in amplification limit calculations.
+            var pkt_info = info;
+            if (!first_packet) pkt_info.datagram_size = 0;
+            first_packet = false;
+            self.recv(&header, &fbs, pkt_info) catch break;
 
             const next_pos = pkt_start + full_size;
             if (fbs.pos < next_pos) fbs.pos = next_pos;

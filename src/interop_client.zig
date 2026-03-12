@@ -316,6 +316,7 @@ fn downloadAll(
                 .to = connection.sockaddrToStorage(&local_addr.any),
                 .from = remote_addr,
                 .ecn = recv_result.ecn,
+                .datagram_size = recv_result.bytes_read,
             });
 
             if (conn.state == .connected) handshake_complete = true;
@@ -491,6 +492,7 @@ fn downloadH0(
                     .to = connection.sockaddrToStorage(&local_addr.any),
                     .from = recv_result.from_addr,
                     .ecn = recv_result.ecn,
+                    .datagram_size = recv_result.bytes_read,
                 });
             }
         }
@@ -639,6 +641,7 @@ fn downloadH3(
                     .to = connection.sockaddrToStorage(&local_addr.any),
                     .from = recv_result.from_addr,
                     .ecn = recv_result.ecn,
+                    .datagram_size = recv_result.bytes_read,
                 });
             }
         }
@@ -734,6 +737,7 @@ fn drainRecv(
             .to = connection.sockaddrToStorage(&local_addr.any),
             .from = recv_result.from_addr,
             .ecn = recv_result.ecn,
+            .datagram_size = recv_result.bytes_read,
         });
     }
 }

@@ -339,8 +339,11 @@ pub const ConnectionManager = struct {
             }
 
             const e = entry.?;
+            // Only count datagram_size for the first packet in a coalesced datagram
+            // to avoid double-counting in amplification limit calculations.
+            const dg_size: u64 = if (current_entry == null) bytes.len else 0;
             current_entry = e;
-            const recv_info: connection.RecvInfo = .{ .to = local, .from = from, .ecn = ecn_val };
+            const recv_info: connection.RecvInfo = .{ .to = local, .from = from, .ecn = ecn_val, .datagram_size = dg_size };
             e.conn.recv(&header, &fbs, recv_info) catch break;
             self.syncCids(e);
 
