@@ -19,7 +19,7 @@ const MAX_SESSIONS: usize = 4;
 pub const SessionState = enum {
     connecting,
     active,
-    closing,
+    draining, // CLOSE_WEBTRANSPORT_SESSION sent or received, awaiting FIN
     closed,
 };
 
@@ -28,6 +28,9 @@ pub const Session = struct {
     session_id: u64 = 0, // = CONNECT stream ID
     state: SessionState = .closed,
     occupied: bool = false,
+    close_error_code: u32 = 0,
+    close_reason_buf: [128]u8 = undefined,
+    close_reason_len: u8 = 0,
 };
 
 /// Events returned by WebTransportConnection.poll().
@@ -39,7 +42,7 @@ pub const WtEvent = union(enum) {
     uni_stream: struct { session_id: u64, stream_id: u64 },
     stream_data: struct { stream_id: u64, data: []const u8 },
     datagram: struct { session_id: u64, data: []const u8 },
-    session_closed: u64, // session_id
+    session_closed: struct { session_id: u64, error_code: u32, reason: []const u8 },
 };
 
 /// WebTransport connection wrapping H3Connection + QUIC Connection.
@@ -48,6 +51,7 @@ pub const WebTransportConnection = struct {
     quic: *quic_connection.Connection,
     is_server: bool,
     sessions: [MAX_SESSIONS]Session = .{Session{}} ** MAX_SESSIONS,
+    active_session_count: u32 = 0,
 
     // Track which bidi/uni streams belong to WT sessions
     // Key: stream_id -> session_id
@@ -76,6 +80,12 @@ pub const WebTransportConnection = struct {
     }
 
     pub fn deinit(self: *WebTransportConnection) void {
+        // Free all buffered stream data
+        var buf_it = self.stream_bufs.iterator();
+        while (buf_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.stream_bufs.deinit();
         self.wt_bidi_streams.deinit();
         self.wt_uni_streams.deinit();
         self.pending_uni_streams.deinit();
@@ -104,10 +114,18 @@ pub const WebTransportConnection = struct {
         return null; // All slots full
     }
 
+    /// Get the peer's maximum allowed sessions from negotiated settings.
+    fn peerMaxSessions(self: *WebTransportConnection) u64 {
+        return self.h3.peer_settings.webtransport_max_sessions orelse 1;
+    }
+
     /// Client: initiate a WebTransport session via Extended CONNECT.
     pub fn connect(self: *WebTransportConnection, authority: []const u8, path: []const u8) !u64 {
+        // Enforce peer's session limit
+        if (self.active_session_count >= self.peerMaxSessions()) return error.TooManySessions;
         const session_id = try self.h3.sendConnectRequest("webtransport", authority, path);
         _ = self.allocateSession(session_id, .connecting) orelse return error.TooManySessions;
+        self.active_session_count += 1;
         return session_id;
     }
 
@@ -115,9 +133,12 @@ pub const WebTransportConnection = struct {
     pub fn acceptSession(self: *WebTransportConnection, session_id: u64) !void {
         try self.h3.sendConnectResponse(session_id, "200");
         if (self.getSession(session_id)) |s| {
-            s.state = .active;
+            if (s.state != .active) {
+                s.state = .active;
+            }
         } else {
             _ = self.allocateSession(session_id, .active) orelse return error.TooManySessions;
+            self.active_session_count += 1;
         }
     }
 
@@ -193,35 +214,182 @@ pub const WebTransportConnection = struct {
         try self.quic.sendDatagram(fbs.getWritten());
     }
 
-    /// Close a WebTransport session (close the CONNECT stream).
+    /// Close a WebTransport session with error code 0 and no reason.
     pub fn closeSession(self: *WebTransportConnection, session_id: u64) void {
-        if (self.getSession(session_id)) |s| {
-            s.state = .closed;
-            s.occupied = false;
-        }
-        // Close the CONNECT stream
+        self.closeSessionWithError(session_id, 0, "") catch {};
+    }
+
+    /// Close a WebTransport session with an application error code and reason.
+    /// Sends CLOSE_WEBTRANSPORT_SESSION frame on the CONNECT stream, then FIN.
+    pub fn closeSessionWithError(self: *WebTransportConnection, session_id: u64, error_code: u32, reason: []const u8) !void {
+        const session = self.getSession(session_id) orelse return;
+        if (session.state == .draining or session.state == .closed) return;
+
+        // Send CLOSE_WEBTRANSPORT_SESSION on the CONNECT stream
         if (self.quic.streams.getStream(session_id)) |stream| {
+            var frame_buf: [256]u8 = undefined;
+            var fbs = io.fixedBufferStream(&frame_buf);
+            h3_frame.write(.{ .close_webtransport_session = .{
+                .error_code = error_code,
+                .reason = reason,
+            } }, fbs.writer()) catch {};
+            stream.send.writeData(fbs.getWritten()) catch {};
             stream.send.close();
+        }
+
+        session.state = .draining;
+
+        // Clean up streams belonging to this session
+        self.cleanupSessionStreams(session_id);
+    }
+
+    /// Mark a session as fully closed and release its slot.
+    fn finalizeSession(self: *WebTransportConnection, session: *Session) void {
+        session.state = .closed;
+        session.occupied = false;
+        self.active_session_count -|= 1;
+    }
+
+    /// Reset all streams belonging to a session and free their buffers.
+    fn cleanupSessionStreams(self: *WebTransportConnection, session_id: u64) void {
+        // Collect stream IDs to remove (can't remove during iteration)
+        var bidi_to_remove: [64]u64 = undefined;
+        var bidi_count: usize = 0;
+        var bidi_it = self.wt_bidi_streams.iterator();
+        while (bidi_it.next()) |entry| {
+            if (entry.value_ptr.* == session_id) {
+                if (bidi_count < 64) {
+                    bidi_to_remove[bidi_count] = entry.key_ptr.*;
+                    bidi_count += 1;
+                }
+            }
+        }
+        for (bidi_to_remove[0..bidi_count]) |sid| {
+            _ = self.wt_bidi_streams.remove(sid);
+            _ = self.h3.excluded_bidi_streams.remove(sid);
+            // Reset the stream if still open
+            if (self.quic.streams.getStream(sid)) |s| {
+                if (!s.send.fin_sent) {
+                    s.send.reset(0);
+                }
+                s.recv.stopSending(0);
+            }
+            // Free buffered data
+            if (self.stream_bufs.getPtr(sid)) |buf| {
+                buf.deinit(self.allocator);
+                _ = self.stream_bufs.remove(sid);
+            }
+        }
+
+        var uni_to_remove: [64]u64 = undefined;
+        var uni_count: usize = 0;
+        var uni_it = self.wt_uni_streams.iterator();
+        while (uni_it.next()) |entry| {
+            if (entry.value_ptr.* == session_id) {
+                if (uni_count < 64) {
+                    uni_to_remove[uni_count] = entry.key_ptr.*;
+                    uni_count += 1;
+                }
+            }
+        }
+        for (uni_to_remove[0..uni_count]) |sid| {
+            _ = self.wt_uni_streams.remove(sid);
+            if (self.quic.streams.recv_streams.get(sid)) |recv_stream| {
+                recv_stream.stopSending(0);
+            }
+            if (self.stream_bufs.getPtr(sid)) |buf| {
+                buf.deinit(self.allocator);
+                _ = self.stream_bufs.remove(sid);
+            }
         }
     }
 
     /// Poll for the next WebTransport event.
     pub fn poll(self: *WebTransportConnection) !?WtEvent {
-        // 1. Check for incoming WT datagrams
+        // 1. Check CONNECT streams for CLOSE_WEBTRANSPORT_SESSION
+        if (self.pollSessionStreams()) |event| return event;
+
+        // 2. Check for incoming WT datagrams
         if (self.pollDatagrams()) |event| return event;
 
-        // 2. Check for incoming WT uni streams with type prefix
+        // 3. Check for incoming WT uni streams with type prefix
         if (try self.identifyWtUniStreams()) |event| return event;
 
-        // 3. Check for incoming WT bidi streams with type prefix
+        // 4. Check for incoming WT bidi streams with type prefix
         if (try self.identifyWtBidiStreams()) |event| return event;
 
-        // 4. Check for data on known WT streams
+        // 5. Check for data on known WT streams
         if (self.pollWtStreamData()) |event| return event;
 
-        // 5. Poll H3 for events (settings, connect requests, responses)
+        // 6. Poll H3 for events (settings, connect requests, responses)
         if (try self.pollH3Events()) |event| return event;
 
+        return null;
+    }
+
+    /// Poll active session CONNECT streams for CLOSE_WEBTRANSPORT_SESSION frames or FIN.
+    fn pollSessionStreams(self: *WebTransportConnection) ?WtEvent {
+        for (&self.sessions) |*session| {
+            if (!session.occupied) continue;
+            if (session.state != .active and session.state != .draining) continue;
+
+            const stream = self.quic.streams.getStream(session.session_id) orelse continue;
+            const data = stream.recv.read() orelse {
+                // No data — check if stream received FIN
+                if (stream.recv.finished) {
+                    const sid = session.session_id;
+                    if (session.state == .draining) {
+                        // Drain complete — peer acknowledged close
+                        const code = session.close_error_code;
+                        const reason_len = session.close_reason_len;
+                        self.finalizeSession(session);
+                        return .{ .session_closed = .{
+                            .session_id = sid,
+                            .error_code = code,
+                            .reason = session.close_reason_buf[0..reason_len],
+                        } };
+                    } else {
+                        // Peer closed without CLOSE frame — clean close with code 0
+                        self.cleanupSessionStreams(sid);
+                        self.finalizeSession(session);
+                        return .{ .session_closed = .{
+                            .session_id = sid,
+                            .error_code = 0,
+                            .reason = "",
+                        } };
+                    }
+                }
+                continue;
+            };
+
+            // Try to parse CLOSE_WEBTRANSPORT_SESSION frame
+            const result = h3_frame.parse(data) catch continue;
+            switch (result.frame) {
+                .close_webtransport_session => |cls| {
+                    const sid = session.session_id;
+                    session.close_error_code = cls.error_code;
+                    const copy_len = @min(cls.reason.len, session.close_reason_buf.len);
+                    @memcpy(session.close_reason_buf[0..copy_len], cls.reason[0..copy_len]);
+                    session.close_reason_len = @intCast(copy_len);
+
+                    // Send our own FIN (echo close) if we haven't already
+                    if (session.state == .active) {
+                        if (self.quic.streams.getStream(sid)) |s| {
+                            s.send.close();
+                        }
+                        self.cleanupSessionStreams(sid);
+                    }
+
+                    self.finalizeSession(session);
+                    return .{ .session_closed = .{
+                        .session_id = sid,
+                        .error_code = cls.error_code,
+                        .reason = session.close_reason_buf[0..copy_len],
+                    } };
+                },
+                else => {}, // Ignore other frames on CONNECT stream
+            }
+        }
         return null;
     }
 
@@ -437,10 +605,11 @@ pub const WebTransportConnection = struct {
                             if (std.mem.eql(u8, h_item.name, ":status")) {
                                 if (std.mem.eql(u8, h_item.value, "200")) {
                                     session.state = .active;
+                                    // Exclude CONNECT stream from H3 — WT layer owns it now
+                                    self.h3.excluded_bidi_streams.put(hdr.stream_id, {}) catch {};
                                     return .{ .session_ready = hdr.stream_id };
                                 } else {
-                                    session.state = .closed;
-                                    session.occupied = false;
+                                    self.finalizeSession(session);
                                     return .{ .session_rejected = .{
                                         .session_id = hdr.stream_id,
                                         .status = h_item.value,
@@ -455,9 +624,14 @@ pub const WebTransportConnection = struct {
             .data => {},
             .finished => |stream_id| {
                 if (self.getSession(stream_id)) |session| {
-                    session.state = .closed;
-                    session.occupied = false;
-                    return .{ .session_closed = stream_id };
+                    // CONNECT stream finished via H3 — session closed without close frame
+                    self.cleanupSessionStreams(stream_id);
+                    self.finalizeSession(session);
+                    return .{ .session_closed = .{
+                        .session_id = stream_id,
+                        .error_code = 0,
+                        .reason = "",
+                    } };
                 }
             },
             .goaway => {},

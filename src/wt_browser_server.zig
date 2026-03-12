@@ -200,8 +200,10 @@ pub fn main() !void {
                         .session_rejected => |rej| {
                             std.debug.print("WT: session {d} rejected ({s})\n", .{ rej.session_id, rej.status });
                         },
-                        .session_closed => |sid| {
-                            std.debug.print("WT: session {d} closed\n", .{sid});
+                        .session_closed => |cls| {
+                            std.debug.print("WT: session {d} closed (code={d}, reason={s})\n", .{
+                                cls.session_id, cls.error_code, cls.reason,
+                            });
                         },
                     }
                 }

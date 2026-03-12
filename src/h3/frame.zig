@@ -13,6 +13,7 @@ pub const H3FrameType = enum(u64) {
     goaway = 0x07,
     max_push_id = 0x0d, // not used
     priority_update = 0xF0700, // RFC 9218
+    close_webtransport_session = 0x2843, // draft-ietf-webtrans-http3
 
     pub fn fromInt(v: u64) ?H3FrameType {
         return switch (v) {
@@ -24,6 +25,7 @@ pub const H3FrameType = enum(u64) {
             0x07 => .goaway,
             0x0d => .max_push_id,
             0xF0700 => .priority_update,
+            0x2843 => .close_webtransport_session,
             else => null,
         };
     }
@@ -78,6 +80,12 @@ pub const PriorityUpdate = struct {
     field_value: []const u8,
 };
 
+/// CLOSE_WEBTRANSPORT_SESSION payload (draft-ietf-webtrans-http3).
+pub const CloseWebtransportSession = struct {
+    error_code: u32,
+    reason: []const u8, // optional UTF-8 reason phrase
+};
+
 /// HTTP/3 frame (RFC 9114 Section 7).
 pub const H3Frame = union(H3FrameType) {
     data: []const u8,
@@ -88,6 +96,7 @@ pub const H3Frame = union(H3FrameType) {
     goaway: u64,
     max_push_id: u64,
     priority_update: PriorityUpdate,
+    close_webtransport_session: CloseWebtransportSession,
 };
 
 /// HTTP/3 unidirectional stream types (RFC 9114 Section 6.2).
@@ -198,6 +207,15 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
                 .field_value = payload[fv_start..],
             } };
         },
+        .close_webtransport_session => blk: {
+            if (payload.len < 4) return error.MalformedFrame;
+            const error_code = std.mem.readInt(u32, payload[0..4], .big);
+            const reason = if (payload.len > 4) payload[4..] else &[_]u8{};
+            break :blk .{ .close_webtransport_session = .{
+                .error_code = error_code,
+                .reason = reason,
+            } };
+        },
     };
 
     return .{
@@ -305,6 +323,15 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
             try packet.writeVarInt(writer, payload_len);
             try packet.writeVarInt(writer, pu.stream_id);
             try writer.writeAll(pu.field_value);
+        },
+        .close_webtransport_session => |cls| {
+            const payload_len: u64 = 4 + cls.reason.len;
+            try packet.writeVarInt(writer, 0x2843);
+            try packet.writeVarInt(writer, payload_len);
+            try writer.writeInt(u32, cls.error_code, .big);
+            if (cls.reason.len > 0) {
+                try writer.writeAll(cls.reason);
+            }
         },
     }
 }
@@ -486,6 +513,41 @@ test "H3Frame: write and parse PRIORITY_UPDATE empty field value" {
     try testing.expectEqual(H3FrameType.priority_update, std.meta.activeTag(result.frame));
     try testing.expectEqual(@as(u64, 0), result.frame.priority_update.stream_id);
     try testing.expectEqualStrings("", result.frame.priority_update.field_value);
+}
+
+test "H3Frame: write and parse CLOSE_WEBTRANSPORT_SESSION" {
+    var buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+
+    try write(.{ .close_webtransport_session = .{
+        .error_code = 42,
+        .reason = "goodbye",
+    } }, fbs.writer());
+
+    const written = fbs.getWritten();
+    const result = try parse(written);
+
+    try testing.expectEqual(H3FrameType.close_webtransport_session, std.meta.activeTag(result.frame));
+    try testing.expectEqual(@as(u32, 42), result.frame.close_webtransport_session.error_code);
+    try testing.expectEqualStrings("goodbye", result.frame.close_webtransport_session.reason);
+    try testing.expectEqual(written.len, result.consumed);
+}
+
+test "H3Frame: write and parse CLOSE_WEBTRANSPORT_SESSION no reason" {
+    var buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+
+    try write(.{ .close_webtransport_session = .{
+        .error_code = 0,
+        .reason = "",
+    } }, fbs.writer());
+
+    const written = fbs.getWritten();
+    const result = try parse(written);
+
+    try testing.expectEqual(H3FrameType.close_webtransport_session, std.meta.activeTag(result.frame));
+    try testing.expectEqual(@as(u32, 0), result.frame.close_webtransport_session.error_code);
+    try testing.expectEqualStrings("", result.frame.close_webtransport_session.reason);
 }
 
 test "UniStreamType: write and read" {

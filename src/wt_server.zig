@@ -122,7 +122,7 @@ pub fn main() !void {
                     .enable_connect_protocol = true,
                     .h3_datagram = true,
                     .enable_webtransport = true,
-                    .webtransport_max_sessions = 1,
+                    .webtransport_max_sessions = 4,
                 };
                 entry.h3_conn.?.initConnection() catch |err| {
                     std.log.err("H3 init error: {any}", .{err});
@@ -182,8 +182,10 @@ pub fn main() !void {
                         .session_rejected => |rej| {
                             std.debug.print("WT: session {d} rejected ({s})\n", .{ rej.session_id, rej.status });
                         },
-                        .session_closed => |sid| {
-                            std.debug.print("WT: session {d} closed\n", .{sid});
+                        .session_closed => |cls| {
+                            std.debug.print("WT: session {d} closed (code={d}, reason={s})\n", .{
+                                cls.session_id, cls.error_code, cls.reason,
+                            });
                         },
                     }
                 }

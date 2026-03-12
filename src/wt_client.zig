@@ -254,8 +254,10 @@ pub fn main() !void {
                     std.debug.print("Datagram response (session={d}): {s}\n", .{ dg.session_id, dg.data });
                     got_response = true;
                 },
-                .session_closed => |sid| {
-                    std.debug.print("Session {d} closed\n", .{sid});
+                .session_closed => |cls| {
+                    std.debug.print("Session {d} closed (code={d}, reason={s})\n", .{
+                        cls.session_id, cls.error_code, cls.reason,
+                    });
                 },
                 else => {},
             }

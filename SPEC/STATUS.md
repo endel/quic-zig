@@ -430,10 +430,10 @@ No remaining work — all sections implemented. Optional improvements:
 | — | Uni streams (0x54 prefix) | ✅ Done | Type prefix + session ID |
 | — | Datagram demux | ✅ Done | quarter_stream_id routing |
 | — | Session management | ✅ Done | WebTransportConnection |
-| — | Multiple sessions | ⚠️ Partial | Single session per connection |
-| — | Session close/drain | ⚠️ Partial | Basic close; no CLOSE_WEBTRANSPORT_SESSION |
+| — | Multiple sessions | ✅ Done | Up to 4 sessions, peer max_sessions enforcement |
+| — | Session close/drain | ✅ Done | CLOSE_WEBTRANSPORT_SESSION (0x2843) frame, drain lifecycle, stream cleanup |
 
-### Summary — WebTransport: ✅ Functional (interop verified with quic-go)
+### Summary — WebTransport: ✅ Complete (interop verified with quic-go)
 
 ---
 
@@ -488,16 +488,16 @@ No remaining work — all sections implemented. Optional improvements:
 
 | RFC | Done | Partial | Missing | Completion |
 |-----|------|---------|---------|------------|
-| RFC 9000 (QUIC) | 94 | 9 | 3 | ~96% |
+| RFC 9000 (QUIC) | 98 | 5 | 3 | ~93% |
 | RFC 9001 (TLS) | 31 | 2 | 0 | ~97% |
-| RFC 9002 (Loss/CC) | 23 | 1 | 0 | ~96% |
-| RFC 9114 (HTTP/3) | 18 | 4 | 5 | ~74% |
+| RFC 9002 (Loss/CC) | 24 | 0 | 0 | 100% |
+| RFC 9114 (HTTP/3) | 21 | 1 | 5 | ~81% |
 | RFC 9204 (QPACK) | 11 | 0 | 0 | 100% |
 | RFC 9297 (Datagrams) | 3 | 0 | 1 | ~88% |
 | RFC 9221 (QUIC DG) | 3 | 0 | 0 | 100% |
 | RFC 9368 (Version Neg) | 3 | 0 | 0 | 100% |
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
-| WebTransport | 6 | 2 | 0 | ~88% |
+| WebTransport | 8 | 0 | 0 | 100% |
 
 ### Top Priority Items Across All RFCs
 
@@ -511,5 +511,5 @@ No remaining work — all sections implemented. Optional improvements:
 | ~~6~~ | ~~Server's Preferred Address~~ | ~~9000 §9.6~~ | ~~Done~~ | ~~Done~~ |
 | ~~7~~ | ~~QPACK dynamic table~~ | ~~9204 §3.2~~ | ~~Done~~ | ~~Done~~ |
 | 8 | Server Push (H3) | 9114 §4.6 | Large | H3 feature completeness |
-| 9 | Graceful H3 shutdown | 9114 §5.2 | Medium | Connection lifecycle |
+| ~~9~~ | ~~Graceful H3 shutdown~~ | ~~9114 §5.2~~ | ~~Done~~ | ~~Done~~ |
 | 10 | Capsule Protocol | 9297 §4 | Medium | WT/proxy completeness |
