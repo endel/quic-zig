@@ -109,6 +109,188 @@ fn verifyRsaPss(
     }
 }
 
+// ─── X.509 extension parsing for chain validation (RFC 5280) ─────────
+
+const X509Extensions = struct {
+    /// basicConstraints: CA flag (RFC 5280 §4.2.1.9)
+    is_ca: ?bool = null,
+    /// basicConstraints: pathLenConstraint
+    path_len_constraint: ?u32 = null,
+    /// keyUsage bit field (RFC 5280 §4.2.1.3), MSB-first
+    key_usage: ?u16 = null,
+
+    /// Check if the keyCertSign bit is set.
+    /// RFC 5280: keyCertSign is bit 5 in the KeyUsage BIT STRING.
+    /// In DER encoding: byte[1] bit 2 = 0x04, stored as ku = byte[1]<<8 | byte[2].
+    fn hasKeyCertSign(self: X509Extensions) bool {
+        if (self.key_usage) |ku| {
+            return (ku & 0x0400) != 0;
+        }
+        // If keyUsage extension is absent, no restriction applies
+        return true;
+    }
+};
+
+/// Parse X.509 v3 extensions from a DER certificate buffer.
+/// Uses the same DER walking approach as std.crypto.Certificate.parse().
+fn parseX509Extensions(cert_der: []const u8) X509Extensions {
+    const der = Certificate.der;
+    var result = X509Extensions{};
+
+    // Parse top-level Certificate SEQUENCE
+    const cert_seq = der.Element.parse(cert_der, 0) catch return result;
+
+    // Parse TBSCertificate SEQUENCE
+    const tbs = der.Element.parse(cert_der, cert_seq.slice.start) catch return result;
+
+    // Walk TBSCertificate fields to find extensions
+    // version [0] EXPLICIT INTEGER
+    var pos: u32 = tbs.slice.start;
+    const version_outer = der.Element.parse(cert_der, pos) catch return result;
+
+    // Check if this is an explicit tag [0] (context-specific, constructed)
+    if (version_outer.identifier.class == .context_specific) {
+        pos = version_outer.slice.end;
+    }
+    // Otherwise v1 cert, no version field — pos stays
+
+    // serialNumber INTEGER
+    const serial = der.Element.parse(cert_der, pos) catch return result;
+    pos = serial.slice.end;
+
+    // signature AlgorithmIdentifier
+    const sig_algo = der.Element.parse(cert_der, pos) catch return result;
+    pos = sig_algo.slice.end;
+
+    // issuer Name
+    const issuer = der.Element.parse(cert_der, pos) catch return result;
+    pos = issuer.slice.end;
+
+    // validity Validity
+    const validity = der.Element.parse(cert_der, pos) catch return result;
+    pos = validity.slice.end;
+
+    // subject Name
+    const subject = der.Element.parse(cert_der, pos) catch return result;
+    pos = subject.slice.end;
+
+    // subjectPublicKeyInfo
+    const pub_key_info = der.Element.parse(cert_der, pos) catch return result;
+    pos = pub_key_info.slice.end;
+
+    // Extensions are [3] EXPLICIT SEQUENCE, after optional issuerUniqueID [1] and subjectUniqueID [2]
+    while (pos < tbs.slice.end) {
+        const elem = der.Element.parse(cert_der, pos) catch return result;
+        pos = elem.slice.end;
+
+        if (elem.identifier.class == .context_specific) {
+            if (@intFromEnum(elem.identifier.tag) == 3) {
+                // Extensions SEQUENCE
+                const extensions = der.Element.parse(cert_der, elem.slice.start) catch return result;
+                var ext_i = extensions.slice.start;
+                while (ext_i < extensions.slice.end) {
+                    const extension = der.Element.parse(cert_der, ext_i) catch return result;
+                    ext_i = extension.slice.end;
+
+                    const oid_elem = der.Element.parse(cert_der, extension.slice.start) catch continue;
+                    if (oid_elem.identifier.tag != .object_identifier) continue;
+
+                    // Skip optional critical BOOLEAN
+                    const next_elem = der.Element.parse(cert_der, oid_elem.slice.end) catch continue;
+                    const value_elem = if (next_elem.identifier.tag == .boolean)
+                        der.Element.parse(cert_der, next_elem.slice.end) catch continue
+                    else
+                        next_elem;
+
+                    // value_elem should be OCTET STRING wrapping the extension value
+                    if (value_elem.identifier.tag != .octetstring) continue;
+
+                    const oid_bytes = cert_der[oid_elem.slice.start..oid_elem.slice.end];
+
+                    // basicConstraints: OID 2.5.29.19 = { 0x55, 0x1D, 0x13 }
+                    if (oid_bytes.len == 3 and oid_bytes[0] == 0x55 and oid_bytes[1] == 0x1D and oid_bytes[2] == 0x13) {
+                        parseBasicConstraints(cert_der, value_elem, &result);
+                    }
+
+                    // keyUsage: OID 2.5.29.15 = { 0x55, 0x1D, 0x0F }
+                    if (oid_bytes.len == 3 and oid_bytes[0] == 0x55 and oid_bytes[1] == 0x1D and oid_bytes[2] == 0x0F) {
+                        parseKeyUsage(cert_der, value_elem, &result);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
+fn parseBasicConstraints(cert_der: []const u8, octet_elem: Certificate.der.Element, result: *X509Extensions) void {
+    const der = Certificate.der;
+    // OCTET STRING contains: SEQUENCE { BOOLEAN (cA), INTEGER (pathLen) OPTIONAL }
+    const seq = der.Element.parse(cert_der, octet_elem.slice.start) catch return;
+    if (seq.identifier.tag != .sequence) return;
+
+    if (seq.slice.start >= seq.slice.end) {
+        // Empty sequence means CA:FALSE (default)
+        result.is_ca = false;
+        return;
+    }
+
+    const ca_elem = der.Element.parse(cert_der, seq.slice.start) catch return;
+    if (ca_elem.identifier.tag == .boolean) {
+        result.is_ca = cert_der[ca_elem.slice.start] != 0;
+
+        // Optional pathLenConstraint INTEGER
+        if (ca_elem.slice.end < seq.slice.end) {
+            const path_len_elem = der.Element.parse(cert_der, ca_elem.slice.end) catch return;
+            if (path_len_elem.identifier.tag == .integer) {
+                const len = path_len_elem.slice.end - path_len_elem.slice.start;
+                if (len == 1) {
+                    result.path_len_constraint = cert_der[path_len_elem.slice.start];
+                }
+            }
+        }
+    } else {
+        // No BOOLEAN means CA:FALSE (default is FALSE per RFC 5280)
+        result.is_ca = false;
+    }
+}
+
+fn parseKeyUsage(cert_der: []const u8, octet_elem: Certificate.der.Element, result: *X509Extensions) void {
+    const der = Certificate.der;
+    // OCTET STRING contains: BIT STRING with key usage bits
+    const bit_str = der.Element.parse(cert_der, octet_elem.slice.start) catch return;
+    if (bit_str.identifier.tag != .bitstring) return;
+
+    const content = cert_der[bit_str.slice.start..bit_str.slice.end];
+    if (content.len < 2) return;
+
+    // First byte is number of unused bits in last byte
+    // Second byte has the key usage bits (MSB first):
+    //   bit 0: digitalSignature
+    //   bit 1: contentCommitment (nonRepudiation)
+    //   bit 2: keyEncipherment
+    //   bit 3: dataEncipherment
+    //   bit 4: keyAgreement
+    //   bit 5: keyCertSign
+    //   bit 6: cRLSign
+    //   bit 7: encipherOnly
+    var ku: u16 = @as(u16, content[1]) << 8;
+    if (content.len >= 3) {
+        ku |= content[2];
+    }
+    result.key_usage = ku;
+}
+
+/// Load system root CA certificates into a Certificate.Bundle.
+/// The caller owns the returned bundle and must call bundle.deinit(allocator).
+pub fn loadSystemCaBundle(allocator: std.mem.Allocator) !Certificate.Bundle {
+    var bundle: Certificate.Bundle = .{};
+    try bundle.rescan(allocator);
+    return bundle;
+}
+
 // ─── TranscriptHash ──────────────────────────────────────────────────
 
 pub const TranscriptHash = struct {
@@ -896,6 +1078,21 @@ pub const Tls13Handshake = struct {
                 if (prev_parsed) |prev| {
                     const now_sec = std.time.timestamp();
                     prev.verify(parsed, now_sec) catch return error.BadCertificate;
+
+                    // RFC 5280 §4.2.1.9: issuer cert must have basicConstraints CA:TRUE
+                    // RFC 5280 §4.2.1.3: if keyUsage present, must include keyCertSign
+                    const exts = parseX509Extensions(cert_der);
+                    if (exts.is_ca) |is_ca| {
+                        if (!is_ca) return error.BadCertificate;
+                    }
+                    if (!exts.hasKeyCertSign()) return error.BadCertificate;
+
+                    // RFC 5280 §4.2.1.9: enforce pathLenConstraint
+                    if (exts.path_len_constraint) |max_len| {
+                        // cert_index counts from leaf (0), so intermediates below
+                        // this cert is cert_index - 1 certs deep
+                        if (cert_index > max_len + 1) return error.BadCertificate;
+                    }
                 }
 
                 // If this is the last cert, verify against CA bundle
@@ -2773,4 +2970,68 @@ test "NewSessionTicket: build and parse roundtrip" {
 
     // Verify PSK is stored correctly
     try std.testing.expectEqualSlices(u8, &psk, &original.psk);
+}
+
+// ─── X.509 extension parsing tests ─────────────────────────────────
+
+test "parseX509Extensions: CA certificate with basicConstraints and keyUsage" {
+    // v3 CA cert with basicConstraints=CA:TRUE and keyUsage=keyCertSign,cRLSign
+    const ca_der = @embedFile("testdata/test_ca.der");
+    const exts = parseX509Extensions(ca_der);
+
+    // CA cert should have basicConstraints CA:TRUE
+    try std.testing.expect(exts.is_ca != null);
+    try std.testing.expect(exts.is_ca.?);
+    // CA cert should have keyCertSign in keyUsage
+    try std.testing.expect(exts.key_usage != null);
+    try std.testing.expect(exts.hasKeyCertSign());
+}
+
+test "parseX509Extensions: leaf certificate is not CA" {
+    // v3 leaf cert with basicConstraints=CA:FALSE and keyUsage=digitalSignature
+    const leaf_der = @embedFile("testdata/test_leaf.der");
+    const exts = parseX509Extensions(leaf_der);
+
+    // Leaf cert should have basicConstraints CA:FALSE
+    try std.testing.expect(exts.is_ca != null);
+    try std.testing.expect(!exts.is_ca.?);
+    // Leaf cert should NOT have keyCertSign
+    try std.testing.expect(exts.key_usage != null);
+    try std.testing.expect(!exts.hasKeyCertSign());
+}
+
+test "parseX509Extensions: v1 certificate has no extensions" {
+    // v1 cert has no extensions at all
+    const v1_der = @embedFile("testdata/v1_ca.der");
+    const exts = parseX509Extensions(v1_der);
+
+    // v1 cert should have no extensions parsed
+    try std.testing.expect(exts.is_ca == null);
+    try std.testing.expect(exts.key_usage == null);
+    // hasKeyCertSign defaults to true when no extension present
+    try std.testing.expect(exts.hasKeyCertSign());
+}
+
+test "X509Extensions: hasKeyCertSign defaults to true when no keyUsage" {
+    const exts = X509Extensions{};
+    // No keyUsage extension present — no restriction, returns true
+    try std.testing.expect(exts.hasKeyCertSign());
+}
+
+test "X509Extensions: hasKeyCertSign with keyCertSign bit set" {
+    // keyCertSign = bit 5 in RFC 5280 = byte[1] bit 2 = 0x04
+    // In our u16 (byte[1]<<8 | byte[2]): keyCertSign = 0x0400
+    var exts = X509Extensions{};
+
+    // keyCertSign + cRLSign (typical CA): byte[1] = 0x06 → ku = 0x0600
+    exts.key_usage = 0x0600;
+    try std.testing.expect(exts.hasKeyCertSign());
+
+    // digitalSignature only (leaf cert): byte[1] = 0x80 → ku = 0x8000
+    exts.key_usage = 0x8000;
+    try std.testing.expect(!exts.hasKeyCertSign());
+
+    // keyCertSign alone: 0x0400
+    exts.key_usage = 0x0400;
+    try std.testing.expect(exts.hasKeyCertSign());
 }
