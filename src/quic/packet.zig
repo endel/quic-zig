@@ -601,6 +601,16 @@ pub fn negotiateVersion(header: Header, writer: anytype) !void {
     for (protocol.SUPPORTED_VERSIONS) |version| {
         try writer.writeInt(u32, version, ENDIAN);
     }
+
+    // RFC 9000 §6.3: Include a reserved version for greasing.
+    // Reserved versions follow the pattern 0x?a?a?a?a.
+    var grease_bytes: [2]u8 = undefined;
+    random.bytes(&grease_bytes);
+    const grease_version: u32 = (@as(u32, grease_bytes[0] >> 4) << 28) | (0xa << 24) |
+        (@as(u32, grease_bytes[0] & 0xf) << 20) | (0xa << 16) |
+        (@as(u32, grease_bytes[1] >> 4) << 12) | (0xa << 8) |
+        (@as(u32, grease_bytes[1] & 0xf) << 4) | 0xa;
+    try writer.writeInt(u32, grease_version, ENDIAN);
 }
 
 pub fn retry(

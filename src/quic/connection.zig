@@ -687,6 +687,50 @@ pub const Connection = struct {
         self.crypto_streams.deinit();
     }
 
+    /// Handle a Version Negotiation packet (RFC 9000 §6.2, client only).
+    /// Since we support Compatible Version Negotiation (RFC 9368), VN packets
+    /// indicate the server doesn't support any of our versions — close the connection.
+    fn handleVersionNegotiation(self: *Connection, header: *const packet.Header, fbs: anytype) void {
+        // RFC 9000 §6.2: A client MUST discard VN if it has already received and
+        // successfully processed any packet, including an earlier VN.
+        if (self.state != .first_flight) return;
+
+        // Validate: the VN's DCID must match our SCID, and SCID must match our DCID
+        if (!std.mem.eql(u8, header.dcid, self.scid[0..self.scid_len])) return;
+        if (!std.mem.eql(u8, header.scid, self.dcid[0..self.dcid_len])) return;
+
+        // Read listed versions from the remaining bytes
+        const remaining = fbs.buffer.len - fbs.pos;
+        if (remaining < 4 or remaining % 4 != 0) return;
+
+        const version_data = fbs.buffer[fbs.pos..];
+        const version_count = remaining / 4;
+
+        // Check if any listed version is one we support (skip reserved versions)
+        var has_supported = false;
+        var i: usize = 0;
+        while (i < version_count) : (i += 1) {
+            const v = std.mem.readInt(u32, version_data[i * 4 ..][0..4], .big);
+            if (protocol.isSupportedVersion(v)) {
+                has_supported = true;
+                break;
+            }
+        }
+
+        if (has_supported) {
+            // The server lists a version we support but sent VN anyway.
+            // This shouldn't happen with compatible VN — possible downgrade attack.
+            // RFC 9000 §6.2: "A client MUST discard a Version Negotiation packet
+            // that lists the QUIC version selected by the client."
+            std.log.warn("VN packet lists our version — possible downgrade attack, ignoring", .{});
+            return;
+        }
+
+        // No compatible version — close the connection
+        std.log.info("VN: server does not support any of our versions, closing", .{});
+        self.closeWithTransportError(0x11, 0x00, "Version negotiation failed"); // 0x11 = VERSION_NEGOTIATION_ERROR
+    }
+
     /// Handle a Retry packet (client only).
     /// Verifies the integrity tag, saves ODCID, re-derives Initial keys with new DCID,
     /// and resets crypto stream so the same ClientHello is re-sent.
@@ -767,6 +811,14 @@ pub const Connection = struct {
         if (header.packet_type == .retry) {
             if (!self.is_server) {
                 try self.handleRetryPacket(header, fbs.buffer[header.packet_start..fbs.buffer.len]);
+            }
+            return;
+        }
+
+        // RFC 9000 §6.2: Handle Version Negotiation packets (client only)
+        if (header.packet_type == .version_negotiation) {
+            if (!self.is_server and !self.handshake_confirmed) {
+                self.handleVersionNegotiation(header, fbs);
             }
             return;
         }

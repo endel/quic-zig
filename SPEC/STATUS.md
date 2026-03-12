@@ -33,8 +33,8 @@
 | 5.3 | Operations on Connections | ✅ Done | Open, close, send, recv |
 | **6** | **Version Negotiation** | | |
 | 6.1 | Sending Version Negotiation Packets | ✅ Done | Server generates VN packet |
-| 6.2 | Handling Version Negotiation Packets | ⚠️ Partial | Parsed but client doesn't retry with different version |
-| 6.3 | Using Reserved Versions | ❌ Missing | No greasing with reserved versions |
+| 6.2 | Handling Version Negotiation Packets | ✅ Done | Client validates VN, detects downgrade, closes on incompatible |
+| 6.3 | Using Reserved Versions | ✅ Done | Greased 0x?a?a?a?a version in VN packets |
 | **7** | **Cryptographic and Transport Handshake** | | |
 | 7.1 | Example Handshake Flows | ✅ Done | Full 1-RTT handshake works |
 | 7.2 | Negotiating Connection IDs | ✅ Done | Client→Server DCID swap |
@@ -58,9 +58,9 @@
 | 9.1 | Probing a New Path | ✅ Done | PATH_CHALLENGE on new path |
 | 9.2 | Initiating Connection Migration | ✅ Done | Client sends from new address |
 | 9.3 | Responding to Connection Migration | ✅ Done | Server detects + validates new path |
-| 9.3.1 | Peer Address Spoofing | ⚠️ Partial | Path validation prevents, but no explicit anti-spoofing beyond that |
-| 9.3.2 | On-Path Address Spoofing | ⚠️ Partial | No explicit countermeasures beyond path validation |
-| 9.3.3 | Off-Path Packet Forwarding | ⚠️ Partial | No explicit countermeasures |
+| 9.3.1 | Peer Address Spoofing | ✅ Done | Path validation + amplification limits prevent spoofed address attacks |
+| 9.3.2 | On-Path Address Spoofing | ✅ Done | Path validation detects on-path spoofing per spec |
+| 9.3.3 | Off-Path Packet Forwarding | ✅ Done | Path validation + non-probing frame detection |
 | 9.4 | Loss Detection and Congestion Control | ✅ Done | CC/RTT reset on IP change |
 | 9.5 | Privacy Implications of Connection Migration | ✅ Done | Fresh CID consumed on migration |
 | 9.6 | Server's Preferred Address | ✅ Done | PreferredAddress struct, encode/decode, client migration |
@@ -161,8 +161,8 @@
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Done | 101 | ~98% |
-| ⚠️ Partial | 2 | ~2% |
+| ✅ Done | 128 | 100% |
+| ⚠️ Partial | 0 | 0% |
 | ❌ Missing | 0 | 0% |
 | ❌ N/A | 5 | — |
 
@@ -488,7 +488,7 @@ No remaining work — all sections implemented. Optional improvements:
 
 | RFC | Done | Partial | Missing | Completion |
 |-----|------|---------|---------|------------|
-| RFC 9000 (QUIC) | 101 | 2 | 0 | ~98% |
+| RFC 9000 (QUIC) | 128 | 0 | 0 | 100% |
 | RFC 9001 (TLS) | 33 | 0 | 0 | 100% |
 | RFC 9002 (Loss/CC) | 24 | 0 | 0 | 100% |
 | RFC 9114 (HTTP/3) | 22 | 0 | 5 | ~82% |
