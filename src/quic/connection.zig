@@ -1708,6 +1708,18 @@ pub const Connection = struct {
             iterations += 1;
             const action = hs.step() catch |err| {
                 std.log.err("TLS 1.3 handshake error: {}", .{err});
+                // RFC 9001 §4.8: map TLS errors to CRYPTO_ERROR (0x100 + TLS alert code)
+                const tls_alert: u64 = switch (err) {
+                    error.BadCertificate => 42, // bad_certificate
+                    error.BadCertificateVerify => 51, // decrypt_error
+                    error.UnexpectedMessage => 10, // unexpected_message
+                    error.DecodeError => 50, // decode_error
+                    error.BadFinished => 51, // decrypt_error
+                    error.NoKeyShare => 40, // handshake_failure
+                    error.UnsupportedVersion => 70, // protocol_version
+                    else => 80, // internal_error
+                };
+                self.closeWithTransportError(0x100 + tls_alert, 0x06, "TLS handshake failure");
                 return;
             };
             std.log.info("advanceHandshake: step {d} produced action={s}", .{ iterations, @tagName(action) });

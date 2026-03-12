@@ -439,9 +439,18 @@ pub const H3Connection = struct {
         }
     }
 
+    /// Close the connection with an H3 error code (RFC 9114 §8).
+    /// Sends APPLICATION_CLOSE via QUIC with the given error code.
+    fn closeWithError(self: *H3Connection, h3_error: H3Error, reason: []const u8) void {
+        self.quic_conn.close(@intFromEnum(h3_error), reason);
+    }
+
     /// Poll for the next HTTP/3 event.
     /// Processes incoming QUIC stream data and returns H3 events.
     pub fn poll(self: *H3Connection) !?H3Event {
+        // Check for critical stream closure (RFC 9114 §6.2.1, RFC 9204 §4.2)
+        if (self.checkCriticalStreams()) |err| return err;
+
         // First, identify any new peer uni streams
         if (try self.identifyPeerUniStreams()) |event| {
             return event;
@@ -466,6 +475,26 @@ pub const H3Connection = struct {
             return .{ .shutdown_complete = {} };
         }
 
+        return null;
+    }
+
+    /// RFC 9114 §6.2.1: Closing a critical uni stream (control, QPACK encoder, QPACK decoder)
+    /// MUST be treated as H3_CLOSED_CRITICAL_STREAM.
+    fn checkCriticalStreams(self: *H3Connection) ?error{H3ClosedCriticalStream} {
+        const critical_ids = [_]?u64{
+            self.peer_control_stream_id,
+            self.peer_qpack_enc_stream_id,
+            self.peer_qpack_dec_stream_id,
+        };
+        for (critical_ids) |maybe_id| {
+            const stream_id = maybe_id orelse continue;
+            if (self.quic_conn.streams.recv_streams.get(stream_id)) |recv_stream| {
+                if (recv_stream.reset_err != null) {
+                    self.closeWithError(.closed_critical_stream, "critical stream reset");
+                    return error.H3ClosedCriticalStream;
+                }
+            }
+        }
         return null;
     }
 
@@ -504,9 +533,9 @@ pub const H3Connection = struct {
                     // Buffer remaining data (encoder instructions after type byte)
                     if (fbs.pos < data.len) {
                         const remaining = data[fbs.pos..];
-                        std.log.info("QPACK encoder stream {d}: buffering {d} bytes of encoder instructions", .{ stream_id, remaining.len });
-                        self.qpack_decoder.processEncoderInstruction(remaining) catch |err| {
-                            std.log.err("QPACK encoder instruction error (initial): {}", .{err});
+                        self.qpack_decoder.processEncoderInstruction(remaining) catch {
+                            self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
+                            return error.H3GeneralProtocolError;
                         };
                     }
                 },
@@ -515,8 +544,9 @@ pub const H3Connection = struct {
                     // Buffer remaining data (decoder instructions after type byte)
                     if (fbs.pos < data.len) {
                         const remaining = data[fbs.pos..];
-                        self.qpack_encoder.processDecoderInstruction(remaining) catch |err| {
-                            std.log.err("QPACK decoder instruction error (initial): {}", .{err});
+                        self.qpack_encoder.processDecoderInstruction(remaining) catch {
+                            self.closeWithError(.general_protocol_error, "QPACK decoder stream error");
+                            return error.H3GeneralProtocolError;
                         };
                     }
                 },
@@ -549,6 +579,24 @@ pub const H3Connection = struct {
 
         const result = h3_frame.parse(buf.items) catch |err| {
             if (err == error.BufferTooShort) return null;
+            // RFC 9114 §7: malformed frames → H3_FRAME_ERROR
+            if (err == error.MalformedSettings) {
+                self.closeWithError(.frame_error, "malformed SETTINGS");
+                return error.H3FrameError;
+            }
+            if (err == error.MalformedGoaway) {
+                self.closeWithError(.frame_error, "malformed GOAWAY");
+                return error.H3FrameError;
+            }
+            if (err == error.MalformedFrame) {
+                self.closeWithError(.frame_error, "malformed frame");
+                return error.H3FrameError;
+            }
+            // RFC 9114 §7.2.8: reserved HTTP/2 frame types
+            if (err == error.H3FrameUnexpected) {
+                self.closeWithError(.frame_unexpected, "HTTP/2 frame type on H3 control stream");
+                return error.H3FrameUnexpected;
+            }
             return err;
         };
 
@@ -562,7 +610,9 @@ pub const H3Connection = struct {
         switch (result.frame) {
             .settings => |settings| {
                 if (self.peer_settings_received) {
-                    return error.H3SettingsError; // Duplicate SETTINGS
+                    // RFC 9114 §7.2.4: receiving a second SETTINGS frame
+                    self.closeWithError(.frame_unexpected, "duplicate SETTINGS");
+                    return error.H3FrameUnexpected;
                 }
                 self.peer_settings_received = true;
                 self.peer_settings = settings;
@@ -575,14 +625,27 @@ pub const H3Connection = struct {
                 return .{ .settings = settings };
             },
             .goaway => |id| {
+                // RFC 9114 §7.2.4: SETTINGS must be first frame on control stream
+                if (!self.peer_settings_received) {
+                    self.closeWithError(.missing_settings, "GOAWAY before SETTINGS");
+                    return error.H3MissingSettings;
+                }
                 // RFC 9114 §5.2: successive GOAWAY IDs must not increase
                 if (self.peer_goaway_id) |prev| {
-                    if (id > prev) return error.H3IdError;
+                    if (id > prev) {
+                        self.closeWithError(.id_error, "GOAWAY ID increased");
+                        return error.H3IdError;
+                    }
                 }
                 self.peer_goaway_id = id;
                 return .{ .goaway = id };
             },
             .priority_update => |pu| {
+                // RFC 9114 §7.2.4: SETTINGS must be first frame on control stream
+                if (!self.peer_settings_received) {
+                    self.closeWithError(.missing_settings, "PRIORITY_UPDATE before SETTINGS");
+                    return error.H3MissingSettings;
+                }
                 const prio = priority.parse(pu.field_value);
                 if (self.quic_conn.streams.getStream(pu.stream_id)) |stream| {
                     stream.send.urgency = prio.urgency;
@@ -590,7 +653,24 @@ pub const H3Connection = struct {
                 }
                 return null; // Internal, don't surface as event
             },
-            else => return null, // Ignore other frames on control stream
+            // RFC 9114 §7.2.1: DATA frames on control stream are H3_FRAME_UNEXPECTED
+            .data => {
+                self.closeWithError(.frame_unexpected, "DATA on control stream");
+                return error.H3FrameUnexpected;
+            },
+            // RFC 9114 §7.2.2: HEADERS frames on control stream are H3_FRAME_UNEXPECTED
+            .headers => {
+                self.closeWithError(.frame_unexpected, "HEADERS on control stream");
+                return error.H3FrameUnexpected;
+            },
+            else => {
+                // RFC 9114 §7.2.4: unknown frame types on control stream before SETTINGS
+                if (!self.peer_settings_received) {
+                    self.closeWithError(.missing_settings, "non-SETTINGS first frame");
+                    return error.H3MissingSettings;
+                }
+                return null; // Ignore other frames on control stream
+            },
         }
     }
 
@@ -719,21 +799,39 @@ pub const H3Connection = struct {
             while (buf.items.len > 0) {
                 const result = h3_frame.parse(buf.items) catch |err| {
                     if (err == error.BufferTooShort) break;
+                    // RFC 9114 §7: malformed frames → H3_FRAME_ERROR
+                    if (err == error.MalformedSettings or err == error.MalformedGoaway or err == error.MalformedFrame) {
+                        stream.send.reset(@intFromEnum(H3Error.frame_error));
+                        stream.recv.stopSending(@intFromEnum(H3Error.frame_error));
+                        break;
+                    }
+                    if (err == error.H3FrameUnexpected) {
+                        self.closeWithError(.frame_unexpected, "HTTP/2 frame type on request stream");
+                        return error.H3FrameUnexpected;
+                    }
                     return err;
                 };
 
                 // Process the frame BEFORE consuming from buffer
                 // (frame data slices point into buf.items)
                 switch (result.frame) {
+                    // RFC 9114 §7.2.4: SETTINGS on bidi stream is H3_FRAME_UNEXPECTED
+                    .settings, .goaway, .cancel_push, .max_push_id, .priority_update => {
+                        self.closeWithError(.frame_unexpected, "control frame on request stream");
+                        return error.H3FrameUnexpected;
+                    },
                     .headers => |qpack_data| {
                         var hdr_count: usize = 0;
                         if (self.qpack_decoder.decode(qpack_data, &self.headers_buf, stream_id)) |c| {
                             hdr_count = c;
                         } else |_| {
                             // Fallback to static-only decoder for compatibility
-                            hdr_count = qpack.decodeHeaders(qpack_data, &self.headers_buf) catch |err2| {
-                                std.log.err("QPACK decode error on stream {d}: {}", .{ stream_id, err2 });
-                                continue;
+                            hdr_count = qpack.decodeHeaders(qpack_data, &self.headers_buf) catch {
+                                // RFC 9114 §4.3: QPACK decode failure on request stream
+                                self.consumeFrameFromBuf(buf, result.consumed);
+                                stream.send.reset(@intFromEnum(H3Error.message_error));
+                                stream.recv.stopSending(@intFromEnum(H3Error.message_error));
+                                break;
                             };
                         }
                         const hdrs = self.headers_buf[0..hdr_count];
@@ -840,14 +938,16 @@ pub const H3Connection = struct {
     }
 
     /// Process data from peer's QPACK encoder and decoder streams.
+    /// RFC 9204 §4: errors on QPACK streams close the connection.
     fn pollQpackStreams(self: *H3Connection) !void {
         // Read from peer's encoder stream → feed to our decoder
         if (self.peer_qpack_enc_stream_id) |enc_id| {
             if (self.quic_conn.streams.recv_streams.get(enc_id)) |recv_stream| {
                 if (recv_stream.read()) |data| {
                     if (data.len > 0) {
-                        self.qpack_decoder.processEncoderInstruction(data) catch |err| {
-                            std.log.err("QPACK encoder instruction error: {}", .{err});
+                        self.qpack_decoder.processEncoderInstruction(data) catch {
+                            self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
+                            return error.H3GeneralProtocolError;
                         };
                     }
                 }
@@ -859,8 +959,9 @@ pub const H3Connection = struct {
             if (self.quic_conn.streams.recv_streams.get(dec_id)) |recv_stream| {
                 if (recv_stream.read()) |data| {
                     if (data.len > 0) {
-                        self.qpack_encoder.processDecoderInstruction(data) catch |err| {
-                            std.log.err("QPACK decoder instruction error: {}", .{err});
+                        self.qpack_encoder.processDecoderInstruction(data) catch {
+                            self.closeWithError(.general_protocol_error, "QPACK decoder stream error");
+                            return error.H3GeneralProtocolError;
                         };
                     }
                 }
@@ -1169,4 +1270,67 @@ test "validateResponseHeaders: uppercase header" {
         .{ .name = "Server", .value = "zig" },
     };
     try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
+}
+
+// RFC 9114 §8: Error handling tests
+
+test "H3Error: all error codes defined" {
+    // Verify all RFC 9114 §8.1 error codes are present and have correct values
+    try testing.expectEqual(@as(u64, 0x0100), @intFromEnum(H3Error.no_error));
+    try testing.expectEqual(@as(u64, 0x0101), @intFromEnum(H3Error.general_protocol_error));
+    try testing.expectEqual(@as(u64, 0x0102), @intFromEnum(H3Error.internal_error));
+    try testing.expectEqual(@as(u64, 0x0103), @intFromEnum(H3Error.stream_creation_error));
+    try testing.expectEqual(@as(u64, 0x0104), @intFromEnum(H3Error.closed_critical_stream));
+    try testing.expectEqual(@as(u64, 0x0105), @intFromEnum(H3Error.frame_unexpected));
+    try testing.expectEqual(@as(u64, 0x0106), @intFromEnum(H3Error.frame_error));
+    try testing.expectEqual(@as(u64, 0x0107), @intFromEnum(H3Error.excessive_load));
+    try testing.expectEqual(@as(u64, 0x0108), @intFromEnum(H3Error.id_error));
+    try testing.expectEqual(@as(u64, 0x0109), @intFromEnum(H3Error.settings_error));
+    try testing.expectEqual(@as(u64, 0x010a), @intFromEnum(H3Error.missing_settings));
+    try testing.expectEqual(@as(u64, 0x010b), @intFromEnum(H3Error.request_rejected));
+    try testing.expectEqual(@as(u64, 0x010c), @intFromEnum(H3Error.request_cancelled));
+    try testing.expectEqual(@as(u64, 0x010d), @intFromEnum(H3Error.request_incomplete));
+    try testing.expectEqual(@as(u64, 0x010e), @intFromEnum(H3Error.message_error));
+    try testing.expectEqual(@as(u64, 0x010f), @intFromEnum(H3Error.connect_error));
+    try testing.expectEqual(@as(u64, 0x0110), @intFromEnum(H3Error.version_fallback));
+}
+
+test "H3 frame error: malformed SETTINGS detected" {
+    // Verify that MalformedSettings maps to H3_FRAME_ERROR in frame parsing
+    // A SETTINGS frame with incomplete varint value should fail
+    var buf: [10]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const writer = fbs.writer();
+    // Write SETTINGS type (0x04) + length (3) + valid id varint + truncated value
+    packet.writeVarInt(writer, 0x04) catch unreachable;
+    packet.writeVarInt(writer, 3) catch unreachable;
+    // Write a setting ID that's valid but value is incomplete (starts with 0xC0 = 8-byte varint prefix)
+    buf[fbs.pos] = 0x01; // QPACK_MAX_TABLE_CAPACITY
+    buf[fbs.pos + 1] = 0xC0; // 8-byte varint prefix but only 2 bytes follow
+    buf[fbs.pos + 2] = 0x00;
+    const result = h3_frame.parse(buf[0 .. fbs.pos + 3]);
+    try testing.expectError(error.MalformedSettings, result);
+}
+
+test "H3 frame error: reserved HTTP/2 frame type" {
+    // Type 0x02 (HTTP/2 PRIORITY) should be H3_FRAME_UNEXPECTED
+    var buf: [4]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const writer = fbs.writer();
+    packet.writeVarInt(writer, 0x02) catch unreachable; // HTTP/2 PRIORITY type
+    packet.writeVarInt(writer, 0) catch unreachable; // length 0
+    const result = h3_frame.parse(buf[0..fbs.pos]);
+    try testing.expectError(error.H3FrameUnexpected, result);
+}
+
+test "H3 frame error: malformed GOAWAY varint" {
+    // GOAWAY with invalid payload should be MalformedGoaway
+    var buf: [4]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const writer = fbs.writer();
+    packet.writeVarInt(writer, 0x07) catch unreachable; // GOAWAY type
+    packet.writeVarInt(writer, 1) catch unreachable; // length 1
+    buf[fbs.pos] = 0xC0; // 8-byte varint prefix but only 1 byte available
+    const result = h3_frame.parse(buf[0 .. fbs.pos + 1]);
+    try testing.expectError(error.MalformedGoaway, result);
 }
