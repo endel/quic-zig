@@ -3,7 +3,7 @@
 // Reads environment variables set by the interop runner:
 //   TESTCASE      - which test to run (handshake, transfer, retry, etc.)
 //   SSLKEYLOGFILE - path to write TLS key log
-//   QLOGDIR       - path to write qlog files (not yet implemented)
+//   QLOGDIR       - path to write qlog files (.sqlog JSON-SEQ format)
 //   REQUESTS      - space-separated URLs to download (CLI args)
 //
 // Downloads files via HTTP/0.9 (hq-interop) or HTTP/3 and saves to /downloads/.
@@ -100,6 +100,7 @@ pub fn main() !void {
     const testcase_str = posix.getenv("TESTCASE") orelse "handshake";
     const testcase = parseTestCase(testcase_str);
     const sslkeylogfile_path = posix.getenv("SSLKEYLOGFILE");
+    const qlog_dir = posix.getenv("QLOGDIR");
     const download_dir = posix.getenv("DOWNLOADS") orelse "/downloads";
 
     std.log.info("interop client: testcase={s}", .{testcase_str});
@@ -136,31 +137,31 @@ pub fn main() !void {
     const v2 = (testcase == .v2);
     switch (testcase) {
         .handshake, .transfer, .ecn, .connectionmigration, .chacha20 => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false, qlog_dir);
         },
         .keyupdate => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, true, cipher_only, false, false, false);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, true, cipher_only, false, false, false, qlog_dir);
         },
         .retry => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false, qlog_dir);
         },
         .multiconnect => {
             for (urls.items) |url| {
                 const single = [_]ParsedUrl{url};
-                _ = try downloadAll(alloc, &single, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, true);
+                _ = try downloadAll(alloc, &single, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, true, qlog_dir);
             }
         },
         .resumption => {
             if (urls.items.len > 0) {
                 const first = [_]ParsedUrl{urls.items[0]};
-                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
+                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false, qlog_dir);
                 if (urls.items.len > 1) {
                     if (ticket) |*t| {
                         std.log.info("resuming with session ticket (lifetime={d}s)", .{t.lifetime});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false, false, false);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false, false, false, qlog_dir);
                     } else {
                         std.log.warn("no session ticket received, falling back to full handshake", .{});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false, qlog_dir);
                     }
                 }
             }
@@ -168,23 +169,23 @@ pub fn main() !void {
         .zerortt => {
             if (urls.items.len > 0) {
                 const first = [_]ParsedUrl{urls.items[0]};
-                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
+                const ticket = try downloadAll(alloc, &first, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false, qlog_dir);
                 if (urls.items.len > 1) {
                     if (ticket) |*t| {
                         std.log.info("resuming with 0-RTT (lifetime={d}s)", .{t.lifetime});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false, true, false);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false, true, false, qlog_dir);
                     } else {
                         std.log.warn("no session ticket received, falling back to full handshake", .{});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false, qlog_dir);
                     }
                 }
             }
         },
         .v2 => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, v2, false, false);
+            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, v2, false, false, qlog_dir);
         },
         .http3 => {
-            _ = try downloadAll(alloc, urls.items, true, keylog_file, download_dir, null, false, cipher_only, false, false, false);
+            _ = try downloadAll(alloc, urls.items, true, keylog_file, download_dir, null, false, cipher_only, false, false, false, qlog_dir);
         },
         .unsupported => unreachable,
     }
@@ -204,6 +205,7 @@ fn downloadAll(
     enable_v2: bool,
     allow_0rtt: bool,
     skip_ticket_and_drain: bool,
+    qlog_dir_param: ?[]const u8,
 ) !?tls13.SessionTicket {
     if (urls.len == 0) return null;
 
@@ -256,7 +258,7 @@ fn downloadAll(
         .cipher_suite_only = cipher_suite_only,
     };
 
-    var conn = try connection.connect(alloc, host, .{ .enable_v2 = enable_v2, .disable_pmtud = true }, tls_config, null);
+    var conn = try connection.connect(alloc, host, .{ .enable_v2 = enable_v2, .disable_pmtud = true, .qlog_dir = qlog_dir_param }, tls_config, null);
     defer conn.deinit();
 
     var remote_addr = connection.sockaddrToStorage(&server_addr.any);

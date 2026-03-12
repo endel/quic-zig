@@ -3,7 +3,7 @@
 // Reads environment variables set by the interop runner:
 //   TESTCASE    - which test to run (handshake, transfer, retry, etc.)
 //   SSLKEYLOGFILE - path to write TLS key log
-//   QLOGDIR     - path to write qlog files (not yet implemented)
+//   QLOGDIR     - path to write qlog files (.sqlog JSON-SEQ format)
 //
 // Serves files from /www/ using HTTP/0.9 (hq-interop) or HTTP/3.
 // Listens on 0.0.0.0:443.
@@ -66,6 +66,7 @@ pub fn main() !void {
     const testcase_str = std.posix.getenv("TESTCASE") orelse "handshake";
     const testcase = parseTestCase(testcase_str);
     const sslkeylogfile_path = std.posix.getenv("SSLKEYLOGFILE");
+    const qlog_dir = std.posix.getenv("QLOGDIR");
     const www_dir = std.posix.getenv("WWW") orelse "/www";
     const certs_dir = std.posix.getenv("CERTS") orelse "/certs";
     const port_str = std.posix.getenv("PORT") orelse "443";
@@ -203,6 +204,7 @@ pub fn main() !void {
             .enable_v2 = (testcase == .v2),
             .disable_pmtud = true,
             .preferred_address = preferred_addr,
+            .qlog_dir = qlog_dir,
         },
         retry_token_key,
         static_reset_key,

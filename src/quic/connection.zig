@@ -22,6 +22,7 @@ const quic_crypto = @import("crypto.zig");
 const mtu_mod = @import("mtu.zig");
 const stateless_reset = @import("stateless_reset.zig");
 const ecn = @import("ecn.zig");
+const qlog = @import("qlog.zig");
 
 pub const State = enum(u8) {
     first_flight = 0,
@@ -367,6 +368,8 @@ pub const ConnectionConfig = struct {
     enable_v2: bool = false,
     // Disable Path MTU Discovery (PMTUD)
     disable_pmtud: bool = false,
+    // QLOG output directory (if set, writes .sqlog files)
+    qlog_dir: ?[]const u8 = null,
 };
 
 /// A QUIC connection.
@@ -475,6 +478,9 @@ pub const Connection = struct {
     // DCID used for initial key derivation (needed for v2 re-derivation)
     initial_dcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
     initial_dcid_len: u8 = 0,
+
+    // QLOG structured logging (optional, enabled via QLOGDIR)
+    qlog_writer: ?qlog.QlogWriter = null,
 
     // PTO probe pending — bypass congestion control for one packet (RFC 9002 §6.2.4)
     pto_probe_pending: u2 = 0,
@@ -631,6 +637,15 @@ pub const Connection = struct {
             }
         }
 
+        // Initialize QLOG if configured
+        if (config.qlog_dir) |dir| {
+            const qlog_odcid = if (odcid) |o| o else header.dcid;
+            conn.qlog_writer = qlog.QlogWriter.init(dir, qlog_odcid, is_server);
+            if (conn.qlog_writer != null) {
+                conn.qlog_writer.?.connectionStarted(now);
+            }
+        }
+
         // Set token key for NEW_TOKEN generation (server)
         if (config.token_key) |tk| {
             conn.token_key = tk;
@@ -656,6 +671,12 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
+        if (self.qlog_writer) |*ql| {
+            const now: i64 = @intCast(std.time.nanoTimestamp());
+            ql.connectionClosed(now, "application", 0);
+            ql.deinit();
+            self.qlog_writer = null;
+        }
         self.pkt_handler.deinit();
         self.streams.deinit();
         self.crypto_streams.deinit();
@@ -928,6 +949,10 @@ pub const Connection = struct {
         var has_non_probing = false;
         var remaining = payload;
 
+        // Collect frames for QLOG
+        var qlog_frames: [32]Frame = undefined;
+        var qlog_frame_count: usize = 0;
+
         while (remaining.len > 0) {
             // Skip padding
             if (remaining[0] == 0x00) {
@@ -955,6 +980,12 @@ pub const Connection = struct {
                 has_non_probing = true;
             }
 
+            // Track frames for QLOG
+            if (qlog_frame_count < qlog_frames.len) {
+                qlog_frames[qlog_frame_count] = frame;
+                qlog_frame_count += 1;
+            }
+
             try self.processFrame(frame, epoch, now);
 
             // Advance past this frame. For frames that contain data slices,
@@ -962,6 +993,13 @@ pub const Connection = struct {
             const consumed = self.frameSize(frame, remaining);
             if (consumed == 0) break; // safety: avoid infinite loop
             remaining = remaining[consumed..];
+        }
+
+        // QLOG: packet_received
+        if (self.qlog_writer) |*ql| {
+            var frames_buf: [2048]u8 = undefined;
+            const frames_len = qlog.QlogWriter.serializeFrames(qlog_frames[0..qlog_frame_count], &frames_buf);
+            ql.packetReceived(now, qlog.packetTypeStr(header.packet_type), header.packet_number, payload.len, frames_buf[0..frames_len]);
         }
 
         // Record receipt for ACK generation
@@ -1091,6 +1129,16 @@ pub const Connection = struct {
                         }
                     }
 
+                    // QLOG: packet_lost
+                    if (self.qlog_writer) |*ql| {
+                        const lost_type: []const u8 = switch (pkt.enc_level) {
+                            .initial => "initial",
+                            .handshake => "handshake",
+                            .application => "1RTT",
+                        };
+                        ql.packetLost(now, lost_type, pkt.pn, "time_threshold");
+                    }
+
                     // Queue stream data retransmission for lost packets
                     self.queueStreamRetransmissions(&pkt);
 
@@ -1119,6 +1167,12 @@ pub const Connection = struct {
                     } else if (earliest_lost_sent_time) |lost_time| {
                         self.cc.onCongestionEvent(lost_time, now);
                     }
+                }
+
+                // QLOG: metrics_updated after ACK processing
+                if (self.qlog_writer) |*ql| {
+                    const rs = &self.pkt_handler.rtt_stats;
+                    ql.metricsUpdated(now, rs.min_rtt, rs.smoothed_rtt, rs.latest_rtt, rs.rtt_var, self.cc.sendWindow(), self.pkt_handler.bytes_in_flight);
                 }
 
                 // Update pacer
@@ -1173,6 +1227,16 @@ pub const Connection = struct {
                         }
                     }
 
+                    // QLOG: packet_lost
+                    if (self.qlog_writer) |*ql| {
+                        const lost_type: []const u8 = switch (pkt.enc_level) {
+                            .initial => "initial",
+                            .handshake => "handshake",
+                            .application => "1RTT",
+                        };
+                        ql.packetLost(now, lost_type, pkt.pn, "time_threshold");
+                    }
+
                     // Queue stream data retransmission for lost packets
                     self.queueStreamRetransmissions(&pkt);
 
@@ -1196,6 +1260,12 @@ pub const Connection = struct {
                     } else if (earliest_lost_sent_time_ecn) |lost_time| {
                         self.cc.onCongestionEvent(lost_time, now);
                     }
+                }
+
+                // QLOG: metrics_updated after ACK_ECN processing
+                if (self.qlog_writer) |*ql| {
+                    const rs = &self.pkt_handler.rtt_stats;
+                    ql.metricsUpdated(now, rs.min_rtt, rs.smoothed_rtt, rs.latest_rtt, rs.rtt_var, self.cc.sendWindow(), self.pkt_handler.bytes_in_flight);
                 }
 
                 // ECN validation (RFC 9000 §13.4.2.1):
@@ -1663,23 +1733,35 @@ pub const Connection = struct {
                                 std.log.info("installed 0-RTT decrypt keys (server)", .{});
                             } else {
                                 self.early_data_seal = ik.seal;
-                                // Pre-set stream limits for 0-RTT (RFC 9000 §7.4.1: use remembered
-                                // transport params). Since we don't persist transport params across
-                                // connections yet, use reasonable defaults so the app can open streams.
                                 self.streams.setMaxStreams(100, 100);
                                 std.log.info("installed 0-RTT encrypt keys (client), set default stream limits", .{});
+                            }
+                            if (self.qlog_writer) |*ql| {
+                                const now_ql: i64 = @intCast(std.time.nanoTimestamp());
+                                ql.keyUpdated(now_ql, "tls", if (self.is_server) "server_0rtt_secret" else "client_0rtt_secret");
                             }
                         },
                         .handshake => {
                             self.installHandshakeKeys(ik.open, ik.seal);
-                            // RFC 9368: After TLS negotiation, check if version switched
+                            if (self.qlog_writer) |*ql| {
+                                const now_ql: i64 = @intCast(std.time.nanoTimestamp());
+                                ql.keyUpdated(now_ql, "tls", "server_handshake_secret");
+                                ql.keyUpdated(now_ql, "tls", "client_handshake_secret");
+                            }
                             if (self.is_server and self.enable_v2) {
                                 if (hs.config.quic_version != self.version) {
                                     try self.switchVersion(hs.config.quic_version);
                                 }
                             }
                         },
-                        .application => self.installAppKeys(ik.open, ik.seal),
+                        .application => {
+                            self.installAppKeys(ik.open, ik.seal);
+                            if (self.qlog_writer) |*ql| {
+                                const now_ql: i64 = @intCast(std.time.nanoTimestamp());
+                                ql.keyUpdated(now_ql, "tls", "server_1rtt_secret");
+                                ql.keyUpdated(now_ql, "tls", "client_1rtt_secret");
+                            }
+                        },
                         else => {},
                     }
                 },
@@ -2187,6 +2269,25 @@ pub const Connection = struct {
         );
 
         if (bytes_written > 0) {
+            // QLOG: packet_sent (log using the highest encryption level that was packed)
+            if (self.qlog_writer) |*ql| {
+                const pkt_type_str: []const u8 = if (app_seal != null and self.pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.application)] > 0)
+                    "1RTT"
+                else if (handshake_seal != null and self.pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.handshake)] > 0)
+                    "handshake"
+                else
+                    "initial";
+                // Use the last PN that was allocated
+                const enc_idx: usize = if (app_seal != null and self.pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.application)] > 0)
+                    @intFromEnum(ack_handler.EncLevel.application)
+                else if (handshake_seal != null and self.pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.handshake)] > 0)
+                    @intFromEnum(ack_handler.EncLevel.handshake)
+                else
+                    @intFromEnum(ack_handler.EncLevel.initial);
+                const pn = self.pkt_handler.next_pn[enc_idx] -| 1;
+                ql.packetSent(now, pkt_type_str, pn, bytes_written, "");
+            }
+
             self.pto_probe_pending -|= 1;
             self.paths[self.active_path_idx].bytes_sent += bytes_written;
             self.pacer.onPacketSent(bytes_written, now);
@@ -2628,6 +2729,13 @@ pub const Connection = struct {
     /// after the Handshake Finished has been sent. Applications should not
     /// need to call this directly.
     pub fn dropHandshakeKeys(self: *Connection) void {
+        if (self.qlog_writer) |*ql| {
+            const now_ql: i64 = @intCast(std.time.nanoTimestamp());
+            ql.keyDiscarded(now_ql, "client_initial_secret");
+            ql.keyDiscarded(now_ql, "server_initial_secret");
+            ql.keyDiscarded(now_ql, "client_handshake_secret");
+            ql.keyDiscarded(now_ql, "server_handshake_secret");
+        }
         self.pkt_num_spaces[0].crypto_open = null;
         self.pkt_num_spaces[0].crypto_seal = null;
         self.pkt_num_spaces[1].crypto_open = null;
@@ -2866,6 +2974,14 @@ pub fn connect(
     @memcpy(conn.initial_dcid_buf[0..8], &dcid);
     conn.enable_v2 = config.enable_v2;
     conn.disable_pmtud = config.disable_pmtud;
+
+    // Initialize QLOG if configured
+    if (config.qlog_dir) |dir| {
+        conn.qlog_writer = qlog.QlogWriter.init(dir, &dcid, false);
+        if (conn.qlog_writer != null) {
+            conn.qlog_writer.?.connectionStarted(now);
+        }
+    }
 
     // Generate static reset key and register initial SCID with deterministic token
     crypto.random.bytes(&conn.static_reset_key);
