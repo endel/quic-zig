@@ -85,6 +85,19 @@ pub const FrameSorter = struct {
             effective_offset = self.read_pos;
         }
 
+        // Check if there's already a chunk at this offset.
+        // Don't overwrite a longer chunk with a shorter one (retransmission
+        // with different fragmentation boundaries). Also free old data to
+        // prevent memory leaks.
+        if (self.chunks.get(effective_offset)) |existing| {
+            if (existing.len >= effective_data.len) {
+                // Existing chunk covers at least as much data — skip.
+                return;
+            }
+            // New chunk is longer — free old, overwrite below.
+            self.allocator.free(existing);
+        }
+
         // Copy data to owned buffer
         const owned = try self.allocator.dupe(u8, effective_data);
         errdefer self.allocator.free(owned);

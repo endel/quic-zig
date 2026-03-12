@@ -462,6 +462,12 @@ fn downloadH0(
     const download_timeout_ns: i128 = 60 * std.time.ns_per_s;
 
     while (completed < urls.len and (std.time.nanoTimestamp() - download_start) < download_timeout_ns) {
+        // Exit early if connection is dead
+        if (conn.isClosed() or conn.isDraining()) {
+            std.log.warn("H0: connection terminated during download, completed {d}/{d}", .{ completed, urls.len });
+            break;
+        }
+
         // Try to open more streams as the limit increases (MAX_STREAMS from server)
         while (next_url_idx < urls.len) {
             const url = urls[next_url_idx];
@@ -613,6 +619,12 @@ fn downloadH3(
     const h3_download_timeout_ns: i128 = 60 * std.time.ns_per_s;
 
     while (completed < urls.len and (std.time.nanoTimestamp() - h3_download_start) < h3_download_timeout_ns) {
+        // Exit early if connection is dead
+        if (conn.isClosed() or conn.isDraining()) {
+            std.log.warn("H3: connection terminated during download, completed {d}/{d}", .{ completed, urls.len });
+            break;
+        }
+
         // Read packets (batch up to 100 datagrams per loop)
         var packets_received: usize = 0;
         {

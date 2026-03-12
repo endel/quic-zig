@@ -455,6 +455,10 @@ pub const Tls13Handshake = struct {
     // Client random for ServerHello matching
     client_random: [32]u8 = undefined,
 
+    // Peer's legacy_session_id from ClientHello (must be echoed in ServerHello)
+    peer_session_id: [32]u8 = .{0} ** 32,
+    peer_session_id_len: u8 = 0,
+
     // Server hello random
     server_random: [32]u8 = undefined,
 
@@ -505,6 +509,8 @@ pub const Tls13Handshake = struct {
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
+        self.peer_session_id_len = 0;
+        self.peer_session_id = .{0} ** 32;
 
         // Pre-encode transport params to avoid dangling slices after struct move
         var tp_fbs = std.io.fixedBufferStream(&self.tp_encoded);
@@ -548,6 +554,8 @@ pub const Tls13Handshake = struct {
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
+        self.peer_session_id_len = 0;
+        self.peer_session_id = .{0} ** 32;
 
         // Pre-encode transport params to avoid dangling slices after struct move
         var tp_fbs = std.io.fixedBufferStream(&self.tp_encoded);
@@ -1030,6 +1038,12 @@ pub const Tls13Handshake = struct {
 
         const session_id_len = body[pos];
         pos += 1;
+        // Save peer's legacy_session_id for ServerHello echo (RFC 8446 §4.1.3)
+        if (session_id_len > 0 and session_id_len <= 32) {
+            self.peer_session_id_len = session_id_len;
+            @memcpy(self.peer_session_id[0..session_id_len], body[pos..][0..session_id_len]);
+            std.log.info("ClientHello: legacy_session_id len={d}", .{session_id_len});
+        }
         pos += session_id_len; // skip session_id
 
         // Cipher suites — select the best one we support
@@ -1117,11 +1131,18 @@ pub const Tls13Handshake = struct {
 
         // Try to process PSK extension if present and we have a ticket key
         if (psk_ext_offset != null and self.config.ticket_key != null) {
+            std.log.info("PSK extension found, attempting PSK processing", .{});
             self.tryProcessPsk(msg, body, pos, ext_data, psk_ext_offset.?, psk_ext_len);
+            if (self.using_psk) {
+                std.log.info("PSK accepted, using resumption", .{});
+            } else {
+                std.log.info("PSK rejected, full handshake", .{});
+            }
         }
 
         // Update transcript with ClientHello
         self.transcript.update(msg);
+        std.log.info("transcript after CH: {x}", .{self.transcript.current()});
 
         // If PSK accepted, derive early data secret for 0-RTT decryption
         if (self.using_psk) {
@@ -1163,12 +1184,13 @@ pub const Tls13Handshake = struct {
             &buf,
             &self.server_random,
             &self.x25519_public,
-            &self.client_random, // echo session_id as empty (we use 0-len)
+            self.peer_session_id[0..self.peer_session_id_len],
             self.using_psk,
             self.negotiated_cipher_suite,
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
+        std.log.info("server transcript after SH ({d} bytes): {x}", .{ msg.len, self.transcript.current() });
 
         // Compute shared secret
         const shared_secret = X25519.scalarmult(self.x25519_secret, self.peer_x25519_public) catch return error.KeyScheduleError;
@@ -1205,6 +1227,11 @@ pub const Tls13Handshake = struct {
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
+        {
+            var ee_sha: [32]u8 = undefined;
+            crypto.hash.sha2.Sha256.hash(msg, &ee_sha, .{});
+            std.log.info("transcript after EE ({d} bytes): {x}, msg_sha256={x}", .{ msg.len, self.transcript.current(), ee_sha });
+        }
 
         @memcpy(self.out_buf[0..msg.len], msg);
         self.out_len = msg.len;
@@ -1226,6 +1253,11 @@ pub const Tls13Handshake = struct {
         const msg = buildCertificate(&buf, self.config.cert_chain_der) catch return error.InternalError;
 
         self.transcript.update(msg);
+        {
+            var cert_sha: [32]u8 = undefined;
+            crypto.hash.sha2.Sha256.hash(msg, &cert_sha, .{});
+            std.log.info("transcript after Cert ({d} bytes): {x}, msg_sha256={x}", .{ msg.len, self.transcript.current(), cert_sha });
+        }
 
         @memcpy(self.out_buf[0..msg.len], msg);
         self.out_len = msg.len;
@@ -1511,14 +1543,15 @@ pub const Tls13Handshake = struct {
 
         if (!psk_found) return;
 
-        // Re-initialize key schedule with PSK
-        self.key_schedule = KeySchedule.initWithPsk(found_psk);
+        // Compute binder key from PSK WITHOUT modifying self.key_schedule yet
+        // (if binder fails, we must leave key_schedule untouched)
+        const temp_ks = KeySchedule.initWithPsk(found_psk);
 
         // Verify binder
         // binder_key = Derive-Secret(early_secret, "res binder", Hash(""))
         var empty_hash: [32]u8 = undefined;
         Sha256.hash("", &empty_hash, .{});
-        const binder_key = quic_crypto.hkdfExpandLabel(self.key_schedule.early_secret, "res binder", &empty_hash, 32);
+        const binder_key = quic_crypto.hkdfExpandLabel(temp_ks.early_secret, "res binder", &empty_hash, 32);
 
         // Partial ClientHello = up to and including identities field (RFC 8446 §4.2.11.2)
         // Exclude: binders_len_field(2) + binder_entries(binders_len)
@@ -1533,8 +1566,13 @@ pub const Tls13Handshake = struct {
         const expected_binder = KeySchedule.computeFinishedVerifyData(binder_key, partial_transcript);
         _ = &partial_transcript;
 
-        if (!std.mem.eql(u8, received_binder, &expected_binder)) return;
+        if (!std.mem.eql(u8, received_binder, &expected_binder)) {
+            std.log.warn("PSK binder verification failed, falling back to full handshake", .{});
+            return;
+        }
 
+        // Binder verified — now safe to install PSK key schedule
+        self.key_schedule = temp_ks;
         self.using_psk = true;
         self.zero_rtt_accepted = true;
     }
@@ -1893,7 +1931,7 @@ fn buildServerHello(
     buf: []u8,
     server_random: *const [32]u8,
     x25519_pub: *const [32]u8,
-    _: *const [32]u8, // client_random (unused, was for session_id echo)
+    session_id_echo: []const u8,
     using_psk: bool,
     cipher_suite: quic_crypto.CipherSuite,
 ) ![]const u8 {
@@ -1908,9 +1946,13 @@ fn buildServerHello(
     @memcpy(buf[pos..][0..32], server_random);
     pos += 32;
 
-    // session_id (empty for QUIC)
-    buf[pos] = 0;
+    // legacy_session_id_echo (RFC 8446 §4.1.3: echo the client's value)
+    buf[pos] = @intCast(session_id_echo.len);
     pos += 1;
+    if (session_id_echo.len > 0) {
+        @memcpy(buf[pos..][0..session_id_echo.len], session_id_echo);
+        pos += session_id_echo.len;
+    }
 
     // cipher_suite (use negotiated from ClientHello)
     writeU16(buf[pos..], @intFromEnum(cipher_suite));

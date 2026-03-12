@@ -131,8 +131,11 @@ pub const PacketPacker = struct {
         var offset: usize = 0;
 
         // Try packing Initial packet
-        // Client MUST pad Initial datagrams to >= 1200 bytes (RFC 9000 §14.1)
-        // Always pad the Initial — 0-RTT data (if any) goes in the next datagram
+        // Both client and server MUST pad UDP datagrams carrying ack-eliciting Initial
+        // packets to >= 1200 bytes (RFC 9000 §14.1).
+        // Client: pad the Initial itself (0-RTT/Handshake go in next datagram).
+        // Server: don't pad the Initial here — pad the Handshake portion below
+        // so the coalesced datagram reaches 1200 bytes without overflowing.
         if (initial_seal != null) {
             const pad_target: usize = if (!self.is_server) MIN_INITIAL_PACKET_SIZE else 0;
             const initial_len = try self.packSinglePacket(
@@ -177,7 +180,13 @@ pub const PacketPacker = struct {
         }
 
         // Try packing Handshake packet
+        // Server: pad the Handshake portion so the coalesced datagram (Initial +
+        // Handshake) reaches 1200 bytes when we sent an ack-eliciting Initial.
         if (handshake_seal != null and offset < out_buf.len) {
+            const hs_pad: usize = if (self.is_server and offset > 0)
+                MIN_INITIAL_PACKET_SIZE -| offset
+            else
+                0;
             const hs_len = try self.packSinglePacket(
                 out_buf[offset..],
                 .handshake,
@@ -187,7 +196,7 @@ pub const PacketPacker = struct {
                 pending_frames,
                 handshake_seal.?,
                 now,
-                0,
+                hs_pad,
                 null,
                 false,
                 ack_only,
@@ -308,6 +317,7 @@ pub const PacketPacker = struct {
         // Collect frames
         var ack_eliciting = false;
         var has_crypto_data = false;
+        var has_handshake_done = false;
 
         // 0-RTT packets only contain STREAM and DATAGRAM frames — skip ACK, CRYPTO, control
         if (!zero_rtt) {
@@ -333,10 +343,33 @@ pub const PacketPacker = struct {
                 }
             }
 
+            // 2b. PING for PTO probes in Initial/Handshake when no crypto data
+            // This ensures the second PTO probe is ack-eliciting even when all
+            // crypto data fit in the first probe (RFC 9002 §6.2.4).
+            if (!ack_eliciting and (level == .initial or level == .handshake)) {
+                if (pending_frames.len > 0) {
+                    // Check if there's a PING in the queue
+                    const pcf = pending_frames.pop();
+                    if (pcf != null) {
+                        switch (pcf.?) {
+                            .ping => {
+                                try writer.writeByte(0x01); // PING frame
+                                ack_eliciting = true;
+                            },
+                            else => {
+                                // Put it back — non-PING control frames go in 1-RTT
+                                pending_frames.push(pcf.?);
+                            },
+                        }
+                    }
+                }
+            }
+
             // 3. HANDSHAKE_DONE frame (server only, 1-RTT)
             if (level == .application and self.send_handshake_done) {
                 try writer.writeByte(0x1e); // HANDSHAKE_DONE frame type
                 self.send_handshake_done = false;
+                has_handshake_done = true;
                 ack_eliciting = true;
                 std.log.info("packing HANDSHAKE_DONE frame", .{});
             }
@@ -438,6 +471,11 @@ pub const PacketPacker = struct {
             }
         }
 
+        // Note: RFC 9002 loss detection deadlock prevention is handled by the PTO
+        // mechanism in ack_handler.zig, which sends PING probes when the PTO timer
+        // fires. No need to inject PINGs into every ACK-only packet here — doing so
+        // creates an ACK amplification loop (ACK+PING → server ACKs → client ACK+PING → ...).
+
         // Check if we have any payload
         var payload_len = fbs.pos - payload_start;
         if (payload_len == 0) {
@@ -463,8 +501,9 @@ pub const PacketPacker = struct {
             payload_len = min_plaintext;
         }
 
-        // Pad to target size for Initial or 0-RTT packets (client only, RFC 9000 §14.1)
-        if (pad_target > 0 and (pkt_type == .initial or pkt_type == .zero_rtt) and !self.is_server) {
+        // Pad to target size (RFC 9000 §14.1): Initial, 0-RTT, or Handshake
+        // when used to pad a coalesced server datagram to 1200 bytes.
+        if (pad_target > 0 and (pkt_type == .initial or pkt_type == .zero_rtt or pkt_type == .handshake)) {
             const current_total = fbs.pos - header_start + AEAD_TAG_LEN;
             if (current_total < pad_target) {
                 const pad_needed = pad_target - current_total;
@@ -525,6 +564,7 @@ pub const PacketPacker = struct {
             .in_flight = ack_eliciting,
             .enc_level = level,
             .has_crypto_data = has_crypto_data,
+            .has_handshake_done = has_handshake_done,
         };
         // Copy stream frame records into the SentPacket
         for (stream_frame_infos[0..stream_frame_info_count]) |info| {

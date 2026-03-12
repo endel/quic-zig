@@ -477,7 +477,7 @@ pub const Connection = struct {
     initial_dcid_len: u8 = 0,
 
     // PTO probe pending — bypass congestion control for one packet (RFC 9002 §6.2.4)
-    pto_probe_pending: bool = false,
+    pto_probe_pending: u2 = 0,
 
     // Connection close state (RFC 9000 Section 10)
     closing_start_time: i64 = 0,
@@ -846,6 +846,14 @@ pub const Connection = struct {
         const now: i64 = @intCast(std.time.nanoTimestamp());
         self.last_packet_received_time = now;
 
+        // RFC 9000 §8.1: Receipt of a Handshake packet from the client confirms
+        // address ownership (client derived keys → it processed our Initial).
+        // Lift the anti-amplification limit immediately.
+        if (self.is_server and epoch == .handshake and !self.paths[self.active_path_idx].is_validated) {
+            self.paths[self.active_path_idx].is_validated = true;
+            std.log.info("path validated via Handshake packet (amplification limit lifted)", .{});
+        }
+
         // Handle key phase change for 1-RTT packets (RFC 9001 Section 6)
         if (epoch == .application) {
             if (self.key_update) |*ku| {
@@ -896,6 +904,23 @@ pub const Connection = struct {
             // Update packer with new DCID
             self.packer.updateDcid(header.scid);
             self.got_peer_conn_id = true;
+        }
+
+        // Server: re-verify DCID from AEAD-authenticated long-header packets.
+        // If the Initial that created this connection was corrupted in transit,
+        // accept() may have stored a wrong peer SCID as our outgoing DCID.
+        // The first successfully-decrypted packet has the real peer SCID.
+        if (self.is_server and !self.handshake_confirmed and
+            (epoch == .initial or epoch == .handshake) and header.scid.len > 0)
+        {
+            if (self.dcid_len != @as(u8, @intCast(header.scid.len)) or
+                !std.mem.eql(u8, self.dcid[0..self.dcid_len], header.scid))
+            {
+                std.log.info("recv: correcting DCID to AEAD-verified SCID (len {d})", .{header.scid.len});
+                self.dcid_len = @intCast(header.scid.len);
+                @memcpy(self.dcid[0..header.scid.len], header.scid);
+                self.packer.updateDcid(header.scid);
+            }
         }
 
         // Process all frames from the decrypted payload
@@ -1073,6 +1098,10 @@ pub const Connection = struct {
                     if (pkt.has_crypto_data) {
                         self.queueCryptoRetransmission(pkt.enc_level);
                     }
+                    // Re-queue HANDSHAKE_DONE if it was lost
+                    if (pkt.has_handshake_done) {
+                        self.packer.send_handshake_done = true;
+                    }
                 }
 
                 if (has_non_probe_loss) {
@@ -1150,6 +1179,9 @@ pub const Connection = struct {
                     // Queue CRYPTO frame retransmission for lost packets (RFC 9002 §6.2)
                     if (pkt.has_crypto_data) {
                         self.queueCryptoRetransmission(pkt.enc_level);
+                    }
+                    if (pkt.has_handshake_done) {
+                        self.packer.send_handshake_done = true;
                     }
                 }
 
@@ -1609,7 +1641,18 @@ pub const Connection = struct {
                     // Write the TLS handshake data to the appropriate crypto stream
                     const cs_level: u8 = @intFromEnum(sd.level);
                     const cs = self.crypto_streams.getStream(cs_level);
-                    std.log.info("advanceHandshake: writing {d} bytes to level {}", .{ sd.data.len, cs_level });
+                    // Log hash of data being written to crypto stream for corruption debugging
+                    var data_hash: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(sd.data, &data_hash, .{});
+                    std.log.info("advanceHandshake: writing {d} bytes to level {}, first4={x:0>2}{x:0>2}{x:0>2}{x:0>2}, sha256={x}", .{
+                        sd.data.len,
+                        cs_level,
+                        sd.data[0],
+                        if (sd.data.len > 1) sd.data[1] else @as(u8, 0),
+                        if (sd.data.len > 2) sd.data[2] else @as(u8, 0),
+                        if (sd.data.len > 3) sd.data[3] else @as(u8, 0),
+                        data_hash,
+                    });
                     try cs.writeData(sd.data);
                 },
                 .install_keys => |ik| {
@@ -1657,6 +1700,21 @@ pub const Connection = struct {
                     // Clear early data keys (0-RTT period is over)
                     self.early_data_open = null;
                     self.early_data_seal = null;
+
+                    // Handle 0-RTT rejection (RFC 9001 §4.1.2):
+                    // When the server rejects 0-RTT, the client must retransmit all
+                    // 0-RTT data as 1-RTT. Queue retransmission of all in-flight
+                    // application-space packets that carried stream data.
+                    if (!self.is_server and !hs.zero_rtt_accepted) {
+                        const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
+                        var pkt_it = app_tracker.sent_packets.iterator();
+                        while (pkt_it.next()) |entry| {
+                            const pkt = entry.value_ptr;
+                            if (pkt.getStreamFrames().len > 0) {
+                                self.queueStreamRetransmissions(pkt);
+                            }
+                        }
+                    }
 
                     if (self.is_server) {
                         // Server confirms handshake immediately and clears Handshake keys
@@ -2050,7 +2108,7 @@ pub const Connection = struct {
 
         // Check congestion window — only send ACKs + control frames when congestion-limited
         // Exception: PTO probes MUST bypass congestion control (RFC 9002 §6.2.4)
-        if (self.pkt_handler.bytes_in_flight >= self.cc.sendWindow() and !self.pto_probe_pending) {
+        if (self.pkt_handler.bytes_in_flight >= self.cc.sendWindow() and self.pto_probe_pending == 0) {
             return try self.sendAckOnly(out_buf, now);
         }
 
@@ -2092,8 +2150,13 @@ pub const Connection = struct {
         // Packet number space indices: 0=Initial, 1=Handshake, 2=Application
         const initial_seal = self.pkt_num_spaces[0].crypto_seal;
         const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
-        // Use KeyUpdateManager seal for 1-RTT if available
-        const app_seal: ?quic_crypto.Seal = if (self.key_update) |*ku|
+        // Use KeyUpdateManager seal for 1-RTT if available.
+        // Server: don't send 1-RTT data until the handshake is complete.
+        // Sending 1-RTT PINGs during the handshake causes the peer to respond
+        // with 1-RTT ACKs instead of retransmitting the Handshake Finished.
+        const app_seal: ?quic_crypto.Seal = if (self.is_server and !self.handshake_confirmed)
+            null
+        else if (self.key_update) |*ku|
             ku.current_seal
         else
             self.pkt_num_spaces[2].crypto_seal;
@@ -2123,7 +2186,7 @@ pub const Connection = struct {
         );
 
         if (bytes_written > 0) {
-            self.pto_probe_pending = false;
+            self.pto_probe_pending -|= 1;
             self.paths[self.active_path_idx].bytes_sent += bytes_written;
             self.pacer.onPacketSent(bytes_written, now);
 
@@ -2202,7 +2265,9 @@ pub const Connection = struct {
         // Gather seals at all encryption levels
         const initial_seal = self.pkt_num_spaces[0].crypto_seal;
         const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
-        const app_seal: ?quic_crypto.Seal = if (self.key_update) |*ku|
+        const app_seal: ?quic_crypto.Seal = if (self.is_server and !self.handshake_confirmed)
+            null
+        else if (self.key_update) |*ku|
             ku.current_seal
         else
             self.pkt_num_spaces[2].crypto_seal;
@@ -2223,7 +2288,7 @@ pub const Connection = struct {
         );
 
         if (bytes_written > 0) {
-            self.pto_probe_pending = false;
+            self.pto_probe_pending -|= 1;
             self.paths[self.active_path_idx].bytes_sent += bytes_written;
             // Don't update pacer — ACKs are not paced
         }
@@ -2295,10 +2360,18 @@ pub const Connection = struct {
             return;
         }
 
-        // Check idle timeout
-        if (now - self.last_packet_received_time > self.idle_timeout_ns) {
-            self.state = .terminated;
-            return;
+        // Check idle timeout (RFC 9000 §10.1)
+        // The effective idle timeout MUST be at least 3× the current PTO (with backoff)
+        // to avoid terminating the connection while waiting for backed-off retransmissions.
+        {
+            var current_pto = self.pkt_handler.rtt_stats.pto();
+            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 62));
+            current_pto = @min(current_pto << shift, 60_000_000_000); // cap at 60s
+            const effective_idle = @max(self.idle_timeout_ns, 3 * current_pto);
+            if (now - self.last_packet_received_time > effective_idle) {
+                self.state = .terminated;
+                return;
+            }
         }
 
         // Loss detection timer: check loss_time BEFORE PTO (RFC 9002 §6.2.1).
@@ -2317,6 +2390,9 @@ pub const Connection = struct {
                 self.queueStreamRetransmissions(&pkt);
                 if (pkt.has_crypto_data) {
                     self.queueCryptoRetransmission(pkt.enc_level);
+                }
+                if (pkt.has_handshake_done) {
+                    self.packer.send_handshake_done = true;
                 }
             }
             if (has_non_probe_loss_lt) {
@@ -2346,14 +2422,21 @@ pub const Connection = struct {
                     switch (pto_level) {
                         .initial, .handshake => {
                             // Re-queue crypto data for retransmission on PTO (RFC 9002 §6.2.4)
-                            // When Handshake PTO fires, also re-queue Initial if it has
-                            // outstanding data — the peer needs ServerHello before it can
-                            // decrypt Handshake packets.
+                            // Coalesced packets share fate: if an Initial+Handshake datagram
+                            // is lost, BOTH levels need retransmission. Always re-queue both
+                            // directions when either level fires PTO.
                             self.queueCryptoRetransmission(pto_level);
                             if (pto_level == .handshake) {
                                 // Also retransmit Initial crypto data if still outstanding
                                 if (self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.initial)].ack_eliciting_in_flight > 0) {
                                     self.queueCryptoRetransmission(.initial);
+                                }
+                            }
+                            if (pto_level == .initial) {
+                                // Also retransmit Handshake crypto data if still outstanding
+                                // (server sends ServerHello + Certificate in one datagram)
+                                if (self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.handshake)].ack_eliciting_in_flight > 0) {
+                                    self.queueCryptoRetransmission(.handshake);
                                 }
                             }
                             // Check both levels for data
@@ -2368,17 +2451,33 @@ pub const Connection = struct {
                             if (self.crypto_streams.getStream(3).hasData()) {
                                 has_data = true;
                             }
+                            // Re-queue HANDSHAKE_DONE if still in-flight (server only)
+                            {
+                                const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
+                                var hd_it = app_tracker.sent_packets.iterator();
+                                while (hd_it.next()) |entry| {
+                                    if (entry.value_ptr.in_flight and entry.value_ptr.has_handshake_done) {
+                                        self.packer.send_handshake_done = true;
+                                        has_data = true;
+                                        break;
+                                    }
+                                }
+                            }
                             // Check if any stream has data to send
+                            var has_stream_data = false;
                             var stream_it = self.streams.streams.valueIterator();
                             while (stream_it.next()) |s_ptr| {
                                 if (s_ptr.*.send.hasData()) {
+                                    has_stream_data = true;
                                     has_data = true;
                                     break;
                                 }
                             }
-                            // If no data queued, check in-flight packets for stream data
-                            // to retransmit (RFC 9002 §6.2.4: prefer data over PING)
-                            if (!has_data) {
+                            // If no stream has pending data, check in-flight packets for
+                            // stream data to retransmit (RFC 9002 §6.2.4: prefer data over PING).
+                            // Use has_stream_data (not has_data) so HANDSHAKE_DONE being
+                            // in-flight doesn't prevent stream retransmission.
+                            if (!has_stream_data) {
                                 const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
                                 if (app_tracker.ack_eliciting_in_flight > 0) {
                                     var pkt_it = app_tracker.sent_packets.iterator();
@@ -2396,12 +2495,50 @@ pub const Connection = struct {
                     }
                 }
 
-                // Always push PING for PTO probes. When congestion-limited, send()
-                // calls sendAckOnly(ack_only=true) which skips stream frames.
-                // Without a PING, the PTO probe would never get sent, stalling
-                // recovery after blackhole/persistent congestion events.
+                // RFC 9002 §6.2.4: Send 2 ack-eliciting datagrams on PTO.
+                // Only push PINGs when there's no crypto data to retransmit —
+                // crypto frames are already ack-eliciting. Stray PINGs end up in
+                // 1-RTT packets, which confuses peers into sending 1-RTT ACKs
+                // instead of Handshake ACKs during the handshake.
+                if (!has_data) {
+                    self.pending_frames.push(.{ .ping = {} });
+                    self.pending_frames.push(.{ .ping = {} });
+                }
+                self.pto_probe_pending = 2;
+                if (self.pkt_handler.getPtoSpace()) |space| {
+                    std.log.info("PTO fired: count={d}, space={s}, has_data={}", .{ self.pkt_handler.pto_count, @tagName(space), has_data });
+                }
+            }
+        }
+
+        // RFC 9002 §6.2.2.1: Client anti-deadlock timer.
+        // When the client has no ack-eliciting packets in flight and the handshake
+        // is not confirmed, the server might be blocked by the anti-amplification
+        // limit. The client MUST arm a PTO timer to send packets that unblock the
+        // server (e.g. a PING in a Handshake or padded Initial packet).
+        else if (!self.is_server and !self.handshake_confirmed) {
+            // Compute PTO based on time since handshake start (creation_time)
+            var pto_duration = self.pkt_handler.rtt_stats.ptoNoAckDelay();
+            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 62));
+            pto_duration = pto_duration << shift;
+            pto_duration = @min(pto_duration, 60_000_000_000); // cap at 60s
+
+            const deadline = self.creation_time + pto_duration;
+            if (now >= deadline) {
+                self.pkt_handler.pto_count += 1;
+
+                // Send a Handshake packet if we have Handshake keys, else padded Initial.
+                // This gives the server more anti-amplification credit.
+                if (self.pkt_num_spaces[1].crypto_seal != null) {
+                    // Re-queue Initial crypto data too if still outstanding
+                    self.queueCryptoRetransmission(.initial);
+                    self.queueCryptoRetransmission(.handshake);
+                } else {
+                    self.queueCryptoRetransmission(.initial);
+                }
                 self.pending_frames.push(.{ .ping = {} });
-                self.pto_probe_pending = true;
+                self.pto_probe_pending = 2;
+                std.log.info("client anti-deadlock PTO fired (pto_count={d})", .{self.pkt_handler.pto_count});
             }
         }
 
