@@ -238,4 +238,5 @@ test {
     _ = @import("h3/huffman.zig");
     _ = @import("h3/connection.zig");
     _ = @import("webtransport/session.zig");
+    _ = @import("h3/capsule.zig");
 }

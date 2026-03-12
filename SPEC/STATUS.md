@@ -396,15 +396,14 @@ No remaining work — all sections implemented. Optional improvements:
 |---|---------|--------|-------|
 | 2 | HTTP Datagram Negotiation | ✅ Done | H3_DATAGRAM setting (0x33) |
 | 3 | HTTP Datagrams | ✅ Done | QUIC DATAGRAM frames 0x30/0x31 |
-| 4 | Capsule Protocol | ❌ Missing | CAPSULE frames not implemented |
+| 4 | Capsule Protocol | ✅ Done | `h3/capsule.zig`: TLV codec, DATAGRAM type (0x00), reserved type check, iterator |
 | 5 | The CONNECT Method | ✅ Done | Extended CONNECT support |
 
 ### Summary — RFC 9297
 
 | Status | Count |
 |--------|-------|
-| ✅ Done | 3 |
-| ❌ Missing | 1 |
+| ✅ Done | 4 |
 
 ---
 
@@ -493,7 +492,7 @@ No remaining work — all sections implemented. Optional improvements:
 | RFC 9002 (Loss/CC) | 24 | 0 | 0 | 100% |
 | RFC 9114 (HTTP/3) | 22 | 0 | 5 | ~82% |
 | RFC 9204 (QPACK) | 11 | 0 | 0 | 100% |
-| RFC 9297 (Datagrams) | 3 | 0 | 1 | ~88% |
+| RFC 9297 (Datagrams) | 4 | 0 | 0 | 100% |
 | RFC 9221 (QUIC DG) | 3 | 0 | 0 | 100% |
 | RFC 9368 (Version Neg) | 3 | 0 | 0 | 100% |
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
@@ -512,4 +511,4 @@ No remaining work — all sections implemented. Optional improvements:
 | ~~7~~ | ~~QPACK dynamic table~~ | ~~9204 §3.2~~ | ~~Done~~ | ~~Done~~ |
 | 8 | Server Push (H3) | 9114 §4.6 | Large | H3 feature completeness |
 | ~~9~~ | ~~Graceful H3 shutdown~~ | ~~9114 §5.2~~ | ~~Done~~ | ~~Done~~ |
-| 10 | Capsule Protocol | 9297 §4 | Medium | WT/proxy completeness |
+| ~~10~~ | ~~Capsule Protocol~~ | ~~9297 §4~~ | ~~Done~~ | ~~Done~~ |
