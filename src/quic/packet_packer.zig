@@ -396,10 +396,10 @@ pub const PacketPacker = struct {
             // Connection-level flow control budget for this packet
             var conn_budget: u64 = if (self.conn_flow_ctrl) |cfc| cfc.sendWindowSize() else std.math.maxInt(u64);
 
-            // Bidirectional streams
-            var stream_it = streams.streams.valueIterator();
-            while (stream_it.next()) |s_ptr| {
-                const s = s_ptr.*;
+            // Bidirectional streams — scheduled by RFC 9218 priority
+            var sched_buf: [stream_mod.StreamsMap.MAX_SCHEDULABLE]*stream_mod.Stream = undefined;
+            const sched_count = streams.getScheduledStreams(&sched_buf);
+            for (sched_buf[0..sched_count]) |s| {
                 if (fbs.pos + AEAD_TAG_LEN + 16 >= effective_max) break;
                 if (conn_budget == 0) break;
                 if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;

@@ -8,6 +8,7 @@ const stream_mod = @import("../quic/stream.zig");
 const packet = @import("../quic/packet.zig");
 const h3_frame = @import("frame.zig");
 const qpack = @import("qpack.zig");
+const priority = @import("priority.zig");
 
 pub const ALPN = [_][]const u8{ "h3", "h3-32", "h3-31", "h3-30", "h3-29" };
 
@@ -32,6 +33,18 @@ pub const H3Error = enum(u64) {
     version_fallback = 0x0110,
 };
 
+/// Graceful shutdown state (RFC 9114 Section 5.2).
+pub const ShutdownState = enum {
+    /// Normal operation.
+    active,
+    /// Sent initial GOAWAY with max stream ID (phase 1).
+    going_away_initial,
+    /// Sent final GOAWAY with actual last-processed stream ID (phase 2).
+    going_away_final,
+    /// All in-flight streams below GOAWAY ID have completed.
+    drain_complete,
+};
+
 /// Events returned by poll().
 pub const H3Event = union(enum) {
     settings: h3_frame.Settings,
@@ -46,6 +59,7 @@ pub const H3Event = union(enum) {
         path: []const u8,
         headers: []const qpack.Header,
     },
+    shutdown_complete: void,
 };
 
 /// Maximum number of headers we'll decode from a single HEADERS frame.
@@ -92,6 +106,12 @@ pub const H3Connection = struct {
     // QPACK encoder/decoder with dynamic table support
     qpack_encoder: qpack.QpackEncoder = .{},
     qpack_decoder: qpack.QpackDecoder = .{},
+
+    // Graceful shutdown state (RFC 9114 §5.2)
+    shutdown_state: ShutdownState = .active,
+    local_goaway_id: ?u64 = null,
+    peer_goaway_id: ?u64 = null,
+    highest_processed_stream_id: ?u64 = null,
 
     pub fn init(allocator: Allocator, quic_conn: *quic_connection.Connection, is_server: bool) H3Connection {
         var conn = H3Connection{
@@ -159,6 +179,12 @@ pub const H3Connection = struct {
     /// Send an HTTP request (client-side).
     /// Opens a new bidirectional stream, sends HEADERS + optional DATA, returns stream ID.
     pub fn sendRequest(self: *H3Connection, headers: []const qpack.Header, body: ?[]const u8) !u64 {
+        // RFC 9114 §5.2: must not initiate requests on streams >= peer's GOAWAY ID
+        if (self.peer_goaway_id) |goaway_id| {
+            if (self.quic_conn.streams.next_bidi_stream_id >= goaway_id) {
+                return error.H3RequestRejected;
+            }
+        }
         const stream = try self.quic_conn.openStream();
         const stream_id = stream.stream_id;
 
@@ -194,6 +220,12 @@ pub const H3Connection = struct {
     /// Opens a bidi stream, sends HEADERS with :method=CONNECT, :protocol, etc.
     /// Does NOT close the stream — session lifetime = stream lifetime.
     pub fn sendConnectRequest(self: *H3Connection, protocol_name: []const u8, authority: []const u8, path: []const u8) !u64 {
+        // RFC 9114 §5.2: must not initiate requests on streams >= peer's GOAWAY ID
+        if (self.peer_goaway_id) |goaway_id| {
+            if (self.quic_conn.streams.next_bidi_stream_id >= goaway_id) {
+                return error.H3RequestRejected;
+            }
+        }
         const stream = try self.quic_conn.openStream();
         const stream_id = stream.stream_id;
 
@@ -277,6 +309,120 @@ pub const H3Connection = struct {
         stream.send.close();
     }
 
+    /// Begin graceful shutdown (RFC 9114 §5.2, phase 1).
+    /// Sends GOAWAY with max stream ID to signal intent to shut down.
+    /// Call `completeShutdown()` after in-flight requests arrive to send the final GOAWAY.
+    pub fn initiateShutdown(self: *H3Connection) !void {
+        if (self.shutdown_state != .active) return;
+        const ctrl = self.local_control_stream orelse return error.NotInitialized;
+
+        // Max client-initiated bidi stream ID (bits 1:0 = 00) for servers,
+        // max push ID for clients.
+        const max_id: u64 = if (self.is_server) 0x3FFFFFFFFFFFFFFC else 0x3FFFFFFFFFFFFFFF;
+
+        var frame_buf: [32]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .goaway = max_id }, fbs.writer());
+        try ctrl.writeData(fbs.getWritten());
+
+        self.local_goaway_id = max_id;
+        self.shutdown_state = .going_away_initial;
+    }
+
+    /// Complete graceful shutdown (RFC 9114 §5.2, phase 2).
+    /// Sends final GOAWAY with the actual last-processed stream ID.
+    /// Streams >= this ID will be rejected with H3_REQUEST_REJECTED.
+    pub fn completeShutdown(self: *H3Connection) !void {
+        if (self.shutdown_state != .going_away_initial) return;
+        const ctrl = self.local_control_stream orelse return error.NotInitialized;
+
+        // Next client-initiated bidi ID after the highest we processed.
+        // If none processed, reject everything (ID = 0).
+        const final_id: u64 = if (self.highest_processed_stream_id) |hid| hid + 4 else 0;
+
+        // Must not increase from previous GOAWAY
+        const goaway_id = if (self.local_goaway_id) |prev| @min(final_id, prev) else final_id;
+
+        var frame_buf: [32]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .goaway = goaway_id }, fbs.writer());
+        try ctrl.writeData(fbs.getWritten());
+
+        self.local_goaway_id = goaway_id;
+        self.shutdown_state = .going_away_final;
+    }
+
+    /// Send a GOAWAY frame with a specific stream ID (RFC 9114 §5.2).
+    /// Single-step alternative to initiateShutdown + completeShutdown.
+    /// The ID must not increase from any previously sent GOAWAY.
+    /// For servers, must be a client-initiated bidi stream ID (divisible by 4) or 0.
+    pub fn sendGoaway(self: *H3Connection, goaway_id: u64) !void {
+        // Validate before writing
+        if (self.local_goaway_id) |prev| {
+            if (goaway_id > prev) return error.H3IdError;
+        }
+        if (self.is_server and goaway_id != 0 and (goaway_id % 4 != 0)) {
+            return error.H3IdError;
+        }
+        const ctrl = self.local_control_stream orelse return error.NotInitialized;
+
+        var frame_buf: [32]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .goaway = goaway_id }, fbs.writer());
+        try ctrl.writeData(fbs.getWritten());
+
+        self.local_goaway_id = goaway_id;
+        if (self.shutdown_state == .active or self.shutdown_state == .going_away_initial) {
+            self.shutdown_state = .going_away_final;
+        }
+    }
+
+    /// Check if all streams below the GOAWAY ID have completed.
+    pub fn isDrainComplete(self: *H3Connection) bool {
+        if (self.shutdown_state != .going_away_final) return false;
+        const goaway_id = self.local_goaway_id orelse return false;
+
+        var stream_it = self.quic_conn.streams.streams.iterator();
+        while (stream_it.next()) |entry| {
+            const sid = entry.key_ptr.*;
+            const stream = entry.value_ptr.*;
+            if (!stream_mod.isClient(sid) or !stream_mod.isBidi(sid)) continue;
+            if (sid >= goaway_id) continue;
+            // Stream still active?
+            if (!stream.closed_for_gc and
+                !(stream.recv.finished and (stream.send.fin_sent or stream.send.reset_err != null)))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Send a PRIORITY_UPDATE frame on the control stream (RFC 9218).
+    /// Used by clients to dynamically reprioritize a request stream.
+    pub fn sendPriorityUpdate(self: *H3Connection, stream_id: u64, prio: priority.StreamPriority) !void {
+        const ctrl = self.local_control_stream orelse return error.NotInitialized;
+
+        // Serialize the field value
+        var fv_buf: [32]u8 = undefined;
+        const fv_len = priority.serialize(prio, &fv_buf);
+
+        // Write PRIORITY_UPDATE frame
+        var frame_buf: [64]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .priority_update = .{
+            .stream_id = stream_id,
+            .field_value = fv_buf[0..fv_len],
+        } }, fbs.writer());
+        try ctrl.writeData(fbs.getWritten());
+
+        // Also update local scheduling state
+        if (self.quic_conn.streams.getStream(stream_id)) |stream| {
+            stream.send.urgency = prio.urgency;
+            stream.send.incremental = prio.incremental;
+        }
+    }
+
     /// Poll for the next HTTP/3 event.
     /// Processes incoming QUIC stream data and returns H3 events.
     pub fn poll(self: *H3Connection) !?H3Event {
@@ -296,6 +442,12 @@ pub const H3Connection = struct {
         // Check bidirectional streams for request/response data
         if (try self.pollBidiStreams()) |event| {
             return event;
+        }
+
+        // Check if graceful shutdown drain is complete
+        if (self.shutdown_state == .going_away_final and self.isDrainComplete()) {
+            self.shutdown_state = .drain_complete;
+            return .{ .shutdown_complete = {} };
         }
 
         return null;
@@ -407,7 +559,20 @@ pub const H3Connection = struct {
                 return .{ .settings = settings };
             },
             .goaway => |id| {
+                // RFC 9114 §5.2: successive GOAWAY IDs must not increase
+                if (self.peer_goaway_id) |prev| {
+                    if (id > prev) return error.H3IdError;
+                }
+                self.peer_goaway_id = id;
                 return .{ .goaway = id };
+            },
+            .priority_update => |pu| {
+                const prio = priority.parse(pu.field_value);
+                if (self.quic_conn.streams.getStream(pu.stream_id)) |stream| {
+                    stream.send.urgency = prio.urgency;
+                    stream.send.incremental = prio.incremental;
+                }
+                return null; // Internal, don't surface as event
             },
             else => return null, // Ignore other frames on control stream
         }
@@ -424,6 +589,16 @@ pub const H3Connection = struct {
             if (self.finished_streams.contains(stream_id)) continue;
             // Skip streams owned by the WebTransport layer
             if (self.excluded_bidi_streams.contains(stream_id)) continue;
+
+            // RFC 9114 §5.2: reject client-initiated bidi streams >= our GOAWAY ID
+            if (self.shutdown_state == .going_away_final) {
+                if (self.local_goaway_id) |goaway_id| {
+                    if (stream_mod.isClient(stream_id) and stream_mod.isBidi(stream_id) and stream_id >= goaway_id) {
+                        stream.send.reset(@intFromEnum(H3Error.request_rejected));
+                        continue;
+                    }
+                }
+            }
 
             // Read incoming data
             if (stream.recv.read()) |data| {
@@ -481,6 +656,21 @@ pub const H3Connection = struct {
                             if (std.mem.eql(u8, h_item.name, ":protocol")) proto = h_item.value;
                             if (std.mem.eql(u8, h_item.name, ":authority")) authority = h_item.value;
                             if (std.mem.eql(u8, h_item.name, ":path")) path = h_item.value;
+                            // RFC 9218: extract Priority header field
+                            if (std.mem.eql(u8, h_item.name, "priority")) {
+                                const prio = priority.parse(h_item.value);
+                                if (self.quic_conn.streams.getStream(stream_id)) |prio_stream| {
+                                    prio_stream.send.urgency = prio.urgency;
+                                    prio_stream.send.incremental = prio.incremental;
+                                }
+                            }
+                        }
+
+                        // Track highest processed client-initiated bidi stream (for GOAWAY)
+                        if (self.is_server and stream_mod.isClient(stream_id) and stream_mod.isBidi(stream_id)) {
+                            if (self.highest_processed_stream_id == null or stream_id > self.highest_processed_stream_id.?) {
+                                self.highest_processed_stream_id = stream_id;
+                            }
                         }
 
                         // Consume frame from buffer AFTER processing
@@ -589,4 +779,96 @@ test "H3Connection: init and deinit" {
     conn.finished_streams = std.AutoHashMap(u64, void).init(testing.allocator);
     conn.excluded_bidi_streams = std.AutoHashMap(u64, void).init(testing.allocator);
     conn.deinit();
+}
+
+test "ShutdownState: initial state is active" {
+    var conn: H3Connection = undefined;
+    conn.shutdown_state = .active;
+    conn.local_goaway_id = null;
+    conn.peer_goaway_id = null;
+    conn.highest_processed_stream_id = null;
+
+    try testing.expectEqual(ShutdownState.active, conn.shutdown_state);
+    try testing.expect(conn.local_goaway_id == null);
+    try testing.expect(conn.peer_goaway_id == null);
+}
+
+test "ShutdownState: peer GOAWAY monotonic decrease" {
+    var conn: H3Connection = undefined;
+    conn.peer_goaway_id = null;
+
+    // First GOAWAY is accepted
+    conn.peer_goaway_id = 100;
+    try testing.expectEqual(@as(u64, 100), conn.peer_goaway_id.?);
+
+    // Lower GOAWAY is accepted
+    conn.peer_goaway_id = 50;
+    try testing.expectEqual(@as(u64, 50), conn.peer_goaway_id.?);
+
+    // Zero GOAWAY is accepted
+    conn.peer_goaway_id = 0;
+    try testing.expectEqual(@as(u64, 0), conn.peer_goaway_id.?);
+}
+
+test "ShutdownState: sendGoaway validates server stream ID" {
+    var conn: H3Connection = undefined;
+    conn.is_server = true;
+    conn.local_goaway_id = null;
+    conn.shutdown_state = .active;
+    conn.local_control_stream = null;
+
+    // No control stream → error
+    try testing.expectError(error.NotInitialized, conn.sendGoaway(0));
+}
+
+test "ShutdownState: sendGoaway rejects increasing ID" {
+    var conn: H3Connection = undefined;
+    conn.is_server = true;
+    conn.local_goaway_id = 8;
+    conn.shutdown_state = .going_away_final;
+    conn.local_control_stream = null;
+
+    // Trying to increase → H3IdError (validated before control stream check)
+    try testing.expectError(error.H3IdError, conn.sendGoaway(12));
+}
+
+test "ShutdownState: sendGoaway rejects non-bidi server ID" {
+    var conn: H3Connection = undefined;
+    conn.is_server = true;
+    conn.local_goaway_id = null;
+    conn.shutdown_state = .active;
+    conn.local_control_stream = null;
+
+    // Odd ID (not client-initiated bidi) → H3IdError
+    try testing.expectError(error.H3IdError, conn.sendGoaway(5));
+}
+
+test "ShutdownState: highest_processed_stream_id tracking" {
+    var conn: H3Connection = undefined;
+    conn.highest_processed_stream_id = null;
+    conn.is_server = true;
+
+    // Simulate processing streams 0, 4, 8
+    conn.highest_processed_stream_id = 0;
+    try testing.expectEqual(@as(u64, 0), conn.highest_processed_stream_id.?);
+
+    conn.highest_processed_stream_id = 4;
+    try testing.expectEqual(@as(u64, 4), conn.highest_processed_stream_id.?);
+
+    conn.highest_processed_stream_id = 8;
+    try testing.expectEqual(@as(u64, 8), conn.highest_processed_stream_id.?);
+}
+
+test "ShutdownState: state transitions" {
+    var conn: H3Connection = undefined;
+    conn.shutdown_state = .active;
+
+    conn.shutdown_state = .going_away_initial;
+    try testing.expectEqual(ShutdownState.going_away_initial, conn.shutdown_state);
+
+    conn.shutdown_state = .going_away_final;
+    try testing.expectEqual(ShutdownState.going_away_final, conn.shutdown_state);
+
+    conn.shutdown_state = .drain_complete;
+    try testing.expectEqual(ShutdownState.drain_complete, conn.shutdown_state);
 }

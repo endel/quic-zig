@@ -243,6 +243,12 @@ pub const SendStream = struct {
     // Track the limit at which we last sent STREAM_DATA_BLOCKED (avoid duplicates)
     blocked_at: ?u64 = null,
 
+    /// RFC 9218 priority: urgency (0=highest, 7=lowest, default 3).
+    urgency: u3 = 3,
+
+    /// RFC 9218 priority: incremental streams are interleaved round-robin.
+    incremental: bool = false,
+
     /// Whether FIN has been queued.
     fin_queued: bool = false,
 
@@ -567,6 +573,9 @@ pub const StreamsMap = struct {
     initial_max_incoming_bidi: u64 = 0,
     initial_max_incoming_uni: u64 = 0,
 
+    /// Round-robin index for fair scheduling of incremental streams (RFC 9218).
+    rr_index: u64 = 0,
+
     pub fn init(allocator: Allocator, is_server: bool) StreamsMap {
         // Stream IDs: client bidi = 0, 4, 8, ...; server bidi = 1, 5, 9, ...
         // Client uni = 2, 6, 10, ...; server uni = 3, 7, 11, ...
@@ -720,6 +729,69 @@ pub const StreamsMap = struct {
     /// Get a stream by ID.
     pub fn getStream(self: *StreamsMap, stream_id: u64) ?*Stream {
         return self.streams.get(stream_id);
+    }
+
+    /// Maximum number of streams returned by getScheduledStreams().
+    pub const MAX_SCHEDULABLE: usize = 48;
+
+    /// Select bidi streams to send data on according to RFC 9218 priority.
+    /// Pass 1: find the minimum urgency level with data ready.
+    /// Pass 2: collect streams at that urgency.
+    ///   - Non-incremental: only the first one (sequential delivery).
+    ///   - Incremental: all of them (round-robin interleaved).
+    /// Returns the count of streams written to `out`.
+    pub fn getScheduledStreams(self: *StreamsMap, out: *[MAX_SCHEDULABLE]*Stream) usize {
+        // Pass 1: find minimum urgency among streams with data
+        var min_urgency: u3 = 7;
+        var has_any = false;
+        var it1 = self.streams.valueIterator();
+        while (it1.next()) |sp| {
+            const s = sp.*;
+            if (s.send.hasData() and !s.closed_for_gc) {
+                if (s.send.urgency < min_urgency) min_urgency = s.send.urgency;
+                has_any = true;
+            }
+        }
+        if (!has_any) return 0;
+
+        // Pass 2: collect streams at min_urgency
+        var count: usize = 0;
+        var found_non_incremental = false;
+        var it2 = self.streams.valueIterator();
+        while (it2.next()) |sp| {
+            const s = sp.*;
+            if (s.send.urgency != min_urgency or !s.send.hasData() or s.closed_for_gc) continue;
+            if (!s.send.incremental) {
+                if (!found_non_incremental) {
+                    if (count >= MAX_SCHEDULABLE) break;
+                    out[count] = s;
+                    count += 1;
+                    found_non_incremental = true;
+                }
+                // Skip additional non-incremental streams (sequential rule)
+            } else {
+                if (count >= MAX_SCHEDULABLE) break;
+                out[count] = s;
+                count += 1;
+            }
+        }
+
+        // Rotate incremental streams for fairness
+        if (count > 1) {
+            const rotation = self.rr_index % count;
+            if (rotation > 0) {
+                // Simple in-place rotation using a temp buffer
+                var tmp: [MAX_SCHEDULABLE]*Stream = undefined;
+                for (0..count) |i| {
+                    tmp[i] = out[(i + rotation) % count];
+                }
+                for (0..count) |i| {
+                    out[i] = tmp[i];
+                }
+            }
+        }
+        self.rr_index +%= 1;
+        return count;
     }
 
     /// Mark a stream as fully closed and update consumed counters.
@@ -1284,4 +1356,128 @@ test "SendStream: partial retransmit due to max_len" {
     try testing.expectEqualSlices(u8, "world", frame2.?.stream.data);
 
     try testing.expect(!ss.hasData());
+}
+
+// RFC 9218 priority scheduling tests
+
+test "StreamsMap: getScheduledStreams returns highest priority stream" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s0 = try sm.openBidiStream(); // id=0
+    const s4 = try sm.openBidiStream(); // id=4
+
+    try s0.send.writeData("low");
+    s0.send.urgency = 5;
+
+    try s4.send.writeData("high");
+    s4.send.urgency = 1;
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    const count = sm.getScheduledStreams(&out);
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(u64, 4), out[0].stream_id);
+}
+
+test "StreamsMap: getScheduledStreams non-incremental is sequential" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s0 = try sm.openBidiStream();
+    const s4 = try sm.openBidiStream();
+
+    try s0.send.writeData("aaa");
+    s0.send.urgency = 3;
+    s0.send.incremental = false;
+
+    try s4.send.writeData("bbb");
+    s4.send.urgency = 3;
+    s4.send.incremental = false;
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    const count = sm.getScheduledStreams(&out);
+    // Non-incremental: only one stream at a time
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "StreamsMap: getScheduledStreams incremental returns all" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s0 = try sm.openBidiStream();
+    const s4 = try sm.openBidiStream();
+
+    try s0.send.writeData("aaa");
+    s0.send.urgency = 2;
+    s0.send.incremental = true;
+
+    try s4.send.writeData("bbb");
+    s4.send.urgency = 2;
+    s4.send.incremental = true;
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    const count = sm.getScheduledStreams(&out);
+    // Incremental: all streams at same urgency
+    try testing.expectEqual(@as(usize, 2), count);
+}
+
+test "StreamsMap: getScheduledStreams skips streams without data" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s0 = try sm.openBidiStream();
+    _ = try sm.openBidiStream(); // no data
+
+    try s0.send.writeData("data");
+    s0.send.urgency = 3;
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    const count = sm.getScheduledStreams(&out);
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(u64, 0), out[0].stream_id);
+}
+
+test "StreamsMap: getScheduledStreams returns empty when no data" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    _ = try sm.openBidiStream();
+    _ = try sm.openBidiStream();
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    const count = sm.getScheduledStreams(&out);
+    try testing.expectEqual(@as(usize, 0), count);
+}
+
+test "StreamsMap: getScheduledStreams mixed incremental and non-incremental" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s0 = try sm.openBidiStream();
+    const s4 = try sm.openBidiStream();
+    const s8 = try sm.openBidiStream();
+
+    // One non-incremental + two incremental at same urgency
+    try s0.send.writeData("aaa");
+    s0.send.urgency = 2;
+    s0.send.incremental = false;
+
+    try s4.send.writeData("bbb");
+    s4.send.urgency = 2;
+    s4.send.incremental = true;
+
+    try s8.send.writeData("ccc");
+    s8.send.urgency = 2;
+    s8.send.incremental = true;
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    const count = sm.getScheduledStreams(&out);
+    // 1 non-incremental + 2 incremental = 3
+    try testing.expectEqual(@as(usize, 3), count);
 }

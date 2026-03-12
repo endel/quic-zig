@@ -12,6 +12,7 @@ pub const H3FrameType = enum(u64) {
     push_promise = 0x05, // not used
     goaway = 0x07,
     max_push_id = 0x0d, // not used
+    priority_update = 0xF0700, // RFC 9218
 
     pub fn fromInt(v: u64) ?H3FrameType {
         return switch (v) {
@@ -22,6 +23,7 @@ pub const H3FrameType = enum(u64) {
             0x05 => .push_promise,
             0x07 => .goaway,
             0x0d => .max_push_id,
+            0xF0700 => .priority_update,
             else => null,
         };
     }
@@ -70,6 +72,12 @@ pub const Settings = struct {
     webtransport_max_sessions: ?u64 = null,
 };
 
+/// PRIORITY_UPDATE payload (RFC 9218).
+pub const PriorityUpdate = struct {
+    stream_id: u64,
+    field_value: []const u8,
+};
+
 /// HTTP/3 frame (RFC 9114 Section 7).
 pub const H3Frame = union(H3FrameType) {
     data: []const u8,
@@ -79,6 +87,7 @@ pub const H3Frame = union(H3FrameType) {
     push_promise: void,
     goaway: u64,
     max_push_id: u64,
+    priority_update: PriorityUpdate,
 };
 
 /// HTTP/3 unidirectional stream types (RFC 9114 Section 6.2).
@@ -179,6 +188,16 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
             break :blk .{ .max_push_id = id };
         },
         .push_promise => .{ .push_promise = {} },
+        .priority_update => blk: {
+            var pfbs = io.fixedBufferStream(payload);
+            const preader = pfbs.reader();
+            const prioritized_id = packet.readVarInt(preader) catch return error.MalformedFrame;
+            const fv_start = pfbs.pos;
+            break :blk .{ .priority_update = .{
+                .stream_id = prioritized_id,
+                .field_value = payload[fv_start..],
+            } };
+        },
     };
 
     return .{
@@ -275,6 +294,18 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
             try packet.writeVarInt(writer, id);
         },
         .push_promise => {},
+        .priority_update => |pu| {
+            // Compute payload length: varint(stream_id) + field_value bytes
+            var id_buf: [8]u8 = undefined;
+            var id_fbs = io.fixedBufferStream(&id_buf);
+            try packet.writeVarInt(id_fbs.writer(), pu.stream_id);
+            const payload_len = id_fbs.pos + pu.field_value.len;
+
+            try packet.writeVarInt(writer, 0xF0700);
+            try packet.writeVarInt(writer, payload_len);
+            try packet.writeVarInt(writer, pu.stream_id);
+            try writer.writeAll(pu.field_value);
+        },
     }
 }
 
@@ -420,6 +451,41 @@ test "H3Frame: write and parse SETTINGS with WebTransport fields" {
     try testing.expect(result.frame.settings.h3_datagram);
     try testing.expect(result.frame.settings.enable_webtransport);
     try testing.expectEqual(@as(u64, 1), result.frame.settings.webtransport_max_sessions.?);
+}
+
+test "H3Frame: write and parse PRIORITY_UPDATE" {
+    var buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+
+    try write(.{ .priority_update = .{
+        .stream_id = 4,
+        .field_value = "u=1, i",
+    } }, fbs.writer());
+
+    const written = fbs.getWritten();
+    const result = try parse(written);
+
+    try testing.expectEqual(H3FrameType.priority_update, std.meta.activeTag(result.frame));
+    try testing.expectEqual(@as(u64, 4), result.frame.priority_update.stream_id);
+    try testing.expectEqualStrings("u=1, i", result.frame.priority_update.field_value);
+    try testing.expectEqual(written.len, result.consumed);
+}
+
+test "H3Frame: write and parse PRIORITY_UPDATE empty field value" {
+    var buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+
+    try write(.{ .priority_update = .{
+        .stream_id = 0,
+        .field_value = "",
+    } }, fbs.writer());
+
+    const written = fbs.getWritten();
+    const result = try parse(written);
+
+    try testing.expectEqual(H3FrameType.priority_update, std.meta.activeTag(result.frame));
+    try testing.expectEqual(@as(u64, 0), result.frame.priority_update.stream_id);
+    try testing.expectEqualStrings("", result.frame.priority_update.field_value);
 }
 
 test "UniStreamType: write and read" {

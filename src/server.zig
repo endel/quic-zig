@@ -191,6 +191,7 @@ pub fn main() !void {
                         .connect_request => |req| {
                             std.log.info("H3: received CONNECT request on stream {d} (protocol={s})", .{ req.stream_id, req.protocol });
                         },
+                        .shutdown_complete => {},
                     }
                 }
             }

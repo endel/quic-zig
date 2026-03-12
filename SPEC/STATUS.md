@@ -7,7 +7,7 @@
 | **2** | **Streams** | | |
 | 2.1 | Stream Types and Identifiers | ✅ Done | Bidi + uni, client/server initiated, proper ID bits |
 | 2.2 | Sending and Receiving Data | ✅ Done | FrameSorter, SendStream, ReceiveStream |
-| 2.3 | Stream Prioritization | ❌ Missing | No priority mechanism (RFC 9218 extensible priorities) |
+| 2.3 | Stream Prioritization | ✅ Done | RFC 9218 extensible priorities: urgency (0-7), incremental, PRIORITY_UPDATE frame |
 | 2.4 | Operations on Streams | ✅ Done | Open, send, recv, close, reset |
 | **3** | **Stream States** | | |
 | 3.1 | Sending Stream States | ✅ Done | Ready→Send→DataSent→DataRecvd/ResetSent |
@@ -170,7 +170,7 @@
 
 | Priority | Section | Item | Effort |
 |----------|---------|------|--------|
-| P3 | §2.3 | Stream Prioritization (RFC 9218) | Medium |
+| ~~P3~~ | ~~§2.3~~ | ~~Stream Prioritization (RFC 9218)~~ | ~~Done~~ |
 | ~~P2~~ | ~~§5.2.2~~ | ~~Multi-connection server (CID-based demux)~~ | ~~Done~~ |
 | ~~P2~~ | ~~§6.2-6.3~~ | ~~Compatible Version Negotiation (RFC 9368/9369)~~ | ~~Done~~ |
 | P3 | §7.4.1 | 0-RTT transport parameter remember/restore | Medium |
@@ -312,7 +312,7 @@
 | 4.6 | Server Push | ❌ Missing | PUSH_PROMISE not implemented |
 | 5 | Connection Closure | | |
 | 5.1 | Idle Connections | ✅ Done | Via QUIC idle timeout |
-| 5.2 | Connection Shutdown | ⚠️ Partial | GOAWAY frame parsed but graceful shutdown not fully impl |
+| 5.2 | Connection Shutdown | ✅ Done | Two-phase GOAWAY, stream rejection, drain detection, shutdown_complete event |
 | 5.3 | Immediate Closure | ✅ Done | H3 error codes in CONNECTION_CLOSE |
 | 6 | Stream Mapping and Usage | | |
 | 6.1 | Bidirectional Streams | ✅ Done | Request/response streams |
@@ -338,8 +338,8 @@
 
 | Status | Count |
 |--------|-------|
-| ✅ Done | 18 |
-| ⚠️ Partial | 4 |
+| ✅ Done | 19 |
+| ⚠️ Partial | 3 |
 | ❌ Missing | 5 |
 | ❌ N/A | 3 |
 
@@ -348,7 +348,7 @@
 | Priority | Section | Item | Effort |
 |----------|---------|------|--------|
 | P3 | §4.6 | Server Push (PUSH_PROMISE, CANCEL_PUSH, MAX_PUSH_ID) | Large |
-| P3 | §5.2 | Graceful shutdown (GOAWAY stream ID tracking) | Medium |
+| ~~P3~~ | ~~§5.2~~ | ~~Graceful shutdown (GOAWAY stream ID tracking)~~ | ~~Done~~ |
 | P3 | §4.2-4.3 | Request cancellation + malformed request handling | Small |
 | P3 | §8 | Comprehensive H3 error handling | Small |
 
