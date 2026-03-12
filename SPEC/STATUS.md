@@ -466,6 +466,24 @@ No remaining work — all sections implemented. Optional improvements:
 
 ---
 
+## QLOG — Structured Logging (draft-ietf-quic-qlog)
+
+| § | Section | Status | Notes |
+|---|---------|--------|-------|
+| — | JSON-SEQ (.sqlog) output format | ✅ Done | Per-connection files with ODCID naming |
+| — | transport:connection_started/closed | ✅ Done | |
+| — | transport:packet_sent/received | ✅ Done | With frame serialization (all 24+ types) |
+| — | transport:packet_dropped | ✅ Done | |
+| — | recovery:metrics_updated | ✅ Done | RTT, cwnd, bytes_in_flight |
+| — | recovery:packet_lost | ✅ Done | |
+| — | recovery:congestion_state_updated | ✅ Done | |
+| — | security:key_updated/discarded | ✅ Done | |
+| — | QLOGDIR env var integration | ✅ Done | Interop server + client |
+
+### Summary — QLOG: ✅ Complete
+
+---
+
 ## Overall Progress
 
 | RFC | Done | Partial | Missing | Completion |
