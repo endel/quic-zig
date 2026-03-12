@@ -280,7 +280,10 @@ pub const ConnectionManager = struct {
                 if (header.packet_type != .initial) {
                     // Short-header for unknown CID: stateless reset (RFC 9000 §10.3)
                     if (header.packet_type == .one_rtt) {
-                        const sr_max = @min(full_size, out_buf.len);
+                        // RFC 9000 §10.3.3: response SHOULD be smaller than the trigger
+                        // packet to prevent loops (a reset responding to a reset).
+                        // Also MUST NOT be 3x or more larger (amplification limit).
+                        const sr_max = @min(full_size -| 1, out_buf.len);
                         const sr_len = stateless_reset.generatePacket(out_buf, sr_max, self.static_reset_key, header.dcid);
                         if (sr_len > 0) {
                             return .{ .send_response = out_buf[0..sr_len] };

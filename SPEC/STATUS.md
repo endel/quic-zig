@@ -79,7 +79,7 @@
 | 10.3 | Stateless Reset | ✅ Done | HMAC-SHA256 tokens, generation, detection |
 | 10.3.1 | Detecting a Stateless Reset | ✅ Done | Token matching on undecryptable packets |
 | 10.3.2 | Calculating a Stateless Reset Token | ✅ Done | Deterministic HMAC-SHA256 |
-| 10.3.3 | Looping | ⚠️ Partial | No explicit loop detection mechanism |
+| 10.3.3 | Looping | ✅ Done | Response always smaller than trigger packet |
 | **11** | **Error Handling** | | |
 | 11.1 | Connection Errors | ✅ Done | CONNECTION_CLOSE with transport error codes |
 | 11.2 | Stream Errors | ✅ Done | RESET_STREAM + STOP_SENDING |
@@ -95,7 +95,7 @@
 | 13.2.1 | Sending ACK Frames | ✅ Done | max_ack_delay honored |
 | 13.2.2 | Acknowledgment Frequency | ✅ Done | Ack-elicit threshold = 2 |
 | 13.2.3 | Managing ACK Ranges | ✅ Done | RangeSet with descending order |
-| 13.2.4 | Limiting Ranges by Tracking ACK Frames | ⚠️ Partial | Basic range limiting; no explicit tracking of peer ACK-of-ACK |
+| 13.2.4 | Limiting Ranges by Tracking ACK Frames | ✅ Done | ACK-of-ACK pruning via largest_acked in SentPacket |
 | 13.2.5 | Measuring and Reporting Host Delay | ✅ Done | ACK delay field |
 | 13.2.6 | ACK Frames and Packet Protection | ✅ Done | ACKs at correct encryption level |
 | 13.2.7 | PADDING Frames Consume Congestion Window | ✅ Done | Counted as in-flight bytes |
@@ -127,7 +127,7 @@
 | 17.3.1 | 1-RTT Packet | ✅ Done | Full support |
 | 17.4 | Latency Spin Bit | ✅ Done | Tracked in header |
 | **18** | **Transport Parameter Encoding** | | |
-| 18.1 | Reserved Transport Parameters | ⚠️ Partial | Unknown params skipped; no greasing sent |
+| 18.1 | Reserved Transport Parameters | ✅ Done | Greasing with 31*N+27 IDs; unknown params skipped on decode |
 | 18.2 | Transport Parameter Definitions | ✅ Done | All 17 standard params |
 | **19** | **Frame Types and Formats** | | |
 | 19.1 | PADDING (0x00) | ✅ Done | |
@@ -161,9 +161,9 @@
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Done | 94 | ~90% |
-| ⚠️ Partial | 9 | ~9% |
-| ❌ Missing | 3 | ~1% |
+| ✅ Done | 98 | ~93% |
+| ⚠️ Partial | 5 | ~5% |
+| ❌ Missing | 3 | ~2% |
 | ❌ N/A | 2 | — |
 
 ### Remaining Work — RFC 9000
@@ -175,13 +175,13 @@
 | ~~P2~~ | ~~§6.2-6.3~~ | ~~Compatible Version Negotiation (RFC 9368/9369)~~ | ~~Done~~ |
 | P3 | §7.4.1 | 0-RTT transport parameter remember/restore | Medium |
 | ~~P2~~ | ~~§9.6~~ | ~~Server's Preferred Address~~ | ~~Done~~ |
-| P3 | §10.3.3 | Stateless Reset loop detection | Small |
+| ~~P3~~ | ~~§10.3.3~~ | ~~Stateless Reset loop detection~~ | ~~Done~~ |
 | ~~P2~~ | ~~§13.4~~ | ~~ECN IP-level marking + full validation~~ | ~~Done~~ |
-| P3 | §13.2.4 | ACK range pruning via ACK-of-ACK tracking | Small |
+| ~~P3~~ | ~~§13.2.4~~ | ~~ACK range pruning via ACK-of-ACK tracking~~ | ~~Done~~ |
 | P3 | §14.2.1/14.3.3 | ICMP message handling for PMTUD | Small (platform-limited) |
 | P3 | §14.4.1 | PMTU probes with SCID | Small |
 | ~~P3~~ | ~~§17.2.3~~ | ~~0-RTT data sending~~ | ~~Done~~ |
-| P3 | §18.1 | Transport parameter greasing | Small |
+| ~~P3~~ | ~~§18.1~~ | ~~Transport parameter greasing~~ | ~~Done~~ |
 
 ---
 
@@ -273,7 +273,7 @@
 | 7.5 | Probe Timeout | ✅ Done | PTO sends don't reduce window |
 | 7.6 | Persistent Congestion | ✅ Done | 3×PTO threshold, reset to 2×MSS |
 | 7.7 | Pacing | ✅ Done | Token bucket, 1.25× cwnd, 10-pkt burst |
-| 7.8 | Under-utilizing the Congestion Window | ⚠️ Partial | App-limited not fully tracked |
+| 7.8 | Under-utilizing the Congestion Window | ✅ Done | app_limited flag suppresses cwnd growth in NewReno + CUBIC |
 | B | NewReno Pseudocode | ✅ Done | Matches appendix B |
 | - | CUBIC (RFC 8312) | ✅ Done | Default CC algorithm, fast convergence |
 
@@ -281,8 +281,8 @@
 
 | Status | Count |
 |--------|-------|
-| ✅ Done | 23 |
-| ⚠️ Partial | 1 |
+| ✅ Done | 24 |
+| ⚠️ Partial | 0 |
 | ❌ Missing | 0 |
 
 ### Remaining Work — RFC 9002
@@ -290,7 +290,7 @@
 | Priority | Section | Item | Effort |
 |----------|---------|------|--------|
 | ~~P2~~ | ~~§7.1~~ | ~~ECN IP-level marking + CE response~~ | ~~Done~~ |
-| P3 | §7.8 | Application-limited cwnd tracking | Small |
+| ~~P3~~ | ~~§7.8~~ | ~~Application-limited cwnd tracking~~ | ~~Done~~ |
 
 ---
 

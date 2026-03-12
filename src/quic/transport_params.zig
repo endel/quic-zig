@@ -214,6 +214,21 @@ pub const TransportParams = struct {
             try Helper.writeParam(writer, .max_datagram_frame_size, size);
         }
 
+        // RFC 9000 §18.1: Transport parameter greasing — send a reserved parameter
+        // with ID of form 31*N+27 so peers learn to ignore unknown parameters.
+        {
+            var grease_entropy: [6]u8 = undefined;
+            std.crypto.random.bytes(&grease_entropy);
+            // Pick N in [0..255], giving IDs like 27, 58, 89, ...
+            const n: u64 = @as(u64, grease_entropy[0]);
+            const grease_id: u64 = 31 * n + 27;
+            // Value: 1-4 random bytes
+            const grease_val_len: u64 = @as(u64, grease_entropy[1] & 0x03) + 1;
+            try packet.writeVarInt(writer, grease_id);
+            try packet.writeVarInt(writer, grease_val_len);
+            try writer.writeAll(grease_entropy[2..][0..grease_val_len]);
+        }
+
         // RFC 9368: version_information
         if (self.version_info_chosen) |chosen| {
             const n = self.version_info_available_count;
@@ -501,4 +516,29 @@ test "TransportParams: connection IDs roundtrip" {
     try testing.expectEqualSlices(u8, &scid, decoded.initial_source_connection_id.?);
     try testing.expect(decoded.original_destination_connection_id != null);
     try testing.expectEqualSlices(u8, &odcid, decoded.original_destination_connection_id.?);
+}
+
+// RFC 9000 §18.1: greased transport parameters are encoded and decode is tolerant
+test "TransportParams: greasing roundtrip" {
+    const original = TransportParams{
+        .max_idle_timeout = 30000,
+        .initial_max_data = 1048576,
+    };
+
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try original.encode(fbs.writer());
+
+    // Decode should succeed — unknown params (greased) are silently ignored
+    const decoded = try TransportParams.decode(fbs.getWritten());
+    try std.testing.expectEqual(@as(u64, 30000), decoded.max_idle_timeout);
+    try std.testing.expectEqual(@as(u64, 1048576), decoded.initial_max_data);
+
+    // Encode twice — greased IDs are random so encoded length may differ,
+    // but both must decode to same semantic values
+    var buf2: [512]u8 = undefined;
+    var fbs2 = std.io.fixedBufferStream(&buf2);
+    try original.encode(fbs2.writer());
+    const decoded2 = try TransportParams.decode(fbs2.getWritten());
+    try std.testing.expectEqual(@as(u64, 30000), decoded2.max_idle_timeout);
 }

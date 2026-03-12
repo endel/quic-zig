@@ -323,11 +323,20 @@ pub const PacketPacker = struct {
         var has_crypto_data = false;
         var has_handshake_done = false;
 
+        // Track the largest_ack we send in this packet's ACK frame (for ACK-of-ACK pruning)
+        var ack_largest_sent: ?u64 = null;
+
         // 0-RTT packets only contain STREAM and DATAGRAM frames — skip ACK, CRYPTO, control
         if (!zero_rtt) {
             // 1. ACK frame (always first if pending)
             const ack_delay_exp: u64 = 3;
             if (pkt_handler.getAckFrame(level, now, ack_delay_exp)) |ack_frame| {
+                // Record the largest_ack for ACK-of-ACK pruning (RFC 9000 §13.2.4)
+                switch (ack_frame) {
+                    .ack => |a| ack_largest_sent = a.largest_ack,
+                    .ack_ecn => |a| ack_largest_sent = a.largest_ack,
+                    else => {},
+                }
                 try ack_frame.write(writer);
             }
 
@@ -570,6 +579,7 @@ pub const PacketPacker = struct {
             .has_crypto_data = has_crypto_data,
             .has_handshake_done = has_handshake_done,
             .ecn_marked = level == .application and self.ecn_mark,
+            .largest_acked = ack_largest_sent,
         };
         // Copy stream frame records into the SentPacket
         for (stream_frame_infos[0..stream_frame_info_count]) |info| {

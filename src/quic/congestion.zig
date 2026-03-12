@@ -47,6 +47,10 @@ pub const NewReno = struct {
     /// Bytes acknowledged in the current round trip (for congestion avoidance).
     bytes_acked_in_round: u64 = 0,
 
+    /// RFC 9002 §7.8: Application-limited — suppress cwnd growth when the
+    /// sender is not fully utilizing the congestion window.
+    app_limited: bool = false,
+
     /// Whether we are in slow start.
     pub fn inSlowStart(self: *const NewReno) bool {
         return self.congestion_window < self.ssthresh;
@@ -79,6 +83,9 @@ pub const NewReno = struct {
     pub fn onPacketAcked(self: *NewReno, acked_bytes: u64, sent_time: i64) void {
         // Don't grow window during recovery
         if (self.inCongestionRecovery(sent_time)) return;
+
+        // RFC 9002 §7.8: Don't increase cwnd when application-limited
+        if (self.app_limited) return;
 
         if (self.inSlowStart()) {
             // Slow start: increase by acked_bytes
@@ -167,6 +174,10 @@ pub const Cubic = struct {
     /// Bytes acknowledged in the current round trip (for slow start / TCP-friendly).
     bytes_acked_in_round: u64 = 0,
 
+    /// RFC 9002 §7.8: Application-limited — suppress cwnd growth when the
+    /// sender is not fully utilizing the congestion window.
+    app_limited: bool = false,
+
     // ── CUBIC-specific state ──
 
     /// W_max: congestion window at the time of the last congestion event (in bytes).
@@ -221,6 +232,9 @@ pub const Cubic = struct {
     pub fn onPacketAcked(self: *Cubic, acked_bytes: u64, sent_time: i64) void {
         // Don't grow window during recovery
         if (self.inCongestionRecovery(sent_time)) return;
+
+        // RFC 9002 §7.8: Don't increase cwnd when application-limited
+        if (self.app_limited) return;
 
         if (self.inSlowStart()) {
             // Slow start: increase by acked_bytes (same as NewReno)

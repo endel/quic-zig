@@ -1090,6 +1090,9 @@ pub const Connection = struct {
                     now,
                 );
 
+                // RFC 9002 §7.8: update app_limited before processing ACKs
+                self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
+
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
                 var earliest_lost_sent_time: ?i64 = null;
@@ -1192,6 +1195,9 @@ pub const Connection = struct {
                     ack.first_ack_range,
                     now,
                 );
+
+                // RFC 9002 §7.8: update app_limited before processing ACKs
+                self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
 
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;

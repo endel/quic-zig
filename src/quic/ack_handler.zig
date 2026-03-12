@@ -341,6 +341,12 @@ pub const ReceivedPacketTracker = struct {
         return self.received.contains(pn);
     }
 
+    /// Prune received ranges below the given packet number (RFC 9000 §13.2.4).
+    /// Called when the peer ACKs a packet that contained our ACK for ranges up to this value.
+    pub fn pruneAckedRanges(self: *ReceivedPacketTracker, below: u64) void {
+        self.received.removeBelow(below);
+    }
+
     pub fn getAckFrame(self: *ReceivedPacketTracker, now: i64, ack_delay_exponent: u64) ?Frame {
         if (!self.ack_queued) {
             if (self.ack_alarm) |alarm| {
@@ -485,11 +491,23 @@ pub const PacketHandler = struct {
             now,
         );
 
+        // ACK-of-ACK pruning (RFC 9000 §13.2.4): when an acked packet contained
+        // our ACK frame, prune received ranges below that ACK's largest_ack
+        var max_ack_of_ack: ?u64 = null;
         for (result.acked.constSlice()) |pkt| {
             if (pkt.in_flight) {
                 self.bytes_in_flight -|= pkt.size;
             }
+            if (pkt.largest_acked) |la| {
+                if (max_ack_of_ack == null or la > max_ack_of_ack.?) {
+                    max_ack_of_ack = la;
+                }
+            }
         }
+        if (max_ack_of_ack) |prune_below| {
+            self.recv[idx].pruneAckedRanges(prune_below);
+        }
+
         for (result.lost.constSlice()) |pkt| {
             if (pkt.in_flight) {
                 self.bytes_in_flight -|= pkt.size;
@@ -780,4 +798,48 @@ test "SentPacket: stream frame capacity limit" {
     // Adding one more should be silently ignored (no crash)
     pkt.addStreamFrame(.{ .stream_id = 100, .offset = 0, .length = 10, .fin = false });
     try testing.expectEqual(@as(u8, MAX_STREAM_FRAMES_PER_PACKET), pkt.stream_frame_count);
+}
+
+// ACK-of-ACK pruning (RFC 9000 §13.2.4)
+test "ReceivedPacketTracker: pruneAckedRanges removes old ranges" {
+    var tracker = ReceivedPacketTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    // Receive packets 0..9
+    var i: u64 = 0;
+    while (i < 10) : (i += 1) {
+        try tracker.onPacketReceived(i, true, 1000 + @as(i64, @intCast(i)), 0);
+    }
+
+    // Ranges should cover 0..9
+    try testing.expectEqual(@as(usize, 1), tracker.received.getRanges().len);
+    try testing.expectEqual(@as(u64, 0), tracker.received.getRanges()[0].start);
+
+    // Prune below 5 — ranges should now start at 5
+    tracker.pruneAckedRanges(5);
+    try testing.expectEqual(@as(usize, 1), tracker.received.getRanges().len);
+    try testing.expectEqual(@as(u64, 5), tracker.received.getRanges()[0].start);
+    try testing.expectEqual(@as(u64, 9), tracker.received.getRanges()[0].end);
+}
+
+// App-limited cwnd suppression (RFC 9002 §7.8)
+test "NewReno: app_limited suppresses cwnd growth" {
+    const cc_mod = @import("congestion.zig");
+    var cc = cc_mod.NewReno.init();
+
+    // Normal growth in slow start
+    const initial = cc.congestion_window;
+    cc.onPacketAcked(1200, 100);
+    try testing.expect(cc.congestion_window > initial);
+
+    // Set app_limited — no further growth
+    const after_ack = cc.congestion_window;
+    cc.app_limited = true;
+    cc.onPacketAcked(1200, 200);
+    try testing.expectEqual(after_ack, cc.congestion_window);
+
+    // Clear app_limited — growth resumes
+    cc.app_limited = false;
+    cc.onPacketAcked(1200, 300);
+    try testing.expect(cc.congestion_window > after_ack);
 }
