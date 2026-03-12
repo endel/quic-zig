@@ -355,6 +355,15 @@ pub const Cubic = struct {
         _ = self;
     }
 
+    /// Enter recovery mode for NAT rebinding migration.
+    /// Pre-migration packets sent to the old address will appear as losses,
+    /// but they are path losses not congestion losses. Setting the recovery
+    /// start time to now prevents onCongestionEvent from reducing CWND for
+    /// those packets (since inCongestionRecovery(sent_time) will be true).
+    pub fn enterRecoveryForMigration(self: *Cubic, now: i64) void {
+        self.congestion_recovery_start_time = now;
+    }
+
     pub fn sendWindow(self: *const Cubic) u64 {
         return self.congestion_window;
     }

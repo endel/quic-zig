@@ -503,6 +503,7 @@ pub const Connection = struct {
 
     // Timing
     last_packet_received_time: i64 = 0,
+    last_keepalive_time: i64 = 0,
     creation_time: i64 = 0,
     idle_timeout_ns: i64 = 30_000_000_000, // 30s default
 
@@ -1027,6 +1028,8 @@ pub const Connection = struct {
             if (!sockaddrEql(&info.from, &active_path.peer_addr)) {
                 std.log.info("connection migration detected from new peer address", .{});
                 self.handleMigration(info.from, info.to, now);
+                // Credit this packet's bytes to the new path (already counted on old path above)
+                self.paths[self.active_path_idx].bytes_received += @intCast(fbs.buffer.len);
             }
         }
 
@@ -2518,7 +2521,8 @@ pub const Connection = struct {
 
         // Reset CC/RTT/MTU/ECN if IP address changed (not just port — NAT rebinding preserves CC)
         const old_path = &self.paths[1 - candidate_idx];
-        if (!sockaddrSameIp(&new_peer_addr, &old_path.peer_addr)) {
+        const same_ip = sockaddrSameIp(&new_peer_addr, &old_path.peer_addr);
+        if (!same_ip) {
             self.cc = congestion.Cubic.init();
             self.pacer = congestion.Pacer.init();
             self.pkt_handler.rtt_stats = rtt.RttStats{};
@@ -2527,10 +2531,15 @@ pub const Connection = struct {
             self.ecn_validator.reset();
             std.log.info("migration: IP changed, reset CC, RTT, MTU and ECN", .{});
         } else {
+            // NAT rebinding (port-only change): path is already validated since same IP,
+            // and carry over MTU from old path
+            self.paths[candidate_idx].is_validated = true;
+            // Mark current time as congestion recovery start so that loss detection
+            // for pre-migration packets (sent to old port) won't reduce CWND —
+            // these are path losses, not congestion losses.
+            self.cc.enterRecoveryForMigration(now);
             std.log.info("migration: port-only change (NAT rebinding), preserving CC", .{});
         }
-
-        _ = now;
     }
 
     /// Check for timeouts and maintenance tasks.
@@ -2734,14 +2743,29 @@ pub const Connection = struct {
             }
         }
 
-        // Check path validation timeouts
-        const pto_ns = self.pkt_handler.rtt_stats.pto();
-        for (&self.paths) |*path| {
-            if (path.validator.needsRetry(now, pto_ns)) {
-                path.validator.retry();
-                self.pending_frames.push(.{ .path_challenge = path.validator.challenge_data });
+        // Keep-alive PING: when no ack-eliciting packets are in flight but the
+        // connection is established and we haven't heard from the peer for >2×PTO,
+        // send a PING to elicit a response. This helps detect NAT rebindings where
+        // the peer's data is being silently dropped by the network (RFC 9000 §10.1.2).
+        if (self.handshake_confirmed and self.pkt_handler.getPtoSpace() == null) {
+            const pto_ns = self.pkt_handler.rtt_stats.pto();
+            const silence = now - self.last_packet_received_time;
+            if (silence > 2 * pto_ns and (self.last_keepalive_time == 0 or now - self.last_keepalive_time > pto_ns)) {
+                self.pending_frames.push(.{ .ping = {} });
+                self.last_keepalive_time = now;
             }
-            path.validator.checkTimeout(now, pto_ns);
+        }
+
+        // Check path validation timeouts
+        {
+            const pto_ns = self.pkt_handler.rtt_stats.pto();
+            for (&self.paths) |*path| {
+                if (path.validator.needsRetry(now, pto_ns)) {
+                    path.validator.retry();
+                    self.pending_frames.push(.{ .path_challenge = path.validator.challenge_data });
+                }
+                path.validator.checkTimeout(now, pto_ns);
+            }
         }
     }
 
