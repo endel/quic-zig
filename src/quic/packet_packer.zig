@@ -75,6 +75,10 @@ pub const PacketPacker = struct {
     /// Maximum packet size for regular (non-probe) packets.
     max_packet_size: usize = DEFAULT_MAX_PACKET_SIZE,
 
+    /// Whether outgoing 1-RTT packets should be marked as ECN (ECT(0)).
+    /// Set by connection before packing based on ECN validator state.
+    ecn_mark: bool = false,
+
     /// Connection-level flow controller (for send-side limit enforcement).
     conn_flow_ctrl: ?*flow_control.ConnectionFlowController = null,
 
@@ -565,6 +569,7 @@ pub const PacketPacker = struct {
             .enc_level = level,
             .has_crypto_data = has_crypto_data,
             .has_handshake_done = has_handshake_done,
+            .ecn_marked = level == .application and self.ecn_mark,
         };
         // Copy stream frame records into the SentPacket
         for (stream_frame_infos[0..stream_frame_info_count]) |info| {

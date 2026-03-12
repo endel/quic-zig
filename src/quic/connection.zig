@@ -2170,6 +2170,7 @@ pub const Connection = struct {
             null;
 
         self.packer.conn_flow_ctrl = &self.conn_flow_ctrl;
+        self.packer.ecn_mark = self.ecn_validator.shouldMark();
         const bytes_written = try self.packer.packCoalesced(
             send_buf,
             &self.pkt_handler,
