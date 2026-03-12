@@ -447,3 +447,58 @@ test "PreferredAddress: toSockaddrV4" {
     try testing.expectEqual(posix.AF.INET, sa_in.family);
     try testing.expectEqual(std.mem.nativeToBig(u16, 4433), sa_in.port);
 }
+
+test "TransportParams: disable_active_migration roundtrip" {
+    const original = TransportParams{
+        .disable_active_migration = true,
+        .max_idle_timeout = 10000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try original.encode(fbs.writer());
+
+    const decoded = try TransportParams.decode(fbs.getWritten());
+    try testing.expect(decoded.disable_active_migration);
+    try testing.expectEqual(@as(u64, 10000), decoded.max_idle_timeout);
+}
+
+test "TransportParams: version_information roundtrip" {
+    var original = TransportParams{
+        .max_idle_timeout = 5000,
+    };
+    original.version_info_chosen = protocol.QUIC_V1;
+    original.version_info_available = .{ protocol.QUIC_V2, protocol.QUIC_V1, 0, 0, 0, 0, 0, 0 };
+    original.version_info_available_count = 2;
+
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try original.encode(fbs.writer());
+
+    const decoded = try TransportParams.decode(fbs.getWritten());
+    try testing.expectEqual(protocol.QUIC_V1, decoded.version_info_chosen);
+    try testing.expectEqual(@as(u8, 2), decoded.version_info_available_count);
+    try testing.expectEqual(protocol.QUIC_V2, decoded.version_info_available[0]);
+    try testing.expectEqual(protocol.QUIC_V1, decoded.version_info_available[1]);
+}
+
+test "TransportParams: connection IDs roundtrip" {
+    const scid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const odcid = [_]u8{ 0x11, 0x12, 0x13, 0x14 };
+
+    const original = TransportParams{
+        .initial_source_connection_id = &scid,
+        .original_destination_connection_id = &odcid,
+        .max_idle_timeout = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try original.encode(fbs.writer());
+
+    const decoded = try TransportParams.decode(fbs.getWritten());
+    try testing.expect(decoded.initial_source_connection_id != null);
+    try testing.expectEqualSlices(u8, &scid, decoded.initial_source_connection_id.?);
+    try testing.expect(decoded.original_destination_connection_id != null);
+    try testing.expectEqualSlices(u8, &odcid, decoded.original_destination_connection_id.?);
+}

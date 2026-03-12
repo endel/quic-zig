@@ -3130,3 +3130,447 @@ test "LocalCidPool: pool full" {
     // Pool full — should return null
     try std.testing.expect(pool.issueNewCid(8, null) == null);
 }
+
+// --- DatagramQueue tests ---
+
+test "DatagramQueue: push and pop" {
+    var q = DatagramQueue{};
+    try std.testing.expect(q.isEmpty());
+
+    const data1 = "hello";
+    const data2 = "world!";
+    try std.testing.expect(q.push(data1));
+    try std.testing.expect(q.push(data2));
+    try std.testing.expect(!q.isEmpty());
+
+    var buf: [1200]u8 = undefined;
+    const len1 = q.pop(&buf).?;
+    try std.testing.expectEqual(@as(usize, 5), len1);
+    try std.testing.expectEqualSlices(u8, "hello", buf[0..len1]);
+
+    const len2 = q.pop(&buf).?;
+    try std.testing.expectEqual(@as(usize, 6), len2);
+    try std.testing.expectEqualSlices(u8, "world!", buf[0..len2]);
+
+    // Empty now
+    try std.testing.expect(q.pop(&buf) == null);
+    try std.testing.expect(q.isEmpty());
+}
+
+test "DatagramQueue: full queue" {
+    var q = DatagramQueue{};
+    // Fill the queue
+    var i: usize = 0;
+    while (i < DatagramQueue.MAX_ITEMS) : (i += 1) {
+        try std.testing.expect(q.push("data"));
+    }
+    // Queue full — push should fail
+    try std.testing.expect(!q.push("overflow"));
+}
+
+test "DatagramQueue: oversized datagram rejected" {
+    var q = DatagramQueue{};
+    const big = [_]u8{0xAA} ** (DatagramQueue.MAX_DATAGRAM_SIZE + 1);
+    try std.testing.expect(!q.push(&big));
+    try std.testing.expect(q.isEmpty());
+}
+
+test "DatagramQueue: pop with small buffer" {
+    var q = DatagramQueue{};
+    try std.testing.expect(q.push("hello"));
+    var small_buf: [2]u8 = undefined;
+    // Buffer too small — should return null
+    try std.testing.expect(q.pop(&small_buf) == null);
+}
+
+// --- Address utility function tests ---
+
+fn makeIpv4Addr(a: u8, b: u8, c: u8, d: u8, port: u16) posix.sockaddr.storage {
+    var in4: posix.sockaddr.in = std.mem.zeroes(posix.sockaddr.in);
+    in4.family = posix.AF.INET;
+    in4.port = std.mem.nativeToBig(u16, port);
+    in4.addr = (@as(u32, d) << 24) | (@as(u32, c) << 16) | (@as(u32, b) << 8) | @as(u32, a);
+    return sockaddrToStorage(@ptrCast(&in4));
+}
+
+fn makeIpv6Addr(addr_bytes_in: [16]u8, port: u16) posix.sockaddr.storage {
+    var in6: posix.sockaddr.in6 = std.mem.zeroes(posix.sockaddr.in6);
+    in6.family = posix.AF.INET6;
+    in6.port = std.mem.nativeToBig(u16, port);
+    in6.addr = addr_bytes_in;
+    return sockaddrToStorage(@ptrCast(&in6));
+}
+
+test "sockaddrEql: same IPv4 addresses" {
+    const a = makeIpv4Addr(127, 0, 0, 1, 4433);
+    const b = makeIpv4Addr(127, 0, 0, 1, 4433);
+    try std.testing.expect(sockaddrEql(&a, &b));
+}
+
+test "sockaddrEql: different IPv4 ports" {
+    const a = makeIpv4Addr(127, 0, 0, 1, 4433);
+    const b = makeIpv4Addr(127, 0, 0, 1, 4434);
+    try std.testing.expect(!sockaddrEql(&a, &b));
+}
+
+test "sockaddrEql: different IPv4 addresses" {
+    const a = makeIpv4Addr(127, 0, 0, 1, 4433);
+    const b = makeIpv4Addr(192, 168, 1, 1, 4433);
+    try std.testing.expect(!sockaddrEql(&a, &b));
+}
+
+test "sockaddrSameIp: same IP different ports" {
+    const a = makeIpv4Addr(10, 0, 0, 1, 1234);
+    const b = makeIpv4Addr(10, 0, 0, 1, 5678);
+    try std.testing.expect(sockaddrSameIp(&a, &b));
+}
+
+test "sockaddrSameIp: different IPs" {
+    const a = makeIpv4Addr(10, 0, 0, 1, 1234);
+    const b = makeIpv4Addr(10, 0, 0, 2, 1234);
+    try std.testing.expect(!sockaddrSameIp(&a, &b));
+}
+
+test "isV4Mapped: IPv4-mapped IPv6" {
+    // ::ffff:127.0.0.1
+    var addr_bytes = [_]u8{0} ** 16;
+    addr_bytes[10] = 0xff;
+    addr_bytes[11] = 0xff;
+    addr_bytes[12] = 127;
+    addr_bytes[13] = 0;
+    addr_bytes[14] = 0;
+    addr_bytes[15] = 1;
+    const addr = makeIpv6Addr(addr_bytes, 4433);
+    try std.testing.expect(isV4Mapped(&addr));
+}
+
+test "isV4Mapped: regular IPv6 is not mapped" {
+    // ::1 (loopback)
+    var addr_bytes = [_]u8{0} ** 16;
+    addr_bytes[15] = 1;
+    const addr = makeIpv6Addr(addr_bytes, 4433);
+    try std.testing.expect(!isV4Mapped(&addr));
+}
+
+test "isV4Mapped: IPv4 is not mapped" {
+    const addr = makeIpv4Addr(127, 0, 0, 1, 4433);
+    try std.testing.expect(!isV4Mapped(&addr));
+}
+
+test "isEffectivelyV4: IPv4" {
+    const addr = makeIpv4Addr(10, 0, 0, 1, 80);
+    try std.testing.expect(isEffectivelyV4(&addr));
+}
+
+test "isEffectivelyV4: IPv4-mapped IPv6" {
+    var addr_bytes = [_]u8{0} ** 16;
+    addr_bytes[10] = 0xff;
+    addr_bytes[11] = 0xff;
+    addr_bytes[12] = 10;
+    addr_bytes[13] = 0;
+    addr_bytes[14] = 0;
+    addr_bytes[15] = 1;
+    const addr = makeIpv6Addr(addr_bytes, 80);
+    try std.testing.expect(isEffectivelyV4(&addr));
+}
+
+test "isEffectivelyV4: native IPv6 is not v4" {
+    var addr_bytes = [_]u8{0} ** 16;
+    addr_bytes[0] = 0x20;
+    addr_bytes[1] = 0x01;
+    const addr = makeIpv6Addr(addr_bytes, 80);
+    try std.testing.expect(!isEffectivelyV4(&addr));
+}
+
+test "sockaddrLen: IPv4 vs IPv6" {
+    const v4 = makeIpv4Addr(127, 0, 0, 1, 80);
+    try std.testing.expectEqual(@as(posix.socklen_t, @sizeOf(posix.sockaddr.in)), sockaddrLen(&v4));
+
+    var v6_bytes = [_]u8{0} ** 16;
+    v6_bytes[15] = 1;
+    const v6 = makeIpv6Addr(v6_bytes, 80);
+    try std.testing.expectEqual(@as(posix.socklen_t, @sizeOf(posix.sockaddr.in6)), sockaddrLen(&v6));
+}
+
+// --- Connection state and method tests ---
+
+fn testConnection(allocator: std.mem.Allocator) Connection {
+    const dcid_val = "dest1234" ++ ([_]u8{0} ** 12);
+    const scid_val = "src12345" ++ ([_]u8{0} ** 12);
+    return Connection{
+        .allocator = allocator,
+        .is_server = true,
+        .dcid = dcid_val.*,
+        .dcid_len = 8,
+        .scid = scid_val.*,
+        .scid_len = 8,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .pkt_handler = ack_handler.PacketHandler.init(allocator),
+        .conn_flow_ctrl = flow_control.ConnectionFlowController.init(1048576, 6 * 1024 * 1024),
+        .streams = stream_mod.StreamsMap.init(allocator, true),
+        .crypto_streams = crypto_stream.CryptoStreamManager.init(allocator),
+        .packer = packet_packer.PacketPacker.init(
+            allocator,
+            true,
+            dcid_val[0..8],
+            scid_val[0..8],
+            protocol.SUPPORTED_VERSIONS[0],
+        ),
+    };
+}
+
+test "Connection: close transitions to closing state" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    try std.testing.expectEqual(State.first_flight, conn.state);
+    conn.close(0, "done");
+    try std.testing.expectEqual(State.closing, conn.state);
+    try std.testing.expect(conn.local_err != null);
+    try std.testing.expect(conn.local_err.?.is_app);
+    try std.testing.expectEqual(@as(u64, 0), conn.local_err.?.code);
+}
+
+test "Connection: close is idempotent in terminal states" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    conn.close(1, "first");
+    try std.testing.expectEqual(State.closing, conn.state);
+    // Second close should be ignored
+    conn.close(2, "second");
+    try std.testing.expectEqual(@as(u64, 1), conn.local_err.?.code);
+}
+
+test "Connection: closeWithTransportError" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    conn.closeWithTransportError(0x0a, 0x06, "flow control");
+    try std.testing.expectEqual(State.closing, conn.state);
+    try std.testing.expect(!conn.local_err.?.is_app);
+    try std.testing.expectEqual(@as(u64, 0x0a), conn.local_err.?.code);
+}
+
+test "Connection: state queries" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // first_flight
+    try std.testing.expect(!conn.isClosed());
+    try std.testing.expect(!conn.isDraining());
+    try std.testing.expect(!conn.isEstablished());
+
+    // connected
+    conn.state = .connected;
+    try std.testing.expect(conn.isEstablished());
+    try std.testing.expect(!conn.isClosed());
+
+    // draining
+    conn.state = .draining;
+    try std.testing.expect(conn.isDraining());
+
+    // terminated
+    conn.state = .terminated;
+    try std.testing.expect(conn.isClosed());
+}
+
+test "Connection: datagram send requires enabled" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // Datagrams not enabled — should error
+    try std.testing.expectError(error.DatagramsNotEnabled, conn.sendDatagram("test"));
+
+    // Enable datagrams and send
+    conn.datagrams_enabled = true;
+    try conn.sendDatagram("hello datagram");
+
+    // Verify it's in the send queue (not recv queue)
+    try std.testing.expect(!conn.datagram_send_queue.isEmpty());
+    try std.testing.expect(conn.datagram_recv_queue.isEmpty());
+}
+
+test "Connection: datagram receive" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // Nothing to receive initially
+    var buf: [1200]u8 = undefined;
+    try std.testing.expect(conn.recvDatagram(&buf) == null);
+
+    // Simulate receiving a datagram (push to recv queue)
+    try std.testing.expect(conn.datagram_recv_queue.push("incoming data"));
+
+    const len = conn.recvDatagram(&buf).?;
+    try std.testing.expectEqualSlices(u8, "incoming data", buf[0..len]);
+    try std.testing.expect(conn.recvDatagram(&buf) == null);
+}
+
+test "Connection: getNewToken" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // No token initially
+    try std.testing.expect(conn.getNewToken() == null);
+
+    // Simulate receiving a token
+    const token = "test-token-12345";
+    @memcpy(conn.new_token_buf[0..token.len], token);
+    conn.new_token_len = @intCast(token.len);
+
+    const got = conn.getNewToken().?;
+    try std.testing.expectEqualSlices(u8, token, got);
+}
+
+test "Connection: dropHandshakeKeys clears Initial and Handshake" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // Initial keys should be set (from testConnection → pkt_num_spaces default)
+    // Set dummy keys to verify they get cleared
+    const dummy_seal = conn.pkt_num_spaces[0].crypto_seal;
+    _ = dummy_seal;
+    conn.dropHandshakeKeys();
+
+    try std.testing.expect(conn.pkt_num_spaces[0].crypto_open == null);
+    try std.testing.expect(conn.pkt_num_spaces[0].crypto_seal == null);
+    try std.testing.expect(conn.pkt_num_spaces[1].crypto_open == null);
+    try std.testing.expect(conn.pkt_num_spaces[1].crypto_seal == null);
+}
+
+test "Connection: initiateKeyUpdate without key_update manager" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // No key update manager — should return false
+    try std.testing.expect(!conn.initiateKeyUpdate());
+}
+
+test "Connection: getEcnMark" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // ECN validator starts disabled — shouldMark() = false
+    try std.testing.expectEqual(ECN_NOT_ECT, conn.getEcnMark());
+
+    // Start ECN validation (transitions to testing)
+    conn.ecn_validator.start();
+    try std.testing.expectEqual(ECN_ECT0, conn.getEcnMark());
+
+    // If ECN fails
+    conn.ecn_validator.state = .failed;
+    try std.testing.expectEqual(ECN_NOT_ECT, conn.getEcnMark());
+}
+
+test "Connection: matchesStatelessReset with no tokens" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    const data = [_]u8{0xAA} ** 32;
+    try std.testing.expect(!conn.matchesStatelessReset(&data));
+}
+
+test "Connection: matchesStatelessReset with matching token" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // Add a peer CID with a known reset token
+    const token = [_]u8{0xBB} ** 16;
+    const cid = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    conn.peer_cid_pool.addPeerCid(1, &cid, token);
+
+    // Build a packet whose last 16 bytes are the token
+    var data: [32]u8 = undefined;
+    @memset(data[0..16], 0xCC); // random prefix
+    @memcpy(data[16..32], &token); // token at end
+    try std.testing.expect(conn.matchesStatelessReset(&data));
+}
+
+test "Connection: openStream" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // Set peer's max bidi streams limit (simulating received transport params)
+    conn.streams.max_bidi_streams = 100;
+
+    // Server opens bidi stream (stream ID 1 for server-initiated bidi)
+    const s = try conn.openStream();
+    try std.testing.expectEqual(@as(u64, 1), s.stream_id);
+}
+
+test "accept: create server connection" {
+    const local = makeIpv4Addr(0, 0, 0, 0, 443);
+    const remote = makeIpv4Addr(192, 168, 1, 100, 12345);
+
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+
+    const header = packet.Header{
+        .packet_type = .initial,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .dcid = &dcid,
+        .scid = &scid,
+        .token = &.{},
+        .packet_number = 0,
+        .packet_number_len = 1,
+        .remainder_len = 0,
+    };
+
+    var conn = try Connection.accept(
+        std.testing.allocator,
+        header,
+        local,
+        remote,
+        true,
+        .{},
+        null,
+        null,
+        null,
+    );
+    defer conn.deinit();
+
+    try std.testing.expect(conn.is_server);
+    try std.testing.expectEqual(State.first_flight, conn.state);
+    // Server: dcid = client's SCID, scid = generated
+    try std.testing.expectEqual(@as(u8, 8), conn.dcid_len);
+    try std.testing.expectEqualSlices(u8, &scid, conn.dcid[0..8]);
+    try std.testing.expectEqual(@as(u8, 8), conn.scid_len);
+    // Path should be initialized
+    try std.testing.expect(conn.path_initialized);
+}
+
+test "PathValidator: checkTimeout after max retries" {
+    var validator = PathValidator{};
+    _ = validator.startChallenge();
+
+    // Exhaust retries
+    validator.retries = PathValidator.MAX_RETRIES;
+    validator.challenge_sent_time = 0;
+
+    const now: i64 = 1_000_000_000;
+    const pto: i64 = 100_000_000;
+    validator.checkTimeout(now, pto);
+
+    try std.testing.expectEqual(PathValidationState.failed, validator.state);
+}
+
+test "NetworkPath: amplification limit" {
+    var path = NetworkPath.init(
+        makeIpv4Addr(0, 0, 0, 0, 443),
+        makeIpv4Addr(192, 168, 1, 1, 12345),
+        true,
+    );
+
+    // Not validated — 3x amplification limit applies
+    try std.testing.expect(!path.is_validated);
+    try std.testing.expect(!path.canSend(1)); // 0 received * 3 = 0 budget
+
+    path.bytes_received = 100;
+    try std.testing.expect(path.canSend(300)); // 300 <= 300
+    try std.testing.expect(!path.canSend(301)); // 301 > 300
+
+    // After validation, no limit
+    path.is_validated = true;
+    try std.testing.expect(path.canSend(1_000_000));
+}

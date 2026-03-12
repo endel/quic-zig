@@ -284,3 +284,74 @@ test "StreamFlowController: limited by connection" {
     // Should be limited by connection window
     try testing.expectEqual(@as(u64, 500), sfc.sendWindowSize());
 }
+
+test "BaseFlowController: shouldSendBlocked fires once per limit" {
+    var fc = BaseFlowController.init(1000, MAX_RECEIVE_WINDOW);
+    fc.send_window = 100;
+    fc.addBytesSent(100);
+
+    // First call should return the limit
+    try testing.expectEqual(@as(?u64, 100), fc.shouldSendBlocked());
+    // Second call should return null (already sent for this limit)
+    try testing.expect(fc.shouldSendBlocked() == null);
+
+    // After window update, should be able to send again
+    fc.updateSendWindow(200);
+    try testing.expect(!fc.isBlocked());
+    fc.addBytesSent(100);
+    try testing.expectEqual(@as(?u64, 200), fc.shouldSendBlocked());
+}
+
+test "BaseFlowController: updateSendWindow ignores smaller values" {
+    var fc = BaseFlowController.init(1000, MAX_RECEIVE_WINDOW);
+    fc.send_window = 5000;
+
+    // Smaller window should be ignored
+    fc.updateSendWindow(3000);
+    try testing.expectEqual(@as(u64, 5000), fc.send_window);
+
+    // Larger window should be accepted
+    fc.updateSendWindow(8000);
+    try testing.expectEqual(@as(u64, 8000), fc.send_window);
+}
+
+test "StreamFlowController: addBytesSent updates both stream and connection" {
+    var cfc = ConnectionFlowController.init(10000, MAX_RECEIVE_WINDOW);
+    cfc.base.send_window = 10000;
+
+    var sfc = StreamFlowController.init(10000, MAX_RECEIVE_WINDOW, &cfc);
+    sfc.base.send_window = 10000;
+
+    sfc.addBytesSent(500);
+    try testing.expectEqual(@as(u64, 500), sfc.base.bytes_sent);
+    try testing.expectEqual(@as(u64, 500), cfc.base.bytes_sent);
+}
+
+test "StreamFlowController: isBlocked when either is blocked" {
+    var cfc = ConnectionFlowController.init(10000, MAX_RECEIVE_WINDOW);
+    cfc.base.send_window = 1000;
+
+    var sfc = StreamFlowController.init(10000, MAX_RECEIVE_WINDOW, &cfc);
+    sfc.base.send_window = 5000;
+
+    // Neither blocked initially
+    try testing.expect(!sfc.isBlocked());
+
+    // Block at connection level
+    cfc.base.addBytesSent(1000);
+    try testing.expect(sfc.isBlocked());
+}
+
+test "BaseFlowController: auto-tuning doubles window" {
+    var fc = BaseFlowController.init(1000, MAX_RECEIVE_WINDOW);
+    var rtt = RttStats{};
+    rtt.updateRtt(50_000_000, 0, false);
+
+    try fc.addBytesReceived(1000);
+    // Read more than 1/4 of window to trigger auto-tuning
+    fc.addBytesRead(800);
+    _ = fc.getWindowUpdate(&rtt);
+
+    // Window size should have doubled (up to max)
+    try testing.expectEqual(@as(u64, 2000), fc.receive_window_size);
+}
