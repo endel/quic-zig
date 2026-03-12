@@ -65,10 +65,30 @@ pub const FrameSorter = struct {
         self.chunks.deinit();
     }
 
+    /// Return the highest byte offset buffered (or read_pos if no chunks).
+    pub fn highestReceived(self: *const FrameSorter) u64 {
+        var highest = self.read_pos;
+        for (self.chunks.keys(), self.chunks.values()) |off, val| {
+            const end = off + val.len;
+            if (end > highest) highest = end;
+        }
+        return highest;
+    }
+
     /// Push received data at the given offset.
     pub fn push(self: *FrameSorter, offset: u64, data: []const u8, fin: bool) !void {
         if (fin) {
-            self.fin_offset = offset + data.len;
+            const new_fin = offset + data.len;
+            // RFC 9000 §4.5: final size cannot change once known
+            if (self.fin_offset) |existing| {
+                if (existing != new_fin) return error.FinalSizeError;
+            }
+            self.fin_offset = new_fin;
+        }
+
+        // RFC 9000 §4.5: data cannot exceed known final size
+        if (self.fin_offset) |fs| {
+            if (offset + data.len > fs) return error.FinalSizeError;
         }
 
         if (data.len == 0) return;
@@ -181,7 +201,15 @@ pub const ReceiveStream = struct {
     }
 
     /// Handle a RESET_STREAM frame.
-    pub fn handleResetStream(self: *ReceiveStream, error_code: u64, final_size: u64) void {
+    /// Returns FinalSizeError if final_size conflicts with known data.
+    pub fn handleResetStream(self: *ReceiveStream, error_code: u64, final_size: u64) !void {
+        // RFC 9000 §4.5: final size cannot change once known
+        if (self.sorter.fin_offset) |existing| {
+            if (existing != final_size) return error.FinalSizeError;
+        }
+        // RFC 9000 §4.5: final size cannot be less than data already received
+        if (final_size < self.sorter.highestReceived()) return error.FinalSizeError;
+
         self.reset_err = error_code;
         self.sorter.fin_offset = final_size;
     }
@@ -926,6 +954,51 @@ test "FrameSorter: out-of-order data" {
     try testing.expect(chunk2 != null);
     try testing.expectEqualStrings(" world", chunk2.?);
     testing.allocator.free(chunk2.?);
+}
+
+// RFC 9000 §4.5: final size validation
+test "FrameSorter: conflicting final size from FIN" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    try sorter.push(0, "hello", true); // fin_offset = 5
+    try testing.expectEqual(@as(?u64, 5), sorter.fin_offset);
+
+    // Different FIN offset must fail
+    const err = sorter.push(0, "hi", true); // would set fin_offset = 2
+    try testing.expectError(error.FinalSizeError, err);
+}
+
+test "FrameSorter: data beyond final size" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    try sorter.push(0, "hello", true); // fin_offset = 5
+    // Data extending past final size must fail
+    const err = sorter.push(3, "xyzw", false); // offset 3 + len 4 = 7 > 5
+    try testing.expectError(error.FinalSizeError, err);
+}
+
+test "ReceiveStream: RESET_STREAM final size mismatch" {
+    var rs = ReceiveStream.init(testing.allocator, 1024);
+    defer rs.deinit();
+
+    try rs.handleStreamFrame(0, "data", false); // received 4 bytes
+    // RESET_STREAM with final_size < already received must fail
+    const err = rs.handleResetStream(0x01, 2);
+    try testing.expectError(error.FinalSizeError, err);
+}
+
+test "ReceiveStream: RESET_STREAM consistent with FIN" {
+    var rs = ReceiveStream.init(testing.allocator, 1024);
+    defer rs.deinit();
+
+    try rs.handleStreamFrame(0, "hello", true); // fin at offset 5
+    // RESET_STREAM with same final_size should succeed
+    try rs.handleResetStream(0x01, 5);
+    // RESET_STREAM with different final_size must fail
+    const err = rs.handleResetStream(0x02, 10);
+    try testing.expectError(error.FinalSizeError, err);
 }
 
 test "SendStream: basic write and pop" {

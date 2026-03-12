@@ -1313,7 +1313,21 @@ pub const Connection = struct {
 
             .reset_stream => |rs| {
                 if (self.streams.getStream(rs.stream_id)) |s| {
-                    s.recv.handleResetStream(rs.error_code, rs.final_size);
+                    s.recv.handleResetStream(rs.error_code, rs.final_size) catch {
+                        // RFC 9000 §4.5: FINAL_SIZE_ERROR
+                        self.closeWithTransportError(0x06, 0x04, "RESET_STREAM final_size mismatch");
+                        return error.ProtocolViolation;
+                    };
+                    // RFC 9000 §4.4: account for final_size in connection flow control
+                    self.conn_flow_ctrl.base.addBytesReceived(rs.final_size) catch {
+                        self.closeWithTransportError(0x03, 0x04, "RESET_STREAM exceeds flow control");
+                        return error.FlowControlError;
+                    };
+                    // Mark bytes as "read" so connection flow control window advances
+                    const already_read = s.recv.bytes_read;
+                    if (rs.final_size > already_read) {
+                        self.conn_flow_ctrl.addBytesRead(rs.final_size - already_read);
+                    }
                     // If send side is also done, stream is fully closed
                     if (s.send.fin_sent or s.send.reset_err != null) {
                         self.streams.closeStream(rs.stream_id);
@@ -1349,7 +1363,13 @@ pub const Connection = struct {
                         std.log.err("Failed to get/create stream {}: {}", .{ s.stream_id, err });
                         return;
                     };
-                    try strm.recv.handleStreamFrame(s.offset, s.data, s.fin);
+                    strm.recv.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
+                        error.FinalSizeError => {
+                            self.closeWithTransportError(0x06, 0x08, "STREAM final_size mismatch");
+                            return error.ProtocolViolation;
+                        },
+                        else => return err,
+                    };
 
                     // Check if stream is fully closed (both directions done)
                     if (s.fin and (strm.send.fin_sent or strm.send.reset_err != null) and !strm.closed_for_gc) {
@@ -1362,7 +1382,13 @@ pub const Connection = struct {
                         std.log.err("Failed to get/create recv stream {}: {}", .{ s.stream_id, err });
                         return;
                     };
-                    try recv_strm.handleStreamFrame(s.offset, s.data, s.fin);
+                    recv_strm.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
+                        error.FinalSizeError => {
+                            self.closeWithTransportError(0x06, 0x08, "STREAM final_size mismatch");
+                            return error.ProtocolViolation;
+                        },
+                        else => return err,
+                    };
 
                     // For incoming uni streams, FIN means the stream is done
                     if (s.fin) {

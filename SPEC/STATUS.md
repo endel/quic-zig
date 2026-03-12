@@ -19,8 +19,8 @@
 | 4.1 | Data Flow Control | ✅ Done | Connection + stream level |
 | 4.2 | Increasing Flow Control Limits | ✅ Done | Auto-tuning window (up to 6MB) |
 | 4.3 | Flow Control Performance | ✅ Done | Auto-tuning prevents stalls |
-| 4.4 | Handling Stream Cancellation | ⚠️ Partial | RESET_STREAM parsed; final size accounting may be incomplete |
-| 4.5 | Stream Final Size | ✅ Done | FIN handling in FrameSorter |
+| 4.4 | Handling Stream Cancellation | ✅ Done | RESET_STREAM/STOP_SENDING, final_size validation, conn flow ctrl accounting |
+| 4.5 | Stream Final Size | ✅ Done | FIN/RESET_STREAM final_size validation, FINAL_SIZE_ERROR on mismatch |
 | 4.6 | Controlling Concurrency | ✅ Done | MAX_STREAMS + STREAMS_BLOCKED |
 | **5** | **Connections** | | |
 | 5.1 | Connection ID | ✅ Done | LocalCidPool + ConnectionIdPool |
@@ -161,8 +161,8 @@
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Done | 99 | ~96% |
-| ⚠️ Partial | 4 | ~4% |
+| ✅ Done | 100 | ~97% |
+| ⚠️ Partial | 3 | ~3% |
 | ❌ Missing | 0 | 0% |
 | ❌ N/A | 5 | — |
 
@@ -488,7 +488,7 @@ No remaining work — all sections implemented. Optional improvements:
 
 | RFC | Done | Partial | Missing | Completion |
 |-----|------|---------|---------|------------|
-| RFC 9000 (QUIC) | 99 | 4 | 0 | ~96% |
+| RFC 9000 (QUIC) | 100 | 3 | 0 | ~97% |
 | RFC 9001 (TLS) | 33 | 0 | 0 | 100% |
 | RFC 9002 (Loss/CC) | 24 | 0 | 0 | 100% |
 | RFC 9114 (HTTP/3) | 22 | 0 | 5 | ~82% |
