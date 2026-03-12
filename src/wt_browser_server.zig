@@ -88,14 +88,10 @@ pub fn main() !void {
     var remote_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
     var addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
+    var batch = ecn_socket.SendBatch.init(sockfd);
 
-    var loop_count: usize = 0;
     while (true) {
-        std.Thread.sleep(1 * std.time.ns_per_ms);
-        loop_count += 1;
-        if (loop_count % 5000 == 0) {
-            std.log.debug("server loop iteration {d} ({d} connections)", .{ loop_count, conn_mgr.connectionCount() });
-        }
+        var packets_received: usize = 0;
 
         // Read loop: process all available UDP packets
         read_loop: while (true) {
@@ -107,6 +103,7 @@ pub fn main() !void {
                 std.log.err("recvmsg error: {any}", .{err});
                 break :read_loop;
             };
+            packets_received += 1;
             remote_addr = recv_result.from_addr;
             addr_size = recv_result.addr_len;
 
@@ -115,17 +112,17 @@ pub fn main() !void {
                     const conn = entry.conn;
                     const bytes_written = conn.send(&out) catch continue;
                     if (bytes_written > 0) {
-                        ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                         const send_addr = conn.peerAddress();
-                        _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(send_addr), connection.sockaddrLen(send_addr)) catch {};
+                        batch.add(out[0..bytes_written], @ptrCast(send_addr), connection.sockaddrLen(send_addr), conn.getEcnMark());
                     }
                 },
                 .send_response => |data| {
-                    _ = posix.sendto(sockfd, data, 0, @ptrCast(&remote_addr), addr_size) catch {};
+                    batch.add(data, @ptrCast(&remote_addr), addr_size, 0);
                 },
                 .dropped => {},
             }
         }
+        batch.flush();
 
         // Per-connection processing: H3+WT init, events, timeouts, periodic sends
         var i: usize = 0;
@@ -217,12 +214,15 @@ pub fn main() !void {
             while (send_count < 100) : (send_count += 1) {
                 const bytes_written = conn.send(&out) catch break;
                 if (bytes_written == 0) break;
-                ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
                 const send_addr = conn.peerAddress();
-                _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(send_addr), connection.sockaddrLen(send_addr)) catch {};
+                batch.add(out[0..bytes_written], @ptrCast(send_addr), connection.sockaddrLen(send_addr), conn.getEcnMark());
             }
 
             i += 1;
         }
+        batch.flush();
+
+        // Sleep only when idle
+        if (packets_received == 0) std.Thread.sleep(200 * std.time.ns_per_us);
     }
 }
