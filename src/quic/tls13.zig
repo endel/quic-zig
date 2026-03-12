@@ -475,6 +475,15 @@ pub const SessionTicket = struct {
     alpn: [16]u8 = .{0} ** 16, // Negotiated ALPN
     alpn_len: u8 = 0,
 
+    // RFC 9000 §7.4.1: remembered transport parameters for 0-RTT
+    initial_max_data: u64 = 0,
+    initial_max_stream_data_bidi_local: u64 = 0,
+    initial_max_stream_data_bidi_remote: u64 = 0,
+    initial_max_stream_data_uni: u64 = 0,
+    initial_max_streams_bidi: u64 = 0,
+    initial_max_streams_uni: u64 = 0,
+    active_connection_id_limit: u64 = 2,
+
     pub fn getTicket(self: *const SessionTicket) []const u8 {
         return self.ticket[0..self.ticket_len];
     }
@@ -1844,6 +1853,17 @@ pub const Tls13Handshake = struct {
             const alpn_copy: u8 = @intCast(@min(alpn_src.len, 16));
             @memcpy(ticket.alpn[0..alpn_copy], alpn_src[0..alpn_copy]);
             ticket.alpn_len = alpn_copy;
+        }
+
+        // RFC 9000 §7.4.1: remember server's transport params for 0-RTT resumption
+        if (self.peer_transport_params) |peer_tp| {
+            ticket.initial_max_data = peer_tp.initial_max_data;
+            ticket.initial_max_stream_data_bidi_local = peer_tp.initial_max_stream_data_bidi_local;
+            ticket.initial_max_stream_data_bidi_remote = peer_tp.initial_max_stream_data_bidi_remote;
+            ticket.initial_max_stream_data_uni = peer_tp.initial_max_stream_data_uni;
+            ticket.initial_max_streams_bidi = peer_tp.initial_max_streams_bidi;
+            ticket.initial_max_streams_uni = peer_tp.initial_max_streams_uni;
+            ticket.active_connection_id_limit = peer_tp.active_connection_id_limit;
         }
 
         self.received_ticket = ticket;

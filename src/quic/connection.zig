@@ -450,6 +450,9 @@ pub const Connection = struct {
     // Session ticket received from server (readable by application)
     session_ticket: ?tls13.SessionTicket = null,
 
+    // RFC 9000 §7.4.1: remembered transport params from session ticket (for 0-RTT validation)
+    remembered_params: ?tls13.SessionTicket = null,
+
     // NEW_TOKEN received from server (client stores for reuse in future connections)
     new_token_buf: [packet.TOKEN_MAX_LEN]u8 = .{0} ** packet.TOKEN_MAX_LEN,
     new_token_len: u8 = 0,
@@ -1751,8 +1754,22 @@ pub const Connection = struct {
                                 std.log.info("installed 0-RTT decrypt keys (server)", .{});
                             } else {
                                 self.early_data_seal = ik.seal;
-                                self.streams.setMaxStreams(100, 100);
-                                std.log.info("installed 0-RTT encrypt keys (client), set default stream limits", .{});
+                                // RFC 9000 §7.4.1: restore remembered transport params for 0-RTT
+                                if (self.remembered_params) |rp| {
+                                    self.streams.setMaxStreams(rp.initial_max_streams_bidi, rp.initial_max_streams_uni);
+                                    self.streams.setPeerInitialMaxStreamData(
+                                        rp.initial_max_stream_data_bidi_local,
+                                        rp.initial_max_stream_data_bidi_remote,
+                                        rp.initial_max_stream_data_uni,
+                                    );
+                                    self.conn_flow_ctrl.base.send_window = rp.initial_max_data;
+                                    std.log.info("installed 0-RTT keys (client), restored remembered params: max_bidi={d}, max_uni={d}, max_data={d}", .{
+                                        rp.initial_max_streams_bidi, rp.initial_max_streams_uni, rp.initial_max_data,
+                                    });
+                                } else {
+                                    self.streams.setMaxStreams(100, 100);
+                                    std.log.info("installed 0-RTT encrypt keys (client), default stream limits", .{});
+                                }
                             }
                             if (self.qlog_writer) |*ql| {
                                 const now_ql: i64 = @intCast(std.time.nanoTimestamp());
@@ -1891,6 +1908,30 @@ pub const Connection = struct {
                                     return error.TransportParameterError;
                                 }
                             }
+                        }
+
+                        // RFC 9000 §7.4.1: if 0-RTT was used, validate that server's new
+                        // transport params are not less than the remembered values.
+                        if (self.remembered_params != null and self.early_data_seal != null) {
+                            const rp = self.remembered_params.?;
+                            if (peer_tp.initial_max_data < rp.initial_max_data or
+                                peer_tp.initial_max_stream_data_bidi_local < rp.initial_max_stream_data_bidi_local or
+                                peer_tp.initial_max_stream_data_bidi_remote < rp.initial_max_stream_data_bidi_remote or
+                                peer_tp.initial_max_stream_data_uni < rp.initial_max_stream_data_uni or
+                                peer_tp.initial_max_streams_bidi < rp.initial_max_streams_bidi or
+                                peer_tp.initial_max_streams_uni < rp.initial_max_streams_uni or
+                                peer_tp.active_connection_id_limit < rp.active_connection_id_limit)
+                            {
+                                std.log.err("transport param validation failed: server reduced 0-RTT remembered params", .{});
+                                self.closeWithTransportError(
+                                    0x08, // TRANSPORT_PARAMETER_ERROR
+                                    0,
+                                    "0-RTT transport params reduced",
+                                );
+                                return error.TransportParameterError;
+                            }
+                            // Clear remembered params after successful validation
+                            self.remembered_params = null;
                         }
 
                         self.streams.setMaxStreams(
@@ -3083,6 +3124,12 @@ pub fn connect(
         var tc_with_sni = tc;
         tc_with_sni.server_name = server_name;
         tc_with_sni.quic_version = conn.version;
+
+        // RFC 9000 §7.4.1: remember transport params from session ticket for 0-RTT
+        if (tc.session_ticket) |ticket| {
+            conn.remembered_params = ticket.*;
+        }
+
         conn.tls13_hs = tls13.Tls13Handshake.initClient(tc_with_sni, local_params);
 
         // Step the handshake to generate the ClientHello

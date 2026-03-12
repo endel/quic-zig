@@ -40,7 +40,7 @@
 | 7.2 | Negotiating Connection IDs | ✅ Done | Client→Server DCID swap |
 | 7.3 | Authenticating Connection IDs | ✅ Done | ODCID + retry_scid validation via transport params |
 | 7.4 | Transport Parameters | ✅ Done | All parameters encode/decode |
-| 7.4.1 | Values of Transport Parameters for 0-RTT | ⚠️ Partial | 0-RTT packet parsing works; param remember/restore not impl |
+| 7.4.1 | Values of Transport Parameters for 0-RTT | ✅ Done | Session ticket stores 7 params; client restores on 0-RTT; validates server doesn't reduce |
 | 7.4.2 | New Transport Parameters | ✅ Done | Unknown params skipped per spec |
 | 7.5 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager per encryption level |
 | **8** | **Address Validation** | | |
@@ -161,8 +161,8 @@
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Done | 98 | ~95% |
-| ⚠️ Partial | 5 | ~5% |
+| ✅ Done | 99 | ~96% |
+| ⚠️ Partial | 4 | ~4% |
 | ❌ Missing | 0 | 0% |
 | ❌ N/A | 5 | — |
 
@@ -173,7 +173,7 @@
 | ~~P3~~ | ~~§2.3~~ | ~~Stream Prioritization (RFC 9218)~~ | ~~Done~~ |
 | ~~P2~~ | ~~§5.2.2~~ | ~~Multi-connection server (CID-based demux)~~ | ~~Done~~ |
 | ~~P2~~ | ~~§6.2-6.3~~ | ~~Compatible Version Negotiation (RFC 9368/9369)~~ | ~~Done~~ |
-| P3 | §7.4.1 | 0-RTT transport parameter remember/restore | Medium |
+| ~~P3~~ | ~~§7.4.1~~ | ~~0-RTT transport parameter remember/restore~~ | ~~Done~~ |
 | ~~P2~~ | ~~§9.6~~ | ~~Server's Preferred Address~~ | ~~Done~~ |
 | ~~P3~~ | ~~§10.3.3~~ | ~~Stateless Reset loop detection~~ | ~~Done~~ |
 | ~~P2~~ | ~~§13.4~~ | ~~ECN IP-level marking + full validation~~ | ~~Done~~ |
@@ -488,7 +488,7 @@ No remaining work — all sections implemented. Optional improvements:
 
 | RFC | Done | Partial | Missing | Completion |
 |-----|------|---------|---------|------------|
-| RFC 9000 (QUIC) | 98 | 5 | 0 | ~95% |
+| RFC 9000 (QUIC) | 99 | 4 | 0 | ~96% |
 | RFC 9001 (TLS) | 33 | 0 | 0 | 100% |
 | RFC 9002 (Loss/CC) | 24 | 0 | 0 | 100% |
 | RFC 9114 (HTTP/3) | 22 | 0 | 5 | ~82% |
