@@ -275,6 +275,7 @@
 | 7.7 | Pacing | ✅ Done | Token bucket, 1.25× cwnd, 10-pkt burst |
 | 7.8 | Under-utilizing the Congestion Window | ⚠️ Partial | App-limited not fully tracked |
 | B | NewReno Pseudocode | ✅ Done | Matches appendix B |
+| - | CUBIC (RFC 8312) | ✅ Done | Default CC algorithm, fast convergence |
 
 ### Summary — RFC 9002
 

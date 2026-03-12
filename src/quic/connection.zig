@@ -403,7 +403,7 @@ pub const Connection = struct {
 
     // New subsystems
     pkt_handler: ack_handler.PacketHandler = undefined,
-    cc: congestion.NewReno = congestion.NewReno.init(),
+    cc: congestion.Cubic = congestion.Cubic.init(),
     pacer: congestion.Pacer = congestion.Pacer.init(),
     conn_flow_ctrl: flow_control.ConnectionFlowController = undefined,
     streams: stream_mod.StreamsMap = undefined,
@@ -1872,7 +1872,7 @@ pub const Connection = struct {
                                     self.pending_frames.push(.{ .path_challenge = challenge });
 
                                     // Reset CC/RTT/MTU/ECN for new IP
-                                    self.cc = congestion.NewReno.init();
+                                    self.cc = congestion.Cubic.init();
                                     self.pacer = congestion.Pacer.init();
                                     self.pkt_handler.rtt_stats = rtt.RttStats{};
                                     self.mtu_discoverer.reset();
@@ -2328,7 +2328,7 @@ pub const Connection = struct {
         // Reset CC/RTT/MTU/ECN if IP address changed (not just port — NAT rebinding preserves CC)
         const old_path = &self.paths[1 - candidate_idx];
         if (!sockaddrSameIp(&new_peer_addr, &old_path.peer_addr)) {
-            self.cc = congestion.NewReno.init();
+            self.cc = congestion.Cubic.init();
             self.pacer = congestion.Pacer.init();
             self.pkt_handler.rtt_stats = rtt.RttStats{};
             self.mtu_discoverer.reset();
