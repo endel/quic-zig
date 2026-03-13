@@ -9,6 +9,7 @@ const protocol = @import("protocol.zig");
 const stateless_reset = @import("stateless_reset.zig");
 const tls13 = @import("tls13.zig");
 const h3 = @import("../h3/connection.zig");
+const h0 = @import("../h0/connection.zig");
 const wt = @import("../webtransport/session.zig");
 
 /// Fixed-size CID key for use in HashMap lookups.
@@ -45,6 +46,7 @@ pub const ConnEntry = struct {
     conn: *connection.Connection,
     h3_conn: ?h3.H3Connection = null,
     h3_initialized: bool = false,
+    h0_conn: ?*h0.H0Connection = null,
     wt_conn: ?wt.WebTransportConnection = null,
 
     // Track which CIDs are registered in the routing map for this connection.

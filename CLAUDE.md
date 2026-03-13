@@ -2,8 +2,8 @@
 
 ## Objective
 - Final objective is the implementation of core QUIC Spec: https://www.rfc-editor.org/rfc/rfc9000.txt
-- Use ./interop/ client and server implementations as reference when testing
-  specific features.
+- Use ./interop/ client and server implementations as reference when testing specific features.
+- Pass as many interoperability tests as possible (https://github.com/quic-interop/quic-interop-runner)
 
 ## Iteration over QUIC specifications
 - Keep code and architecture clean, covered with tests, optimized and maintainable

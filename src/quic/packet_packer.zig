@@ -379,12 +379,13 @@ pub const PacketPacker = struct {
             }
 
             // 3. HANDSHAKE_DONE frame (server only, 1-RTT)
+            // Keep sending until handshake is confirmed (cleared by connection
+            // when 1-RTT ACK is received). This ensures delivery under loss
+            // without relying solely on PTO retransmission.
             if (level == .application and self.send_handshake_done) {
                 try writer.writeByte(0x1e); // HANDSHAKE_DONE frame type
-                self.send_handshake_done = false;
                 has_handshake_done = true;
                 ack_eliciting = true;
-                std.log.info("packing HANDSHAKE_DONE frame", .{});
             }
 
             // 4. Pending control frames (only in 1-RTT)
@@ -981,8 +982,8 @@ test "PacketPacker: HANDSHAKE_DONE frame packed in 1-RTT" {
 
     try testing.expect(written > 0);
 
-    // HANDSHAKE_DONE flag should be cleared after packing
-    try testing.expect(!packer.send_handshake_done);
+    // HANDSHAKE_DONE stays set until ACKed (cleared by connection, not packer)
+    try testing.expect(packer.send_handshake_done);
 
     // Sent packet should be tracked as ack-eliciting with handshake_done
     const app_idx = @intFromEnum(ack_handler.EncLevel.application);

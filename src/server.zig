@@ -33,16 +33,28 @@ pub fn main() !void {
     defer arena.deinit();
     const alloc = arena.allocator();
 
+    // Parse --port argument
+    var port: u16 = 4434;
+    var args = std.process.args();
+    _ = args.next(); // skip program name
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--port")) {
+            if (args.next()) |port_str| {
+                port = std.fmt.parseInt(u16, port_str, 10) catch 4434;
+            }
+        }
+    }
+
     var handler = H3Handler{ .alloc = alloc };
     var server = try event_loop.Server(H3Handler).init(alloc, &handler, .{
-        .port = 4434,
+        .port = port,
         .cert_path = "interop/certs/server.crt",
         .key_path = "interop/certs/server.key",
         .require_retry = true,
     });
     defer server.deinit();
 
-    std.log.info("QUIC H3 server listening on 127.0.0.1:4434", .{});
+    std.log.info("QUIC H3 server listening on 127.0.0.1:{d}", .{port});
     try server.run();
 }
 

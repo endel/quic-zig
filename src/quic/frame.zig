@@ -794,11 +794,13 @@ pub const PendingControlFrame = union(enum) {
 
 /// Fixed-capacity queue for pending control frames.
 pub const PendingFrameQueue = struct {
-    items: [32]PendingControlFrame = undefined,
+    const capacity = 128;
+
+    items: [capacity]PendingControlFrame = undefined,
     len: u8 = 0,
 
     pub fn push(self: *PendingFrameQueue, frame: PendingControlFrame) void {
-        if (self.len < 32) {
+        if (self.len < capacity) {
             self.items[self.len] = frame;
             self.len += 1;
         }

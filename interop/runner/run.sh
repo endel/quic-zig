@@ -44,7 +44,7 @@ PEER="${2:-quic-zig}"
 IMAGE_TAG="quic-zig-interop:latest"
 
 echo "=== Building quic-zig interop Docker image ==="
-docker build --no-cache -t "$IMAGE_TAG" -f "$SCRIPT_DIR/Dockerfile" "$ROOT_DIR"
+docker build --no-cache --network=host -t "$IMAGE_TAG" -f "$SCRIPT_DIR/Dockerfile" "$ROOT_DIR"
 
 echo ""
 echo "=== Injecting quic-zig into implementations_quic.json ==="
@@ -80,11 +80,11 @@ else
     $PYTHON pull.py -i "$PEER" 2>/dev/null || true
 
     echo "    quic-zig server <-> $PEER client"
-    $PYTHON run.py -s quic-zig -c "$PEER" -t "$TESTS" -d
+    $PYTHON run.py -s quic-zig -c "$PEER" -t "$TESTS" -d || true
 
     echo ""
     echo "    $PEER server <-> quic-zig client"
-    $PYTHON run.py -s "$PEER" -c quic-zig -t "$TESTS" -d
+    $PYTHON run.py -s "$PEER" -c quic-zig -t "$TESTS" -d || true
 fi
 
 echo ""

@@ -1217,10 +1217,6 @@ pub const Connection = struct {
                     if (pkt.has_crypto_data) {
                         self.queueCryptoRetransmission(pkt.enc_level);
                     }
-                    // Re-queue HANDSHAKE_DONE if it was lost
-                    if (pkt.has_handshake_done) {
-                        self.packer.send_handshake_done = true;
-                    }
                 }
 
                 if (has_non_probe_loss) {
@@ -1280,6 +1276,11 @@ pub const Connection = struct {
                     }
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent);
 
+                    // Stop including HANDSHAKE_DONE once a packet containing it is ACKed
+                    if (pkt.has_handshake_done) {
+                        self.packer.send_handshake_done = false;
+                    }
+
                     if (enc_level == .application) {
                         if (self.key_update) |*ku| {
                             if (ku.first_sent_with_current) |first_pn| {
@@ -1317,9 +1318,6 @@ pub const Connection = struct {
                     // Queue CRYPTO frame retransmission for lost packets (RFC 9002 §6.2)
                     if (pkt.has_crypto_data) {
                         self.queueCryptoRetransmission(pkt.enc_level);
-                    }
-                    if (pkt.has_handshake_done) {
-                        self.packer.send_handshake_done = true;
                     }
                 }
 
@@ -2054,6 +2052,9 @@ pub const Connection = struct {
                         }
                         // else: keep local timeout (already set)
 
+                        // Apply peer's max_ack_delay to RTT stats (RFC 9002 §5.3)
+                        self.pkt_handler.rtt_stats.max_ack_delay = @as(i64, @intCast(peer_tp.max_ack_delay)) * 1_000_000;
+
                         // Store peer's stateless reset token for initial CID (RFC 9000 §10.3.1)
                         // Server sends this in transport params; client stores it for detection
                         if (peer_tp.stateless_reset_token) |token| {
@@ -2364,9 +2365,12 @@ pub const Connection = struct {
         }
 
         // Check if pacer allows sending
-        const pacer_delay = self.pacer.timeUntilSend(now);
-        if (pacer_delay > 0) {
-            return 0;
+        // Exception: PTO probes bypass pacing (RFC 9002 §6.2.4)
+        if (self.pto_probe_pending == 0) {
+            const pacer_delay = self.pacer.timeUntilSend(now);
+            if (pacer_delay > 0) {
+                return 0;
+            }
         }
 
         // Check congestion window — only send ACKs + control frames when congestion-limited
@@ -2689,9 +2693,6 @@ pub const Connection = struct {
                 if (pkt.has_crypto_data) {
                     self.queueCryptoRetransmission(pkt.enc_level);
                 }
-                if (pkt.has_handshake_done) {
-                    self.packer.send_handshake_done = true;
-                }
             }
             if (has_non_probe_loss_lt) {
                 if (loss_result.persistent_congestion) {
@@ -2749,17 +2750,10 @@ pub const Connection = struct {
                             if (self.crypto_streams.getStream(3).hasData()) {
                                 has_data = true;
                             }
-                            // Re-queue HANDSHAKE_DONE if still in-flight (server only)
-                            {
-                                const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
-                                var hd_it = app_tracker.sent_packets.iterator();
-                                while (hd_it.next()) |entry| {
-                                    if (entry.value_ptr.in_flight and entry.value_ptr.has_handshake_done) {
-                                        self.packer.send_handshake_done = true;
-                                        has_data = true;
-                                        break;
-                                    }
-                                }
+                            // HANDSHAKE_DONE uses persistent sending (included in every
+                            // packet until ACKed), so no PTO re-queue is needed.
+                            if (self.packer.send_handshake_done) {
+                                has_data = true;
                             }
                             // Check if any stream has data to send
                             var has_stream_data = false;

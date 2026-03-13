@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Stage 1: Build quic-zig binaries
 FROM ubuntu:24.04 AS builder
 
@@ -12,13 +13,9 @@ RUN ZIG_ARCH=$(case "$TARGETARCH" in arm64) echo "aarch64";; *) echo "x86_64";; 
 WORKDIR /src
 COPY . .
 
-# Build interop binaries with zig build-exe (avoids Zig 0.15.2 build runner shuffle bug)
-RUN mkdir -p zig-out/bin && \
-    cd src && \
-    zig build-exe interop_server.zig -OReleaseSafe -lc --name interop-server && \
-    mv interop-server ../zig-out/bin/ && \
-    zig build-exe interop_client.zig -OReleaseSafe -lc --name interop-client && \
-    mv interop-client ../zig-out/bin/
+# Build interop binaries via zig build (needed for libxev dependency)
+# Use --network=host so BuildKit can resolve DNS for dependency fetching
+RUN --network=host zig build -Doptimize=ReleaseSafe
 
 # Stage 2: Runtime image based on quic-network-simulator endpoint
 FROM martenseemann/quic-network-simulator-endpoint:latest

@@ -1,6 +1,11 @@
 const std = @import("std");
 const posix = std.posix;
-const xev = @import("xev");
+const builtin = @import("builtin");
+const xev_mod = @import("xev");
+
+// On Linux, use epoll for Docker/container compatibility
+// (io_uring requires kernel >= 5.19 and may be blocked by seccomp)
+const xev = if (builtin.os.tag == .linux) xev_mod.Epoll else xev_mod;
 
 const connection = @import("quic/connection.zig");
 const connection_manager = @import("quic/connection_manager.zig");
@@ -8,10 +13,11 @@ const ConnEntry = connection_manager.ConnEntry;
 const tls13 = @import("quic/tls13.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
+const h0 = @import("h0/connection.zig");
 const qpack = @import("h3/qpack.zig");
 const wt = @import("webtransport/session.zig");
 
-pub const Protocol = enum { quic, h3, webtransport };
+pub const Protocol = enum { quic, h3, h0, webtransport };
 
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
@@ -21,16 +27,30 @@ pub const Config = struct {
     max_datagram_frame_size: u64 = 65536,
     webtransport_max_sessions: u64 = 4,
     require_retry: bool = false,
+
+    // Advanced: provide pre-built TLS and connection configs directly.
+    // When tls_config is set, cert_path/key_path are ignored.
+    tls_config: ?tls13.TlsConfig = null,
+    conn_config: ?connection.ConnectionConfig = null,
+    retry_token_key: ?[16]u8 = null,
+    static_reset_key: ?[16]u8 = null,
+
+    // Use IPv6 dual-stack socket (supports both IPv4 and IPv6)
+    ipv6: bool = false,
 };
 
 /// Session wraps a ConnEntry and provides convenience methods for sending data.
 pub const Session = struct {
     entry: *ConnEntry,
 
+    // --- H3 methods ---
+
     pub fn sendResponse(self: *Session, stream_id: u64, headers: []const qpack.Header, body: []const u8) !void {
         var h3c = &self.entry.h3_conn.?;
         try h3c.sendResponse(stream_id, headers, body);
     }
+
+    // --- WebTransport methods ---
 
     pub fn sendStreamData(self: *Session, stream_id: u64, data: []const u8) !void {
         if (self.entry.wt_conn) |*wtc| {
@@ -53,6 +73,20 @@ pub const Session = struct {
     pub fn closeStream(self: *Session, stream_id: u64) void {
         if (self.entry.wt_conn) |*wtc| {
             wtc.closeStream(stream_id);
+        }
+    }
+
+    // --- H0 methods ---
+
+    pub fn serveFile(self: *Session, stream_id: u64, root_dir: []const u8, path: []const u8) !void {
+        if (self.entry.h0_conn) |h0c| {
+            try h0c.serveFile(stream_id, root_dir, path);
+        }
+    }
+
+    pub fn sendH0Response(self: *Session, stream_id: u64, data: []const u8) !void {
+        if (self.entry.h0_conn) |h0c| {
+            try h0c.sendResponse(stream_id, data);
         }
     }
 };
@@ -83,43 +117,45 @@ pub fn Server(comptime Handler: type) type {
         out_buf: [1500]u8,
 
         pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: Config) !Self {
-            // Read cert files
-            const server_cert_pem = try std.fs.cwd().readFileAlloc(alloc, config.cert_path, 8192);
-            const server_key_pem = try std.fs.cwd().readFileAlloc(alloc, config.key_path, 8192);
+            // Determine TLS config: use advanced or build from cert/key paths
+            const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
+                // Read cert files
+                const server_cert_pem = try std.fs.cwd().readFileAlloc(alloc, config.cert_path, 8192);
+                const server_key_pem = try std.fs.cwd().readFileAlloc(alloc, config.key_path, 8192);
 
-            // Parse PEM -> DER
-            var cert_der_buf: [4096]u8 = undefined;
-            const cert_der = try tls13.parsePemCert(server_cert_pem, &cert_der_buf);
+                // Parse PEM -> DER
+                var cert_der_buf: [4096]u8 = undefined;
+                const cert_der = try tls13.parsePemCert(server_cert_pem, &cert_der_buf);
 
-            var key_der_buf: [4096]u8 = undefined;
-            const key_der = try tls13.parsePemPrivateKey(server_key_pem, &key_der_buf);
-            const ec_private_key = try tls13.extractEcPrivateKey(key_der);
+                var key_der_buf: [4096]u8 = undefined;
+                const key_der = try tls13.parsePemPrivateKey(server_key_pem, &key_der_buf);
+                const ec_private_key = try tls13.extractEcPrivateKey(key_der);
 
-            // Build TLS config
-            const cert_chain = try alloc.alloc([]const u8, 1);
-            cert_chain[0] = cert_der;
+                const cert_chain = try alloc.alloc([]const u8, 1);
+                cert_chain[0] = cert_der;
 
-            const alpn = try alloc.alloc([]const u8, 1);
-            alpn[0] = "h3";
+                const alpn = try alloc.alloc([]const u8, 1);
+                alpn[0] = "h3";
 
-            var ticket_key: [16]u8 = undefined;
-            std.crypto.random.bytes(&ticket_key);
+                var ticket_key: [16]u8 = undefined;
+                std.crypto.random.bytes(&ticket_key);
 
-            var retry_token_key: [16]u8 = undefined;
-            std.crypto.random.bytes(&retry_token_key);
-
-            var static_reset_key: [16]u8 = undefined;
-            std.crypto.random.bytes(&static_reset_key);
-
-            const tls_config: tls13.TlsConfig = .{
-                .cert_chain_der = cert_chain,
-                .private_key_bytes = ec_private_key,
-                .alpn = alpn,
-                .ticket_key = ticket_key,
+                break :blk .{
+                    .cert_chain_der = cert_chain,
+                    .private_key_bytes = ec_private_key,
+                    .alpn = alpn,
+                    .ticket_key = ticket_key,
+                };
             };
 
+            var retry_token_key: [16]u8 = if (config.retry_token_key) |k| k else undefined;
+            if (config.retry_token_key == null) std.crypto.random.bytes(&retry_token_key);
+
+            var static_reset_key: [16]u8 = if (config.static_reset_key) |k| k else undefined;
+            if (config.static_reset_key == null) std.crypto.random.bytes(&static_reset_key);
+
             // Connection config
-            const conn_config: connection.ConnectionConfig = blk: {
+            const conn_config: connection.ConnectionConfig = if (config.conn_config) |cc| cc else blk: {
                 var cc: connection.ConnectionConfig = .{ .token_key = retry_token_key };
                 if (Handler.protocol == .webtransport or Handler.protocol == .quic) {
                     cc.max_datagram_frame_size = config.max_datagram_frame_size;
@@ -128,10 +164,27 @@ pub fn Server(comptime Handler: type) type {
             };
 
             // Create UDP socket
-            const local_addr = try std.net.Address.parseIp4(config.address, config.port);
-            const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-            errdefer posix.close(sockfd);
-            try posix.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
+            const sockfd, const local_addr = if (config.ipv6) blk: {
+                // IPv6 dual-stack socket (handles both IPv4 and IPv6)
+                const addr6 = try std.net.Address.parseIp6("::", config.port);
+                const fd6 = try posix.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+                errdefer posix.close(fd6);
+                // Allow dual-stack (disable IPV6_V6ONLY)
+                const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
+                const zero_val: c_int = 0;
+                posix.setsockopt(fd6, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero_val)) catch {};
+                posix.setsockopt(fd6, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+                try posix.bind(fd6, &addr6.any, addr6.getOsSockLen());
+                break :blk .{ fd6, addr6 };
+            } else blk: {
+                // IPv4 socket
+                const addr4 = try std.net.Address.parseIp4(config.address, config.port);
+                const fd4 = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+                errdefer posix.close(fd4);
+                posix.setsockopt(fd4, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+                try posix.bind(fd4, &addr4.any, addr4.getOsSockLen());
+                break :blk .{ fd4, addr4 };
+            };
             ecn_socket.enableEcnRecv(sockfd) catch {};
 
             var conn_mgr = connection_manager.ConnectionManager.init(
@@ -169,6 +222,14 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Clean up H0 connections (heap-allocated pointers)
+            for (self.conn_mgr.entries.items) |entry| {
+                if (entry.h0_conn) |h0c| {
+                    h0c.deinit();
+                    self.allocator.destroy(h0c);
+                    entry.h0_conn = null;
+                }
+            }
             self.timer.deinit();
             self.loop.deinit();
             posix.close(self.sockfd);
@@ -213,7 +274,7 @@ pub fn Server(comptime Handler: type) type {
             // Drain all available packets
             self.recvAllPackets();
 
-            // Process all connections (H3/WT init + event dispatch)
+            // Process all connections (H3/WT/H0 init + event dispatch)
             self.processConnections();
 
             // Tick + burst send
@@ -288,7 +349,7 @@ pub fn Server(comptime Handler: type) type {
             for (self.conn_mgr.entries.items) |entry| {
                 const conn = entry.conn;
 
-                // Initialize H3 once handshake completes
+                // Initialize protocol layer once handshake completes
                 if (conn.isEstablished() and !entry.h3_initialized) {
                     self.initProtocol(entry);
                 }
@@ -297,16 +358,16 @@ pub fn Server(comptime Handler: type) type {
                 switch (Handler.protocol) {
                     .webtransport => self.pollWtEvents(entry),
                     .h3 => self.pollH3Events(entry),
+                    .h0 => self.pollH0Events(entry),
                     .quic => {},
                 }
             }
         }
 
         fn initProtocol(self: *Self, entry: *ConnEntry) void {
-            entry.h3_conn = h3.H3Connection.init(self.allocator, entry.conn, true);
-
             switch (Handler.protocol) {
                 .webtransport => {
+                    entry.h3_conn = h3.H3Connection.init(self.allocator, entry.conn, true);
                     entry.h3_conn.?.local_settings = .{
                         .enable_connect_protocol = true,
                         .h3_datagram = true,
@@ -322,7 +383,13 @@ pub fn Server(comptime Handler: type) type {
                     );
                 },
                 .h3 => {
+                    entry.h3_conn = h3.H3Connection.init(self.allocator, entry.conn, true);
                     entry.h3_conn.?.initConnection() catch return;
+                },
+                .h0 => {
+                    const h0c = self.allocator.create(h0.H0Connection) catch return;
+                    h0c.* = h0.H0Connection.init(self.allocator, entry.conn, true);
+                    entry.h0_conn = h0c;
                 },
                 .quic => {},
             }
@@ -395,16 +462,49 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
+        fn pollH0Events(self: *Self, entry: *ConnEntry) void {
+            const h0c = entry.h0_conn orelse return;
+            var session = Session{ .entry = entry };
+
+            while (true) {
+                const event = h0c.poll() catch break;
+                if (event == null) break;
+
+                switch (event.?) {
+                    .request => |req| {
+                        if (@hasDecl(Handler, "onH0Request")) {
+                            self.handler.onH0Request(&session, req.stream_id, req.path);
+                        }
+                    },
+                    .data => |d| {
+                        if (@hasDecl(Handler, "onH0Data")) {
+                            self.handler.onH0Data(&session, d.stream_id, d.data);
+                        }
+                    },
+                    .finished => |stream_id| {
+                        if (@hasDecl(Handler, "onH0Finished")) {
+                            self.handler.onH0Finished(&session, stream_id);
+                        }
+                    },
+                }
+            }
+        }
+
         fn tickAndSend(self: *Self) void {
             var i: usize = 0;
             while (i < self.conn_mgr.entries.items.len) {
                 const entry = self.conn_mgr.entries.items[i];
 
-                if (!self.conn_mgr.tickEntry(entry)) continue; // removed, don't increment
+                if (!self.conn_mgr.tickEntry(entry)) {
+                    // Entry was removed — clean up H0 pointer if present
+                    // (tickEntry already freed the entry, but we cleaned h0 before tick)
+                    continue; // removed, don't increment
+                }
 
                 const conn = entry.conn;
+                const max_burst_packets = 1000;
                 var send_count: usize = 0;
-                while (send_count < 100) : (send_count += 1) {
+                while (send_count < max_burst_packets) : (send_count += 1) {
                     const bytes_written = conn.send(&self.out_buf) catch break;
                     if (bytes_written == 0) break;
                     const send_addr = conn.peerAddress();
@@ -462,9 +562,10 @@ pub fn Server(comptime Handler: type) type {
 
             const deadline = earliest orelse return null;
             const delta_ns = deadline - now;
-            if (delta_ns <= 0) return 1; // fire immediately
-            // Convert ns to ms, round up
-            return @intCast(@divFloor(delta_ns, 1_000_000) + 1);
+            if (delta_ns <= 0) return 1; // fire immediately (overdue)
+            // Convert ns to ms (truncate, don't add extra ms)
+            const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
+            return if (ms == 0) 1 else ms;
         }
     };
 }

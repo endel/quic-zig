@@ -784,12 +784,14 @@ pub const StreamsMap = struct {
     /// Returns the count of streams written to `out`.
     pub fn getScheduledStreams(self: *StreamsMap, out: *[MAX_SCHEDULABLE]*Stream) usize {
         // Pass 1: find minimum urgency among streams with data
+        // Include closed_for_gc streams that have retransmit data — PTO probes
+        // must carry the actual stream data, not just PINGs.
         var min_urgency: u3 = 7;
         var has_any = false;
         var it1 = self.streams.valueIterator();
         while (it1.next()) |sp| {
             const s = sp.*;
-            if (s.send.hasData() and !s.closed_for_gc) {
+            if (s.send.hasData() and (!s.closed_for_gc or s.send.retransmit_count > 0)) {
                 if (s.send.urgency < min_urgency) min_urgency = s.send.urgency;
                 has_any = true;
             }
@@ -802,7 +804,7 @@ pub const StreamsMap = struct {
         var it2 = self.streams.valueIterator();
         while (it2.next()) |sp| {
             const s = sp.*;
-            if (s.send.urgency != min_urgency or !s.send.hasData() or s.closed_for_gc) continue;
+            if (s.send.urgency != min_urgency or !s.send.hasData() or (s.closed_for_gc and s.send.retransmit_count == 0)) continue;
             if (!s.send.incremental) {
                 if (!found_non_incremental) {
                     if (count >= MAX_SCHEDULABLE) break;
@@ -847,8 +849,7 @@ pub const StreamsMap = struct {
         var it = self.streams.iterator();
         while (it.next()) |kv| {
             const s = kv.value_ptr.*;
-            if (!s.closed_for_gc and s.recv.finished and s.send.fin_sent and
-                s.send.retransmit_count == 0 and !s.send.fin_lost)
+            if (!s.closed_for_gc and (s.recv.finished or s.recv.fin_received) and s.send.fin_sent)
             {
                 s.closed_for_gc = true;
                 self.closeStream(s.stream_id);
@@ -880,7 +881,7 @@ pub const StreamsMap = struct {
         // Use fixed threshold based on initial limit (not growing max_incoming).
         // This prevents the threshold from outgrowing batch sizes and stalling.
         if (self.max_incoming_bidi_streams > 0) {
-            const threshold = @max(self.initial_max_incoming_bidi / 2, 1);
+            const threshold = @max(self.initial_max_incoming_bidi / 4, 1);
             if (self.consumed_bidi_streams >= threshold) {
                 const new_max = self.last_sent_max_bidi + self.consumed_bidi_streams;
                 if (new_max > self.last_sent_max_bidi) {
@@ -894,7 +895,7 @@ pub const StreamsMap = struct {
 
         // Uni: same fixed-threshold sliding window
         if (self.max_incoming_uni_streams > 0) {
-            const threshold = @max(self.initial_max_incoming_uni / 2, 1);
+            const threshold = @max(self.initial_max_incoming_uni / 4, 1);
             if (self.consumed_uni_streams >= threshold) {
                 const new_max = self.last_sent_max_uni + self.consumed_uni_streams;
                 if (new_max > self.last_sent_max_uni) {
@@ -1135,9 +1136,9 @@ test "StreamsMap: getMaxStreamsUpdates returns null below threshold" {
 
     sm.setMaxIncomingStreams(10, 10);
 
-    // Consume 4 streams (< half of 10), no update should be sent
-    sm.consumed_bidi_streams = 4;
-    sm.consumed_uni_streams = 4;
+    // Consume 1 stream (< quarter of 10 = 2), no update should be sent
+    sm.consumed_bidi_streams = 1;
+    sm.consumed_uni_streams = 1;
 
     const update = sm.getMaxStreamsUpdates();
     try testing.expect(update.bidi == null);
@@ -1150,41 +1151,41 @@ test "StreamsMap: getMaxStreamsUpdates triggers at threshold" {
 
     sm.setMaxIncomingStreams(10, 10);
 
-    // Consume 5 streams (= half of 10), update should trigger
-    sm.consumed_bidi_streams = 5;
+    // Consume 2 streams (= quarter of 10), update should trigger
+    sm.consumed_bidi_streams = 2;
 
     const update = sm.getMaxStreamsUpdates();
-    // New max = consumed(5) + max_incoming(10) = 15
-    try testing.expectEqual(@as(u64, 15), update.bidi.?);
+    // New max = consumed(2) + max_incoming(10) = 12
+    try testing.expectEqual(@as(u64, 12), update.bidi.?);
     try testing.expect(update.uni == null);
 
     // consumed should be reset after update
     try testing.expectEqual(@as(u64, 0), sm.consumed_bidi_streams);
     // max_incoming should be updated
-    try testing.expectEqual(@as(u64, 15), sm.max_incoming_bidi_streams);
+    try testing.expectEqual(@as(u64, 12), sm.max_incoming_bidi_streams);
     // last_sent tracked
-    try testing.expectEqual(@as(u64, 15), sm.last_sent_max_bidi);
+    try testing.expectEqual(@as(u64, 12), sm.last_sent_max_bidi);
 }
 
 test "StreamsMap: getMaxStreamsUpdates sliding window advances" {
     var sm = StreamsMap.init(testing.allocator, true);
     defer sm.deinit();
 
-    sm.setMaxIncomingStreams(4, 4);
+    sm.setMaxIncomingStreams(8, 8);
 
-    // First round: consume 2 (>= 4/2=2)
+    // First round: consume 2 (>= 8/4=2)
     sm.consumed_bidi_streams = 2;
     const upd1 = sm.getMaxStreamsUpdates();
-    try testing.expectEqual(@as(u64, 6), upd1.bidi.?); // 2 + 4 = 6
+    try testing.expectEqual(@as(u64, 10), upd1.bidi.?); // 2 + 8 = 10
 
-    // After first update: max_incoming=6, consumed=0
-    // Second round: consume 3 (>= 6/2=3)
+    // After first update: max_incoming=10, consumed=0
+    // Second round: consume 3 (>= 8/4=2)
     sm.consumed_bidi_streams = 3;
     const upd2 = sm.getMaxStreamsUpdates();
-    try testing.expectEqual(@as(u64, 9), upd2.bidi.?); // 3 + 6 = 9
+    try testing.expectEqual(@as(u64, 13), upd2.bidi.?); // 3 + 10 = 13
 
     // No redundant update if consumed hasn't reached threshold
-    sm.consumed_bidi_streams = 1;
+    sm.consumed_bidi_streams = 0;
     const upd3 = sm.getMaxStreamsUpdates();
     try testing.expect(upd3.bidi == null);
 }

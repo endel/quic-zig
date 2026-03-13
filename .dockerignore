@@ -1,0 +1,10 @@
+.git
+.zig-cache
+zig-out
+zig-cache
+interop/quic-interop-runner
+interop/quic-go
+interop/quiche
+interop/browser
+test_crypto.o
+SESSION.md

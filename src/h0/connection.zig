@@ -99,6 +99,9 @@ pub const H0Connection = struct {
     pub fn sendResponse(self: *H0Connection, stream_id: u64, data: []const u8) !void {
         const streams_map = &self.quic_conn.streams;
         const stream = streams_map.getStream(stream_id) orelse return error.StreamNotFound;
+        // Mark as incremental so the priority scheduler packs multiple
+        // streams into a single packet (critical for multiplexing tests).
+        stream.send.incremental = true;
         try stream.send.writeData(data);
         stream.send.close();
     }
@@ -182,6 +185,8 @@ pub const H0Connection = struct {
                         const path = line[4..];
                         @memcpy(self.path_buf[0..path.len], path);
                         self.path_len = path.len;
+                        // Mark as finished so subsequent polls skip this stream
+                        self.finished_streams.put(stream_id, {}) catch {};
                         return H0Event{ .request = .{
                             .stream_id = stream_id,
                             .path = self.path_buf[0..self.path_len],

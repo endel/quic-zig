@@ -107,6 +107,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = need_libc,
+            .imports = &.{.{ .name = "xev", .module = xev_dep.module("xev") }},
         }),
     });
     b.installArtifact(exe_interop_server);
