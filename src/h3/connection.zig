@@ -108,6 +108,11 @@ pub const H3Connection = struct {
     qpack_encoder: qpack.QpackEncoder = .{},
     qpack_decoder: qpack.QpackDecoder = .{},
 
+    // Deferred buffer consumption: after returning a .data event whose payload
+    // slices into a stream buffer, we must wait until the caller has finished
+    // reading before shifting the buffer.  Applied at the top of the next poll().
+    pending_data_consumed: ?struct { stream_id: u64, consumed: usize } = null,
+
     // Graceful shutdown state (RFC 9114 §5.2)
     shutdown_state: ShutdownState = .active,
     local_goaway_id: ?u64 = null,
@@ -448,6 +453,16 @@ pub const H3Connection = struct {
     /// Poll for the next HTTP/3 event.
     /// Processes incoming QUIC stream data and returns H3 events.
     pub fn poll(self: *H3Connection) !?H3Event {
+        // Apply deferred buffer consumption from previous .data event.
+        // The payload slice pointed into the stream buffer, so we had to
+        // wait until the caller finished reading before shifting.
+        if (self.pending_data_consumed) |pdc| {
+            self.pending_data_consumed = null;
+            if (self.stream_bufs.getPtr(pdc.stream_id)) |buf| {
+                self.consumeFrameFromBuf(buf, pdc.consumed);
+            }
+        }
+
         // Check for critical stream closure (RFC 9114 §6.2.1, RFC 9204 §4.2)
         if (self.checkCriticalStreams()) |err| return err;
 
@@ -901,7 +916,12 @@ pub const H3Connection = struct {
                             self.consumeFrameFromBuf(buf, result.consumed);
                             continue; // Skip GREASE/unknown frames
                         }
-                        self.consumeFrameFromBuf(buf, result.consumed);
+                        // Defer buffer consumption: payload is a slice into buf.items,
+                        // so we must NOT shift the buffer until the caller has read it.
+                        self.pending_data_consumed = .{
+                            .stream_id = stream_id,
+                            .consumed = result.consumed,
+                        };
                         return .{ .data = .{
                             .stream_id = stream_id,
                             .data = payload,
