@@ -322,7 +322,7 @@ fn downloadAll(
     // Handshake phase — shorter timeout for multiconnect (many sequential connections)
     var handshake_complete = false;
     const handshake_start = std.time.nanoTimestamp();
-    const handshake_timeout_ns: i128 = if (skip_ticket_and_drain) 60 * std.time.ns_per_s else 120 * std.time.ns_per_s;
+    const handshake_timeout_ns: i128 = if (skip_ticket_and_drain) 10 * std.time.ns_per_s else 120 * std.time.ns_per_s;
 
     while (!handshake_complete and (std.time.nanoTimestamp() - handshake_start) < handshake_timeout_ns) {
         // Fire PTO timer for handshake retransmissions
@@ -506,7 +506,7 @@ fn downloadH0(
     var migration_done = false;
     var h0_last_progress: usize = 0;
     const download_start = std.time.nanoTimestamp();
-    const download_timeout_ns: i128 = if (quick_mode) 60 * std.time.ns_per_s else 120 * std.time.ns_per_s;
+    const download_timeout_ns: i128 = if (quick_mode) 10 * std.time.ns_per_s else 120 * std.time.ns_per_s;
 
     while (completed < urls.len and (std.time.nanoTimestamp() - download_start) < download_timeout_ns) {
         // Exit early if connection is dead
