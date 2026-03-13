@@ -2935,6 +2935,71 @@ pub const Connection = struct {
         return self.state == .connected;
     }
 
+    /// Compute the next timeout deadline (nanosecond timestamp) without side effects.
+    /// Returns null if the connection is terminated and needs no timer.
+    /// Used by event loop to schedule the global timer.
+    pub fn nextTimeoutNs(self: *const Connection) ?i64 {
+        if (self.state == .terminated) return null;
+
+        var earliest: ?i64 = null;
+
+        // Closing/draining: 3×PTO from closing_start_time
+        if (self.state == .closing or self.state == .draining) {
+            if (self.closing_start_time > 0) {
+                const pto_ns = self.pkt_handler.rtt_stats.pto();
+                const deadline = self.closing_start_time + 3 * pto_ns;
+                return deadline;
+            }
+            return null;
+        }
+
+        // Idle timeout
+        {
+            var current_pto = self.pkt_handler.rtt_stats.pto();
+            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 62));
+            current_pto = @min(current_pto << shift, 60_000_000_000);
+            const effective_idle = @max(self.idle_timeout_ns, 3 * current_pto);
+            const last_activity = if (!self.handshake_confirmed)
+                @max(self.last_packet_received_time, self.last_packet_sent_time)
+            else
+                self.last_packet_received_time;
+            const idle_deadline = last_activity + effective_idle;
+            if (earliest == null or idle_deadline < earliest.?) {
+                earliest = idle_deadline;
+            }
+        }
+
+        // Loss time and PTO from packet handler
+        for (self.pkt_handler.sent, 0..) |tracker, idx| {
+            if (tracker.loss_time) |lt| {
+                if (earliest == null or lt < earliest.?) {
+                    earliest = lt;
+                }
+                continue;
+            }
+
+            if (tracker.ack_eliciting_in_flight == 0) continue;
+
+            const largest_sent = tracker.largest_sent orelse continue;
+            const sent_pkt = tracker.sent_packets.get(largest_sent) orelse continue;
+
+            var pto_duration = if (idx == @intFromEnum(ack_handler.EncLevel.application))
+                self.pkt_handler.rtt_stats.pto()
+            else
+                self.pkt_handler.rtt_stats.ptoNoAckDelay();
+
+            const pto_shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 62));
+            pto_duration = @min(pto_duration << pto_shift, 60_000_000_000);
+
+            const timeout = sent_pkt.time_sent + pto_duration;
+            if (earliest == null or timeout < earliest.?) {
+                earliest = timeout;
+            }
+        }
+
+        return earliest;
+    }
+
     /// Drop Initial and Handshake encryption keys (RFC 9001 §4.9).
     /// Called automatically for server in advanceHandshake, and for client
     /// after the Handshake Finished has been sent. Applications should not

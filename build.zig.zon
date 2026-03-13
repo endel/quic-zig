@@ -1,6 +1,12 @@
 .{
     .name = .quic_zig,
     .version = "0.1.0",
+    .dependencies = .{
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/d398cba9bf711fa4dd21c48bf73d25e4d8986408.tar.gz",
+            .hash = "libxev-0.0.0-86vtc689EwAjQWysidPm9NKkAwwUNByiE3kZTg_xu0Hp",
+        },
+    },
     .fingerprint = 0xe7003483efbbb531,
     .minimum_zig_version = "0.15.0",
     .paths = .{
