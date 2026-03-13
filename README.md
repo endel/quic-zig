@@ -38,12 +38,12 @@ shelved. QUIC is not one spec -- it's a stack of RFCs (9000, 9001, 9002, 9114,
 9204, 9297) each building on the last, each with enough edge cases to fill a
 career. For a solo developer, it was humanly impossible.
 
-Fast-forward to 2026. [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-changed the equation. Not by writing perfect code -- but by making it possible
-to move fast enough across the full stack that the project could actually reach
-the point where it gets battle-tested. The entire codebase was rebuilt from
-scratch: TLS 1.3 handshake, QUIC transport, loss detection, congestion control,
-HTTP/3, QPACK, and WebTransport -- all in pure Zig, no C dependencies.
+Fast-forward to 2026. Claude Code changed the equation. Not by writing perfect
+code -- but by making it possible to move fast enough across the full stack that
+the project could actually reach the point where it gets battle-tested. The
+entire codebase was rebuilt from scratch: TLS 1.3 handshake, QUIC transport,
+loss detection, congestion control, HTTP/3, QPACK, and WebTransport -- all in
+pure Zig, no C dependencies.
 
 The code passes most interop tests against [quic-go](https://github.com/quic-go/quic-go)
 and [quiche](https://github.com/cloudflare/quiche), and integrates with the
