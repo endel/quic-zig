@@ -8,8 +8,11 @@ const packet = @import("packet.zig");
 const protocol = @import("protocol.zig");
 const stateless_reset = @import("stateless_reset.zig");
 const tls13 = @import("tls13.zig");
+const ecn_socket = @import("ecn_socket.zig");
 const h3 = @import("../h3/connection.zig");
 const wt = @import("../webtransport/session.zig");
+
+const MAX_DATAGRAM_SIZE: usize = 1500;
 
 /// Fixed-size CID key for use in HashMap lookups.
 pub const CidKey = struct {
@@ -100,6 +103,12 @@ pub const ConnectionManager = struct {
 
     /// When true, Initial packets without a valid token get a Retry response.
     require_retry: bool = false,
+
+    // Socket I/O fields for recvAll/sendAll (set via setupSocket).
+    sockfd: posix.socket_t = 0,
+    local_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage),
+    batch: ecn_socket.SendBatch = .{ .sockfd = 0 },
+    out_buf: [MAX_DATAGRAM_SIZE]u8 = undefined,
 
     pub fn init(
         allocator: Allocator,
@@ -368,6 +377,74 @@ pub const ConnectionManager = struct {
             return false;
         }
         return true;
+    }
+
+    /// Configure socket I/O for use with recvAll/sendAll.
+    pub fn setupSocket(self: *ConnectionManager, sockfd: posix.socket_t, local_addr: posix.sockaddr.storage) void {
+        self.sockfd = sockfd;
+        self.local_addr = local_addr;
+        self.batch = ecn_socket.SendBatch.init(sockfd);
+    }
+
+    /// Receive and process all available UDP packets from the socket.
+    /// Batches immediate responses (VN, Retry, Stateless Reset) and the first
+    /// conn.send() per processed connection. Flushes the batch before returning.
+    /// Returns the number of datagrams received (0 = idle).
+    pub fn recvAll(self: *ConnectionManager) usize {
+        var packets_received: usize = 0;
+
+        while (true) {
+            var bytes: [8192]u8 = undefined;
+
+            const recv_result = ecn_socket.recvmsgEcn(self.sockfd, &bytes) catch |err| {
+                if (err == error.WouldBlock) break;
+                break;
+            };
+            packets_received += 1;
+
+            switch (self.recvDatagram(bytes[0..recv_result.bytes_read], recv_result.from_addr, self.local_addr, recv_result.ecn, &self.out_buf)) {
+                .processed => |entry| {
+                    const conn = entry.conn;
+                    const bytes_written = conn.send(&self.out_buf) catch continue;
+                    if (bytes_written > 0) {
+                        const send_addr = conn.peerAddress();
+                        self.batch.add(self.out_buf[0..bytes_written], @ptrCast(send_addr), connection.sockaddrLen(send_addr), conn.getEcnMark());
+                    }
+                },
+                .send_response => |data| {
+                    self.batch.add(data, @ptrCast(&recv_result.from_addr), recv_result.addr_len, 0);
+                },
+                .dropped => {},
+            }
+        }
+
+        self.batch.flush();
+        return packets_received;
+    }
+
+    /// Tick all connections (timeouts, close detection) and burst-send queued
+    /// data. Call this after application-specific per-connection processing
+    /// (H3/WT polling). Removes closed connections.
+    pub fn sendAll(self: *ConnectionManager) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+
+            if (!self.tickEntry(entry)) continue; // removed, don't increment
+
+            const conn = entry.conn;
+            var send_count: usize = 0;
+            while (send_count < 100) : (send_count += 1) {
+                const bytes_written = conn.send(&self.out_buf) catch break;
+                if (bytes_written == 0) break;
+                const send_addr = conn.peerAddress();
+                self.batch.add(self.out_buf[0..bytes_written], @ptrCast(send_addr), connection.sockaddrLen(send_addr), conn.getEcnMark());
+            }
+
+            i += 1;
+        }
+
+        self.batch.flush();
     }
 
     /// Return the number of active connections.

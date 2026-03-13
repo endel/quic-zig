@@ -8,8 +8,6 @@ const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
 const wt = @import("webtransport/session.zig");
 
-const MAX_DATAGRAM_SIZE: usize = 1500;
-
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -65,51 +63,14 @@ pub fn main() !void {
         retry_token_key,
         static_reset_key,
     );
+    conn_mgr.setupSocket(sockfd, connection.sockaddrToStorage(&local_addr.any));
     defer conn_mgr.deinit();
 
-    var remote_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-    var addr_size: posix.socklen_t = @sizeOf(posix.sockaddr);
-    var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
-    var batch = ecn_socket.SendBatch.init(sockfd);
-
     while (true) {
-        var packets_received: usize = 0;
+        const packets_received = conn_mgr.recvAll();
 
-        // Read loop: process all available UDP packets
-        read_loop: while (true) {
-            var bytes: [8192]u8 = undefined;
-            addr_size = @sizeOf(posix.sockaddr);
-
-            const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch |err| {
-                if (err == error.WouldBlock) break :read_loop;
-                std.log.err("recvmsg error: {any}", .{err});
-                break :read_loop;
-            };
-            packets_received += 1;
-            remote_addr = recv_result.from_addr;
-            addr_size = recv_result.addr_len;
-
-            switch (conn_mgr.recvDatagram(bytes[0..recv_result.bytes_read], remote_addr, connection.sockaddrToStorage(&local_addr.any), recv_result.ecn, &out)) {
-                .processed => |entry| {
-                    const conn = entry.conn;
-                    const bytes_written = conn.send(&out) catch continue;
-                    if (bytes_written > 0) {
-                        const send_addr = conn.peerAddress();
-                        batch.add(out[0..bytes_written], @ptrCast(send_addr), connection.sockaddrLen(send_addr), conn.getEcnMark());
-                    }
-                },
-                .send_response => |data| {
-                    batch.add(data, @ptrCast(&remote_addr), addr_size, 0);
-                },
-                .dropped => {},
-            }
-        }
-        batch.flush();
-
-        // Per-connection processing: H3+WT init, events, timeouts, periodic sends
-        var i: usize = 0;
-        while (i < conn_mgr.entries.items.len) {
-            const entry = conn_mgr.entries.items[i];
+        // Per-connection processing: H3+WT init and event polling
+        for (conn_mgr.entries.items) |entry| {
             const conn = entry.conn;
 
             // Initialize H3+WT once handshake completes
@@ -123,7 +84,6 @@ pub fn main() !void {
                 };
                 entry.h3_conn.?.initConnection() catch |err| {
                     std.log.err("H3 init error: {any}", .{err});
-                    i += 1;
                     continue;
                 };
                 entry.wt_conn = wt.WebTransportConnection.init(alloc, &entry.h3_conn.?, conn, true);
@@ -187,24 +147,9 @@ pub fn main() !void {
                     }
                 }
             }
-
-            // Timeouts + close check
-            if (!conn_mgr.tickEntry(entry)) continue;
-
-            // Burst send — drain queued data
-            var send_count: usize = 0;
-            while (send_count < 100) : (send_count += 1) {
-                const bytes_written = conn.send(&out) catch break;
-                if (bytes_written == 0) break;
-                const send_addr = conn.peerAddress();
-                batch.add(out[0..bytes_written], @ptrCast(send_addr), connection.sockaddrLen(send_addr), conn.getEcnMark());
-            }
-
-            i += 1;
         }
-        batch.flush();
+        conn_mgr.sendAll();
 
-        // Sleep only when idle
         if (packets_received == 0) std.Thread.sleep(200 * std.time.ns_per_us);
     }
 }
