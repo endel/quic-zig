@@ -621,7 +621,11 @@ pub const WebTransportConnection = struct {
                 }
             },
             .settings => {}, // H3 settings — handled by H3 layer
-            .data => {},
+            .data => {
+                // Drain body to clear pending state
+                var sink: [4096]u8 = undefined;
+                while (self.h3.recvBody(&sink) > 0) {}
+            },
             .finished => |stream_id| {
                 if (self.getSession(stream_id)) |session| {
                     // CONNECT stream finished via H3 — session closed without close frame

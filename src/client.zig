@@ -229,8 +229,13 @@ pub fn main() !void {
                     }
                 },
                 .data => |d| {
-                    std.log.info("H3: received response body ({d} bytes)", .{d.data.len});
-                    std.debug.print("Response: {s}\n", .{d.data});
+                    std.log.info("H3: received response body ({d} bytes)", .{d.len});
+                    var body_buf: [8192]u8 = undefined;
+                    while (true) {
+                        const n = h3_conn.recvBody(&body_buf);
+                        if (n == 0) break;
+                        std.debug.print("Response: {s}\n", .{body_buf[0..n]});
+                    }
                     got_response = true;
                 },
                 .finished => |stream_id| {

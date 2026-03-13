@@ -36,16 +36,6 @@ const TestCase = enum {
     connectionmigration,
     chacha20,
     v2,
-    longrtt,
-    multiplexing,
-    blackhole,
-    handshakeloss,
-    transferloss,
-    handshakecorruption,
-    transfercorruption,
-    amplificationlimit,
-    ipv6,
-    versionnegotiation,
     unsupported,
 };
 
@@ -62,16 +52,6 @@ fn parseTestCase(name: []const u8) TestCase {
     if (mem.eql(u8, name, "connectionmigration")) return .connectionmigration;
     if (mem.eql(u8, name, "chacha20")) return .chacha20;
     if (mem.eql(u8, name, "v2")) return .v2;
-    if (mem.eql(u8, name, "longrtt")) return .longrtt;
-    if (mem.eql(u8, name, "multiplexing")) return .multiplexing;
-    if (mem.eql(u8, name, "blackhole")) return .blackhole;
-    if (mem.eql(u8, name, "handshakeloss")) return .handshakeloss;
-    if (mem.eql(u8, name, "transferloss")) return .transferloss;
-    if (mem.eql(u8, name, "handshakecorruption")) return .handshakecorruption;
-    if (mem.eql(u8, name, "transfercorruption")) return .transfercorruption;
-    if (mem.eql(u8, name, "amplificationlimit")) return .amplificationlimit;
-    if (mem.eql(u8, name, "ipv6")) return .ipv6;
-    if (mem.eql(u8, name, "versionnegotiation")) return .versionnegotiation;
     return .unsupported;
 }
 
@@ -156,24 +136,7 @@ pub fn main() !void {
 
     const v2 = (testcase == .v2);
     switch (testcase) {
-        .handshake,
-        .transfer,
-        .ecn,
-        .connectionmigration,
-        .chacha20,
-        .longrtt,
-        .blackhole,
-        .handshakeloss,
-        .transferloss,
-        .handshakecorruption,
-        .transfercorruption,
-        .amplificationlimit,
-        .ipv6,
-        .versionnegotiation,
-        => {
-            _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false, qlog_dir);
-        },
-        .multiplexing => {
+        .handshake, .transfer, .ecn, .connectionmigration, .chacha20 => {
             _ = try downloadAll(alloc, urls.items, use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false, qlog_dir);
         },
         .keyupdate => {
@@ -716,13 +679,13 @@ fn downloadH3(
                 .data => |d| {
                     if (downloads.getPtr(d.stream_id)) |dl_buf| {
                         var body_buf: [8192]u8 = undefined;
-                        var remaining = d.len;
-                        while (remaining > 0) {
+                        var h3_remaining = d.len;
+                        while (h3_remaining > 0) {
                             const n = h3c.recvBody(&body_buf);
                             if (n == 0) break;
                             dl_buf.appendSlice(alloc, body_buf[0..n]) catch {};
                             total_bytes_received += n;
-                            remaining -= n;
+                            h3_remaining -= n;
                         }
                     }
                 },

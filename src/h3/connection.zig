@@ -49,7 +49,8 @@ pub const ShutdownState = enum {
 pub const H3Event = union(enum) {
     settings: h3_frame.Settings,
     headers: struct { stream_id: u64, headers: []const qpack.Header },
-    data: struct { stream_id: u64, data: []const u8 },
+    /// Body data is available on this stream. Call recvBody() to read it.
+    data: struct { stream_id: u64, len: usize },
     finished: u64,
     goaway: u64,
     connect_request: struct {
@@ -108,10 +109,15 @@ pub const H3Connection = struct {
     qpack_encoder: qpack.QpackEncoder = .{},
     qpack_decoder: qpack.QpackDecoder = .{},
 
-    // Deferred buffer consumption: after returning a .data event whose payload
-    // slices into a stream buffer, we must wait until the caller has finished
-    // reading before shifting the buffer.  Applied at the top of the next poll().
-    pending_data_consumed: ?struct { stream_id: u64, consumed: usize } = null,
+    // Pending DATA frame body: set by poll() when a DATA frame is found,
+    // consumed by recvBody().  poll() won't advance past this stream
+    // until the body is fully read.
+    pending_body: ?struct {
+        stream_id: u64,
+        offset: usize, // offset into stream_bufs where payload starts
+        remaining: usize, // bytes not yet read by recvBody()
+        frame_total: usize, // total frame size (header + payload) for final consume
+    } = null,
 
     // Graceful shutdown state (RFC 9114 §5.2)
     shutdown_state: ShutdownState = .active,
@@ -453,16 +459,6 @@ pub const H3Connection = struct {
     /// Poll for the next HTTP/3 event.
     /// Processes incoming QUIC stream data and returns H3 events.
     pub fn poll(self: *H3Connection) !?H3Event {
-        // Apply deferred buffer consumption from previous .data event.
-        // The payload slice pointed into the stream buffer, so we had to
-        // wait until the caller finished reading before shifting.
-        if (self.pending_data_consumed) |pdc| {
-            self.pending_data_consumed = null;
-            if (self.stream_bufs.getPtr(pdc.stream_id)) |buf| {
-                self.consumeFrameFromBuf(buf, pdc.consumed);
-            }
-        }
-
         // Check for critical stream closure (RFC 9114 §6.2.1, RFC 9204 §4.2)
         if (self.checkCriticalStreams()) |err| return err;
 
@@ -491,6 +487,38 @@ pub const H3Connection = struct {
         }
 
         return null;
+    }
+
+    /// Read body data from a stream after a `.data` event.
+    /// Copies into the caller-provided buffer and returns the number of bytes read.
+    /// Call repeatedly until 0 is returned to drain the full DATA frame payload.
+    pub fn recvBody(self: *H3Connection, buf: []u8) usize {
+        const pb = self.pending_body orelse return 0;
+        const stream_buf = self.stream_bufs.getPtr(pb.stream_id) orelse {
+            self.pending_body = null;
+            return 0;
+        };
+
+        const available = @min(pb.remaining, buf.len);
+        if (available == 0) return 0;
+
+        @memcpy(buf[0..available], stream_buf.items[pb.offset..][0..available]);
+
+        if (available == pb.remaining) {
+            // Fully consumed — remove the entire frame from the stream buffer
+            self.consumeFrameFromBuf(stream_buf, pb.frame_total);
+            self.pending_body = null;
+        } else {
+            // Partial read — advance offset
+            self.pending_body = .{
+                .stream_id = pb.stream_id,
+                .offset = pb.offset + available,
+                .remaining = pb.remaining - available,
+                .frame_total = pb.frame_total,
+            };
+        }
+
+        return available;
     }
 
     /// RFC 9114 §6.2.1: Closing a critical uni stream (control, QPACK encoder, QPACK decoder)
@@ -770,6 +798,9 @@ pub const H3Connection = struct {
 
     /// Poll bidirectional streams for HEADERS/DATA frames.
     fn pollBidiStreams(self: *H3Connection) !?H3Event {
+        // Can't parse more frames while a body read is pending
+        if (self.pending_body != null) return null;
+
         var stream_it = self.quic_conn.streams.streams.iterator();
         while (stream_it.next()) |entry| {
             const stream_id = entry.key_ptr.*;
@@ -916,15 +947,18 @@ pub const H3Connection = struct {
                             self.consumeFrameFromBuf(buf, result.consumed);
                             continue; // Skip GREASE/unknown frames
                         }
-                        // Defer buffer consumption: payload is a slice into buf.items,
-                        // so we must NOT shift the buffer until the caller has read it.
-                        self.pending_data_consumed = .{
+                        // Don't consume from buffer — recvBody() will read
+                        // the payload and consume the full frame.
+                        const header_len = result.consumed - payload.len;
+                        self.pending_body = .{
                             .stream_id = stream_id,
-                            .consumed = result.consumed,
+                            .offset = header_len,
+                            .remaining = payload.len,
+                            .frame_total = result.consumed,
                         };
                         return .{ .data = .{
                             .stream_id = stream_id,
-                            .data = payload,
+                            .len = payload.len,
                         } };
                     },
                     else => {

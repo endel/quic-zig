@@ -454,7 +454,16 @@ pub fn Server(comptime Handler: type) type {
                     },
                     .data => |d| {
                         if (@hasDecl(Handler, "onData")) {
-                            self.handler.onData(&session, d.stream_id, d.data);
+                            var body_buf: [8192]u8 = undefined;
+                            while (true) {
+                                const n = h3c.recvBody(&body_buf);
+                                if (n == 0) break;
+                                self.handler.onData(&session, d.stream_id, body_buf[0..n]);
+                            }
+                        } else {
+                            // Drain body even if handler doesn't consume it
+                            var sink: [4096]u8 = undefined;
+                            while (h3c.recvBody(&sink) > 0) {}
                         }
                     },
                     .settings, .finished, .goaway, .connect_request, .shutdown_complete, .request_cancelled => {},
