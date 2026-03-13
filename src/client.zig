@@ -11,6 +11,31 @@ const Certificate = std.crypto.Certificate;
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
 
+fn recvAll(sockfd: posix.socket_t, conn: *connection.Connection, local_addr: *const net.Address, remote_addr: *posix.sockaddr.storage, addr_size: *posix.socklen_t) void {
+    while (true) {
+        var bytes: [8192]u8 = undefined;
+        const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
+        remote_addr.* = recv_result.from_addr;
+        addr_size.* = recv_result.addr_len;
+        conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
+            .to = connection.sockaddrToStorage(&local_addr.any),
+            .from = remote_addr.*,
+            .ecn = recv_result.ecn,
+            .datagram_size = recv_result.bytes_read,
+        });
+    }
+}
+
+fn sendAll(sockfd: posix.socket_t, conn: *connection.Connection, out: []u8, remote_addr: *const posix.sockaddr.storage, addr_size: posix.socklen_t) void {
+    var count: usize = 0;
+    while (count < 20) : (count += 1) {
+        const n = conn.send(out) catch break;
+        if (n == 0) break;
+        ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
+        _ = posix.sendto(sockfd, out[0..n], 0, @ptrCast(remote_addr), addr_size) catch break;
+    }
+}
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -69,86 +94,37 @@ pub fn main() !void {
     var addr_size: posix.socklen_t = connection.sockaddrLen(&remote_addr);
     var out: [MAX_DATAGRAM_SIZE]u8 = undefined;
 
-    // Send initial packets and wait for handshake to complete
-    var handshake_complete = false;
-    var send_count: usize = 0;
-    const max_iterations: usize = 1000;
+    // === Handshake ===
     var iteration: usize = 0;
-
-    while (!handshake_complete and iteration < max_iterations) : (iteration += 1) {
+    while (conn.state != .connected and iteration < 1000) : (iteration += 1) {
+        conn.onTimeout() catch {};
+        sendAll(sockfd, &conn, &out, &remote_addr, addr_size);
+        recvAll(sockfd, &conn, &local_addr, &remote_addr, &addr_size);
+        if (conn.state == .connected) break;
         std.Thread.sleep(1 * std.time.ns_per_ms);
-
-        // Send any pending packets
-        if (!handshake_complete) {
-            const bytes_written = conn.send(&out) catch |err| {
-                std.log.err("send error: {any}", .{err});
-                break;
-            };
-            if (bytes_written > 0) {
-                send_count += 1;
-                ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-                const sent = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(&remote_addr), addr_size) catch |err| {
-                    std.log.err("sendto failed: {any}", .{err});
-                    continue;
-                };
-                std.log.info("sent {d} bytes (packet #{d}), sendto returned {d}", .{ bytes_written, send_count, sent });
-            }
-        }
-
-        // Try to read response packets
-        read_loop: while (true) {
-            var bytes: [8192]u8 = undefined;
-
-            const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch {
-                break :read_loop;
-            };
-            remote_addr = recv_result.from_addr;
-            addr_size = recv_result.addr_len;
-
-            conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-                .to = connection.sockaddrToStorage(&local_addr.any),
-                .from = remote_addr,
-                .ecn = recv_result.ecn,
-                .datagram_size = recv_result.bytes_read,
-            });
-
-            if (conn.state == .connected) {
-                handshake_complete = true;
-            }
-        }
     }
 
-    if (!handshake_complete) {
+    if (conn.state != .connected) {
         std.log.err("handshake did not complete after {d} iterations", .{iteration});
         return;
     }
-
     std.log.info("handshake complete, connection active", .{});
 
-    // Send any pending handshake packets (Finished, ACKs)
-    const hs_bytes = conn.send(&out) catch |err| {
-        std.log.err("send error (handshake): {any}", .{err});
-        return;
-    };
-    if (hs_bytes > 0) {
-        ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = try posix.sendto(sockfd, out[0..hs_bytes], 0, @ptrCast(&remote_addr), addr_size);
-        std.log.info("sent {d} bytes (handshake completion)", .{hs_bytes});
-    }
+    // Send handshake completion packets (Finished, ACKs) and let server process them
+    sendAll(sockfd, &conn, &out, &remote_addr, addr_size);
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    recvAll(sockfd, &conn, &local_addr, &remote_addr, &addr_size);
+    conn.onTimeout() catch {};
+    sendAll(sockfd, &conn, &out, &remote_addr, addr_size);
 
     // Sync remote_addr from active path (may have changed due to preferred address migration)
     remote_addr = conn.peerAddress().*;
 
-    // Small delay for the server to process the Finished
-    std.Thread.sleep(50 * std.time.ns_per_ms);
-
-    // Initialize HTTP/3 connection
+    // === HTTP/3 request ===
     var h3_conn = h3.H3Connection.init(alloc, &conn, false);
     defer h3_conn.deinit();
     try h3_conn.initConnection();
-    std.log.info("HTTP/3 connection initialized", .{});
 
-    // Send HTTP/3 GET request
     const req_headers = [_]qpack.Header{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
@@ -159,59 +135,19 @@ pub fn main() !void {
     const req_stream_id = try h3_conn.sendRequest(&req_headers, null);
     std.log.info("H3: sent GET / request on stream {d}", .{req_stream_id});
 
-    // Send the H3 control streams + request data
-    const data_bytes = conn.send(&out) catch |err| {
-        std.log.err("send error: {any}", .{err});
-        return;
-    };
-    if (data_bytes > 0) {
-        ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = try posix.sendto(sockfd, out[0..data_bytes], 0, @ptrCast(&remote_addr), addr_size);
-        std.log.info("sent {d} bytes with H3 data", .{data_bytes});
-    }
+    // Flush all pending data (H3 control streams + request)
+    sendAll(sockfd, &conn, &out, &remote_addr, addr_size);
 
-    // Keep sending until all stream data is flushed
-    var flush_count: usize = 0;
-    while (flush_count < 10) : (flush_count += 1) {
-        const more = conn.send(&out) catch break;
-        if (more == 0) break;
-        ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-        _ = posix.sendto(sockfd, out[0..more], 0, @ptrCast(&remote_addr), addr_size) catch break;
-        std.log.info("sent {d} more bytes (flush #{d})", .{ more, flush_count + 1 });
-    }
-
-    // Read response
+    // === Read response ===
     var got_response = false;
     var response_iteration: usize = 0;
-    const max_response_iterations: usize = 500;
 
-    while (!got_response and response_iteration < max_response_iterations) : (response_iteration += 1) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+    while (!got_response and response_iteration < 200) : (response_iteration += 1) {
+        recvAll(sockfd, &conn, &local_addr, &remote_addr, &addr_size);
+        conn.onTimeout() catch {};
+        sendAll(sockfd, &conn, &out, &remote_addr, addr_size);
 
-        // Read QUIC packets
-        while (true) {
-            var bytes: [8192]u8 = undefined;
-
-            const recv_result = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
-            remote_addr = recv_result.from_addr;
-            addr_size = recv_result.addr_len;
-
-            conn.handleDatagram(bytes[0..recv_result.bytes_read], .{
-                .to = connection.sockaddrToStorage(&local_addr.any),
-                .from = remote_addr,
-                .ecn = recv_result.ecn,
-                .datagram_size = recv_result.bytes_read,
-            });
-
-            if (conn.state == .draining) break;
-        }
-
-        // Send ACKs
-        const ack_bytes = conn.send(&out) catch continue;
-        if (ack_bytes > 0) {
-            ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-            _ = posix.sendto(sockfd, out[0..ack_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
-        }
+        if (conn.state == .draining) break;
 
         // Poll for H3 events
         while (true) {
@@ -250,6 +186,10 @@ pub fn main() !void {
                 .request_cancelled => {},
             }
         }
+
+        if (!got_response) {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
     }
 
     if (!got_response) {
@@ -261,38 +201,18 @@ pub fn main() !void {
         std.log.info("received session ticket (len={d}, lifetime={d}s) - can use for 0-RTT resumption", .{ ticket.ticket_len, ticket.lifetime });
     }
 
-    // Close connection
+    // === Close connection ===
     conn.close(0, "done");
-    const final_bytes = conn.send(&out) catch 0;
-    if (final_bytes > 0) {
-        _ = try posix.sendto(sockfd, out[0..final_bytes], 0, @ptrCast(&remote_addr), addr_size);
-    }
+    sendAll(sockfd, &conn, &out, &remote_addr, addr_size);
 
-    // Wait for draining period to complete
+    // Drain: wait for connection to terminate (3×PTO)
     var drain_iter: usize = 0;
-    while (!conn.isClosed() and drain_iter < 100) : (drain_iter += 1) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+    while (!conn.isClosed() and drain_iter < 30) : (drain_iter += 1) {
+        std.Thread.sleep(5 * std.time.ns_per_ms);
         conn.onTimeout() catch break;
 
-        // Read and process any incoming packets (triggers close retransmit)
-        while (true) {
-            var bytes: [8192]u8 = undefined;
-            const drain_recv = ecn_socket.recvmsgEcn(sockfd, &bytes) catch break;
-            remote_addr = drain_recv.from_addr;
-            addr_size = drain_recv.addr_len;
-            conn.handleDatagram(bytes[0..drain_recv.bytes_read], .{
-                .to = connection.sockaddrToStorage(&local_addr.any),
-                .from = remote_addr,
-                .ecn = drain_recv.ecn,
-                .datagram_size = drain_recv.bytes_read,
-            });
-        }
-
-        // Send retransmit if triggered
-        const retransmit_bytes = conn.send(&out) catch 0;
-        if (retransmit_bytes > 0) {
-            _ = posix.sendto(sockfd, out[0..retransmit_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
-        }
+        recvAll(sockfd, &conn, &local_addr, &remote_addr, &addr_size);
+        sendAll(sockfd, &conn, &out, &remote_addr, addr_size);
     }
     std.log.info("connection closed cleanly", .{});
 }

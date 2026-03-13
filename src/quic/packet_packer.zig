@@ -382,14 +382,15 @@ pub const PacketPacker = struct {
             // Keep sending until handshake is confirmed (cleared by connection
             // when 1-RTT ACK is received). This ensures delivery under loss
             // without relying solely on PTO retransmission.
-            if (level == .application and self.send_handshake_done) {
+            // Skip when ack_only (congestion-limited) to avoid infinite packet generation.
+            if (level == .application and self.send_handshake_done and !ack_only) {
                 try writer.writeByte(0x1e); // HANDSHAKE_DONE frame type
                 has_handshake_done = true;
                 ack_eliciting = true;
             }
 
-            // 4. Pending control frames (only in 1-RTT)
-            if (level == .application) {
+            // 4. Pending control frames (only in 1-RTT, skip when ack_only)
+            if (level == .application and !ack_only) {
                 while (pending_frames.pop()) |pcf| {
                     try pcf.write(writer);
                     ack_eliciting = true;

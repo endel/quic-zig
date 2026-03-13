@@ -334,6 +334,7 @@ pub const WebTransportConnection = struct {
             if (session.state != .active and session.state != .draining) continue;
 
             const stream = self.quic.streams.getStream(session.session_id) orelse continue;
+            // read() transfers ownership of heap-allocated data from FrameSorter
             const data = stream.recv.read() orelse {
                 // No data — check if stream received FIN
                 if (stream.recv.finished) {
@@ -361,6 +362,8 @@ pub const WebTransportConnection = struct {
                 }
                 continue;
             };
+
+            defer self.allocator.free(data);
 
             // Try to parse CLOSE_WEBTRANSPORT_SESSION frame
             const result = h3_frame.parse(data) catch continue;
@@ -430,8 +433,9 @@ pub const WebTransportConnection = struct {
             if (self.h3.peer_qpack_dec_stream_id != null and self.h3.peer_qpack_dec_stream_id.? == stream_id) continue;
             if (self.pending_uni_streams.contains(stream_id)) continue;
 
-            // Try to read data
+            // Try to read data (read() transfers ownership)
             const data = recv_stream.read() orelse continue;
+            defer self.allocator.free(data);
             if (data.len == 0) continue;
 
             var fbs = io.fixedBufferStream(data);
@@ -473,8 +477,9 @@ pub const WebTransportConnection = struct {
             // Also skip our CONNECT session streams
             if (self.getSession(stream_id) != null) continue;
 
-            // Try to read prefix data
+            // Try to read prefix data (read() transfers ownership)
             const data = stream.recv.read() orelse continue;
+            defer self.allocator.free(data);
             if (data.len == 0) continue;
 
             var fbs = io.fixedBufferStream(data);
@@ -586,6 +591,7 @@ pub const WebTransportConnection = struct {
                 if (std.mem.eql(u8, req.protocol, "webtransport")) {
                     // Register as a connecting session
                     _ = self.allocateSession(req.stream_id, .connecting);
+                    self.active_session_count += 1;
                     // Exclude this stream from H3 bidi processing
                     try self.h3.excluded_bidi_streams.put(req.stream_id, {});
                     return .{ .connect_request = .{
@@ -663,4 +669,742 @@ test "DatagramQueue used by WT" {
     const len = q.pop(&buf).?;
     try std.testing.expectEqual(@as(usize, 5), len);
     try std.testing.expectEqualStrings("hello", buf[0..len]);
+}
+
+// =============================================================================
+// WebTransport integration tests via stream-level injection
+// =============================================================================
+
+const testing = std.testing;
+const ack_handler = @import("../quic/ack_handler.zig");
+const flow_control = @import("../quic/flow_control.zig");
+const crypto_stream = @import("../quic/crypto_stream.zig");
+const packet_packer = @import("../quic/packet_packer.zig");
+const protocol = @import("../quic/protocol.zig");
+
+fn createTestQuicConn(is_server: bool) quic_connection.Connection {
+    const dcid = "testdcid" ++ ([_]u8{0} ** 12);
+    const scid = "testscid" ++ ([_]u8{0} ** 12);
+
+    var conn = quic_connection.Connection{
+        .allocator = testing.allocator,
+        .is_server = is_server,
+        .dcid = dcid.*,
+        .dcid_len = 8,
+        .scid = scid.*,
+        .scid_len = 8,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .pkt_handler = ack_handler.PacketHandler.init(testing.allocator),
+        .conn_flow_ctrl = flow_control.ConnectionFlowController.init(1048576, 6 * 1024 * 1024),
+        .streams = stream_mod.StreamsMap.init(testing.allocator, is_server),
+        .crypto_streams = crypto_stream.CryptoStreamManager.init(testing.allocator),
+        .packer = packet_packer.PacketPacker.init(
+            testing.allocator,
+            is_server,
+            dcid[0..8],
+            scid[0..8],
+            protocol.SUPPORTED_VERSIONS[0],
+        ),
+    };
+    conn.streams.setMaxStreams(100, 100);
+    conn.streams.setMaxIncomingStreams(100, 100);
+    conn.streams.peer_initial_max_stream_data_bidi_local = 1048576;
+    conn.streams.peer_initial_max_stream_data_bidi_remote = 1048576;
+    conn.streams.peer_initial_max_stream_data_uni = 1048576;
+    conn.conn_flow_ctrl.base.send_window = 1048576;
+    conn.datagrams_enabled = true;
+    return conn;
+}
+
+// Build control stream type byte + WT-enabled SETTINGS
+fn buildWtControlPayload(buf: []u8) usize {
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.writeUniStreamType(fbs.writer(), .control) catch unreachable;
+    h3_frame.write(.{ .settings = .{
+        .enable_connect_protocol = true,
+        .h3_datagram = true,
+        .enable_webtransport = true,
+        .webtransport_max_sessions = 4,
+    } }, fbs.writer()) catch unreachable;
+    return fbs.pos;
+}
+
+fn injectPeerControlStream(quic_conn: *quic_connection.Connection, h3: *h3_conn.H3Connection, is_server: bool) !void {
+    const peer_uni_id: u64 = if (is_server) 2 else 3;
+    var buf: [128]u8 = undefined;
+    const len = buildWtControlPayload(&buf);
+    const rs = try quic_conn.streams.getOrCreateRecvStream(peer_uni_id);
+    try rs.handleStreamFrame(0, buf[0..len], false);
+    const ev = try h3.poll();
+    if (ev) |e| {
+        switch (e) {
+            .settings => {},
+            else => return error.UnexpectedEvent,
+        }
+    } else return error.ExpectedSettingsEvent;
+}
+
+// Build a QPACK-encoded Extended CONNECT request
+fn buildConnectRequest(buf: []u8, path: []const u8) usize {
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&headers, &qpack_buf) catch unreachable;
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer()) catch unreachable;
+    return fbs.pos;
+}
+
+// Build a QPACK-encoded 200 response
+fn buildConnectResponse(buf: []u8) usize {
+    const headers = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&headers, &qpack_buf) catch unreachable;
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer()) catch unreachable;
+    return fbs.pos;
+}
+
+// Build WT bidi stream type prefix: 0x41 + session_id
+fn buildWtBidiPrefix(buf: []u8, session_id: u64) usize {
+    var fbs = io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    packet.writeVarInt(w, WT_BIDI_STREAM_TYPE) catch unreachable;
+    packet.writeVarInt(w, session_id) catch unreachable;
+    return fbs.pos;
+}
+
+// Build WT uni stream type prefix: 0x54 + session_id
+fn buildWtUniPrefix(buf: []u8, session_id: u64) usize {
+    var fbs = io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    packet.writeVarInt(w, WT_UNI_STREAM_TYPE) catch unreachable;
+    packet.writeVarInt(w, session_id) catch unreachable;
+    return fbs.pos;
+}
+
+// Full setup: QUIC conn + H3 + WT + peer control stream + active session.
+// Returns the session_id of the active session.
+const WtTestSetup = struct {
+    quic_conn: quic_connection.Connection,
+    h3: h3_conn.H3Connection,
+    wt: WebTransportConnection,
+
+    fn initServer(self: *WtTestSetup) !u64 {
+        self.quic_conn = createTestQuicConn(true);
+        self.h3 = h3_conn.H3Connection.init(testing.allocator, &self.quic_conn, true);
+        self.h3.local_settings.enable_connect_protocol = true;
+        self.h3.local_settings.enable_webtransport = true;
+        self.h3.local_settings.h3_datagram = true;
+        try self.h3.initConnection();
+        try injectPeerControlStream(&self.quic_conn, &self.h3, true);
+        self.wt = WebTransportConnection.init(testing.allocator, &self.h3, &self.quic_conn, true);
+
+        // Inject CONNECT request on client bidi stream 0
+        var req_buf: [512]u8 = undefined;
+        const req_len = buildConnectRequest(&req_buf, "/wt");
+        const stream = try self.quic_conn.streams.getOrCreateStream(0);
+        try stream.recv.handleStreamFrame(0, req_buf[0..req_len], false);
+
+        // Poll WT to get connect_request event
+        const ev = try self.wt.poll();
+        if (ev) |e| {
+            switch (e) {
+                .connect_request => {},
+                else => return error.UnexpectedEvent,
+            }
+        } else return error.ExpectedConnectRequest;
+
+        // Accept the session
+        try self.wt.acceptSession(0);
+        return 0;
+    }
+
+    fn initClient(self: *WtTestSetup) !u64 {
+        self.quic_conn = createTestQuicConn(false);
+        self.h3 = h3_conn.H3Connection.init(testing.allocator, &self.quic_conn, false);
+        self.h3.local_settings.enable_connect_protocol = true;
+        self.h3.local_settings.enable_webtransport = true;
+        self.h3.local_settings.h3_datagram = true;
+        try self.h3.initConnection();
+        try injectPeerControlStream(&self.quic_conn, &self.h3, false);
+        self.wt = WebTransportConnection.init(testing.allocator, &self.h3, &self.quic_conn, false);
+
+        // Client initiates connect
+        const session_id = try self.wt.connect("example.com", "/wt");
+
+        // Inject 200 response from server on the CONNECT stream
+        var resp_buf: [256]u8 = undefined;
+        const resp_len = buildConnectResponse(&resp_buf);
+        const stream = self.quic_conn.streams.getStream(session_id).?;
+        const offset = stream.recv.sorter.highestReceived();
+        try stream.recv.handleStreamFrame(offset, resp_buf[0..resp_len], false);
+
+        // Poll to get session_ready
+        const ev = try self.wt.poll();
+        if (ev) |e| {
+            switch (e) {
+                .session_ready => {},
+                else => return error.UnexpectedEvent,
+            }
+        } else return error.ExpectedSessionReady;
+
+        return session_id;
+    }
+
+    fn deinit(self: *WtTestSetup) void {
+        self.wt.deinit();
+        self.h3.deinit();
+        self.quic_conn.deinit();
+    }
+};
+
+// ---- Group A: Session management ----
+
+test "WT integration: connect initiates session" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, false);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, false);
+    defer wt.deinit();
+
+    const session_id = try wt.connect("example.com", "/wt");
+    // Session should be allocated in connecting state
+    const session = wt.getSession(session_id).?;
+    try testing.expectEqual(SessionState.connecting, session.state);
+    try testing.expectEqual(@as(u32, 1), wt.active_session_count);
+}
+
+test "WT integration: acceptSession activates session" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const session = setup.wt.getSession(session_id).?;
+    try testing.expectEqual(SessionState.active, session.state);
+    try testing.expectEqual(@as(u32, 1), setup.wt.active_session_count);
+}
+
+test "WT integration: session limit enforced" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, false);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, false);
+    defer wt.deinit();
+
+    // Peer advertised webtransport_max_sessions = 4
+    // Connect up to the limit
+    var i: u32 = 0;
+    while (i < 4) : (i += 1) {
+        _ = try wt.connect("example.com", "/wt");
+    }
+
+    // Next connect should fail
+    const result = wt.connect("example.com", "/wt");
+    try testing.expectError(error.TooManySessions, result);
+}
+
+test "WT integration: closeSession sends CLOSE frame and FIN" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    setup.wt.closeSession(session_id);
+
+    const session = setup.wt.getSession(session_id);
+    // Session should be in draining state or finalized
+    if (session) |s| {
+        try testing.expect(s.state == .draining or s.state == .closed);
+    }
+
+    // CONNECT stream should have FIN queued
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    try testing.expect(stream.send.fin_queued);
+    // Write buffer should contain CLOSE_WEBTRANSPORT_SESSION frame
+    try testing.expect(stream.send.write_buffer.items.len > 0);
+}
+
+// ---- Group B: Stream opening ----
+
+test "WT integration: openBidiStream writes type prefix" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id);
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+
+    // Write buffer should contain WT bidi prefix: 0x41 + session_id
+    try testing.expect(stream.send.write_buffer.items.len >= 2);
+    // Parse the prefix
+    var fbs = io.fixedBufferStream(stream.send.write_buffer.items);
+    const reader = fbs.reader();
+    const stream_type = packet.readVarInt(reader) catch unreachable;
+    try testing.expectEqual(WT_BIDI_STREAM_TYPE, stream_type);
+    const sid = packet.readVarInt(reader) catch unreachable;
+    try testing.expectEqual(session_id, sid);
+
+    // Should be tracked in wt_bidi_streams
+    try testing.expect(setup.wt.wt_bidi_streams.contains(stream_id));
+}
+
+test "WT integration: openUniStream writes type prefix" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openUniStream(session_id);
+    const send_stream = setup.quic_conn.streams.send_streams.get(stream_id).?;
+
+    // Write buffer should contain WT uni prefix: 0x54 + session_id
+    try testing.expect(send_stream.write_buffer.items.len >= 2);
+    var fbs = io.fixedBufferStream(send_stream.write_buffer.items);
+    const reader = fbs.reader();
+    const stream_type = packet.readVarInt(reader) catch unreachable;
+    try testing.expectEqual(WT_UNI_STREAM_TYPE, stream_type);
+    const sid = packet.readVarInt(reader) catch unreachable;
+    try testing.expectEqual(session_id, sid);
+
+    try testing.expect(setup.wt.wt_uni_streams.contains(stream_id));
+}
+
+test "WT integration: sendStreamData writes to bidi stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id);
+    try setup.wt.sendStreamData(stream_id, "Hello WT!");
+
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    // Write buffer should contain prefix + "Hello WT!"
+    const items = stream.send.write_buffer.items;
+    try testing.expect(items.len > 9);
+    // The payload should end with "Hello WT!"
+    try testing.expectEqualStrings("Hello WT!", items[items.len - 9 ..]);
+}
+
+test "WT integration: closeStream sends FIN" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id);
+    setup.wt.closeStream(stream_id);
+
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    try testing.expect(stream.send.fin_queued);
+}
+
+// ---- Group C: Incoming stream identification ----
+
+test "WT integration: identifies incoming WT bidi stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT bidi prefix on client-initiated bidi stream 4
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtBidiPrefix(&prefix_buf, session_id);
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .bidi_stream => |bs| {
+            try testing.expectEqual(session_id, bs.session_id);
+            try testing.expectEqual(@as(u64, 4), bs.stream_id);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    // Should be tracked and excluded from H3
+    try testing.expect(setup.wt.wt_bidi_streams.contains(4));
+    try testing.expect(setup.h3.excluded_bidi_streams.contains(4));
+}
+
+test "WT integration: identifies incoming WT uni stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT uni prefix on client-initiated uni stream
+    // Client uni streams for server: 2, 6, 10, ...
+    // Stream 2 is already used by peer control stream, 6 and 10 might be QPACK
+    // Use a higher one: 14
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .uni_stream => |us| {
+            try testing.expectEqual(session_id, us.session_id);
+            try testing.expectEqual(@as(u64, 14), us.stream_id);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    try testing.expect(setup.wt.wt_uni_streams.contains(14));
+}
+
+test "WT integration: bidi stream with trailing data buffers remainder" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT bidi prefix + "extra data" in one shot
+    var buf: [64]u8 = undefined;
+    const prefix_len = buildWtBidiPrefix(&buf, session_id);
+    const extra = "extra data";
+    @memcpy(buf[prefix_len..][0..extra.len], extra);
+    const total_len = prefix_len + extra.len;
+
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, buf[0..total_len], false);
+
+    // First poll: bidi_stream event
+    const ev1 = try setup.wt.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .bidi_stream => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    // Second poll: stream_data with the buffered remainder
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 4), sd.stream_id);
+            try testing.expectEqualStrings(extra, sd.data);
+            // Caller owns this data — free it
+            testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+// ---- Group D: Datagram handling ----
+
+test "WT integration: sendDatagram writes quarter_stream_id + payload" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    try setup.wt.sendDatagram(session_id, "dgram payload");
+
+    // Read from QUIC datagram send queue
+    var dgram_buf: [1200]u8 = undefined;
+    const dgram_len = setup.quic_conn.datagram_send_queue.pop(&dgram_buf).?;
+
+    // Parse quarter_stream_id
+    var fbs = io.fixedBufferStream(dgram_buf[0..dgram_len]);
+    const quarter_id = packet.readVarInt(fbs.reader()) catch unreachable;
+    try testing.expectEqual(session_id / 4, quarter_id);
+    // Rest is payload
+    try testing.expectEqualStrings("dgram payload", dgram_buf[fbs.pos..dgram_len]);
+}
+
+test "WT integration: poll receives datagram demuxed by session" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Manually push a datagram into the QUIC recv queue
+    const quarter_id = session_id / 4;
+    var dgram_buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&dgram_buf);
+    packet.writeVarInt(fbs.writer(), quarter_id) catch unreachable;
+    fbs.writer().writeAll("hello dgram") catch unreachable;
+    try testing.expect(setup.quic_conn.datagram_recv_queue.push(dgram_buf[0..fbs.pos]));
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .datagram => |dg| {
+            try testing.expectEqual(session_id, dg.session_id);
+            try testing.expectEqualStrings("hello dgram", dg.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+// ---- Group E: H3 event translation ----
+
+test "WT integration: server receives connect_request from H3" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, true);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, true);
+    defer wt.deinit();
+
+    // Inject CONNECT request
+    var req_buf: [512]u8 = undefined;
+    const req_len = buildConnectRequest(&req_buf, "/webtransport");
+    const stream = try quic_conn.streams.getOrCreateStream(0);
+    try stream.recv.handleStreamFrame(0, req_buf[0..req_len], false);
+
+    const ev = try wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .connect_request => |cr| {
+            try testing.expectEqual(@as(u64, 0), cr.session_id);
+            try testing.expectEqualStrings("webtransport", cr.protocol);
+            try testing.expectEqualStrings("/webtransport", cr.path);
+            try testing.expectEqualStrings("example.com", cr.authority);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: client receives session_ready on 200 response" {
+    var setup: WtTestSetup = undefined;
+    // initClient already does the full connect+200 flow and verifies session_ready
+    const session_id = try setup.initClient();
+    defer setup.deinit();
+
+    const session = setup.wt.getSession(session_id).?;
+    try testing.expectEqual(SessionState.active, session.state);
+}
+
+test "WT integration: client receives session_rejected on non-200" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, false);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, false);
+    defer wt.deinit();
+
+    const session_id = try wt.connect("example.com", "/wt");
+
+    // Inject 403 response
+    const resp_headers = [_]qpack.Header{
+        .{ .name = ":status", .value = "403" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&resp_headers, &qpack_buf) catch unreachable;
+    var frame_buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer()) catch unreachable;
+
+    const stream = quic_conn.streams.getStream(session_id).?;
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, fbs.getWritten(), false);
+
+    const ev = try wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .session_rejected => |rej| {
+            try testing.expectEqual(session_id, rej.session_id);
+            try testing.expectEqualStrings("403", rej.status);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+// ---- Group F: Session close ----
+
+test "WT integration: closeSessionWithError sends CLOSE frame" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Record write buffer length before close (response HEADERS already written)
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+
+    try setup.wt.closeSessionWithError(session_id, 42, "test error");
+
+    try testing.expect(stream.send.fin_queued);
+    // Parse the CLOSE frame from the portion written after acceptSession's response
+    const close_data = stream.send.write_buffer.items[pre_len..];
+    try testing.expect(close_data.len > 0);
+    const result = h3_frame.parse(close_data) catch unreachable;
+    switch (result.frame) {
+        .close_webtransport_session => |cls| {
+            try testing.expectEqual(@as(u32, 42), cls.error_code);
+            try testing.expectEqualStrings("test error", cls.reason);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: receiving CLOSE_WEBTRANSPORT_SESSION produces session_closed" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Build and inject CLOSE_WEBTRANSPORT_SESSION frame on the CONNECT stream
+    var frame_buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .close_webtransport_session = .{
+        .error_code = 7,
+        .reason = "goodbye",
+    } }, fbs.writer()) catch unreachable;
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, fbs.getWritten(), false);
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .session_closed => |sc| {
+            try testing.expectEqual(session_id, sc.session_id);
+            try testing.expectEqual(@as(u32, 7), sc.error_code);
+            try testing.expectEqualStrings("goodbye", sc.reason);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: peer FIN without CLOSE produces session_closed with code 0" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Send FIN on the CONNECT stream (no CLOSE frame)
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, "", true);
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .session_closed => |sc| {
+            try testing.expectEqual(session_id, sc.session_id);
+            try testing.expectEqual(@as(u32, 0), sc.error_code);
+            try testing.expectEqualStrings("", sc.reason);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: session cleanup resets associated streams" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Open a bidi stream belonging to this session
+    const wt_stream_id = try setup.wt.openBidiStream(session_id);
+    try testing.expect(setup.wt.wt_bidi_streams.contains(wt_stream_id));
+
+    // Close the session — should clean up associated streams
+    setup.wt.closeSession(session_id);
+
+    // The WT bidi stream should be removed from tracking
+    try testing.expect(!setup.wt.wt_bidi_streams.contains(wt_stream_id));
+}
+
+// ---- Group G: Stream data ----
+
+test "WT integration: poll returns stream_data on known bidi stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT bidi prefix on client-initiated bidi stream 4
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtBidiPrefix(&prefix_buf, session_id);
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    // Poll to identify the stream
+    const ev1 = try setup.wt.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .bidi_stream => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    // Now inject more data on the same stream
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, "stream payload", false);
+
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 4), sd.stream_id);
+            try testing.expectEqualStrings("stream payload", sd.data);
+            // Caller owns data from FrameSorter — free it
+            testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: poll returns stream_data on known uni stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT uni prefix on client uni stream 14
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    // Poll to identify
+    const ev1 = try setup.wt.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .uni_stream => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    // Inject more data
+    const offset = rs.sorter.highestReceived();
+    try rs.handleStreamFrame(offset, "uni payload", false);
+
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 14), sd.stream_id);
+            try testing.expectEqualStrings("uni payload", sd.data);
+            testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: sendStreamData on uni stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openUniStream(session_id);
+    try setup.wt.sendStreamData(stream_id, "uni data");
+
+    const send_stream = setup.quic_conn.streams.send_streams.get(stream_id).?;
+    const items = send_stream.write_buffer.items;
+    // Should end with "uni data"
+    try testing.expectEqualStrings("uni data", items[items.len - 8 ..]);
 }

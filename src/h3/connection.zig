@@ -553,8 +553,9 @@ pub const H3Connection = struct {
             if (self.peer_qpack_enc_stream_id != null and self.peer_qpack_enc_stream_id.? == stream_id) continue;
             if (self.peer_qpack_dec_stream_id != null and self.peer_qpack_dec_stream_id.? == stream_id) continue;
 
-            // Try to read type byte
+            // Try to read type byte (read() transfers ownership of heap-allocated data)
             const data = recv_stream.read() orelse continue;
+            defer self.allocator.free(data);
             if (data.len == 0) continue;
 
             var fbs = io.fixedBufferStream(data);
@@ -604,9 +605,10 @@ pub const H3Connection = struct {
     fn pollControlStream(self: *H3Connection) !?H3Event {
         const ctrl_id = self.peer_control_stream_id orelse return null;
 
-        // Read more data from control stream
+        // Read more data from control stream (read() transfers ownership)
         if (self.quic_conn.streams.recv_streams.get(ctrl_id)) |recv_stream| {
             if (recv_stream.read()) |data| {
+                defer self.allocator.free(data);
                 var buf = self.stream_bufs.getPtr(ctrl_id) orelse blk: {
                     const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
                     try self.stream_bufs.put(ctrl_id, new_buf);
@@ -821,8 +823,9 @@ pub const H3Connection = struct {
                 }
             }
 
-            // Read incoming data
+            // Read incoming data (read() transfers ownership of heap-allocated data)
             if (stream.recv.read()) |data| {
+                defer self.allocator.free(data);
                 // Buffer new data
                 var new_buf_ptr = self.stream_bufs.getPtr(stream_id) orelse blk: {
                     const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
@@ -831,10 +834,13 @@ pub const H3Connection = struct {
                 };
                 try new_buf_ptr.appendSlice(self.allocator, data);
             } else {
-                // Check if stream is finished
+                // Check if stream is finished — but only if no buffered H3 data remains
                 if (stream.recv.finished) {
-                    try self.finished_streams.put(stream_id, {});
-                    return .{ .finished = stream_id };
+                    const has_buffered = if (self.stream_bufs.getPtr(stream_id)) |b| b.items.len > 0 else false;
+                    if (!has_buffered) {
+                        try self.finished_streams.put(stream_id, {});
+                        return .{ .finished = stream_id };
+                    }
                 }
             }
 
@@ -998,6 +1004,7 @@ pub const H3Connection = struct {
         if (self.peer_qpack_enc_stream_id) |enc_id| {
             if (self.quic_conn.streams.recv_streams.get(enc_id)) |recv_stream| {
                 if (recv_stream.read()) |data| {
+                    defer self.allocator.free(data);
                     if (data.len > 0) {
                         self.qpack_decoder.processEncoderInstruction(data) catch {
                             self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
@@ -1012,6 +1019,7 @@ pub const H3Connection = struct {
         if (self.peer_qpack_dec_stream_id) |dec_id| {
             if (self.quic_conn.streams.recv_streams.get(dec_id)) |recv_stream| {
                 if (recv_stream.read()) |data| {
+                    defer self.allocator.free(data);
                     if (data.len > 0) {
                         self.qpack_encoder.processDecoderInstruction(data) catch {
                             self.closeWithError(.general_protocol_error, "QPACK decoder stream error");
@@ -1387,4 +1395,823 @@ test "H3 frame error: malformed GOAWAY varint" {
     buf[fbs.pos] = 0xC0; // 8-byte varint prefix but only 1 byte available
     const result = h3_frame.parse(buf[0 .. fbs.pos + 1]);
     try testing.expectError(error.MalformedGoaway, result);
+}
+
+// =============================================================================
+// H3Connection integration tests via stream-level injection
+// =============================================================================
+
+const ack_handler = @import("../quic/ack_handler.zig");
+const flow_control = @import("../quic/flow_control.zig");
+const crypto_stream = @import("../quic/crypto_stream.zig");
+const packet_packer = @import("../quic/packet_packer.zig");
+const protocol = @import("../quic/protocol.zig");
+
+// Create a minimal QUIC Connection suitable for H3 tests.
+// The `is_server` flag determines stream ID assignment (server bidi starts at 1, client at 0).
+fn createTestQuicConn(is_server: bool) quic_connection.Connection {
+    const dcid = "testdcid" ++ ([_]u8{0} ** 12);
+    const scid = "testscid" ++ ([_]u8{0} ** 12);
+
+    var conn = quic_connection.Connection{
+        .allocator = testing.allocator,
+        .is_server = is_server,
+        .dcid = dcid.*,
+        .dcid_len = 8,
+        .scid = scid.*,
+        .scid_len = 8,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .pkt_handler = ack_handler.PacketHandler.init(testing.allocator),
+        .conn_flow_ctrl = flow_control.ConnectionFlowController.init(1048576, 6 * 1024 * 1024),
+        .streams = stream_mod.StreamsMap.init(testing.allocator, is_server),
+        .crypto_streams = crypto_stream.CryptoStreamManager.init(testing.allocator),
+        .packer = packet_packer.PacketPacker.init(
+            testing.allocator,
+            is_server,
+            dcid[0..8],
+            scid[0..8],
+            protocol.SUPPORTED_VERSIONS[0],
+        ),
+    };
+    // Allow enough streams for H3 control + QPACK + bidi requests
+    conn.streams.setMaxStreams(100, 100);
+    conn.streams.setMaxIncomingStreams(100, 100);
+    // Set send windows so opened streams can write
+    conn.streams.peer_initial_max_stream_data_bidi_local = 1048576;
+    conn.streams.peer_initial_max_stream_data_bidi_remote = 1048576;
+    conn.streams.peer_initial_max_stream_data_uni = 1048576;
+    conn.conn_flow_ctrl.base.send_window = 1048576;
+    return conn;
+}
+
+// Inject H3-encoded bytes into a peer-initiated uni receive stream.
+// For a server: peer (client) uni streams are 2, 6, 10, ...
+// For a client: peer (server) uni streams are 3, 7, 11, ...
+fn injectUniStreamData(quic_conn: *quic_connection.Connection, stream_id: u64, data: []const u8, fin: bool) !void {
+    const rs = try quic_conn.streams.getOrCreateRecvStream(stream_id);
+    try rs.handleStreamFrame(0, data, fin);
+}
+
+// Inject data into a bidi stream's receive side.
+// For a server, client-initiated bidi streams are 0, 4, 8, ...
+fn injectBidiStreamData(quic_conn: *quic_connection.Connection, stream_id: u64, data: []const u8, fin: bool) !void {
+    const stream = try quic_conn.streams.getOrCreateStream(stream_id);
+    try stream.recv.handleStreamFrame(0, data, fin);
+}
+
+// Build a SETTINGS frame with default (empty) settings: type=0x04, length=0x00
+fn buildSettingsFrame(buf: []u8) usize {
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .settings = .{} }, fbs.writer()) catch unreachable;
+    return fbs.pos;
+}
+
+// Build a control stream type byte + SETTINGS frame
+fn buildControlStreamPayload(buf: []u8) usize {
+    var fbs = io.fixedBufferStream(buf);
+    // Stream type: control = 0x00
+    h3_frame.writeUniStreamType(fbs.writer(), .control) catch unreachable;
+    // Empty SETTINGS frame
+    h3_frame.write(.{ .settings = .{} }, fbs.writer()) catch unreachable;
+    return fbs.pos;
+}
+
+// Inject a peer control stream with SETTINGS, poll once to consume the settings event.
+fn injectPeerControlStream(quic_conn: *quic_connection.Connection, h3: *H3Connection) !void {
+    // Peer uni stream IDs: for server, peer (client) uni = 2,6,10,...
+    // For client, peer (server) uni = 3,7,11,...
+    const peer_uni_id: u64 = if (h3.is_server) 2 else 3;
+    var buf: [64]u8 = undefined;
+    const len = buildControlStreamPayload(&buf);
+    try injectUniStreamData(quic_conn, peer_uni_id, buf[0..len], false);
+
+    // Poll to consume SETTINGS event
+    const ev = try h3.poll();
+    if (ev) |e| {
+        switch (e) {
+            .settings => {}, // expected
+            else => return error.UnexpectedEvent,
+        }
+    } else {
+        return error.ExpectedSettingsEvent;
+    }
+}
+
+// Encode a minimal GET request as QPACK + HEADERS frame
+fn buildGetRequestFrame(buf: []u8) usize {
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&headers, &qpack_buf) catch unreachable;
+
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer()) catch unreachable;
+    return fbs.pos;
+}
+
+// Build a DATA frame with given payload
+fn buildDataFrame(buf: []u8, payload: []const u8) usize {
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .data = payload }, fbs.writer()) catch unreachable;
+    return fbs.pos;
+}
+
+// ---- Group A: initConnection tests ----
+
+test "H3 integration: initConnection opens control + QPACK streams" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try h3.initConnection();
+
+    // Control stream should be opened
+    try testing.expect(h3.local_control_stream != null);
+    const ctrl = h3.local_control_stream.?;
+    // Write buffer should contain type byte (0x00) + SETTINGS frame
+    try testing.expect(ctrl.write_buffer.items.len > 0);
+    // First byte should be the control stream type (0x00)
+    try testing.expectEqual(@as(u8, 0x00), ctrl.write_buffer.items[0]);
+
+    // QPACK encoder stream should be opened with type byte 0x02
+    try testing.expect(h3.local_qpack_enc_stream != null);
+    try testing.expect(h3.local_qpack_enc_stream.?.write_buffer.items.len > 0);
+    try testing.expectEqual(@as(u8, 0x02), h3.local_qpack_enc_stream.?.write_buffer.items[0]);
+
+    // QPACK decoder stream should be opened with type byte 0x03
+    try testing.expect(h3.local_qpack_dec_stream != null);
+    try testing.expect(h3.local_qpack_dec_stream.?.write_buffer.items.len > 0);
+    try testing.expectEqual(@as(u8, 0x03), h3.local_qpack_dec_stream.?.write_buffer.items[0]);
+}
+
+test "H3 integration: initConnection sets initialized flag" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try testing.expect(!h3.initialized);
+    try h3.initConnection();
+    try testing.expect(h3.initialized);
+}
+
+test "H3 integration: initConnection is idempotent" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try h3.initConnection();
+    const ctrl_ptr = h3.local_control_stream;
+    const enc_ptr = h3.local_qpack_enc_stream;
+    const dec_ptr = h3.local_qpack_dec_stream;
+
+    // Second call should be a no-op
+    try h3.initConnection();
+    try testing.expectEqual(ctrl_ptr, h3.local_control_stream);
+    try testing.expectEqual(enc_ptr, h3.local_qpack_enc_stream);
+    try testing.expectEqual(dec_ptr, h3.local_qpack_dec_stream);
+}
+
+// ---- Group B: Peer uni stream identification ----
+
+test "H3 integration: poll identifies peer control stream and returns settings" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    // Inject peer control stream (client uni stream id=2 for server)
+    var buf: [64]u8 = undefined;
+    const len = buildControlStreamPayload(&buf);
+    try injectUniStreamData(&quic_conn, 2, buf[0..len], false);
+
+    const ev = try h3.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .settings => {},
+        else => return error.UnexpectedEvent,
+    }
+    try testing.expect(h3.peer_control_stream_id != null);
+    try testing.expectEqual(@as(u64, 2), h3.peer_control_stream_id.?);
+    try testing.expect(h3.peer_settings_received);
+}
+
+test "H3 integration: poll identifies QPACK encoder + decoder streams" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    // Inject QPACK encoder stream (type 0x02) on client uni stream id=6
+    try injectUniStreamData(&quic_conn, 6, &[_]u8{0x02}, false);
+    // Inject QPACK decoder stream (type 0x03) on client uni stream id=10
+    try injectUniStreamData(&quic_conn, 10, &[_]u8{0x03}, false);
+
+    // Poll to identify them
+    _ = try h3.poll();
+
+    try testing.expect(h3.peer_qpack_enc_stream_id != null);
+    try testing.expectEqual(@as(u64, 6), h3.peer_qpack_enc_stream_id.?);
+    try testing.expect(h3.peer_qpack_dec_stream_id != null);
+    try testing.expectEqual(@as(u64, 10), h3.peer_qpack_dec_stream_id.?);
+}
+
+// ---- Group C: Control stream tests ----
+
+test "H3 integration: GOAWAY on control stream" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Now inject GOAWAY(4) on the control stream
+    var goaway_buf: [32]u8 = undefined;
+    var goaway_fbs = io.fixedBufferStream(&goaway_buf);
+    h3_frame.write(.{ .goaway = 4 }, goaway_fbs.writer()) catch unreachable;
+    const goaway_data = goaway_fbs.getWritten();
+
+    // Append to the control recv stream at next offset
+    const ctrl_rs = quic_conn.streams.recv_streams.get(2).?;
+    const offset = ctrl_rs.sorter.highestReceived();
+    try ctrl_rs.handleStreamFrame(offset, goaway_data, false);
+
+    const ev = try h3.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .goaway => |id| try testing.expectEqual(@as(u64, 4), id),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "H3 integration: DATA on control stream returns H3FrameUnexpected" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject DATA frame on control stream
+    var data_buf: [32]u8 = undefined;
+    var data_fbs = io.fixedBufferStream(&data_buf);
+    h3_frame.write(.{ .data = "hello" }, data_fbs.writer()) catch unreachable;
+    const data_payload = data_fbs.getWritten();
+
+    const ctrl_rs = quic_conn.streams.recv_streams.get(2).?;
+    const offset = ctrl_rs.sorter.highestReceived();
+    try ctrl_rs.handleStreamFrame(offset, data_payload, false);
+
+    const result = h3.poll();
+    try testing.expectError(error.H3FrameUnexpected, result);
+}
+
+test "H3 integration: duplicate SETTINGS returns H3FrameUnexpected" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject another SETTINGS frame on control stream
+    var settings_buf: [32]u8 = undefined;
+    const settings_len = buildSettingsFrame(&settings_buf);
+
+    const ctrl_rs = quic_conn.streams.recv_streams.get(2).?;
+    const offset = ctrl_rs.sorter.highestReceived();
+    try ctrl_rs.handleStreamFrame(offset, settings_buf[0..settings_len], false);
+
+    const result = h3.poll();
+    try testing.expectError(error.H3FrameUnexpected, result);
+}
+
+test "H3 integration: GOAWAY before SETTINGS returns H3MissingSettings" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    // Inject control stream type byte + GOAWAY (no SETTINGS first)
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    h3_frame.writeUniStreamType(fbs.writer(), .control) catch unreachable;
+    h3_frame.write(.{ .goaway = 0 }, fbs.writer()) catch unreachable;
+    try injectUniStreamData(&quic_conn, 2, fbs.getWritten(), false);
+
+    // First poll identifies control stream, buffers GOAWAY, then pollControlStream
+    // finds GOAWAY before SETTINGS → H3MissingSettings error
+    const result = h3.poll();
+    try testing.expectError(error.H3MissingSettings, result);
+}
+
+// ---- Group D: Request/response lifecycle ----
+
+test "H3 integration: server receives HEADERS event" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject GET request on client bidi stream 0
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+    try injectBidiStreamData(&quic_conn, 0, req_buf[0..req_len], false);
+
+    const ev = try h3.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .headers => |h| {
+            try testing.expectEqual(@as(u64, 0), h.stream_id);
+            // Should have at least :method, :scheme, :path, :authority
+            try testing.expect(h.headers.len >= 4);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "H3 integration: server receives DATA and recvBody reads it" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject HEADERS + DATA on client bidi stream 0
+    var frame_buf: [512]u8 = undefined;
+    var pos: usize = 0;
+
+    // Build HEADERS frame
+    const hdr_len = buildGetRequestFrame(frame_buf[pos..]);
+    pos += hdr_len;
+
+    // Build DATA frame with "Hello, World!"
+    const body = "Hello, World!";
+    const data_len = buildDataFrame(frame_buf[pos..], body);
+    pos += data_len;
+
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..pos], false);
+
+    // First poll: headers event
+    const ev1 = try h3.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .headers => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    // Second poll: data event
+    const ev2 = try h3.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .data => |d| {
+            try testing.expectEqual(@as(u64, 0), d.stream_id);
+            try testing.expectEqual(body.len, d.len);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    // Read body
+    var read_buf: [64]u8 = undefined;
+    const n = h3.recvBody(&read_buf);
+    try testing.expectEqual(body.len, n);
+    try testing.expectEqualStrings(body, read_buf[0..n]);
+}
+
+test "H3 integration: recvBody partial reads" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // 100-byte payload
+    var payload: [100]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast(i % 256);
+
+    var frame_buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    const hdr_len = buildGetRequestFrame(frame_buf[pos..]);
+    pos += hdr_len;
+    const data_len = buildDataFrame(frame_buf[pos..], &payload);
+    pos += data_len;
+
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..pos], false);
+
+    // Poll headers
+    _ = try h3.poll();
+    // Poll data
+    const ev = try h3.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .data => |d| try testing.expectEqual(@as(usize, 100), d.len),
+        else => return error.UnexpectedEvent,
+    }
+
+    // Read in 30-byte chunks
+    var total_read: usize = 0;
+    var result_buf: [100]u8 = undefined;
+    while (total_read < 100) {
+        var chunk: [30]u8 = undefined;
+        const n = h3.recvBody(&chunk);
+        if (n == 0) break;
+        @memcpy(result_buf[total_read..][0..n], chunk[0..n]);
+        total_read += n;
+    }
+    try testing.expectEqual(@as(usize, 100), total_read);
+    try testing.expectEqualSlices(u8, &payload, &result_buf);
+}
+
+test "H3 integration: recvBody returns 0 with no pending body" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    var buf: [64]u8 = undefined;
+    const n = h3.recvBody(&buf);
+    try testing.expectEqual(@as(usize, 0), n);
+}
+
+test "H3 integration: poll blocks while body pending" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var frame_buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    const hdr_len = buildGetRequestFrame(frame_buf[pos..]);
+    pos += hdr_len;
+    const data_len = buildDataFrame(frame_buf[pos..], "test body data");
+    pos += data_len;
+
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..pos], false);
+
+    // Poll headers
+    _ = try h3.poll();
+    // Poll data event
+    _ = try h3.poll();
+
+    // Body is pending — next poll should return null
+    const ev = try h3.poll();
+    try testing.expect(ev == null);
+
+    // Drain the body
+    var drain_buf: [64]u8 = undefined;
+    _ = h3.recvBody(&drain_buf);
+
+    // Now poll should be able to proceed (no more frames → null)
+    const ev2 = try h3.poll();
+    // Might get a finished event or null; either is fine
+    _ = ev2;
+}
+
+test "H3 integration: stream FIN produces finished event" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject HEADERS with fin=true on bidi stream 0
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+    try injectBidiStreamData(&quic_conn, 0, req_buf[0..req_len], true);
+
+    // First poll: headers
+    const ev1 = try h3.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .headers => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    // Next poll: finished
+    const ev2 = try h3.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .finished => |sid| try testing.expectEqual(@as(u64, 0), sid),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "H3 integration: sendRequest writes HEADERS + DATA" {
+    var quic_conn = createTestQuicConn(false); // client
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    try h3.initConnection();
+
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+
+    const stream_id = try h3.sendRequest(&headers, "request body");
+    try testing.expectEqual(@as(u64, 0), stream_id);
+
+    // Verify the stream's write buffer has content
+    const stream = quic_conn.streams.getStream(stream_id).?;
+    try testing.expect(stream.send.write_buffer.items.len > 0);
+    // Stream should have FIN queued (sendRequest closes the stream)
+    try testing.expect(stream.send.fin_queued);
+}
+
+test "H3 integration: sendResponse writes HEADERS + DATA + FIN" {
+    var quic_conn = createTestQuicConn(true); // server
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Create the client bidi stream (id=0) that the server responds on
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+    try injectBidiStreamData(&quic_conn, 0, req_buf[0..req_len], true);
+
+    // Poll to get headers event (this creates the stream in H3)
+    _ = try h3.poll();
+
+    const resp_headers = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+    };
+
+    try h3.sendResponse(0, &resp_headers, "Hello!");
+
+    // Verify stream write buffer has data and FIN queued
+    const stream = quic_conn.streams.getStream(0).?;
+    try testing.expect(stream.send.write_buffer.items.len > 0);
+    try testing.expect(stream.send.fin_queued);
+}
+
+// ---- Group E: Extended CONNECT ----
+
+test "H3 integration: CONNECT request produces connect_request event" {
+    var quic_conn = createTestQuicConn(true); // server
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Build Extended CONNECT HEADERS frame
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/wt" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&headers, &qpack_buf) catch unreachable;
+
+    var frame_buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer()) catch unreachable;
+
+    try injectBidiStreamData(&quic_conn, 0, fbs.getWritten(), false);
+
+    const ev = try h3.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .connect_request => |cr| {
+            try testing.expectEqual(@as(u64, 0), cr.stream_id);
+            try testing.expectEqualStrings("webtransport", cr.protocol);
+            try testing.expectEqualStrings("/wt", cr.path);
+            try testing.expectEqualStrings("example.com", cr.authority);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "H3 integration: sendConnectResponse writes headers without FIN" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Create the bidi stream first by injecting a CONNECT request
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&headers, &qpack_buf) catch unreachable;
+
+    var frame_buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer()) catch unreachable;
+    try injectBidiStreamData(&quic_conn, 0, fbs.getWritten(), false);
+
+    _ = try h3.poll(); // consume connect_request event
+
+    try h3.sendConnectResponse(0, "200");
+
+    const stream = quic_conn.streams.getStream(0).?;
+    try testing.expect(stream.send.write_buffer.items.len > 0);
+    // Extended CONNECT response must NOT close the stream
+    try testing.expect(!stream.send.fin_queued);
+}
+
+// ---- Group F: Error handling ----
+
+test "H3 integration: invalid headers (missing :path) resets stream" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Build malformed request (missing :path)
+    const bad_headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        // no :path!
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&bad_headers, &qpack_buf) catch unreachable;
+
+    var frame_buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer()) catch unreachable;
+
+    try injectBidiStreamData(&quic_conn, 0, fbs.getWritten(), false);
+
+    // Poll should skip the malformed request (no headers event)
+    const ev = try h3.poll();
+    // Should return null (invalid headers cause stream reset, not connection error)
+    try testing.expect(ev == null);
+
+    // The stream should have been reset
+    const stream = quic_conn.streams.getStream(0).?;
+    try testing.expect(stream.send.reset_err != null);
+    try testing.expectEqual(@intFromEnum(H3Error.message_error), stream.send.reset_err.?);
+}
+
+test "H3 integration: SETTINGS on bidi stream returns H3FrameUnexpected" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject SETTINGS frame on bidi stream 0 (wrong stream type for control frames)
+    var settings_buf: [32]u8 = undefined;
+    const settings_len = buildSettingsFrame(&settings_buf);
+    try injectBidiStreamData(&quic_conn, 0, settings_buf[0..settings_len], false);
+
+    const result = h3.poll();
+    try testing.expectError(error.H3FrameUnexpected, result);
+}
+
+test "H3 integration: critical stream closure returns H3ClosedCriticalStream" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    // Inject peer control stream
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Simulate peer resetting the control stream
+    const ctrl_rs = quic_conn.streams.recv_streams.get(2).?;
+    ctrl_rs.reset_err = @intFromEnum(H3Error.no_error);
+
+    const result = h3.poll();
+    try testing.expectError(error.H3ClosedCriticalStream, result);
+}
+
+test "H3 integration: HTTP/2 frame type on bidi stream returns H3FrameUnexpected" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject reserved HTTP/2 PRIORITY frame type (0x02) on bidi stream
+    var buf: [4]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    packet.writeVarInt(fbs.writer(), 0x02) catch unreachable; // HTTP/2 PRIORITY type
+    packet.writeVarInt(fbs.writer(), 0) catch unreachable; // length 0
+    try injectBidiStreamData(&quic_conn, 0, fbs.getWritten(), false);
+
+    const result = h3.poll();
+    try testing.expectError(error.H3FrameUnexpected, result);
+}
+
+// ---- Group G: Multiple frames / streams ----
+
+test "H3 integration: HEADERS + DATA in one injection" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Build both HEADERS and DATA frames together
+    var frame_buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    const hdr_len = buildGetRequestFrame(frame_buf[pos..]);
+    pos += hdr_len;
+    const data_len = buildDataFrame(frame_buf[pos..], "combined payload");
+    pos += data_len;
+
+    // Inject both at once
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..pos], false);
+
+    // First poll should return headers
+    const ev1 = try h3.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .headers => |h| try testing.expectEqual(@as(u64, 0), h.stream_id),
+        else => return error.UnexpectedEvent,
+    }
+
+    // Second poll should return data
+    const ev2 = try h3.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .data => |d| {
+            try testing.expectEqual(@as(u64, 0), d.stream_id);
+            try testing.expectEqual(@as(usize, 16), d.len); // "combined payload".len
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    // Drain body
+    var body_buf: [32]u8 = undefined;
+    const n = h3.recvBody(&body_buf);
+    try testing.expectEqualStrings("combined payload", body_buf[0..n]);
+}
+
+test "H3 integration: multiple concurrent streams" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject requests on streams 0, 4, 8
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+
+    try injectBidiStreamData(&quic_conn, 0, req_buf[0..req_len], true);
+
+    // Stream 4: need a fresh injection at offset 0
+    const stream4 = try quic_conn.streams.getOrCreateStream(4);
+    try stream4.recv.handleStreamFrame(0, req_buf[0..req_len], true);
+
+    // Stream 8
+    const stream8 = try quic_conn.streams.getOrCreateStream(8);
+    try stream8.recv.handleStreamFrame(0, req_buf[0..req_len], true);
+
+    // Poll should return headers for each stream (order may vary by hash map iteration)
+    var seen_streams = [_]bool{ false, false, false };
+    var polls: usize = 0;
+    while (polls < 10) : (polls += 1) {
+        const ev = try h3.poll();
+        if (ev == null) break;
+        switch (ev.?) {
+            .headers => |h| {
+                if (h.stream_id == 0) seen_streams[0] = true;
+                if (h.stream_id == 4) seen_streams[1] = true;
+                if (h.stream_id == 8) seen_streams[2] = true;
+            },
+            .finished => {}, // fin=true on inject → finished events expected
+            else => {},
+        }
+    }
+    try testing.expect(seen_streams[0]);
+    try testing.expect(seen_streams[1]);
+    try testing.expect(seen_streams[2]);
 }
