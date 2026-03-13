@@ -389,11 +389,24 @@ pub const PacketPacker = struct {
                 ack_eliciting = true;
             }
 
-            // 4. Pending control frames (only in 1-RTT, skip when ack_only)
-            if (level == .application and !ack_only) {
-                while (pending_frames.pop()) |pcf| {
-                    try pcf.write(writer);
-                    ack_eliciting = true;
+            // 4. Pending control frames (only in 1-RTT)
+            // PATH_CHALLENGE/PATH_RESPONSE are always sent (path probing is exempt from CC).
+            // Other control frames are skipped when ack_only (congestion-limited).
+            if (level == .application) {
+                var remaining = pending_frames.len;
+                while (remaining > 0) : (remaining -= 1) {
+                    const pcf = pending_frames.pop() orelse break;
+                    const is_path_probing = switch (pcf) {
+                        .path_challenge, .path_response => true,
+                        else => false,
+                    };
+                    if (is_path_probing or !ack_only) {
+                        try pcf.write(writer);
+                        ack_eliciting = true;
+                    } else {
+                        // Re-queue non-probing frames when congestion-limited
+                        pending_frames.push(pcf);
+                    }
                 }
             }
         }

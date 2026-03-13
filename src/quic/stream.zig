@@ -393,6 +393,23 @@ pub const SendStream = struct {
                 .fin = fin,
             };
             self.retransmit_count += 1;
+        } else {
+            // Queue overflow: fall back to resending from the earliest lost offset.
+            // Find minimum offset across all queued ranges and the new range,
+            // then reset send_offset so the packer resends everything from there.
+            // The receiver's FrameSorter deduplicates any already-received data.
+            var min_offset = offset;
+            var has_fin = fin;
+            for (self.retransmit_ranges[0..self.retransmit_count]) |r| {
+                min_offset = @min(min_offset, r.offset);
+                if (r.fin) has_fin = true;
+            }
+            self.send_offset = @min(self.send_offset, min_offset);
+            self.retransmit_count = 0;
+            if (has_fin) {
+                self.fin_lost = true;
+                self.fin_sent = false;
+            }
         }
     }
 
@@ -1444,6 +1461,37 @@ test "SendStream: partial retransmit due to max_len" {
     try testing.expectEqualSlices(u8, "world", frame2.?.stream.data);
 
     try testing.expect(!ss.hasData());
+}
+
+// Retransmit queue overflow: when MAX_RETRANSMIT_RANGES is exceeded,
+// send_offset is lowered to cover all lost data (no silent data loss).
+test "SendStream: retransmit queue overflow falls back to send_offset" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    // Write enough data to cover all ranges
+    const data = "x" ** 2048;
+    try ss.writeData(data);
+    // Simulate having sent all data
+    ss.send_offset = 2048;
+
+    // Fill the retransmit queue with non-adjacent ranges (simulating random
+    // hash-map iteration order during mass loss detection)
+    var i: u8 = 0;
+    while (i < MAX_RETRANSMIT_RANGES) : (i += 1) {
+        // Non-adjacent: offset 0, 100, 200, ... with length 50 each (gaps of 50)
+        ss.queueRetransmit(@as(u64, i) * 100, 50, false);
+    }
+    try testing.expectEqual(@as(u8, MAX_RETRANSMIT_RANGES), ss.retransmit_count);
+    try testing.expectEqual(@as(u64, 2048), ss.send_offset);
+
+    // Queue one more — should trigger overflow fallback
+    ss.queueRetransmit(1700, 50, false);
+
+    // After overflow: retransmit queue is cleared, send_offset lowered to earliest
+    try testing.expectEqual(@as(u8, 0), ss.retransmit_count);
+    try testing.expectEqual(@as(u64, 0), ss.send_offset); // min of all range offsets
+    try testing.expect(ss.hasData()); // still has data to send
 }
 
 // RFC 9218 priority scheduling tests

@@ -3035,6 +3035,25 @@ pub const Connection = struct {
         return if (self.ecn_validator.shouldMark()) ECN_ECT0 else ECN_NOT_ECT;
     }
 
+    /// Initiate a client-side connection migration (RFC 9000 Section 9).
+    /// Consumes a fresh DCID from the peer CID pool and queues PATH_CHALLENGE.
+    /// The caller is responsible for actually sending from a new local address.
+    /// Returns true if migration was initiated, false if no unused CID is available.
+    pub fn initiateClientMigration(self: *Connection) bool {
+        const entry = self.peer_cid_pool.consumeUnused() orelse return false;
+        const new_cid = entry.getCid();
+
+        // Update DCID in packer (affects outgoing packet headers)
+        self.packer.updateDcid(new_cid);
+
+        // Keep self.dcid in sync
+        self.dcid_len = @intCast(new_cid.len);
+        @memcpy(self.dcid[0..new_cid.len], new_cid);
+
+        std.log.info("client migration: switched to new DCID seq={d}", .{entry.seq_num});
+        return true;
+    }
+
     /// Return the peer address on the active path.
     /// This may change after connection migration or preferred address selection.
     pub fn peerAddress(self: *const Connection) *const posix.sockaddr.storage {
