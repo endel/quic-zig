@@ -13,9 +13,14 @@ RUN ZIG_ARCH=$(case "$TARGETARCH" in arm64) echo "aarch64";; *) echo "x86_64";; 
 WORKDIR /src
 COPY . .
 
-# Build interop binaries via zig build (needed for libxev dependency)
-# Use --network=host so BuildKit can resolve DNS for dependency fetching
-RUN --network=host zig build -Doptimize=ReleaseSafe
+# Pre-fetch libxev dependency (curl works with Docker DNS; zig fetch sometimes doesn't)
+RUN mkdir -p /root/.cache/zig && \
+    curl -L -o /tmp/libxev.tar.gz https://github.com/mitchellh/libxev/archive/d398cba9bf711fa4dd21c48bf73d25e4d8986408.tar.gz && \
+    zig fetch --global-cache-dir /root/.cache/zig /tmp/libxev.tar.gz && \
+    rm /tmp/libxev.tar.gz
+
+# Build interop binaries
+RUN zig build -Doptimize=ReleaseSafe --global-cache-dir /root/.cache/zig
 
 # Stage 2: Runtime image based on quic-network-simulator endpoint
 FROM martenseemann/quic-network-simulator-endpoint:latest
