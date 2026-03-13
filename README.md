@@ -1,13 +1,21 @@
 ![quic-zig](./quic-zig.svg)
 
-A _work-in-progress_ QUIC implementation, written in Zig.
+A QUIC / H3 / WebTransport implementation in pure Zig.
 
-> This is experimental. Do not use in production.
+> **Current state:** 🚨 Not stable. APIs may change at any time.
 
 ---
 
 Check out my [GitHub Sponsors](https://github.com/sponsors/endel) for motivation
 and goals of this project!
+
+## Features
+
+- **QUIC v1** (RFC 9000) — handshake, streams, flow control, connection migration, PMTUD
+- **TLS 1.3** (RFC 8446 / RFC 9001) — ECDSA P-256 + RSA PSS, X25519, session resumption, 0-RTT
+- **Loss Detection & Congestion Control** (RFC 9002) — NewReno, PTO, token bucket pacer
+- **HTTP/3** (RFC 9114) — QPACK static table, request/response, SETTINGS
+- **WebTransport** (draft-ietf-webtrans-http3) — bidi/uni streams, datagrams, Extended CONNECT
 
 ## The Story
 
@@ -44,13 +52,6 @@ official [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runn
 Is AI-assisted code "slop"? Only until it's battle-tested. That's the challenge
 -- and I'm hoping we can get there.
 
-## Features
-
-- **QUIC v1** (RFC 9000) — handshake, streams, flow control, connection migration, PMTUD
-- **TLS 1.3** (RFC 8446 / RFC 9001) — ECDSA P-256 + RSA PSS, X25519, session resumption, 0-RTT
-- **Loss Detection & Congestion Control** (RFC 9002) — NewReno, PTO, token bucket pacer
-- **HTTP/3** (RFC 9114) — QPACK static table, request/response, SETTINGS
-- **WebTransport** (draft-ietf-webtrans-http3) — bidi/uni streams, datagrams, Extended CONNECT
 
 ## Building
 
