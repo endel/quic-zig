@@ -123,13 +123,15 @@ pub fn Server(comptime Handler: type) type {
                 const server_cert_pem = try std.fs.cwd().readFileAlloc(alloc, config.cert_path, 8192);
                 const server_key_pem = try std.fs.cwd().readFileAlloc(alloc, config.key_path, 8192);
 
-                // Parse PEM -> DER
+                // Parse PEM -> DER (heap-allocate so slices outlive init())
                 var cert_der_buf: [4096]u8 = undefined;
-                const cert_der = try tls13.parsePemCert(server_cert_pem, &cert_der_buf);
+                const cert_der_tmp = try tls13.parsePemCert(server_cert_pem, &cert_der_buf);
+                const cert_der = try alloc.dupe(u8, cert_der_tmp);
 
                 var key_der_buf: [4096]u8 = undefined;
                 const key_der = try tls13.parsePemPrivateKey(server_key_pem, &key_der_buf);
-                const ec_private_key = try tls13.extractEcPrivateKey(key_der);
+                const ec_private_key_tmp = try tls13.extractEcPrivateKey(key_der);
+                const ec_private_key = try alloc.dupe(u8, ec_private_key_tmp);
 
                 const cert_chain = try alloc.alloc([]const u8, 1);
                 cert_chain[0] = cert_der;
