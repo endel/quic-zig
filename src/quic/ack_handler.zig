@@ -30,6 +30,10 @@ const DEFAULT_MAX_ACK_DELAY: i64 = 25_000_000;
 /// Maximum PTO (60 seconds in nanoseconds).
 const MAX_PTO: i64 = 60_000_000_000;
 
+/// Maximum PTO for Initial/Handshake spaces (3 seconds in nanoseconds).
+/// Caps backoff to ensure timely retransmission under extreme packet loss.
+const MAX_HANDSHAKE_PTO: i64 = 3_000_000_000;
+
 /// Maximum number of packets tracked per ACK result.
 const MAX_ACK_RESULT: usize = 256;
 
@@ -547,7 +551,8 @@ pub const PacketHandler = struct {
 
             const shift: u6 = @intCast(@min(self.pto_count, 62));
             pto_duration = pto_duration << shift;
-            pto_duration = @min(pto_duration, MAX_PTO);
+            const max_pto = if (idx == @intFromEnum(EncLevel.application)) MAX_PTO else MAX_HANDSHAKE_PTO;
+            pto_duration = @min(pto_duration, max_pto);
 
             const timeout = sent_pkt.time_sent + pto_duration;
             if (earliest == null or timeout < earliest.?) {
@@ -608,7 +613,8 @@ pub const PacketHandler = struct {
 
             const shift2: u6 = @intCast(@min(self.pto_count, 62));
             pto_duration = pto_duration << shift2;
-            pto_duration = @min(pto_duration, MAX_PTO);
+            const max_pto2 = if (idx == @intFromEnum(EncLevel.application)) MAX_PTO else MAX_HANDSHAKE_PTO;
+            pto_duration = @min(pto_duration, max_pto2);
 
             const timeout = sent_pkt.time_sent + pto_duration;
             if (earliest == null or timeout < earliest.?) {

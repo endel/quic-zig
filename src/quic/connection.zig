@@ -1148,6 +1148,13 @@ pub const Connection = struct {
             .ack => |ack| {
                 const enc_level = epochToEncLevel(epoch);
                 const peer_tp = self.peer_params orelse transport_params.TransportParams{};
+
+                // RFC 9002 §7.8: snapshot app_limited BEFORE processing ACKs,
+                // while bytes_in_flight still reflects the pre-ACK state.
+                // If checked after, bytes_in_flight is already decremented,
+                // making it appear app-limited even when the sender filled cwnd.
+                self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
+
                 const result = try self.pkt_handler.onAckReceived(
                     enc_level,
                     ack.largest_ack,
@@ -1157,9 +1164,6 @@ pub const Connection = struct {
                     ack.first_ack_range,
                     now,
                 );
-
-                // RFC 9002 §7.8: update app_limited before processing ACKs
-                self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
 
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
@@ -1250,6 +1254,10 @@ pub const Connection = struct {
                 const enc_level = epochToEncLevel(epoch);
                 const space_idx = @intFromEnum(enc_level);
                 const peer_tp = self.peer_params orelse transport_params.TransportParams{};
+
+                // RFC 9002 §7.8: snapshot app_limited BEFORE processing ACKs
+                self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
+
                 const result = try self.pkt_handler.onAckReceived(
                     enc_level,
                     ack.largest_ack,
@@ -1259,9 +1267,6 @@ pub const Connection = struct {
                     ack.first_ack_range,
                     now,
                 );
-
-                // RFC 9002 §7.8: update app_limited before processing ACKs
-                self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
 
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
@@ -2746,6 +2751,16 @@ pub const Connection = struct {
                             }
                         },
                         .application => {
+                            // Client: also retransmit Handshake Finished when Application
+                            // PTO fires but the handshake is not yet confirmed. Otherwise
+                            // the server stays stuck waiting for Finished while we only
+                            // retransmit 1-RTT data it cannot respond to.
+                            if (!self.is_server and !self.handshake_confirmed) {
+                                if (self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.handshake)].ack_eliciting_in_flight > 0) {
+                                    self.queueCryptoRetransmission(.handshake);
+                                    has_data = true;
+                                }
+                            }
                             // Check application-level crypto stream (e.g. NewSessionTicket)
                             if (self.crypto_streams.getStream(3).hasData()) {
                                 has_data = true;
