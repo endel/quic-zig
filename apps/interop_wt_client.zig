@@ -857,7 +857,7 @@ fn sendPendingDgramReplies(
     var sent: usize = 0;
     while (state.pending_dgram_replies.items.len > 0 and sent < max_batch) {
         // Don't queue more than a few datagrams at a time
-        if (conn.datagram_send_queue.count >= 4) break;
+        if (conn.isDatagramSendQueueFull()) break;
 
         const filename = state.pending_dgram_replies.orderedRemove(0);
         var ep = state.endpoint;

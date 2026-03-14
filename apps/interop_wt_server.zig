@@ -813,7 +813,7 @@ fn sendPendingDgramReplies(
     const max_batch: usize = 8;
     var sent: usize = 0;
     while (state.pending_dgram_replies.items.len > 0 and sent < max_batch) {
-        if (conn.datagram_send_queue.count >= 4) break;
+        if (conn.isDatagramSendQueueFull()) break;
 
         const filename = state.pending_dgram_replies.orderedRemove(0);
         const file_data = readFileFromWww(alloc, "/www", state.sessionPath(), filename) catch |err| {

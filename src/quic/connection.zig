@@ -296,9 +296,9 @@ pub const LocalCidPool = struct {
 };
 
 /// Fixed-capacity queue for QUIC DATAGRAM frames (RFC 9221).
-/// Stores up to 16 datagrams, each up to MAX_DATAGRAM_SIZE bytes.
+/// Stores up to 32 datagrams, each up to MAX_DATAGRAM_SIZE bytes.
 pub const DatagramQueue = struct {
-    pub const MAX_ITEMS: usize = 256;
+    pub const MAX_ITEMS: usize = 32;
     pub const MAX_DATAGRAM_SIZE: usize = 1200;
 
     bufs: [MAX_ITEMS][MAX_DATAGRAM_SIZE]u8 = undefined,
@@ -328,6 +328,14 @@ pub const DatagramQueue = struct {
 
     pub fn isEmpty(self: *const DatagramQueue) bool {
         return self.count == 0;
+    }
+
+    pub fn isFull(self: *const DatagramQueue) bool {
+        return self.count >= MAX_ITEMS;
+    }
+
+    pub fn queueLen(self: *const DatagramQueue) usize {
+        return self.count;
     }
 
     /// Peek at the length of the next datagram without removing it.
@@ -2978,12 +2986,45 @@ pub const Connection = struct {
     }
 
     /// Send a QUIC DATAGRAM frame (RFC 9221).
-    /// Returns error if datagrams are not enabled or the queue is full.
+    /// Returns error.DatagramsNotEnabled, error.DatagramTooLarge (permanent — reduce payload),
+    /// or error.DatagramQueueFull (transient — retry after sending).
     pub fn sendDatagram(self: *Connection, data: []const u8) !void {
         if (!self.datagrams_enabled) return error.DatagramsNotEnabled;
-        if (!self.datagram_send_queue.push(data)) {
-            return error.DatagramQueueFull;
-        }
+        if (data.len > DatagramQueue.MAX_DATAGRAM_SIZE) return error.DatagramTooLarge;
+        if (self.datagram_send_queue.isFull()) return error.DatagramQueueFull;
+        _ = self.datagram_send_queue.push(data);
+    }
+
+    /// Returns true if the datagram send queue is full.
+    pub fn isDatagramSendQueueFull(self: *const Connection) bool {
+        return self.datagram_send_queue.isFull();
+    }
+
+    /// Returns the number of datagrams currently in the send queue.
+    pub fn datagramSendQueueLen(self: *const Connection) usize {
+        return self.datagram_send_queue.queueLen();
+    }
+
+    /// Returns the maximum payload size for a DATAGRAM frame, accounting for
+    /// short header overhead, AEAD tag, and frame encoding. Returns null if
+    /// datagrams are not enabled.
+    pub fn maxDatagramPayloadSize(self: *const Connection) ?usize {
+        if (!self.datagrams_enabled) return null;
+        const peer_max = if (self.peer_params) |pp| pp.max_datagram_frame_size orelse return null else return null;
+        // Short header: 1 (flags) + dcid_len + 4 (max pkt num) + 16 (AEAD tag)
+        const header_overhead = 1 + @as(usize, self.dcid_len) + 4 + 16;
+        const max_pkt = self.packer.max_packet_size;
+        if (header_overhead >= max_pkt) return null;
+        const payload_budget = max_pkt - header_overhead;
+        // DATAGRAM_WITH_LENGTH frame: 1 (type) + varint(len) + payload
+        // Use 2-byte varint for length (covers up to 16383)
+        const frame_overhead: usize = 1 + 2;
+        if (frame_overhead >= payload_budget) return null;
+        const from_pkt = payload_budget - frame_overhead;
+        // Peer's max_datagram_frame_size includes type + length + payload
+        const from_peer = if (peer_max > frame_overhead) peer_max - frame_overhead else return null;
+        const max_payload = @min(from_pkt, from_peer);
+        return @min(max_payload, DatagramQueue.MAX_DATAGRAM_SIZE);
     }
 
     /// Receive a QUIC DATAGRAM frame (RFC 9221).
@@ -3645,12 +3686,15 @@ test "LocalCidPool: pool full" {
 test "DatagramQueue: push and pop" {
     var q = DatagramQueue{};
     try std.testing.expect(q.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), q.queueLen());
+    try std.testing.expect(!q.isFull());
 
     const data1 = "hello";
     const data2 = "world!";
     try std.testing.expect(q.push(data1));
     try std.testing.expect(q.push(data2));
     try std.testing.expect(!q.isEmpty());
+    try std.testing.expectEqual(@as(usize, 2), q.queueLen());
 
     var buf: [1200]u8 = undefined;
     const len1 = q.pop(&buf).?;
@@ -3664,16 +3708,20 @@ test "DatagramQueue: push and pop" {
     // Empty now
     try std.testing.expect(q.pop(&buf) == null);
     try std.testing.expect(q.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), q.queueLen());
 }
 
 test "DatagramQueue: full queue" {
     var q = DatagramQueue{};
-    // Fill the queue
+    // Fill the queue (MAX_ITEMS = 32)
     var i: usize = 0;
     while (i < DatagramQueue.MAX_ITEMS) : (i += 1) {
+        try std.testing.expect(!q.isFull());
         try std.testing.expect(q.push("data"));
     }
     // Queue full — push should fail
+    try std.testing.expect(q.isFull());
+    try std.testing.expectEqual(@as(usize, 32), q.queueLen());
     try std.testing.expect(!q.push("overflow"));
 }
 
@@ -3898,6 +3946,53 @@ test "Connection: datagram send requires enabled" {
     // Verify it's in the send queue (not recv queue)
     try std.testing.expect(!conn.datagram_send_queue.isEmpty());
     try std.testing.expect(conn.datagram_recv_queue.isEmpty());
+}
+
+test "Connection: DatagramTooLarge vs DatagramQueueFull" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.datagrams_enabled = true;
+
+    // Too-large payload → permanent error
+    const big = [_]u8{0xAA} ** (DatagramQueue.MAX_DATAGRAM_SIZE + 1);
+    try std.testing.expectError(error.DatagramTooLarge, conn.sendDatagram(&big));
+
+    // Fill the queue → transient error
+    var i: usize = 0;
+    while (i < DatagramQueue.MAX_ITEMS) : (i += 1) {
+        try conn.sendDatagram("x");
+    }
+    try std.testing.expect(conn.isDatagramSendQueueFull());
+    try std.testing.expectEqual(@as(usize, 32), conn.datagramSendQueueLen());
+    try std.testing.expectError(error.DatagramQueueFull, conn.sendDatagram("overflow"));
+}
+
+test "Connection: maxDatagramPayloadSize" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // Datagrams not enabled → null
+    try std.testing.expect(conn.maxDatagramPayloadSize() == null);
+
+    // Enable datagrams but no peer params → null
+    conn.datagrams_enabled = true;
+    try std.testing.expect(conn.maxDatagramPayloadSize() == null);
+
+    // Set peer params with max_datagram_frame_size
+    conn.peer_params = transport_params.TransportParams{};
+    conn.peer_params.?.max_datagram_frame_size = 65536;
+    conn.dcid_len = 8;
+    // Short header: 1 + 8 + 4 + 16 = 29 overhead
+    // max_packet_size default = 1200, payload budget = 1200 - 29 = 1171
+    // frame overhead = 3 (type + 2-byte varint), from_pkt = 1168
+    // from_peer = 65536 - 3 = 65533, capped by from_pkt and MAX_DATAGRAM_SIZE
+    const max_payload = conn.maxDatagramPayloadSize().?;
+    try std.testing.expect(max_payload > 0);
+    try std.testing.expect(max_payload <= DatagramQueue.MAX_DATAGRAM_SIZE);
+
+    // Disabled peer param → null
+    conn.peer_params.?.max_datagram_frame_size = null;
+    try std.testing.expect(conn.maxDatagramPayloadSize() == null);
 }
 
 test "Connection: datagram receive" {

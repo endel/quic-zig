@@ -236,6 +236,21 @@ pub const WebTransportConnection = struct {
         try self.quic.sendDatagram(fbs.getWritten());
     }
 
+    /// Returns true if the datagram send queue is full.
+    pub fn isDatagramSendQueueFull(self: *const WebTransportConnection) bool {
+        return self.quic.isDatagramSendQueueFull();
+    }
+
+    /// Returns the maximum WT datagram payload size, subtracting the
+    /// quarter_stream_id varint overhead from the QUIC-level budget.
+    pub fn maxDatagramPayloadSize(self: *const WebTransportConnection, session_id: u64) ?usize {
+        const quic_max = self.quic.maxDatagramPayloadSize() orelse return null;
+        const quarter_id = session_id / 4;
+        const varint_len = packet.varIntLength(quarter_id);
+        if (varint_len >= quic_max) return null;
+        return quic_max - varint_len;
+    }
+
     /// Close a WebTransport session with error code 0 and no reason.
     pub fn closeSession(self: *WebTransportConnection, session_id: u64) void {
         self.closeSessionWithError(session_id, 0, "") catch {};

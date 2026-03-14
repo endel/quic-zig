@@ -81,6 +81,20 @@ pub const Session = struct {
         }
     }
 
+    pub fn isDatagramSendQueueFull(self: *const Session) bool {
+        if (self.entry.wt_conn) |*wtc| {
+            return wtc.isDatagramSendQueueFull();
+        }
+        return true;
+    }
+
+    pub fn maxDatagramPayloadSize(self: *const Session, session_id: u64) ?usize {
+        if (self.entry.wt_conn) |*wtc| {
+            return wtc.maxDatagramPayloadSize(session_id);
+        }
+        return null;
+    }
+
     // --- H0 methods ---
 
     pub fn serveFile(self: *Session, stream_id: u64, root_dir: []const u8, path: []const u8) !void {
