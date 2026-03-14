@@ -418,10 +418,8 @@ fn downloadAll(
             std.Thread.sleep(5 * std.time.ns_per_ms);
             conn.onTimeout() catch {};
             drainRecv(&conn, sockfd, local_addr, &remote_addr, &addr_size);
-            var send_count: usize = 0;
-            while (send_count < 10) : (send_count += 1) {
-                const more = conn.send(&out) catch break;
-                if (more == 0) break;
+            const more = conn.send(&out) catch 0;
+            if (more > 0) {
                 _ = posix.sendto(sockfd, out[0..more], 0, @ptrCast(&remote_addr), addr_size) catch {};
             }
         }
