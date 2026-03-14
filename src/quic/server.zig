@@ -45,6 +45,6 @@ pub const Server = struct {
 };
 
 test "init" {
-    var server = try Server.init(std.testing.allocator, "self-signed/cert.crt");
+    var server = try Server.init(std.testing.allocator, "interop/certs/server.crt");
     defer server.deinit();
 }

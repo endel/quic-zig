@@ -5,7 +5,6 @@ const crypto = std.crypto;
 
 const protocol = @import("protocol.zig");
 const packet = @import("packet.zig");
-const tls = @import("tls.zig");
 const tls13 = @import("tls13.zig");
 const frame_mod = @import("frame.zig");
 const Frame = frame_mod.Frame;
