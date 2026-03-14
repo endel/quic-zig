@@ -12,16 +12,16 @@
 const std = @import("std");
 const posix = std.posix;
 
-const connection = @import("quic/connection.zig");
-const connection_manager = @import("quic/connection_manager.zig");
-const quic_crypto = @import("quic/crypto.zig");
-const tls13 = @import("quic/tls13.zig");
-const ecn_socket = @import("quic/ecn_socket.zig");
-const h3 = @import("h3/connection.zig");
-const h0 = @import("h0/connection.zig");
-const qpack = @import("h3/qpack.zig");
-
-const transport_params = @import("quic/transport_params.zig");
+const lib = @import("quic");
+const connection = lib.connection;
+const connection_manager = lib.connection_manager;
+const quic_crypto = lib.crypto;
+const tls13 = lib.tls13;
+const ecn_socket = lib.ecn_socket;
+const h3 = lib.h3;
+const h0 = lib.h0;
+const qpack = lib.qpack;
+const transport_params = lib.transport_params;
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
 
@@ -185,7 +185,7 @@ pub fn main() !void {
             pref.cid_len = 8;
             std.crypto.random.bytes(pref.cid_buf[0..8]);
             // Generate stateless reset token for this CID
-            const stateless_reset = @import("quic/stateless_reset.zig");
+            const stateless_reset = lib.stateless_reset;
             pref.stateless_reset_token = stateless_reset.computeToken(static_reset_key, pref.cid_buf[0..8]);
             preferred_addr = pref;
             std.log.info("connectionmigration: preferred_address ipv4={any} ipv6={any} cid_len={d}", .{

@@ -1,6 +1,7 @@
 const std = @import("std");
-const event_loop = @import("event_loop.zig");
-const qpack = @import("h3/qpack.zig");
+const quic = @import("quic");
+const event_loop = quic.event_loop;
+const qpack = quic.qpack;
 
 const H3Handler = struct {
     pub const protocol: event_loop.Protocol = .h3;
@@ -56,32 +57,4 @@ pub fn main() !void {
 
     std.log.info("QUIC H3 server listening on 127.0.0.1:{d}", .{port});
     try server.run();
-}
-
-test {
-    _ = @import("quic/connection.zig");
-    _ = @import("quic/packet.zig");
-    _ = @import("quic/protocol.zig");
-    _ = @import("quic/frame.zig");
-    _ = @import("quic/ranges.zig");
-    _ = @import("quic/rtt.zig");
-    _ = @import("quic/ack_handler.zig");
-    _ = @import("quic/congestion.zig");
-    _ = @import("quic/flow_control.zig");
-    _ = @import("quic/transport_params.zig");
-    _ = @import("quic/stream.zig");
-    _ = @import("quic/crypto_stream.zig");
-    _ = @import("quic/packet_packer.zig");
-    _ = @import("quic/tls13.zig");
-    _ = @import("quic/mtu.zig");
-    _ = @import("quic/stateless_reset.zig");
-    _ = @import("quic/connection_manager.zig");
-    _ = @import("quic/ecn.zig");
-    _ = @import("quic/ecn_socket.zig");
-    _ = @import("h3/frame.zig");
-    _ = @import("h3/qpack.zig");
-    _ = @import("h3/huffman.zig");
-    _ = @import("h3/connection.zig");
-    _ = @import("webtransport/session.zig");
-    _ = @import("h3/capsule.zig");
 }

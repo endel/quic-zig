@@ -13,13 +13,14 @@ const posix = std.posix;
 const net = std.net;
 const mem = std.mem;
 
-const connection = @import("quic/connection.zig");
-const quic_crypto = @import("quic/crypto.zig");
-const tls13 = @import("quic/tls13.zig");
-const ecn_socket = @import("quic/ecn_socket.zig");
-const h3 = @import("h3/connection.zig");
-const h0 = @import("h0/connection.zig");
-const qpack = @import("h3/qpack.zig");
+const lib = @import("quic");
+const connection = lib.connection;
+const quic_crypto = lib.crypto;
+const tls13 = lib.tls13;
+const ecn_socket = lib.ecn_socket;
+const h3 = lib.h3;
+const h0 = lib.h0;
+const qpack = lib.qpack;
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
 

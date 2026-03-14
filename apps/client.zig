@@ -2,11 +2,12 @@ const std = @import("std");
 const posix = std.posix;
 const net = std.net;
 
-const connection = @import("quic/connection.zig");
-const tls13 = @import("quic/tls13.zig");
-const ecn_socket = @import("quic/ecn_socket.zig");
-const h3 = @import("h3/connection.zig");
-const qpack = @import("h3/qpack.zig");
+const quic = @import("quic");
+const connection = quic.connection;
+const tls13 = quic.tls13;
+const ecn_socket = quic.ecn_socket;
+const h3 = quic.h3;
+const qpack = quic.qpack;
 const Certificate = std.crypto.Certificate;
 
 const MAX_DATAGRAM_SIZE: usize = 1500;

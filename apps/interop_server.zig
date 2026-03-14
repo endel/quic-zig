@@ -12,12 +12,13 @@
 const std = @import("std");
 const posix = std.posix;
 
-const event_loop = @import("event_loop.zig");
-const connection = @import("quic/connection.zig");
-const quic_crypto = @import("quic/crypto.zig");
-const tls13 = @import("quic/tls13.zig");
-const qpack = @import("h3/qpack.zig");
-const transport_params = @import("quic/transport_params.zig");
+const lib = @import("quic");
+const event_loop = lib.event_loop;
+const connection = lib.connection;
+const quic_crypto = lib.crypto;
+const tls13 = lib.tls13;
+const qpack = lib.qpack;
+const transport_params = lib.transport_params;
 
 const TestCase = enum {
     handshake,
@@ -210,7 +211,7 @@ pub fn main() !void {
             }
             pref.cid_len = 8;
             std.crypto.random.bytes(pref.cid_buf[0..8]);
-            const stateless_reset = @import("quic/stateless_reset.zig");
+            const stateless_reset = lib.stateless_reset;
             pref.stateless_reset_token = stateless_reset.computeToken(static_reset_key, pref.cid_buf[0..8]);
             preferred_addr = pref;
             std.log.info("connectionmigration: preferred_address ipv4={any} ipv6={any} port={d} cid_len={d}", .{
