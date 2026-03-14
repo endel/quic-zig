@@ -414,11 +414,14 @@ fn downloadAll(
     // Wait for NewSessionTicket if we don't have one yet.
     if (!skip_ticket_and_drain and conn.session_ticket == null) {
         var ticket_iter: usize = 0;
-        while (conn.session_ticket == null and ticket_iter < 100) : (ticket_iter += 1) {
+        while (conn.session_ticket == null and ticket_iter < 200) : (ticket_iter += 1) {
             std.Thread.sleep(5 * std.time.ns_per_ms);
+            conn.onTimeout() catch {};
             drainRecv(&conn, sockfd, local_addr, &remote_addr, &addr_size);
-            const more = conn.send(&out) catch 0;
-            if (more > 0) {
+            var send_count: usize = 0;
+            while (send_count < 10) : (send_count += 1) {
+                const more = conn.send(&out) catch break;
+                if (more == 0) break;
                 _ = posix.sendto(sockfd, out[0..more], 0, @ptrCast(&remote_addr), addr_size) catch {};
             }
         }

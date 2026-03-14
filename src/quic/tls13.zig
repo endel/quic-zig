@@ -1374,6 +1374,10 @@ pub const Tls13Handshake = struct {
                     self.config.quic_version = protocol.QUIC_V2;
                     // Update our version_information to reflect the chosen version
                     self.local_transport_params.version_info_chosen = protocol.QUIC_V2;
+                    // Re-encode transport params so EncryptedExtensions carries the updated chosen_version
+                    var tp_fbs = std.io.fixedBufferStream(&self.tp_encoded);
+                    self.local_transport_params.encode(tp_fbs.writer()) catch {};
+                    self.tp_encoded_len = tp_fbs.pos;
                 }
             }
         }
@@ -2052,19 +2056,20 @@ fn buildClientHello(
     @memcpy(buf[pos..][0..tp_encoded_data.len], tp_encoded_data);
     pos += tp_encoded_data.len;
 
+    // psk_key_exchange_modes extension (type=45) — always included so
+    // servers know we support session tickets and can send NewSessionTicket.
+    // modes_list_len(1) + mode(1)=0x01 (psk_dhe_ke)
+    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.psk_key_exchange_modes), 2);
+    buf[pos] = 1; // modes list length
+    pos += 1;
+    buf[pos] = 0x01; // psk_dhe_ke
+    pos += 1;
+
     // PSK extensions (must be last, per RFC 8446 §4.2.11)
     if (session_ticket) |ticket| {
         // early_data extension (RFC 8446 §4.2.10) — empty payload in ClientHello
         // Tells the server we intend to send 0-RTT data
         pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.early_data), 0);
-
-        // psk_key_exchange_modes extension (type=45)
-        // modes_list_len(1) + mode(1)=0x01 (psk_dhe_ke)
-        pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.psk_key_exchange_modes), 2);
-        buf[pos] = 1; // modes list length
-        pos += 1;
-        buf[pos] = 0x01; // psk_dhe_ke
-        pos += 1;
 
         // pre_shared_key extension (type=41) - MUST be last
         const ticket_bytes = ticket.getTicket();
