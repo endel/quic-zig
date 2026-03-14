@@ -2726,6 +2726,20 @@ pub const Connection = struct {
             if (now >= pto_time) {
                 self.pkt_handler.pto_count += 1;
 
+                // Force-arm ACKs for the PTO level so probes include acknowledgements.
+                // When a PTO fires, our previous packets (which carried ACK frames) likely
+                // never reached the peer. getAckFrame() clears ack_queued on first call,
+                // so without re-arming, PTO probes go out without ACKs. This is critical
+                // for amplification-limited handshakes: the server needs ACKs to know the
+                // client received its data, and the client needs ACKs in its probes to
+                // give the server enough anti-amplification credit.
+                if (self.pkt_handler.getPtoSpace()) |pto_level_for_ack| {
+                    const ack_idx = @intFromEnum(pto_level_for_ack);
+                    if (self.pkt_handler.recv[ack_idx].largest_received != null) {
+                        self.pkt_handler.recv[ack_idx].ack_queued = true;
+                    }
+                }
+
                 // Check if there's retransmittable data in the PTO space
                 var has_data = false;
                 if (self.pkt_handler.getPtoSpace()) |pto_level| {
@@ -2839,6 +2853,15 @@ pub const Connection = struct {
             const deadline = self.creation_time + pto_duration;
             if (now >= deadline) {
                 self.pkt_handler.pto_count += 1;
+
+                // Force-arm ACKs so anti-deadlock probes include them.
+                // Without ACKs, the server can't confirm we received its data
+                // and stays amplification-limited.
+                for (&self.pkt_handler.recv) |*recv_tracker| {
+                    if (recv_tracker.largest_received != null) {
+                        recv_tracker.ack_queued = true;
+                    }
+                }
 
                 // Send a Handshake packet if we have Handshake keys, else padded Initial.
                 // This gives the server more anti-amplification credit.
