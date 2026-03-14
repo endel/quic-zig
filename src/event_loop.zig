@@ -121,13 +121,19 @@ pub fn Server(comptime Handler: type) type {
         recv_buf: [8192]u8,
         out_buf: [1500]u8,
 
-        // Optional second socket for preferred_address (connectionmigration)
-        pref_sockfd: ?posix.socket_t,
-        pref_local_addr: posix.sockaddr.storage,
-        pref_file: xev.File,
-        pref_poll_completion: xev.Completion,
-        pref_batch: ecn_socket.SendBatch,
-        pref_port: u16,
+        /// Optional second socket for preferred_address (connectionmigration).
+        /// When the server advertises a preferred_address on a different port,
+        /// clients migrate there. This socket receives and responds on that port.
+        preferred: ?PreferredSocket,
+
+        const PreferredSocket = struct {
+            sockfd: posix.socket_t,
+            local_addr: posix.sockaddr.storage,
+            port: u16,
+            file: xev.File,
+            poll_completion: xev.Completion,
+            batch: ecn_socket.SendBatch,
+        };
 
         pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: Config) !Self {
             // Determine TLS config: use advanced or build from cert/key paths
@@ -202,33 +208,36 @@ pub fn Server(comptime Handler: type) type {
             };
             ecn_socket.enableEcnRecv(sockfd) catch {};
 
-            // Optional second socket for preferred_address
-            var pref_sockfd: ?posix.socket_t = null;
-            var pref_local_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-            if (config.preferred_port) |pp| {
-                if (config.ipv6) {
-                    const addr6 = try std.net.Address.parseIp6("::", pp);
-                    const fd6 = try posix.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-                    errdefer posix.close(fd6);
+            // Optional second socket for preferred_address (connectionmigration)
+            const preferred: ?PreferredSocket = if (config.preferred_port) |pp| blk: {
+                const pfd, const paddr = if (config.ipv6) v6: {
+                    const a6 = try std.net.Address.parseIp6("::", pp);
+                    const fd = try posix.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+                    errdefer posix.close(fd);
                     const IPV6_V6ONLY2: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
                     const zero2: c_int = 0;
-                    posix.setsockopt(fd6, posix.IPPROTO.IPV6, IPV6_V6ONLY2, std.mem.asBytes(&zero2)) catch {};
-                    posix.setsockopt(fd6, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
-                    try posix.bind(fd6, &addr6.any, addr6.getOsSockLen());
-                    ecn_socket.enableEcnRecv(fd6) catch {};
-                    pref_sockfd = fd6;
-                    pref_local_addr = connection.sockaddrToStorage(&addr6.any);
-                } else {
-                    const addr4 = try std.net.Address.parseIp4(config.address, pp);
-                    const fd4 = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-                    errdefer posix.close(fd4);
-                    posix.setsockopt(fd4, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
-                    try posix.bind(fd4, &addr4.any, addr4.getOsSockLen());
-                    ecn_socket.enableEcnRecv(fd4) catch {};
-                    pref_sockfd = fd4;
-                    pref_local_addr = connection.sockaddrToStorage(&addr4.any);
-                }
-            }
+                    posix.setsockopt(fd, posix.IPPROTO.IPV6, IPV6_V6ONLY2, std.mem.asBytes(&zero2)) catch {};
+                    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+                    try posix.bind(fd, &a6.any, a6.getOsSockLen());
+                    break :v6 .{ fd, a6 };
+                } else v4: {
+                    const a4 = try std.net.Address.parseIp4(config.address, pp);
+                    const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+                    errdefer posix.close(fd);
+                    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+                    try posix.bind(fd, &a4.any, a4.getOsSockLen());
+                    break :v4 .{ fd, a4 };
+                };
+                ecn_socket.enableEcnRecv(pfd) catch {};
+                break :blk .{
+                    .sockfd = pfd,
+                    .local_addr = connection.sockaddrToStorage(&paddr.any),
+                    .port = pp,
+                    .file = xev.File.initFd(pfd),
+                    .poll_completion = .{},
+                    .batch = ecn_socket.SendBatch.init(pfd),
+                };
+            } else null;
 
             var conn_mgr = connection_manager.ConnectionManager.init(
                 alloc,
@@ -261,12 +270,7 @@ pub fn Server(comptime Handler: type) type {
                 .batch = ecn_socket.SendBatch.init(sockfd),
                 .recv_buf = undefined,
                 .out_buf = undefined,
-                .pref_sockfd = pref_sockfd,
-                .pref_local_addr = pref_local_addr,
-                .pref_file = if (pref_sockfd) |pfd| xev.File.initFd(pfd) else xev.File.initFd(sockfd),
-                .pref_poll_completion = .{},
-                .pref_batch = if (pref_sockfd) |pfd| ecn_socket.SendBatch.init(pfd) else ecn_socket.SendBatch.init(sockfd),
-                .pref_port = config.preferred_port orelse 0,
+                .preferred = preferred,
             };
         }
 
@@ -282,7 +286,7 @@ pub fn Server(comptime Handler: type) type {
             self.timer.deinit();
             self.loop.deinit();
             posix.close(self.sockfd);
-            if (self.pref_sockfd) |pfd| posix.close(pfd);
+            if (self.preferred) |p| posix.close(p.sockfd);
             self.conn_mgr.deinit();
         }
 
@@ -291,8 +295,8 @@ pub fn Server(comptime Handler: type) type {
             // Register socket readability watch
             self.file.poll(&self.loop, &self.poll_completion, .read, Self, self, onReadable);
             // Register preferred socket if present
-            if (self.pref_sockfd != null) {
-                self.pref_file.poll(&self.loop, &self.pref_poll_completion, .read, Self, self, onReadable);
+            if (self.preferred) |*p| {
+                p.file.poll(&self.loop, &p.poll_completion, .read, Self, self, onReadable);
             }
             // Arm initial timer (1ms to kick things off)
             self.timer.run(&self.loop, &self.timer_completion, 1, Self, self, onTimer);
@@ -364,8 +368,8 @@ pub fn Server(comptime Handler: type) type {
 
         fn recvAllPackets(self: *Self) void {
             self.drainSocket(self.sockfd, self.local_addr, &self.batch);
-            if (self.pref_sockfd) |pfd| {
-                self.drainSocket(pfd, self.pref_local_addr, &self.pref_batch);
+            if (self.preferred) |*p| {
+                self.drainSocket(p.sockfd, p.local_addr, &p.batch);
             }
         }
 
@@ -404,17 +408,17 @@ pub fn Server(comptime Handler: type) type {
             }
 
             self.batch.flush();
-            self.pref_batch.flush();
+            if (self.preferred) |*p| p.batch.flush();
         }
 
         /// Pick the correct SendBatch for a connection based on its local port.
         /// After preferred_address migration, the connection's local_addr will
         /// have the preferred port, so we send from the preferred socket.
         fn batchForConn(self: *Self, conn: *connection.Connection) *ecn_socket.SendBatch {
-            if (self.pref_sockfd != null and self.pref_port != 0) {
+            if (self.preferred) |*p| {
                 const local = conn.localAddress();
                 const port = connection.sockaddrPort(local);
-                if (port == self.pref_port) return &self.pref_batch;
+                if (port == p.port) return &p.batch;
             }
             return &self.batch;
         }
@@ -604,7 +608,7 @@ pub fn Server(comptime Handler: type) type {
             }
 
             self.batch.flush();
-            self.pref_batch.flush();
+            if (self.preferred) |*p| p.batch.flush();
         }
 
         fn rescheduleTimer(self: *Self) void {
