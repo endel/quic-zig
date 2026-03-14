@@ -35,9 +35,9 @@ pub const Session = struct {
 
 /// Events returned by WebTransportConnection.poll().
 pub const WtEvent = union(enum) {
-    session_ready: u64, // session_id
+    session_ready: struct { session_id: u64, headers: []const qpack.Header = &.{} },
     session_rejected: struct { session_id: u64, status: []const u8 },
-    connect_request: struct { session_id: u64, protocol: []const u8, authority: []const u8, path: []const u8 },
+    connect_request: struct { session_id: u64, protocol: []const u8, authority: []const u8, path: []const u8, headers: []const qpack.Header = &.{} },
     bidi_stream: struct { session_id: u64, stream_id: u64 },
     uni_stream: struct { session_id: u64, stream_id: u64 },
     stream_data: struct { stream_id: u64, data: []const u8 },
@@ -129,9 +129,31 @@ pub const WebTransportConnection = struct {
         return session_id;
     }
 
+    /// Client: initiate a WebTransport session with extra headers (e.g. sec-webtransport-protocol).
+    pub fn connectWithHeaders(self: *WebTransportConnection, authority: []const u8, path: []const u8, extra_headers: []const qpack.Header) !u64 {
+        if (self.active_session_count >= self.peerMaxSessions()) return error.TooManySessions;
+        const session_id = try self.h3.sendConnectRequestWithHeaders("webtransport", authority, path, extra_headers);
+        _ = self.allocateSession(session_id, .connecting) orelse return error.TooManySessions;
+        self.active_session_count += 1;
+        return session_id;
+    }
+
     /// Server: accept a WebTransport session (send 200 response).
     pub fn acceptSession(self: *WebTransportConnection, session_id: u64) !void {
         try self.h3.sendConnectResponse(session_id, "200");
+        if (self.getSession(session_id)) |s| {
+            if (s.state != .active) {
+                s.state = .active;
+            }
+        } else {
+            _ = self.allocateSession(session_id, .active) orelse return error.TooManySessions;
+            self.active_session_count += 1;
+        }
+    }
+
+    /// Server: accept a WebTransport session with extra response headers (e.g., sub-protocol).
+    pub fn acceptSessionWithHeaders(self: *WebTransportConnection, session_id: u64, extra_headers: []const qpack.Header) !void {
+        try self.h3.sendConnectResponseWithHeaders(session_id, "200", extra_headers);
         if (self.getSession(session_id)) |s| {
             if (s.state != .active) {
                 s.state = .active;
@@ -599,6 +621,7 @@ pub const WebTransportConnection = struct {
                         .protocol = req.protocol,
                         .authority = req.authority,
                         .path = req.path,
+                        .headers = req.headers,
                     } };
                 }
             },
@@ -613,7 +636,7 @@ pub const WebTransportConnection = struct {
                                     session.state = .active;
                                     // Exclude CONNECT stream from H3 — WT layer owns it now
                                     self.h3.excluded_bidi_streams.put(hdr.stream_id, {}) catch {};
-                                    return .{ .session_ready = hdr.stream_id };
+                                    return .{ .session_ready = .{ .session_id = hdr.stream_id, .headers = hdr.headers } };
                                 } else {
                                     self.finalizeSession(session);
                                     return .{ .session_rejected = .{

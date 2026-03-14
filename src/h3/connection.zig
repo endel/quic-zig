@@ -263,6 +263,39 @@ pub const H3Connection = struct {
         return stream_id;
     }
 
+    /// Send a CONNECT request with additional headers (client-side, RFC 9220).
+    pub fn sendConnectRequestWithHeaders(self: *H3Connection, protocol_name: []const u8, authority: []const u8, path: []const u8, extra_headers: []const qpack.Header) !u64 {
+        if (self.peer_goaway_id) |goaway_id| {
+            if (self.quic_conn.streams.next_bidi_stream_id >= goaway_id) {
+                return error.H3RequestRejected;
+            }
+        }
+        const stream = try self.quic_conn.openStream();
+        const stream_id = stream.stream_id;
+
+        var all_headers: [16]qpack.Header = undefined;
+        all_headers[0] = .{ .name = ":method", .value = "CONNECT" };
+        all_headers[1] = .{ .name = ":protocol", .value = protocol_name };
+        all_headers[2] = .{ .name = ":scheme", .value = "https" };
+        all_headers[3] = .{ .name = ":authority", .value = authority };
+        all_headers[4] = .{ .name = ":path", .value = path };
+        const count = @min(extra_headers.len, 11);
+        for (0..count) |i| {
+            all_headers[5 + i] = extra_headers[i];
+        }
+
+        var qpack_buf: [4096]u8 = undefined;
+        const qpack_len = try self.qpack_encoder.encode(all_headers[0 .. 5 + count], &qpack_buf);
+
+        var frame_buf: [4096 + 16]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer());
+        try stream.send.writeData(fbs.getWritten());
+
+        try self.flushEncoderInstructions();
+        return stream_id;
+    }
+
     /// Send a CONNECT response (server-side, RFC 9220).
     /// Sends :status response HEADERS, does NOT close the stream.
     pub fn sendConnectResponse(self: *H3Connection, stream_id: u64, status: []const u8) !void {
@@ -274,6 +307,31 @@ pub const H3Connection = struct {
 
         var qpack_buf: [4096]u8 = undefined;
         const qpack_len = try self.qpack_encoder.encode(&resp_headers, &qpack_buf);
+
+        var frame_buf: [4096 + 16]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, fbs.writer());
+        try stream.send.writeData(fbs.getWritten());
+
+        try self.flushEncoderInstructions();
+
+        // Do NOT close the stream — session stays open
+    }
+
+    /// Send a CONNECT response with additional headers (server-side, RFC 9220).
+    /// Sends :status + extra headers, does NOT close the stream.
+    pub fn sendConnectResponseWithHeaders(self: *H3Connection, stream_id: u64, status: []const u8, extra_headers: []const qpack.Header) !void {
+        const stream = self.quic_conn.streams.getStream(stream_id) orelse return error.StreamNotFound;
+
+        var all_headers: [16]qpack.Header = undefined;
+        all_headers[0] = .{ .name = ":status", .value = status };
+        const count = @min(extra_headers.len, 15);
+        for (0..count) |i| {
+            all_headers[1 + i] = extra_headers[i];
+        }
+
+        var qpack_buf: [4096]u8 = undefined;
+        const qpack_len = try self.qpack_encoder.encode(all_headers[0 .. 1 + count], &qpack_buf);
 
         var frame_buf: [4096 + 16]u8 = undefined;
         var fbs = io.fixedBufferStream(&frame_buf);

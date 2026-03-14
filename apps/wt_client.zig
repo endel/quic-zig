@@ -185,8 +185,8 @@ pub fn main() !void {
             if (event == null) break;
 
             switch (event.?) {
-                .session_ready => |sid| {
-                    std.debug.print("WebTransport session ready (session_id={d})\n", .{sid});
+                .session_ready => |sr| {
+                    std.debug.print("WebTransport session ready (session_id={d})\n", .{sr.session_id});
                     session_ready = true;
                 },
                 .session_rejected => |rej| {

@@ -490,9 +490,9 @@ pub fn Server(comptime Handler: type) type {
                             self.handler.onConnectRequest(&session, req.session_id, req.path);
                         }
                     },
-                    .session_ready => |sid| {
+                    .session_ready => |sr| {
                         if (@hasDecl(Handler, "onSessionReady")) {
-                            self.handler.onSessionReady(&session, sid);
+                            self.handler.onSessionReady(&session, sr.session_id);
                         }
                     },
                     .stream_data => |sd| {

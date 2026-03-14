@@ -28,6 +28,8 @@ FROM martenseemann/quic-network-simulator-endpoint:latest
 # Copy built binaries
 COPY --from=builder /src/zig-out/bin/interop-server /usr/local/bin/interop-server
 COPY --from=builder /src/zig-out/bin/interop-client /usr/local/bin/interop-client
+COPY --from=builder /src/zig-out/bin/interop-wt-server /usr/local/bin/interop-wt-server
+COPY --from=builder /src/zig-out/bin/interop-wt-client /usr/local/bin/interop-wt-client
 
 # Copy entrypoint script
 COPY interop/runner/run_endpoint.sh /run_endpoint.sh

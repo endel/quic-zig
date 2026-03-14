@@ -94,6 +94,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_interop_client.addArgs(args);
     b.step("run-interop-client", "Run interop runner client").dependOn(&run_interop_client.step);
 
+    // Interop runner WebTransport server
+    const exe_interop_wt_server = App.add(b, "interop-wt-server", "apps/interop_wt_server.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_interop_wt_server);
+    const run_interop_wt_server = b.addRunArtifact(exe_interop_wt_server);
+    run_interop_wt_server.step.dependOn(b.getInstallStep());
+    b.step("run-interop-wt-server", "Run interop runner WebTransport server").dependOn(&run_interop_wt_server.step);
+
+    // Interop runner WebTransport client
+    const exe_interop_wt_client = App.add(b, "interop-wt-client", "apps/interop_wt_client.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_interop_wt_client);
+    const run_interop_wt_client = b.addRunArtifact(exe_interop_wt_client);
+    run_interop_wt_client.step.dependOn(b.getInstallStep());
+    b.step("run-interop-wt-client", "Run interop runner WebTransport client").dependOn(&run_interop_wt_client.step);
+
     // Tests
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
