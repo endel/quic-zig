@@ -192,27 +192,29 @@ pub fn main() !void {
     };
 
     // Build preferred_address for connectionmigration test case
+    // Use a DIFFERENT port (preferred_port) so clients actually migrate
+    // (if we use the same port+address, clients see no difference and skip migration)
+    const preferred_port: u16 = 4433;
     var preferred_addr: ?transport_params.PreferredAddress = null;
     if (testcase == .connectionmigration) {
         const addrs = getServerAddresses();
         if (addrs.ipv4 != null or addrs.ipv6 != null) {
-            const listen_port: u16 = std.fmt.parseInt(u16, port_str, 10) catch 443;
             var pref = transport_params.PreferredAddress{};
             if (addrs.ipv4) |v4| {
                 pref.ipv4_addr = v4;
-                pref.ipv4_port = listen_port;
+                pref.ipv4_port = preferred_port;
             }
             if (addrs.ipv6) |v6| {
                 pref.ipv6_addr = v6;
-                pref.ipv6_port = listen_port;
+                pref.ipv6_port = preferred_port;
             }
             pref.cid_len = 8;
             std.crypto.random.bytes(pref.cid_buf[0..8]);
             const stateless_reset = @import("quic/stateless_reset.zig");
             pref.stateless_reset_token = stateless_reset.computeToken(static_reset_key, pref.cid_buf[0..8]);
             preferred_addr = pref;
-            std.log.info("connectionmigration: preferred_address ipv4={any} ipv6={any} cid_len={d}", .{
-                addrs.ipv4, addrs.ipv6, pref.cid_len,
+            std.log.info("connectionmigration: preferred_address ipv4={any} ipv6={any} port={d} cid_len={d}", .{
+                addrs.ipv4, addrs.ipv6, preferred_port, pref.cid_len,
             });
         } else {
             std.log.warn("connectionmigration: could not determine server addresses for preferred_address", .{});
@@ -239,6 +241,7 @@ pub fn main() !void {
         .conn_config = conn_config,
         .retry_token_key = retry_token_key,
         .static_reset_key = static_reset_key,
+        .preferred_port = if (testcase == .connectionmigration) preferred_port else null,
     };
 
     std.log.info("interop server listening on [::]:{d} (ALPN={s})", .{ listen_port, alpn[0] });

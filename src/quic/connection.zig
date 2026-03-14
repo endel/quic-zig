@@ -1092,6 +1092,13 @@ pub const Connection = struct {
                 if (info.datagram_size > 0) {
                     self.paths[self.active_path_idx].bytes_received += info.datagram_size;
                 }
+            } else if (!sockaddrEql(&info.to, &active_path.local_addr)) {
+                // Local address changed (e.g., client migrated to our preferred_address port).
+                // Treat as a path change: update local_addr and send PATH_CHALLENGE.
+                std.log.info("preferred_address migration: local address changed", .{});
+                active_path.local_addr = info.to;
+                const challenge = active_path.validator.startChallenge();
+                self.pending_frames.push(.{ .path_challenge = challenge });
             }
         }
 
@@ -2117,11 +2124,11 @@ pub const Connection = struct {
                                     self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
                                     self.ecn_validator.reset();
 
-                                    const migrating_to_v6 = !current_is_v4;
+                                    const migrating_to_v4 = !current_is_v4 and pref.hasIpv4();
                                     std.log.info("preferred_address: migrating from {s} to {s} port {d}", .{
                                         if (current_is_v4) "IPv4" else "IPv6",
-                                        if (migrating_to_v6) "IPv6" else "IPv4",
-                                        if (migrating_to_v6) pref.ipv6_port else pref.ipv4_port,
+                                        if (migrating_to_v4) "IPv4" else "IPv6",
+                                        if (migrating_to_v4) pref.ipv4_port else pref.ipv6_port,
                                     });
                                 }
                             }
@@ -3075,6 +3082,11 @@ pub const Connection = struct {
         return &self.paths[self.active_path_idx].peer_addr;
     }
 
+    /// Return the local address on the active path.
+    pub fn localAddress(self: *const Connection) *const posix.sockaddr.storage {
+        return &self.paths[self.active_path_idx].local_addr;
+    }
+
     // Get the NEW_TOKEN received from the server (for reuse in future connections).
     // Returns null if no token was received.
     pub fn getNewToken(self: *const Connection) ?[]const u8 {
@@ -3195,6 +3207,18 @@ pub fn sockaddrSameIp(a: *const posix.sockaddr.storage, b: *const posix.sockaddr
 /// Get the correct address length for sendto() based on the address family.
 pub fn sockaddrLen(addr: *const posix.sockaddr.storage) posix.socklen_t {
     return if (addr.family == posix.AF.INET6) @sizeOf(posix.sockaddr.in6) else @sizeOf(posix.sockaddr.in);
+}
+
+/// Extract port from a sockaddr in host byte order.
+pub fn sockaddrPort(addr: *const posix.sockaddr.storage) u16 {
+    if (addr.family == posix.AF.INET6) {
+        const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
+        return std.mem.bigToNative(u16, in6.port);
+    } else if (addr.family == posix.AF.INET) {
+        const in4: *const posix.sockaddr.in = @ptrCast(@alignCast(addr));
+        return std.mem.bigToNative(u16, in4.port);
+    }
+    return 0;
 }
 
 /// Convert a posix.sockaddr (from std.net.Address.any) to posix.sockaddr.storage.
