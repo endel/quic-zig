@@ -431,9 +431,12 @@ pub const WebTransportConnection = struct {
         const session_id = quarter_id * 4;
 
         if (self.getSession(session_id)) |_| {
+            // Heap-allocate data so the slice outlives this stack frame
+            const payload = dgram_buf[fbs.pos..dgram_len];
+            const data = self.allocator.dupe(u8, payload) catch return null;
             return .{ .datagram = .{
                 .session_id = session_id,
-                .data = dgram_buf[fbs.pos..dgram_len],
+                .data = data,
             } };
         }
 
@@ -468,6 +471,18 @@ pub const WebTransportConnection = struct {
                 const session_id = packet.readVarInt(reader) catch continue;
                 if (self.getSession(session_id) != null) {
                     try self.wt_uni_streams.put(stream_id, session_id);
+
+                    // Buffer remaining data after the type prefix
+                    if (fbs.pos < data.len) {
+                        const remaining = data[fbs.pos..];
+                        var buf = self.stream_bufs.getPtr(stream_id) orelse blk: {
+                            const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                            try self.stream_bufs.put(stream_id, new_buf);
+                            break :blk self.stream_bufs.getPtr(stream_id).?;
+                        };
+                        buf.appendSlice(self.allocator, remaining) catch {};
+                    }
+
                     return .{ .uni_stream = .{
                         .session_id = session_id,
                         .stream_id = stream_id,
@@ -1166,6 +1181,7 @@ test "WT integration: poll receives datagram demuxed by session" {
         .datagram => |dg| {
             try testing.expectEqual(session_id, dg.session_id);
             try testing.expectEqualStrings("hello dgram", dg.data);
+            testing.allocator.free(dg.data);
         },
         else => return error.UnexpectedEvent,
     }

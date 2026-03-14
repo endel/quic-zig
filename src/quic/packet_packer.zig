@@ -384,14 +384,15 @@ pub const PacketPacker = struct {
             }
 
             // 3. HANDSHAKE_DONE frame (server only, 1-RTT)
-            // Keep sending until handshake is confirmed (cleared by connection
-            // when 1-RTT ACK is received). This ensures delivery under loss
-            // without relying solely on PTO retransmission.
-            // Skip when ack_only (congestion-limited) to avoid infinite packet generation.
+            // Sent once per trigger (initial handshake completion or PTO/loss re-arm).
+            // Connection clears send_handshake_done after packing to prevent flooding
+            // the CC window with HANDSHAKE_DONE-only packets in burst loops.
+            // Skip when ack_only (congestion-limited).
             if (level == .application and self.send_handshake_done and !ack_only) {
                 try writer.writeByte(0x1e); // HANDSHAKE_DONE frame type
                 has_handshake_done = true;
                 ack_eliciting = true;
+                self.send_handshake_done = false; // One-shot: PTO/loss will re-arm
             }
 
             // 4. Pending control frames (only in 1-RTT)
@@ -489,12 +490,22 @@ pub const PacketPacker = struct {
                 }
             }
 
-            // 6. DATAGRAM frames (RFC 9221, skip when ack_only)
+        }
+
+        // 6. DATAGRAM frames (RFC 9221) — subject to congestion control (RFC 9221 §5)
+        // Only pack datagrams when CC allows (i.e. not in ack_only mode).
+        if (level == .application and !ack_only) {
             if (datagram_queue) |dq| {
                 var dgram_buf: [conn_mod.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
-                while (fbs.pos + AEAD_TAG_LEN + 16 < effective_max) {
+                while (true) {
+                    // Peek at the next datagram's size before popping to avoid
+                    // consuming datagrams that won't fit in the packet.
+                    const peek_len = dq.peekLen() orelse break;
+                    // DATAGRAM_WITH_LENGTH frame: type(1) + varint(len) + payload
+                    const varint_overhead: usize = if (peek_len <= 63) 1 else 2;
+                    const frame_size = 1 + varint_overhead + peek_len;
+                    if (fbs.pos + frame_size + AEAD_TAG_LEN > effective_max) break;
                     const dgram_len = dq.pop(&dgram_buf) orelse break;
-                    // Use DATAGRAM_WITH_LENGTH (0x31) so multiple datagrams can coexist in one packet
                     const dgram_frame = Frame{ .datagram_with_length = .{
                         .data = dgram_buf[0..dgram_len],
                     } };
@@ -1001,8 +1012,8 @@ test "PacketPacker: HANDSHAKE_DONE frame packed in 1-RTT" {
 
     try testing.expect(written > 0);
 
-    // HANDSHAKE_DONE stays set until ACKed (cleared by connection, not packer)
-    try testing.expect(packer.send_handshake_done);
+    // HANDSHAKE_DONE is one-shot: cleared by packer after writing, re-armed by PTO/loss
+    try testing.expect(!packer.send_handshake_done);
 
     // Sent packet should be tracked as ack-eliciting with handshake_done
     const app_idx = @intFromEnum(ack_handler.EncLevel.application);

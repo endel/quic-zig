@@ -133,6 +133,8 @@ const SessionState = struct {
     uni_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
     // Receive mode: track files by stream id
     pending_gets: std.AutoHashMap(u64, []const u8),
+    // Deferred datagram replies (for pacing — avoid burst-sending all at once)
+    pending_dgram_replies: std.ArrayList([]const u8),
     files_completed: usize = 0,
     files_expected: usize = 0,
 
@@ -144,6 +146,7 @@ const SessionState = struct {
             .bidi_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(alloc),
             .uni_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(alloc),
             .pending_gets = std.AutoHashMap(u64, []const u8).init(alloc),
+            .pending_dgram_replies = .{ .items = &.{}, .capacity = 0 },
         };
     }
 
@@ -257,9 +260,11 @@ pub fn main() !void {
     };
 
     var conn = try connection.connect(alloc, host, .{
-        .disable_pmtud = true,
         .qlog_dir = qlog_dir,
-        .max_datagram_frame_size = 1200,
+        .max_datagram_frame_size = 1452,
+        .initial_max_stream_data_uni = 4_194_304,
+        .initial_max_stream_data_bidi_local = 4_194_304,
+        .initial_max_stream_data_bidi_remote = 4_194_304,
     }, tls_config, null);
     defer conn.deinit();
 
@@ -334,6 +339,10 @@ pub fn main() !void {
     // ---- Initialize H3 + WT ----
     var h3c = h3.H3Connection.init(alloc, &conn, false);
     defer h3c.deinit();
+    h3c.local_settings.enable_connect_protocol = true;
+    h3c.local_settings.h3_datagram = true;
+    h3c.local_settings.enable_webtransport = true;
+    h3c.local_settings.webtransport_max_sessions = 1;
     try h3c.initConnection();
 
     var wt = webtransport.WebTransportConnection.init(alloc, &h3c, &conn, false);
@@ -438,6 +447,12 @@ pub fn main() !void {
         // Poll WT events and handle per-session logic
         for (session_states.items) |*ss| {
             done = pollWtEvents(alloc, &wt, ss, testcase) or done;
+        }
+
+        // Drip-feed deferred datagram replies: queue a few per iteration to avoid
+        // bursting 200 datagrams into the CC window at once.
+        for (session_states.items) |*ss| {
+            sendPendingDgramReplies(alloc, &wt, ss, &conn);
         }
 
         // Burst send
@@ -580,6 +595,7 @@ fn pollWtEvents(
 
             .datagram => |dg| {
                 handleDatagram(alloc, wt, state, testcase, dg.session_id, dg.data);
+                if (dg.data.len > 0) alloc.free(dg.data);
             },
 
             .connect_request => {},
@@ -632,6 +648,10 @@ fn checkFinishedStreams(
     for (bidi_finished[0..bidi_finished_count]) |stream_id| {
         if (state.bidi_bufs.get(stream_id)) |buf| {
             handleBidiStreamComplete(alloc, wt, state, testcase, stream_id, buf.items);
+            if (state.bidi_bufs.getPtr(stream_id)) |buf_ptr| {
+                buf_ptr.deinit(alloc);
+                _ = state.bidi_bufs.remove(stream_id);
+            }
         }
     }
 
@@ -659,6 +679,10 @@ fn checkFinishedStreams(
     for (uni_finished[0..uni_finished_count]) |stream_id| {
         if (state.uni_bufs.get(stream_id)) |buf| {
             handleUniStreamComplete(alloc, wt, state, testcase, stream_id, buf.items);
+            if (state.uni_bufs.getPtr(stream_id)) |buf_ptr| {
+                buf_ptr.deinit(alloc);
+                _ = state.uni_bufs.remove(stream_id);
+            }
         }
     }
 }
@@ -779,10 +803,10 @@ fn handleUniStreamComplete(
 /// Handle a received datagram.
 fn handleDatagram(
     alloc: std.mem.Allocator,
-    wt: *webtransport.WebTransportConnection,
+    _: *webtransport.WebTransportConnection,
     state: *SessionState,
     testcase: TestCase,
-    session_id: u64,
+    _: u64,
     data: []const u8,
 ) void {
     switch (testcase) {
@@ -805,30 +829,12 @@ fn handleDatagram(
             }
         },
         .transfer => {
-            // Responder: server sent "GET filename" datagram, we send "PUSH filename\n" + contents
+            // Responder: server sent "GET filename" datagram — defer reply to avoid burst
             if (mem.startsWith(u8, data, "GET ")) {
                 const filename = mem.trim(u8, data[4..], " \r\n");
-                std.log.info("transfer dgram: GET {s}", .{filename});
-                var ep = state.endpoint;
-                if (ep.len > 0 and ep[0] == '/') ep = ep[1..];
-                const file_data = readFileFromWww(alloc, "/www", ep, filename) catch |err| {
-                    std.log.err("transfer dgram: file not found: {s}: {any}", .{ filename, err });
-                    return;
-                };
-                defer alloc.free(file_data);
-
-                var dgram_buf: [1200]u8 = undefined;
-                var pos: usize = 0;
-                const push_header = std.fmt.bufPrint(dgram_buf[pos..], "PUSH {s}\n", .{filename}) catch return;
-                pos += push_header.len;
-                const copy_len = @min(file_data.len, dgram_buf.len - pos);
-                @memcpy(dgram_buf[pos..][0..copy_len], file_data[0..copy_len]);
-                pos += copy_len;
-
-                wt.sendDatagram(session_id, dgram_buf[0..pos]) catch |err| {
-                    std.log.err("transfer dgram: send error: {any}", .{err});
-                };
-                std.log.info("transfer dgram: sent PUSH {s} ({d} bytes)", .{ filename, pos });
+                std.log.info("transfer dgram: queued GET {s}", .{filename});
+                const duped = alloc.dupe(u8, filename) catch return;
+                state.pending_dgram_replies.append(alloc, duped) catch return;
             }
         },
         else => {},
@@ -836,6 +842,49 @@ fn handleDatagram(
 }
 
 // ---- Utility functions ----
+
+/// Send up to N pending datagram replies per call, to avoid bursting.
+fn sendPendingDgramReplies(
+    alloc: std.mem.Allocator,
+    wt: *webtransport.WebTransportConnection,
+    state: *SessionState,
+    conn: *connection.Connection,
+) void {
+    // Drip-feed datagram replies to avoid bursting all at once.
+    // Limit batch size and check QUIC queue depth to let the CC window
+    // breathe between iterations.
+    const max_batch: usize = 8;
+    var sent: usize = 0;
+    while (state.pending_dgram_replies.items.len > 0 and sent < max_batch) {
+        // Don't queue more than a few datagrams at a time
+        if (conn.datagram_send_queue.count >= 4) break;
+
+        const filename = state.pending_dgram_replies.orderedRemove(0);
+        var ep = state.endpoint;
+        if (ep.len > 0 and ep[0] == '/') ep = ep[1..];
+        const file_data = readFileFromWww(alloc, "/www", ep, filename) catch |err| {
+            std.log.err("transfer dgram: file not found: {s}: {any}", .{ filename, err });
+            continue;
+        };
+        defer alloc.free(file_data);
+
+        // Leave room for WT quarter_stream_id varint prefix (up to 8 bytes)
+        var dgram_buf: [1192]u8 = undefined;
+        var pos: usize = 0;
+        const push_header = std.fmt.bufPrint(dgram_buf[pos..], "PUSH {s}\n", .{filename}) catch continue;
+        pos += push_header.len;
+        const copy_len = @min(file_data.len, dgram_buf.len - pos);
+        @memcpy(dgram_buf[pos..][0..copy_len], file_data[0..copy_len]);
+        pos += copy_len;
+
+        wt.sendDatagram(state.session_id, dgram_buf[0..pos]) catch |err| {
+            std.log.err("transfer dgram: send error: {any}", .{err});
+            continue;
+        };
+        std.log.info("sent PUSH {s} ({d} bytes)", .{ filename, pos });
+        sent += 1;
+    }
+}
 
 fn readFileFromWww(alloc: std.mem.Allocator, www_dir: []const u8, endpoint: []const u8, filename: []const u8) ![]u8 {
     var path_buf: [4096]u8 = undefined;

@@ -54,12 +54,17 @@ const ConnState = struct {
     session_id: ?u64 = null,
     session_ready: bool = false,
     send_requests_initiated: bool = false,
+    // Session endpoint path (e.g. "/endpoint_slug" -> "endpoint_slug")
+    session_path_buf: [256]u8 = undefined,
+    session_path_len: usize = 0,
 
     // For transfer test: accumulated data per stream
     bidi_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
     uni_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
     // Track stream -> filename for incoming PUSH responses
     pending_gets: std.AutoHashMap(u64, []const u8),
+    // Deferred datagram replies (for pacing — avoid burst-sending all at once)
+    pending_dgram_replies: std.ArrayList([]const u8),
     // Track completed files count
     files_completed: usize = 0,
     files_expected: usize = 0,
@@ -69,7 +74,21 @@ const ConnState = struct {
             .bidi_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(alloc),
             .uni_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(alloc),
             .pending_gets = std.AutoHashMap(u64, []const u8).init(alloc),
+            .pending_dgram_replies = .{ .items = &.{}, .capacity = 0 },
         };
+    }
+
+    fn sessionPath(self: *const ConnState) []const u8 {
+        return self.session_path_buf[0..self.session_path_len];
+    }
+
+    fn setSessionPath(self: *ConnState, path: []const u8) void {
+        // Strip leading slash
+        var clean = path;
+        while (clean.len > 0 and clean[0] == '/') clean = clean[1..];
+        const len = @min(clean.len, self.session_path_buf.len);
+        @memcpy(self.session_path_buf[0..len], clean[0..len]);
+        self.session_path_len = len;
     }
 
     fn deinit(self: *ConnState, alloc: std.mem.Allocator) void {
@@ -208,9 +227,11 @@ pub fn main() !void {
         tls_config,
         .{
             .token_key = retry_token_key,
-            .disable_pmtud = true,
             .qlog_dir = qlog_dir,
-            .max_datagram_frame_size = 1200,
+            .max_datagram_frame_size = 1452,
+            .initial_max_stream_data_uni = 4_194_304,
+            .initial_max_stream_data_bidi_local = 4_194_304,
+            .initial_max_stream_data_bidi_remote = 4_194_304,
         },
         retry_token_key,
         static_reset_key,
@@ -273,6 +294,10 @@ pub fn main() !void {
             // Initialize H3 + WT when connection is established
             if (conn.isEstablished() and !entry.h3_initialized) {
                 entry.h3_conn = h3.H3Connection.init(alloc, conn, true);
+                entry.h3_conn.?.local_settings.enable_connect_protocol = true;
+                entry.h3_conn.?.local_settings.h3_datagram = true;
+                entry.h3_conn.?.local_settings.enable_webtransport = true;
+                entry.h3_conn.?.local_settings.webtransport_max_sessions = 1;
                 entry.h3_conn.?.initConnection() catch |err| {
                     std.log.err("H3 init error: {any}", .{err});
                     i += 1;
@@ -309,14 +334,21 @@ pub fn main() !void {
                 continue;
             }
 
+            // Drip-feed deferred datagram replies
+            if (conn_states.get(conn_key)) |state| {
+                sendPendingDgramReplies(alloc, state, conn);
+            }
+
             // Burst send
-            var send_count: usize = 0;
-            while (send_count < 100) : (send_count += 1) {
-                const bytes_written = conn.send(&out) catch break;
-                if (bytes_written == 0) break;
-                ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
-                const send_addr = conn.peerAddress();
-                _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(send_addr), connection.sockaddrLen(send_addr)) catch {};
+            {
+                var sc: usize = 0;
+                while (sc < 100) : (sc += 1) {
+                    const bytes_written = conn.send(&out) catch break;
+                    if (bytes_written == 0) break;
+                    ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
+                    const send_addr = conn.peerAddress();
+                    _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(send_addr), connection.sockaddrLen(send_addr)) catch {};
+                }
             }
 
             i += 1;
@@ -498,6 +530,7 @@ fn pollWtEvents(
 
                 state.session_id = req.session_id;
                 state.session_ready = true;
+                state.setSessionPath(req.path);
             },
 
             .bidi_stream => |bs| {
@@ -523,6 +556,7 @@ fn pollWtEvents(
 
             .datagram => |dg| {
                 handleDatagram(alloc, wt, state, testcase, dg.session_id, dg.data);
+                if (dg.data.len > 0) alloc.free(dg.data);
             },
 
             .session_ready => |sr| {
@@ -583,6 +617,11 @@ fn checkFinishedStreams(
     for (bidi_finished[0..bidi_finished_count]) |stream_id| {
         if (state.bidi_bufs.get(stream_id)) |buf| {
             handleBidiStreamComplete(alloc, wt, state, testcase, stream_id, buf.items);
+            // Remove to prevent re-processing
+            if (state.bidi_bufs.getPtr(stream_id)) |buf_ptr| {
+                buf_ptr.deinit(alloc);
+                _ = state.bidi_bufs.remove(stream_id);
+            }
         }
     }
 
@@ -610,6 +649,11 @@ fn checkFinishedStreams(
     for (uni_finished[0..uni_finished_count]) |stream_id| {
         if (state.uni_bufs.get(stream_id)) |buf| {
             handleUniStreamComplete(alloc, wt, state, testcase, stream_id, buf.items);
+            // Remove to prevent re-processing
+            if (state.uni_bufs.getPtr(stream_id)) |buf_ptr| {
+                buf_ptr.deinit(alloc);
+                _ = state.uni_bufs.remove(stream_id);
+            }
         }
     }
 }
@@ -629,7 +673,7 @@ fn handleBidiStreamComplete(
             if (mem.startsWith(u8, data, "GET ")) {
                 const filename = mem.trim(u8, data[4..], " \r\n");
                 std.log.info("transfer bidi: GET {s} on stream {d}", .{ filename, stream_id });
-                const file_data = readFileFromWww(alloc, "/www", filename) catch |err| {
+                const file_data = readFileFromWww(alloc, "/www", state.sessionPath(), filename) catch |err| {
                     std.log.err("transfer bidi: file not found: {s}: {any}", .{ filename, err });
                     return;
                 };
@@ -643,11 +687,13 @@ fn handleBidiStreamComplete(
         .transfer_bidirectional_send => {
             // Server initiated bidi GET; client sent file contents back on same stream.
             if (state.pending_gets.get(stream_id)) |filename| {
-                saveFile("/downloads", filename, data) catch |err| {
-                    std.log.err("failed to save {s}: {any}", .{ filename, err });
+                var save_buf: [1024]u8 = undefined;
+                const save_path = std.fmt.bufPrint(&save_buf, "{s}/{s}", .{ state.sessionPath(), filename }) catch filename;
+                saveFile("/downloads", save_path, data) catch |err| {
+                    std.log.err("failed to save {s}: {any}", .{ save_path, err });
                 };
                 state.files_completed += 1;
-                std.log.info("bidi-send: saved {s} ({d}/{d})", .{ filename, state.files_completed, state.files_expected });
+                std.log.info("bidi-send: saved {s} ({d}/{d})", .{ save_path, state.files_completed, state.files_expected });
             }
         },
         else => {},
@@ -670,7 +716,7 @@ fn handleUniStreamComplete(
             if (mem.startsWith(u8, data, "GET ")) {
                 const filename = mem.trim(u8, data[4..], " \r\n");
                 std.log.info("transfer uni: GET {s}", .{filename});
-                const file_data = readFileFromWww(alloc, "/www", filename) catch |err| {
+                const file_data = readFileFromWww(alloc, "/www", state.sessionPath(), filename) catch |err| {
                     std.log.err("transfer uni: file not found: {s}: {any}", .{ filename, err });
                     return;
                 };
@@ -702,12 +748,14 @@ fn handleUniStreamComplete(
                 const newline_pos = mem.indexOf(u8, data, "\n") orelse return;
                 const filename = mem.trim(u8, data[5..newline_pos], " \r");
                 const file_data = data[newline_pos + 1 ..];
-                saveFile("/downloads", filename, file_data) catch |err| {
-                    std.log.err("failed to save {s}: {any}", .{ filename, err });
+                var save_buf: [1024]u8 = undefined;
+                const save_path = std.fmt.bufPrint(&save_buf, "{s}/{s}", .{ state.sessionPath(), filename }) catch filename;
+                saveFile("/downloads", save_path, file_data) catch |err| {
+                    std.log.err("failed to save {s}: {any}", .{ save_path, err });
                     return;
                 };
                 state.files_completed += 1;
-                std.log.info("uni-send: saved {s} ({d}/{d})", .{ filename, state.files_completed, state.files_expected });
+                std.log.info("uni-send: saved {s} ({d}/{d})", .{ save_path, state.files_completed, state.files_expected });
             }
         },
         else => {},
@@ -717,37 +765,20 @@ fn handleUniStreamComplete(
 /// Handle a received datagram.
 fn handleDatagram(
     alloc: std.mem.Allocator,
-    wt: *webtransport.WebTransportConnection,
+    _: *webtransport.WebTransportConnection,
     state: *ConnState,
     testcase: TestCase,
-    session_id: u64,
+    _: u64,
     data: []const u8,
 ) void {
     switch (testcase) {
         .transfer => {
-            // Client sent "GET filename" as datagram. Server sends "PUSH filename\n" + contents as datagram.
+            // Client sent "GET filename" as datagram — defer reply to avoid burst
             if (mem.startsWith(u8, data, "GET ")) {
                 const filename = mem.trim(u8, data[4..], " \r\n");
-                std.log.info("transfer dgram: GET {s}", .{filename});
-                const file_data = readFileFromWww(alloc, "/www", filename) catch |err| {
-                    std.log.err("transfer dgram: file not found: {s}: {any}", .{ filename, err });
-                    return;
-                };
-                defer alloc.free(file_data);
-
-                // Build "PUSH filename\n" + file_data as a single datagram
-                var dgram_buf: [1200]u8 = undefined;
-                var pos: usize = 0;
-                const push_header = std.fmt.bufPrint(dgram_buf[pos..], "PUSH {s}\n", .{filename}) catch return;
-                pos += push_header.len;
-                const copy_len = @min(file_data.len, dgram_buf.len - pos);
-                @memcpy(dgram_buf[pos..][0..copy_len], file_data[0..copy_len]);
-                pos += copy_len;
-
-                wt.sendDatagram(session_id, dgram_buf[0..pos]) catch |err| {
-                    std.log.err("transfer dgram: send error: {any}", .{err});
-                };
-                std.log.info("transfer dgram: sent PUSH {s} ({d} bytes)", .{ filename, pos });
+                std.log.info("transfer dgram: queued GET {s}", .{filename});
+                const duped = alloc.dupe(u8, filename) catch return;
+                state.pending_dgram_replies.append(alloc, duped) catch return;
             }
         },
         .transfer_datagram_send => {
@@ -756,26 +787,66 @@ fn handleDatagram(
                 const newline_pos = mem.indexOf(u8, data, "\n") orelse return;
                 const filename = mem.trim(u8, data[5..newline_pos], " \r");
                 const file_data = data[newline_pos + 1 ..];
-                saveFile("/downloads", filename, file_data) catch |err| {
-                    std.log.err("failed to save {s}: {any}", .{ filename, err });
+                var save_buf: [1024]u8 = undefined;
+                const save_path = std.fmt.bufPrint(&save_buf, "{s}/{s}", .{ state.sessionPath(), filename }) catch filename;
+                saveFile("/downloads", save_path, file_data) catch |err| {
+                    std.log.err("failed to save {s}: {any}", .{ save_path, err });
                     return;
                 };
                 state.files_completed += 1;
-                std.log.info("dgram-send: saved {s} ({d}/{d})", .{ filename, state.files_completed, state.files_expected });
+                std.log.info("dgram-send: saved {s} ({d}/{d})", .{ save_path, state.files_completed, state.files_expected });
             }
         },
         else => {},
     }
 }
 
+/// Send up to N pending datagram replies per call, to avoid bursting.
+fn sendPendingDgramReplies(
+    alloc: std.mem.Allocator,
+    state: *ConnState,
+    conn: *connection.Connection,
+) void {
+    var wt = &(state.wt_conn orelse return);
+    const session_id = state.session_id orelse return;
+
+    const max_batch: usize = 8;
+    var sent: usize = 0;
+    while (state.pending_dgram_replies.items.len > 0 and sent < max_batch) {
+        if (conn.datagram_send_queue.count >= 4) break;
+
+        const filename = state.pending_dgram_replies.orderedRemove(0);
+        const file_data = readFileFromWww(alloc, "/www", state.sessionPath(), filename) catch |err| {
+            std.log.err("transfer dgram: file not found: {s}: {any}", .{ filename, err });
+            continue;
+        };
+        defer alloc.free(file_data);
+
+        var dgram_buf: [1192]u8 = undefined;
+        var pos: usize = 0;
+        const push_header = std.fmt.bufPrint(dgram_buf[pos..], "PUSH {s}\n", .{filename}) catch continue;
+        pos += push_header.len;
+        const copy_len = @min(file_data.len, dgram_buf.len - pos);
+        @memcpy(dgram_buf[pos..][0..copy_len], file_data[0..copy_len]);
+        pos += copy_len;
+
+        wt.sendDatagram(session_id, dgram_buf[0..pos]) catch |err| {
+            std.log.err("transfer dgram: send error: {any}", .{err});
+            continue;
+        };
+        std.log.info("sent PUSH {s} ({d} bytes)", .{ filename, pos });
+        sent += 1;
+    }
+}
+
 // ---- Utility functions ----
 
-fn readFileFromWww(alloc: std.mem.Allocator, www_dir: []const u8, path: []const u8) ![]u8 {
-    var clean_path = path;
-    while (clean_path.len > 0 and clean_path[0] == '/') {
-        clean_path = clean_path[1..];
+fn readFileFromWww(alloc: std.mem.Allocator, www_dir: []const u8, endpoint: []const u8, filename: []const u8) ![]u8 {
+    var clean_name = filename;
+    while (clean_name.len > 0 and clean_name[0] == '/') {
+        clean_name = clean_name[1..];
     }
-    if (clean_path.len == 0) clean_path = "index.html";
+    if (clean_name.len == 0) clean_name = "index.html";
 
     var full_path_buf: [4096]u8 = undefined;
     var pos: usize = 0;
@@ -785,8 +856,14 @@ fn readFileFromWww(alloc: std.mem.Allocator, www_dir: []const u8, path: []const 
         full_path_buf[pos] = '/';
         pos += 1;
     }
-    @memcpy(full_path_buf[pos..][0..clean_path.len], clean_path);
-    pos += clean_path.len;
+    if (endpoint.len > 0) {
+        @memcpy(full_path_buf[pos..][0..endpoint.len], endpoint);
+        pos += endpoint.len;
+        full_path_buf[pos] = '/';
+        pos += 1;
+    }
+    @memcpy(full_path_buf[pos..][0..clean_name.len], clean_name);
+    pos += clean_name.len;
 
     return std.fs.cwd().readFileAlloc(alloc, full_path_buf[0..pos], MAX_FILE_SIZE);
 }
@@ -823,11 +900,28 @@ fn loadFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 /// Extract the filename from a request path like "endpoint1/file1.txt".
-/// Strips any leading slashes.
+/// Returns just "file1.txt" (the part after the first path component).
 fn extractFilename(path: []const u8) []const u8 {
     var result = path;
     while (result.len > 0 and result[0] == '/') {
         result = result[1..];
     }
-    return if (result.len > 0) result else path;
+    // Skip the endpoint component (first path segment)
+    if (mem.indexOf(u8, result, "/")) |slash| {
+        return result[slash + 1 ..];
+    }
+    return result;
+}
+
+/// Extract the endpoint from a request path like "endpoint1/file1.txt".
+/// Returns "endpoint1".
+fn extractEndpoint(path: []const u8) []const u8 {
+    var result = path;
+    while (result.len > 0 and result[0] == '/') {
+        result = result[1..];
+    }
+    if (mem.indexOf(u8, result, "/")) |slash| {
+        return result[0..slash];
+    }
+    return result;
 }

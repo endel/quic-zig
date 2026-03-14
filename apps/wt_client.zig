@@ -269,6 +269,7 @@ pub fn main() !void {
                 .datagram => |dg| {
                     std.debug.print("Datagram response (session={d}): {s}\n", .{ dg.session_id, dg.data });
                     got_response = true;
+                    alloc.free(dg.data);
                 },
                 .session_closed => |cls| {
                     std.debug.print("Session {d} closed (code={d}, reason={s})\n", .{

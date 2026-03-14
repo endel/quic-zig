@@ -504,6 +504,7 @@ pub fn Server(comptime Handler: type) type {
                         if (@hasDecl(Handler, "onDatagram")) {
                             self.handler.onDatagram(&session, dg.session_id, dg.data);
                         }
+                        if (dg.data.len > 0) self.allocator.free(dg.data);
                     },
                     .session_closed => |cls| {
                         if (@hasDecl(Handler, "onSessionClosed")) {

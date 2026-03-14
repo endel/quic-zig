@@ -298,7 +298,7 @@ pub const LocalCidPool = struct {
 /// Fixed-capacity queue for QUIC DATAGRAM frames (RFC 9221).
 /// Stores up to 16 datagrams, each up to MAX_DATAGRAM_SIZE bytes.
 pub const DatagramQueue = struct {
-    pub const MAX_ITEMS: usize = 16;
+    pub const MAX_ITEMS: usize = 256;
     pub const MAX_DATAGRAM_SIZE: usize = 1200;
 
     bufs: [MAX_ITEMS][MAX_DATAGRAM_SIZE]u8 = undefined,
@@ -328,6 +328,12 @@ pub const DatagramQueue = struct {
 
     pub fn isEmpty(self: *const DatagramQueue) bool {
         return self.count == 0;
+    }
+
+    /// Peek at the length of the next datagram without removing it.
+    pub fn peekLen(self: *const DatagramQueue) ?usize {
+        if (self.count == 0) return null;
+        return self.lens[self.head];
     }
 };
 
@@ -439,6 +445,11 @@ pub const Connection = struct {
 
     // Path MTU Discovery (DPLPMTUD, RFC 8899)
     mtu_discoverer: mtu_mod.MtuDiscoverer = .{},
+
+    // HANDSHAKE_DONE delivery tracking (server only)
+    // True from handshake completion until the client ACKs a packet carrying HANDSHAKE_DONE.
+    // Used to re-arm packer.send_handshake_done on PTO/loss retransmission.
+    handshake_done_pending: bool = false,
 
     // QUIC DATAGRAM support (RFC 9221)
     datagram_recv_queue: DatagramQueue = .{},
@@ -1227,6 +1238,11 @@ pub const Connection = struct {
                     if (pkt.has_crypto_data) {
                         self.queueCryptoRetransmission(pkt.enc_level);
                     }
+
+                    // Re-arm HANDSHAKE_DONE if the lost packet carried it
+                    if (pkt.has_handshake_done and self.handshake_done_pending) {
+                        self.packer.send_handshake_done = true;
+                    }
                 }
 
                 if (has_non_probe_loss) {
@@ -1290,6 +1306,7 @@ pub const Connection = struct {
                     // Stop including HANDSHAKE_DONE once a packet containing it is ACKed
                     if (pkt.has_handshake_done) {
                         self.packer.send_handshake_done = false;
+                        self.handshake_done_pending = false;
                     }
 
                     if (enc_level == .application) {
@@ -1329,6 +1346,11 @@ pub const Connection = struct {
                     // Queue CRYPTO frame retransmission for lost packets (RFC 9002 §6.2)
                     if (pkt.has_crypto_data) {
                         self.queueCryptoRetransmission(pkt.enc_level);
+                    }
+
+                    // Re-arm HANDSHAKE_DONE if the lost packet carried it
+                    if (pkt.has_handshake_done and self.handshake_done_pending) {
+                        self.packer.send_handshake_done = true;
                     }
                 }
 
@@ -1607,7 +1629,8 @@ pub const Connection = struct {
 
             .datagram => |d| {
                 if (self.datagrams_enabled) {
-                    _ = self.datagram_recv_queue.push(d.data);
+                    const ok = self.datagram_recv_queue.push(d.data);
+                    std.log.info("DGRAM_RECV: len={d} ok={} q={d}", .{ d.data.len, ok, self.datagram_recv_queue.count });
                 }
             },
 
@@ -1942,6 +1965,7 @@ pub const Connection = struct {
 
                         // Server must send HANDSHAKE_DONE to the client (RFC 9001 Section 4.1.2)
                         self.packer.send_handshake_done = true;
+                        self.handshake_done_pending = true;
                     }
                     // Client: Keep Handshake keys until HANDSHAKE_DONE received (RFC 9001 §4.9.2)
                     // This allows the client to ACK server's Handshake retransmissions under loss
@@ -2386,6 +2410,8 @@ pub const Connection = struct {
 
         // Check congestion window — only send ACKs + control frames when congestion-limited
         // Exception: PTO probes MUST bypass congestion control (RFC 9002 §6.2.4)
+        // DATAGRAM frames are subject to CC per RFC 9221 §5: "DATAGRAM frames SHOULD be
+        // subject to congestion control" — they piggyback on CC-allowed packets only.
         if (self.pkt_handler.bytes_in_flight >= self.cc.sendWindow() and self.pto_probe_pending == 0) {
             return try self.sendAckOnly(out_buf, now);
         }
@@ -2704,6 +2730,9 @@ pub const Connection = struct {
                 if (pkt.has_crypto_data) {
                     self.queueCryptoRetransmission(pkt.enc_level);
                 }
+                if (pkt.has_handshake_done and self.handshake_done_pending) {
+                    self.packer.send_handshake_done = true;
+                }
             }
             if (has_non_probe_loss_lt) {
                 if (loss_result.persistent_congestion) {
@@ -2785,9 +2814,9 @@ pub const Connection = struct {
                             if (self.crypto_streams.getStream(3).hasData()) {
                                 has_data = true;
                             }
-                            // HANDSHAKE_DONE uses persistent sending (included in every
-                            // packet until ACKed), so no PTO re-queue is needed.
-                            if (self.packer.send_handshake_done) {
+                            // HANDSHAKE_DONE: re-arm for retransmission on PTO
+                            if (self.handshake_done_pending) {
+                                self.packer.send_handshake_done = true;
                                 has_data = true;
                             }
                             // Check if any stream has data to send
@@ -2952,7 +2981,9 @@ pub const Connection = struct {
     /// Returns error if datagrams are not enabled or the queue is full.
     pub fn sendDatagram(self: *Connection, data: []const u8) !void {
         if (!self.datagrams_enabled) return error.DatagramsNotEnabled;
-        if (!self.datagram_send_queue.push(data)) return error.DatagramQueueFull;
+        if (!self.datagram_send_queue.push(data)) {
+            return error.DatagramQueueFull;
+        }
     }
 
     /// Receive a QUIC DATAGRAM frame (RFC 9221).
