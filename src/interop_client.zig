@@ -367,6 +367,20 @@ fn downloadAll(
             if (conn.state == .connected) handshake_complete = true;
         }
 
+        // Flush immediately after recv: when the TLS handshake completes during recv(),
+        // the Handshake Finished needs to be sent right away (before the loop exits or
+        // the server's mini-connection times out under amplification limit scenarios).
+        if (received_any) {
+            var fc: usize = 0;
+            while (fc < 10) : (fc += 1) {
+                const flush_bytes = conn.send(&out) catch break;
+                if (flush_bytes == 0) break;
+                ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
+                _ = posix.sendto(sockfd, out[0..flush_bytes], 0, @ptrCast(&remote_addr), addr_size) catch {};
+                sent_any = true;
+            }
+        }
+
         // Only sleep when idle (nothing to send or receive)
         if (!sent_any and !received_any) std.Thread.sleep(1 * std.time.ns_per_ms);
     }

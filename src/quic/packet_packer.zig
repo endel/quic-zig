@@ -184,11 +184,16 @@ pub const PacketPacker = struct {
         }
 
         // Try packing Handshake packet
-        // Server: pad the Handshake portion so the coalesced datagram (Initial +
-        // Handshake) reaches 1200 bytes when we sent an ack-eliciting Initial.
+        // Padding logic:
+        // - Server: pad Handshake so coalesced datagram (Initial+Handshake) reaches 1200 bytes.
+        // - Client (standalone Handshake, no Initial coalesced): pad to 1200 bytes so
+        //   the server gets amplification credit and peers don't reject small datagrams
+        //   (RFC 9000 §14.1 recommends padding during handshake).
         if (handshake_seal != null and offset < out_buf.len) {
             const hs_pad: usize = if (self.is_server and offset > 0)
                 MIN_INITIAL_PACKET_SIZE -| offset
+            else if (!self.is_server and offset == 0 and initial_seal == null)
+                MIN_INITIAL_PACKET_SIZE
             else
                 0;
             const hs_len = try self.packSinglePacket(

@@ -2664,7 +2664,7 @@ pub const Connection = struct {
         // to avoid terminating the connection while waiting for backed-off retransmissions.
         {
             var current_pto = self.pkt_handler.rtt_stats.pto();
-            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 62));
+            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
             current_pto = @min(current_pto << shift, 60_000_000_000); // cap at 60s
             const effective_idle = @max(self.idle_timeout_ns, 3 * current_pto);
             // RFC 9000 §10.1.2: Before handshake confirmed, also defer idle timeout
@@ -2826,7 +2826,7 @@ pub const Connection = struct {
         else if (!self.is_server and !self.handshake_confirmed) {
             // Compute PTO based on time since handshake start (creation_time)
             var pto_duration = self.pkt_handler.rtt_stats.ptoNoAckDelay();
-            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 62));
+            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
             pto_duration = pto_duration << shift;
             pto_duration = @min(pto_duration, 60_000_000_000); // cap at 60s
 
@@ -2965,7 +2965,7 @@ pub const Connection = struct {
         // Idle timeout
         {
             var current_pto = self.pkt_handler.rtt_stats.pto();
-            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 62));
+            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
             current_pto = @min(current_pto << shift, 60_000_000_000);
             const effective_idle = @max(self.idle_timeout_ns, 3 * current_pto);
             const last_activity = if (!self.handshake_confirmed)
@@ -2997,7 +2997,7 @@ pub const Connection = struct {
             else
                 self.pkt_handler.rtt_stats.ptoNoAckDelay();
 
-            const pto_shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 62));
+            const pto_shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
             pto_duration = @min(pto_duration << pto_shift, 60_000_000_000);
 
             const timeout = sent_pkt.time_sent + pto_duration;

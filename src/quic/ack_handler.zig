@@ -549,7 +549,7 @@ pub const PacketHandler = struct {
             else
                 self.rtt_stats.ptoNoAckDelay();
 
-            const shift: u6 = @intCast(@min(self.pto_count, 62));
+            const shift: u6 = @intCast(@min(self.pto_count, 30));
             pto_duration = pto_duration << shift;
             const max_pto = if (idx == @intFromEnum(EncLevel.application)) MAX_PTO else MAX_HANDSHAKE_PTO;
             pto_duration = @min(pto_duration, max_pto);
@@ -611,7 +611,7 @@ pub const PacketHandler = struct {
             else
                 self.rtt_stats.ptoNoAckDelay();
 
-            const shift2: u6 = @intCast(@min(self.pto_count, 62));
+            const shift2: u6 = @intCast(@min(self.pto_count, 30));
             pto_duration = pto_duration << shift2;
             const max_pto2 = if (idx == @intFromEnum(EncLevel.application)) MAX_PTO else MAX_HANDSHAKE_PTO;
             pto_duration = @min(pto_duration, max_pto2);
