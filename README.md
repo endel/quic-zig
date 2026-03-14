@@ -11,11 +11,11 @@ and goals of this project!
 
 ## Features
 
-- **QUIC v1** (RFC 9000) — handshake, streams, flow control, connection migration, PMTUD
-- **TLS 1.3** (RFC 8446 / RFC 9001) — ECDSA P-256 + RSA PSS, X25519, session resumption, 0-RTT
-- **Loss Detection & Congestion Control** (RFC 9002) — NewReno, PTO, token bucket pacer
-- **HTTP/3** (RFC 9114) — QPACK static table, request/response, SETTINGS
-- **WebTransport** (draft-ietf-webtrans-http3) — bidi/uni streams, datagrams, Extended CONNECT
+- **QUIC v1 & v2** (RFC 9000 / RFC 9369) — handshake, streams, flow control, connection migration, PMTUD, ECN
+- **TLS 1.3** (RFC 8446 / RFC 9001) — ECDSA P-256 + RSA PSS, X25519, AES-128-GCM + ChaCha20, session resumption, 0-RTT
+- **Loss Detection & Congestion Control** (RFC 9002) — CUBIC, PTO, token bucket pacer
+- **HTTP/3** (RFC 9114) — QPACK static table, request/response, priority scheduling (RFC 9218)
+- **WebTransport** (draft-ietf-webtrans-http3) — bidi/uni streams, datagrams, Extended CONNECT, browser support
 
 ## The Story
 
@@ -69,8 +69,10 @@ Produces binaries in `zig-out/bin/`:
 | `client` | HTTP/3 client |
 | `wt-server` | WebTransport echo server |
 | `wt-client` | WebTransport client |
+| `wt-browser-server` | WebTransport server for browser clients (0.0.0.0:4433) |
 | `interop-server` | QUIC Interop Runner server endpoint |
 | `interop-client` | QUIC Interop Runner client endpoint |
+| `interop-wt-server` | QUIC Interop Runner WebTransport server |
 
 ## Running Tests
 
@@ -80,21 +82,36 @@ zig build test
 
 ## Interop Testing
 
-### Local (Zig ↔ Go)
+### Local
 
-Bidirectional interop with [quic-go](https://github.com/quic-go/quic-go) and [quiche](https://github.com/cloudflare/quiche) is verified. See `interop/quic-go/` and `interop/quiche/` for test programs.
+Bidirectional interop is verified against [quic-go](https://github.com/quic-go/quic-go) and [quiche](https://github.com/cloudflare/quiche) across QUIC, HTTP/3, and WebTransport. Browser WebTransport (Chrome) is also tested.
+
+An automated test script covers all combinations:
+
+```bash
+./interop/run_local_tests.sh
+```
+
+Or run individual tests manually:
 
 ```bash
 # Build Go interop programs
-cd interop/quic-go && go build -o server_bin ./server && go build -o client_bin ./client
+cd interop/quic-go
+go build -o h3server_bin ./h3server && go build -o h3client_bin ./h3client
+go build -o wt_server_bin ./wt_server && go build -o wt_client_bin ./wt_client
 
-# Zig server ↔ Go client
+# H3: Zig server ↔ Go client
 zig-out/bin/server &
-./interop/quic-go/client_bin --addr localhost:4434
+./interop/quic-go/h3client_bin --addr localhost:4434
 
-# Go server ↔ Zig client
-./interop/quic-go/server_bin --addr localhost:4434 &
-zig-out/bin/client
+# WebTransport: Zig server ↔ Go client
+zig-out/bin/wt-server &
+./interop/quic-go/wt_client_bin --addr localhost:4434
+
+# Browser WebTransport (requires ECDSA cert)
+cd interop/browser && ./generate-cert.sh
+zig build run-wt-browser-server
+# Open interop/browser/index.html in Chrome
 ```
 
 ### QUIC Interop Runner
@@ -131,19 +148,6 @@ pip3 install -r interop/quic-interop-runner/requirements.txt
 ```
 
 The script builds a Docker image (`quic-zig-interop:latest`), injects it into the runner's implementation list, and executes the tests.
-
-**Supported test cases:**
-
-| Test Case | `TESTCASE` | Description |
-|-----------|-----------|-------------|
-| Handshake | `handshake` | Basic connection + small file download |
-| Transfer | `transfer` | Stream multiplexing, flow control |
-| Retry | `retry` | Server-side Retry token validation |
-| Resumption | `resumption` | Session resumption (no 0-RTT) |
-| 0-RTT | `zerortt` | 0-RTT resumption |
-| Key Update | `keyupdate` | Key update during transfer |
-| HTTP/3 | `http3` | File transfer over HTTP/3 |
-| Multi-connect | `multiconnect` | Multiple sequential connections |
 
 **Manual Docker build:**
 
