@@ -28,6 +28,7 @@ for (let i = 0; i < args.length; i++) {
   if (args[i] === '--filter' && args[i + 1]) filterArg = args[++i];
   if (args[i] === '--browser' && args[i + 1]) browserType = args[++i];
   if (args[i] === '--firefox') browserType = 'firefox';
+  if (args[i] === '--safari') browserType = 'safari';
 }
 
 // Compute cert hash
@@ -355,54 +356,115 @@ async function main() {
   let passed = 0, failed = 0;
   const failures = [];
 
-  console.log(`\nRunning ${testsToRun.length} tests...\n`);
+  console.log(`Running ${testsToRun.length} tests...\n`);
 
-  for (const test of testsToRun) {
-    process.stdout.write(`  ${test.name} ... `);
-    const page = await browser.newPage();
+  if (browserType === 'safari') {
+    // Safari: use safaridriver via WebDriver protocol
+    const { execSync, spawn } = await import('child_process');
+    const driverProc = spawn('safaridriver', ['-p', '9515'], { stdio: 'ignore' });
+    await new Promise(r => setTimeout(r, 1500));
 
-    // Capture console for debugging
-    const consoleLogs = [];
-    page.on('console', msg => consoleLogs.push(msg.text()));
-
-    try {
-      await page.goto(`http://127.0.0.1:${HTTP_PORT}/test/${test.name}`, {
-        waitUntil: 'domcontentloaded',
-      });
-
-      // Poll document.title for result
-      const result = await new Promise((resolve, reject) => {
-        const deadline = Date.now() + TEST_TIMEOUT + 2000;
-        const check = async () => {
-          if (Date.now() > deadline) return reject(new Error('runner timeout'));
-          try {
-            const title = await page.title();
-            if (title.startsWith('PASS:')) return resolve(title.slice(5));
-            if (title.startsWith('FAIL:')) return reject(new Error(title.slice(5)));
-          } catch (e) { /* page might be navigating */ }
-          setTimeout(check, 100);
-        };
-        check();
-      });
-
-      console.log(`\x1b[32mPASS\x1b[0m ${result}`);
-      passed++;
-    } catch (err) {
-      const msg = err.message || String(err);
-      console.log(`\x1b[31mFAIL\x1b[0m ${msg}`);
-      failed++;
-      failures.push({ name: test.name, error: msg });
-      if (consoleLogs.length) {
-        for (const log of consoleLogs.slice(-5)) {
-          console.log(`    console: ${log}`);
-        }
-      }
+    async function wdFetch(method, path, body) {
+      const url = `http://localhost:9515${path}`;
+      const opts = { method, headers: { 'Content-Type': 'application/json' } };
+      if (body) opts.body = JSON.stringify(body);
+      const res = await fetch(url, opts);
+      return res.json();
     }
 
-    await page.close();
-  }
+    for (const test of testsToRun) {
+      process.stdout.write(`  ${test.name} ... `);
 
-  await browser.close();
+      // Create new session per test
+      const sessRes = await wdFetch('POST', '/session', {
+        capabilities: { alwaysMatch: { browserName: 'safari' } }
+      });
+      const sid = sessRes?.value?.sessionId;
+      if (!sid) {
+        console.log(`\x1b[31mFAIL\x1b[0m could not create session`);
+        failed++;
+        failures.push({ name: test.name, error: 'session creation failed' });
+        continue;
+      }
+
+      try {
+        // Navigate to test page
+        await wdFetch('POST', `/session/${sid}/url`, {
+          url: `http://127.0.0.1:${HTTP_PORT}/test/${test.name}`
+        });
+
+        // Poll document.title for result
+        const deadline = Date.now() + TEST_TIMEOUT + 2000;
+        let result = null;
+        while (Date.now() < deadline) {
+          await new Promise(r => setTimeout(r, 200));
+          const titleRes = await wdFetch('GET', `/session/${sid}/title`);
+          const title = titleRes?.value || '';
+          if (title.startsWith('PASS:')) { result = title.slice(5); break; }
+          if (title.startsWith('FAIL:')) { throw new Error(title.slice(5)); }
+        }
+        if (result === null) throw new Error('runner timeout');
+
+        console.log(`\x1b[32mPASS\x1b[0m ${result}`);
+        passed++;
+      } catch (err) {
+        const msg = err.message || String(err);
+        console.log(`\x1b[31mFAIL\x1b[0m ${msg}`);
+        failed++;
+        failures.push({ name: test.name, error: msg });
+      }
+
+      await wdFetch('DELETE', `/session/${sid}`);
+    }
+
+    driverProc.kill();
+  } else {
+    // Chrome/Firefox: use Puppeteer
+    for (const test of testsToRun) {
+      process.stdout.write(`  ${test.name} ... `);
+      const page = await browser.newPage();
+
+      const consoleLogs = [];
+      page.on('console', msg => consoleLogs.push(msg.text()));
+
+      try {
+        await page.goto(`http://127.0.0.1:${HTTP_PORT}/test/${test.name}`, {
+          waitUntil: 'domcontentloaded',
+        });
+
+        const result = await new Promise((resolve, reject) => {
+          const deadline = Date.now() + TEST_TIMEOUT + 2000;
+          const check = async () => {
+            if (Date.now() > deadline) return reject(new Error('runner timeout'));
+            try {
+              const title = await page.title();
+              if (title.startsWith('PASS:')) return resolve(title.slice(5));
+              if (title.startsWith('FAIL:')) return reject(new Error(title.slice(5)));
+            } catch (e) { /* page might be navigating */ }
+            setTimeout(check, 100);
+          };
+          check();
+        });
+
+        console.log(`\x1b[32mPASS\x1b[0m ${result}`);
+        passed++;
+      } catch (err) {
+        const msg = err.message || String(err);
+        console.log(`\x1b[31mFAIL\x1b[0m ${msg}`);
+        failed++;
+        failures.push({ name: test.name, error: msg });
+        if (consoleLogs.length) {
+          for (const log of consoleLogs.slice(-5)) {
+            console.log(`    console: ${log}`);
+          }
+        }
+      }
+
+      await page.close();
+    }
+
+    await browser.close();
+  }
   server.close();
 
   console.log(`\n${'─'.repeat(50)}`);
