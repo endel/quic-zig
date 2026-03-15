@@ -11,11 +11,28 @@ const qpack = quic.qpack;
 const WptHandler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
 
+    // Fields
     allocator: std.mem.Allocator,
-    /// Per-session state keyed by session_id.
     session_state: std.AutoHashMap(u64, SessionInfo),
-    /// Stash: cross-session shared key-value store (for query.py pattern).
     stash: std.StringHashMap([]const u8),
+    pending_actions: [MAX_PENDING]PendingAction = .{PendingAction{ .session_id = 0 }} ** MAX_PENDING,
+    pending_count: u8 = 0,
+
+    // Types
+    const MAX_PENDING = 8;
+
+    const PendingAction = struct {
+        session_id: u64,
+        handler: Handler = .unknown,
+        code: u32 = 0,
+        reason_buf: [256]u8 = undefined,
+        reason_len: u8 = 0,
+        ticks_remaining: u8 = 2,
+
+        fn getReason(self: *const PendingAction) []const u8 {
+            return self.reason_buf[0..self.reason_len];
+        }
+    };
 
     const Handler = enum {
         echo,
@@ -137,6 +154,56 @@ const WptHandler = struct {
         return null;
     }
 
+    fn queueAction(self: *WptHandler, action: PendingAction) void {
+        if (self.pending_count < MAX_PENDING) {
+            self.pending_actions[self.pending_count] = action;
+            self.pending_count += 1;
+        }
+    }
+
+    fn executePendingActions(self: *WptHandler, session: *event_loop.Session) void {
+        var i: u8 = 0;
+        while (i < self.pending_count) {
+            var action = &self.pending_actions[i];
+            if (action.ticks_remaining > 0) {
+                action.ticks_remaining -= 1;
+                i += 1;
+                continue;
+            }
+
+            const sid = action.session_id;
+            switch (action.handler) {
+                .server_close => {
+                    std.log.info("[wpt] executing deferred server-close: code={d} reason={s}", .{
+                        action.code, action.getReason(),
+                    });
+                    session.closeSessionWithError(sid, action.code, action.getReason()) catch {};
+                },
+                .server_connection_close => {
+                    std.log.info("[wpt] executing deferred server-connection-close", .{});
+                    _ = session.openBidiStream(sid) catch {};
+                    session.closeConnection();
+                },
+                .abort_stream_from_server => {
+                    std.log.info("[wpt] executing deferred abort-stream: code={d}", .{action.code});
+                    if (session.openUniStream(sid)) |stream_id| {
+                        session.sendStreamData(stream_id, "a") catch {};
+                        session.resetStream(stream_id, action.code);
+                    } else |_| {}
+                    if (session.openBidiStream(sid)) |stream_id| {
+                        session.resetStream(stream_id, action.code);
+                    } else |_| {}
+                },
+                else => {},
+            }
+
+            // Remove this action by swapping with last
+            self.pending_actions[i] = self.pending_actions[self.pending_count - 1];
+            self.pending_count -= 1;
+            // Don't increment i — we swapped a new element into this slot
+        }
+    }
+
     // -- Event loop handler callbacks --
 
     pub fn onConnectRequest(self: *WptHandler, session: *event_loop.Session, session_id: u64, path: []const u8) void {
@@ -169,42 +236,25 @@ const WptHandler = struct {
             return;
         };
 
-        // Post-accept handler-specific actions
+        // Defer server-initiated actions so the 200 response is flushed first
         switch (handler) {
             .server_close => {
-                // Close immediately with code/reason from query params
                 const code_str = getQueryParam(path, "code") orelse "0";
                 const code = std.fmt.parseInt(u32, code_str, 10) catch 0;
                 const reason = getQueryParam(path, "reason") orelse "";
-                std.log.info("[wpt] server-close: code={d} reason={s}", .{ code, reason });
-                session.closeSessionWithError(session_id, code, reason) catch {};
+                var action = PendingAction{ .session_id = session_id, .handler = .server_close, .code = code };
+                const rlen = @min(reason.len, action.reason_buf.len);
+                @memcpy(action.reason_buf[0..rlen], reason[0..rlen]);
+                action.reason_len = @intCast(rlen);
+                self.queueAction(action);
             },
             .server_connection_close => {
-                // Create a bidi stream then abruptly close the QUIC connection
-                _ = session.openBidiStream(session_id) catch {};
-                session.closeConnection();
-            },
-            .server_read_then_close => {
-                // Will close on first data received
+                self.queueAction(.{ .session_id = session_id, .handler = .server_connection_close });
             },
             .abort_stream_from_server => {
-                // Parse code and create streams to abort
                 const code_str = getQueryParam(path, "code") orelse "0";
                 const code = std.fmt.parseInt(u32, code_str, 10) catch 0;
-
-                // Create a uni stream and reset it
-                if (session.openUniStream(session_id)) |stream_id| {
-                    session.sendStreamData(stream_id, "a]") catch {};
-                    session.resetStream(stream_id, code);
-                } else |_| {}
-
-                // Create a bidi stream and reset it
-                if (session.openBidiStream(session_id)) |stream_id| {
-                    session.resetStream(stream_id, code);
-                } else |_| {}
-            },
-            .echo_request_headers => {
-                // We'll send headers as JSON when session is ready
+                self.queueAction(.{ .session_id = session_id, .handler = .abort_stream_from_server, .code = code });
             },
             .query => {
                 // Retrieve stashed data by token and send on a uni stream
@@ -223,6 +273,10 @@ const WptHandler = struct {
             },
             else => {},
         }
+    }
+
+    pub fn onPollComplete(self: *WptHandler, session: *event_loop.Session) void {
+        self.executePendingActions(session);
     }
 
     pub fn onSessionReady(_: *WptHandler, _: *event_loop.Session, sid: u64) void {

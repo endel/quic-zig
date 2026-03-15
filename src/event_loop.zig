@@ -537,6 +537,11 @@ pub fn Server(comptime Handler: type) type {
             var wtc = &entry.wt_conn.?;
             var session = Session{ .entry = entry };
 
+            // Allow handler to run deferred work each poll cycle
+            if (@hasDecl(Handler, "onPollComplete")) {
+                self.handler.onPollComplete(&session);
+            }
+
             while (true) {
                 const event = wtc.poll() catch break;
                 if (event == null) break;
