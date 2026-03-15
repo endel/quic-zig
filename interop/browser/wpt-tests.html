@@ -276,11 +276,13 @@ const TEST_GROUPS = [
         name: 'server connection close',
         run: async () => {
           const wt = await createWT('server-connection-close.py');
-          // Server should abruptly close the connection
+          // Server should abruptly close the connection — closed rejects
           try {
             await wt.closed;
+            // If it resolves cleanly, that's also acceptable
           } catch (e) {
             // Connection was closed abruptly — expected
+            log(`  server-connection-close got expected error: ${e.message}`);
           }
         }
       },

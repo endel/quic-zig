@@ -27,7 +27,7 @@ const WptHandler = struct {
         code: u32 = 0,
         reason_buf: [256]u8 = undefined,
         reason_len: u8 = 0,
-        ticks_remaining: u8 = 2,
+        ticks_remaining: u16 = 100, // ~20ms at 200µs poll interval
 
         fn getReason(self: *const PendingAction) []const u8 {
             return self.reason_buf[0..self.reason_len];
@@ -162,9 +162,25 @@ const WptHandler = struct {
     }
 
     fn executePendingActions(self: *WptHandler, session: *event_loop.Session) void {
+        const wtc = if (session.entry.wt_conn) |*w| w else return;
+
         var i: u8 = 0;
         while (i < self.pending_count) {
             var action = &self.pending_actions[i];
+
+            // Only process actions belonging to THIS connection's sessions
+            var has_session = false;
+            for (&wtc.sessions) |*s| {
+                if (s.occupied and s.session_id == action.session_id) {
+                    has_session = true;
+                    break;
+                }
+            }
+            if (!has_session) {
+                i += 1;
+                continue; // Skip — this action belongs to a different connection
+            }
+
             if (action.ticks_remaining > 0) {
                 action.ticks_remaining -= 1;
                 i += 1;
@@ -172,20 +188,18 @@ const WptHandler = struct {
             }
 
             const sid = action.session_id;
+            std.log.info("[wpt] executing deferred {s}: session={d} code={d}", .{
+                @tagName(action.handler), sid, action.code,
+            });
             switch (action.handler) {
                 .server_close => {
-                    std.log.info("[wpt] executing deferred server-close: code={d} reason={s}", .{
-                        action.code, action.getReason(),
-                    });
                     session.closeSessionWithError(sid, action.code, action.getReason()) catch {};
                 },
                 .server_connection_close => {
-                    std.log.info("[wpt] executing deferred server-connection-close", .{});
                     _ = session.openBidiStream(sid) catch {};
                     session.closeConnection();
                 },
                 .abort_stream_from_server => {
-                    std.log.info("[wpt] executing deferred abort-stream: code={d}", .{action.code});
                     if (session.openUniStream(sid)) |stream_id| {
                         session.sendStreamData(stream_id, "a") catch {};
                         session.resetStream(stream_id, action.code);
@@ -197,10 +211,9 @@ const WptHandler = struct {
                 else => {},
             }
 
-            // Remove this action by swapping with last
+            // Remove by swapping with last
             self.pending_actions[i] = self.pending_actions[self.pending_count - 1];
             self.pending_count -= 1;
-            // Don't increment i — we swapped a new element into this slot
         }
     }
 
