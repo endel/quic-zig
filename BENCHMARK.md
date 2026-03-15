@@ -30,7 +30,6 @@ zig-out/bin/bench [options]
 ```
 zig-out/bin/server [options]
   --port PORT        Listen port (default: 4434)
-  -w, --workers N    Worker threads (default: 0 = single-threaded)
 ```
 
 ## Results (macOS M-series, localhost, 50 conn × 100 req)
@@ -97,4 +96,4 @@ go build -o bench_bin ./bench
 - All servers use the same TLS certificates (`interop/certs/`)
 - quiche's standalone server processes connections serially; in Cloudflare's production stack it uses connection-per-worker sharding
 - The Go client shows lower p50 latency but lower throughput due to `net/http` overhead
-- Multi-worker mode (`--workers N`) uses a recv thread + N worker threads with CID-based dispatch
+- For multi-core scaling, run multiple server instances behind a QUIC-aware load balancer (see [QUIC-LB](https://datatracker.ietf.org/doc/html/draft-ietf-quic-load-balancers))

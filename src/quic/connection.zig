@@ -255,10 +255,6 @@ pub const LocalCidPool = struct {
     /// Issue a new CID with the given length. Returns the entry or null if pool full.
     /// If static_key is provided, compute a deterministic reset token; otherwise random.
     pub fn issueNewCid(self: *LocalCidPool, cid_len: u8, static_key: ?[16]u8) ?*const LocalCidEntry {
-        return self.issueNewCidForWorker(cid_len, static_key, null, 0);
-    }
-
-    pub fn issueNewCidForWorker(self: *LocalCidPool, cid_len: u8, static_key: ?[16]u8, worker_id: ?u16, num_workers: u16) ?*const LocalCidEntry {
         // Find a free slot
         for (&self.entries) |*entry| {
             if (!entry.occupied) {
@@ -266,11 +262,7 @@ pub const LocalCidPool = struct {
                 entry.retired = false;
                 entry.seq_num = self.next_seq_num;
                 entry.cid_len = cid_len;
-                if (worker_id) |wid| {
-                    generateConnectionIdForWorker(entry.cid_buf[0..cid_len], wid, num_workers);
-                } else {
-                    generateConnectionId(entry.cid_buf[0..cid_len]);
-                }
+                generateConnectionId(entry.cid_buf[0..cid_len]);
                 if (static_key) |key| {
                     entry.stateless_reset_token = stateless_reset.computeToken(key, entry.cid_buf[0..cid_len]);
                 } else {
@@ -399,11 +391,6 @@ pub const ConnectionConfig = struct {
     // sent after this duration of silence, clamped to idle_timeout/2 so the
     // connection stays alive without tripping the idle timeout.
     keep_alive_period: u64 = 0,
-    // Worker ID for multi-threaded servers. When set, CID byte 0 is stamped
-    // with (worker_id % num_workers) so the dispatch thread can route packets
-    // back to the correct worker. null = single-threaded (no stamping).
-    worker_id: ?u16 = null,
-    num_workers: u16 = 0,
 };
 
 /// A QUIC connection.
@@ -462,10 +449,6 @@ pub const Connection = struct {
 
     // Static key for deterministic stateless reset tokens (RFC 9000 §10.3)
     static_reset_key: [16]u8 = .{0} ** 16,
-
-    // Multi-worker routing: worker ID stamped into CID byte 0
-    worker_id: ?u16 = null,
-    num_workers: u16 = 0,
 
     // Key update manager for 1-RTT key rotation (RFC 9001 Section 6)
     key_update: ?quic_crypto.KeyUpdateManager = null,
@@ -599,11 +582,7 @@ pub const Connection = struct {
             conn.dcid_len = @intCast(header.scid.len);
             @memcpy(conn.dcid[0..header.scid.len], header.scid);
             conn.scid_len = 8;
-            if (config.worker_id) |wid| {
-                generateConnectionIdForWorker(conn.scid[0..8], wid, config.num_workers);
-            } else {
-                generateConnectionId(conn.scid[0..8]);
-            }
+            generateConnectionId(conn.scid[0..8]);
             conn.got_peer_conn_id = true;
         } else {
             conn.dcid_len = @intCast(header.dcid.len);
@@ -614,10 +593,6 @@ pub const Connection = struct {
 
         // Generate static reset key for deterministic tokens
         crypto.random.bytes(&conn.static_reset_key);
-
-        // Multi-worker CID routing
-        conn.worker_id = config.worker_id;
-        conn.num_workers = config.num_workers;
 
         // Register initial SCID in local CID pool with deterministic token
         conn.local_cid_pool.registerInitialCid(conn.scid[0..conn.scid_len], conn.static_reset_key);
@@ -1716,7 +1691,7 @@ pub const Connection = struct {
                 // Issue a replacement CID to stay at the peer's limit
                 const peer_limit = if (self.peer_params) |pp| pp.active_connection_id_limit else 2;
                 if (self.local_cid_pool.activeCount() < peer_limit) {
-                    if (self.local_cid_pool.issueNewCidForWorker(self.scid_len, self.static_reset_key, self.worker_id, self.num_workers)) |entry| {
+                    if (self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key)) |entry| {
                         self.pending_frames.push(.{ .new_connection_id = .{
                             .seq_num = entry.seq_num,
                             .retire_prior_to = self.local_cid_pool.retire_prior_to,
@@ -2293,7 +2268,7 @@ pub const Connection = struct {
                     {
                         const peer_limit = if (self.peer_params) |pp| pp.active_connection_id_limit else 2;
                         while (self.local_cid_pool.activeCount() < peer_limit) {
-                            if (self.local_cid_pool.issueNewCidForWorker(self.scid_len, self.static_reset_key, self.worker_id, self.num_workers)) |entry| {
+                            if (self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key)) |entry| {
                                 self.pending_frames.push(.{ .new_connection_id = .{
                                     .seq_num = entry.seq_num,
                                     .retire_prior_to = self.local_cid_pool.retire_prior_to,
@@ -3565,17 +3540,6 @@ pub fn sockaddrToStorage(addr: *const posix.sockaddr) posix.sockaddr.storage {
 /// Generates a new random connection ID of the given size into the provided buffer.
 pub fn generateConnectionId(buf: []u8) void {
     crypto.random.bytes(buf);
-}
-
-/// Generate a CID with worker ID encoded in byte 0 for multi-worker routing.
-pub fn generateConnectionIdForWorker(buf: []u8, worker_id: u16, num_workers: u16) void {
-    crypto.random.bytes(buf);
-    if (buf.len > 0 and num_workers > 0) {
-        // Stamp byte 0 so that (byte0 % num_workers == worker_id)
-        const remainder = buf[0] % @as(u8, @intCast(num_workers));
-        const target = @as(u8, @intCast(worker_id % num_workers));
-        buf[0] = buf[0] -% remainder +% target;
-    }
 }
 
 /// Create a client-side connection and generate the initial packet.
