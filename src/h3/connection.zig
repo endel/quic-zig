@@ -796,11 +796,14 @@ pub const H3Connection = struct {
         var method_count: u8 = 0;
         var scheme_count: u8 = 0;
         var path_count: u8 = 0;
+        var authority_count: u8 = 0;
         var path_empty = false;
         var has_status = false;
         var pseudo_done = false;
         var is_connect = false;
         var has_protocol = false;
+        var has_host = false;
+        var scheme_value: []const u8 = "";
 
         for (headers) |h| {
             if (h.name.len > 0 and h.name[0] == ':') {
@@ -810,6 +813,7 @@ pub const H3Connection = struct {
                     is_connect = std.mem.eql(u8, h.value, "CONNECT");
                 } else if (std.mem.eql(u8, h.name, ":scheme")) {
                     scheme_count += 1;
+                    scheme_value = h.value;
                 } else if (std.mem.eql(u8, h.name, ":path")) {
                     path_count += 1;
                     if (h.value.len == 0) path_empty = true;
@@ -817,6 +821,10 @@ pub const H3Connection = struct {
                     has_status = true;
                 } else if (std.mem.eql(u8, h.name, ":protocol")) {
                     has_protocol = true;
+                } else if (std.mem.eql(u8, h.name, ":authority")) {
+                    authority_count += 1;
+                } else {
+                    return false; // unknown pseudo-header (RFC 9114 §4.1.1)
                 }
             } else {
                 pseudo_done = true;
@@ -824,6 +832,7 @@ pub const H3Connection = struct {
                 for (h.name) |c| {
                     if (c >= 'A' and c <= 'Z') return false;
                 }
+                if (std.mem.eql(u8, h.name, "host")) has_host = true;
                 // te header: only "trailers" allowed
                 if (std.mem.eql(u8, h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) {
                     return false;
@@ -833,15 +842,20 @@ pub const H3Connection = struct {
 
         if (has_status) return false; // request must not have :status
         if (method_count != 1) return false;
-        if (method_count > 1 or scheme_count > 1 or path_count > 1) return false;
+        if (method_count > 1 or scheme_count > 1 or path_count > 1 or authority_count > 1) return false;
 
-        // Plain CONNECT: no :scheme/:path required
+        // Plain CONNECT: no :scheme/:path required, :authority mandatory
         // Extended CONNECT (with :protocol): all pseudo-headers required
-        if (is_connect and !has_protocol) return true;
+        if (is_connect and !has_protocol) return authority_count == 1;
 
         if (scheme_count != 1) return false;
         if (path_count != 1) return false;
         if (path_empty) return false;
+
+        // RFC 9114 §4.3.1: for http/https, :authority or Host must be present
+        if (std.mem.eql(u8, scheme_value, "http") or std.mem.eql(u8, scheme_value, "https")) {
+            if (authority_count == 0 and !has_host) return false;
+        }
 
         return true;
     }
@@ -1261,6 +1275,7 @@ test "validateRequestHeaders: valid POST with body headers" {
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":path", .value = "/submit" },
+        .{ .name = ":authority", .value = "example.com" },
         .{ .name = "content-type", .value = "application/json" },
     };
     try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
@@ -1344,6 +1359,7 @@ test "validateRequestHeaders: valid te trailers" {
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
         .{ .name = "te", .value = "trailers" },
     };
     try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
