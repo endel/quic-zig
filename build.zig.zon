@@ -1,5 +1,5 @@
 .{
-    .name = .quic_zig,
+    .name = .quic,
     .version = "0.1.0",
     .dependencies = .{
         .libxev = .{
@@ -7,7 +7,7 @@
             .hash = "libxev-0.0.0-86vtc689EwAjQWysidPm9NKkAwwUNByiE3kZTg_xu0Hp",
         },
     },
-    .fingerprint = 0xe7003483efbbb531,
+    .fingerprint = 0xc079525234abfc4c,
     .minimum_zig_version = "0.15.0",
     .paths = .{
         "build.zig",
