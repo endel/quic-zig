@@ -11,6 +11,10 @@ path = "src/bin/server.rs"
 name = "client"
 path = "src/bin/client.rs"
 
+[[bin]]
+name = "h3server"
+path = "src/bin/h3server.rs"
+
 [dependencies]
 quiche = "0.22"
 anyhow = "1"
@@ -18,3 +22,5 @@ clap = { version = "4", features = ["derive"] }
 ring = "0.17"
 rustls = "0.23"
 rustls-pemfile = "2"
+tokio = { version = "1", features = ["full"] }
+mio = { version = "1", features = ["net", "os-poll"] }
