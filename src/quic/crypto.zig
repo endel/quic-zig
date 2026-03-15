@@ -47,6 +47,15 @@ pub const CipherSuite = enum(u16) {
             .chacha20_poly1305_sha256 => 32,
         };
     }
+
+    /// Confidentiality limit: max packets before key rotation required.
+    /// RFC 9001 Section 6.6: 2^23 for AES-128-GCM, 2^62 for ChaCha20.
+    pub fn confidentialityLimit(self: CipherSuite) u64 {
+        return switch (self) {
+            .aes_128_gcm_sha256 => 1 << 23,
+            .chacha20_poly1305_sha256 => 1 << 62,
+        };
+    }
 };
 
 // TODO: merge this structure with "packet.Epoch" [??] they're basically the same!
@@ -754,7 +763,7 @@ pub const KeyUpdateManager = struct {
     /// Check if we should proactively initiate a key update.
     /// Returns true if packets sent with current keys >= confidentiality limit.
     pub fn shouldInitiateUpdate(self: *const KeyUpdateManager) bool {
-        return self.packets_sent_with_current >= CONFIDENTIALITY_LIMIT;
+        return self.packets_sent_with_current >= self.cipher_suite.confidentialityLimit();
     }
 
     /// Check if we are allowed to initiate a key update.
