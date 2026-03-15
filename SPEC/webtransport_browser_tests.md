@@ -105,7 +105,7 @@ Tested with quic-go's [webtransport-go](https://github.com/quic-go/webtransport-
 | server-close-code0 | FAIL | FAIL | FAIL | FAIL |
 | server-close-code42 | FAIL | FAIL | FAIL | FAIL |
 | server-close-code3999 | FAIL | FAIL | FAIL | FAIL |
-| server-connection-close | FAIL | PASS | FAIL | FAIL |
+| server-connection-close | FAIL | FAIL | FAIL | FAIL |
 | bidi-echo-small | PASS | PASS | PASS | PASS |
 | bidi-echo-3-streams | PASS | PASS | PASS | PASS |
 | bidi-echo-64kb | PASS | PASS | FAIL | PASS |
@@ -113,7 +113,7 @@ Tested with quic-go's [webtransport-go](https://github.com/quic-go/webtransport-
 | datagram-echo | PASS | PASS | PASS | PASS |
 | datagram-maxsize | PASS | PASS | PASS | PASS |
 | server-abort-stream | PASS | PASS | PASS | PASS |
-| **Total** | **9/13** | **10/13** | **8/13** | **9/13** |
+| **Total** | **9/13** | **9/13** | **8/13** | **9/13** |
 
 ### Known Issues
 
@@ -121,7 +121,7 @@ Tested with quic-go's [webtransport-go](https://github.com/quic-go/webtransport-
 
 **Safari 64KB bidi**: Safari's WebTransport (behind feature flag) appears to have a bug with large data transfers on bidirectional streams. This is a Safari issue.
 
-**server-connection-close**: Only Firefox properly handles abrupt QUIC connection close. Chrome and Safari time out waiting for `wt.closed` to resolve/reject.
+**server-connection-close (all browsers)**: All browsers time out waiting for `wt.closed` to resolve/reject after an abrupt QUIC connection close. quic-go also fails this test.
 
 ## Certificate Requirements
 
