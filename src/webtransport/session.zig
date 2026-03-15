@@ -296,7 +296,8 @@ pub const WebTransportConnection = struct {
         // Truncate reason to spec limit (1024 bytes)
         const truncated_reason = if (reason.len > 1024) reason[0..1024] else reason;
 
-        // Send CLOSE_WEBTRANSPORT_SESSION on the CONNECT stream
+        // Send CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
+        // Also stop reading (STOP_SENDING) so the peer knows we're done.
         if (self.quic.streams.getStream(session_id)) |stream| {
             var frame_buf: [1100]u8 = undefined;
             var fbs = io.fixedBufferStream(&frame_buf);
@@ -306,6 +307,7 @@ pub const WebTransportConnection = struct {
             } }, fbs.writer()) catch {};
             stream.send.writeData(fbs.getWritten()) catch {};
             stream.send.close();
+            stream.recv.stopSending(WEBTRANSPORT_SESSION_GONE);
         }
 
         session.state = .draining;
