@@ -116,6 +116,14 @@ pub fn build(b: *std.Build) void {
     run_interop_wt_client.step.dependOn(b.getInstallStep());
     b.step("run-interop-wt-client", "Run interop runner WebTransport client").dependOn(&run_interop_wt_client.step);
 
+    // QUIC Load Balancer
+    const exe_lb = App.add(b, "quic-lb", "apps/quic_lb.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_lb);
+    const run_lb = b.addRunArtifact(exe_lb);
+    run_lb.step.dependOn(b.getInstallStep());
+    if (b.args) |args_lb| run_lb.addArgs(args_lb);
+    b.step("run-quic-lb", "Run QUIC load balancer").dependOn(&run_lb.step);
+
     // Benchmark
     const exe_bench = App.add(b, "bench", "apps/bench.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_bench);

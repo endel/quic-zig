@@ -23,6 +23,7 @@ const mtu_mod = @import("mtu.zig");
 const stateless_reset = @import("stateless_reset.zig");
 const ecn = @import("ecn.zig");
 const qlog = @import("qlog.zig");
+const quic_lb = @import("quic_lb.zig");
 
 pub const State = enum(u8) {
     first_flight = 0,
@@ -275,6 +276,29 @@ pub const LocalCidPool = struct {
         return null;
     }
 
+    /// Issue a new CID using QUIC-LB encoding. Returns the entry or null if pool full.
+    /// If static_key is provided, compute a deterministic reset token; otherwise random.
+    pub fn issueNewCidLb(self: *LocalCidPool, lb_config: *const quic_lb.Config, static_key: ?[16]u8) ?*const LocalCidEntry {
+        for (&self.entries) |*entry| {
+            if (!entry.occupied) {
+                entry.occupied = true;
+                entry.retired = false;
+                entry.seq_num = self.next_seq_num;
+                const cid_len = quic_lb.cidLength(lb_config);
+                entry.cid_len = cid_len;
+                quic_lb.generateCid(lb_config, entry.cid_buf[0..cid_len]);
+                if (static_key) |key| {
+                    entry.stateless_reset_token = stateless_reset.computeToken(key, entry.cid_buf[0..cid_len]);
+                } else {
+                    crypto.random.bytes(&entry.stateless_reset_token);
+                }
+                self.next_seq_num += 1;
+                return entry;
+            }
+        }
+        return null;
+    }
+
     /// Mark an entry as retired by sequence number.
     pub fn retireBySeq(self: *LocalCidPool, seq: u64) void {
         for (&self.entries) |*entry| {
@@ -385,6 +409,8 @@ pub const ConnectionConfig = struct {
     enable_v2: bool = false,
     // Disable Path MTU Discovery (PMTUD)
     disable_pmtud: bool = false,
+    // QUIC-LB CID encoding config (server-side, for load balancer routing)
+    quic_lb: ?quic_lb.Config = null,
     // QLOG output directory (if set, writes .sqlog files)
     qlog_dir: ?[]const u8 = null,
     // Keep-alive period in milliseconds (0 = disabled). When enabled, PINGs are
@@ -449,6 +475,9 @@ pub const Connection = struct {
 
     // Static key for deterministic stateless reset tokens (RFC 9000 §10.3)
     static_reset_key: [16]u8 = .{0} ** 16,
+
+    // QUIC-LB CID encoding config (server-side, for load balancer routing)
+    quic_lb_config: ?quic_lb.Config = null,
 
     // Key update manager for 1-RTT key rotation (RFC 9001 Section 6)
     key_update: ?quic_crypto.KeyUpdateManager = null,
@@ -581,8 +610,16 @@ pub const Connection = struct {
         if (is_server) {
             conn.dcid_len = @intCast(header.scid.len);
             @memcpy(conn.dcid[0..header.scid.len], header.scid);
-            conn.scid_len = 8;
-            generateConnectionId(conn.scid[0..8]);
+            if (config.quic_lb) |lb_config| {
+                // Use QUIC-LB encoded CID for load balancer routing
+                const scid_len = quic_lb.cidLength(&lb_config);
+                conn.scid_len = scid_len;
+                quic_lb.generateCid(&lb_config, conn.scid[0..scid_len]);
+                conn.quic_lb_config = lb_config;
+            } else {
+                conn.scid_len = 8;
+                generateConnectionId(conn.scid[0..8]);
+            }
             conn.got_peer_conn_id = true;
         } else {
             conn.dcid_len = @intCast(header.dcid.len);
@@ -1691,7 +1728,11 @@ pub const Connection = struct {
                 // Issue a replacement CID to stay at the peer's limit
                 const peer_limit = if (self.peer_params) |pp| pp.active_connection_id_limit else 2;
                 if (self.local_cid_pool.activeCount() < peer_limit) {
-                    if (self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key)) |entry| {
+                    const maybe_entry = if (self.quic_lb_config) |*lb_cfg|
+                        self.local_cid_pool.issueNewCidLb(lb_cfg, self.static_reset_key)
+                    else
+                        self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key);
+                    if (maybe_entry) |entry| {
                         self.pending_frames.push(.{ .new_connection_id = .{
                             .seq_num = entry.seq_num,
                             .retire_prior_to = self.local_cid_pool.retire_prior_to,
@@ -2268,7 +2309,11 @@ pub const Connection = struct {
                     {
                         const peer_limit = if (self.peer_params) |pp| pp.active_connection_id_limit else 2;
                         while (self.local_cid_pool.activeCount() < peer_limit) {
-                            if (self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key)) |entry| {
+                            const maybe_entry = if (self.quic_lb_config) |*lb_cfg|
+                                self.local_cid_pool.issueNewCidLb(lb_cfg, self.static_reset_key)
+                            else
+                                self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key);
+                            if (maybe_entry) |entry| {
                                 self.pending_frames.push(.{ .new_connection_id = .{
                                     .seq_num = entry.seq_num,
                                     .retire_prior_to = self.local_cid_pool.retire_prior_to,
