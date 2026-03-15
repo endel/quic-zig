@@ -37,7 +37,7 @@
 
 <div class="config">
   <label>Server URL (host:port)</label>
-  <input id="server-url" value="localhost:4433">
+  <input id="server-url" value="127.0.0.1:4433">
   <label>Certificate SHA-256 hash (hex, from server output)</label>
   <input id="cert-hash" placeholder="paste hex hash from server startup output">
   <button onclick="runAllTests()">Run All Tests</button>
@@ -79,13 +79,26 @@ function wtUrl(handler) {
 
 async function createWT(handler, opts = {}) {
   const hash = getCertHash();
+  const url = wtUrl(handler);
+  log(`  connecting to: ${url}`);
   const options = {
     serverCertificateHashes: hash ? [{ algorithm: 'sha-256', value: hash.buffer }] : undefined,
     ...opts,
   };
-  const wt = new WebTransport(wtUrl(handler), options);
-  await wt.ready;
-  return wt;
+  try {
+    const wt = new WebTransport(url, options);
+    wt.closed.then(
+      info => log(`  connection closed: code=${info.closeCode} reason=${info.reason}`),
+      err => log(`  connection closed with error: ${err.message || err}`)
+    );
+    await wt.ready;
+    log(`  connected successfully`);
+    return wt;
+  } catch (err) {
+    log(`  handshake FAILED: ${err.message || err}`);
+    log(`  error name: ${err.name}, stack: ${err.stack?.split('\n')[0] || 'N/A'}`);
+    throw err;
+  }
 }
 
 // -- Test definitions --
