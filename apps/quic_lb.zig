@@ -224,11 +224,16 @@ pub fn main() !void {
 
         // Check if this is from a known backend (return traffic)
         if (isFromBackend(&config, &src_addr)) {
-            // Extract DCID from the response packet to find the client
-            const resp_dcid = extractDcid(recv_buf[0..n]) orelse continue;
-            if (findClientByCid(&client_mappings, resp_dcid)) |client_entry| {
-                const client_sa: *const posix.sockaddr = @ptrCast(&client_entry.client_addr);
-                const client_addr_len: posix.socklen_t = if (client_entry.client_addr.family == posix.AF.INET6)
+            // Find client by: 1) DCID in response, 2) fallback to backend address
+            const resp_dcid = extractDcid(recv_buf[0..n]);
+            const client_entry = if (resp_dcid) |dcid|
+                findClientByCid(&client_mappings, dcid) orelse findMappingForBackend(&client_mappings, &src_addr)
+            else
+                findMappingForBackend(&client_mappings, &src_addr);
+
+            if (client_entry) |entry| {
+                const client_sa: *const posix.sockaddr = @ptrCast(&entry.client_addr);
+                const client_addr_len: posix.socklen_t = if (entry.client_addr.family == posix.AF.INET6)
                     @sizeOf(posix.sockaddr.in6)
                 else
                     @sizeOf(posix.sockaddr.in);
@@ -348,10 +353,15 @@ fn findClientByCid(mappings: []ClientMapping, dcid: []const u8) ?*ClientMapping 
             if (std.mem.eql(u8, m.cid[0..m.cid_len], dcid[0..m.cid_len])) return m;
         }
     }
-    std.log.debug("LB: findClientByCid failed for dcid len={d}, stored mappings: {d} occupied", .{
-        dcid.len,
-        countOccupied(mappings),
-    });
+    if (dcid.len >= 4) {
+        const stored_cid = if (countOccupied(mappings) > 0) blk: {
+            for (mappings) |*m| {
+                if (m.occupied and m.cid_len > 0) break :blk m.cid[0..@min(4, m.cid_len)];
+            }
+            break :blk @as([]const u8, &.{});
+        } else @as([]const u8, &.{});
+        std.log.debug("LB: CID mismatch, dcid={x}, stored={x}", .{ dcid[0..@min(4, dcid.len)], stored_cid });
+    }
     return null;
 }
 
@@ -368,6 +378,22 @@ fn findMappingForClient(mappings: []ClientMapping, client_addr: *const posix.soc
         if (m.occupied and sockaddrEql(&m.client_addr, client_addr)) return m;
     }
     return null;
+}
+
+fn findMappingForBackend(mappings: []ClientMapping, backend_addr: *const posix.sockaddr.storage) ?*ClientMapping {
+    const src_port = std.mem.readInt(u16, std.mem.asBytes(backend_addr)[2..4], .big);
+    var best: ?*ClientMapping = null;
+    var best_time: i64 = 0;
+    for (mappings) |*m| {
+        if (m.occupied and m.last_seen >= best_time) {
+            const m_port = std.mem.readInt(u16, std.mem.asBytes(&m.backend_addr)[2..4], .big);
+            if (m_port == src_port) {
+                best = m;
+                best_time = m.last_seen;
+            }
+        }
+    }
+    return best;
 }
 
 fn storeClientMapping(mappings: []ClientMapping, client_scid: []const u8, client_addr: *const posix.sockaddr.storage, backend_addr: *const posix.sockaddr, now: i64) void {

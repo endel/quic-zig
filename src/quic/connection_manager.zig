@@ -7,6 +7,7 @@ const connection = @import("connection.zig");
 const packet = @import("packet.zig");
 const protocol = @import("protocol.zig");
 const stateless_reset = @import("stateless_reset.zig");
+const quic_lb = @import("quic_lb.zig");
 const tls13 = @import("tls13.zig");
 const h3 = @import("../h3/connection.zig");
 const h0 = @import("../h0/connection.zig");
@@ -118,6 +119,7 @@ pub const ConnectionManager = struct {
             .conn_config = conn_config,
             .retry_token_key = retry_token_key,
             .static_reset_key = static_reset_key,
+            .local_cid_len = if (conn_config.quic_lb) |lb| quic_lb.cidLength(&lb) else 8,
         };
     }
 

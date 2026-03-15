@@ -1,6 +1,8 @@
 const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
+const connection = quic.connection;
+const quic_lb = quic.quic_lb;
 const qpack = quic.qpack;
 
 const H3Handler = struct {
@@ -34,16 +36,42 @@ pub fn main() !void {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Parse --port argument
     var port: u16 = 4434;
+    var server_id_hex: ?[]const u8 = null;
+    var lb_key_hex: ?[]const u8 = null;
     var args = std.process.args();
-    _ = args.next(); // skip program name
+    _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
-            if (args.next()) |port_str| {
-                port = std.fmt.parseInt(u16, port_str, 10) catch 4434;
-            }
+            if (args.next()) |v| port = std.fmt.parseInt(u16, v, 10) catch 4434;
+        } else if (std.mem.eql(u8, arg, "--server-id")) {
+            if (args.next()) |v| server_id_hex = v;
+        } else if (std.mem.eql(u8, arg, "--lb-key")) {
+            if (args.next()) |v| lb_key_hex = v;
         }
+    }
+
+    var conn_config: ?connection.ConnectionConfig = null;
+    if (server_id_hex) |sid_hex| {
+        var cfg = quic_lb.Config{
+            .config_id = 0,
+            .server_id_len = @intCast(sid_hex.len / 2),
+            .nonce_len = 6,
+        };
+        _ = std.fmt.hexToBytes(cfg.server_id[0..cfg.server_id_len], sid_hex) catch {
+            std.log.err("invalid --server-id hex: {s}", .{sid_hex});
+            return;
+        };
+        if (lb_key_hex) |khex| {
+            var key: [16]u8 = undefined;
+            _ = std.fmt.hexToBytes(&key, khex) catch {
+                std.log.err("invalid --lb-key hex", .{});
+                return;
+            };
+            cfg.key = key;
+        }
+        conn_config = .{ .quic_lb = cfg };
+        std.log.info("QUIC-LB: server_id={s}, encrypted={}", .{ sid_hex, cfg.key != null });
     }
 
     var handler = H3Handler{ .alloc = alloc };
@@ -51,7 +79,8 @@ pub fn main() !void {
         .port = port,
         .cert_path = "interop/certs/server.crt",
         .key_path = "interop/certs/server.key",
-        .require_retry = true,
+        .require_retry = if (server_id_hex != null) false else true,
+        .conn_config = conn_config,
     });
     defer server.deinit();
 
