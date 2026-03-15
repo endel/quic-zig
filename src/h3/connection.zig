@@ -157,6 +157,7 @@ pub const H3Connection = struct {
         self.stream_bufs.deinit();
         self.finished_streams.deinit();
         self.excluded_bidi_streams.deinit();
+        self.headers_received_streams.deinit();
     }
 
     /// Initialize the HTTP/3 connection: open control + QPACK streams, send SETTINGS.
@@ -1163,6 +1164,7 @@ test "H3Connection: init and deinit" {
     conn.stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(testing.allocator);
     conn.finished_streams = std.AutoHashMap(u64, void).init(testing.allocator);
     conn.excluded_bidi_streams = std.AutoHashMap(u64, void).init(testing.allocator);
+    conn.headers_received_streams = std.AutoHashMap(u64, void).init(testing.allocator);
     conn.deinit();
 }
 
