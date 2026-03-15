@@ -2030,6 +2030,30 @@ pub const Connection = struct {
                     if (hs.peer_transport_params) |peer_tp| {
                         self.peer_params = peer_tp;
 
+                        // Validate initial_source_connection_id is present (RFC 9000 §7.3)
+                        if (peer_tp.initial_source_connection_id == null) {
+                            std.log.err("transport param validation failed: initial_source_connection_id missing", .{});
+                            self.closeWithTransportError(0x08, 0x06, "missing initial_source_connection_id");
+                            return error.TransportParameterError;
+                        }
+
+                        // Validate numeric ranges (RFC 9000 §7.4, §18.2)
+                        if (peer_tp.max_udp_payload_size < 1200) {
+                            std.log.err("transport param validation failed: max_udp_payload_size < 1200", .{});
+                            self.closeWithTransportError(0x08, 0x06, "max_udp_payload_size below 1200");
+                            return error.TransportParameterError;
+                        }
+                        if (peer_tp.ack_delay_exponent > 20) {
+                            std.log.err("transport param validation failed: ack_delay_exponent > 20", .{});
+                            self.closeWithTransportError(0x08, 0x06, "ack_delay_exponent exceeds 20");
+                            return error.TransportParameterError;
+                        }
+                        if (peer_tp.max_ack_delay >= 16384) {
+                            std.log.err("transport param validation failed: max_ack_delay >= 2^14", .{});
+                            self.closeWithTransportError(0x08, 0x06, "max_ack_delay exceeds 2^14");
+                            return error.TransportParameterError;
+                        }
+
                         // Client-side: validate ODCID and retry_scid transport params (RFC 9000 §7.3)
                         if (!self.is_server) {
                             // original_destination_connection_id must match the DCID we initially sent
@@ -2055,6 +2079,30 @@ pub const Connection = struct {
                                     std.log.err("transport param validation failed: retry_scid present without Retry", .{});
                                     return error.TransportParameterError;
                                 }
+                            }
+                        }
+
+                        // Server-side: reject server-only params from client (RFC 9000 §18.2)
+                        if (self.is_server) {
+                            if (peer_tp.original_destination_connection_id != null) {
+                                std.log.err("transport param validation failed: client sent original_destination_connection_id", .{});
+                                self.closeWithTransportError(0x08, 0x06, "client sent original_destination_connection_id");
+                                return error.TransportParameterError;
+                            }
+                            if (peer_tp.preferred_address != null) {
+                                std.log.err("transport param validation failed: client sent preferred_address", .{});
+                                self.closeWithTransportError(0x08, 0x06, "client sent preferred_address");
+                                return error.TransportParameterError;
+                            }
+                            if (peer_tp.retry_source_connection_id != null) {
+                                std.log.err("transport param validation failed: client sent retry_source_connection_id", .{});
+                                self.closeWithTransportError(0x08, 0x06, "client sent retry_source_connection_id");
+                                return error.TransportParameterError;
+                            }
+                            if (peer_tp.stateless_reset_token != null) {
+                                std.log.err("transport param validation failed: client sent stateless_reset_token", .{});
+                                self.closeWithTransportError(0x08, 0x06, "client sent stateless_reset_token");
+                                return error.TransportParameterError;
                             }
                         }
 
