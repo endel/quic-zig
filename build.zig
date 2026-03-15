@@ -79,6 +79,14 @@ pub fn build(b: *std.Build) void {
     run_wt_browser.step.dependOn(b.getInstallStep());
     b.step("run-wt-browser-server", "Run WebTransport browser server").dependOn(&run_wt_browser.step);
 
+    // WebTransport echo server (production deployment)
+    const exe_wt_echo = App.add(b, "wt-echo-server", "apps/wt_echo_server.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_wt_echo);
+    const run_wt_echo = b.addRunArtifact(exe_wt_echo);
+    run_wt_echo.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_wt_echo.addArgs(args);
+    b.step("run-wt-echo-server", "Run WebTransport echo server").dependOn(&run_wt_echo.step);
+
     // Interop runner server
     const exe_interop_server = App.add(b, "interop-server", "apps/interop_server.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_interop_server);
