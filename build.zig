@@ -116,6 +116,14 @@ pub fn build(b: *std.Build) void {
     run_interop_wt_client.step.dependOn(b.getInstallStep());
     b.step("run-interop-wt-client", "Run interop runner WebTransport client").dependOn(&run_interop_wt_client.step);
 
+    // Benchmark
+    const exe_bench = App.add(b, "bench", "apps/bench.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_bench);
+    const run_bench = b.addRunArtifact(exe_bench);
+    run_bench.step.dependOn(b.getInstallStep());
+    if (b.args) |args_b| run_bench.addArgs(args_b);
+    b.step("run-bench", "Run benchmark client").dependOn(&run_bench.step);
+
     // Tests
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
