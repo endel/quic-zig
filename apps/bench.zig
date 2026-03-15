@@ -87,50 +87,66 @@ fn doRequests(
     latency_offset: *u32,
     total_bytes: *u64,
 ) void {
-    var req_idx: u32 = 0;
-    while (req_idx < count) : (req_idx += 1) {
-        const req_start = timestamp();
+    const req_headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = ":path", .value = "/" },
+    };
 
-        const req_headers = [_]qpack.Header{
-            .{ .name = ":method", .value = "GET" },
-            .{ .name = ":scheme", .value = "https" },
-            .{ .name = ":authority", .value = "localhost" },
-            .{ .name = ":path", .value = "/" },
-        };
-        _ = h3_conn.sendRequest(&req_headers, null) catch break;
+    // Track per-stream send times for latency measurement
+    var stream_send_time: [256]i64 = undefined;
+    var req_idx: u32 = 0;
+    var responses: u32 = 0;
+    var in_flight: u32 = 0;
+    const max_in_flight: u32 = 8; // pipeline up to 8 requests
+
+    while (responses < count) {
+        // Send requests up to pipeline limit
+        while (req_idx < count and in_flight < max_in_flight) {
+            const stream_id = h3_conn.sendRequest(&req_headers, null) catch break;
+            const slot = (stream_id / 4) % stream_send_time.len;
+            stream_send_time[slot] = timestamp();
+            req_idx += 1;
+            in_flight += 1;
+        }
         sendAll(cs);
 
-        var got_response = false;
-        var wait: usize = 0;
-        while (!got_response and wait < 200) : (wait += 1) {
+        // Poll for responses (tight loop, no sleep)
+        var spins: u32 = 0;
+        while (spins < 5000) : (spins += 1) {
             recvAll(cs);
             cs.conn.onTimeout() catch {};
             sendAll(cs);
 
+            var got_event = false;
             while (true) {
                 const event = h3_conn.poll() catch break;
                 if (event == null) break;
+                got_event = true;
                 switch (event.?) {
                     .data => |d| {
                         var body_buf: [8192]u8 = undefined;
                         while (h3_conn.recvBody(&body_buf) > 0) {}
                         total_bytes.* += d.len;
                     },
-                    .finished => {
-                        got_response = true;
+                    .finished => |stream_id| {
+                        const slot = (stream_id / 4) % stream_send_time.len;
+                        if (latency_offset.* < latencies.len) {
+                            latencies[latency_offset.*] = timestamp() - stream_send_time[slot];
+                            latency_offset.* += 1;
+                        }
+                        responses += 1;
+                        in_flight -= 1;
                     },
                     .headers, .settings => {},
                     else => {},
                 }
             }
-
-            if (!got_response) std.Thread.sleep(100 * std.time.ns_per_us);
+            if (got_event) break; // got progress, send more
         }
 
-        if (got_response and latency_offset.* < latencies.len) {
-            latencies[latency_offset.*] = timestamp() - req_start;
-            latency_offset.* += 1;
-        }
+        if (cs.conn.state == .draining or cs.conn.state == .closing) break;
     }
 }
 
