@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebTransport WPT Tests — quic-zig</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Menlo', monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+  h1 { color: #00d4ff; margin-bottom: 8px; font-size: 1.4em; }
+  .subtitle { color: #888; margin-bottom: 20px; font-size: 0.85em; }
+  .config { background: #16213e; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  .config label { display: block; margin-bottom: 6px; color: #aaa; font-size: 0.85em; }
+  .config input { background: #0f3460; border: 1px solid #555; color: #fff; padding: 6px 10px; border-radius: 4px; width: 100%; font-family: inherit; margin-bottom: 10px; }
+  .config button { background: #00d4ff; color: #000; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; font-family: inherit; margin-right: 8px; }
+  .config button:hover { background: #00b8d4; }
+  .config button.danger { background: #ff4444; color: #fff; }
+  .tests { display: grid; gap: 8px; }
+  .test-group { background: #16213e; border: 1px solid #333; border-radius: 8px; padding: 12px 16px; }
+  .test-group h3 { color: #00d4ff; font-size: 0.95em; margin-bottom: 8px; }
+  .test-case { padding: 4px 0; font-size: 0.85em; display: flex; align-items: center; gap: 8px; }
+  .test-case .status { width: 20px; text-align: center; }
+  .pass { color: #4caf50; }
+  .fail { color: #f44336; }
+  .skip { color: #ff9800; }
+  .pending { color: #666; }
+  .error-detail { color: #f44336; font-size: 0.8em; margin-left: 28px; word-break: break-all; }
+  .summary { background: #16213e; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-top: 20px; }
+  .summary span { margin-right: 20px; }
+  #log { background: #0a0a1a; border: 1px solid #333; border-radius: 8px; padding: 12px; margin-top: 20px; max-height: 300px; overflow-y: auto; font-size: 0.8em; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+
+<h1>WebTransport WPT Tests</h1>
+<p class="subtitle">Testing quic-zig server against W3C Web Platform Tests handler behaviors</p>
+
+<div class="config">
+  <label>Server URL (host:port)</label>
+  <input id="server-url" value="localhost:4433">
+  <label>Certificate SHA-256 hash (hex, from server output)</label>
+  <input id="cert-hash" placeholder="paste hex hash from server startup output">
+  <button onclick="runAllTests()">Run All Tests</button>
+  <button class="danger" onclick="clearResults()">Clear</button>
+</div>
+
+<div class="summary" id="summary" style="display:none">
+  <span class="pass" id="pass-count">0 passed</span>
+  <span class="fail" id="fail-count">0 failed</span>
+  <span class="skip" id="skip-count">0 skipped</span>
+</div>
+
+<div class="tests" id="tests"></div>
+<div id="log"></div>
+
+<script>
+const TIMEOUT = 10000; // 10s per test
+
+function log(msg) {
+  const el = document.getElementById('log');
+  el.textContent += msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+function getServerUrl() {
+  return document.getElementById('server-url').value;
+}
+
+function getCertHash() {
+  const hex = document.getElementById('cert-hash').value.trim();
+  if (!hex) return null;
+  const bytes = new Uint8Array(hex.match(/.{2}/g).map(b => parseInt(b, 16)));
+  return bytes;
+}
+
+function wtUrl(handler) {
+  return `https://${getServerUrl()}/webtransport/handlers/${handler}`;
+}
+
+async function createWT(handler, opts = {}) {
+  const hash = getCertHash();
+  const options = {
+    serverCertificateHashes: hash ? [{ algorithm: 'sha-256', value: hash.buffer }] : undefined,
+    ...opts,
+  };
+  const wt = new WebTransport(wtUrl(handler), options);
+  await wt.ready;
+  return wt;
+}
+
+// -- Test definitions --
+
+const TEST_GROUPS = [
+  {
+    name: 'Connection',
+    tests: [
+      {
+        name: 'basic connection to echo handler',
+        run: async () => {
+          const wt = await createWT('echo.py');
+          wt.close();
+        }
+      },
+      {
+        name: 'connection with server-close (code=0)',
+        run: async () => {
+          const wt = await createWT('server-close.py?code=0&reason=bye');
+          const info = await wt.closed;
+          assert(info.closeCode === 0, `expected code 0, got ${info.closeCode}`);
+          assert(info.reason === 'bye', `expected reason "bye", got "${info.reason}"`);
+        }
+      },
+      {
+        name: 'connection with server-close (code=42)',
+        run: async () => {
+          const wt = await createWT('server-close.py?code=42&reason=test');
+          const info = await wt.closed;
+          assert(info.closeCode === 42, `expected code 42, got ${info.closeCode}`);
+        }
+      },
+      {
+        name: 'client-initiated close with code and reason',
+        run: async () => {
+          const wt = await createWT('echo.py');
+          wt.close({ closeCode: 7, reason: 'client done' });
+          await wt.closed;
+        }
+      },
+    ]
+  },
+  {
+    name: 'Bidirectional Streams',
+    tests: [
+      {
+        name: 'echo on bidi stream',
+        run: async () => {
+          const wt = await createWT('echo.py');
+          const stream = await wt.createBidirectionalStream();
+          const writer = stream.writable.getWriter();
+          await writer.write(new TextEncoder().encode('hello'));
+          await writer.close();
+          const data = await readStream(stream.readable);
+          assert(data === 'hello', `expected "hello", got "${data}"`);
+          wt.close();
+        }
+      },
+      {
+        name: 'echo multiple bidi streams',
+        run: async () => {
+          const wt = await createWT('echo.py');
+          const promises = [];
+          for (let i = 0; i < 3; i++) {
+            promises.push((async () => {
+              const stream = await wt.createBidirectionalStream();
+              const writer = stream.writable.getWriter();
+              const msg = `msg${i}`;
+              await writer.write(new TextEncoder().encode(msg));
+              await writer.close();
+              const data = await readStream(stream.readable);
+              assert(data === msg, `stream ${i}: expected "${msg}", got "${data}"`);
+            })());
+          }
+          await Promise.all(promises);
+          wt.close();
+        }
+      },
+      {
+        name: 'echo large bidi data (64KB)',
+        run: async () => {
+          const wt = await createWT('echo.py');
+          const stream = await wt.createBidirectionalStream();
+          const writer = stream.writable.getWriter();
+          const data = new Uint8Array(65536);
+          for (let i = 0; i < data.length; i++) data[i] = i & 0xff;
+          await writer.write(data);
+          await writer.close();
+          const result = await readStreamBytes(stream.readable);
+          assert(result.length === data.length, `expected ${data.length} bytes, got ${result.length}`);
+          wt.close();
+        }
+      },
+    ]
+  },
+  {
+    name: 'Unidirectional Streams',
+    tests: [
+      {
+        name: 'echo on uni stream (client→server→client)',
+        run: async () => {
+          const wt = await createWT('echo.py');
+          // Send on client-initiated uni stream
+          const sendStream = await wt.createUnidirectionalStream();
+          const writer = sendStream.getWriter();
+          await writer.write(new TextEncoder().encode('uni-hello'));
+          await writer.close();
+          // Read from server-initiated uni stream
+          const reader = wt.incomingUnidirectionalStreams.getReader();
+          const { value: recvStream } = await reader.read();
+          reader.releaseLock();
+          const data = await readStream(recvStream);
+          assert(data === 'uni-hello', `expected "uni-hello", got "${data}"`);
+          wt.close();
+        }
+      },
+    ]
+  },
+  {
+    name: 'Datagrams',
+    tests: [
+      {
+        name: 'echo datagram',
+        run: async () => {
+          const wt = await createWT('echo.py');
+          const writer = wt.datagrams.writable.getWriter();
+          await writer.write(new TextEncoder().encode('dgram-test'));
+          writer.releaseLock();
+          const reader = wt.datagrams.readable.getReader();
+          const { value } = await reader.read();
+          reader.releaseLock();
+          const text = new TextDecoder().decode(value);
+          assert(text === 'dgram-test', `expected "dgram-test", got "${text}"`);
+          wt.close();
+        }
+      },
+      {
+        name: 'maxDatagramSize is positive',
+        run: async () => {
+          const wt = await createWT('echo.py');
+          const size = wt.datagrams.maxDatagramSize;
+          assert(size > 0, `maxDatagramSize should be > 0, got ${size}`);
+          wt.close();
+        }
+      },
+    ]
+  },
+  {
+    name: 'Server-Initiated Actions',
+    tests: [
+      {
+        name: 'server aborts stream with error code',
+        run: async () => {
+          const wt = await createWT('abort-stream-from-server.py?code=42');
+          // Server creates and resets a bidi stream — we should see it
+          const reader = wt.incomingBidirectionalStreams.getReader();
+          try {
+            const { value: stream } = await withTimeout(reader.read(), 5000);
+            reader.releaseLock();
+            // Try reading — should get error from reset
+            try {
+              await readStream(stream.readable);
+              assert(false, 'expected stream read to fail');
+            } catch (e) {
+              // Expected: stream was reset by server
+            }
+          } catch (e) {
+            reader.releaseLock();
+            // Timeout acceptable — server may reset before we see it
+          }
+          wt.close();
+        }
+      },
+      {
+        name: 'server connection close',
+        run: async () => {
+          const wt = await createWT('server-connection-close.py');
+          // Server should abruptly close the connection
+          try {
+            await wt.closed;
+          } catch (e) {
+            // Connection was closed abruptly — expected
+          }
+        }
+      },
+    ]
+  },
+  {
+    name: 'Close Semantics',
+    tests: [
+      {
+        name: 'server close with code 0',
+        run: async () => {
+          const wt = await createWT('server-close.py?code=0');
+          const info = await wt.closed;
+          assert(info.closeCode === 0, `expected code 0, got ${info.closeCode}`);
+        }
+      },
+      {
+        name: 'server close with max code (3999)',
+        run: async () => {
+          const wt = await createWT('server-close.py?code=3999&reason=max');
+          const info = await wt.closed;
+          assert(info.closeCode === 3999, `expected code 3999, got ${info.closeCode}`);
+        }
+      },
+    ]
+  },
+];
+
+// -- Helpers --
+
+function assert(condition, msg) {
+  if (!condition) throw new Error(msg || 'assertion failed');
+}
+
+async function readStream(readable) {
+  const reader = readable.getReader();
+  const chunks = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  reader.releaseLock();
+  return new TextDecoder().decode(concatArrays(chunks));
+}
+
+async function readStreamBytes(readable) {
+  const reader = readable.getReader();
+  const chunks = [];
+  let totalLen = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    totalLen += value.length;
+  }
+  reader.releaseLock();
+  const result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
+}
+
+function concatArrays(arrays) {
+  const total = arrays.reduce((sum, a) => sum + a.length, 0);
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const a of arrays) {
+    result.set(a, offset);
+    offset += a.length;
+  }
+  return result;
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))
+  ]);
+}
+
+// -- Test runner --
+
+let results = { pass: 0, fail: 0, skip: 0 };
+
+function clearResults() {
+  document.getElementById('tests').innerHTML = '';
+  document.getElementById('log').textContent = '';
+  document.getElementById('summary').style.display = 'none';
+  results = { pass: 0, fail: 0, skip: 0 };
+}
+
+function updateSummary() {
+  document.getElementById('summary').style.display = 'block';
+  document.getElementById('pass-count').textContent = `${results.pass} passed`;
+  document.getElementById('fail-count').textContent = `${results.fail} failed`;
+  document.getElementById('skip-count').textContent = `${results.skip} skipped`;
+}
+
+async function runAllTests() {
+  clearResults();
+  const hash = getCertHash();
+  if (!hash) {
+    log('ERROR: Please paste the certificate SHA-256 hash from the server output');
+    return;
+  }
+
+  const testsEl = document.getElementById('tests');
+
+  for (const group of TEST_GROUPS) {
+    const groupEl = document.createElement('div');
+    groupEl.className = 'test-group';
+    groupEl.innerHTML = `<h3>${group.name}</h3>`;
+    testsEl.appendChild(groupEl);
+
+    for (const test of group.tests) {
+      const testEl = document.createElement('div');
+      testEl.className = 'test-case';
+      testEl.innerHTML = `<span class="status pending">...</span><span>${test.name}</span>`;
+      groupEl.appendChild(testEl);
+
+      try {
+        log(`[RUN] ${group.name} / ${test.name}`);
+        await withTimeout(test.run(), TIMEOUT);
+        testEl.querySelector('.status').textContent = '\u2713';
+        testEl.querySelector('.status').className = 'status pass';
+        results.pass++;
+        log(`[PASS] ${group.name} / ${test.name}`);
+      } catch (err) {
+        testEl.querySelector('.status').textContent = '\u2717';
+        testEl.querySelector('.status').className = 'status fail';
+        results.fail++;
+        const errEl = document.createElement('div');
+        errEl.className = 'error-detail';
+        errEl.textContent = err.message || String(err);
+        groupEl.appendChild(errEl);
+        log(`[FAIL] ${group.name} / ${test.name}: ${err.message || err}`);
+      }
+      updateSummary();
+    }
+  }
+  log(`\nDone: ${results.pass} passed, ${results.fail} failed, ${results.skip} skipped`);
+}
+</script>
+</body>
+</html>

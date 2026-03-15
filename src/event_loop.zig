@@ -81,6 +81,48 @@ pub const Session = struct {
         }
     }
 
+    pub fn openBidiStream(self: *Session, session_id: u64) !u64 {
+        if (self.entry.wt_conn) |*wtc| {
+            return try wtc.openBidiStream(session_id);
+        }
+        return error.NoWtConnection;
+    }
+
+    pub fn openUniStream(self: *Session, session_id: u64) !u64 {
+        if (self.entry.wt_conn) |*wtc| {
+            return try wtc.openUniStream(session_id);
+        }
+        return error.NoWtConnection;
+    }
+
+    pub fn closeSession(self: *Session, session_id: u64) void {
+        if (self.entry.wt_conn) |*wtc| {
+            wtc.closeSession(session_id);
+        }
+    }
+
+    pub fn closeSessionWithError(self: *Session, session_id: u64, error_code: u32, reason: []const u8) !void {
+        if (self.entry.wt_conn) |*wtc| {
+            try wtc.closeSessionWithError(session_id, error_code, reason);
+        }
+    }
+
+    pub fn resetStream(self: *Session, stream_id: u64, error_code: u32) void {
+        if (self.entry.wt_conn) |*wtc| {
+            wtc.resetStream(stream_id, error_code);
+        }
+    }
+
+    pub fn acceptSessionWithHeaders(self: *Session, session_id: u64, extra_headers: []const qpack.Header) !void {
+        if (self.entry.wt_conn) |*wtc| {
+            try wtc.acceptSessionWithHeaders(session_id, extra_headers);
+        }
+    }
+
+    pub fn closeConnection(self: *Session) void {
+        self.entry.conn.close(0, "");
+    }
+
     pub fn isDatagramSendQueueFull(self: *const Session) bool {
         if (self.entry.wt_conn) |*wtc| {
             return wtc.isDatagramSendQueueFull();
@@ -531,7 +573,17 @@ pub fn Server(comptime Handler: type) type {
                             self.handler.onSessionDraining(&session, drain.session_id);
                         }
                     },
-                    .bidi_stream, .uni_stream, .session_rejected => {},
+                    .bidi_stream => |bs| {
+                        if (@hasDecl(Handler, "onBidiStream")) {
+                            self.handler.onBidiStream(&session, bs.session_id, bs.stream_id);
+                        }
+                    },
+                    .uni_stream => |us| {
+                        if (@hasDecl(Handler, "onUniStream")) {
+                            self.handler.onUniStream(&session, us.session_id, us.stream_id);
+                        }
+                    },
+                    .session_rejected => {},
                 }
             }
         }

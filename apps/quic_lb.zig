@@ -30,8 +30,12 @@ const ServerMapping = struct {
     addr: net.Address,
 };
 
-/// Mapping: client address → backend address (for return traffic)
+/// Mapping: connection ID → client address (for return traffic)
+/// We store the client's SCID (which becomes the server's DCID in responses)
 const ClientMapping = struct {
+    /// Client's SCID (the DCID the server will use when responding)
+    cid: [20]u8 = .{0} ** 20,
+    cid_len: u8 = 0,
     client_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage),
     backend_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage),
     occupied: bool = false,
@@ -195,6 +199,7 @@ pub fn main() !void {
     // Client mappings for return traffic
     var client_mappings: [MAX_CLIENTS]ClientMapping = .{ClientMapping{}} ** MAX_CLIENTS;
 
+    var next_rr: usize = 0; // round-robin index for Initial packets
     var recv_buf: [MAX_PACKET_SIZE]u8 = undefined;
     var src_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
     var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
@@ -218,17 +223,20 @@ pub fn main() !void {
         const now: i64 = @intCast(std.time.nanoTimestamp());
 
         // Check if this is from a known backend (return traffic)
-        if (findClientForBackend(&client_mappings, &src_addr)) |client_entry| {
-            // Forward back to client
-            const client_sa: *const posix.sockaddr = @ptrCast(&client_entry.client_addr);
-            const client_addr_len: posix.socklen_t = if (client_entry.client_addr.family == posix.AF.INET6)
-                @sizeOf(posix.sockaddr.in6)
-            else
-                @sizeOf(posix.sockaddr.in);
-            _ = posix.sendto(sock, recv_buf[0..n], 0, client_sa, client_addr_len) catch |err| {
-                std.log.err("sendto client error: {any}", .{err});
-                continue;
-            };
+        if (isFromBackend(&config, &src_addr)) {
+            // Extract DCID from the response packet to find the client
+            const resp_dcid = extractDcid(recv_buf[0..n]) orelse continue;
+            if (findClientByCid(&client_mappings, resp_dcid)) |client_entry| {
+                const client_sa: *const posix.sockaddr = @ptrCast(&client_entry.client_addr);
+                const client_addr_len: posix.socklen_t = if (client_entry.client_addr.family == posix.AF.INET6)
+                    @sizeOf(posix.sockaddr.in6)
+                else
+                    @sizeOf(posix.sockaddr.in);
+                _ = posix.sendto(sock, recv_buf[0..n], 0, client_sa, client_addr_len) catch |err| {
+                    std.log.err("sendto client error: {any}", .{err});
+                    continue;
+                };
+            }
             continue;
         }
 
@@ -255,62 +263,132 @@ pub fn main() !void {
 
         const dcid = recv_buf[dcid_offset .. dcid_offset + dcid_len];
 
-        // Check config_id matches
-        if (dcid.len < 1) continue;
-        const pkt_config_id = quic_lb.extractConfigId(dcid[0]);
-        if (pkt_config_id != config.lb_config.config_id) {
-            std.log.warn("unknown config_id {d} in packet, dropping", .{pkt_config_id});
-            continue;
+        // Try to extract server_id from CID for routing
+        var backend_addr: ?net.Address = null;
+
+        if (dcid.len >= quic_lb.cidLength(&config.lb_config)) {
+            var server_id: [15]u8 = undefined;
+            if (quic_lb.extractServerId(&config.lb_config, dcid, &server_id)) {
+                backend_addr = findBackend(&config, &server_id);
+            }
         }
 
-        // Extract server_id
-        var server_id: [15]u8 = undefined;
-        if (!quic_lb.extractServerId(&config.lb_config, dcid, &server_id)) {
-            std.log.warn("failed to extract server_id from CID, dropping", .{});
-            continue;
+        // Fallback: Initial packets have random client-generated DCIDs.
+        // Route by round-robin, or reuse existing client mapping.
+        if (backend_addr == null) {
+            // Check if we already have a mapping for this client
+            if (findMappingForClient(&client_mappings, &src_addr)) |existing| {
+                // Find the server entry matching this backend address
+                for (config.servers[0..config.server_count]) |mapping| {
+                    if (sockaddrEql(&existing.backend_addr, &addrToStorage(&mapping.addr.any))) {
+                        backend_addr = mapping.addr;
+                        break;
+                    }
+                }
+            }
+            if (backend_addr == null and config.server_count > 0) {
+                // Round-robin for new clients
+                backend_addr = config.servers[next_rr].addr;
+                next_rr = (next_rr + 1) % config.server_count;
+            }
         }
 
-        // Look up backend
-        const backend_addr = findBackend(&config, &server_id) orelse {
-            std.log.warn("no backend for server_id (first 2 bytes: {x:0>2}{x:0>2})", .{ server_id[0], server_id[1] });
-            continue;
-        };
+        const dest = backend_addr orelse continue;
 
         // Store client → backend mapping for return traffic
-        storeClientMapping(&client_mappings, &src_addr, &backend_addr.any, now);
+        // Extract client's SCID from long header (Initial/Handshake)
+        if (is_long_header and n > dcid_offset + dcid_len + 1) {
+            const scid_len_pos = dcid_offset + dcid_len;
+            const scid_len_val = recv_buf[scid_len_pos];
+            if (n > scid_len_pos + 1 + scid_len_val) {
+                const scid = recv_buf[scid_len_pos + 1 .. scid_len_pos + 1 + scid_len_val];
+                storeClientMapping(&client_mappings, scid, &src_addr, &dest.any, now);
+            }
+        }
 
         // Forward to backend
-        _ = posix.sendto(sock, recv_buf[0..n], 0, &backend_addr.any, backend_addr.getOsSockLen()) catch |err| {
+        _ = posix.sendto(sock, recv_buf[0..n], 0, &dest.any, dest.getOsSockLen()) catch |err| {
             std.log.err("sendto backend error: {any}", .{err});
             continue;
         };
     }
 }
 
-fn findClientForBackend(mappings: []ClientMapping, backend_addr: *const posix.sockaddr.storage) ?*ClientMapping {
-    for (mappings) |*m| {
-        if (m.occupied and sockaddrEql(&m.backend_addr, backend_addr)) {
-            return m;
+fn isFromBackend(config: *const LbConfig, addr: *const posix.sockaddr.storage) bool {
+    const src_port = std.mem.readInt(u16, std.mem.asBytes(addr)[2..4], .big);
+    for (config.servers[0..config.server_count]) |mapping| {
+        if (mapping.addr.getPort() == src_port) {
+            std.log.info("LB: return traffic from backend port {d}", .{src_port});
+            return true;
         }
+    }
+    std.log.debug("LB: packet from port {d} (not a backend)", .{src_port});
+    return false;
+}
+
+fn extractDcid(pkt: []const u8) ?[]const u8 {
+    if (pkt.len < 2) return null;
+    if (pkt[0] & 0x80 != 0) {
+        // Long header: DCID len at byte 5, DCID at byte 6
+        if (pkt.len < 6) return null;
+        const dcid_len = pkt[5];
+        if (pkt.len < 6 + dcid_len) return null;
+        return pkt[6 .. 6 + dcid_len];
+    } else {
+        // Short header: DCID at byte 1, but we don't know the length.
+        // Use the client's known CID length — typically 8 bytes for our implementation.
+        const dcid_len: usize = @min(8, pkt.len - 1);
+        return pkt[1 .. 1 + dcid_len];
+    }
+}
+
+fn findClientByCid(mappings: []ClientMapping, dcid: []const u8) ?*ClientMapping {
+    for (mappings) |*m| {
+        if (m.occupied and m.cid_len > 0 and m.cid_len <= dcid.len) {
+            if (std.mem.eql(u8, m.cid[0..m.cid_len], dcid[0..m.cid_len])) return m;
+        }
+    }
+    std.log.debug("LB: findClientByCid failed for dcid len={d}, stored mappings: {d} occupied", .{
+        dcid.len,
+        countOccupied(mappings),
+    });
+    return null;
+}
+
+fn countOccupied(mappings: []const ClientMapping) usize {
+    var n: usize = 0;
+    for (mappings) |m| {
+        if (m.occupied) n += 1;
+    }
+    return n;
+}
+
+fn findMappingForClient(mappings: []ClientMapping, client_addr: *const posix.sockaddr.storage) ?*ClientMapping {
+    for (mappings) |*m| {
+        if (m.occupied and sockaddrEql(&m.client_addr, client_addr)) return m;
     }
     return null;
 }
 
-fn storeClientMapping(mappings: []ClientMapping, client_addr: *const posix.sockaddr.storage, backend_addr: *const posix.sockaddr, now: i64) void {
-    // Try to find existing or empty slot
+fn storeClientMapping(mappings: []ClientMapping, client_scid: []const u8, client_addr: *const posix.sockaddr.storage, backend_addr: *const posix.sockaddr, now: i64) void {
     var oldest_idx: usize = 0;
     var oldest_time: i64 = std.math.maxInt(i64);
 
     for (mappings, 0..) |*m, i| {
-        if (!m.occupied) {
-            m.occupied = true;
+        // Update existing by CID match
+        if (m.occupied and m.cid_len > 0 and m.cid_len == client_scid.len and
+            std.mem.eql(u8, m.cid[0..m.cid_len], client_scid))
+        {
             m.client_addr = client_addr.*;
             @memcpy(std.mem.asBytes(&m.backend_addr)[0..@sizeOf(posix.sockaddr)], std.mem.asBytes(backend_addr));
             m.last_seen = now;
             return;
         }
-        if (sockaddrEql(&m.client_addr, client_addr)) {
-            // Update existing mapping
+        if (!m.occupied) {
+            m.occupied = true;
+            m.cid_len = @intCast(@min(client_scid.len, 20));
+            @memcpy(m.cid[0..m.cid_len], client_scid[0..m.cid_len]);
+            m.client_addr = client_addr.*;
             @memcpy(std.mem.asBytes(&m.backend_addr)[0..@sizeOf(posix.sockaddr)], std.mem.asBytes(backend_addr));
             m.last_seen = now;
             return;
@@ -322,10 +400,22 @@ fn storeClientMapping(mappings: []ClientMapping, client_addr: *const posix.socka
     }
 
     // Evict oldest
-    mappings[oldest_idx].occupied = true;
-    mappings[oldest_idx].client_addr = client_addr.*;
-    @memcpy(std.mem.asBytes(&mappings[oldest_idx].backend_addr)[0..@sizeOf(posix.sockaddr)], std.mem.asBytes(backend_addr));
-    mappings[oldest_idx].last_seen = now;
+    const m = &mappings[oldest_idx];
+    m.occupied = true;
+    m.cid_len = @intCast(@min(client_scid.len, 20));
+    @memcpy(m.cid[0..m.cid_len], client_scid[0..m.cid_len]);
+    m.client_addr = client_addr.*;
+    @memcpy(std.mem.asBytes(&m.backend_addr)[0..@sizeOf(posix.sockaddr)], std.mem.asBytes(backend_addr));
+    m.last_seen = now;
+}
+
+fn addrToStorage(sa: *const posix.sockaddr) posix.sockaddr.storage {
+    var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    const src = std.mem.asBytes(sa);
+    const dst = std.mem.asBytes(&storage);
+    const len: usize = if (sa.family == posix.AF.INET6) @sizeOf(posix.sockaddr.in6) else @sizeOf(posix.sockaddr.in);
+    @memcpy(dst[0..len], src[0..len]);
+    return storage;
 }
 
 fn sockaddrEql(a: *const posix.sockaddr.storage, b: *const posix.sockaddr.storage) bool {
