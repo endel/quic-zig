@@ -161,7 +161,7 @@ pub fn Server(comptime Handler: type) type {
 
                 var key_der_buf: [4096]u8 = undefined;
                 const key_der = try tls13.parsePemPrivateKey(server_key_pem, &key_der_buf);
-                const ec_private_key_tmp = try tls13.extractEcPrivateKey(key_der);
+                const ec_private_key_tmp = tls13.extractEcPrivateKey(key_der) catch try tls13.extractPkcs8EcPrivateKey(key_der);
                 const ec_private_key = try alloc.dupe(u8, ec_private_key_tmp);
 
                 const alpn = try alloc.alloc([]const u8, 1);
