@@ -570,6 +570,10 @@ fn pollWtEvents(
             .session_rejected => |sr| {
                 std.log.info("WT session {d} rejected: {s}", .{ sr.session_id, sr.status });
             },
+
+            .session_draining => |sd| {
+                std.log.info("WT session {d} draining", .{sd.session_id});
+            },
         }
     }
 

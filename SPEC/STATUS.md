@@ -430,9 +430,23 @@ No remaining work — all sections implemented. Optional improvements:
 | — | Datagram demux | ✅ Done | quarter_stream_id routing |
 | — | Session management | ✅ Done | WebTransportConnection |
 | — | Multiple sessions | ✅ Done | Up to 4 sessions, peer max_sessions enforcement |
-| — | Session close/drain | ✅ Done | CLOSE_WEBTRANSPORT_SESSION (0x2843) frame, drain lifecycle, stream cleanup |
+| — | CLOSE_WEBTRANSPORT_SESSION (0x2843) | ✅ Done | Capsule send/receive, error code + reason (up to 1024 bytes) |
+| — | DRAIN_WEBTRANSPORT_SESSION (0x78ae) | ✅ Done | Graceful shutdown capsule, session_draining event |
+| — | WEBTRANSPORT_SESSION_GONE (0x170d7b68) | ✅ Done | Streams reset with this code on session close |
+| — | WEBTRANSPORT_BUFFERED_STREAM_REJECTED (0x3994bd84) | ✅ Done | Streams to unknown sessions rejected |
+| — | Stream error code remapping | ✅ Done | appErrorCodeToH3() maps 32-bit codes to H3 range, resetStream() API |
+| — | H3_ID_ERROR validation | ✅ Done | Invalid session IDs (not client-initiated bidi) close connection |
+| — | H3_MESSAGE_ERROR post-close | ✅ Done | Data on CONNECT stream after CLOSE triggers reset |
+| — | Sub-protocol negotiation | ✅ Done | Via sec-webtransport-protocol / WebTransport-Subprotocol headers |
+| — | Session prioritization | ✅ Done | Priority header on CONNECT parsed by H3 layer, PRIORITY_UPDATE frames supported |
+| — | GOAWAY → session interaction | ✅ Done | H3 GOAWAY triggers session_draining events for active WT sessions |
 
-### Summary — WebTransport: ✅ Complete (interop verified with quic-go)
+### Summary — WebTransport: ✅ Complete (17/17)
+
+| Status | Count |
+|--------|-------|
+| ✅ Done | 17 |
+| ❌ Missing | 0 |
 
 ---
 
@@ -496,7 +510,7 @@ No remaining work — all sections implemented. Optional improvements:
 | RFC 9221 (QUIC DG) | 3 | 0 | 0 | 100% |
 | RFC 9368 (Version Neg) | 3 | 0 | 0 | 100% |
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
-| WebTransport | 8 | 0 | 0 | 100% |
+| WebTransport | 17 | 0 | 0 | 100% |
 
 ### Top Priority Items Across All RFCs
 

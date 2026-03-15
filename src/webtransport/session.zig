@@ -15,6 +15,35 @@ const WT_BIDI_STREAM_TYPE: u64 = 0x41;
 /// Maximum number of concurrent WebTransport sessions.
 const MAX_SESSIONS: usize = 4;
 
+/// WebTransport error codes (draft-ietf-webtrans-http3).
+pub const WEBTRANSPORT_SESSION_GONE: u64 = 0x170d7b68;
+pub const WEBTRANSPORT_BUFFERED_STREAM_REJECTED: u64 = 0x3994bd84;
+
+/// WebTransport application error code range for H3 stream resets.
+/// Maps 32-bit app error codes to range starting at 0x52e4a40fa8db,
+/// skipping reserved codepoints of form 0x1f * N + 0x21 (RFC 9114 §8.1).
+pub fn appErrorCodeToH3(error_code: u32) u64 {
+    const base: u64 = 0x52e4a40fa8db;
+    const code: u64 = @intCast(error_code);
+    // For every 0x1e consecutive codes, we skip one reserved codepoint.
+    return base + code + (code / 0x1e);
+}
+
+/// Inverse: extract the 32-bit app error code from an H3 error code.
+pub fn h3ToAppErrorCode(h3_code: u64) ?u32 {
+    const base: u64 = 0x52e4a40fa8db;
+    if (h3_code < base) return null;
+    const diff = h3_code - base;
+    // Check if this falls on a reserved codepoint (0x1f * N + 0x21)
+    if ((h3_code -% 0x21) % 0x1f == 0) return null;
+    // Inverse: code + code/0x1e = diff → code = diff - diff/0x1f
+    const code = diff - (diff / 0x1f);
+    if (code > 0xffffffff) return null;
+    // Verify round-trip
+    if (appErrorCodeToH3(@intCast(code)) != h3_code) return null;
+    return @intCast(code);
+}
+
 /// WebTransport session state.
 pub const SessionState = enum {
     connecting,
@@ -29,8 +58,8 @@ pub const Session = struct {
     state: SessionState = .closed,
     occupied: bool = false,
     close_error_code: u32 = 0,
-    close_reason_buf: [128]u8 = undefined,
-    close_reason_len: u8 = 0,
+    close_reason_buf: [1024]u8 = undefined,
+    close_reason_len: u16 = 0,
 };
 
 /// Events returned by WebTransportConnection.poll().
@@ -43,6 +72,7 @@ pub const WtEvent = union(enum) {
     stream_data: struct { stream_id: u64, data: []const u8 },
     datagram: struct { session_id: u64, data: []const u8 },
     session_closed: struct { session_id: u64, error_code: u32, reason: []const u8 },
+    session_draining: struct { session_id: u64 },
 };
 
 /// WebTransport connection wrapping H3Connection + QUIC Connection.
@@ -257,18 +287,22 @@ pub const WebTransportConnection = struct {
     }
 
     /// Close a WebTransport session with an application error code and reason.
-    /// Sends CLOSE_WEBTRANSPORT_SESSION frame on the CONNECT stream, then FIN.
+    /// Sends CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
+    /// Reason is truncated to 1024 bytes per spec.
     pub fn closeSessionWithError(self: *WebTransportConnection, session_id: u64, error_code: u32, reason: []const u8) !void {
         const session = self.getSession(session_id) orelse return;
         if (session.state == .draining or session.state == .closed) return;
 
+        // Truncate reason to spec limit (1024 bytes)
+        const truncated_reason = if (reason.len > 1024) reason[0..1024] else reason;
+
         // Send CLOSE_WEBTRANSPORT_SESSION on the CONNECT stream
         if (self.quic.streams.getStream(session_id)) |stream| {
-            var frame_buf: [256]u8 = undefined;
+            var frame_buf: [1100]u8 = undefined;
             var fbs = io.fixedBufferStream(&frame_buf);
             h3_frame.write(.{ .close_webtransport_session = .{
                 .error_code = error_code,
-                .reason = reason,
+                .reason = truncated_reason,
             } }, fbs.writer()) catch {};
             stream.send.writeData(fbs.getWritten()) catch {};
             stream.send.close();
@@ -280,6 +314,42 @@ pub const WebTransportConnection = struct {
         self.cleanupSessionStreams(session_id);
     }
 
+    /// Send DRAIN_WEBTRANSPORT_SESSION capsule — signals graceful shutdown intent.
+    /// The peer MAY continue using the session and MAY open new streams,
+    /// but should begin winding down.
+    pub fn drainSession(self: *WebTransportConnection, session_id: u64) !void {
+        const session = self.getSession(session_id) orelse return;
+        if (session.state != .active) return;
+
+        if (self.quic.streams.getStream(session_id)) |stream| {
+            var frame_buf: [16]u8 = undefined;
+            var fbs = io.fixedBufferStream(&frame_buf);
+            h3_frame.write(.{ .drain_webtransport_session = {} }, fbs.writer()) catch {};
+            stream.send.writeData(fbs.getWritten()) catch {};
+        }
+    }
+
+    /// Reset a WT stream with an application error code.
+    /// The error code is mapped to the WEBTRANSPORT_APPLICATION_ERROR range.
+    pub fn resetStream(self: *WebTransportConnection, stream_id: u64, error_code: u32) void {
+        const h3_code = appErrorCodeToH3(error_code);
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            if (!stream.send.fin_sent) {
+                stream.send.reset(h3_code);
+            }
+            stream.recv.stopSending(h3_code);
+            return;
+        }
+        if (self.quic.streams.send_streams.get(stream_id)) |send_stream| {
+            if (!send_stream.fin_sent) {
+                send_stream.reset(h3_code);
+            }
+        }
+        if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
+            recv_stream.stopSending(h3_code);
+        }
+    }
+
     /// Mark a session as fully closed and release its slot.
     fn finalizeSession(self: *WebTransportConnection, session: *Session) void {
         session.state = .closed;
@@ -288,6 +358,7 @@ pub const WebTransportConnection = struct {
     }
 
     /// Reset all streams belonging to a session and free their buffers.
+    /// Uses WEBTRANSPORT_SESSION_GONE error code per draft-ietf-webtrans-http3.
     fn cleanupSessionStreams(self: *WebTransportConnection, session_id: u64) void {
         // Collect stream IDs to remove (can't remove during iteration)
         var bidi_to_remove: [64]u64 = undefined;
@@ -304,12 +375,12 @@ pub const WebTransportConnection = struct {
         for (bidi_to_remove[0..bidi_count]) |sid| {
             _ = self.wt_bidi_streams.remove(sid);
             _ = self.h3.excluded_bidi_streams.remove(sid);
-            // Reset the stream if still open
+            // Reset the stream with WEBTRANSPORT_SESSION_GONE
             if (self.quic.streams.getStream(sid)) |s| {
                 if (!s.send.fin_sent) {
-                    s.send.reset(0);
+                    s.send.reset(WEBTRANSPORT_SESSION_GONE);
                 }
-                s.recv.stopSending(0);
+                s.recv.stopSending(WEBTRANSPORT_SESSION_GONE);
             }
             // Free buffered data
             if (self.stream_bufs.getPtr(sid)) |buf| {
@@ -331,8 +402,14 @@ pub const WebTransportConnection = struct {
         }
         for (uni_to_remove[0..uni_count]) |sid| {
             _ = self.wt_uni_streams.remove(sid);
+            // Reset send side if we opened it
+            if (self.quic.streams.send_streams.get(sid)) |send_stream| {
+                if (!send_stream.fin_sent) {
+                    send_stream.reset(WEBTRANSPORT_SESSION_GONE);
+                }
+            }
             if (self.quic.streams.recv_streams.get(sid)) |recv_stream| {
-                recv_stream.stopSending(0);
+                recv_stream.stopSending(WEBTRANSPORT_SESSION_GONE);
             }
             if (self.stream_bufs.getPtr(sid)) |buf| {
                 buf.deinit(self.allocator);
@@ -364,7 +441,7 @@ pub const WebTransportConnection = struct {
         return null;
     }
 
-    /// Poll active session CONNECT streams for CLOSE_WEBTRANSPORT_SESSION frames or FIN.
+    /// Poll active session CONNECT streams for CLOSE/DRAIN_WEBTRANSPORT_SESSION capsules or FIN.
     fn pollSessionStreams(self: *WebTransportConnection) ?WtEvent {
         for (&self.sessions) |*session| {
             if (!session.occupied) continue;
@@ -402,15 +479,15 @@ pub const WebTransportConnection = struct {
 
             defer self.allocator.free(data);
 
-            // Try to parse CLOSE_WEBTRANSPORT_SESSION frame
+            // Try to parse capsules on the CONNECT stream
             const result = h3_frame.parse(data) catch continue;
             switch (result.frame) {
                 .close_webtransport_session => |cls| {
                     const sid = session.session_id;
                     session.close_error_code = cls.error_code;
-                    const copy_len = @min(cls.reason.len, session.close_reason_buf.len);
+                    const copy_len: u16 = @intCast(@min(cls.reason.len, session.close_reason_buf.len));
                     @memcpy(session.close_reason_buf[0..copy_len], cls.reason[0..copy_len]);
-                    session.close_reason_len = @intCast(copy_len);
+                    session.close_reason_len = copy_len;
 
                     // Send our own FIN (echo close) if we haven't already
                     if (session.state == .active) {
@@ -427,7 +504,23 @@ pub const WebTransportConnection = struct {
                         .reason = session.close_reason_buf[0..copy_len],
                     } };
                 },
-                else => {}, // Ignore other frames on CONNECT stream
+                .drain_webtransport_session => {
+                    // Graceful shutdown signal from peer
+                    if (session.state == .active) {
+                        return .{ .session_draining = .{
+                            .session_id = session.session_id,
+                        } };
+                    }
+                },
+                else => {
+                    // Data on CONNECT stream after CLOSE_WEBTRANSPORT_SESSION
+                    // is a protocol violation — reset with H3_MESSAGE_ERROR
+                    if (session.state == .draining) {
+                        if (self.quic.streams.getStream(session.session_id)) |s| {
+                            s.send.reset(@intFromEnum(h3_conn.H3Error.message_error));
+                        }
+                    }
+                },
             }
         }
         return null;
@@ -484,6 +577,14 @@ pub const WebTransportConnection = struct {
 
             if (stream_type == WT_UNI_STREAM_TYPE) {
                 const session_id = packet.readVarInt(reader) catch continue;
+
+                // Validate session ID: must be a client-initiated bidi stream (divisible by 4)
+                if (session_id % 4 != 0) {
+                    // Invalid session ID — close connection with H3_ID_ERROR
+                    self.h3.closeWithError(.id_error, "invalid WT session ID");
+                    return null;
+                }
+
                 if (self.getSession(session_id) != null) {
                     try self.wt_uni_streams.put(stream_id, session_id);
 
@@ -502,6 +603,11 @@ pub const WebTransportConnection = struct {
                         .session_id = session_id,
                         .stream_id = stream_id,
                     } };
+                } else {
+                    // Session not found — reject buffered stream
+                    if (self.quic.streams.recv_streams.get(stream_id)) |rs| {
+                        rs.stopSending(WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
+                    }
                 }
             }
             // Not a WT stream — let H3 handle it by marking as pending
@@ -540,6 +646,13 @@ pub const WebTransportConnection = struct {
 
             if (stream_type == WT_BIDI_STREAM_TYPE) {
                 const session_id = packet.readVarInt(reader) catch continue;
+
+                // Validate session ID: must be a client-initiated bidi stream (divisible by 4)
+                if (session_id % 4 != 0) {
+                    self.h3.closeWithError(.id_error, "invalid WT session ID");
+                    return null;
+                }
+
                 if (self.getSession(session_id) != null) {
                     try self.wt_bidi_streams.put(stream_id, session_id);
                     // Exclude from H3 processing
@@ -560,6 +673,12 @@ pub const WebTransportConnection = struct {
                         .session_id = session_id,
                         .stream_id = stream_id,
                     } };
+                } else {
+                    // Session not found — reject buffered stream
+                    if (self.quic.streams.getStream(stream_id)) |s| {
+                        s.send.reset(WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
+                        s.recv.stopSending(WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
+                    }
                 }
             }
             // Not a WT stream — buffer for H3 to handle
@@ -697,7 +816,18 @@ pub const WebTransportConnection = struct {
                     } };
                 }
             },
-            .goaway => {},
+            .goaway => {
+                // H3 GOAWAY signals shutdown — drain all active WT sessions.
+                // New session creation will be blocked by H3 layer (GOAWAY stream ID).
+                // Signal draining on the first active session found.
+                for (&self.sessions) |*session| {
+                    if (session.occupied and session.state == .active) {
+                        return .{ .session_draining = .{
+                            .session_id = session.session_id,
+                        } };
+                    }
+                }
+            },
             .shutdown_complete => {},
             .request_cancelled => {},
         }
@@ -1461,4 +1591,182 @@ test "WT integration: sendStreamData on uni stream" {
     const items = send_stream.write_buffer.items;
     // Should end with "uni data"
     try testing.expectEqualStrings("uni data", items[items.len - 8 ..]);
+}
+
+// ---- Group H: Draft-ietf-webtrans-http3 protocol features ----
+
+test "WT: appErrorCodeToH3 and h3ToAppErrorCode round-trip" {
+    // Error code 0
+    const h3_0 = appErrorCodeToH3(0);
+    try testing.expectEqual(@as(u64, 0x52e4a40fa8db), h3_0);
+    try testing.expectEqual(@as(?u32, 0), h3ToAppErrorCode(h3_0));
+
+    // Error code 1
+    const h3_1 = appErrorCodeToH3(1);
+    try testing.expect(h3_1 > h3_0);
+    try testing.expectEqual(@as(?u32, 1), h3ToAppErrorCode(h3_1));
+
+    // Error code 42
+    const h3_42 = appErrorCodeToH3(42);
+    try testing.expectEqual(@as(?u32, 42), h3ToAppErrorCode(h3_42));
+
+    // Reserved codepoints should return null
+    try testing.expectEqual(@as(?u32, null), h3ToAppErrorCode(0x21));
+
+    // Values below base should return null
+    try testing.expectEqual(@as(?u32, null), h3ToAppErrorCode(0));
+}
+
+test "WT: WEBTRANSPORT_SESSION_GONE used in stream cleanup" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Open a bidi stream
+    const wt_stream_id = try setup.wt.openBidiStream(session_id);
+
+    // Close the session
+    setup.wt.closeSession(session_id);
+
+    // The stream should have been reset with WEBTRANSPORT_SESSION_GONE
+    const stream = setup.quic_conn.streams.getStream(wt_stream_id).?;
+    try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), stream.send.reset_err);
+    try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), stream.recv.stop_sending_err);
+}
+
+test "WT: drainSession sends DRAIN_WEBTRANSPORT_SESSION capsule" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+
+    try setup.wt.drainSession(session_id);
+
+    // Should have written DRAIN capsule (type 0x78ae, length 0)
+    const drain_data = stream.send.write_buffer.items[pre_len..];
+    try testing.expect(drain_data.len > 0);
+    const result = h3_frame.parse(drain_data) catch unreachable;
+    try testing.expectEqual(h3_frame.H3FrameType.drain_webtransport_session, std.meta.activeTag(result.frame));
+}
+
+test "WT: receiving DRAIN_WEBTRANSPORT_SESSION produces session_draining event" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject DRAIN capsule on the CONNECT stream
+    var frame_buf: [16]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .drain_webtransport_session = {} }, fbs.writer()) catch unreachable;
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, fbs.getWritten(), false);
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .session_draining => |sd| {
+            try testing.expectEqual(session_id, sd.session_id);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    // Session should still be active (drain is advisory)
+    const session = setup.wt.getSession(session_id).?;
+    try testing.expectEqual(SessionState.active, session.state);
+}
+
+test "WT: resetStream maps app error code to H3 range" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id);
+    setup.wt.resetStream(stream_id, 42);
+
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    try testing.expectEqual(@as(?u64, appErrorCodeToH3(42)), stream.send.reset_err);
+    try testing.expectEqual(@as(?u64, appErrorCodeToH3(42)), stream.recv.stop_sending_err);
+}
+
+test "WT: close reason supports up to 1024 bytes" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Create a 1024-byte reason
+    var long_reason: [1024]u8 = undefined;
+    @memset(&long_reason, 'X');
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+
+    try setup.wt.closeSessionWithError(session_id, 99, &long_reason);
+
+    // Parse the CLOSE frame
+    const close_data = stream.send.write_buffer.items[pre_len..];
+    const result = h3_frame.parse(close_data) catch unreachable;
+    switch (result.frame) {
+        .close_webtransport_session => |cls| {
+            try testing.expectEqual(@as(u32, 99), cls.error_code);
+            try testing.expectEqual(@as(usize, 1024), cls.reason.len);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT: invalid session ID triggers H3_ID_ERROR on bidi stream" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT bidi prefix with an odd session ID (invalid — must be client-initiated bidi = 4*n)
+    var prefix_buf: [16]u8 = undefined;
+    var fbs = io.fixedBufferStream(&prefix_buf);
+    packet.writeVarInt(fbs.writer(), WT_BIDI_STREAM_TYPE) catch unreachable;
+    packet.writeVarInt(fbs.writer(), 1) catch unreachable; // Invalid: not divisible by 4
+
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, fbs.getWritten(), false);
+
+    const ev = try setup.wt.poll();
+    // Should return null (connection closed with H3_ID_ERROR)
+    try testing.expect(ev == null);
+    // Connection should be closing
+    try testing.expect(setup.quic_conn.local_err != null);
+}
+
+test "WT: uni stream to unknown session gets BUFFERED_STREAM_REJECTED" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT uni prefix referencing non-existent session 8
+    var prefix_buf: [16]u8 = undefined;
+    var fbs = io.fixedBufferStream(&prefix_buf);
+    packet.writeVarInt(fbs.writer(), WT_UNI_STREAM_TYPE) catch unreachable;
+    packet.writeVarInt(fbs.writer(), 8) catch unreachable; // Valid format but session doesn't exist
+
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, fbs.getWritten(), false);
+
+    const ev = try setup.wt.poll();
+    // No event returned (stream rejected silently)
+    try testing.expect(ev == null);
+    // Recv stream should have STOP_SENDING with BUFFERED_STREAM_REJECTED
+    try testing.expectEqual(@as(?u64, WEBTRANSPORT_BUFFERED_STREAM_REJECTED), rs.stop_sending_err);
+}
+
+test "H3Frame: write and parse DRAIN_WEBTRANSPORT_SESSION" {
+    var buf: [16]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try h3_frame.write(.{ .drain_webtransport_session = {} }, fbs.writer());
+    const written = fbs.getWritten();
+    try testing.expect(written.len > 0);
+
+    const result = try h3_frame.parse(written);
+    try testing.expectEqual(h3_frame.H3FrameType.drain_webtransport_session, std.meta.activeTag(result.frame));
 }

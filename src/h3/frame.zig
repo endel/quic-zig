@@ -14,6 +14,7 @@ pub const H3FrameType = enum(u64) {
     max_push_id = 0x0d, // not used
     priority_update = 0xF0700, // RFC 9218
     close_webtransport_session = 0x2843, // draft-ietf-webtrans-http3
+    drain_webtransport_session = 0x78ae, // draft-ietf-webtrans-http3
 
     pub fn fromInt(v: u64) ?H3FrameType {
         return switch (v) {
@@ -26,6 +27,7 @@ pub const H3FrameType = enum(u64) {
             0x0d => .max_push_id,
             0xF0700 => .priority_update,
             0x2843 => .close_webtransport_session,
+            0x78ae => .drain_webtransport_session,
             else => null,
         };
     }
@@ -105,6 +107,7 @@ pub const H3Frame = union(H3FrameType) {
     max_push_id: u64,
     priority_update: PriorityUpdate,
     close_webtransport_session: CloseWebtransportSession,
+    drain_webtransport_session: void,
 };
 
 /// HTTP/3 unidirectional stream types (RFC 9114 Section 6.2).
@@ -235,6 +238,7 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
                 .reason = reason,
             } };
         },
+        .drain_webtransport_session => .{ .drain_webtransport_session = {} },
     };
 
     return .{
@@ -351,6 +355,10 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
             if (cls.reason.len > 0) {
                 try writer.writeAll(cls.reason);
             }
+        },
+        .drain_webtransport_session => {
+            try packet.writeVarInt(writer, 0x78ae);
+            try packet.writeVarInt(writer, 0); // zero-length payload
         },
     }
 }

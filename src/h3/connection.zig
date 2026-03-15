@@ -519,7 +519,7 @@ pub const H3Connection = struct {
 
     /// Close the connection with an H3 error code (RFC 9114 §8).
     /// Sends APPLICATION_CLOSE via QUIC with the given error code.
-    fn closeWithError(self: *H3Connection, h3_error: H3Error, reason: []const u8) void {
+    pub fn closeWithError(self: *H3Connection, h3_error: H3Error, reason: []const u8) void {
         self.quic_conn.close(@intFromEnum(h3_error), reason);
     }
 

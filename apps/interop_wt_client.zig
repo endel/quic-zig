@@ -602,6 +602,9 @@ fn pollWtEvents(
             .session_closed => |sc| {
                 std.log.info("WT session {d} closed (code={d})", .{ sc.session_id, sc.error_code });
             },
+            .session_draining => |sd| {
+                std.log.info("WT session {d} draining", .{sd.session_id});
+            },
         }
     }
 

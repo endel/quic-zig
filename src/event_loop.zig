@@ -526,6 +526,11 @@ pub fn Server(comptime Handler: type) type {
                             self.handler.onSessionClosed(&session, cls.session_id, cls.error_code, cls.reason);
                         }
                     },
+                    .session_draining => |drain| {
+                        if (@hasDecl(Handler, "onSessionDraining")) {
+                            self.handler.onSessionDraining(&session, drain.session_id);
+                        }
+                    },
                     .bidi_stream, .uni_stream, .session_rejected => {},
                 }
             }
