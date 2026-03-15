@@ -39,6 +39,14 @@ fn isReservedH2FrameType(frame_type: u64) bool {
     };
 }
 
+/// Reserved HTTP/2 settings IDs that MUST cause H3_SETTINGS_ERROR (RFC 9114 Section 7.2.4.1).
+fn isReservedH2SettingsId(id: u64) bool {
+    return switch (id) {
+        0x00, 0x02, 0x03, 0x04, 0x05 => true,
+        else => false,
+    };
+}
+
 /// HTTP/3 SETTINGS identifiers (RFC 9114 Section 7.2.4.1).
 pub const SettingsId = enum(u64) {
     qpack_max_table_capacity = 0x01,
@@ -162,6 +170,11 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
             while (sfbs.pos < payload.len) {
                 const id_raw = packet.readVarInt(sreader) catch break;
                 const value = packet.readVarInt(sreader) catch return error.MalformedSettings;
+
+                // RFC 9114 §7.2.4.1: reserved HTTP/2 settings MUST cause H3_SETTINGS_ERROR
+                if (isReservedH2SettingsId(id_raw)) {
+                    return error.H3SettingsError;
+                }
 
                 if (SettingsId.fromInt(id_raw)) |id| {
                     switch (id) {

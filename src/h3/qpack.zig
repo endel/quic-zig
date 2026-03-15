@@ -596,7 +596,9 @@ pub const QpackEncoder = struct {
                 _ = try decodeInteger(data, &pos, 6);
             } else {
                 // Insert Count Increment: 00XXXXXX — 6-bit increment
-                _ = try decodeInteger(data, &pos, 6);
+                const increment = try decodeInteger(data, &pos, 6);
+                // RFC 9204 §4.4.3: increment of 0 is QPACK_DECODER_STREAM_ERROR
+                if (increment == 0) return error.QpackDecoderStreamError;
                 _ = self; // acknowledged, no action needed in our simple model
             }
         }

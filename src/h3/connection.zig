@@ -31,6 +31,10 @@ pub const H3Error = enum(u64) {
     message_error = 0x010e,
     connect_error = 0x010f,
     version_fallback = 0x0110,
+    // QPACK error codes (RFC 9204 Section 6)
+    qpack_decompression_failed = 0x0200,
+    qpack_encoder_stream_error = 0x0201,
+    qpack_decoder_stream_error = 0x0202,
 };
 
 /// Graceful shutdown state (RFC 9114 Section 5.2).
@@ -105,6 +109,9 @@ pub const H3Connection = struct {
     // Bidi streams excluded from H3 processing (owned by WT layer)
     excluded_bidi_streams: std.AutoHashMap(u64, void),
 
+    // Streams that have received HEADERS (for DATA-before-HEADERS detection)
+    headers_received_streams: std.AutoHashMap(u64, void),
+
     // QPACK encoder/decoder with dynamic table support
     qpack_encoder: qpack.QpackEncoder = .{},
     qpack_decoder: qpack.QpackDecoder = .{},
@@ -133,6 +140,7 @@ pub const H3Connection = struct {
             .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
             .finished_streams = std.AutoHashMap(u64, void).init(allocator),
             .excluded_bidi_streams = std.AutoHashMap(u64, void).init(allocator),
+            .headers_received_streams = std.AutoHashMap(u64, void).init(allocator),
         };
         // Advertise dynamic table capacity in local settings
         conn.local_settings.qpack_max_table_capacity = 4096;
@@ -590,8 +598,9 @@ pub const H3Connection = struct {
         for (critical_ids) |maybe_id| {
             const stream_id = maybe_id orelse continue;
             if (self.quic_conn.streams.recv_streams.get(stream_id)) |recv_stream| {
-                if (recv_stream.reset_err != null) {
-                    self.closeWithError(.closed_critical_stream, "critical stream reset");
+                // RFC 9114 §6.2.1: closing a critical stream (reset or FIN) is an error
+                if (recv_stream.reset_err != null or recv_stream.finished) {
+                    self.closeWithError(.closed_critical_stream, "critical stream closed");
                     return error.H3ClosedCriticalStream;
                 }
             }
@@ -699,6 +708,11 @@ pub const H3Connection = struct {
             if (err == error.H3FrameUnexpected) {
                 self.closeWithError(.frame_unexpected, "HTTP/2 frame type on H3 control stream");
                 return error.H3FrameUnexpected;
+            }
+            // RFC 9114 §7.2.4.1: reserved HTTP/2 settings
+            if (err == error.H3SettingsError) {
+                self.closeWithError(.settings_error, "reserved HTTP/2 settings identifier");
+                return error.H3SettingsError;
             }
             return err;
         };
@@ -919,6 +933,10 @@ pub const H3Connection = struct {
                         self.closeWithError(.frame_unexpected, "HTTP/2 frame type on request stream");
                         return error.H3FrameUnexpected;
                     }
+                    if (err == error.H3SettingsError) {
+                        self.closeWithError(.settings_error, "reserved HTTP/2 settings identifier");
+                        return error.H3SettingsError;
+                    }
                     return err;
                 };
 
@@ -937,11 +955,10 @@ pub const H3Connection = struct {
                         } else |_| {
                             // Fallback to static-only decoder for compatibility
                             hdr_count = qpack.decodeHeaders(qpack_data, &self.headers_buf) catch {
-                                // RFC 9114 §4.3: QPACK decode failure on request stream
+                                // RFC 9204 §4.5.5: QPACK decompression failure
                                 self.consumeFrameFromBuf(buf, result.consumed);
-                                stream.send.reset(@intFromEnum(H3Error.message_error));
-                                stream.recv.stopSending(@intFromEnum(H3Error.message_error));
-                                break;
+                                self.closeWithError(.qpack_decompression_failed, "QPACK decode failure");
+                                return error.H3FrameError;
                             };
                         }
                         const hdrs = self.headers_buf[0..hdr_count];
@@ -956,10 +973,12 @@ pub const H3Connection = struct {
                             validateResponseHeaders(hdrs);
                         if (!valid) {
                             self.consumeFrameFromBuf(buf, result.consumed);
-                            stream.send.reset(@intFromEnum(H3Error.message_error));
-                            stream.recv.stopSending(@intFromEnum(H3Error.message_error));
-                            continue;
+                            self.closeWithError(.message_error, "invalid pseudo-headers");
+                            return error.H3MessageError;
                         }
+
+                        // Track that HEADERS was received on this stream
+                        try self.headers_received_streams.put(stream_id, {});
 
                         // Check for Extended CONNECT (:method=CONNECT + :protocol)
                         var method: ?[]const u8 = null;
@@ -1007,6 +1026,12 @@ pub const H3Connection = struct {
                         } };
                     },
                     .data => |payload| {
+                        // RFC 9114 §4.1: DATA before HEADERS is H3_FRAME_UNEXPECTED
+                        if (!self.headers_received_streams.contains(stream_id)) {
+                            self.consumeFrameFromBuf(buf, result.consumed);
+                            self.closeWithError(.frame_unexpected, "DATA before HEADERS");
+                            return error.H3FrameUnexpected;
+                        }
                         if (payload.len == 0) {
                             self.consumeFrameFromBuf(buf, result.consumed);
                             continue; // Skip GREASE/unknown frames
@@ -1064,8 +1089,12 @@ pub const H3Connection = struct {
                 if (recv_stream.read()) |data| {
                     defer self.allocator.free(data);
                     if (data.len > 0) {
-                        self.qpack_decoder.processEncoderInstruction(data) catch {
-                            self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
+                        self.qpack_decoder.processEncoderInstruction(data) catch |err| {
+                            if (err == error.CapacityExceeded) {
+                                self.closeWithError(.qpack_encoder_stream_error, "QPACK encoder stream error");
+                            } else {
+                                self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
+                            }
                             return error.H3GeneralProtocolError;
                         };
                     }
@@ -1079,8 +1108,12 @@ pub const H3Connection = struct {
                 if (recv_stream.read()) |data| {
                     defer self.allocator.free(data);
                     if (data.len > 0) {
-                        self.qpack_encoder.processDecoderInstruction(data) catch {
-                            self.closeWithError(.general_protocol_error, "QPACK decoder stream error");
+                        self.qpack_encoder.processDecoderInstruction(data) catch |err| {
+                            if (err == error.QpackDecoderStreamError) {
+                                self.closeWithError(.qpack_decoder_stream_error, "QPACK decoder stream error");
+                            } else {
+                                self.closeWithError(.general_protocol_error, "QPACK decoder stream error");
+                            }
                             return error.H3GeneralProtocolError;
                         };
                     }
@@ -2098,7 +2131,7 @@ test "H3 integration: sendConnectResponse writes headers without FIN" {
 
 // ---- Group F: Error handling ----
 
-test "H3 integration: invalid headers (missing :path) resets stream" {
+test "H3 integration: invalid headers (missing :path) closes connection" {
     var quic_conn = createTestQuicConn(true);
     defer quic_conn.deinit();
     var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
@@ -2121,15 +2154,13 @@ test "H3 integration: invalid headers (missing :path) resets stream" {
 
     try injectBidiStreamData(&quic_conn, 0, fbs.getWritten(), false);
 
-    // Poll should skip the malformed request (no headers event)
-    const ev = try h3.poll();
-    // Should return null (invalid headers cause stream reset, not connection error)
-    try testing.expect(ev == null);
+    // Poll should close connection with H3_MESSAGE_ERROR
+    const ev = h3.poll();
+    try testing.expectError(error.H3MessageError, ev);
 
-    // The stream should have been reset
-    const stream = quic_conn.streams.getStream(0).?;
-    try testing.expect(stream.send.reset_err != null);
-    try testing.expectEqual(@intFromEnum(H3Error.message_error), stream.send.reset_err.?);
+    // Connection should be in closing state with H3_MESSAGE_ERROR
+    try testing.expect(quic_conn.local_err != null);
+    try testing.expectEqual(@intFromEnum(H3Error.message_error), quic_conn.local_err.?.code);
 }
 
 test "H3 integration: SETTINGS on bidi stream returns H3FrameUnexpected" {
