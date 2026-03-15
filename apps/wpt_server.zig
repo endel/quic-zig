@@ -15,6 +15,7 @@ const WptHandler = struct {
     allocator: std.mem.Allocator,
     session_state: std.AutoHashMap(u64, SessionInfo),
     stash: std.StringHashMap([]const u8),
+    uni_echo_streams: std.AutoHashMap(u64, u64),
     const Handler = enum {
         echo,
         echo_raw, // echo without "Echo: " prefix
@@ -63,11 +64,13 @@ const WptHandler = struct {
             .allocator = allocator,
             .session_state = std.AutoHashMap(u64, SessionInfo).init(allocator),
             .stash = std.StringHashMap([]const u8).init(allocator),
+            .uni_echo_streams = std.AutoHashMap(u64, u64).init(allocator),
         };
     }
 
     fn deinit(self: *WptHandler) void {
         self.session_state.deinit();
+        self.uni_echo_streams.deinit();
         // Free stash values
         var it = self.stash.iterator();
         while (it.next()) |entry| {
@@ -299,11 +302,23 @@ const WptHandler = struct {
         switch (info.handler) {
             .echo, .echo_raw => {
                 if (isUniStream(stream_id)) {
-                    // Unidirectional: echo on a NEW uni stream
-                    if (session.openUniStream(session_id)) |new_stream_id| {
-                        if (data.len > 0) session.sendStreamData(new_stream_id, data) catch {};
-                        if (fin) session.closeStream(new_stream_id);
-                    } else |_| {}
+                    // Unidirectional: echo on a single outgoing uni stream per incoming stream.
+                    // Open on first data chunk, close on FIN.
+                    const out_id: ?u64 = self.uni_echo_streams.get(stream_id) orelse blk: {
+                        const new_id = session.openUniStream(session_id) catch |err| {
+                            std.log.err("[wpt] openUniStream failed: {any}", .{err});
+                            break :blk null;
+                        };
+                        self.uni_echo_streams.put(stream_id, new_id) catch {};
+                        break :blk new_id;
+                    };
+                    if (out_id) |oid| {
+                        if (data.len > 0) session.sendStreamData(oid, data) catch {};
+                        if (fin) {
+                            session.closeStream(oid);
+                            _ = self.uni_echo_streams.remove(stream_id);
+                        }
+                    }
                 } else {
                     // Bidirectional: echo back on same stream, close only after FIN
                     if (data.len > 0) session.sendStreamData(stream_id, data) catch {};
