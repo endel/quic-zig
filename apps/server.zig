@@ -34,27 +34,34 @@ pub fn main() !void {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Parse --port argument
     var port: u16 = 4434;
+    var workers: u16 = 0;
     var args = std.process.args();
-    _ = args.next(); // skip program name
+    _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
-            if (args.next()) |port_str| {
-                port = std.fmt.parseInt(u16, port_str, 10) catch 4434;
-            }
+            if (args.next()) |v| port = std.fmt.parseInt(u16, v, 10) catch 4434;
+        } else if (std.mem.eql(u8, arg, "--workers") or std.mem.eql(u8, arg, "-w")) {
+            if (args.next()) |v| workers = std.fmt.parseInt(u16, v, 10) catch 0;
         }
     }
 
-    var handler = H3Handler{ .alloc = alloc };
-    var server = try event_loop.Server(H3Handler).init(alloc, &handler, .{
+    const config: event_loop.Config = .{
         .port = port,
         .cert_path = "interop/certs/server.crt",
         .key_path = "interop/certs/server.key",
-        .require_retry = true,
-    });
-    defer server.deinit();
+        .require_retry = if (workers > 0) false else true,
+        .workers = workers,
+    };
 
-    std.log.info("QUIC H3 server listening on 127.0.0.1:{d}", .{port});
-    try server.run();
+    var handler = H3Handler{ .alloc = alloc };
+
+    if (workers > 0) {
+        try event_loop.Server(H3Handler).runMulti(alloc, &handler, config);
+    } else {
+        var server = try event_loop.Server(H3Handler).init(alloc, &handler, config);
+        defer server.deinit();
+        std.log.info("QUIC H3 server listening on 127.0.0.1:{d}", .{port});
+        try server.run();
+    }
 }
