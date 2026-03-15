@@ -313,6 +313,13 @@ pub const WebTransportConnection = struct {
             stream.send.close();
         }
 
+        // Store our close code/reason so pollSessionStreams reports it correctly
+        // when the draining state is finalized
+        session.close_error_code = error_code;
+        const reason_copy_len: u16 = @intCast(@min(truncated_reason.len, session.close_reason_buf.len));
+        @memcpy(session.close_reason_buf[0..reason_copy_len], truncated_reason[0..reason_copy_len]);
+        session.close_reason_len = reason_copy_len;
+
         session.state = .draining;
 
         // Clean up streams belonging to this session
@@ -457,9 +464,9 @@ pub const WebTransportConnection = struct {
             const data = stream.recv.read() orelse {
                 // No data — check if stream received FIN
                 if (stream.recv.finished) {
-                    const sid = session.session_id;
                     if (session.state == .draining) {
-                        // Drain complete — peer acknowledged close
+                        // Drain complete — peer acknowledged our close
+                        const sid = session.session_id;
                         const code = session.close_error_code;
                         const reason_len = session.close_reason_len;
                         self.finalizeSession(session);
@@ -468,16 +475,11 @@ pub const WebTransportConnection = struct {
                             .error_code = code,
                             .reason = session.close_reason_buf[0..reason_len],
                         } };
-                    } else {
-                        // Peer closed without CLOSE frame — clean close with code 0
-                        self.cleanupSessionStreams(sid);
-                        self.finalizeSession(session);
-                        return .{ .session_closed = .{
-                            .session_id = sid,
-                            .error_code = 0,
-                            .reason = "",
-                        } };
                     }
+                    // Active state: FIN on the CONNECT stream recv side is normal
+                    // (HTTP/3 CONNECT requests close their send side after headers).
+                    // Session termination requires CLOSE_WEBTRANSPORT_SESSION capsule
+                    // or RESET_STREAM — a bare FIN just means no more request body.
                 }
                 continue;
             };
@@ -833,14 +835,20 @@ pub const WebTransportConnection = struct {
             },
             .finished => |stream_id| {
                 if (self.getSession(stream_id)) |session| {
-                    // CONNECT stream finished via H3 — session closed without close frame
-                    self.cleanupSessionStreams(stream_id);
-                    self.finalizeSession(session);
-                    return .{ .session_closed = .{
-                        .session_id = stream_id,
-                        .error_code = 0,
-                        .reason = "",
-                    } };
+                    // H3 finished on CONNECT stream — only close if we're draining
+                    // (waiting for peer to acknowledge our CLOSE capsule).
+                    // In active state, the peer's FIN just means no more request body.
+                    if (session.state == .draining) {
+                        const sid = session.session_id;
+                        const code = session.close_error_code;
+                        const reason_len = session.close_reason_len;
+                        self.finalizeSession(session);
+                        return .{ .session_closed = .{
+                            .session_id = sid,
+                            .error_code = code,
+                            .reason = session.close_reason_buf[0..reason_len],
+                        } };
+                    }
                 }
             },
             .goaway => {
@@ -1495,7 +1503,9 @@ test "WT integration: receiving CLOSE_WEBTRANSPORT_SESSION produces session_clos
     }
 }
 
-test "WT integration: peer FIN without CLOSE produces session_closed with code 0" {
+// Bare FIN on CONNECT stream recv side is normal (HTTP/3 CONNECT closes send side
+// after headers). It should NOT close the WT session — only CLOSE capsule does that.
+test "WT integration: bare FIN on CONNECT recv does not close session" {
     var setup: WtTestSetup = undefined;
     const session_id = try setup.initServer();
     defer setup.deinit();
@@ -1505,16 +1515,13 @@ test "WT integration: peer FIN without CLOSE produces session_closed with code 0
     const offset = stream.recv.sorter.highestReceived();
     try stream.recv.handleStreamFrame(offset, "", true);
 
+    // Poll should NOT produce session_closed
     const ev = try setup.wt.poll();
-    try testing.expect(ev != null);
-    switch (ev.?) {
-        .session_closed => |sc| {
-            try testing.expectEqual(session_id, sc.session_id);
-            try testing.expectEqual(@as(u32, 0), sc.error_code);
-            try testing.expectEqualStrings("", sc.reason);
-        },
-        else => return error.UnexpectedEvent,
-    }
+    // Should be null (no event) — session stays active
+    try testing.expect(ev == null);
+    // Session should still be active
+    const session = setup.wt.getSession(session_id).?;
+    try testing.expectEqual(SessionState.active, session.state);
 }
 
 test "WT integration: session cleanup resets associated streams" {

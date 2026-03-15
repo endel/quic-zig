@@ -15,25 +15,6 @@ const WptHandler = struct {
     allocator: std.mem.Allocator,
     session_state: std.AutoHashMap(u64, SessionInfo),
     stash: std.StringHashMap([]const u8),
-    pending_actions: [MAX_PENDING]PendingAction = .{PendingAction{ .session_id = 0 }} ** MAX_PENDING,
-    pending_count: u8 = 0,
-
-    // Types
-    const MAX_PENDING = 8;
-
-    const PendingAction = struct {
-        session_id: u64,
-        handler: Handler = .unknown,
-        code: u32 = 0,
-        reason_buf: [256]u8 = undefined,
-        reason_len: u8 = 0,
-        ticks_remaining: u16 = 100, // ~20ms at 200µs poll interval
-
-        fn getReason(self: *const PendingAction) []const u8 {
-            return self.reason_buf[0..self.reason_len];
-        }
-    };
-
     const Handler = enum {
         echo,
         echo_raw, // echo without "Echo: " prefix
@@ -53,13 +34,16 @@ const WptHandler = struct {
         session_id: u64 = 0,
         path: [512]u8 = undefined,
         path_len: u16 = 0,
-        // For echo handler: track uni streams to echo on new uni stream
-        // For client-close: accumulate events
         close_code: ?u32 = null,
         close_reason_buf: [256]u8 = undefined,
         close_reason_len: u16 = 0,
         token_buf: [128]u8 = undefined,
         token_len: u8 = 0,
+        // Deferred action: counts down ticks, executes at 0
+        deferred_ticks: u16 = 0,
+        deferred_code: u32 = 0,
+        deferred_reason_buf: [256]u8 = undefined,
+        deferred_reason_len: u8 = 0,
 
         fn getPath(self: *const SessionInfo) []const u8 {
             return self.path[0..self.path_len];
@@ -67,6 +51,10 @@ const WptHandler = struct {
 
         fn getToken(self: *const SessionInfo) []const u8 {
             return self.token_buf[0..self.token_len];
+        }
+
+        fn getDeferredReason(self: *const SessionInfo) []const u8 {
+            return self.deferred_reason_buf[0..self.deferred_reason_len];
         }
     };
 
@@ -154,46 +142,27 @@ const WptHandler = struct {
         return null;
     }
 
-    fn queueAction(self: *WptHandler, action: PendingAction) void {
-        if (self.pending_count < MAX_PENDING) {
-            self.pending_actions[self.pending_count] = action;
-            self.pending_count += 1;
-        }
-    }
-
-    fn executePendingActions(self: *WptHandler, session: *event_loop.Session) void {
+    fn executeDeferredActions(self: *WptHandler, session: *event_loop.Session) void {
         const wtc = if (session.entry.wt_conn) |*w| w else return;
 
-        var i: u8 = 0;
-        while (i < self.pending_count) {
-            var action = &self.pending_actions[i];
+        // Check each active WT session for deferred actions
+        for (&wtc.sessions) |*wts| {
+            if (!wts.occupied) continue;
+            if (wts.state != .active) continue;
+            const sid = wts.session_id;
+            const info_ptr = self.session_state.getPtr(sid) orelse continue;
+            if (info_ptr.deferred_ticks == 0) continue;
 
-            // Only process actions belonging to THIS connection's sessions
-            var has_session = false;
-            for (&wtc.sessions) |*s| {
-                if (s.occupied and s.session_id == action.session_id) {
-                    has_session = true;
-                    break;
-                }
-            }
-            if (!has_session) {
-                i += 1;
-                continue; // Skip — this action belongs to a different connection
-            }
+            info_ptr.deferred_ticks -= 1;
+            if (info_ptr.deferred_ticks > 0) continue;
 
-            if (action.ticks_remaining > 0) {
-                action.ticks_remaining -= 1;
-                i += 1;
-                continue;
-            }
-
-            const sid = action.session_id;
+            // Execute deferred action
             std.log.info("[wpt] executing deferred {s}: session={d} code={d}", .{
-                @tagName(action.handler), sid, action.code,
+                @tagName(info_ptr.handler), sid, info_ptr.deferred_code,
             });
-            switch (action.handler) {
+            switch (info_ptr.handler) {
                 .server_close => {
-                    session.closeSessionWithError(sid, action.code, action.getReason()) catch {};
+                    session.closeSessionWithError(sid, info_ptr.deferred_code, info_ptr.getDeferredReason()) catch {};
                 },
                 .server_connection_close => {
                     _ = session.openBidiStream(sid) catch {};
@@ -202,18 +171,14 @@ const WptHandler = struct {
                 .abort_stream_from_server => {
                     if (session.openUniStream(sid)) |stream_id| {
                         session.sendStreamData(stream_id, "a") catch {};
-                        session.resetStream(stream_id, action.code);
+                        session.resetStream(stream_id, info_ptr.deferred_code);
                     } else |_| {}
                     if (session.openBidiStream(sid)) |stream_id| {
-                        session.resetStream(stream_id, action.code);
+                        session.resetStream(stream_id, info_ptr.deferred_code);
                     } else |_| {}
                 },
                 else => {},
             }
-
-            // Remove by swapping with last
-            self.pending_actions[i] = self.pending_actions[self.pending_count - 1];
-            self.pending_count -= 1;
         }
     }
 
@@ -249,25 +214,37 @@ const WptHandler = struct {
             return;
         };
 
-        // Defer server-initiated actions so the 200 response is flushed first
+        // Defer server-initiated actions so the 200 response is flushed first.
+        // Store deferred info in session_state (per-session, not shared).
         switch (handler) {
             .server_close => {
                 const code_str = getQueryParam(path, "code") orelse "0";
                 const code = std.fmt.parseInt(u32, code_str, 10) catch 0;
                 const reason = getQueryParam(path, "reason") orelse "";
-                var action = PendingAction{ .session_id = session_id, .handler = .server_close, .code = code };
-                const rlen = @min(reason.len, action.reason_buf.len);
-                @memcpy(action.reason_buf[0..rlen], reason[0..rlen]);
-                action.reason_len = @intCast(rlen);
-                self.queueAction(action);
+                if (self.session_state.getPtr(session_id)) |si| {
+                    si.deferred_ticks = 1; // execute on next processConnections call
+                    si.deferred_code = code;
+                    const rlen = @min(reason.len, si.deferred_reason_buf.len);
+                    @memcpy(si.deferred_reason_buf[0..rlen], reason[0..rlen]);
+                    si.deferred_reason_len = @intCast(rlen);
+                }
+                // Trigger a QUIC keepalive to ensure processConnections runs again soon
+                session.sendKeepAlive();
             },
             .server_connection_close => {
-                self.queueAction(.{ .session_id = session_id, .handler = .server_connection_close });
+                if (self.session_state.getPtr(session_id)) |si| {
+                    si.deferred_ticks = 1;
+                }
+                session.sendKeepAlive();
             },
             .abort_stream_from_server => {
                 const code_str = getQueryParam(path, "code") orelse "0";
                 const code = std.fmt.parseInt(u32, code_str, 10) catch 0;
-                self.queueAction(.{ .session_id = session_id, .handler = .abort_stream_from_server, .code = code });
+                if (self.session_state.getPtr(session_id)) |si| {
+                    si.deferred_ticks = 1;
+                    si.deferred_code = code;
+                }
+                session.sendKeepAlive();
             },
             .query => {
                 // Retrieve stashed data by token and send on a uni stream
@@ -289,7 +266,7 @@ const WptHandler = struct {
     }
 
     pub fn onPollComplete(self: *WptHandler, session: *event_loop.Session) void {
-        self.executePendingActions(session);
+        self.executeDeferredActions(session);
     }
 
     pub fn onSessionReady(_: *WptHandler, _: *event_loop.Session, sid: u64) void {
@@ -360,10 +337,19 @@ const WptHandler = struct {
         }
     }
 
-    pub fn onSessionClosed(self: *WptHandler, _: *event_loop.Session, session_id: u64, error_code: u32, reason: []const u8) void {
+    pub fn onSessionClosed(self: *WptHandler, session: *event_loop.Session, session_id: u64, error_code: u32, reason: []const u8) void {
         const info = self.session_state.get(session_id) orelse return;
-        std.log.info("[wpt] session {d} closed (handler={s}, code={d}, reason={s})", .{
-            session_id, @tagName(info.handler), error_code, reason,
+        // Log CONNECT stream state for debugging
+        var recv_finished: bool = false;
+        var send_fin_sent: bool = false;
+        if (session.entry.wt_conn) |*wtc| {
+            if (wtc.quic.streams.getStream(session_id)) |stream| {
+                recv_finished = stream.recv.finished;
+                send_fin_sent = stream.send.fin_sent;
+            }
+        }
+        std.log.info("[wpt] session {d} closed (handler={s}, code={d}, reason={s}, recv_fin={}, send_fin={})", .{
+            session_id, @tagName(info.handler), error_code, reason, recv_finished, send_fin_sent,
         });
 
         // For client-close handler: stash the close info
