@@ -566,6 +566,7 @@ pub const HandshakeError = error{
     UnsupportedVersion,
     NoApplicationProtocol,
     MissingExtension,
+    TransportParameterError,
 };
 
 pub const Action = union(enum) {
@@ -1333,7 +1334,11 @@ pub const Tls13Handshake = struct {
                 }
             } else if (etype == @intFromEnum(ExtType.quic_transport_parameters)) {
                 const tp_data = ext_data[ext_pos..][0..elen];
-                self.peer_transport_params = transport_params.TransportParams.decode(tp_data) catch null;
+                self.peer_transport_params = transport_params.TransportParams.decode(tp_data) catch |tperr| blk: {
+                    // Propagate TransportParameterError to caller for proper QUIC error code
+                    if (tperr == error.TransportParameterError) return error.TransportParameterError;
+                    break :blk null;
+                };
             } else if (etype == @intFromEnum(ExtType.application_layer_protocol_negotiation)) {
                 // Parse client's ALPN list and try to match with our configured ALPNs
                 if (elen >= 2) {

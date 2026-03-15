@@ -1977,6 +1977,11 @@ pub const Connection = struct {
             iterations += 1;
             const action = hs.step() catch |err| {
                 std.log.err("TLS 1.3 handshake error: {}", .{err});
+                // RFC 9000 §7.4: TransportParameterError is a QUIC transport error, not TLS
+                if (err == error.TransportParameterError) {
+                    self.closeWithTransportError(0x08, 0x06, "transport parameter error");
+                    return;
+                }
                 // RFC 9001 §4.8: map TLS errors to CRYPTO_ERROR (0x100 + TLS alert code)
                 const tls_alert: u64 = switch (err) {
                     error.BadCertificate => 42, // bad_certificate
