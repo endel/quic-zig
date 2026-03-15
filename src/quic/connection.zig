@@ -892,7 +892,10 @@ pub const Connection = struct {
             space.crypto_open = saved_open;
             _ = &early_open;
 
-            if (payload.len == 0) return error.InvalidPacket;
+            if (payload.len == 0) {
+                self.closeWithTransportError(0x0a, 0, "empty packet payload");
+                return error.InvalidPacket;
+            }
 
             const now: i64 = @intCast(std.time.nanoTimestamp());
             self.last_packet_received_time = now;
@@ -956,7 +959,14 @@ pub const Connection = struct {
         }
 
         if (payload.len == 0) {
+            self.closeWithTransportError(0x0a, 0, "empty packet payload");
             return error.InvalidPacket;
+        }
+
+        // RFC 9000 §17.2, §17.3: reserved bits MUST be zero after header protection removal
+        if (header.reserved_bits_set) {
+            self.closeWithTransportError(0x0a, 0, "reserved header bits are non-zero");
+            return error.ProtocolViolation;
         }
 
         const now: i64 = @intCast(std.time.nanoTimestamp());
@@ -1060,7 +1070,13 @@ pub const Connection = struct {
 
             const frame = Frame.parse(remaining) catch |err| {
                 std.log.err("Failed to parse frame: {}", .{err});
-                break;
+                // RFC 9000 §12.4: frame encoding errors
+                if (err == error.FrameEncodingError) {
+                    self.closeWithTransportError(0x07, 0, "unknown or malformed frame type");
+                } else {
+                    self.closeWithTransportError(0x07, 0, "frame encoding error");
+                }
+                return error.ProtocolViolation;
             };
 
             std.log.debug("recv: parsed frame type={s}", .{@tagName(frame)});
@@ -1068,6 +1084,7 @@ pub const Connection = struct {
             // Enforce frame-in-correct-space (RFC 9000 §12.5)
             if (!frame.isAllowedIn(header.packet_type)) {
                 std.log.warn("frame {s} not allowed in {s} packet, closing", .{ @tagName(frame), @tagName(header.packet_type) });
+                self.closeWithTransportError(0x0a, 0, "frame not allowed in this packet type");
                 return error.ProtocolViolation;
             }
 
@@ -1465,8 +1482,12 @@ pub const Connection = struct {
             },
 
             .new_token => |token| {
-                // Client stores the token for reuse in future connections (RFC 9000 §8.1.3)
-                if (!self.is_server and token.len <= self.new_token_buf.len) {
+                // RFC 9000 §19.7: server MUST NOT send NEW_TOKEN; client receiving it is valid
+                if (self.is_server) {
+                    self.closeWithTransportError(0x0a, 0x07, "server received NEW_TOKEN");
+                    return error.ProtocolViolation;
+                }
+                if (token.len <= self.new_token_buf.len) {
                     @memcpy(self.new_token_buf[0..token.len], token);
                     self.new_token_len = @intCast(token.len);
                     std.log.info("stored NEW_TOKEN from server ({d} bytes)", .{token.len});
@@ -1638,6 +1659,11 @@ pub const Connection = struct {
             },
 
             .handshake_done => {
+                // RFC 9000 §19.20: only server sends HANDSHAKE_DONE
+                if (self.is_server) {
+                    self.closeWithTransportError(0x0a, 0x1e, "server received HANDSHAKE_DONE");
+                    return error.ProtocolViolation;
+                }
                 self.handshake_confirmed = true;
                 self.state = .connected;
                 self.ecn_validator.start();

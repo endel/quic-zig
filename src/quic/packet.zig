@@ -194,6 +194,10 @@ pub const Header = struct {
     /// Only meaningful for short (1-RTT) headers.
     spin_bit: bool = false,
 
+    /// Whether reserved bits in the unprotected header are non-zero (RFC 9000 §17.2, §17.3).
+    /// Set during header protection removal; checked in connection.recv().
+    reserved_bits_set: bool = false,
+
     /// The offset of this packet's first byte within the buffer.
     /// Used to correctly handle coalesced packets.
     packet_start: usize = 0,
@@ -334,6 +338,13 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
         first_byte ^= (mask[0] & 0x1f);
     }
 
+    // Check reserved bits after header protection removal (RFC 9000 §17.2, §17.3)
+    if (isLongHeader(first_byte)) {
+        header.reserved_bits_set = (first_byte & 0x0c) != 0;
+    } else {
+        header.reserved_bits_set = (first_byte & 0x18) != 0;
+    }
+
     // Extract key phase and spin bits from unprotected short header (RFC 9001 §5.4.1, RFC 9000 §17.4)
     if (!isLongHeader(first_byte)) {
         header.key_phase = (first_byte & KEY_PHASE_BIT) != 0;
@@ -418,6 +429,9 @@ pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *PacketNumSpac
 
     // Short header unmasking
     first_byte ^= (mask[0] & 0x1f);
+
+    // Check reserved bits (RFC 9000 §17.3)
+    header.reserved_bits_set = (first_byte & 0x18) != 0;
 
     // Extract key phase and spin bits from unprotected first byte
     header.key_phase = (first_byte & KEY_PHASE_BIT) != 0;
