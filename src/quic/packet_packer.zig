@@ -380,6 +380,9 @@ pub const PacketPacker = struct {
                         .connection_close => {
                             try pcf.write(writer);
                             ack_eliciting = true;
+                            // Keep CONNECTION_CLOSE for higher encryption levels too
+                            // (RFC 9000 §10.2.3: send at all available levels)
+                            pending_frames.push(pcf);
                         },
                         else => {
                             // Put it back — other control frames go in 1-RTT

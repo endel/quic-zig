@@ -912,7 +912,7 @@ pub const Connection = struct {
                 const frame = Frame.parse(remaining) catch break;
                 // Enforce frame-in-correct-space (RFC 9000 §12.5)
                 if (!frame.isAllowedIn(.zero_rtt)) {
-                    std.log.warn("frame {s} not allowed in 0-RTT packet, closing", .{@tagName(frame)});
+                    self.closeWithTransportError(0x0a, 0x06, "frame not allowed in 0-RTT");
                     return error.ProtocolViolation;
                 }
                 if (frame.isAckEliciting()) ack_eliciting = true;
@@ -2577,15 +2577,19 @@ pub const Connection = struct {
             // Try 1-RTT, then Handshake, then Initial
             const seal = app_seal orelse handshake_seal orelse initial_seal;
             if (seal != null) {
+                // During closing, send at ALL available encryption levels
+                // so the peer can decrypt at whatever level they've reached.
+                // Include Initial/Handshake crypto data so the peer can
+                // derive keys before seeing the CONNECTION_CLOSE.
                 const bytes_written = try self.packer.packCoalesced(
                     out_buf,
                     &self.pkt_handler,
                     &self.crypto_streams,
                     &self.streams,
                     &self.pending_frames,
-                    if (app_seal == null and handshake_seal == null) initial_seal else null,
+                    initial_seal,
                     null,
-                    if (app_seal == null) handshake_seal else null,
+                    handshake_seal,
                     app_seal,
                     now,
                     null,
