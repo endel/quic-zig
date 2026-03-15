@@ -1446,6 +1446,11 @@ pub const Connection = struct {
             },
 
             .reset_stream => |rs| {
+                // RFC 9000 §19.4: RESET_STREAM on a send-only stream is STREAM_STATE_ERROR
+                if (stream_mod.isLocal(rs.stream_id, self.is_server) and !stream_mod.isBidi(rs.stream_id)) {
+                    self.closeWithTransportError(0x05, 0x04, "RESET_STREAM on send-only stream");
+                    return error.ProtocolViolation;
+                }
                 if (self.streams.getStream(rs.stream_id)) |s| {
                     s.recv.handleResetStream(rs.error_code, rs.final_size) catch {
                         // RFC 9000 §4.5: FINAL_SIZE_ERROR
@@ -1470,6 +1475,11 @@ pub const Connection = struct {
             },
 
             .stop_sending => |ss| {
+                // RFC 9000 §19.5: STOP_SENDING for a receive-only stream is STREAM_STATE_ERROR
+                if (!stream_mod.isLocal(ss.stream_id, self.is_server) and !stream_mod.isBidi(ss.stream_id)) {
+                    self.closeWithTransportError(0x05, 0x05, "STOP_SENDING on receive-only stream");
+                    return error.ProtocolViolation;
+                }
                 if (self.streams.getStream(ss.stream_id)) |s| {
                     s.send.reset(ss.error_code);
                 }
@@ -1495,6 +1505,32 @@ pub const Connection = struct {
             },
 
             .stream => |s| {
+                // RFC 9000 §19.8: STREAM on send-only stream is STREAM_STATE_ERROR
+                if (stream_mod.isLocal(s.stream_id, self.is_server) and !stream_mod.isBidi(s.stream_id)) {
+                    self.closeWithTransportError(0x05, 0x08, "STREAM on send-only stream");
+                    return error.ProtocolViolation;
+                }
+                // RFC 9000 §19.8: STREAM for locally-initiated stream not yet created
+                if (stream_mod.isLocal(s.stream_id, self.is_server) and stream_mod.isBidi(s.stream_id)) {
+                    if (self.streams.getStream(s.stream_id) == null) {
+                        self.closeWithTransportError(0x05, 0x08, "STREAM for locally-initiated stream not yet created");
+                        return error.ProtocolViolation;
+                    }
+                }
+                // RFC 9000 §4.1: STREAM frame offset exceeding flow control limit
+                if (s.offset + s.data.len > self.conn_flow_ctrl.base.receive_window) {
+                    self.closeWithTransportError(0x03, 0x08, "STREAM exceeds connection flow control limit");
+                    return error.FlowControlError;
+                }
+                // RFC 9000 §4.6: stream ID exceeding peer's MAX_STREAMS limit
+                {
+                    const stream_seq = s.stream_id / 4;
+                    const limit = if (stream_mod.isBidi(s.stream_id)) self.streams.max_incoming_bidi_streams else self.streams.max_incoming_uni_streams;
+                    if (!stream_mod.isLocal(s.stream_id, self.is_server) and stream_seq >= limit) {
+                        self.closeWithTransportError(0x04, 0x08, "stream ID exceeds MAX_STREAMS limit");
+                        return error.ProtocolViolation;
+                    }
+                }
                 if (stream_mod.isBidi(s.stream_id)) {
                     // Bidirectional stream
                     const strm = self.streams.getOrCreateStream(s.stream_id) catch |err| {
@@ -1544,28 +1580,60 @@ pub const Connection = struct {
             },
 
             .max_stream_data => |msd| {
+                // RFC 9000 §19.10: MAX_STREAM_DATA on receive-only stream is STREAM_STATE_ERROR
+                if (!stream_mod.isLocal(msd.stream_id, self.is_server) and !stream_mod.isBidi(msd.stream_id)) {
+                    self.closeWithTransportError(0x05, 0x11, "MAX_STREAM_DATA on receive-only stream");
+                    return error.ProtocolViolation;
+                }
+                // RFC 9000 §19.10: MAX_STREAM_DATA for locally-initiated stream not yet created
+                if (stream_mod.isLocal(msd.stream_id, self.is_server)) {
+                    if (self.streams.getStream(msd.stream_id) == null) {
+                        self.closeWithTransportError(0x05, 0x11, "MAX_STREAM_DATA for stream not yet created");
+                        return error.ProtocolViolation;
+                    }
+                }
                 if (self.streams.getStream(msd.stream_id)) |s| {
                     s.send.updateSendWindow(msd.max);
                 }
             },
 
             .max_streams_bidi => |max| {
+                // RFC 9000 §19.11: MAX_STREAMS must not exceed 2^60
+                if (max > (1 << 60)) {
+                    self.closeWithTransportError(0x07, 0x12, "MAX_STREAMS_BIDI exceeds 2^60");
+                    return error.ProtocolViolation;
+                }
                 self.streams.setMaxStreams(max, self.streams.max_uni_streams);
             },
 
             .max_streams_uni => |max| {
+                // RFC 9000 §19.11: MAX_STREAMS must not exceed 2^60
+                if (max > (1 << 60)) {
+                    self.closeWithTransportError(0x07, 0x13, "MAX_STREAMS_UNI exceeds 2^60");
+                    return error.ProtocolViolation;
+                }
                 self.streams.setMaxStreams(self.streams.max_bidi_streams, max);
             },
 
             .data_blocked => {},
             .stream_data_blocked => {},
-            .streams_blocked_bidi => {
+            .streams_blocked_bidi => |val| {
+                // RFC 9000 §19.14: STREAMS_BLOCKED must not exceed 2^60
+                if (val > (1 << 60)) {
+                    self.closeWithTransportError(0x04, 0x16, "STREAMS_BLOCKED_BIDI exceeds 2^60");
+                    return error.ProtocolViolation;
+                }
                 // Peer is blocked — respond with our current MAX_STREAMS limit
                 if (self.streams.max_incoming_bidi_streams > 0) {
                     self.pending_frames.push(.{ .max_streams_bidi = self.streams.max_incoming_bidi_streams });
                 }
             },
-            .streams_blocked_uni => {
+            .streams_blocked_uni => |val| {
+                // RFC 9000 §19.14: STREAMS_BLOCKED must not exceed 2^60
+                if (val > (1 << 60)) {
+                    self.closeWithTransportError(0x04, 0x17, "STREAMS_BLOCKED_UNI exceeds 2^60");
+                    return error.ProtocolViolation;
+                }
                 // Peer is blocked — respond with our current MAX_STREAMS limit
                 if (self.streams.max_incoming_uni_streams > 0) {
                     self.pending_frames.push(.{ .max_streams_uni = self.streams.max_incoming_uni_streams });
@@ -1573,6 +1641,16 @@ pub const Connection = struct {
             },
 
             .new_connection_id => |ncid| {
+                // RFC 9000 §19.15: Retire_Prior_To must not exceed Sequence_Number
+                if (ncid.retire_prior_to > ncid.seq_num) {
+                    self.closeWithTransportError(0x07, 0x18, "NEW_CONNECTION_ID: retire_prior_to > seq_num");
+                    return error.ProtocolViolation;
+                }
+                // RFC 9000 §19.15: CID length of 0 is invalid (except for initial)
+                if (ncid.conn_id.len == 0) {
+                    self.closeWithTransportError(0x07, 0x18, "NEW_CONNECTION_ID: 0-byte connection ID");
+                    return error.ProtocolViolation;
+                }
                 if (ncid.seq_num > self.peer_max_cid_seq) {
                     self.peer_max_cid_seq = ncid.seq_num;
                 }
