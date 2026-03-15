@@ -108,6 +108,12 @@ pub const Session = struct {
             try h0c.sendResponse(stream_id, data);
         }
     }
+
+    // --- Connection-level methods ---
+
+    pub fn sendKeepAlive(self: *Session) void {
+        self.entry.conn.sendKeepAlive();
+    }
 };
 
 pub fn Server(comptime Handler: type) type {

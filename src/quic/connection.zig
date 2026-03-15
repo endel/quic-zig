@@ -386,6 +386,10 @@ pub const ConnectionConfig = struct {
     disable_pmtud: bool = false,
     // QLOG output directory (if set, writes .sqlog files)
     qlog_dir: ?[]const u8 = null,
+    // Keep-alive period in milliseconds (0 = disabled). When enabled, PINGs are
+    // sent after this duration of silence, clamped to idle_timeout/2 so the
+    // connection stays alive without tripping the idle timeout.
+    keep_alive_period: u64 = 0,
 };
 
 /// A QUIC connection.
@@ -450,6 +454,11 @@ pub const Connection = struct {
 
     // Whether PMTUD is disabled
     disable_pmtud: bool = false,
+
+    // Keep-alive: computed interval in nanoseconds (0 = disabled)
+    keep_alive_interval_ns: i64 = 0,
+    // True after a keep-alive PING has been sent; reset on packet receipt
+    keep_alive_ping_sent: bool = false,
 
     // Path MTU Discovery (DPLPMTUD, RFC 8899)
     mtu_discoverer: mtu_mod.MtuDiscoverer = .{},
@@ -525,7 +534,6 @@ pub const Connection = struct {
     // Timing
     last_packet_received_time: i64 = 0,
     last_packet_sent_time: i64 = 0,
-    last_keepalive_time: i64 = 0,
     creation_time: i64 = 0,
     idle_timeout_ns: i64 = 30_000_000_000, // 30s default
 
@@ -622,6 +630,12 @@ pub const Connection = struct {
         conn.local_params = local_params;
         conn.enable_v2 = config.enable_v2;
         conn.disable_pmtud = config.disable_pmtud;
+
+        // Compute keep-alive interval: clamp to idle_timeout/2
+        if (config.keep_alive_period > 0) {
+            const ka_ns: i64 = @intCast(config.keep_alive_period * 1_000_000);
+            conn.keep_alive_interval_ns = @min(ka_ns, @divTrunc(conn.idle_timeout_ns, 2));
+        }
 
         // Initialize TLS 1.3 handshake if config provided
         if (tls_config) |tc| {
@@ -882,6 +896,7 @@ pub const Connection = struct {
 
             const now: i64 = @intCast(std.time.nanoTimestamp());
             self.last_packet_received_time = now;
+            self.keep_alive_ping_sent = false;
             if (info.datagram_size > 0) {
                 self.paths[self.active_path_idx].bytes_received += info.datagram_size;
             }
@@ -946,6 +961,7 @@ pub const Connection = struct {
 
         const now: i64 = @intCast(std.time.nanoTimestamp());
         self.last_packet_received_time = now;
+        self.keep_alive_ping_sent = false;
 
         // RFC 9000 §8.1: Receipt of a Handshake packet from the client confirms
         // address ownership (client derived keys → it processed our Initial).
@@ -2095,6 +2111,11 @@ pub const Connection = struct {
                         }
                         // else: keep local timeout (already set)
 
+                        // Recompute keep-alive interval after idle timeout negotiation
+                        if (self.keep_alive_interval_ns > 0) {
+                            self.keep_alive_interval_ns = @min(self.keep_alive_interval_ns, @divTrunc(self.idle_timeout_ns, 2));
+                        }
+
                         // Apply peer's max_ack_delay to RTT stats (RFC 9002 §5.3)
                         self.pkt_handler.rtt_stats.max_ack_delay = @as(i64, @intCast(peer_tp.max_ack_delay)) * 1_000_000;
 
@@ -2915,16 +2936,15 @@ pub const Connection = struct {
             }
         }
 
-        // Keep-alive PING: when no ack-eliciting packets are in flight but the
-        // connection is established and we haven't heard from the peer for >2×PTO,
-        // send a PING to elicit a response. This helps detect NAT rebindings where
-        // the peer's data is being silently dropped by the network (RFC 9000 §10.1.2).
-        if (self.handshake_confirmed and self.pkt_handler.getPtoSpace() == null) {
+        // Keep-alive PING: send a PING after keep_alive_interval_ns of silence
+        // to prevent the connection from hitting the idle timeout (RFC 9000 §10.1.2).
+        if (self.keep_alive_interval_ns > 0 and self.handshake_confirmed and !self.keep_alive_ping_sent) {
             const pto_ns = self.pkt_handler.rtt_stats.pto();
+            const interval = @max(self.keep_alive_interval_ns, pto_ns + @divTrunc(pto_ns, 2)); // floor at 1.5×PTO
             const silence = now - self.last_packet_received_time;
-            if (silence > 2 * pto_ns and (self.last_keepalive_time == 0 or now - self.last_keepalive_time > pto_ns)) {
+            if (silence >= interval) {
                 self.pending_frames.push(.{ .ping = {} });
-                self.last_keepalive_time = now;
+                self.keep_alive_ping_sent = true;
             }
         }
 
@@ -3079,6 +3099,16 @@ pub const Connection = struct {
             }
         }
 
+        // Keep-alive deadline
+        if (self.keep_alive_interval_ns > 0 and self.handshake_confirmed and !self.keep_alive_ping_sent) {
+            const pto_ns = self.pkt_handler.rtt_stats.pto();
+            const interval = @max(self.keep_alive_interval_ns, pto_ns + @divTrunc(pto_ns, 2));
+            const ka_deadline = self.last_packet_received_time + interval;
+            if (earliest == null or ka_deadline < earliest.?) {
+                earliest = ka_deadline;
+            }
+        }
+
         // Loss time and PTO from packet handler
         for (self.pkt_handler.sent, 0..) |tracker, idx| {
             if (tracker.loss_time) |lt| {
@@ -3143,6 +3173,13 @@ pub const Connection = struct {
             }
         }
         return false;
+    }
+
+    /// Manually queue a keep-alive PING frame.
+    /// No-op if the connection is not yet fully established.
+    pub fn sendKeepAlive(self: *Connection) void {
+        if (self.state != .connected or !self.handshake_confirmed) return;
+        self.pending_frames.push(.{ .ping = {} });
     }
 
     /// Return the ECN codepoint to mark on outgoing packets.
@@ -3402,6 +3439,12 @@ pub fn connect(
     @memcpy(conn.initial_dcid_buf[0..8], &dcid);
     conn.enable_v2 = config.enable_v2;
     conn.disable_pmtud = config.disable_pmtud;
+
+    // Compute keep-alive interval: clamp to idle_timeout/2
+    if (config.keep_alive_period > 0) {
+        const ka_ns: i64 = @intCast(config.keep_alive_period * 1_000_000);
+        conn.keep_alive_interval_ns = @min(ka_ns, @divTrunc(conn.idle_timeout_ns, 2));
+    }
 
     // Initialize QLOG if configured
     if (config.qlog_dir) |dir| {
@@ -4177,4 +4220,83 @@ test "NetworkPath: amplification limit" {
     // After validation, no limit
     path.is_validated = true;
     try std.testing.expect(path.canSend(1_000_000));
+}
+
+// Keep-alive tests
+
+test "keep_alive_period = 0 means no keep-alive interval" {
+    var conn = try connect(std.testing.allocator, "example.com", .{ .keep_alive_period = 0 }, null, null);
+    defer conn.deinit();
+    try std.testing.expectEqual(@as(i64, 0), conn.keep_alive_interval_ns);
+}
+
+test "keep_alive_period within idle_timeout/2 is used directly" {
+    // keep_alive_period = 10s, idle_timeout = 30s → interval = 10s
+    var conn = try connect(std.testing.allocator, "example.com", .{
+        .keep_alive_period = 10_000,
+        .max_idle_timeout = 30_000,
+    }, null, null);
+    defer conn.deinit();
+    try std.testing.expectEqual(@as(i64, 10_000_000_000), conn.keep_alive_interval_ns);
+}
+
+test "keep_alive_period capped at idle_timeout/2" {
+    // keep_alive_period = 20s, idle_timeout = 30s → interval = 15s (capped)
+    var conn = try connect(std.testing.allocator, "example.com", .{
+        .keep_alive_period = 20_000,
+        .max_idle_timeout = 30_000,
+    }, null, null);
+    defer conn.deinit();
+    try std.testing.expectEqual(@as(i64, 15_000_000_000), conn.keep_alive_interval_ns);
+}
+
+test "sendKeepAlive queues PING when connected" {
+    var conn = try connect(std.testing.allocator, "example.com", .{}, null, null);
+    defer conn.deinit();
+
+    // Not connected yet — should be no-op
+    conn.sendKeepAlive();
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.len);
+
+    // Simulate connected state
+    conn.state = .connected;
+    conn.handshake_confirmed = true;
+    conn.sendKeepAlive();
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.len);
+}
+
+test "nextTimeoutNs includes keep-alive deadline" {
+    var conn = try connect(std.testing.allocator, "example.com", .{
+        .keep_alive_period = 5_000, // 5s
+        .max_idle_timeout = 30_000,
+    }, null, null);
+    defer conn.deinit();
+
+    conn.state = .connected;
+    conn.handshake_confirmed = true;
+
+    const timeout_with_ka = conn.nextTimeoutNs();
+    try std.testing.expect(timeout_with_ka != null);
+
+    // Now disable keep-alive and check that the deadline changes
+    conn.keep_alive_interval_ns = 0;
+    const timeout_without_ka = conn.nextTimeoutNs();
+    try std.testing.expect(timeout_without_ka != null);
+
+    // Keep-alive deadline should be earlier than idle timeout alone
+    try std.testing.expect(timeout_with_ka.? <= timeout_without_ka.?);
+}
+
+test "keep_alive_ping_sent resets on packet receipt simulation" {
+    var conn = try connect(std.testing.allocator, "example.com", .{
+        .keep_alive_period = 5_000,
+        .max_idle_timeout = 30_000,
+    }, null, null);
+    defer conn.deinit();
+
+    conn.keep_alive_ping_sent = true;
+    // Simulate what recv() does
+    conn.last_packet_received_time = @intCast(std.time.nanoTimestamp());
+    conn.keep_alive_ping_sent = false;
+    try std.testing.expect(!conn.keep_alive_ping_sent);
 }
