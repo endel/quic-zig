@@ -198,6 +198,12 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
             break :blk .{ .goaway = id };
         },
         .cancel_push => blk: {
+            // CANCEL_PUSH requires a Push ID, but tolerate empty payload
+            // so the H3 layer can properly reject it as H3_FRAME_UNEXPECTED
+            // on request streams (RFC 9114 §7.2.5)
+            if (payload.len == 0) {
+                break :blk .{ .cancel_push = 0 };
+            }
             var cfbs = io.fixedBufferStream(payload);
             const creader = cfbs.reader();
             const id = packet.readVarInt(creader) catch return error.MalformedFrame;
