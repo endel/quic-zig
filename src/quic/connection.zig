@@ -1480,6 +1480,13 @@ pub const Connection = struct {
                     self.closeWithTransportError(0x05, 0x05, "STOP_SENDING on receive-only stream");
                     return error.ProtocolViolation;
                 }
+                // RFC 9000 §19.5: STOP_SENDING for a locally-initiated stream not yet created
+                if (stream_mod.isLocal(ss.stream_id, self.is_server)) {
+                    if (self.streams.getStream(ss.stream_id) == null) {
+                        self.closeWithTransportError(0x05, 0x05, "STOP_SENDING for stream not yet created");
+                        return error.ProtocolViolation;
+                    }
+                }
                 if (self.streams.getStream(ss.stream_id)) |s| {
                     s.send.reset(ss.error_code);
                 }
@@ -1922,7 +1929,15 @@ pub const Connection = struct {
             if (got_data) {
                 var nst_iters: usize = 0;
                 while (nst_iters < 10) : (nst_iters += 1) {
-                    const action = hs.step() catch break;
+                    const action = hs.step() catch |err| {
+                        // RFC 9001 §4.8: post-handshake TLS errors
+                        const tls_alert: u64 = switch (err) {
+                            error.UnexpectedMessage => 10,
+                            else => 80,
+                        };
+                        self.closeWithTransportError(0x100 + tls_alert, 0x06, "post-handshake TLS error");
+                        return;
+                    };
                     switch (action) {
                         .complete => {
                             if (hs.received_ticket) |ticket| {

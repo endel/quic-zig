@@ -564,6 +564,8 @@ pub const HandshakeError = error{
     KeyScheduleError,
     NoKeyShare,
     UnsupportedVersion,
+    NoApplicationProtocol,
+    MissingExtension,
 };
 
 pub const Action = union(enum) {
