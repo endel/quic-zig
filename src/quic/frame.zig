@@ -37,6 +37,34 @@ pub const FrameType = enum(u64) {
     _,
 };
 
+/// QUIC transport error codes (RFC 9000 Section 20).
+pub const TransportError = enum(u64) {
+    no_error = 0x00,
+    internal_error = 0x01,
+    connection_refused = 0x02,
+    flow_control_error = 0x03,
+    stream_limit_error = 0x04,
+    stream_state_error = 0x05,
+    final_size_error = 0x06,
+    frame_encoding_error = 0x07,
+    transport_parameter_error = 0x08,
+    connection_id_limit_error = 0x09,
+    protocol_violation = 0x0a,
+    invalid_token = 0x0b,
+    application_error = 0x0c,
+    crypto_buffer_exceeded = 0x0d,
+    key_update_error = 0x0e,
+    aead_limit_reached = 0x0f,
+    no_viable_path = 0x10,
+    version_negotiation_error = 0x11,
+    _,
+
+    /// Create a CRYPTO_ERROR code (0x100 + TLS alert code)
+    pub fn cryptoError(alert: u64) u64 {
+        return 0x100 + alert;
+    }
+};
+
 /// ACK range: represents a contiguous range of acknowledged packet numbers.
 pub const AckRange = struct {
     /// Smallest packet number in this range.

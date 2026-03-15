@@ -9,6 +9,7 @@ const tls13 = @import("tls13.zig");
 const frame_mod = @import("frame.zig");
 const Frame = frame_mod.Frame;
 const FrameType = frame_mod.FrameType;
+const TransportError = frame_mod.TransportError;
 const ack_handler = @import("ack_handler.zig");
 const congestion = @import("congestion.zig");
 const flow_control = @import("flow_control.zig");
@@ -763,7 +764,7 @@ pub const Connection = struct {
 
         // No compatible version — close the connection
         std.log.info("VN: server does not support any of our versions, closing", .{});
-        self.closeWithTransportError(0x11, 0x00, "Version negotiation failed"); // 0x11 = VERSION_NEGOTIATION_ERROR
+        self.closeWithTransportError(@intFromEnum(TransportError.version_negotiation_error), 0, "Version negotiation failed");
     }
 
     /// Handle a Retry packet (client only).
@@ -893,7 +894,7 @@ pub const Connection = struct {
             _ = &early_open;
 
             if (payload.len == 0) {
-                self.closeWithTransportError(0x0a, 0, "empty packet payload");
+                self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "empty packet payload");
                 return error.InvalidPacket;
             }
 
@@ -912,7 +913,7 @@ pub const Connection = struct {
                 const frame = Frame.parse(remaining) catch break;
                 // Enforce frame-in-correct-space (RFC 9000 §12.5)
                 if (!frame.isAllowedIn(.zero_rtt)) {
-                    self.closeWithTransportError(0x0a, 0x06, "frame not allowed in 0-RTT");
+                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.crypto), "frame not allowed in 0-RTT");
                     return error.ProtocolViolation;
                 }
                 if (frame.isAckEliciting()) ack_eliciting = true;
@@ -959,13 +960,13 @@ pub const Connection = struct {
         }
 
         if (payload.len == 0) {
-            self.closeWithTransportError(0x0a, 0, "empty packet payload");
+            self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "empty packet payload");
             return error.InvalidPacket;
         }
 
         // RFC 9000 §17.2, §17.3: reserved bits MUST be zero after header protection removal
         if (header.reserved_bits_set) {
-            self.closeWithTransportError(0x0a, 0, "reserved header bits are non-zero");
+            self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "reserved header bits are non-zero");
             return error.ProtocolViolation;
         }
 
@@ -1072,9 +1073,9 @@ pub const Connection = struct {
                 std.log.err("Failed to parse frame: {}", .{err});
                 // RFC 9000 §12.4: frame encoding errors
                 if (err == error.FrameEncodingError) {
-                    self.closeWithTransportError(0x07, 0, "unknown or malformed frame type");
+                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), 0, "unknown or malformed frame type");
                 } else {
-                    self.closeWithTransportError(0x07, 0, "frame encoding error");
+                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), 0, "frame encoding error");
                 }
                 return error.ProtocolViolation;
             };
@@ -1084,7 +1085,7 @@ pub const Connection = struct {
             // Enforce frame-in-correct-space (RFC 9000 §12.5)
             if (!frame.isAllowedIn(header.packet_type)) {
                 std.log.warn("frame {s} not allowed in {s} packet, closing", .{ @tagName(frame), @tagName(header.packet_type) });
-                self.closeWithTransportError(0x0a, 0, "frame not allowed in this packet type");
+                self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "frame not allowed in this packet type");
                 return error.ProtocolViolation;
             }
 
@@ -1448,18 +1449,18 @@ pub const Connection = struct {
             .reset_stream => |rs| {
                 // RFC 9000 §19.4: RESET_STREAM on a send-only stream is STREAM_STATE_ERROR
                 if (stream_mod.isLocal(rs.stream_id, self.is_server) and !stream_mod.isBidi(rs.stream_id)) {
-                    self.closeWithTransportError(0x05, 0x04, "RESET_STREAM on send-only stream");
+                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM on send-only stream");
                     return error.ProtocolViolation;
                 }
                 if (self.streams.getStream(rs.stream_id)) |s| {
                     s.recv.handleResetStream(rs.error_code, rs.final_size) catch {
                         // RFC 9000 §4.5: FINAL_SIZE_ERROR
-                        self.closeWithTransportError(0x06, 0x04, "RESET_STREAM final_size mismatch");
+                        self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM final_size mismatch");
                         return error.ProtocolViolation;
                     };
                     // RFC 9000 §4.4: account for final_size in connection flow control
                     self.conn_flow_ctrl.base.addBytesReceived(rs.final_size) catch {
-                        self.closeWithTransportError(0x03, 0x04, "RESET_STREAM exceeds flow control");
+                        self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM exceeds flow control");
                         return error.FlowControlError;
                     };
                     // Mark bytes as "read" so connection flow control window advances
@@ -1477,13 +1478,13 @@ pub const Connection = struct {
             .stop_sending => |ss| {
                 // RFC 9000 §19.5: STOP_SENDING for a receive-only stream is STREAM_STATE_ERROR
                 if (!stream_mod.isLocal(ss.stream_id, self.is_server) and !stream_mod.isBidi(ss.stream_id)) {
-                    self.closeWithTransportError(0x05, 0x05, "STOP_SENDING on receive-only stream");
+                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stop_sending), "STOP_SENDING on receive-only stream");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.5: STOP_SENDING for a locally-initiated stream not yet created
                 if (stream_mod.isLocal(ss.stream_id, self.is_server)) {
                     if (self.streams.getStream(ss.stream_id) == null) {
-                        self.closeWithTransportError(0x05, 0x05, "STOP_SENDING for stream not yet created");
+                        self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stop_sending), "STOP_SENDING for stream not yet created");
                         return error.ProtocolViolation;
                     }
                 }
@@ -1501,7 +1502,7 @@ pub const Connection = struct {
             .new_token => |token| {
                 // RFC 9000 §19.7: server MUST NOT send NEW_TOKEN; client receiving it is valid
                 if (self.is_server) {
-                    self.closeWithTransportError(0x0a, 0x07, "server received NEW_TOKEN");
+                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.new_token), "server received NEW_TOKEN");
                     return error.ProtocolViolation;
                 }
                 if (token.len <= self.new_token_buf.len) {
@@ -1514,19 +1515,19 @@ pub const Connection = struct {
             .stream => |s| {
                 // RFC 9000 §19.8: STREAM on send-only stream is STREAM_STATE_ERROR
                 if (stream_mod.isLocal(s.stream_id, self.is_server) and !stream_mod.isBidi(s.stream_id)) {
-                    self.closeWithTransportError(0x05, 0x08, "STREAM on send-only stream");
+                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stream), "STREAM on send-only stream");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.8: STREAM for locally-initiated stream not yet created
                 if (stream_mod.isLocal(s.stream_id, self.is_server) and stream_mod.isBidi(s.stream_id)) {
                     if (self.streams.getStream(s.stream_id) == null) {
-                        self.closeWithTransportError(0x05, 0x08, "STREAM for locally-initiated stream not yet created");
+                        self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stream), "STREAM for locally-initiated stream not yet created");
                         return error.ProtocolViolation;
                     }
                 }
                 // RFC 9000 §4.1: STREAM frame offset exceeding flow control limit
                 if (s.offset + s.data.len > self.conn_flow_ctrl.base.receive_window) {
-                    self.closeWithTransportError(0x03, 0x08, "STREAM exceeds connection flow control limit");
+                    self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.stream), "STREAM exceeds connection flow control limit");
                     return error.FlowControlError;
                 }
                 // RFC 9000 §4.6: stream ID exceeding peer's MAX_STREAMS limit
@@ -1534,7 +1535,7 @@ pub const Connection = struct {
                     const stream_seq = s.stream_id / 4;
                     const limit = if (stream_mod.isBidi(s.stream_id)) self.streams.max_incoming_bidi_streams else self.streams.max_incoming_uni_streams;
                     if (!stream_mod.isLocal(s.stream_id, self.is_server) and stream_seq >= limit) {
-                        self.closeWithTransportError(0x04, 0x08, "stream ID exceeds MAX_STREAMS limit");
+                        self.closeWithTransportError(@intFromEnum(TransportError.stream_limit_error), @intFromEnum(FrameType.stream), "stream ID exceeds MAX_STREAMS limit");
                         return error.ProtocolViolation;
                     }
                 }
@@ -1546,7 +1547,7 @@ pub const Connection = struct {
                     };
                     strm.recv.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
                         error.FinalSizeError => {
-                            self.closeWithTransportError(0x06, 0x08, "STREAM final_size mismatch");
+                            self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
                             return error.ProtocolViolation;
                         },
                         else => return err,
@@ -1565,7 +1566,7 @@ pub const Connection = struct {
                     };
                     recv_strm.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
                         error.FinalSizeError => {
-                            self.closeWithTransportError(0x06, 0x08, "STREAM final_size mismatch");
+                            self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
                             return error.ProtocolViolation;
                         },
                         else => return err,
@@ -1589,13 +1590,13 @@ pub const Connection = struct {
             .max_stream_data => |msd| {
                 // RFC 9000 §19.10: MAX_STREAM_DATA on receive-only stream is STREAM_STATE_ERROR
                 if (!stream_mod.isLocal(msd.stream_id, self.is_server) and !stream_mod.isBidi(msd.stream_id)) {
-                    self.closeWithTransportError(0x05, 0x11, "MAX_STREAM_DATA on receive-only stream");
+                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.max_stream_data), "MAX_STREAM_DATA on receive-only stream");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.10: MAX_STREAM_DATA for locally-initiated stream not yet created
                 if (stream_mod.isLocal(msd.stream_id, self.is_server)) {
                     if (self.streams.getStream(msd.stream_id) == null) {
-                        self.closeWithTransportError(0x05, 0x11, "MAX_STREAM_DATA for stream not yet created");
+                        self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.max_stream_data), "MAX_STREAM_DATA for stream not yet created");
                         return error.ProtocolViolation;
                     }
                 }
@@ -1607,7 +1608,7 @@ pub const Connection = struct {
             .max_streams_bidi => |max| {
                 // RFC 9000 §19.11: MAX_STREAMS must not exceed 2^60
                 if (max > (1 << 60)) {
-                    self.closeWithTransportError(0x07, 0x12, "MAX_STREAMS_BIDI exceeds 2^60");
+                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), @intFromEnum(FrameType.max_streams_bidi), "MAX_STREAMS_BIDI exceeds 2^60");
                     return error.ProtocolViolation;
                 }
                 self.streams.setMaxStreams(max, self.streams.max_uni_streams);
@@ -1616,7 +1617,7 @@ pub const Connection = struct {
             .max_streams_uni => |max| {
                 // RFC 9000 §19.11: MAX_STREAMS must not exceed 2^60
                 if (max > (1 << 60)) {
-                    self.closeWithTransportError(0x07, 0x13, "MAX_STREAMS_UNI exceeds 2^60");
+                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), @intFromEnum(FrameType.max_streams_uni), "MAX_STREAMS_UNI exceeds 2^60");
                     return error.ProtocolViolation;
                 }
                 self.streams.setMaxStreams(self.streams.max_bidi_streams, max);
@@ -1627,7 +1628,7 @@ pub const Connection = struct {
             .streams_blocked_bidi => |val| {
                 // RFC 9000 §19.14: STREAMS_BLOCKED must not exceed 2^60
                 if (val > (1 << 60)) {
-                    self.closeWithTransportError(0x04, 0x16, "STREAMS_BLOCKED_BIDI exceeds 2^60");
+                    self.closeWithTransportError(@intFromEnum(TransportError.stream_limit_error), @intFromEnum(FrameType.streams_blocked_bidi), "STREAMS_BLOCKED_BIDI exceeds 2^60");
                     return error.ProtocolViolation;
                 }
                 // Peer is blocked — respond with our current MAX_STREAMS limit
@@ -1638,7 +1639,7 @@ pub const Connection = struct {
             .streams_blocked_uni => |val| {
                 // RFC 9000 §19.14: STREAMS_BLOCKED must not exceed 2^60
                 if (val > (1 << 60)) {
-                    self.closeWithTransportError(0x04, 0x17, "STREAMS_BLOCKED_UNI exceeds 2^60");
+                    self.closeWithTransportError(@intFromEnum(TransportError.stream_limit_error), @intFromEnum(FrameType.streams_blocked_uni), "STREAMS_BLOCKED_UNI exceeds 2^60");
                     return error.ProtocolViolation;
                 }
                 // Peer is blocked — respond with our current MAX_STREAMS limit
@@ -1650,12 +1651,12 @@ pub const Connection = struct {
             .new_connection_id => |ncid| {
                 // RFC 9000 §19.15: Retire_Prior_To must not exceed Sequence_Number
                 if (ncid.retire_prior_to > ncid.seq_num) {
-                    self.closeWithTransportError(0x07, 0x18, "NEW_CONNECTION_ID: retire_prior_to > seq_num");
+                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), @intFromEnum(FrameType.new_connection_id), "NEW_CONNECTION_ID: retire_prior_to > seq_num");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.15: CID length of 0 is invalid (except for initial)
                 if (ncid.conn_id.len == 0) {
-                    self.closeWithTransportError(0x07, 0x18, "NEW_CONNECTION_ID: 0-byte connection ID");
+                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), @intFromEnum(FrameType.new_connection_id), "NEW_CONNECTION_ID: 0-byte connection ID");
                     return error.ProtocolViolation;
                 }
                 if (ncid.seq_num > self.peer_max_cid_seq) {
@@ -1746,7 +1747,7 @@ pub const Connection = struct {
             .handshake_done => {
                 // RFC 9000 §19.20: only server sends HANDSHAKE_DONE
                 if (self.is_server) {
-                    self.closeWithTransportError(0x0a, 0x1e, "server received HANDSHAKE_DONE");
+                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.handshake_done), "server received HANDSHAKE_DONE");
                     return error.ProtocolViolation;
                 }
                 self.handshake_confirmed = true;
@@ -1935,7 +1936,7 @@ pub const Connection = struct {
                             error.UnexpectedMessage => 10,
                             else => 80,
                         };
-                        self.closeWithTransportError(0x100 + tls_alert, 0x06, "post-handshake TLS error");
+                        self.closeWithTransportError(TransportError.cryptoError(tls_alert), @intFromEnum(FrameType.crypto), "post-handshake TLS error");
                         return;
                     };
                     switch (action) {
@@ -1979,7 +1980,7 @@ pub const Connection = struct {
                 std.log.err("TLS 1.3 handshake error: {}", .{err});
                 // RFC 9000 §7.4: TransportParameterError is a QUIC transport error, not TLS
                 if (err == error.TransportParameterError) {
-                    self.closeWithTransportError(0x08, 0x06, "transport parameter error");
+                    self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "transport parameter error");
                     return;
                 }
                 // RFC 9001 §4.8: map TLS errors to CRYPTO_ERROR (0x100 + TLS alert code)
@@ -1995,7 +1996,7 @@ pub const Connection = struct {
                     error.MissingExtension => 109, // missing_extension
                     else => 80, // internal_error
                 };
-                self.closeWithTransportError(0x100 + tls_alert, 0x06, "TLS handshake failure");
+                self.closeWithTransportError(TransportError.cryptoError(tls_alert), @intFromEnum(FrameType.crypto), "TLS handshake failure");
                 return;
             };
             std.log.info("advanceHandshake: step {d} produced action={s}", .{ iterations, @tagName(action) });
@@ -2156,105 +2157,7 @@ pub const Connection = struct {
                     if (hs.peer_transport_params) |peer_tp| {
                         self.peer_params = peer_tp;
 
-                        // Validate initial_source_connection_id is present (RFC 9000 §7.3)
-                        if (peer_tp.initial_source_connection_id == null) {
-                            std.log.err("transport param validation failed: initial_source_connection_id missing", .{});
-                            self.closeWithTransportError(0x08, 0x06, "missing initial_source_connection_id");
-                            return error.TransportParameterError;
-                        }
-
-                        // Validate numeric ranges (RFC 9000 §7.4, §18.2)
-                        if (peer_tp.max_udp_payload_size < 1200) {
-                            std.log.err("transport param validation failed: max_udp_payload_size < 1200", .{});
-                            self.closeWithTransportError(0x08, 0x06, "max_udp_payload_size below 1200");
-                            return error.TransportParameterError;
-                        }
-                        if (peer_tp.ack_delay_exponent > 20) {
-                            std.log.err("transport param validation failed: ack_delay_exponent > 20", .{});
-                            self.closeWithTransportError(0x08, 0x06, "ack_delay_exponent exceeds 20");
-                            return error.TransportParameterError;
-                        }
-                        if (peer_tp.max_ack_delay >= 16384) {
-                            std.log.err("transport param validation failed: max_ack_delay >= 2^14", .{});
-                            self.closeWithTransportError(0x08, 0x06, "max_ack_delay exceeds 2^14");
-                            return error.TransportParameterError;
-                        }
-
-                        // Client-side: validate ODCID and retry_scid transport params (RFC 9000 §7.3)
-                        if (!self.is_server) {
-                            // original_destination_connection_id must match the DCID we initially sent
-                            if (peer_tp.original_destination_connection_id) |peer_odcid| {
-                                if (!std.mem.eql(u8, peer_odcid, self.odcid_buf[0..self.odcid_len])) {
-                                    std.log.err("transport param validation failed: ODCID mismatch", .{});
-                                    return error.TransportParameterError;
-                                }
-                            } else {
-                                std.log.err("transport param validation failed: server must send ODCID", .{});
-                                return error.TransportParameterError;
-                            }
-
-                            // If Retry was used, retry_source_connection_id must be present
-                            // If not, it must be absent
-                            if (self.retry_received) {
-                                if (peer_tp.retry_source_connection_id == null) {
-                                    std.log.err("transport param validation failed: retry_scid missing after Retry", .{});
-                                    return error.TransportParameterError;
-                                }
-                            } else {
-                                if (peer_tp.retry_source_connection_id != null) {
-                                    std.log.err("transport param validation failed: retry_scid present without Retry", .{});
-                                    return error.TransportParameterError;
-                                }
-                            }
-                        }
-
-                        // Server-side: reject server-only params from client (RFC 9000 §18.2)
-                        if (self.is_server) {
-                            if (peer_tp.original_destination_connection_id != null) {
-                                std.log.err("transport param validation failed: client sent original_destination_connection_id", .{});
-                                self.closeWithTransportError(0x08, 0x06, "client sent original_destination_connection_id");
-                                return error.TransportParameterError;
-                            }
-                            if (peer_tp.preferred_address != null) {
-                                std.log.err("transport param validation failed: client sent preferred_address", .{});
-                                self.closeWithTransportError(0x08, 0x06, "client sent preferred_address");
-                                return error.TransportParameterError;
-                            }
-                            if (peer_tp.retry_source_connection_id != null) {
-                                std.log.err("transport param validation failed: client sent retry_source_connection_id", .{});
-                                self.closeWithTransportError(0x08, 0x06, "client sent retry_source_connection_id");
-                                return error.TransportParameterError;
-                            }
-                            if (peer_tp.stateless_reset_token != null) {
-                                std.log.err("transport param validation failed: client sent stateless_reset_token", .{});
-                                self.closeWithTransportError(0x08, 0x06, "client sent stateless_reset_token");
-                                return error.TransportParameterError;
-                            }
-                        }
-
-                        // RFC 9000 §7.4.1: if 0-RTT was used, validate that server's new
-                        // transport params are not less than the remembered values.
-                        if (self.remembered_params != null and self.early_data_seal != null) {
-                            const rp = self.remembered_params.?;
-                            if (peer_tp.initial_max_data < rp.initial_max_data or
-                                peer_tp.initial_max_stream_data_bidi_local < rp.initial_max_stream_data_bidi_local or
-                                peer_tp.initial_max_stream_data_bidi_remote < rp.initial_max_stream_data_bidi_remote or
-                                peer_tp.initial_max_stream_data_uni < rp.initial_max_stream_data_uni or
-                                peer_tp.initial_max_streams_bidi < rp.initial_max_streams_bidi or
-                                peer_tp.initial_max_streams_uni < rp.initial_max_streams_uni or
-                                peer_tp.active_connection_id_limit < rp.active_connection_id_limit)
-                            {
-                                std.log.err("transport param validation failed: server reduced 0-RTT remembered params", .{});
-                                self.closeWithTransportError(
-                                    0x08, // TRANSPORT_PARAMETER_ERROR
-                                    0,
-                                    "0-RTT transport params reduced",
-                                );
-                                return error.TransportParameterError;
-                            }
-                            // Clear remembered params after successful validation
-                            self.remembered_params = null;
-                        }
+                        try self.validatePeerTransportParams(&peer_tp);
 
                         self.streams.setMaxStreams(
                             peer_tp.initial_max_streams_bidi,
@@ -3154,6 +3057,100 @@ pub const Connection = struct {
             .frame_type = 0,
             .is_app = true,
         } });
+    }
+
+    /// Validate peer transport parameters (RFC 9000 §7.3, §7.4, §18.2).
+    fn validatePeerTransportParams(self: *Connection, peer_tp: *const transport_params.TransportParams) !void {
+        // Validate initial_source_connection_id is present (RFC 9000 §7.3)
+        if (peer_tp.initial_source_connection_id == null) {
+            self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "missing initial_source_connection_id");
+            return error.TransportParameterError;
+        }
+
+        // Validate numeric ranges (RFC 9000 §7.4, §18.2)
+        if (peer_tp.max_udp_payload_size < 1200) {
+            self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "max_udp_payload_size below 1200");
+            return error.TransportParameterError;
+        }
+        if (peer_tp.ack_delay_exponent > 20) {
+            self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "ack_delay_exponent exceeds 20");
+            return error.TransportParameterError;
+        }
+        if (peer_tp.max_ack_delay >= 16384) {
+            self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "max_ack_delay exceeds 2^14");
+            return error.TransportParameterError;
+        }
+
+        // Client-side: validate ODCID and retry_scid transport params (RFC 9000 §7.3)
+        if (!self.is_server) {
+            // original_destination_connection_id must match the DCID we initially sent
+            if (peer_tp.original_destination_connection_id) |peer_odcid| {
+                if (!std.mem.eql(u8, peer_odcid, self.odcid_buf[0..self.odcid_len])) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "ODCID mismatch");
+                    return error.TransportParameterError;
+                }
+            } else {
+                self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "server must send ODCID");
+                return error.TransportParameterError;
+            }
+
+            // If Retry was used, retry_source_connection_id must be present
+            // If not, it must be absent
+            if (self.retry_received) {
+                if (peer_tp.retry_source_connection_id == null) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "retry_scid missing after Retry");
+                    return error.TransportParameterError;
+                }
+            } else {
+                if (peer_tp.retry_source_connection_id != null) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "retry_scid present without Retry");
+                    return error.TransportParameterError;
+                }
+            }
+        }
+
+        // Server-side: reject server-only params from client (RFC 9000 §18.2)
+        if (self.is_server) {
+            if (peer_tp.original_destination_connection_id != null) {
+                self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "client sent original_destination_connection_id");
+                return error.TransportParameterError;
+            }
+            if (peer_tp.preferred_address != null) {
+                self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "client sent preferred_address");
+                return error.TransportParameterError;
+            }
+            if (peer_tp.retry_source_connection_id != null) {
+                self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "client sent retry_source_connection_id");
+                return error.TransportParameterError;
+            }
+            if (peer_tp.stateless_reset_token != null) {
+                self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "client sent stateless_reset_token");
+                return error.TransportParameterError;
+            }
+        }
+
+        // RFC 9000 §7.4.1: if 0-RTT was used, validate that server's new
+        // transport params are not less than the remembered values.
+        if (self.remembered_params != null and self.early_data_seal != null) {
+            const rp = self.remembered_params.?;
+            if (peer_tp.initial_max_data < rp.initial_max_data or
+                peer_tp.initial_max_stream_data_bidi_local < rp.initial_max_stream_data_bidi_local or
+                peer_tp.initial_max_stream_data_bidi_remote < rp.initial_max_stream_data_bidi_remote or
+                peer_tp.initial_max_stream_data_uni < rp.initial_max_stream_data_uni or
+                peer_tp.initial_max_streams_bidi < rp.initial_max_streams_bidi or
+                peer_tp.initial_max_streams_uni < rp.initial_max_streams_uni or
+                peer_tp.active_connection_id_limit < rp.active_connection_id_limit)
+            {
+                self.closeWithTransportError(
+                    @intFromEnum(TransportError.transport_parameter_error),
+                    0,
+                    "0-RTT transport params reduced",
+                );
+                return error.TransportParameterError;
+            }
+            // Clear remembered params after successful validation
+            self.remembered_params = null;
+        }
     }
 
     /// Close the connection with a transport error (RFC 9000 §10.2).
@@ -4124,10 +4121,10 @@ test "Connection: closeWithTransportError" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
 
-    conn.closeWithTransportError(0x0a, 0x06, "flow control");
+    conn.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.crypto), "flow control");
     try std.testing.expectEqual(State.closing, conn.state);
     try std.testing.expect(!conn.local_err.?.is_app);
-    try std.testing.expectEqual(@as(u64, 0x0a), conn.local_err.?.code);
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
 }
 
 test "Connection: state queries" {
