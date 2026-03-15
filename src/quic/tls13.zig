@@ -864,13 +864,15 @@ pub const Tls13Handshake = struct {
             .server_send_ticket => return self.serverSendTicket(),
 
             .connected => {
-                // Check for post-handshake messages (NewSessionTicket)
-                if (!self.is_server) {
-                    if (self.readHandshakeMsg()) |msg| {
-                        if (msg[0] == @intFromEnum(MsgType.new_session_ticket)) {
-                            self.parseNewSessionTicket(msg);
-                            return ._continue;
-                        }
+                // Check for post-handshake messages
+                if (self.readHandshakeMsg()) |msg| {
+                    // RFC 9001 §6: KeyUpdate (24) MUST NOT be used in QUIC
+                    if (msg[0] == 24) return error.UnexpectedMessage;
+                    // RFC 9001 §8.3: EndOfEarlyData (5) MUST NOT be sent in QUIC
+                    if (msg[0] == 5) return error.UnexpectedMessage;
+                    if (!self.is_server and msg[0] == @intFromEnum(MsgType.new_session_ticket)) {
+                        self.parseNewSessionTicket(msg);
+                        return ._continue;
                     }
                 }
                 return .complete;
@@ -1022,6 +1024,11 @@ pub const Tls13Handshake = struct {
 
         // Parse EncryptedExtensions to extract transport params + ALPN + early_data
         self.parseEncryptedExtensions(msg[4..]) catch {};
+
+        // RFC 9001 §8.2: quic_transport_parameters extension MUST be present
+        if (self.peer_transport_params == null) {
+            return error.MissingExtension;
+        }
 
         self.transcript.update(msg);
         self.state = .client_wait_certificate;
@@ -1325,6 +1332,30 @@ pub const Tls13Handshake = struct {
             } else if (etype == @intFromEnum(ExtType.quic_transport_parameters)) {
                 const tp_data = ext_data[ext_pos..][0..elen];
                 self.peer_transport_params = transport_params.TransportParams.decode(tp_data) catch null;
+            } else if (etype == @intFromEnum(ExtType.application_layer_protocol_negotiation)) {
+                // Parse client's ALPN list and try to match with our configured ALPNs
+                if (elen >= 2) {
+                    const list_len = readU16(ext_data[ext_pos..]);
+                    var alpn_pos: usize = 2;
+                    var matched = false;
+                    while (alpn_pos < 2 + list_len and alpn_pos + 1 <= elen) {
+                        const proto_len = ext_data[ext_pos + alpn_pos];
+                        alpn_pos += 1;
+                        if (alpn_pos + proto_len > elen) break;
+                        const proto = ext_data[ext_pos + alpn_pos ..][0..proto_len];
+                        for (self.config.alpn) |our_proto| {
+                            if (std.mem.eql(u8, proto, our_proto)) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if (matched) break;
+                        alpn_pos += proto_len;
+                    }
+                    if (!matched and self.config.alpn.len > 0) {
+                        return error.NoApplicationProtocol;
+                    }
+                }
             } else if (etype == @intFromEnum(ExtType.pre_shared_key)) {
                 // PSK extension must be the last one (RFC 8446 §4.2.11)
                 psk_ext_offset = ext_pos;
@@ -1334,6 +1365,11 @@ pub const Tls13Handshake = struct {
         }
 
         if (!found_key_share) return error.NoKeyShare;
+
+        // RFC 9001 §8.2: quic_transport_parameters extension MUST be present
+        if (self.peer_transport_params == null) {
+            return error.MissingExtension;
+        }
 
         // Try to process PSK extension if present and we have a ticket key
         if (psk_ext_offset != null and self.config.ticket_key != null) {
