@@ -361,24 +361,30 @@ pub const PacketPacker = struct {
                 }
             }
 
-            // 2b. PING for PTO probes in Initial/Handshake when no crypto data
-            // This ensures the second PTO probe is ack-eliciting even when all
-            // crypto data fit in the first probe (RFC 9002 §6.2.4).
-            if (!ack_eliciting and (level == .initial or level == .handshake)) {
-                if (pending_frames.len > 0) {
-                    // Check if there's a PING in the queue
-                    const pcf = pending_frames.pop();
-                    if (pcf != null) {
-                        switch (pcf.?) {
-                            .ping => {
+            // 2b. PING and CONNECTION_CLOSE for Initial/Handshake packets
+            // PING: PTO probes need ack-eliciting frames (RFC 9002 §6.2.4)
+            // CONNECTION_CLOSE: valid at all levels (RFC 9000 §10.2.3)
+            if (level == .initial or level == .handshake) {
+                var remaining_pf = pending_frames.len;
+                while (remaining_pf > 0) : (remaining_pf -= 1) {
+                    const pcf = pending_frames.pop() orelse break;
+                    switch (pcf) {
+                        .ping => {
+                            if (!ack_eliciting) {
                                 try writer.writeByte(0x01); // PING frame
                                 ack_eliciting = true;
-                            },
-                            else => {
-                                // Put it back — non-PING control frames go in 1-RTT
-                                pending_frames.push(pcf.?);
-                            },
-                        }
+                            } else {
+                                pending_frames.push(pcf);
+                            }
+                        },
+                        .connection_close => {
+                            try pcf.write(writer);
+                            ack_eliciting = true;
+                        },
+                        else => {
+                            // Put it back — other control frames go in 1-RTT
+                            pending_frames.push(pcf);
+                        },
                     }
                 }
             }
