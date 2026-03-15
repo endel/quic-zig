@@ -11,6 +11,7 @@ import puppeteer from 'puppeteer';
 import { execSync } from 'child_process';
 import http from 'http';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -22,8 +23,11 @@ const HTTP_PORT = 8787;
 
 const args = process.argv.slice(2);
 let filterArg = null;
+let browserType = 'chrome'; // 'chrome' or 'firefox'
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--filter' && args[i + 1]) filterArg = args[++i];
+  if (args[i] === '--browser' && args[i + 1]) browserType = args[++i];
+  if (args[i] === '--firefox') browserType = 'firefox';
 }
 
 // Compute cert hash
@@ -34,13 +38,17 @@ const hashBytes = certHash.match(/.{2}/g).map(b => parseInt(b, 16));
 
 console.log(`\nCert hash: ${certHash}`);
 console.log(`Server:    ${SERVER_URL}`);
+console.log(`Browser:   ${browserType}`);
 
 // Generate test HTML with cert hash baked in
 function generateTestPage(testName, testCode) {
+  // Both Chrome and Firefox support serverCertificateHashes
+  const useHash = true;
   return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>
 <script>
 const CERT_HASH = new Uint8Array([${hashBytes.join(',')}]);
 const SERVER = '${SERVER_URL}';
+const USE_CERT_HASH = ${useHash};
 
 function wtUrl(handler) {
   return 'https://' + SERVER + '/webtransport/handlers/' + handler;
@@ -48,9 +56,10 @@ function wtUrl(handler) {
 
 function createWT(handler) {
   const url = wtUrl(handler);
-  const wt = new WebTransport(url, {
-    serverCertificateHashes: [{ algorithm: 'sha-256', value: CERT_HASH.buffer }],
-  });
+  const opts = USE_CERT_HASH
+    ? { serverCertificateHashes: [{ algorithm: 'sha-256', value: CERT_HASH.buffer }] }
+    : {};
+  const wt = new WebTransport(url, opts);
   return wt;
 }
 
@@ -294,16 +303,50 @@ async function main() {
   });
   await new Promise(r => server.listen(HTTP_PORT, r));
 
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--enable-quic',
-      '--origin-to-force-quic-on=' + SERVER_URL,
-      '--ignore-certificate-errors',
-    ],
-  });
+  console.log(`Browser:   ${browserType}\n`);
+
+  let browser;
+  if (browserType === 'firefox') {
+    // Firefox needs the CA cert imported into a profile.
+    // Create a temp profile, import cert, then launch.
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-wpt-'));
+    try {
+      // Try to use certutil to import the cert as trusted
+      execSync(`which certutil && certutil -A -n "wpt-test" -t "CT,," -i "${CERT_PATH}" -d "sql:${profileDir}" 2>/dev/null`, { stdio: 'pipe' });
+      console.log(`  Imported cert into Firefox profile: ${profileDir}`);
+    } catch {
+      console.log(`  certutil not found — Firefox may reject self-signed cert`);
+      console.log(`  Install: brew install nss`);
+    }
+    browser = await puppeteer.launch({
+      browser: 'firefox',
+      headless: true,
+      userDataDir: profileDir,
+      firefoxUserPrefs: {
+        // Enable WebTransport + HTTP/3
+        'network.webtransport.enabled': true,
+        'network.http.http3.enabled': true,
+        'network.http.http3.enable': true,
+        'network.http.http3.webtransport.enabled': true,
+        // Allow serverCertificateHashes with self-signed certs
+        'network.webtransport.datagrams.enabled': true,
+        // Relax security for testing
+        'security.enterprise_roots.enabled': true,
+        'dom.security.https_first': false,
+      },
+    });
+  } else {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--enable-quic',
+        '--origin-to-force-quic-on=' + SERVER_URL,
+        '--ignore-certificate-errors',
+      ],
+    });
+  }
 
   const testsToRun = filterArg
     ? TESTS.filter(t => t.name.includes(filterArg))
