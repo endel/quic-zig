@@ -310,16 +310,13 @@ const WptHandler = struct {
         });
     }
 
-    pub fn onStreamData(self: *WptHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
+    pub fn onStreamData(self: *WptHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
         // Find which session this stream belongs to
         const session_id = self.findSessionForStream(session) orelse return;
         const info = self.session_state.get(session_id) orelse return;
 
-        // Check if sender has finished (FIN received)
-        const sender_finished = self.isStreamFinished(session, stream_id);
-
         std.log.info("[wpt] stream data: handler={s} stream={d} len={d} fin={}", .{
-            @tagName(info.handler), stream_id, data.len, sender_finished,
+            @tagName(info.handler), stream_id, data.len, fin,
         });
 
         switch (info.handler) {
@@ -327,13 +324,13 @@ const WptHandler = struct {
                 if (isUniStream(stream_id)) {
                     // Unidirectional: echo on a NEW uni stream
                     if (session.openUniStream(session_id)) |new_stream_id| {
-                        session.sendStreamData(new_stream_id, data) catch {};
-                        if (sender_finished) session.closeStream(new_stream_id);
+                        if (data.len > 0) session.sendStreamData(new_stream_id, data) catch {};
+                        if (fin) session.closeStream(new_stream_id);
                     } else |_| {}
                 } else {
                     // Bidirectional: echo back on same stream, close only after FIN
-                    session.sendStreamData(stream_id, data) catch {};
-                    if (sender_finished) session.closeStream(stream_id);
+                    if (data.len > 0) session.sendStreamData(stream_id, data) catch {};
+                    if (fin) session.closeStream(stream_id);
                 }
             },
             .server_read_then_close => {
@@ -424,19 +421,6 @@ const WptHandler = struct {
             }
         }
         return null;
-    }
-
-    /// Check if a stream's receive side has finished (peer sent FIN).
-    fn isStreamFinished(_: *WptHandler, session: *event_loop.Session, stream_id: u64) bool {
-        if (session.entry.wt_conn) |*wtc| {
-            if (wtc.quic.streams.getStream(stream_id)) |stream| {
-                return stream.recv.finished;
-            }
-            if (wtc.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
-                return recv_stream.finished;
-            }
-        }
-        return false;
     }
 
     /// Check if a stream ID is a unidirectional stream.

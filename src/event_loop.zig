@@ -559,7 +559,12 @@ pub fn Server(comptime Handler: type) type {
                     },
                     .stream_data => |sd| {
                         if (@hasDecl(Handler, "onStreamData")) {
-                            self.handler.onStreamData(&session, sd.stream_id, sd.data);
+                            // Support both 4-arg (with fin) and 3-arg (without fin) signatures
+                            if (@typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params.len == 5) {
+                                self.handler.onStreamData(&session, sd.stream_id, sd.data, sd.fin);
+                            } else {
+                                self.handler.onStreamData(&session, sd.stream_id, sd.data);
+                            }
                         }
                     },
                     .datagram => |dg| {

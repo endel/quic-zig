@@ -69,7 +69,7 @@ pub const WtEvent = union(enum) {
     connect_request: struct { session_id: u64, protocol: []const u8, authority: []const u8, path: []const u8, headers: []const qpack.Header = &.{} },
     bidi_stream: struct { session_id: u64, stream_id: u64 },
     uni_stream: struct { session_id: u64, stream_id: u64 },
-    stream_data: struct { stream_id: u64, data: []const u8 },
+    stream_data: struct { stream_id: u64, data: []const u8, fin: bool = false },
     datagram: struct { session_id: u64, data: []const u8 },
     session_closed: struct { session_id: u64, error_code: u32, reason: []const u8 },
     session_draining: struct { session_id: u64 },
@@ -94,6 +94,9 @@ pub const WebTransportConnection = struct {
     // Buffered data for WT streams (data after type prefix, or data read before poll)
     stream_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
 
+    // Streams that have already delivered their FIN event (prevents repeated fin events)
+    fin_delivered: std.AutoHashMap(u64, void),
+
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, h3: *h3_conn.H3Connection, quic: *quic_connection.Connection, is_server: bool) WebTransportConnection {
@@ -105,6 +108,7 @@ pub const WebTransportConnection = struct {
             .wt_uni_streams = std.AutoHashMap(u64, u64).init(allocator),
             .pending_uni_streams = std.AutoHashMap(u64, void).init(allocator),
             .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
+            .fin_delivered = std.AutoHashMap(u64, void).init(allocator),
             .allocator = allocator,
         };
     }
@@ -116,6 +120,7 @@ pub const WebTransportConnection = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.stream_bufs.deinit();
+        self.fin_delivered.deinit();
         self.wt_bidi_streams.deinit();
         self.wt_uni_streams.deinit();
         self.pending_uni_streams.deinit();
@@ -297,7 +302,6 @@ pub const WebTransportConnection = struct {
         const truncated_reason = if (reason.len > 1024) reason[0..1024] else reason;
 
         // Send CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
-        // Also stop reading (STOP_SENDING) so the peer knows we're done.
         if (self.quic.streams.getStream(session_id)) |stream| {
             var frame_buf: [1100]u8 = undefined;
             var fbs = io.fixedBufferStream(&frame_buf);
@@ -307,7 +311,6 @@ pub const WebTransportConnection = struct {
             } }, fbs.writer()) catch {};
             stream.send.writeData(fbs.getWritten()) catch {};
             stream.send.close();
-            stream.recv.stopSending(WEBTRANSPORT_SESSION_GONE);
         }
 
         session.state = .draining;
@@ -695,6 +698,9 @@ pub const WebTransportConnection = struct {
     }
 
     /// Poll known WT streams for data.
+    /// The `fin` field is set when the peer has finished sending (FIN received
+    /// and all data consumed). A final event with empty data + fin=true is
+    /// emitted when FIN arrives after the last data chunk.
     fn pollWtStreamData(self: *WebTransportConnection) ?WtEvent {
         // Check bidi streams
         var bidi_it = self.wt_bidi_streams.iterator();
@@ -704,7 +710,6 @@ pub const WebTransportConnection = struct {
             // First check WT buffer for data left over from prefix parsing
             if (self.stream_bufs.getPtr(stream_id)) |buf| {
                 if (buf.items.len > 0) {
-                    // Return buffered data; will be consumed on next call
                     const data_slice = self.allocator.dupe(u8, buf.items) catch continue;
                     buf.items.len = 0;
                     return .{ .stream_data = .{
@@ -716,9 +721,19 @@ pub const WebTransportConnection = struct {
 
             if (self.quic.streams.getStream(stream_id)) |stream| {
                 if (stream.recv.read()) |data| {
+                    const is_fin = stream.recv.finished;
+                    if (is_fin) self.fin_delivered.put(stream_id, {}) catch {};
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = data,
+                        .fin = is_fin,
+                    } };
+                } else if (stream.recv.finished and !self.fin_delivered.contains(stream_id)) {
+                    self.fin_delivered.put(stream_id, {}) catch {};
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = &.{},
+                        .fin = true,
                     } };
                 }
             }
@@ -743,9 +758,19 @@ pub const WebTransportConnection = struct {
 
             if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
                 if (recv_stream.read()) |data| {
+                    const is_fin = recv_stream.finished;
+                    if (is_fin) self.fin_delivered.put(stream_id, {}) catch {};
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = data,
+                        .fin = is_fin,
+                    } };
+                } else if (recv_stream.finished and !self.fin_delivered.contains(stream_id)) {
+                    self.fin_delivered.put(stream_id, {}) catch {};
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = &.{},
+                        .fin = true,
                     } };
                 }
             }
