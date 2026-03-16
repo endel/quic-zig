@@ -70,6 +70,7 @@
   <div style="display:flex;gap:10px;margin-top:4px;">
     <button id="btnConnect" class="btn-primary" onclick="doConnect()">Connect</button>
     <button id="btnDisconnect" class="btn-danger" onclick="doDisconnect()" disabled>Disconnect</button>
+    <button id="btnReconnect" class="btn-send" onclick="doReconnect()" disabled>Reconnect (0-RTT test)</button>
   </div>
 </div>
 
@@ -99,6 +100,7 @@
 
 <script>
 let transport = null;
+let connectCount = 0;
 
 function log(msg, cls = 'info') {
   const el = document.getElementById('log');
@@ -116,6 +118,7 @@ function setStatus(s) {
 function setConnected(connected) {
   document.getElementById('btnConnect').disabled = connected;
   document.getElementById('btnDisconnect').disabled = !connected;
+  document.getElementById('btnReconnect').disabled = !connected;
   document.getElementById('btnBidi').disabled = !connected;
   document.getElementById('btnDg').disabled = !connected;
 }
@@ -140,7 +143,12 @@ async function doConnect() {
 
   const hashBytes = hexToBytes(hashHex);
   setStatus('connecting');
-  log(`Connecting to ${url}...`);
+  connectCount++;
+  const thisConnect = connectCount;
+  const label = thisConnect === 1 ? 'Initial' : `Reconnect #${thisConnect - 1}`;
+  log(`${label}: connecting to ${url}...`);
+
+  const t0 = performance.now();
 
   try {
     transport = new WebTransport(url, {
@@ -163,9 +171,11 @@ async function doConnect() {
     });
 
     await transport.ready;
+    const elapsed = (performance.now() - t0).toFixed(1);
     setStatus('connected');
     setConnected(true);
-    log('Connected!', 'info');
+    const hint = thisConnect > 1 ? ' (should be faster if 0-RTT)' : ' (full handshake)';
+    log(`${label}: connected in ${elapsed}ms${hint}`, 'info');
 
     // Listen for incoming datagrams
     readDatagrams();
@@ -187,6 +197,25 @@ async function doDisconnect() {
   setStatus('disconnected');
   setConnected(false);
   log('Disconnected');
+}
+
+async function doReconnect() {
+  log('--- 0-RTT Reconnect Test ---', 'warn');
+  log('Disconnecting...', 'info');
+  if (transport) {
+    try { transport.close(); } catch {}
+    transport = null;
+  }
+  setStatus('disconnected');
+  setConnected(false);
+
+  // Brief pause to let the close complete, then reconnect.
+  // Chrome stores the session ticket from the previous connection
+  // and will attempt 0-RTT on the next connection to the same server.
+  await new Promise(r => setTimeout(r, 500));
+
+  log('Reconnecting (browser should use stored session ticket)...', 'info');
+  await doConnect();
 }
 
 async function sendBidi() {

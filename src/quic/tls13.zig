@@ -1826,6 +1826,7 @@ pub const Tls13Handshake = struct {
         self.key_schedule = temp_ks;
         self.using_psk = true;
         self.zero_rtt_accepted = true;
+        std.log.info("PSK resumption accepted — 0-RTT enabled", .{});
     }
 
     // ─── Client: Parse NewSessionTicket ──────────────────────────────

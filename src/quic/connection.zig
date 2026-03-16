@@ -916,6 +916,7 @@ pub const Connection = struct {
                 return;
             }
 
+            std.log.info("recv: processing 0-RTT packet (early data)", .{});
             // 0-RTT uses pkt_num_spaces[2] (application) for PN tracking
             var space = self.pkt_num_spaces[2];
             var early_open = self.early_data_open.?;
