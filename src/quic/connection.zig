@@ -3357,6 +3357,27 @@ pub const Connection = struct {
             }
         }
 
+        // Pacer: if the pacer has bandwidth set (active transfer), include its
+        // next-send time so the event loop wakes up promptly to send more data.
+        if (self.pacer.bandwidth_shifted > 0 and self.state == .connected) {
+            const now: i64 = @intCast(std.time.nanoTimestamp());
+            // Estimate pacer delay without mutating: budget is replenished by elapsed time
+            const elapsed = now - self.pacer.last_sent_time;
+            var budget = self.pacer.budget;
+            if (self.pacer.last_sent_time > 0 and elapsed > 0) {
+                const replenished = (self.pacer.bandwidth_shifted *| @as(u64, @intCast(elapsed))) >> 20;
+                budget = @min(budget + replenished, self.pacer.max_burst);
+            }
+            if (budget < self.pacer.max_datagram_size) {
+                const deficit = self.pacer.max_datagram_size - budget;
+                const delay: i64 = @intCast((deficit << 20) / self.pacer.bandwidth_shifted);
+                const pacer_deadline = now + delay;
+                if (earliest == null or pacer_deadline < earliest.?) {
+                    earliest = pacer_deadline;
+                }
+            }
+        }
+
         return earliest;
     }
 

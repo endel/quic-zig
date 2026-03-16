@@ -4,8 +4,21 @@ const testing = std.testing;
 const rtt_mod = @import("rtt.zig");
 const RttStats = rtt_mod.RttStats;
 
-/// Default initial congestion window in bytes (10 * max_datagram_size per RFC 9002).
+/// Default initial congestion window in packets.
+/// RFC 9002 §7.2: initial_window = min(10 * mds, max(14720, 2 * mds))
 const INITIAL_WINDOW_PACKETS: u64 = 10;
+
+/// RFC 9002 §7.2: floor for initial window (14720 bytes).
+const INITIAL_WINDOW_FLOOR: u64 = 14720;
+
+/// Compute the initial congestion window per RFC 9002 §7.2:
+///   initial_window = min(10 * max_datagram_size, max(14720, 2 * max_datagram_size))
+fn initialWindow(max_datagram_size: u64) u64 {
+    return @min(
+        INITIAL_WINDOW_PACKETS * max_datagram_size,
+        @max(INITIAL_WINDOW_FLOOR, 2 * max_datagram_size),
+    );
+}
 
 /// Minimum congestion window in bytes (2 * max_datagram_size per RFC 9002).
 const MIN_WINDOW_PACKETS: u64 = 2;
@@ -67,14 +80,14 @@ pub const NewReno = struct {
     /// Initialize with default values.
     pub fn init() NewReno {
         return .{
-            .congestion_window = INITIAL_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE,
+            .congestion_window = initialWindow(DEFAULT_MAX_DATAGRAM_SIZE),
         };
     }
 
     /// Initialize with a specific max datagram size.
     pub fn initWithMds(max_datagram_size: u64) NewReno {
         return .{
-            .congestion_window = INITIAL_WINDOW_PACKETS * max_datagram_size,
+            .congestion_window = initialWindow(max_datagram_size),
             .max_datagram_size = max_datagram_size,
         };
     }
@@ -217,13 +230,13 @@ pub const Cubic = struct {
 
     pub fn init() Cubic {
         return .{
-            .congestion_window = INITIAL_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE,
+            .congestion_window = initialWindow(DEFAULT_MAX_DATAGRAM_SIZE),
         };
     }
 
     pub fn initWithMds(max_datagram_size: u64) Cubic {
         return .{
-            .congestion_window = INITIAL_WINDOW_PACKETS * max_datagram_size,
+            .congestion_window = initialWindow(max_datagram_size),
             .max_datagram_size = max_datagram_size,
         };
     }
