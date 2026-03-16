@@ -497,7 +497,12 @@ No remaining work — all sections implemented. Optional improvements:
 
 ---
 
-## ACK Frequency (draft-ietf-quic-ack-frequency)
+## ACK Frequency (draft-ietf-quic-ack-frequency-14, 2026-02-05)
+
+**Note:** This is an active Internet-Draft (not yet an RFC). Our implementation targets
+draft-14. Frame types (0xaf, 0x1f) and transport parameter ID (0xff04de1b) are provisional
+and may change when the RFC is published. Check for updates at:
+https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/
 
 | § | Section | Status | Notes |
 |---|---------|--------|-------|
