@@ -518,6 +518,17 @@ https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/
 
 ---
 
+## Multipath QUIC (draft-ietf-quic-multipath)
+
+**Status: Not implemented.** The draft is still evolving and no major QUIC implementation
+(quic-go, quiche, msquic) has production support yet. Would require per-path packet number
+spaces, path scheduling, PATH_ABANDON/PATH_STATUS frames, and significant architectural
+changes to the connection and congestion control layers.
+
+Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
+
+---
+
 ## Overall Progress
 
 | RFC | Done | Partial | Missing | Completion |
