@@ -3,6 +3,10 @@ const posix = std.posix;
 const builtin = @import("builtin");
 const xev_mod = @import("xev");
 
+/// Global signal state for graceful shutdown.
+var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var shutdown_pipe_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1);
+
 // Default backend: io_uring on Linux, kqueue on macOS.
 // Callers can use ServerWithBackend(xev_mod.Epoll, H) for containers that block io_uring.
 const xev = xev_mod;
@@ -214,6 +218,9 @@ pub fn Server(comptime Handler: type) type {
         poll_completion: xev.Completion,
         timer_completion: xev.Completion,
         timer_cancel_completion: xev.Completion,
+        signal_completion: xev.Completion,
+        signal_file: ?xev.File,
+        signal_pipe_fd: ?posix.socket_t,
         timer_armed: bool,
         started: bool,
         stopping: bool,
@@ -362,6 +369,9 @@ pub fn Server(comptime Handler: type) type {
                 .poll_completion = .{},
                 .timer_completion = .{},
                 .timer_cancel_completion = .{},
+                .signal_completion = .{},
+                .signal_file = null,
+                .signal_pipe_fd = null,
                 .timer_armed = false,
                 .started = false,
                 .stopping = false,
@@ -387,6 +397,9 @@ pub fn Server(comptime Handler: type) type {
             self.loop.deinit();
             posix.close(self.sockfd);
             if (self.preferred) |p| posix.close(p.sockfd);
+            if (self.signal_pipe_fd) |fd| posix.close(fd);
+            const write_fd = shutdown_pipe_fd.swap(-1, .release);
+            if (write_fd >= 0) posix.close(@intCast(write_fd));
             self.conn_mgr.deinit();
         }
 
@@ -405,7 +418,9 @@ pub fn Server(comptime Handler: type) type {
         }
 
         /// Blocking run: registers watchers and runs the event loop until done.
+        /// Installs SIGTERM/SIGINT handlers for graceful shutdown.
         pub fn run(self: *Self) !void {
+            self.installSignalHandlers();
             self.start();
             try self.loop.run(.until_done);
         }
@@ -420,13 +435,71 @@ pub fn Server(comptime Handler: type) type {
         /// Initiate graceful shutdown. All active connections receive
         /// CONNECTION_CLOSE, pending data is flushed, then the event loop exits.
         pub fn stop(self: *Self) void {
+            if (self.stopping) return;
             self.stopping = true;
+            std.log.info("graceful shutdown: closing {d} connection(s)", .{self.conn_mgr.entries.items.len});
             for (self.conn_mgr.entries.items) |entry| {
                 const conn = entry.conn;
                 if (!conn.isClosed() and conn.state != .closing and conn.state != .draining) {
                     conn.close(0, "server shutdown");
                 }
             }
+            // Flush pending close packets immediately
+            self.tickAndSend();
+        }
+
+        fn installSignalHandlers(self: *Self) void {
+            if (comptime builtin.os.tag == .windows) return;
+
+            // Create a self-pipe so the signal handler can wake the event loop
+            const pipe = posix.pipe() catch return;
+            shutdown_pipe_fd.store(pipe[1], .release);
+
+            // Watch the read end of the pipe for readability
+            self.signal_pipe_fd = pipe[0];
+            self.signal_file = xev.File.initFd(pipe[0]);
+            self.signal_file.?.poll(&self.loop, &self.signal_completion, .read, Self, self, onSignalPipe);
+
+            const handler = struct {
+                fn handle(_: c_int) callconv(.c) void {
+                    shutdown_requested.store(true, .release);
+                    // Wake the event loop by writing to the pipe
+                    const fd = shutdown_pipe_fd.load(.acquire);
+                    if (fd >= 0) {
+                        _ = posix.write(@intCast(fd), "x") catch {};
+                    }
+                }
+            }.handle;
+
+            const act = posix.Sigaction{
+                .handler = .{ .handler = handler },
+                .mask = std.mem.zeroes(posix.sigset_t),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.TERM, &act, null);
+            posix.sigaction(posix.SIG.INT, &act, null);
+        }
+
+        fn onSignalPipe(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.File,
+            _: xev.PollError!xev.PollEvent,
+        ) xev.CallbackAction {
+            const self = self_opt orelse return .disarm;
+            // Drain the pipe
+            var buf: [16]u8 = undefined;
+            _ = posix.read(self.signal_pipe_fd.?, &buf) catch {};
+
+            if (!self.stopping) {
+                self.stop();
+            }
+            if (self.allConnectionsClosed()) {
+                self.loop.stop();
+                return .disarm;
+            }
+            return .rearm;
         }
 
         // ---- Internal callbacks ----
@@ -440,6 +513,11 @@ pub fn Server(comptime Handler: type) type {
         ) xev.CallbackAction {
             _ = r catch return .rearm;
             const self = self_opt orelse return .disarm;
+
+            // Check for signal-triggered shutdown
+            if (shutdown_requested.load(.acquire) and !self.stopping) {
+                self.stop();
+            }
 
             // Drain all available packets
             self.recvAllPackets();
@@ -470,6 +548,11 @@ pub fn Server(comptime Handler: type) type {
             _ = r catch return .disarm;
             const self = self_opt orelse return .disarm;
             self.timer_armed = false;
+
+            // Check for signal-triggered shutdown
+            if (shutdown_requested.load(.acquire) and !self.stopping) {
+                self.stop();
+            }
 
             // Process events generated by timeouts
             self.processConnections();
