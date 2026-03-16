@@ -167,4 +167,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_tests = b.addRunArtifact(exe_tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
+
+    // Fuzz tests (smoke test: zig build fuzz)
+    const exe_fuzz = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = need_libc,
+            .imports = &.{.{ .name = "xev", .module = xev_dep.module("xev") }},
+        }),
+    });
+    const run_fuzz = b.addRunArtifact(exe_fuzz);
+    b.step("fuzz", "Run fuzz tests").dependOn(&run_fuzz.step);
 }

@@ -26,3 +26,7 @@ jobs:
 
       - name: Test
         run: zig build test
+
+      - name: Fuzz (smoke test)
+        if: runner.os != 'Windows'
+        run: zig build fuzz
