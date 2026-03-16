@@ -4,3 +4,4 @@ zig-out
 .DS_Store
 .vscode
 interop/quiche/target
+fuzz/corpus
