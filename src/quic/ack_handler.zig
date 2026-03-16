@@ -296,6 +296,12 @@ pub const ReceivedPacketTracker = struct {
     ecn_ect1: u64 = 0,
     ecn_ce: u64 = 0,
 
+    // draft-ietf-quic-ack-frequency: configurable ACK generation parameters
+    ack_eliciting_threshold: u32 = ACK_ELICITING_THRESHOLD,
+    max_ack_delay_ns: i64 = DEFAULT_MAX_ACK_DELAY,
+    reordering_threshold: u64 = 1, // 0 = no reorder-triggered ACKs
+    ack_frequency_seq: u64 = 0, // highest received ACK_FREQUENCY sequence number
+
     pub fn init(allocator: Allocator) ReceivedPacketTracker {
         return .{
             .allocator = allocator,
@@ -327,17 +333,43 @@ pub const ReceivedPacketTracker = struct {
         if (ack_eliciting) {
             self.ack_eliciting_since_last_ack += 1;
 
+            // Reordering-based immediate ACK (draft-ietf-quic-ack-frequency)
             if (self.largest_received != null and pn < self.largest_received.?) {
-                self.ack_queued = true;
-                self.ack_alarm = null;
-            } else if (self.ack_eliciting_since_last_ack >= ACK_ELICITING_THRESHOLD) {
+                if (self.reordering_threshold > 0) {
+                    const gap = self.largest_received.? - pn;
+                    if (gap >= self.reordering_threshold) {
+                        self.ack_queued = true;
+                        self.ack_alarm = null;
+                    }
+                }
+                // If reordering_threshold == 0, don't trigger immediate ACK on reorder
+            } else if (self.ack_eliciting_since_last_ack >= self.ack_eliciting_threshold) {
                 self.ack_queued = true;
                 self.ack_alarm = null;
             } else {
                 if (self.ack_alarm == null) {
-                    self.ack_alarm = now + DEFAULT_MAX_ACK_DELAY;
+                    self.ack_alarm = now + self.max_ack_delay_ns;
                 }
             }
+        }
+    }
+
+    /// Apply ACK_FREQUENCY frame parameters (draft-ietf-quic-ack-frequency).
+    /// Ignores frames with sequence numbers not greater than the last applied.
+    pub fn applyAckFrequency(self: *ReceivedPacketTracker, seq: u64, threshold: u64, max_delay_us: u64, reorder_threshold: u64) bool {
+        if (self.ack_frequency_seq > 0 and seq < self.ack_frequency_seq) return false;
+        self.ack_frequency_seq = seq + 1; // store next expected (> current)
+        self.ack_eliciting_threshold = @intCast(@max(1, @min(threshold, 256)));
+        self.max_ack_delay_ns = @intCast(max_delay_us * 1000); // µs → ns
+        self.reordering_threshold = reorder_threshold;
+        return true;
+    }
+
+    /// Force immediate ACK transmission (IMMEDIATE_ACK frame, draft-ietf-quic-ack-frequency).
+    pub fn triggerImmediateAck(self: *ReceivedPacketTracker) void {
+        if (self.largest_received != null) {
+            self.ack_queued = true;
+            self.ack_alarm = null;
         }
     }
 

@@ -497,6 +497,22 @@ No remaining work — all sections implemented. Optional improvements:
 
 ---
 
+## ACK Frequency (draft-ietf-quic-ack-frequency)
+
+| § | Section | Status | Notes |
+|---|---------|--------|-------|
+| — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize, send after handshake |
+| — | IMMEDIATE_ACK frame (0x1f) | ✅ Done | Parse, serialize, triggers immediate ACK |
+| — | min_ack_delay transport parameter (0xff04de1b) | ✅ Done | Advertised by both client and server |
+| — | Dynamic ACK thresholds | ✅ Done | ack_eliciting_threshold, max_ack_delay, reordering_threshold |
+| — | Sequence number tracking | ✅ Done | Obsolete ACK_FREQUENCY frames ignored |
+| — | Negotiation via min_ack_delay | ✅ Done | Only send ACK_FREQUENCY if peer advertises support |
+| — | Server sends ACK_FREQUENCY | ✅ Done | threshold=10, max_delay=25ms, reorder=1 after handshake |
+
+### Summary — ACK Frequency: ✅ Complete (7/7)
+
+---
+
 ## Overall Progress
 
 | RFC | Done | Partial | Missing | Completion |
@@ -511,6 +527,7 @@ No remaining work — all sections implemented. Optional improvements:
 | RFC 9368 (Version Neg) | 3 | 0 | 0 | 100% |
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
 | WebTransport | 17 | 0 | 0 | 100% |
+| ACK Frequency | 7 | 0 | 0 | 100% |
 
 ### Top Priority Items Across All RFCs
 

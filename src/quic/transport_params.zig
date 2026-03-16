@@ -27,6 +27,7 @@ pub const ParamId = enum(u64) {
     retry_source_connection_id = 0x10,
     version_information = 0x11, // RFC 9368
     max_datagram_frame_size = 0x20,
+    min_ack_delay = 0xff04de1b, // draft-ietf-quic-ack-frequency (provisional)
     _,
 };
 
@@ -91,6 +92,10 @@ pub const TransportParams = struct {
     initial_source_connection_id: ?[]const u8 = null,
     retry_source_connection_id: ?[]const u8 = null,
     max_datagram_frame_size: ?u64 = null,
+
+    // draft-ietf-quic-ack-frequency: minimum ACK delay in microseconds.
+    // null = does not support ACK frequency extension.
+    min_ack_delay: ?u64 = null,
 
     /// RFC 9368 version_information transport parameter.
     /// chosen_version: the version used for this connection.
@@ -214,6 +219,10 @@ pub const TransportParams = struct {
             try Helper.writeParam(writer, .max_datagram_frame_size, size);
         }
 
+        if (self.min_ack_delay) |delay| {
+            try Helper.writeParam(writer, .min_ack_delay, delay);
+        }
+
         // RFC 9000 §18.1: Transport parameter greasing — send a reserved parameter
         // with ID of form 31*N+27 so peers learn to ignore unknown parameters.
         {
@@ -327,6 +336,9 @@ pub const TransportParams = struct {
                 },
                 @intFromEnum(ParamId.max_datagram_frame_size) => {
                     params.max_datagram_frame_size = try packet.readVarInt(reader);
+                },
+                @intFromEnum(ParamId.min_ack_delay) => {
+                    params.min_ack_delay = try packet.readVarInt(reader);
                 },
                 @intFromEnum(ParamId.version_information) => {
                     if (param_len < 4 or (param_len % 4) != 0) {

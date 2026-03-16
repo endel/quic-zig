@@ -32,8 +32,10 @@ pub const FrameType = enum(u64) {
     connection_close = 0x1c,
     application_close = 0x1d,
     handshake_done = 0x1e,
+    immediate_ack = 0x1f,
     datagram = 0x30,
     datagram_with_length = 0x31,
+    ack_frequency = 0xaf,
     _,
 };
 
@@ -171,12 +173,23 @@ pub const Frame = union(FrameType) {
 
     handshake_done: void,
 
+    // draft-ietf-quic-ack-frequency
+    immediate_ack: void,
+
     datagram: struct {
         data: []u8,
     },
 
     datagram_with_length: struct {
         data: []u8,
+    },
+
+    // draft-ietf-quic-ack-frequency
+    ack_frequency: struct {
+        sequence_number: u64,
+        ack_eliciting_threshold: u64,
+        request_max_ack_delay: u64, // microseconds
+        reordering_threshold: u64,
     },
 
     /// Parse a single frame from a byte buffer. Returns the frame and advances
@@ -445,6 +458,9 @@ pub const Frame = union(FrameType) {
             // handshake done
             0x1e => .{ .handshake_done = {} },
 
+            // immediate ack (draft-ietf-quic-ack-frequency)
+            0x1f => .{ .immediate_ack = {} },
+
             // datagram without length (0x30) — data is rest of packet
             0x30 => .{ .datagram = .{
                 .data = bytes[stream.pos..],
@@ -457,6 +473,14 @@ pub const Frame = union(FrameType) {
                     .data = bytes[stream.pos..@min(stream.pos + length, bytes.len)],
                 } };
             },
+
+            // ack frequency (draft-ietf-quic-ack-frequency)
+            0xaf => .{ .ack_frequency = .{
+                .sequence_number = try packet.readVarInt(reader),
+                .ack_eliciting_threshold = try packet.readVarInt(reader),
+                .request_max_ack_delay = try packet.readVarInt(reader),
+                .reordering_threshold = try packet.readVarInt(reader),
+            } },
 
             else => return error.FrameEncodingError,
         };
@@ -640,6 +664,10 @@ pub const Frame = union(FrameType) {
                 try packet.writeVarInt(writer, 0x1e);
             },
 
+            .immediate_ack => {
+                try packet.writeVarInt(writer, 0x1f);
+            },
+
             .datagram => |d| {
                 try packet.writeVarInt(writer, 0x30);
                 try writer.writeAll(d.data);
@@ -649,6 +677,14 @@ pub const Frame = union(FrameType) {
                 try packet.writeVarInt(writer, 0x31);
                 try packet.writeVarInt(writer, d.data.len);
                 try writer.writeAll(d.data);
+            },
+
+            .ack_frequency => |af| {
+                try packet.writeVarInt(writer, 0xaf);
+                try packet.writeVarInt(writer, af.sequence_number);
+                try packet.writeVarInt(writer, af.ack_eliciting_threshold);
+                try packet.writeVarInt(writer, af.request_max_ack_delay);
+                try packet.writeVarInt(writer, af.reordering_threshold);
             },
         }
     }
@@ -680,7 +716,10 @@ pub const Frame = union(FrameType) {
             // CONNECTION_CLOSE: Initial, Handshake, 1-RTT (NOT 0-RTT)
             .connection_close => pkt_type != .zero_rtt,
             // NEW_TOKEN, NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, HANDSHAKE_DONE: 1-RTT only
-            .new_token, .new_connection_id, .retire_connection_id, .handshake_done => pkt_type == .one_rtt,
+            // ACK_FREQUENCY, IMMEDIATE_ACK: 1-RTT only (draft-ietf-quic-ack-frequency)
+            .new_token, .new_connection_id, .retire_connection_id, .handshake_done,
+            .ack_frequency, .immediate_ack,
+            => pkt_type == .one_rtt,
             // All others: 0-RTT and 1-RTT only
             .reset_stream, .stop_sending, .stream, .max_data, .max_stream_data,
             .max_streams_bidi, .max_streams_uni, .data_blocked, .stream_data_blocked,
@@ -768,6 +807,13 @@ pub const PendingControlFrame = union(enum) {
         cid_len: u8,
         stateless_reset_token: [16]u8,
     },
+    ack_frequency: struct {
+        sequence_number: u64,
+        ack_eliciting_threshold: u64,
+        request_max_ack_delay: u64,
+        reordering_threshold: u64,
+    },
+    immediate_ack: void,
 
     /// Write this pending control frame directly on the wire.
     /// For new_connection_id we serialize directly (avoids dangling slice from toFrame()).
@@ -814,6 +860,13 @@ pub const PendingControlFrame = union(enum) {
             .stream_data_blocked => |sdb| .{ .stream_data_blocked = .{ .stream_id = sdb.stream_id, .limit = sdb.limit } },
             .reset_stream => |rs| .{ .reset_stream = .{ .stream_id = rs.stream_id, .error_code = rs.error_code, .final_size = rs.final_size } },
             .stop_sending => |ss| .{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = ss.error_code } },
+            .ack_frequency => |af| .{ .ack_frequency = .{
+                .sequence_number = af.sequence_number,
+                .ack_eliciting_threshold = af.ack_eliciting_threshold,
+                .request_max_ack_delay = af.request_max_ack_delay,
+                .reordering_threshold = af.reordering_threshold,
+            } },
+            .immediate_ack => .{ .immediate_ack = {} },
             .new_token => unreachable, // handled directly in write()
             .new_connection_id => unreachable, // handled directly in write()
         };

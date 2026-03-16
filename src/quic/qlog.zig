@@ -232,8 +232,10 @@ pub const QlogWriter = struct {
             .stream_data_blocked => |v| std.fmt.bufPrint(out, "{{\"frame_type\":\"stream_data_blocked\",\"stream_id\":{d},\"limit\":{d}}}", .{ v.stream_id, v.limit }) catch return 0,
             .streams_blocked_bidi => |v| std.fmt.bufPrint(out, "{{\"frame_type\":\"streams_blocked\",\"stream_type\":\"bidirectional\",\"limit\":{d}}}", .{v}) catch return 0,
             .streams_blocked_uni => |v| std.fmt.bufPrint(out, "{{\"frame_type\":\"streams_blocked\",\"stream_type\":\"unidirectional\",\"limit\":{d}}}", .{v}) catch return 0,
+            .immediate_ack => std.fmt.bufPrint(out, "{{\"frame_type\":\"immediate_ack\"}}", .{}) catch return 0,
             .datagram => |d| std.fmt.bufPrint(out, "{{\"frame_type\":\"datagram\",\"length\":{d}}}", .{d.data.len}) catch return 0,
             .datagram_with_length => |d| std.fmt.bufPrint(out, "{{\"frame_type\":\"datagram\",\"length\":{d}}}", .{d.data.len}) catch return 0,
+            .ack_frequency => |af| std.fmt.bufPrint(out, "{{\"frame_type\":\"ack_frequency\",\"sequence\":{d},\"threshold\":{d},\"max_delay\":{d},\"reorder\":{d}}}", .{ af.sequence_number, af.ack_eliciting_threshold, af.request_max_ack_delay, af.reordering_threshold }) catch return 0,
         };
         return result.len;
     }

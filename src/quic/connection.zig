@@ -503,6 +503,10 @@ pub const Connection = struct {
     datagram_send_queue: DatagramQueue = .{},
     datagrams_enabled: bool = false,
 
+    // draft-ietf-quic-ack-frequency
+    peer_supports_ack_freq: bool = false,
+    ack_freq_send_seq: u64 = 0,
+
     // 0-RTT (early data) keys
     early_data_open: ?quic_crypto.Open = null, // Server: decrypt 0-RTT packets
     early_data_seal: ?quic_crypto.Seal = null, // Client: encrypt 0-RTT packets
@@ -654,6 +658,7 @@ pub const Connection = struct {
             .initial_max_streams_bidi = config.initial_max_streams_bidi,
             .initial_max_streams_uni = config.initial_max_streams_uni,
             .max_datagram_frame_size = config.max_datagram_frame_size,
+            .min_ack_delay = 1000, // 1ms minimum ACK delay (draft-ietf-quic-ack-frequency)
             // Server's preferred address (RFC 9000 §9.6) — only for servers, must not coexist with disable_active_migration
             .preferred_address = if (is_server and config.preferred_address != null) config.preferred_address else null,
         };
@@ -1817,6 +1822,30 @@ pub const Connection = struct {
                     _ = self.datagram_recv_queue.push(d.data);
                 }
             },
+
+            .ack_frequency => |af| {
+                // draft-ietf-quic-ack-frequency: update ACK generation parameters
+                if (!self.peer_supports_ack_freq) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY not negotiated");
+                    return error.ProtocolViolation;
+                }
+                const applied = self.pkt_handler.recv[2].applyAckFrequency(
+                    af.sequence_number,
+                    af.ack_eliciting_threshold,
+                    af.request_max_ack_delay,
+                    af.reordering_threshold,
+                );
+                if (applied) {
+                    std.log.info("ACK_FREQUENCY applied: seq={d} threshold={d} max_delay={d}µs reorder={d}", .{
+                        af.sequence_number, af.ack_eliciting_threshold, af.request_max_ack_delay, af.reordering_threshold,
+                    });
+                }
+            },
+
+            .immediate_ack => {
+                // draft-ietf-quic-ack-frequency: force immediate ACK
+                self.pkt_handler.recv[2].triggerImmediateAck();
+            },
         }
     }
 
@@ -2159,6 +2188,17 @@ pub const Connection = struct {
                         // Server must send HANDSHAKE_DONE to the client (RFC 9001 Section 4.1.2)
                         self.packer.send_handshake_done = true;
                         self.handshake_done_pending = true;
+
+                        // draft-ietf-quic-ack-frequency: send ACK_FREQUENCY to reduce client ACK rate
+                        if (self.peer_supports_ack_freq) {
+                            self.pending_frames.push(.{ .ack_frequency = .{
+                                .sequence_number = self.ack_freq_send_seq,
+                                .ack_eliciting_threshold = 10,
+                                .request_max_ack_delay = 25000, // 25ms in microseconds
+                                .reordering_threshold = 1,
+                            } });
+                            self.ack_freq_send_seq += 1;
+                        }
                     }
                     // Client: Keep Handshake keys until HANDSHAKE_DONE received (RFC 9001 §4.9.2)
                     // This allows the client to ACK server's Handshake retransmissions under loss
@@ -2250,6 +2290,11 @@ pub const Connection = struct {
                             peer_tp.initial_max_streams_uni,
                             peer_tp.initial_max_data,
                         });
+
+                        // draft-ietf-quic-ack-frequency: detect peer support
+                        if (peer_tp.min_ack_delay != null) {
+                            self.peer_supports_ack_freq = true;
+                        }
 
                         // Client: migrate to server's preferred address (RFC 9000 §9.6)
                         if (!self.is_server) {
@@ -3637,6 +3682,7 @@ pub fn connect(
         .initial_max_streams_bidi = config.initial_max_streams_bidi,
         .initial_max_streams_uni = config.initial_max_streams_uni,
         .max_datagram_frame_size = config.max_datagram_frame_size,
+        .min_ack_delay = 1000, // 1ms minimum ACK delay (draft-ietf-quic-ack-frequency)
         .initial_source_connection_id = &scid,
     };
 
