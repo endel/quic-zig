@@ -53,6 +53,88 @@ Is AI-assisted code "slop"? Only until it's battle-tested. That's the challenge
 -- and I'm hoping we can get there.
 
 
+## Using as a Library
+
+Add to your `build.zig.zon`:
+
+```bash
+zig fetch --save git+https://github.com/endel/quic-zig
+```
+
+Then in your `build.zig`:
+
+```zig
+const quic_dep = b.dependency("quic", .{ .target = target, .optimize = optimize });
+
+const exe = b.addExecutable(.{
+    .name = "my-app",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "quic", .module = quic_dep.module("quic") }},
+    }),
+});
+```
+
+### High-level API (event loop server)
+
+```zig
+const quic = @import("quic");
+const event_loop = quic.event_loop;
+
+const MyHandler = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+
+    pub fn onConnectRequest(_: *MyHandler, session: *event_loop.Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch return;
+    }
+
+    pub fn onStreamData(_: *MyHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
+        session.sendStreamData(stream_id, data) catch {}; // echo
+        session.closeStream(stream_id);
+    }
+
+    pub fn onDatagram(_: *MyHandler, session: *event_loop.Session, session_id: u64, data: []const u8) void {
+        session.sendDatagram(session_id, data) catch {}; // echo
+    }
+
+    pub fn onSessionReady(_: *MyHandler, _: *event_loop.Session, _: u64) void {}
+    pub fn onSessionClosed(_: *MyHandler, _: *event_loop.Session, _: u64, _: u32, _: []const u8) void {}
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+
+    var handler = MyHandler{};
+    var server = try event_loop.Server(MyHandler).init(alloc, &handler, .{
+        .port = 4433,
+        .cert_path = "cert.pem",
+        .key_path = "key.pem",
+    });
+    defer server.deinit();
+    try server.run();
+}
+```
+
+### Low-level API (direct connection control)
+
+```zig
+const quic = @import("quic");
+
+// Client
+var conn = try quic.connection.connect(allocator, "example.com", .{}, tls_config, null);
+defer conn.deinit();
+
+// Send/receive loop
+var out: [1500]u8 = undefined;
+const n = conn.send(&out) catch 0;
+// sendto(sockfd, out[0..n], ...)
+// recvfrom(...) -> buf
+conn.handleDatagram(buf[0..len], recv_info);
+```
+
 ## Building
 
 Requires **Zig 0.15.2**.
