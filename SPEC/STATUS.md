@@ -309,7 +309,7 @@
 | 4.3 | Malformed Requests and Responses | ✅ Done | Pseudo-header validation, lowercase check, te header, CONNECT/extended CONNECT rules |
 | 4.4 | The CONNECT Method | ✅ Done | Extended CONNECT (RFC 9220) for WT |
 | 4.5 | HTTP Upgrade | ❌ N/A | Not applicable to H3 |
-| 4.6 | Server Push | ❌ Missing | PUSH_PROMISE not implemented |
+| 4.6 | Server Push | ❌ N/A | Deprecated — Chrome removed support (RFC 9218 prioritization replaces it) |
 | 5 | Connection Closure | | |
 | 5.1 | Idle Connections | ✅ Done | Via QUIC idle timeout |
 | 5.2 | Connection Shutdown | ✅ Done | Two-phase GOAWAY, stream rejection, drain detection, shutdown_complete event |
@@ -318,17 +318,17 @@
 | 6.1 | Bidirectional Streams | ✅ Done | Request/response streams |
 | 6.2 | Unidirectional Streams | ✅ Done | Control + QPACK encoder/decoder |
 | 6.2.1 | Control Streams | ✅ Done | SETTINGS sent on open |
-| 6.2.2 | Push Streams | ❌ Missing | Not implemented |
+| 6.2.2 | Push Streams | ❌ N/A | Deprecated with Server Push |
 | 7 | HTTP Framing Layer | | |
 | 7.1 | Frame Layout | ✅ Done | Varint type + length |
 | 7.2 | Frame Definitions | | |
 | 7.2.1 | DATA (0x00) | ✅ Done | |
 | 7.2.2 | HEADERS (0x01) | ✅ Done | |
-| 7.2.3 | CANCEL_PUSH (0x03) | ❌ Missing | |
+| 7.2.3 | CANCEL_PUSH (0x03) | ❌ N/A | Deprecated with Server Push |
 | 7.2.4 | SETTINGS (0x04) | ✅ Done | |
-| 7.2.5 | PUSH_PROMISE (0x05) | ❌ Missing | |
+| 7.2.5 | PUSH_PROMISE (0x05) | ❌ N/A | Deprecated with Server Push |
 | 7.2.6 | GOAWAY (0x07) | ✅ Done | Parsed and generated |
-| 7.2.7 | MAX_PUSH_ID (0x0d) | ❌ Missing | |
+| 7.2.7 | MAX_PUSH_ID (0x0d) | ❌ N/A | Deprecated with Server Push |
 | 7.2.8 | Reserved Frame Types | ✅ Done | HTTP/2 types rejected |
 | 8 | Error Handling | ✅ Done | All 17 error codes; frame errors, critical stream closure, SETTINGS order, frame-unexpected checks |
 | 9 | Extensions to HTTP/3 | ✅ Done | DATAGRAM + WT settings |
@@ -340,17 +340,12 @@
 |--------|-------|
 | ✅ Done | 22 |
 | ⚠️ Partial | 0 |
-| ❌ Missing | 5 |
-| ❌ N/A | 3 |
+| ❌ Missing | 0 |
+| ❌ N/A | 8 |
 
-### Remaining Work — RFC 9114
-
-| Priority | Section | Item | Effort |
-|----------|---------|------|--------|
-| P3 | §4.6 | Server Push (PUSH_PROMISE, CANCEL_PUSH, MAX_PUSH_ID) | Large |
-| ~~P3~~ | ~~§5.2~~ | ~~Graceful shutdown (GOAWAY stream ID tracking)~~ | ~~Done~~ |
-| ~~P3~~ | ~~§4.2-4.3~~ | ~~Request cancellation + malformed request handling~~ | ~~Done~~ |
-| ~~P3~~ | ~~§8~~ | ~~Comprehensive H3 error handling~~ | ~~Done~~ |
+Server Push (§4.6, §6.2.2, §7.2.3, §7.2.5, §7.2.7) is intentionally not implemented.
+It is deprecated in practice — Chrome removed support, and RFC 9218 Extensible
+Prioritization replaces its use cases.
 
 ---
 
@@ -536,7 +531,7 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | RFC 9000 (QUIC) | 128 | 0 | 0 | 100% |
 | RFC 9001 (TLS) | 33 | 0 | 0 | 100% |
 | RFC 9002 (Loss/CC) | 24 | 0 | 0 | 100% |
-| RFC 9114 (HTTP/3) | 22 | 0 | 5 | ~82% |
+| RFC 9114 (HTTP/3) | 22 | 0 | 0 | 100% |
 | RFC 9204 (QPACK) | 11 | 0 | 0 | 100% |
 | RFC 9297 (Datagrams) | 4 | 0 | 0 | 100% |
 | RFC 9221 (QUIC DG) | 3 | 0 | 0 | 100% |
@@ -556,6 +551,6 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | ~~5~~ | ~~ECN IP-level marking~~ | ~~9000 §13.4~~ | ~~Done~~ | ~~Done~~ |
 | ~~6~~ | ~~Server's Preferred Address~~ | ~~9000 §9.6~~ | ~~Done~~ | ~~Done~~ |
 | ~~7~~ | ~~QPACK dynamic table~~ | ~~9204 §3.2~~ | ~~Done~~ | ~~Done~~ |
-| 8 | Server Push (H3) | 9114 §4.6 | Large | H3 feature completeness |
+| ~~8~~ | ~~Server Push (H3)~~ | ~~9114 §4.6~~ | ~~N/A~~ | ~~Deprecated (Chrome removed support)~~ |
 | ~~9~~ | ~~Graceful H3 shutdown~~ | ~~9114 §5.2~~ | ~~Done~~ | ~~Done~~ |
 | ~~10~~ | ~~Capsule Protocol~~ | ~~9297 §4~~ | ~~Done~~ | ~~Done~~ |
