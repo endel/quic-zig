@@ -159,6 +159,47 @@ pub const Session = struct {
 };
 
 pub fn Server(comptime Handler: type) type {
+    comptime {
+        if (!@hasDecl(Handler, "protocol")) {
+            @compileError("Handler must declare 'pub const protocol: event_loop.Protocol'");
+        }
+
+        const known = [_][]const u8{
+            "onConnectRequest", "onSessionReady",  "onStreamData",
+            "onDatagram",       "onSessionClosed",  "onSessionDraining",
+            "onBidiStream",     "onUniStream",      "onPollComplete",
+            "onRequest",        "onData",
+            "onH0Request",      "onH0Data",         "onH0Finished",
+        };
+
+        for (@typeInfo(Handler).@"struct".decls) |decl| {
+            if (decl.name.len >= 2 and decl.name[0] == 'o' and decl.name[1] == 'n') {
+                var found = false;
+                for (known) |k| {
+                    if (std.mem.eql(u8, decl.name, k)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    @compileError("Handler has unrecognized callback '" ++ decl.name ++
+                        "'. Known callbacks: onRequest, onData, onConnectRequest, " ++
+                        "onSessionReady, onStreamData, onDatagram, onSessionClosed, " ++
+                        "onSessionDraining, onBidiStream, onUniStream, onPollComplete, " ++
+                        "onH0Request, onH0Data, onH0Finished");
+                }
+            }
+        }
+
+        if (@hasDecl(Handler, "onStreamData")) {
+            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params;
+            if (params.len != 4 and params.len != 5) {
+                @compileError("onStreamData must have 4 params (self, session, stream_id, data) " ++
+                    "or 5 params (self, session, stream_id, data, fin)");
+            }
+        }
+    }
+
     return struct {
         const Self = @This();
 
@@ -175,6 +216,7 @@ pub fn Server(comptime Handler: type) type {
         timer_cancel_completion: xev.Completion,
         timer_armed: bool,
         started: bool,
+        stopping: bool,
 
         // I/O (our own, for ECN support)
         sockfd: posix.socket_t,
@@ -322,6 +364,7 @@ pub fn Server(comptime Handler: type) type {
                 .timer_cancel_completion = .{},
                 .timer_armed = false,
                 .started = false,
+                .stopping = false,
                 .sockfd = sockfd,
                 .local_addr = connection.sockaddrToStorage(&local_addr.any),
                 .batch = ecn_socket.SendBatch.init(sockfd),
@@ -374,6 +417,18 @@ pub fn Server(comptime Handler: type) type {
             try self.loop.run(.no_wait);
         }
 
+        /// Initiate graceful shutdown. All active connections receive
+        /// CONNECTION_CLOSE, pending data is flushed, then the event loop exits.
+        pub fn stop(self: *Self) void {
+            self.stopping = true;
+            for (self.conn_mgr.entries.items) |entry| {
+                const conn = entry.conn;
+                if (!conn.isClosed() and conn.state != .closing and conn.state != .draining) {
+                    conn.close(0, "server shutdown");
+                }
+            }
+        }
+
         // ---- Internal callbacks ----
 
         fn onReadable(
@@ -394,6 +449,11 @@ pub fn Server(comptime Handler: type) type {
 
             // Tick + burst send
             self.tickAndSend();
+
+            if (self.stopping and self.allConnectionsClosed()) {
+                self.loop.stop();
+                return .disarm;
+            }
 
             // Reschedule timer
             self.rescheduleTimer();
@@ -416,6 +476,11 @@ pub fn Server(comptime Handler: type) type {
 
             // Tick + burst send (after processing, so generated data is included)
             self.tickAndSend();
+
+            if (self.stopping and self.allConnectionsClosed()) {
+                self.loop.stop();
+                return .disarm;
+            }
 
             // Reschedule timer
             self.rescheduleTimer();
@@ -718,6 +783,13 @@ pub fn Server(comptime Handler: type) type {
                 );
             }
             self.timer_armed = true;
+        }
+
+        fn allConnectionsClosed(self: *Self) bool {
+            for (self.conn_mgr.entries.items) |entry| {
+                if (!entry.conn.isClosed()) return false;
+            }
+            return true;
         }
 
         fn computeNextTimeoutMs(self: *Self) ?u64 {
