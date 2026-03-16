@@ -3,9 +3,9 @@ const posix = std.posix;
 const builtin = @import("builtin");
 const xev_mod = @import("xev");
 
-// On Linux, use epoll for Docker/container compatibility
-// (io_uring requires kernel >= 5.19 and may be blocked by seccomp)
-const xev = if (builtin.os.tag == .linux) xev_mod.Epoll else xev_mod;
+// Default backend: io_uring on Linux, kqueue on macOS.
+// Callers can use ServerWithBackend(xev_mod.Epoll, H) for containers that block io_uring.
+const xev = xev_mod;
 
 const connection = @import("quic/connection.zig");
 const connection_manager = @import("quic/connection_manager.zig");
