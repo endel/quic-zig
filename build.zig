@@ -19,6 +19,21 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "xev", .module = xev_dep.module("xev") }},
     });
 
+    // C API shared library
+    const lib_shared = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "quic-zig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/c_api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = need_libc,
+            .imports = &.{.{ .name = "quic", .module = lib_mod }},
+        }),
+    });
+    const lib_install = b.addInstallArtifact(lib_shared, .{});
+    b.step("lib", "Build C API shared library").dependOn(&lib_install.step);
+
     // Helper to build an app executable
     const App = struct {
         fn add(
