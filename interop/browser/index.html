@@ -102,7 +102,7 @@ let transport = null;
 
 function log(msg, cls = 'info') {
   const el = document.getElementById('log');
-  const t = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 3 });
+  const d = new Date(); const t = String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0')+'.'+String(d.getMilliseconds()).padStart(3,'0');
   el.innerHTML += `<div><span class="log-time">${t}</span> <span class="log-${cls}">${msg}</span></div>`;
   el.scrollTop = el.scrollHeight;
 }
@@ -193,7 +193,7 @@ async function sendBidi() {
   if (!transport) return;
   const msg = document.getElementById('bidiMsg').value;
   document.getElementById('bidiResp').textContent = 'waiting...';
-  log(`Bidi send: "${msg}"`, 'send');
+  log(`→ Bidi: "${msg}"`, 'send');
 
   try {
     const stream = await transport.createBidirectionalStream();
@@ -209,7 +209,7 @@ async function sendBidi() {
       response += new TextDecoder().decode(value);
     }
     document.getElementById('bidiResp').textContent = response;
-    log(`Bidi recv: "${response}"`, 'recv');
+    log(`← Bidi: "${response}"`, 'recv');
   } catch (err) {
     log(`Bidi error: ${err}`, 'error');
     document.getElementById('bidiResp').textContent = 'Error: ' + err;
@@ -220,13 +220,13 @@ async function sendDatagram() {
   if (!transport) return;
   const msg = document.getElementById('dgMsg').value;
   document.getElementById('dgResp').textContent = 'waiting...';
-  log(`Datagram send: "${msg}"`, 'send');
+  log(`→ Datagram: "${msg}"`, 'send');
 
   try {
     const writer = transport.datagrams.writable.getWriter();
     await writer.write(new TextEncoder().encode(msg));
     writer.releaseLock();
-    log('Datagram sent', 'send');
+    log('→ Datagram sent', 'send');
   } catch (err) {
     log(`Datagram send error: ${err}`, 'error');
     document.getElementById('dgResp').textContent = 'Error: ' + err;
@@ -242,7 +242,7 @@ async function readDatagrams() {
       if (done) break;
       const text = new TextDecoder().decode(value);
       document.getElementById('dgResp').textContent = text;
-      log(`Datagram recv: "${text}"`, 'recv');
+      log(`← Datagram: "${text}"`, 'recv');
     }
   } catch (err) {
     if (transport) log(`Datagram reader error: ${err}`, 'error');
@@ -272,7 +272,7 @@ async function handleIncomingStream(stream) {
       if (done) break;
       data += new TextDecoder().decode(value);
     }
-    log(`Incoming stream data: "${data}"`, 'recv');
+    log(`← Stream: "${data}"`, 'recv');
   } catch (err) {
     log(`Incoming stream error: ${err}`, 'error');
   }
