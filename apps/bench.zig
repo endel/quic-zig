@@ -2,6 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 const net = std.net;
 
+pub const std_options: std.Options = .{ .log_level = .err };
+
 const quic = @import("quic");
 const connection = quic.connection;
 const tls13 = quic.tls13;
