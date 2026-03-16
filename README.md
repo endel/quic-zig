@@ -118,6 +118,42 @@ pub fn main() !void {
 }
 ```
 
+### Graceful shutdown
+
+The server exposes `stop()` for graceful shutdown — it sends CONNECTION_CLOSE to
+all active connections, waits for the drain period (3×PTO), then exits. Signal
+handling is the application's responsibility:
+
+```zig
+const std = @import("std");
+const posix = std.posix;
+const quic = @import("quic");
+
+var server_instance: ?*MyServer = null;
+
+fn handleSignal(_: c_int) callconv(.c) void {
+    if (server_instance) |s| s.stop();
+}
+
+pub fn main() !void {
+    // ...
+    var server = try quic.event_loop.Server(MyHandler).init(alloc, &handler, .{ .port = 4433 });
+    defer server.deinit();
+    server_instance = &server;
+
+    // Install signal handlers
+    const act = posix.Sigaction{
+        .handler = .{ .handler = handleSignal },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.TERM, &act, null);
+    posix.sigaction(posix.SIG.INT, &act, null);
+
+    try server.run(); // blocks until stop() is called and all connections drain
+}
+```
+
 ### Low-level API (direct connection control)
 
 ```zig
