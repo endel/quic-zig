@@ -1115,11 +1115,7 @@ pub const Tls13Handshake = struct {
                 if (cert_index == 0) {
                     // Leaf cert: extract public key for CertificateVerify
                     const pub_key = parsed.pubKey();
-                    if (pub_key.len <= self.leaf_pub_key_buf.len) {
-                        @memcpy(self.leaf_pub_key_buf[0..pub_key.len], pub_key);
-                        self.leaf_pub_key_len = @intCast(pub_key.len);
-                        self.leaf_pub_key_algo = std.meta.activeTag(parsed.pub_key_algo);
-                    }
+                    try self.storeLeafPublicKey(pub_key, std.meta.activeTag(parsed.pub_key_algo));
 
                     // Verify hostname if SNI was set
                     if (self.config.server_name) |server_name| {
@@ -1162,6 +1158,8 @@ pub const Tls13Handshake = struct {
             cert_index += 1;
         }
 
+        if (!self.config.skip_cert_verify and cert_index == 0) return error.BadCertificate;
+
         self.transcript.update(msg);
         self.state = .client_wait_certificate_verify;
         return ._continue;
@@ -1171,8 +1169,9 @@ pub const Tls13Handshake = struct {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
 
         if (msg[0] != @intFromEnum(MsgType.certificate_verify)) return error.UnexpectedMessage;
+        if (!self.config.skip_cert_verify and self.leaf_pub_key_len == 0) return error.BadCertificateVerify;
 
-        if (!self.config.skip_cert_verify and self.leaf_pub_key_len > 0) {
+        if (!self.config.skip_cert_verify) {
             // Get transcript hash BEFORE updating with CertificateVerify
             const transcript_hash = self.transcript.current();
 
@@ -1204,6 +1203,17 @@ pub const Tls13Handshake = struct {
         self.transcript.update(msg);
         self.state = .client_wait_finished;
         return ._continue;
+    }
+
+    fn storeLeafPublicKey(
+        self: *Tls13Handshake,
+        pub_key: []const u8,
+        pub_key_algo: Certificate.AlgorithmCategory,
+    ) HandshakeError!void {
+        if (pub_key.len == 0 or pub_key.len > self.leaf_pub_key_buf.len) return error.BadCertificate;
+        @memcpy(self.leaf_pub_key_buf[0..pub_key.len], pub_key);
+        self.leaf_pub_key_len = @intCast(pub_key.len);
+        self.leaf_pub_key_algo = pub_key_algo;
     }
 
     fn clientProcessFinished(self: *Tls13Handshake) !Action {
@@ -3102,6 +3112,77 @@ test "loopback PSK resumption: two handshakes with session ticket" {
         &client2.key_schedule.server_app_traffic_secret,
         &server2.key_schedule.server_app_traffic_secret,
     );
+}
+
+test "clientProcessCertificate rejects empty certificate list when verification enabled" {
+    const tp = transport_params.TransportParams{
+        .initial_max_data = 1048576,
+        .initial_max_streams_bidi = 100,
+    };
+
+    const client_config = TlsConfig{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+        .skip_cert_verify = false,
+    };
+
+    var handshake = Tls13Handshake.initClient(client_config, tp);
+
+    var buf: [64]u8 = undefined;
+    const cert_msg = try buildCertificate(&buf, &.{});
+    handshake.provideData(cert_msg);
+
+    try std.testing.expectError(error.BadCertificate, handshake.clientProcessCertificate());
+}
+
+test "storeLeafPublicKey rejects oversized verification keys" {
+    const tp = transport_params.TransportParams{
+        .initial_max_data = 1048576,
+        .initial_max_streams_bidi = 100,
+    };
+
+    const client_config = TlsConfig{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+        .skip_cert_verify = false,
+    };
+
+    var handshake = Tls13Handshake.initClient(client_config, tp);
+    var oversized: [601]u8 = .{0x42} ** 601;
+
+    try std.testing.expectError(
+        error.BadCertificate,
+        handshake.storeLeafPublicKey(&oversized, .X9_62_id_ecPublicKey),
+    );
+}
+
+test "clientProcessCertificateVerify rejects missing leaf key when verification enabled" {
+    const tp = transport_params.TransportParams{
+        .initial_max_data = 1048576,
+        .initial_max_streams_bidi = 100,
+    };
+
+    const client_config = TlsConfig{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+        .skip_cert_verify = false,
+    };
+
+    var handshake = Tls13Handshake.initClient(client_config, tp);
+    handshake.provideData(&[_]u8{
+        @intFromEnum(MsgType.certificate_verify),
+        0,
+        0,
+        0,
+    });
+
+    try std.testing.expectError(error.BadCertificateVerify, handshake.clientProcessCertificateVerify());
 }
 
 // NewSessionTicket roundtrip test
