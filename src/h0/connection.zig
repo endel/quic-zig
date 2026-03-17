@@ -20,6 +20,7 @@ const MAX_REQUEST_LINE = 4096;
 
 /// Maximum file size to serve (10MB).
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const REQUEST_REJECTED_ERROR: u64 = 1;
 
 fn copyDefaultPath(out_buf: []u8) ![]const u8 {
     const default_path = "index.html";
@@ -89,6 +90,11 @@ fn copyRequestPath(line: []const u8, out_buf: []u8) !?[]const u8 {
 
     @memcpy(out_buf[0..path.len], path);
     return out_buf[0..path.len];
+}
+
+fn rejectRequestStream(stream: *stream_mod.Stream) void {
+    stream.send.reset(REQUEST_REJECTED_ERROR);
+    stream.recv.stopSending(REQUEST_REJECTED_ERROR);
 }
 
 /// Event returned by poll().
@@ -184,7 +190,7 @@ pub const H0Connection = struct {
             std.log.warn("H0: rejected request path '{s}': {any}", .{ path, err });
             const streams_map = &self.quic_conn.streams;
             const stream = streams_map.getStream(stream_id) orelse return;
-            stream.send.close();
+            rejectRequestStream(stream);
             return;
         };
 
@@ -241,7 +247,7 @@ pub const H0Connection = struct {
                     buf_entry.value_ptr.deinit(self.allocator);
                     _ = self.stream_bufs.remove(stream_id);
                     self.finished_streams.put(stream_id, {}) catch {};
-                    stream.send.close();
+                    rejectRequestStream(stream);
                     continue;
                 }
                 try buf_entry.value_ptr.appendSlice(self.allocator, data);
@@ -317,4 +323,14 @@ test "copyRequestPath rejects oversized paths before memcpy" {
     var buf: [4]u8 = undefined;
 
     try std.testing.expectError(error.PathTooLong, copyRequestPath("GET /abcd", &buf));
+}
+
+test "rejectRequestStream cancels both directions" {
+    var stream = stream_mod.Stream.init(std.testing.allocator, 0);
+    defer stream.deinit();
+
+    rejectRequestStream(&stream);
+
+    try std.testing.expectEqual(@as(?u64, REQUEST_REJECTED_ERROR), stream.send.reset_err);
+    try std.testing.expectEqual(@as(?u64, REQUEST_REJECTED_ERROR), stream.recv.stop_sending_err);
 }
