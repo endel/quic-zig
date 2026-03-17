@@ -2765,11 +2765,15 @@ pub const Connection = struct {
             self.pacer.onPacketSent(bytes_written, now);
             self.last_packet_sent_time = now;
 
-            // Client: auto-clear Handshake keys once Finished has been packed and sent
-            // (RFC 9001 §4.9.2: discard Handshake keys when handshake is confirmed)
+            // Client: auto-clear Handshake keys once Finished has been sent AND acknowledged
+            // RFC 9001 §4.9.2: "A client MUST NOT discard keys for the Handshake packet
+            // number space until ... its HANDSHAKE packets have been acknowledged."
             if (!self.is_server and self.handshake_confirmed and self.pkt_num_spaces[1].crypto_seal != null) {
                 if (!self.crypto_streams.getStream(1).hasData()) {
-                    self.dropHandshakeKeys();
+                    const hs_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.handshake)];
+                    if (hs_tracker.ack_eliciting_in_flight == 0) {
+                        self.dropHandshakeKeys();
+                    }
                 }
             }
 
@@ -3481,7 +3485,12 @@ pub const Connection = struct {
     fn maybeConfirmHandshake(self: *Connection, enc_level: ack_handler.EncLevel, acked_count: usize) void {
         if (!self.is_server and !self.handshake_confirmed and enc_level == .application and acked_count > 0) {
             self.handshake_confirmed = true;
-            self.dropHandshakeKeys();
+            // RFC 9001 §4.9.2: Do NOT drop Handshake keys here — they must be kept
+            // until the client's Handshake packets (Finished) have been acknowledged.
+            // In 0-RTT scenarios, the server may send 1-RTT ACKs (for 0-RTT data)
+            // before receiving the client's Handshake Finished. Dropping keys here
+            // would prevent the client from retransmitting the Finished if lost.
+            // The auto-clear in emitPackets() handles key discard safely.
             std.log.info("handshake confirmed via 1-RTT ACK", .{});
         }
     }

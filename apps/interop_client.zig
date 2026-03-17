@@ -218,7 +218,7 @@ pub fn main() !void {
                 if (urls.items.len > 1) {
                     if (ticket) |*t| {
                         std.log.info("resuming with 0-RTT (lifetime={d}s)", .{t.lifetime});
-                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false, true, false, qlog_dir, false);
+                        _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, t, false, cipher_only, false, true, false, qlog_dir, true);
                     } else {
                         std.log.warn("no session ticket received, falling back to full handshake", .{});
                         _ = try downloadAll(alloc, urls.items[1..], use_h3, keylog_file, download_dir, null, false, cipher_only, false, false, false, qlog_dir, false);
@@ -325,6 +325,16 @@ fn downloadAll(
             std.log.info("0-RTT: sent early request for {s} on stream {d}", .{ url.path, s.stream_id });
         }
         early_data_sent = true;
+
+        // Flush all 0-RTT data immediately — send enough packets to drain all stream data
+        // so that the interop test sees maximum data in 0-RTT packets (not 1-RTT).
+        var flush_0rtt: usize = 0;
+        while (flush_0rtt < 20) : (flush_0rtt += 1) {
+            const bytes_written = conn.send(&out) catch break;
+            if (bytes_written == 0) break;
+            ecn_socket.setEcnMark(sockfd, conn.getEcnMark()) catch {};
+            _ = posix.sendto(sockfd, out[0..bytes_written], 0, @ptrCast(&remote_addr), addr_size) catch {};
+        }
     }
 
     // Handshake phase — shorter timeout for multiconnect (many sequential connections)
@@ -439,7 +449,7 @@ fn downloadAll(
     if (!skip_ticket_and_drain) {
         // Drain — brief drain to send CONNECTION_CLOSE, don't wait for full 3×PTO
         var drain_iter: usize = 0;
-        while (!conn.isClosed() and drain_iter < 10) : (drain_iter += 1) {
+        while (!conn.isClosed() and drain_iter < 3) : (drain_iter += 1) {
             std.Thread.sleep(5 * std.time.ns_per_ms);
             conn.onTimeout() catch break;
             drainRecv(&conn, sockfd, local_addr, &remote_addr, &addr_size);
