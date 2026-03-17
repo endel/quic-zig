@@ -508,7 +508,7 @@ pub const TlsConfig = struct {
     private_key_bytes: []const u8, // Raw ECDSA P-256 private key (32 bytes)
     alpn: []const []const u8,
     server_name: ?[]const u8 = null, // SNI (client only)
-    skip_cert_verify: bool = true, // Skip X.509 chain + CertificateVerify validation
+    skip_cert_verify: bool = false, // Skip X.509 chain + CertificateVerify validation
     ca_bundle: ?*Certificate.Bundle = null, // Caller-owned CA bundle for trust anchor verification
     session_ticket: ?*const SessionTicket = null, // Stored ticket from previous connection (client)
     ticket_key: ?[16]u8 = null, // AES-128-GCM key for encrypting/decrypting tickets (server)
@@ -2794,6 +2794,16 @@ test "buildServerHello: produces valid message" {
     try std.testing.expectEqual(msg.len - 4, body_len);
 }
 
+test "TlsConfig defaults to certificate verification enabled" {
+    const config = TlsConfig{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &.{},
+    };
+
+    try std.testing.expect(!config.skip_cert_verify);
+}
+
 test "loopback handshake: client and server complete" {
     // Generate an ECDSA P-256 key pair for the server
     const server_key_pair = EcdsaP256Sha256.KeyPair.generate();
@@ -2815,6 +2825,7 @@ test "loopback handshake: client and server complete" {
         .private_key_bytes = &.{},
         .alpn = &[_][]const u8{"h3"},
         .server_name = "localhost",
+        .skip_cert_verify = true,
     };
 
     const server_tp = transport_params.TransportParams{
@@ -2961,6 +2972,7 @@ test "loopback PSK resumption: two handshakes with session ticket" {
         .private_key_bytes = &.{},
         .alpn = &[_][]const u8{"h3"},
         .server_name = "localhost",
+        .skip_cert_verify = true,
     };
 
     const tp = transport_params.TransportParams{

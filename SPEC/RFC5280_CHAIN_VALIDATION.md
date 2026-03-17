@@ -43,6 +43,6 @@ const tls_config = TlsConfig{
 
 ### Caveats
 
-- `skip_cert_verify` defaults to `true` for backward compatibility
+- `skip_cert_verify` defaults to `false`; callers must opt out explicitly for test-only/self-signed scenarios
 - V1 certificates (no extensions) are accepted as CAs when no basicConstraints is present — this matches common practice but is less strict than RFC 5280's recommendation
 - The interop client always uses `skip_cert_verify=true` since interop test peers use various self-signed certs
