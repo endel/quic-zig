@@ -539,10 +539,6 @@ pub fn hkdfExpandLabelRuntime(
 
 /// Derive a QUIC key and pad to max_key_len.
 /// `actual_len` is the real key length (16 for AES, 32 for ChaCha20).
-pub fn deriveKeyPadded(secret: [32]u8, actual_len: usize) [max_key_len]u8 {
-    return deriveKeyPaddedV(secret, actual_len, protocol.QUIC_V1);
-}
-
 pub fn deriveKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_key_len]u8 {
     return deriveKeyPaddedL(secret, actual_len, protocol.quicLabel(version, .key));
 }
@@ -557,11 +553,6 @@ fn deriveKeyPaddedL(secret: [32]u8, actual_len: usize, label: []const u8) [max_k
         @memcpy(result[0..16], &k16);
     }
     return result;
-}
-
-/// Derive a QUIC HP key and pad to max_key_len.
-pub fn deriveHpKeyPadded(secret: [32]u8, actual_len: usize) [max_key_len]u8 {
-    return deriveHpKeyPaddedV(secret, actual_len, protocol.QUIC_V1);
 }
 
 pub fn deriveHpKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_key_len]u8 {

@@ -288,12 +288,6 @@ fn parseKeyUsage(cert_der: []const u8, octet_elem: Certificate.der.Element, resu
 
 /// Load system root CA certificates into a Certificate.Bundle.
 /// The caller owns the returned bundle and must call bundle.deinit(allocator).
-pub fn loadSystemCaBundle(allocator: std.mem.Allocator) !Certificate.Bundle {
-    var bundle: Certificate.Bundle = .{};
-    try bundle.rescan(allocator);
-    return bundle;
-}
-
 // ─── TranscriptHash ──────────────────────────────────────────────────
 
 pub const TranscriptHash = struct {

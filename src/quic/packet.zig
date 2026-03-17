@@ -301,10 +301,6 @@ pub const PacketNumSpace = struct {
     }
 };
 
-pub fn parseIncoming(bytes: []const u8) void {
-    _ = bytes;
-}
-
 pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     // We need at least 4 bytes for packet number + 16 for sample
     if (fbs.pos + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
@@ -646,18 +642,6 @@ pub fn retry(
     const integrity_tag = try computeRetryIntegrityTag(fbs.getWritten(), header.dcid, header.version);
 
     try writer.writeAll(&integrity_tag);
-}
-
-pub fn packetNumberLength(pn: u64) !usize {
-    if (pn < std.math.maxInt(u8)) {
-        return 1;
-    } else if (pn < std.math.maxInt(u16)) {
-        return 2;
-    } else if (pn < std.math.maxInt(u32)) {
-        return 4;
-    } else {
-        return error.InvalidPacket;
-    }
 }
 
 ///

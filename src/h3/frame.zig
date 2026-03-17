@@ -380,12 +380,6 @@ pub fn readUniStreamType(reader: anytype) !UniStreamType {
     return UniStreamType.fromInt(raw) orelse error.UnknownStreamType;
 }
 
-/// Read a raw uni stream type varint without mapping to enum.
-/// Used by WebTransport to identify WT-specific stream types (0x41, 0x54).
-pub fn readUniStreamTypeRaw(reader: anytype) !u64 {
-    return try packet.readVarInt(reader);
-}
-
 // Tests
 
 test "H3Frame: write and parse DATA" {
