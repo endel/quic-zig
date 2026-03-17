@@ -417,6 +417,33 @@ pub fn Server(comptime Handler: type) type {
             try self.loop.run(.no_wait);
         }
 
+        /// Flush any data queued by external callers (e.g. C API handlers that
+        /// called sendStreamData / acceptSession / sendDatagram between ticks).
+        /// This ensures outgoing QUIC packets are built and sent immediately
+        /// rather than waiting for the next onReadable / onTimer callback.
+        pub fn flush(self: *Self) void {
+            for (self.conn_mgr.entries.items) |entry| {
+                const conn = entry.conn;
+                if (conn.isClosed()) continue;
+                const batch = self.batchForConn(conn);
+                var send_count: usize = 0;
+                while (send_count < 1000) : (send_count += 1) {
+                    const bytes_written = conn.send(&self.out_buf) catch break;
+                    if (bytes_written == 0) break;
+                    const send_addr = conn.peerAddress();
+                    batch.add(
+                        self.out_buf[0..bytes_written],
+                        @ptrCast(send_addr),
+                        connection.sockaddrLen(send_addr),
+                        conn.getEcnMark(),
+                    );
+                }
+            }
+            self.batch.flush();
+            if (self.preferred) |*p| p.batch.flush();
+            self.rescheduleTimer();
+        }
+
         /// Initiate graceful shutdown. All active connections receive
         /// CONNECTION_CLOSE, pending data is flushed, then the event loop exits.
         pub fn stop(self: *Self) void {

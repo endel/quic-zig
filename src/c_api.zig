@@ -337,6 +337,11 @@ export fn qz_server_poll(handle: *anyopaque, buf: [*]u8, buf_len: u32) u32 {
     return ev.serialize(buf, buf_len);
 }
 
+export fn qz_server_flush(handle: *anyopaque) void {
+    const ws = getWtServer(handle);
+    ws.server.flush();
+}
+
 export fn qz_server_stop(handle: *anyopaque) void {
     const ws = getWtServer(handle);
     ws.server.stop();
