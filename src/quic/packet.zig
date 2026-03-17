@@ -308,7 +308,7 @@ pub fn parseIncoming(bytes: []const u8) void {
     _ = bytes;
 }
 
-fn buildHeaderBytes(header_bytes_buf: []u8, first_byte: u8, packet_buf: []const u8, packet_start: usize, header_end: usize) PacketError![]const u8 {
+fn buildHeaderBytes(header_bytes_buf: []u8, first_byte: u8, packet_buf: []const u8, packet_start: usize, header_end: usize) error{InvalidPacket}![]const u8 {
     if (header_end <= packet_start or header_end > packet_buf.len) {
         return error.InvalidPacket;
     }
