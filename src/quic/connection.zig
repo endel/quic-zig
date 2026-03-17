@@ -2982,16 +2982,12 @@ pub const Connection = struct {
                             self.queueCryptoRetransmission(pto_level);
                             if (pto_level == .handshake) {
                                 // Also retransmit Initial crypto data if still outstanding
-                                if (self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.initial)].ack_eliciting_in_flight > 0) {
-                                    self.queueCryptoRetransmission(.initial);
-                                }
+                                self.queueCryptoRetransmission(.initial);
                             }
                             if (pto_level == .initial) {
                                 // Also retransmit Handshake crypto data if still outstanding
                                 // (server sends ServerHello + Certificate in one datagram)
-                                if (self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.handshake)].ack_eliciting_in_flight > 0) {
-                                    self.queueCryptoRetransmission(.handshake);
-                                }
+                                self.queueCryptoRetransmission(.handshake);
                             }
                             // Check both levels for data
                             if (self.crypto_streams.getStream(0).hasData() or
@@ -3006,8 +3002,8 @@ pub const Connection = struct {
                             // the server stays stuck waiting for Finished while we only
                             // retransmit 1-RTT data it cannot respond to.
                             if (!self.is_server and !self.handshake_confirmed) {
-                                if (self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.handshake)].ack_eliciting_in_flight > 0) {
-                                    self.queueCryptoRetransmission(.handshake);
+                                self.queueCryptoRetransmission(.handshake);
+                                if (self.crypto_streams.getStream(2).hasData()) {
                                     has_data = true;
                                 }
                             }
