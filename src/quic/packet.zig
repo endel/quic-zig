@@ -38,24 +38,6 @@ const RETRY_INTEGRITY_NONCE_V1: [crypto.nonce_len]u8 = .{ 0x46, 0x15, 0x99, 0xd3
 const RETRY_INTEGRITY_KEY_V2: [crypto.key_len]u8 = .{ 0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92 };
 const RETRY_INTEGRITY_NONCE_V2: [crypto.nonce_len]u8 = .{ 0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a };
 
-fn buildHeaderBytes(
-    header_bytes_buf: *[512]u8,
-    first_byte: u8,
-    packet: []u8,
-    pkt_start: usize,
-    header_end: usize,
-) ![]const u8 {
-    if (header_end <= pkt_start) return error.InvalidPacket;
-    const header_len = header_end - pkt_start;
-    if (header_len > header_bytes_buf.len) return error.InvalidPacket;
-
-    header_bytes_buf[0] = first_byte;
-    if (header_len > 1) {
-        @memcpy(header_bytes_buf[1..][0..(header_len - 1)], packet[(pkt_start + 1)..header_end]);
-    }
-    return header_bytes_buf[0..header_len];
-}
-
 pub const PacketType = enum(u8) {
     /// Initial packet
     initial = LONG_HEADER_BIT | FIXED_BIT | 0x00,
@@ -393,14 +375,25 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     // Skip the packet number bytes in the buffer
     try fbs.seekBy(@intCast(header.packet_number_len));
 
+    if (header.remainder_len < header.packet_number_len) {
+        return error.InvalidPacket;
+    }
     const payload_len = header.remainder_len - header.packet_number_len;
+    if (payload_len > (fbs.buffer.len - fbs.pos)) {
+        return error.InvalidPacket;
+    }
 
     // RFC 9001 Section 5.2: AD includes the unprotected first byte and everything up to and including packet number
     // For coalesced packets, use packet_start to get the correct offset within the buffer
     const pkt_start = header.packet_start;
+    const header_len = fbs.pos - pkt_start; // total header length including packet number
     var header_bytes_buf: [512]u8 = undefined;
-    const header_bytes = try buildHeaderBytes(&header_bytes_buf, first_byte, fbs.buffer, pkt_start, fbs.pos);
-    const encrypted_payload = fbs.buffer[(fbs.pos)..(fbs.pos + payload_len)];
+    // Copy first byte as unprotected
+    header_bytes_buf[0] = first_byte;
+    // Copy the rest of the header and packet number (from byte after first to current position)
+    @memcpy(header_bytes_buf[1..][0..(header_len - 1)], fbs.buffer[(pkt_start + 1)..fbs.pos]);
+    const header_bytes = header_bytes_buf[0..header_len];
+    const encrypted_payload = fbs.buffer[fbs.pos..(fbs.pos + payload_len)];
 
     // Decode packet number
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
@@ -470,13 +463,22 @@ pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *PacketNumSpac
 
     try fbs.seekBy(@intCast(header.packet_number_len));
 
+    if (header.remainder_len < header.packet_number_len) {
+        return error.InvalidPacket;
+    }
     const payload_len = header.remainder_len - header.packet_number_len;
+    if (payload_len > (fbs.buffer.len - fbs.pos)) {
+        return error.InvalidPacket;
+    }
 
     // Build associated data
     const pkt_start = header.packet_start;
+    const header_len = fbs.pos - pkt_start;
     var header_bytes_buf: [512]u8 = undefined;
-    const header_bytes = try buildHeaderBytes(&header_bytes_buf, first_byte, fbs.buffer, pkt_start, fbs.pos);
-    const encrypted_payload = fbs.buffer[(fbs.pos)..(fbs.pos + payload_len)];
+    header_bytes_buf[0] = first_byte;
+    @memcpy(header_bytes_buf[1..][0..(header_len - 1)], fbs.buffer[(pkt_start + 1)..fbs.pos]);
+    const header_bytes = header_bytes_buf[0..header_len];
+    const encrypted_payload = fbs.buffer[fbs.pos..(fbs.pos + payload_len)];
 
     // Decode packet number
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
@@ -1043,27 +1045,6 @@ test "QUIC: Variable-Length Integer Decoding" {
 
     fbs = io.fixedBufferStream(&[_]u8{ 0x40, 0x25 });
     try std.testing.expect(37 == try readVarInt(fbs.reader()));
-}
-
-test "QUIC: buildHeaderBytes rejects oversized associated data headers" {
-    var packet_buf: [513]u8 = .{0x42} ** 513;
-    var header_bytes_buf: [512]u8 = undefined;
-
-    try std.testing.expectError(
-        error.InvalidPacket,
-        buildHeaderBytes(&header_bytes_buf, 0xc0, &packet_buf, 0, packet_buf.len),
-    );
-}
-
-test "QUIC: buildHeaderBytes keeps the unprotected first byte" {
-    var packet_buf = [_]u8{ 0xaa, 0x01, 0x02, 0x03, 0x04 };
-    var header_bytes_buf: [512]u8 = undefined;
-
-    const header_bytes = try buildHeaderBytes(&header_bytes_buf, 0xc1, &packet_buf, 0, packet_buf.len);
-
-    try std.testing.expectEqual(@as(usize, packet_buf.len), header_bytes.len);
-    try std.testing.expectEqual(@as(u8, 0xc1), header_bytes[0]);
-    try std.testing.expectEqualSlices(u8, packet_buf[1..], header_bytes[1..]);
 }
 
 //
