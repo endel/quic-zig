@@ -25,7 +25,7 @@
 - **Stream scheduling double-pass** (`stream.zig:802-856`) — Two full iterations over all streams per packet for priority scheduling. Cache min-urgency and reduce to single pass.
 
 ### Worth Considering (good ROI, needs design)
-- **Sent packet HashMap → ordered structure** (`ack_handler.zig`) — `SentPacketTracker` uses `AutoHashMap(u64, SentPacket)`. ACK processing calls `fetchRemove` per PN in range. A ring buffer indexed by PN offset would make bulk ACK processing O(1) per range instead of O(n) lookups. Biggest theoretical win but also biggest refactor.
+- **Shrink SentPacket struct** (`ack_handler.zig`) — Currently ~1250 bytes due to embedded `[48]StreamFrameInfo` array. Moving stream frame info to a separate slab and storing only a pointer/index would reduce it to ~50 bytes, dramatically improving HashMap cache locality. Ring buffer replacement was evaluated and rejected: 960KB fixed memory per connection (vs ~30KB typical HashMap) with marginal iteration gains.
 - **FrameSorter per-chunk allocations** (`stream.zig:41-146`) — Every out-of-order STREAM frame triggers `allocator.dupe()` + HashMap put. On lossy networks this is hot. A ring buffer or slab would help but changes buffer semantics (fixed max size).
 
 ## 3. Future Extensions (Nice to Have)
