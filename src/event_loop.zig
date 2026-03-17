@@ -539,7 +539,10 @@ pub fn Server(comptime Handler: type) type {
                 )) {
                     .processed => |entry| {
                         const conn = entry.conn;
-                        const bytes_written = conn.send(&self.out_buf) catch continue;
+                        const bytes_written = conn.send(&self.out_buf) catch |err| {
+                            std.log.warn("send error after recv: {}", .{err});
+                            continue;
+                        };
                         if (bytes_written > 0) {
                             const send_addr = conn.peerAddress();
                             self.batchForConn(conn).add(
@@ -1269,7 +1272,10 @@ pub fn Client(comptime Handler: type) type {
                 });
 
                 // Send one response packet immediately (e.g. ACKs during handshake)
-                const bytes_written = self.conn.send(&self.out_buf) catch continue;
+                const bytes_written = self.conn.send(&self.out_buf) catch |err| {
+                    std.log.warn("client send error after recv: {}", .{err});
+                    continue;
+                };
                 if (bytes_written > 0) {
                     self.batch.add(
                         self.out_buf[0..bytes_written],
@@ -1399,7 +1405,9 @@ pub fn Client(comptime Handler: type) type {
 
         fn tickAndSend(self: *Self) void {
             const conn = self.conn;
-            conn.onTimeout() catch {};
+            conn.onTimeout() catch |err| {
+                std.log.warn("client onTimeout error: {}", .{err});
+            };
 
             if (conn.isClosed()) {
                 if (self.stopping) self.loop.stop();

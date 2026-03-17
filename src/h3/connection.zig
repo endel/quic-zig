@@ -627,7 +627,10 @@ pub const H3Connection = struct {
             if (data.len == 0) continue;
 
             var fbs = io.fixedBufferStream(data);
-            const stream_type = h3_frame.readUniStreamType(fbs.reader()) catch continue;
+            const stream_type = h3_frame.readUniStreamType(fbs.reader()) catch |err| {
+                std.log.debug("H3 uni stream type parse error on stream {d}: {}", .{ stream_id, err });
+                continue;
+            };
 
             switch (stream_type) {
                 .control => {

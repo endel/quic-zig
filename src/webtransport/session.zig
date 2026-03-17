@@ -486,8 +486,11 @@ pub const WebTransportConnection = struct {
 
             defer self.allocator.free(data);
 
-            // Try to parse capsules on the CONNECT stream
-            const result = h3_frame.parse(data) catch continue;
+            // Try to parse capsules on the CONNECT stream (may be partial data)
+            const result = h3_frame.parse(data) catch |err| {
+                std.log.debug("WT capsule parse error: {}", .{err});
+                continue;
+            };
             switch (result.frame) {
                 .close_webtransport_session => |cls| {
                     const sid = session.session_id;
@@ -712,7 +715,10 @@ pub const WebTransportConnection = struct {
             // First check WT buffer for data left over from prefix parsing
             if (self.stream_bufs.getPtr(stream_id)) |buf| {
                 if (buf.items.len > 0) {
-                    const data_slice = self.allocator.dupe(u8, buf.items) catch continue;
+                    const data_slice = self.allocator.dupe(u8, buf.items) catch {
+                        std.log.err("WT bidi stream data alloc failed (OOM)", .{});
+                        continue;
+                    };
                     buf.items.len = 0;
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
@@ -749,7 +755,10 @@ pub const WebTransportConnection = struct {
             // First check WT buffer
             if (self.stream_bufs.getPtr(stream_id)) |buf| {
                 if (buf.items.len > 0) {
-                    const data_slice = self.allocator.dupe(u8, buf.items) catch continue;
+                    const data_slice = self.allocator.dupe(u8, buf.items) catch {
+                        std.log.err("WT uni stream data alloc failed (OOM)", .{});
+                        continue;
+                    };
                     buf.items.len = 0;
                     return .{ .stream_data = .{
                         .stream_id = stream_id,

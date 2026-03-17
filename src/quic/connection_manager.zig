@@ -366,7 +366,9 @@ pub const ConnectionManager = struct {
     /// Returns true if the connection is still alive, false if it was removed
     /// (caller should `continue` without incrementing the index).
     pub fn tickEntry(self: *ConnectionManager, entry: *ConnEntry) bool {
-        entry.conn.onTimeout() catch {};
+        entry.conn.onTimeout() catch |err| {
+            std.log.warn("onTimeout error: {}", .{err});
+        };
         if (entry.conn.isClosed()) {
             self.removeConnection(entry);
             return false;
