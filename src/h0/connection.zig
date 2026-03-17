@@ -21,6 +21,66 @@ const MAX_REQUEST_LINE = 4096;
 /// Maximum file size to serve (10MB).
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
+fn copyDefaultPath(out_buf: []u8) ![]const u8 {
+    const default_path = "index.html";
+    if (out_buf.len < default_path.len) return error.PathTooLong;
+    @memcpy(out_buf[0..default_path.len], default_path);
+    return out_buf[0..default_path.len];
+}
+
+/// Convert an untrusted request path into a normalized relative filesystem path.
+/// Rejects path traversal, backslash separators, NUL bytes, and oversized paths.
+pub fn sanitizeRelativePath(path: []const u8, out_buf: []u8) ![]const u8 {
+    var trimmed = path;
+    if (mem.indexOfAny(u8, trimmed, "?#")) |idx| {
+        trimmed = trimmed[0..idx];
+    }
+
+    while (trimmed.len > 0 and trimmed[0] == '/') {
+        trimmed = trimmed[1..];
+    }
+
+    if (trimmed.len == 0) {
+        return copyDefaultPath(out_buf);
+    }
+
+    var out_len: usize = 0;
+    var segments = mem.splitScalar(u8, trimmed, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or mem.eql(u8, segment, ".")) continue;
+        if (mem.eql(u8, segment, "..")) return error.PathTraversal;
+        if (mem.indexOfScalar(u8, segment, 0) != null) return error.InvalidPath;
+        if (mem.indexOfScalar(u8, segment, '\\') != null) return error.InvalidPath;
+
+        const separator_len: usize = if (out_len == 0) 0 else 1;
+        if (out_len + separator_len + segment.len > out_buf.len) return error.PathTooLong;
+        if (separator_len == 1) {
+            out_buf[out_len] = '/';
+            out_len += 1;
+        }
+        @memcpy(out_buf[out_len..][0..segment.len], segment);
+        out_len += segment.len;
+    }
+
+    if (out_len == 0) {
+        return copyDefaultPath(out_buf);
+    }
+
+    return out_buf[0..out_len];
+}
+
+pub fn buildSafeFilePath(root_dir: []const u8, request_path: []const u8, clean_path_buf: []u8, full_path_buf: []u8) ![]const u8 {
+    const clean_path = try sanitizeRelativePath(request_path, clean_path_buf);
+
+    if (root_dir.len == 0) {
+        return std.fmt.bufPrint(full_path_buf, "{s}", .{clean_path}) catch error.PathTooLong;
+    }
+    if (root_dir[root_dir.len - 1] == '/') {
+        return std.fmt.bufPrint(full_path_buf, "{s}{s}", .{ root_dir, clean_path }) catch error.PathTooLong;
+    }
+    return std.fmt.bufPrint(full_path_buf, "{s}/{s}", .{ root_dir, clean_path }) catch error.PathTooLong;
+}
+
 /// Event returned by poll().
 pub const H0Event = union(enum) {
     /// A complete request was received on a bidi stream (server-side).
@@ -108,27 +168,15 @@ pub const H0Connection = struct {
 
     /// Serve a file from the given root directory on the specified stream.
     pub fn serveFile(self: *H0Connection, stream_id: u64, root_dir: []const u8, path: []const u8) !void {
-        // Sanitize path: strip leading "/"
-        var clean_path = path;
-        while (clean_path.len > 0 and clean_path[0] == '/') {
-            clean_path = clean_path[1..];
-        }
-        if (clean_path.len == 0) clean_path = "index.html";
-
-        // Build full filesystem path
+        var clean_path_buf: [MAX_REQUEST_LINE]u8 = undefined;
         var full_path_buf: [4096]u8 = undefined;
-        var full_path_pos: usize = 0;
-        @memcpy(full_path_buf[full_path_pos..][0..root_dir.len], root_dir);
-        full_path_pos += root_dir.len;
-        if (root_dir.len > 0 and root_dir[root_dir.len - 1] != '/') {
-            full_path_buf[full_path_pos] = '/';
-            full_path_pos += 1;
-        }
-        @memcpy(full_path_buf[full_path_pos..][0..clean_path.len], clean_path);
-        full_path_pos += clean_path.len;
-        full_path_buf[full_path_pos] = 0;
-
-        const full_path = full_path_buf[0..full_path_pos];
+        const full_path = buildSafeFilePath(root_dir, path, &clean_path_buf, &full_path_buf) catch |err| {
+            std.log.warn("H0: rejected request path '{s}': {any}", .{ path, err });
+            const streams_map = &self.quic_conn.streams;
+            const stream = streams_map.getStream(stream_id) orelse return;
+            stream.send.close();
+            return;
+        };
 
         // Read file
         const file_data = std.fs.cwd().readFileAlloc(self.allocator, full_path, MAX_FILE_SIZE) catch |err| {
@@ -205,3 +253,32 @@ pub const H0Connection = struct {
         return null;
     }
 };
+
+test "sanitizeRelativePath normalizes safe request paths" {
+    var buf: [MAX_REQUEST_LINE]u8 = undefined;
+
+    try std.testing.expectEqualStrings("index.html", try sanitizeRelativePath("/", &buf));
+    try std.testing.expectEqualStrings("nested/file.txt", try sanitizeRelativePath("//nested/./file.txt?download=1#frag", &buf));
+    try std.testing.expectEqualStrings("foo/bar", try sanitizeRelativePath("/foo//bar/", &buf));
+}
+
+test "sanitizeRelativePath rejects traversal and invalid separators" {
+    var buf: [MAX_REQUEST_LINE]u8 = undefined;
+
+    try std.testing.expectError(error.PathTraversal, sanitizeRelativePath("/../etc/passwd", &buf));
+    try std.testing.expectError(error.PathTraversal, sanitizeRelativePath("/safe/../../etc/passwd", &buf));
+    try std.testing.expectError(error.InvalidPath, sanitizeRelativePath("/foo\\bar", &buf));
+}
+
+test "buildSafeFilePath bounds the final path" {
+    var clean_path_buf: [MAX_REQUEST_LINE]u8 = undefined;
+    var full_path_buf: [32]u8 = undefined;
+    var long_request: [MAX_REQUEST_LINE]u8 = undefined;
+
+    @memset(&long_request, 'a');
+
+    try std.testing.expectError(
+        error.PathTooLong,
+        buildSafeFilePath("/www", long_request[0..], &clean_path_buf, &full_path_buf),
+    );
+}
