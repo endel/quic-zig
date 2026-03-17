@@ -167,10 +167,10 @@ pub fn Server(comptime Handler: type) type {
 
         const known = [_][]const u8{
             "onConnectRequest", "onSessionReady",  "onStreamData",
-            "onDatagram",       "onSessionClosed",  "onSessionDraining",
-            "onBidiStream",     "onUniStream",      "onPollComplete",
-            "onRequest",        "onData",
-            "onH0Request",      "onH0Data",         "onH0Finished",
+            "onDatagram",       "onSessionClosed", "onSessionDraining",
+            "onBidiStream",     "onUniStream",     "onPollComplete",
+            "onRequest",        "onData",          "onH0Request",
+            "onH0Data",         "onH0Finished",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -870,6 +870,57 @@ pub const ClientConfig = struct {
     ipv6: bool = false,
 };
 
+const client_alpn = &[_][]const u8{"h3"};
+
+const BuiltClientTlsConfig = struct {
+    tls_config: tls13.TlsConfig,
+    owned_ca_bundle: ?*Certificate.Bundle = null,
+
+    fn deinit(self: *BuiltClientTlsConfig, alloc: std.mem.Allocator) void {
+        if (self.owned_ca_bundle) |bundle| {
+            bundle.deinit(alloc);
+            alloc.destroy(bundle);
+            self.owned_ca_bundle = null;
+            self.tls_config.ca_bundle = null;
+        }
+    }
+};
+
+fn buildClientTlsConfig(alloc: std.mem.Allocator, config: ClientConfig) !BuiltClientTlsConfig {
+    if (config.tls_config) |tc| {
+        return .{ .tls_config = tc };
+    }
+
+    var ca_bundle: ?*Certificate.Bundle = null;
+    if (!config.skip_cert_verify) {
+        const bundle_ptr = try alloc.create(Certificate.Bundle);
+        errdefer alloc.destroy(bundle_ptr);
+
+        if (config.ca_cert_path) |ca_path| {
+            bundle_ptr.* = .{};
+            errdefer bundle_ptr.deinit(alloc);
+            try bundle_ptr.addCertsFromFilePath(alloc, std.fs.cwd(), ca_path);
+        } else {
+            bundle_ptr.* = try tls13.loadSystemCaBundle(alloc);
+            errdefer bundle_ptr.deinit(alloc);
+        }
+
+        ca_bundle = bundle_ptr;
+    }
+
+    return .{
+        .tls_config = .{
+            .cert_chain_der = &.{},
+            .private_key_bytes = &.{},
+            .alpn = client_alpn,
+            .server_name = config.server_name,
+            .skip_cert_verify = config.skip_cert_verify,
+            .ca_bundle = ca_bundle,
+        },
+        .owned_ca_bundle = ca_bundle,
+    };
+}
+
 /// ClientSession wraps a single client-side connection and provides the same
 /// convenience methods as the server-side Session.
 pub const ClientSession = struct {
@@ -965,9 +1016,9 @@ pub fn Client(comptime Handler: type) type {
         }
 
         const known = [_][]const u8{
-            "onConnected",        "onSessionReady",    "onSessionRejected",
-            "onStreamData",       "onDatagram",        "onSessionClosed",
-            "onSessionDraining",  "onBidiStream",      "onUniStream",
+            "onConnected",       "onSessionReady", "onSessionRejected",
+            "onStreamData",      "onDatagram",     "onSessionClosed",
+            "onSessionDraining", "onBidiStream",   "onUniStream",
             "onPollComplete",
         };
 
@@ -1031,6 +1082,7 @@ pub fn Client(comptime Handler: type) type {
         wt_conn: ?wt.WebTransportConnection,
         protocol_initialized: bool,
         session_id: ?u64,
+        owned_ca_bundle: ?*Certificate.Bundle,
 
         // Config retained for protocol init
         server_name: []const u8,
@@ -1038,27 +1090,8 @@ pub fn Client(comptime Handler: type) type {
 
         pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: ClientConfig) !Self {
             // Build TLS config
-            const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
-                const alpn = try alloc.alloc([]const u8, 1);
-                alpn[0] = "h3";
-
-                var ca_bundle: ?*Certificate.Bundle = null;
-                if (config.ca_cert_path) |ca_path| {
-                    const bundle_ptr = try alloc.create(Certificate.Bundle);
-                    bundle_ptr.* = .{};
-                    try bundle_ptr.addCertsFromFilePath(alloc, std.fs.cwd(), ca_path);
-                    ca_bundle = bundle_ptr;
-                }
-
-                break :blk .{
-                    .cert_chain_der = &.{},
-                    .private_key_bytes = &.{},
-                    .alpn = alpn,
-                    .server_name = config.server_name,
-                    .skip_cert_verify = config.skip_cert_verify,
-                    .ca_bundle = ca_bundle,
-                };
-            };
+            var built_tls_config = try buildClientTlsConfig(alloc, config);
+            errdefer built_tls_config.deinit(alloc);
 
             // Connection config
             const conn_config: connection.ConnectionConfig = if (config.conn_config) |cc| cc else cc_blk: {
@@ -1070,20 +1103,21 @@ pub fn Client(comptime Handler: type) type {
             };
 
             // Create QUIC client connection
-            const conn = try connection.connect(
+            // Heap-allocate so pointers remain stable
+            const conn_ptr = try alloc.create(connection.Connection);
+            var conn_initialized = false;
+            errdefer {
+                if (conn_initialized) conn_ptr.deinit();
+                alloc.destroy(conn_ptr);
+            }
+            conn_ptr.* = try connection.connect(
                 alloc,
                 config.server_name,
                 conn_config,
-                tls_config,
+                built_tls_config.tls_config,
                 null,
             );
-            // Heap-allocate so pointers remain stable
-            const conn_ptr = try alloc.create(connection.Connection);
-            errdefer {
-                conn_ptr.deinit();
-                alloc.destroy(conn_ptr);
-            }
-            conn_ptr.* = conn;
+            conn_initialized = true;
 
             // Resolve remote address
             const remote_addr = if (config.ipv6) blk: {
@@ -1142,6 +1176,7 @@ pub fn Client(comptime Handler: type) type {
                 .wt_conn = null,
                 .protocol_initialized = false,
                 .session_id = null,
+                .owned_ca_bundle = built_tls_config.owned_ca_bundle,
                 .server_name = config.server_name,
                 .path = config.path,
             };
@@ -1155,6 +1190,10 @@ pub fn Client(comptime Handler: type) type {
             posix.close(self.sockfd);
             self.conn.deinit();
             self.allocator.destroy(self.conn);
+            if (self.owned_ca_bundle) |bundle| {
+                bundle.deinit(self.allocator);
+                self.allocator.destroy(bundle);
+            }
         }
 
         pub fn start(self: *Self) void {
@@ -1470,4 +1509,21 @@ pub fn Client(comptime Handler: type) type {
             };
         }
     };
+}
+
+test "buildClientTlsConfig loads system CA bundle when verification is enabled" {
+    var built = try buildClientTlsConfig(std.testing.allocator, .{});
+    defer built.deinit(std.testing.allocator);
+
+    try std.testing.expect(!built.tls_config.skip_cert_verify);
+    try std.testing.expect(built.tls_config.ca_bundle != null);
+}
+
+test "buildClientTlsConfig does not allocate a CA bundle when verification is skipped" {
+    var built = try buildClientTlsConfig(std.testing.allocator, .{
+        .skip_cert_verify = true,
+    });
+    defer built.deinit(std.testing.allocator);
+
+    try std.testing.expect(built.tls_config.ca_bundle == null);
 }

@@ -20,6 +20,7 @@ test {
     _ = @import("quic/ecn.zig");
     _ = @import("quic/ecn_socket.zig");
     _ = @import("quic/quic_lb.zig");
+    _ = @import("event_loop.zig");
     _ = @import("h3/frame.zig");
     _ = @import("h3/qpack.zig");
     _ = @import("h3/huffman.zig");

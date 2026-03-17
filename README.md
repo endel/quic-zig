@@ -208,7 +208,7 @@ pub fn main() !void {
 | `port` | `4433` | Server port |
 | `server_name` | `"localhost"` | TLS SNI / CONNECT authority |
 | `path` | `"/.well-known/webtransport"` | WebTransport CONNECT path |
-| `ca_cert_path` | `null` | CA certificate for TLS verification |
+| `ca_cert_path` | `null` | CA certificate for TLS verification; when unset, verified clients use the system root store |
 | `skip_cert_verify` | `false` | Skip certificate verification (testing only) |
 | `max_datagram_frame_size` | `65536` | QUIC datagram frame size limit |
 | `ipv6` | `false` | Use IPv6 dual-stack socket |
