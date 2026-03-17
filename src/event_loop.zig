@@ -882,13 +882,13 @@ pub const ClientSession = struct {
     pub fn sendStreamData(self: *ClientSession, stream_id: u64, data: []const u8) !void {
         if (self.wt_conn) |wtc| {
             try wtc.sendStreamData(stream_id, data);
-        }
+        } else return error.NoWtConnection;
     }
 
     pub fn sendDatagram(self: *ClientSession, session_id: u64, data: []const u8) !void {
         if (self.wt_conn) |wtc| {
             try wtc.sendDatagram(session_id, data);
-        }
+        } else return error.NoWtConnection;
     }
 
     pub fn closeStream(self: *ClientSession, stream_id: u64) void {
@@ -1079,6 +1079,10 @@ pub fn Client(comptime Handler: type) type {
             );
             // Heap-allocate so pointers remain stable
             const conn_ptr = try alloc.create(connection.Connection);
+            errdefer {
+                conn_ptr.deinit();
+                alloc.destroy(conn_ptr);
+            }
             conn_ptr.* = conn;
 
             // Resolve remote address
@@ -1107,6 +1111,7 @@ pub fn Client(comptime Handler: type) type {
                 try posix.bind(fd, &addr4.any, addr4.getOsSockLen());
                 break :blk .{ fd, addr4 };
             };
+            errdefer posix.close(sockfd);
             ecn_socket.enableEcnRecv(sockfd) catch {};
 
             // Init libxev

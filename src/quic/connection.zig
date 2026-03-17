@@ -1353,13 +1353,7 @@ pub const Connection = struct {
                     ql.metricsUpdated(now, rs.min_rtt, rs.smoothed_rtt, rs.latest_rtt, rs.rtt_var, self.cc.sendWindow(), self.pkt_handler.bytes_in_flight);
                 }
 
-                // RFC 9001 §4.1.2: At the client, the handshake is considered confirmed
-                // when it receives an acknowledgment for a 1-RTT packet.
-                if (!self.is_server and !self.handshake_confirmed and enc_level == .application and result.acked.len > 0) {
-                    self.handshake_confirmed = true;
-                    self.dropHandshakeKeys();
-                    std.log.info("handshake confirmed via 1-RTT ACK", .{});
-                }
+                self.maybeConfirmHandshake(enc_level, result.acked.len);
 
                 // Update pacer
                 self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
@@ -1493,13 +1487,7 @@ pub const Connection = struct {
                 self.peer_ecn_ect1[space_idx] = ack.ecn_ect1;
                 self.peer_ecn_ce[space_idx] = ack.ecn_ce;
 
-                // RFC 9001 §4.1.2: At the client, the handshake is considered confirmed
-                // when it receives an acknowledgment for a 1-RTT packet.
-                if (!self.is_server and !self.handshake_confirmed and enc_level == .application and result.acked.len > 0) {
-                    self.handshake_confirmed = true;
-                    self.dropHandshakeKeys();
-                    std.log.info("handshake confirmed via 1-RTT ACK (ECN)", .{});
-                }
+                self.maybeConfirmHandshake(enc_level, result.acked.len);
 
                 // Update pacer
                 self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
@@ -3443,6 +3431,16 @@ pub const Connection = struct {
     /// Called automatically for server in advanceHandshake, and for client
     /// after the Handshake Finished has been sent. Applications should not
     /// need to call this directly.
+    /// RFC 9001 §4.1.2: At the client, the handshake is considered confirmed
+    /// when it receives an acknowledgment for a 1-RTT packet.
+    fn maybeConfirmHandshake(self: *Connection, enc_level: ack_handler.EncLevel, acked_count: usize) void {
+        if (!self.is_server and !self.handshake_confirmed and enc_level == .application and acked_count > 0) {
+            self.handshake_confirmed = true;
+            self.dropHandshakeKeys();
+            std.log.info("handshake confirmed via 1-RTT ACK", .{});
+        }
+    }
+
     pub fn dropHandshakeKeys(self: *Connection) void {
         if (self.qlog_writer) |*ql| {
             const now_ql: i64 = @intCast(std.time.nanoTimestamp());

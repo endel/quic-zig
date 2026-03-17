@@ -564,6 +564,38 @@ pub const PacketHandler = struct {
         return self.recv[idx].getAckFrame(now, ack_delay_exponent);
     }
 
+    /// Compute PTO deadline for a single packet number space.
+    /// Returns null if the space should not arm PTO (no data, application space idle).
+    /// RFC 9002 §6.2.2.1: handshake spaces arm PTO even with no packets in flight.
+    fn spacePtoDeadline(self: *const PacketHandler, tracker: SentPacketTracker, idx: usize) ?i64 {
+        const is_handshake_space = (idx != @intFromEnum(EncLevel.application));
+        if (tracker.ack_eliciting_in_flight == 0) {
+            if (!(is_handshake_space and tracker.last_ack_eliciting_sent_time != null)) {
+                return null;
+            }
+        }
+
+        const base_time = if (tracker.ack_eliciting_in_flight > 0) blk: {
+            const largest_sent = tracker.largest_sent orelse return null;
+            const sent_pkt = tracker.sent_packets.get(largest_sent) orelse return null;
+            break :blk sent_pkt.time_sent;
+        } else blk: {
+            break :blk tracker.last_ack_eliciting_sent_time.?;
+        };
+
+        var pto_duration = if (idx == @intFromEnum(EncLevel.application))
+            self.rtt_stats.pto()
+        else
+            self.rtt_stats.ptoNoAckDelay();
+
+        const shift: u6 = @intCast(@min(self.pto_count, 30));
+        pto_duration = pto_duration << shift;
+        const max_pto = if (idx == @intFromEnum(EncLevel.application)) MAX_PTO else MAX_HANDSHAKE_PTO;
+        pto_duration = @min(pto_duration, max_pto);
+
+        return base_time + pto_duration;
+    }
+
     pub fn getPtoTimeout(self: *PacketHandler) ?i64 {
         var earliest: ?i64 = null;
 
@@ -575,43 +607,7 @@ pub const PacketHandler = struct {
                 continue;
             }
 
-            // RFC 9002 §6.2.2.1: During the handshake, a client MUST arm PTO even
-            // if there are no ack-eliciting packets in flight. When all in-flight
-            // packets are declared lost, ack_eliciting_in_flight becomes 0, but
-            // the crypto data still needs retransmission via PTO.
-            // For Initial/Handshake spaces, use last_ack_eliciting_sent_time as the
-            // baseline when there are no packets in flight.
-            const is_handshake_space = (idx != @intFromEnum(EncLevel.application));
-            if (tracker.ack_eliciting_in_flight == 0) {
-                if (is_handshake_space and tracker.last_ack_eliciting_sent_time != null) {
-                    // Still arm PTO based on last sent time
-                } else {
-                    continue;
-                }
-            }
-
-            // Use the last ack-eliciting sent time as baseline. When packets are
-            // in flight, this equals the most recent sent packet's time. When all
-            // were declared lost, it's the time of the last packet we sent.
-            const base_time = if (tracker.ack_eliciting_in_flight > 0) blk: {
-                const largest_sent = tracker.largest_sent orelse continue;
-                const sent_pkt = tracker.sent_packets.get(largest_sent) orelse continue;
-                break :blk sent_pkt.time_sent;
-            } else blk: {
-                break :blk tracker.last_ack_eliciting_sent_time.?;
-            };
-
-            var pto_duration = if (idx == @intFromEnum(EncLevel.application))
-                self.rtt_stats.pto()
-            else
-                self.rtt_stats.ptoNoAckDelay();
-
-            const shift: u6 = @intCast(@min(self.pto_count, 30));
-            pto_duration = pto_duration << shift;
-            const max_pto = if (idx == @intFromEnum(EncLevel.application)) MAX_PTO else MAX_HANDSHAKE_PTO;
-            pto_duration = @min(pto_duration, max_pto);
-
-            const timeout = base_time + pto_duration;
+            const timeout = self.spacePtoDeadline(tracker, idx) orelse continue;
             if (earliest == null or timeout < earliest.?) {
                 earliest = timeout;
             }
@@ -658,35 +654,7 @@ pub const PacketHandler = struct {
 
         for (self.sent, 0..) |tracker, idx| {
             if (tracker.loss_time != null) continue;
-
-            const is_handshake_space = (idx != @intFromEnum(EncLevel.application));
-            if (tracker.ack_eliciting_in_flight == 0) {
-                if (is_handshake_space and tracker.last_ack_eliciting_sent_time != null) {
-                    // Allow PTO for handshake spaces even with no packets in flight
-                } else {
-                    continue;
-                }
-            }
-
-            const base_time = if (tracker.ack_eliciting_in_flight > 0) blk: {
-                const largest_sent = tracker.largest_sent orelse continue;
-                const sent_pkt = tracker.sent_packets.get(largest_sent) orelse continue;
-                break :blk sent_pkt.time_sent;
-            } else blk: {
-                break :blk tracker.last_ack_eliciting_sent_time.?;
-            };
-
-            var pto_duration = if (idx == @intFromEnum(EncLevel.application))
-                self.rtt_stats.pto()
-            else
-                self.rtt_stats.ptoNoAckDelay();
-
-            const shift2: u6 = @intCast(@min(self.pto_count, 30));
-            pto_duration = pto_duration << shift2;
-            const max_pto2 = if (idx == @intFromEnum(EncLevel.application)) MAX_PTO else MAX_HANDSHAKE_PTO;
-            pto_duration = @min(pto_duration, max_pto2);
-
-            const timeout = base_time + pto_duration;
+            const timeout = self.spacePtoDeadline(tracker, idx) orelse continue;
             if (earliest == null or timeout < earliest.?) {
                 earliest = timeout;
                 result = @enumFromInt(idx);

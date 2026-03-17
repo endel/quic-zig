@@ -1477,17 +1477,16 @@ pub const Tls13Handshake = struct {
 
         // Prepare key share based on negotiated group
         var ks_data_buf: [65]u8 = undefined;
-        var ks_data: []const u8 = undefined;
-        if (self.negotiated_group == GROUP_SECP256R1) {
+        const ks_data: []const u8 = if (self.negotiated_group == GROUP_SECP256R1) blk: {
             // Generate P-256 ephemeral key pair
             crypto.random.bytes(&self.p256_secret);
             self.p256_public = (P256.basePoint.mulPublic(self.p256_secret, .big) catch return error.KeyScheduleError).toUncompressedSec1();
             @memcpy(&ks_data_buf, &self.p256_public);
-            ks_data = ks_data_buf[0..65];
-        } else {
+            break :blk ks_data_buf[0..65];
+        } else blk: {
             @memcpy(ks_data_buf[0..32], &self.x25519_public);
-            ks_data = ks_data_buf[0..32];
-        }
+            break :blk ks_data_buf[0..32];
+        };
 
         var buf: [512]u8 = undefined;
         const msg = buildServerHello(
