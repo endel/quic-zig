@@ -379,11 +379,13 @@ pub fn main() !void {
         var proto_header_len: usize = 0;
 
         if (client_protocols.items.len > 0) {
-            // Send comma-separated list of protocols
+            // Send as HTTP Structured Fields list of quoted strings (RFC 8941)
             var fbs = std.io.fixedBufferStream(&proto_header_buf);
             for (client_protocols.items, 0..) |p, idx| {
                 if (idx > 0) fbs.writer().writeAll(", ") catch {};
+                fbs.writer().writeByte('"') catch {};
                 fbs.writer().writeAll(p) catch {};
+                fbs.writer().writeByte('"') catch {};
             }
             proto_header_len = fbs.pos;
         }
@@ -391,7 +393,7 @@ pub fn main() !void {
         const session_id = blk: {
             if (proto_header_len > 0) {
                 const extra = [_]qpack.Header{
-                    .{ .name = "sec-webtransport-protocol", .value = proto_header_buf[0..proto_header_len] },
+                    .{ .name = "wt-available-protocols", .value = proto_header_buf[0..proto_header_len] },
                 };
                 break :blk wt.connectWithHeaders("server4:443", group.endpoint, &extra) catch |err| {
                     std.log.err("failed to connect WT session to {s}: {any}", .{ group.endpoint, err });
@@ -556,8 +558,9 @@ fn pollWtEvents(
                     if (testcase == .handshake) {
                         var negotiated: []const u8 = "";
                         for (sr.headers) |hdr| {
-                            if (mem.eql(u8, hdr.name, "sec-webtransport-protocol")) {
-                                negotiated = hdr.value;
+                            if (mem.eql(u8, hdr.name, "wt-protocol") or mem.eql(u8, hdr.name, "sec-webtransport-protocol")) {
+                                // Strip quotes from HTTP Structured Fields format
+                                negotiated = mem.trim(u8, hdr.value, "\"");
                                 break;
                             }
                         }

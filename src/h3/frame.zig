@@ -56,7 +56,8 @@ pub const SettingsId = enum(u64) {
     qpack_blocked_streams = 0x07,
     enable_connect_protocol = 0x08,
     h3_datagram = 0x33,
-    enable_webtransport = 0x2b603742,
+    enable_webtransport = 0x2b603742, // draft-06 and earlier
+    wt_enabled = 0x2c7cf000, // SETTINGS_WT_ENABLED (current draft)
     webtransport_max_sessions = 0xc671706a,
 
     pub fn fromInt(v: u64) ?SettingsId {
@@ -67,6 +68,7 @@ pub const SettingsId = enum(u64) {
             0x08 => .enable_connect_protocol,
             0x33 => .h3_datagram,
             0x2b603742 => .enable_webtransport,
+            0x2c7cf000 => .wt_enabled,
             0xc671706a => .webtransport_max_sessions,
             else => null,
         };
@@ -186,7 +188,7 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
                         .qpack_blocked_streams => settings.qpack_blocked_streams = value,
                         .enable_connect_protocol => settings.enable_connect_protocol = (value != 0),
                         .h3_datagram => settings.h3_datagram = (value != 0),
-                        .enable_webtransport => settings.enable_webtransport = (value != 0),
+                        .enable_webtransport, .wt_enabled => settings.enable_webtransport = (value != 0),
                         .webtransport_max_sessions => settings.webtransport_max_sessions = value,
                     }
                 }
@@ -289,7 +291,11 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
             }
 
             if (s.enable_webtransport) {
+                // Send both old (draft-06) and new (current draft) setting IDs
+                // for compatibility with all WebTransport implementations
                 try packet.writeVarInt(sw, @intFromEnum(SettingsId.enable_webtransport));
+                try packet.writeVarInt(sw, 1);
+                try packet.writeVarInt(sw, @intFromEnum(SettingsId.wt_enabled));
                 try packet.writeVarInt(sw, 1);
             }
 

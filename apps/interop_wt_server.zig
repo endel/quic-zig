@@ -476,11 +476,12 @@ fn pollWtEvents(
                 // Sub-protocol negotiation: find first client protocol matching server protocols
                 var negotiated: ?[]const u8 = null;
                 for (req.headers) |hdr| {
-                    if (mem.eql(u8, hdr.name, "sec-webtransport-protocol")) {
-                        // Client may send comma-separated or multiple headers
+                    if (mem.eql(u8, hdr.name, "wt-available-protocols") or mem.eql(u8, hdr.name, "sec-webtransport-protocol")) {
+                        // Client sends comma-separated protocols, possibly as HTTP Structured Fields
+                        // (quoted strings like: "proto1", "proto2"). Strip quotes if present.
                         var proto_it = mem.splitScalar(u8, hdr.value, ',');
                         while (proto_it.next()) |client_proto_raw| {
-                            const client_proto = mem.trim(u8, client_proto_raw, " ");
+                            const client_proto = mem.trim(u8, mem.trim(u8, client_proto_raw, " "), "\"");
                             for (server_protocols) |sp| {
                                 if (mem.eql(u8, client_proto, sp)) {
                                     negotiated = sp;
@@ -495,8 +496,14 @@ fn pollWtEvents(
 
                 // Accept with sub-protocol header if negotiated
                 if (negotiated) |proto| {
+                    // Format as HTTP Structured Fields Item (RFC 8941): quoted string
+                    var sfv_buf: [256]u8 = undefined;
+                    sfv_buf[0] = '"';
+                    @memcpy(sfv_buf[1..][0..proto.len], proto);
+                    sfv_buf[1 + proto.len] = '"';
+                    const sfv_value = sfv_buf[0 .. proto.len + 2];
                     const extra = [_]qpack.Header{
-                        .{ .name = "sec-webtransport-protocol", .value = proto },
+                        .{ .name = "wt-protocol", .value = sfv_value },
                     };
                     wt.acceptSessionWithHeaders(req.session_id, &extra) catch |err| {
                         std.log.err("WT accept error: {any}", .{err});
@@ -520,8 +527,9 @@ fn pollWtEvents(
                     };
                     std.log.info("WT session accepted (no sub-protocol)", .{});
 
-                    // For handshake test with no protocol match: still write empty and succeed
+                    // For handshake test with no protocol match: still write empty file and succeed
                     if (testcase == .handshake) {
+                        saveFile("/downloads", "negotiated_protocol.txt", "") catch {};
                         state.session_id = req.session_id;
                         state.session_ready = true;
                         return true;
