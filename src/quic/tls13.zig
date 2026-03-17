@@ -1828,6 +1828,10 @@ pub const Tls13Handshake = struct {
         // Decrypt ticket identity to get PSK
         if (identity_len < 16 + 1) return; // at least tag + 1 byte
         const ciphertext_len = identity_len - 16;
+        const max_ticket_plaintext_len = 64;
+        const max_ticket_identity_len = max_ticket_plaintext_len + 16;
+        if (identity_len > max_ticket_identity_len) return;
+        if (ciphertext_len > max_ticket_plaintext_len) return;
 
         // Reconstruct nonce from ticket (we use the last 4 bytes of identity as hint)
         var ticket_nonce: [12]u8 = .{0} ** 12;
@@ -3102,6 +3106,33 @@ test "loopback PSK resumption: two handshakes with session ticket" {
         &client2.key_schedule.server_app_traffic_secret,
         &server2.key_schedule.server_app_traffic_secret,
     );
+}
+
+test "tryProcessPsk rejects oversized ticket identity before decrypt" {
+    const tp = transport_params.TransportParams{
+        .initial_max_data = 1048576,
+        .initial_max_streams_bidi = 100,
+    };
+
+    const server_config = TlsConfig{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .ticket_key = .{0xA5} ** 16,
+    };
+
+    var handshake = Tls13Handshake.initServer(server_config, tp);
+
+    var psk_ext: [124]u8 = .{0} ** 124;
+    std.mem.writeInt(u16, psk_ext[0..2], 87, .big);
+    std.mem.writeInt(u16, psk_ext[2..4], 81, .big);
+    std.mem.writeInt(u32, psk_ext[85..89], 0, .big);
+    std.mem.writeInt(u16, psk_ext[89..91], 33, .big);
+    psk_ext[91] = 32;
+
+    handshake.tryProcessPsk("", "", 0, &psk_ext, 0, psk_ext.len);
+
+    try std.testing.expect(!handshake.using_psk);
 }
 
 // NewSessionTicket roundtrip test
