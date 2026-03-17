@@ -1119,6 +1119,8 @@ pub const Tls13Handshake = struct {
                         @memcpy(self.leaf_pub_key_buf[0..pub_key.len], pub_key);
                         self.leaf_pub_key_len = @intCast(pub_key.len);
                         self.leaf_pub_key_algo = std.meta.activeTag(parsed.pub_key_algo);
+                    } else {
+                        return error.BadCertificate;
                     }
 
                     // Verify hostname if SNI was set
@@ -1150,10 +1152,9 @@ pub const Tls13Handshake = struct {
 
                 // If this is the last cert, verify against CA bundle
                 if (pos >= cert_list_end) {
-                    if (self.config.ca_bundle) |bundle| {
-                        const now_sec = std.time.timestamp();
-                        bundle.verify(parsed, now_sec) catch return error.BadCertificate;
-                    }
+                    const bundle = self.config.ca_bundle orelse return error.BadCertificate;
+                    const now_sec = std.time.timestamp();
+                    bundle.verify(parsed, now_sec) catch return error.BadCertificate;
                 }
 
                 prev_parsed = parsed;
@@ -1172,7 +1173,9 @@ pub const Tls13Handshake = struct {
 
         if (msg[0] != @intFromEnum(MsgType.certificate_verify)) return error.UnexpectedMessage;
 
-        if (!self.config.skip_cert_verify and self.leaf_pub_key_len > 0) {
+        if (!self.config.skip_cert_verify) {
+            if (self.leaf_pub_key_len == 0) return error.BadCertificateVerify;
+
             // Get transcript hash BEFORE updating with CertificateVerify
             const transcript_hash = self.transcript.current();
 
