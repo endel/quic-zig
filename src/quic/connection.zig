@@ -1353,6 +1353,14 @@ pub const Connection = struct {
                     ql.metricsUpdated(now, rs.min_rtt, rs.smoothed_rtt, rs.latest_rtt, rs.rtt_var, self.cc.sendWindow(), self.pkt_handler.bytes_in_flight);
                 }
 
+                // RFC 9001 §4.1.2: At the client, the handshake is considered confirmed
+                // when it receives an acknowledgment for a 1-RTT packet.
+                if (!self.is_server and !self.handshake_confirmed and enc_level == .application and result.acked.len > 0) {
+                    self.handshake_confirmed = true;
+                    self.dropHandshakeKeys();
+                    std.log.info("handshake confirmed via 1-RTT ACK", .{});
+                }
+
                 // Update pacer
                 self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
             },
@@ -1484,6 +1492,14 @@ pub const Connection = struct {
                 self.peer_ecn_ect0[space_idx] = ack.ecn_ect0;
                 self.peer_ecn_ect1[space_idx] = ack.ecn_ect1;
                 self.peer_ecn_ce[space_idx] = ack.ecn_ce;
+
+                // RFC 9001 §4.1.2: At the client, the handshake is considered confirmed
+                // when it receives an acknowledgment for a 1-RTT packet.
+                if (!self.is_server and !self.handshake_confirmed and enc_level == .application and result.acked.len > 0) {
+                    self.handshake_confirmed = true;
+                    self.dropHandshakeKeys();
+                    std.log.info("handshake confirmed via 1-RTT ACK (ECN)", .{});
+                }
 
                 // Update pacer
                 self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
@@ -3439,6 +3455,9 @@ pub const Connection = struct {
         self.pkt_num_spaces[0].crypto_seal = null;
         self.pkt_num_spaces[1].crypto_open = null;
         self.pkt_num_spaces[1].crypto_seal = null;
+        // Drop Initial and Handshake packet number spaces so PTO won't fire for them
+        self.pkt_handler.dropSpace(.initial);
+        self.pkt_handler.dropSpace(.handshake);
     }
 
     /// Initiate a key update (RFC 9001 §6).
