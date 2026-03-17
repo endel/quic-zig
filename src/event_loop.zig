@@ -1103,21 +1103,21 @@ pub fn Client(comptime Handler: type) type {
             };
 
             // Create QUIC client connection
-            var conn = try connection.connect(
+            // Heap-allocate so pointers remain stable
+            const conn_ptr = try alloc.create(connection.Connection);
+            var conn_initialized = false;
+            errdefer {
+                if (conn_initialized) conn_ptr.deinit();
+                alloc.destroy(conn_ptr);
+            }
+            conn_ptr.* = try connection.connect(
                 alloc,
                 config.server_name,
                 conn_config,
                 built_tls_config.tls_config,
                 null,
             );
-            errdefer conn.deinit();
-            // Heap-allocate so pointers remain stable
-            const conn_ptr = try alloc.create(connection.Connection);
-            errdefer {
-                conn_ptr.deinit();
-                alloc.destroy(conn_ptr);
-            }
-            conn_ptr.* = conn;
+            conn_initialized = true;
 
             // Resolve remote address
             const remote_addr = if (config.ipv6) blk: {
