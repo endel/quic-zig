@@ -81,6 +81,16 @@ pub fn buildSafeFilePath(root_dir: []const u8, request_path: []const u8, clean_p
     return std.fmt.bufPrint(full_path_buf, "{s}/{s}", .{ root_dir, clean_path }) catch error.PathTooLong;
 }
 
+fn copyRequestPath(line: []const u8, out_buf: []u8) !?[]const u8 {
+    if (!mem.startsWith(u8, line, "GET ")) return null;
+
+    const path = line[4..];
+    if (path.len > out_buf.len) return error.PathTooLong;
+
+    @memcpy(out_buf[0..path.len], path);
+    return out_buf[0..path.len];
+}
+
 /// Event returned by poll().
 pub const H0Event = union(enum) {
     /// A complete request was received on a bidi stream (server-side).
@@ -210,6 +220,10 @@ pub const H0Connection = struct {
             const data = stream.recv.read() orelse {
                 // No data available - check if stream is finished
                 if (stream.recv.finished) {
+                    if (self.stream_bufs.getPtr(stream_id)) |buf| {
+                        buf.deinit(self.allocator);
+                        _ = self.stream_bufs.remove(stream_id);
+                    }
                     self.finished_streams.put(stream_id, {}) catch {};
                     return H0Event{ .finished = stream_id };
                 }
@@ -222,6 +236,14 @@ pub const H0Connection = struct {
                 if (!buf_entry.found_existing) {
                     buf_entry.value_ptr.* = .{ .items = &.{}, .capacity = 0 };
                 }
+                if (buf_entry.value_ptr.items.len +| data.len > MAX_REQUEST_LINE) {
+                    std.log.warn("H0: rejecting oversized request line on stream {d}", .{stream_id});
+                    buf_entry.value_ptr.deinit(self.allocator);
+                    _ = self.stream_bufs.remove(stream_id);
+                    self.finished_streams.put(stream_id, {}) catch {};
+                    stream.send.close();
+                    continue;
+                }
                 try buf_entry.value_ptr.appendSlice(self.allocator, data);
 
                 // Check for complete request line
@@ -229,10 +251,10 @@ pub const H0Connection = struct {
                 if (mem.indexOf(u8, buf_data, "\r\n")) |idx| {
                     // Parse "GET /path"
                     const line = buf_data[0..idx];
-                    if (mem.startsWith(u8, line, "GET ")) {
-                        const path = line[4..];
-                        @memcpy(self.path_buf[0..path.len], path);
+                    if (try copyRequestPath(line, &self.path_buf)) |path| {
                         self.path_len = path.len;
+                        buf_entry.value_ptr.deinit(self.allocator);
+                        _ = self.stream_bufs.remove(stream_id);
                         // Mark as finished so subsequent polls skip this stream
                         self.finished_streams.put(stream_id, {}) catch {};
                         return H0Event{ .request = .{
@@ -281,4 +303,18 @@ test "buildSafeFilePath bounds the final path" {
         error.PathTooLong,
         buildSafeFilePath("/www", long_request[0..], &clean_path_buf, &full_path_buf),
     );
+}
+
+test "copyRequestPath extracts GET paths" {
+    var buf: [16]u8 = undefined;
+
+    const path = (try copyRequestPath("GET /file.txt", &buf)).?;
+    try std.testing.expectEqualStrings("/file.txt", path);
+    try std.testing.expect((try copyRequestPath("POST /file.txt", &buf)) == null);
+}
+
+test "copyRequestPath rejects oversized paths before memcpy" {
+    var buf: [4]u8 = undefined;
+
+    try std.testing.expectError(error.PathTooLong, copyRequestPath("GET /abcd", &buf));
 }
