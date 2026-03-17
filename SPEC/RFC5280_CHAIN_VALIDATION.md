@@ -19,6 +19,7 @@
 #### System Root CAs
 - `loadSystemCaBundle()` helper wraps `Certificate.Bundle.rescan()` for OS-native roots
 - Supports macOS (Keychain), Linux (`/etc/ssl/certs/`), Windows (CertStore), FreeBSD, OpenBSD, etc.
+- `event_loop.ClientConfig` now auto-loads the system root store when `skip_cert_verify=false` and no `ca_cert_path` is provided
 
 ### Configuration
 
@@ -39,8 +40,6 @@ const tls_config = TlsConfig{
 - **Extended Key Usage** — `id-kp-serverAuth` not checked on leaf (recommended but not required by TLS 1.3)
 - **Name Constraints** — RFC 5280 §4.2.1.10
 - **Policy Constraints** — RFC 5280 §4.2.1.11
-- **Mandatory ca_bundle enforcement** — When `skip_cert_verify=false` and no `ca_bundle` is provided, the chain's self-signed root is accepted without trust anchor verification
-
 ### Caveats
 
 - `skip_cert_verify` defaults to `true` for backward compatibility
