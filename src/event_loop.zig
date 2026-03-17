@@ -1103,13 +1103,14 @@ pub fn Client(comptime Handler: type) type {
             };
 
             // Create QUIC client connection
-            const conn = try connection.connect(
+            var conn = try connection.connect(
                 alloc,
                 config.server_name,
                 conn_config,
                 built_tls_config.tls_config,
                 null,
             );
+            errdefer conn.deinit();
             // Heap-allocate so pointers remain stable
             const conn_ptr = try alloc.create(connection.Connection);
             errdefer {
