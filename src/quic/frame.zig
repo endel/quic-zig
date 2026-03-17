@@ -730,37 +730,6 @@ pub const Frame = union(FrameType) {
     }
 };
 
-/// Parse multiple frames from a payload buffer. Calls handler for each frame.
-pub fn parseFrames(bytes: []u8, comptime handler: fn (Frame) anyerror!void) !void {
-    var stream = io.fixedBufferStream(bytes);
-    const reader = stream.reader();
-
-    while (stream.pos < bytes.len) {
-        const frame_type = try packet.readVarInt(reader);
-
-        // Skip padding bytes efficiently
-        if (frame_type == 0x00) {
-            while (stream.pos < bytes.len) {
-                if (try reader.readByte() != 0x00) {
-                    stream.pos -= 1;
-                    break;
-                }
-            }
-            continue;
-        }
-
-        // For other frame types, rewind and parse the full frame
-        // (We already consumed the type byte, so we need to reconstruct)
-        // Instead, parse from the remaining bytes including type
-        const frame_start = stream.pos - packet.varIntLength(frame_type);
-        const frame = try Frame.parse(bytes[frame_start..]);
-        try handler(frame);
-
-        // Advance past this frame's data
-        // TODO: track exact frame size for accurate advancement
-    }
-}
-
 /// A pending control frame to be sent in the next outgoing packet.
 /// Uses value types only (no slices) to avoid dangling references.
 pub const PendingControlFrame = union(enum) {

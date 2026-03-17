@@ -58,7 +58,9 @@ pub const CipherSuite = enum(u16) {
     }
 };
 
-// TODO: merge this structure with "packet.Epoch" [??] they're basically the same!
+// Note: similar to packet.Epoch (4 values, maps to packet types) and
+// ack_handler.EncLevel (3 values, maps to PN spaces — no 0-RTT space).
+// Kept separate because the value mappings and cardinalities differ.
 pub const EncryptionLevel = enum(u8) {
     initial = 0,
     early_data,

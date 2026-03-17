@@ -183,9 +183,6 @@ pub const Header = struct {
     /// protection is removed.
     packet_number_len: usize = 0,
 
-    // TODO: version negotiation
-    // versions: ProtocolVersion = undefined,
-
     /// The key phase bit of the packet. It's only meaningful after the header
     /// protection is removed.
     key_phase: bool = false,
