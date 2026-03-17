@@ -321,32 +321,62 @@ pub const LocalCidPool = struct {
 };
 
 /// Fixed-capacity queue for QUIC DATAGRAM frames (RFC 9221).
-/// Stores up to 32 datagrams, each up to MAX_DATAGRAM_SIZE bytes.
 pub const DatagramQueue = struct {
-    pub const MAX_ITEMS: usize = 32;
+    pub const DEFAULT_MAX_ITEMS: usize = 32;
     pub const MAX_DATAGRAM_SIZE: usize = 1200;
 
-    bufs: [MAX_ITEMS][MAX_DATAGRAM_SIZE]u8 = undefined,
-    lens: [MAX_ITEMS]usize = .{0} ** MAX_ITEMS,
+    allocator: ?std.mem.Allocator = null,
+    bufs_static: [DEFAULT_MAX_ITEMS][MAX_DATAGRAM_SIZE]u8 = undefined,
+    lens_static: [DEFAULT_MAX_ITEMS]usize = .{0} ** DEFAULT_MAX_ITEMS,
+    bufs_dynamic: ?[][MAX_DATAGRAM_SIZE]u8 = null,
+    lens_dynamic: ?[]usize = null,
+    max_items: usize = DEFAULT_MAX_ITEMS,
     head: usize = 0,
     tail: usize = 0,
     count: usize = 0,
 
+    /// Resize the queue to a custom capacity (must be called before use).
+    pub fn resize(self: *DatagramQueue, alloc: std.mem.Allocator, capacity: usize) !void {
+        if (capacity <= DEFAULT_MAX_ITEMS) return; // static buffer is enough
+        self.allocator = alloc;
+        self.bufs_dynamic = try alloc.alloc([MAX_DATAGRAM_SIZE]u8, capacity);
+        self.lens_dynamic = try alloc.alloc(usize, capacity);
+        @memset(self.lens_dynamic.?, 0);
+        self.max_items = capacity;
+    }
+
+    pub fn deinitQueue(self: *DatagramQueue) void {
+        if (self.allocator) |alloc| {
+            if (self.bufs_dynamic) |b| alloc.free(b);
+            if (self.lens_dynamic) |l| alloc.free(l);
+        }
+    }
+
+    fn getBuf(self: *DatagramQueue, idx: usize) *[MAX_DATAGRAM_SIZE]u8 {
+        if (self.bufs_dynamic) |b| return &b[idx];
+        return &self.bufs_static[idx];
+    }
+
+    fn getLen(self: *DatagramQueue, idx: usize) *usize {
+        if (self.lens_dynamic) |l| return &l[idx];
+        return &self.lens_static[idx];
+    }
+
     pub fn push(self: *DatagramQueue, data: []const u8) bool {
-        if (self.count >= MAX_ITEMS or data.len > MAX_DATAGRAM_SIZE) return false;
-        @memcpy(self.bufs[self.tail][0..data.len], data);
-        self.lens[self.tail] = data.len;
-        self.tail = (self.tail + 1) % MAX_ITEMS;
+        if (self.count >= self.max_items or data.len > MAX_DATAGRAM_SIZE) return false;
+        @memcpy(self.getBuf(self.tail)[0..data.len], data);
+        self.getLen(self.tail).* = data.len;
+        self.tail = (self.tail + 1) % self.max_items;
         self.count += 1;
         return true;
     }
 
     pub fn pop(self: *DatagramQueue, out: []u8) ?usize {
         if (self.count == 0) return null;
-        const len = self.lens[self.head];
+        const len = self.getLen(self.head).*;
         if (out.len < len) return null;
-        @memcpy(out[0..len], self.bufs[self.head][0..len]);
-        self.head = (self.head + 1) % MAX_ITEMS;
+        @memcpy(out[0..len], self.getBuf(self.head)[0..len]);
+        self.head = (self.head + 1) % self.max_items;
         self.count -= 1;
         return len;
     }
@@ -356,7 +386,7 @@ pub const DatagramQueue = struct {
     }
 
     pub fn isFull(self: *const DatagramQueue) bool {
-        return self.count >= MAX_ITEMS;
+        return self.count >= self.max_items;
     }
 
     pub fn queueLen(self: *const DatagramQueue) usize {
@@ -364,9 +394,9 @@ pub const DatagramQueue = struct {
     }
 
     /// Peek at the length of the next datagram without removing it.
-    pub fn peekLen(self: *const DatagramQueue) ?usize {
+    pub fn peekLen(self: *DatagramQueue) ?usize {
         if (self.count == 0) return null;
-        return self.lens[self.head];
+        return self.getLen(self.head).*;
     }
 };
 
@@ -417,6 +447,9 @@ pub const ConnectionConfig = struct {
     // sent after this duration of silence, clamped to idle_timeout/2 so the
     // connection stays alive without tripping the idle timeout.
     keep_alive_period: u64 = 0,
+    // Datagram queue capacity (per direction). Default 32. Increase for apps
+    // that send/receive large bursts of datagrams (e.g. WebTransport datagram tests).
+    datagram_queue_capacity: usize = DatagramQueue.DEFAULT_MAX_ITEMS,
 };
 
 /// A QUIC connection.
@@ -750,6 +783,12 @@ pub const Connection = struct {
             conn.idle_timeout_ns = @as(i64, @intCast(config.max_idle_timeout)) * 1_000_000;
         }
 
+        // Resize datagram queues if configured larger than default
+        if (config.datagram_queue_capacity > DatagramQueue.DEFAULT_MAX_ITEMS) {
+            try conn.datagram_recv_queue.resize(allocator, config.datagram_queue_capacity);
+            try conn.datagram_send_queue.resize(allocator, config.datagram_queue_capacity);
+        }
+
         return conn;
     }
 
@@ -763,6 +802,8 @@ pub const Connection = struct {
         self.pkt_handler.deinit();
         self.streams.deinit();
         self.crypto_streams.deinit();
+        self.datagram_recv_queue.deinitQueue();
+        self.datagram_send_queue.deinitQueue();
     }
 
     /// Handle a Version Negotiation packet (RFC 9000 §6.2, client only).
@@ -1642,13 +1683,18 @@ pub const Connection = struct {
                 }
                 // RFC 9000 §19.10: MAX_STREAM_DATA for locally-initiated stream not yet created
                 if (stream_mod.isLocal(msd.stream_id, self.is_server)) {
-                    if (self.streams.getStream(msd.stream_id) == null) {
+                    if (self.streams.getStream(msd.stream_id) == null and self.streams.send_streams.get(msd.stream_id) == null) {
                         self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.max_stream_data), "MAX_STREAM_DATA for stream not yet created");
                         return error.ProtocolViolation;
                     }
                 }
+                // Update send window on bidi streams
                 if (self.streams.getStream(msd.stream_id)) |s| {
                     s.send.updateSendWindow(msd.max);
+                }
+                // Update send window on uni send streams
+                if (self.streams.send_streams.get(msd.stream_id)) |s| {
+                    s.updateSendWindow(msd.max);
                 }
             },
 
@@ -1816,8 +1862,7 @@ pub const Connection = struct {
 
             .datagram => |d| {
                 if (self.datagrams_enabled) {
-                    const ok = self.datagram_recv_queue.push(d.data);
-                    std.log.info("DGRAM_RECV: len={d} ok={} q={d}", .{ d.data.len, ok, self.datagram_recv_queue.count });
+                    _ = self.datagram_recv_queue.push(d.data);
                 }
             },
 
@@ -3826,6 +3871,12 @@ pub fn connect(
         try cs.writeData(tp_data);
     }
 
+    // Resize datagram queues if configured larger than default
+    if (config.datagram_queue_capacity > DatagramQueue.DEFAULT_MAX_ITEMS) {
+        try conn.datagram_recv_queue.resize(allocator, config.datagram_queue_capacity);
+        try conn.datagram_send_queue.resize(allocator, config.datagram_queue_capacity);
+    }
+
     return conn;
 }
 
@@ -4059,13 +4110,13 @@ test "DatagramQueue: full queue" {
     var q = DatagramQueue{};
     // Fill the queue (MAX_ITEMS = 32)
     var i: usize = 0;
-    while (i < DatagramQueue.MAX_ITEMS) : (i += 1) {
+    while (i < DatagramQueue.DEFAULT_MAX_ITEMS) : (i += 1) {
         try std.testing.expect(!q.isFull());
         try std.testing.expect(q.push("data"));
     }
     // Queue full — push should fail
     try std.testing.expect(q.isFull());
-    try std.testing.expectEqual(@as(usize, 32), q.queueLen());
+    try std.testing.expectEqual(@as(usize, DatagramQueue.DEFAULT_MAX_ITEMS), q.queueLen());
     try std.testing.expect(!q.push("overflow"));
 }
 
@@ -4303,11 +4354,11 @@ test "Connection: DatagramTooLarge vs DatagramQueueFull" {
 
     // Fill the queue → transient error
     var i: usize = 0;
-    while (i < DatagramQueue.MAX_ITEMS) : (i += 1) {
+    while (i < DatagramQueue.DEFAULT_MAX_ITEMS) : (i += 1) {
         try conn.sendDatagram("x");
     }
     try std.testing.expect(conn.isDatagramSendQueueFull());
-    try std.testing.expectEqual(@as(usize, 32), conn.datagramSendQueueLen());
+    try std.testing.expectEqual(@as(usize, DatagramQueue.DEFAULT_MAX_ITEMS), conn.datagramSendQueueLen());
     try std.testing.expectError(error.DatagramQueueFull, conn.sendDatagram("overflow"));
 }
 

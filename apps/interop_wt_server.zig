@@ -68,6 +68,7 @@ const ConnState = struct {
     // Track completed files count
     files_completed: usize = 0,
     files_expected: usize = 0,
+    dgram_get_offset: usize = 0,
 
     fn init(alloc: std.mem.Allocator) ConnState {
         return .{
@@ -232,6 +233,7 @@ pub fn main() !void {
             .initial_max_stream_data_uni = 4_194_304,
             .initial_max_stream_data_bidi_local = 4_194_304,
             .initial_max_stream_data_bidi_remote = 4_194_304,
+            .datagram_queue_capacity = 256,
         },
         retry_token_key,
         static_reset_key,
@@ -337,6 +339,19 @@ pub fn main() !void {
             // Drip-feed deferred datagram replies
             if (conn_states.get(conn_key)) |state| {
                 sendPendingDgramReplies(alloc, state, conn);
+                // Continue drip-feeding GET requests for datagram-send test
+                if (state.dgram_get_offset < request_paths.items.len and state.session_ready) {
+                    var wt_for_dgram = &(state.wt_conn orelse continue);
+                    var batch: usize = 0;
+                    while (state.dgram_get_offset < request_paths.items.len and batch < 32) : (batch += 1) {
+                        if (conn.isDatagramSendQueueFull()) break;
+                        const filename = extractFilename(request_paths.items[state.dgram_get_offset]);
+                        var get_buf: [1024]u8 = undefined;
+                        const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{filename}) catch break;
+                        wt_for_dgram.sendDatagram(state.session_id.?, get_msg) catch break;
+                        state.dgram_get_offset += 1;
+                    }
+                }
             }
 
             // Burst send
@@ -450,16 +465,18 @@ fn pollWtEvents(
             .transfer_datagram_send => {
                 state.send_requests_initiated = true;
                 state.files_expected = request_paths.len;
+                // Drip-feed GET datagrams to avoid overflowing the send queue
+                var sent: usize = 0;
                 for (request_paths) |path| {
+                    if (wt.isDatagramSendQueueFull()) break;
                     const filename = extractFilename(path);
                     var get_buf: [1024]u8 = undefined;
                     const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{filename}) catch continue;
-                    wt.sendDatagram(state.session_id.?, get_msg) catch |err| {
-                        std.log.err("failed to send GET datagram: {any}", .{err});
-                        continue;
-                    };
+                    wt.sendDatagram(state.session_id.?, get_msg) catch break;
                     std.log.info("sent GET {s} via datagram", .{filename});
+                    sent += 1;
                 }
+                state.dgram_get_offset = sent;
             },
             else => {},
         }
@@ -822,7 +839,7 @@ fn sendPendingDgramReplies(
     var wt = &(state.wt_conn orelse return);
     const session_id = state.session_id orelse return;
 
-    const max_batch: usize = 8;
+    const max_batch: usize = 32;
     var sent: usize = 0;
     while (state.pending_dgram_replies.items.len > 0 and sent < max_batch) {
         if (conn.isDatagramSendQueueFull()) break;

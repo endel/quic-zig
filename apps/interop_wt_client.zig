@@ -137,6 +137,8 @@ const SessionState = struct {
     pending_dgram_replies: std.ArrayList([]const u8),
     files_completed: usize = 0,
     files_expected: usize = 0,
+    // Track drip-feed progress for datagram GET requests
+    dgram_get_offset: usize = 0,
 
     fn init(alloc: std.mem.Allocator, session_id: u64, endpoint: []const u8, files: []const []const u8) SessionState {
         return .{
@@ -265,6 +267,7 @@ pub fn main() !void {
         .initial_max_stream_data_uni = 4_194_304,
         .initial_max_stream_data_bidi_local = 4_194_304,
         .initial_max_stream_data_bidi_remote = 4_194_304,
+        .datagram_queue_capacity = 256,
     }, tls_config, null);
     defer conn.deinit();
 
@@ -451,10 +454,20 @@ pub fn main() !void {
             done = pollWtEvents(alloc, &wt, ss, testcase) or done;
         }
 
-        // Drip-feed deferred datagram replies: queue a few per iteration to avoid
-        // bursting 200 datagrams into the CC window at once.
+        // Drip-feed deferred datagram replies and pending GET requests
         for (session_states.items) |*ss| {
             sendPendingDgramReplies(alloc, &wt, ss, &conn);
+            // Continue drip-feeding GET requests for datagram-receive test
+            if (ss.dgram_get_offset < ss.files.len and ss.session_ready) {
+                var batch: usize = 0;
+                while (ss.dgram_get_offset < ss.files.len and batch < 32) : (batch += 1) {
+                    if (wt.isDatagramSendQueueFull()) break;
+                    var get_buf: [1024]u8 = undefined;
+                    const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{ss.files[ss.dgram_get_offset]}) catch break;
+                    wt.sendDatagram(ss.session_id, get_msg) catch break;
+                    ss.dgram_get_offset += 1;
+                }
+            }
         }
 
         // Burst send
@@ -527,14 +540,20 @@ fn pollWtEvents(
                 }
             },
             .transfer_datagram_receive => {
+                // Drip-feed GET requests to avoid overflowing the datagram queue
+                var sent: usize = 0;
                 for (state.files) |filename| {
+                    if (wt.isDatagramSendQueueFull()) break;
                     var get_buf: [1024]u8 = undefined;
                     const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{filename}) catch continue;
-                    wt.sendDatagram(state.session_id, get_msg) catch |err| {
-                        std.log.err("failed to send GET datagram: {any}", .{err});
-                        continue;
-                    };
-                    std.log.info("sent GET {s} via datagram", .{filename});
+                    wt.sendDatagram(state.session_id, get_msg) catch break;
+                    sent += 1;
+                }
+                // Track how many GETs we've queued so far
+                if (sent < state.files.len) {
+                    state.dgram_get_offset = sent;
+                } else {
+                    state.dgram_get_offset = state.files.len;
                 }
             },
             .transfer => {
@@ -604,9 +623,12 @@ fn pollWtEvents(
             .connect_request => {},
             .session_closed => |sc| {
                 std.log.info("WT session {d} closed (code={d})", .{ sc.session_id, sc.error_code });
+                // In transfer (responder) mode, exit when the peer closes the session
+                if (testcase == .transfer) return true;
             },
             .session_draining => |sd| {
                 std.log.info("WT session {d} draining", .{sd.session_id});
+                if (testcase == .transfer) return true;
             },
         }
     }
@@ -859,7 +881,7 @@ fn sendPendingDgramReplies(
     // Drip-feed datagram replies to avoid bursting all at once.
     // Limit batch size and check QUIC queue depth to let the CC window
     // breathe between iterations.
-    const max_batch: usize = 8;
+    const max_batch: usize = 32;
     var sent: usize = 0;
     while (state.pending_dgram_replies.items.len > 0 and sent < max_batch) {
         // Don't queue more than a few datagrams at a time
