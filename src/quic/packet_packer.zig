@@ -468,6 +468,7 @@ pub const PacketPacker = struct {
             }
 
             // Unidirectional send streams
+            if (streams.send_streams.count() > 0) {
             var uni_it = streams.send_streams.valueIterator();
             while (uni_it.next()) |s_ptr| {
                 const s = s_ptr.*;
@@ -498,6 +499,7 @@ pub const PacketPacker = struct {
                     stream_frame_info_count += 1;
                 }
             }
+            } // send_streams.count() > 0
 
         }
 
@@ -547,10 +549,8 @@ pub const PacketPacker = struct {
         const min_plaintext: usize = 4;
         if (payload_len < min_plaintext) {
             const min_pad = min_plaintext - payload_len;
-            var p: usize = 0;
-            while (p < min_pad) : (p += 1) {
-                try writer.writeByte(0x00); // PADDING frame
-            }
+            @memset(tmp[fbs.pos..][0..min_pad], 0x00);
+            fbs.pos += min_pad;
             payload_len = min_plaintext;
         }
 
@@ -559,11 +559,9 @@ pub const PacketPacker = struct {
         if (pad_target > 0 and (pkt_type == .initial or pkt_type == .zero_rtt or pkt_type == .handshake)) {
             const current_total = fbs.pos - header_start + AEAD_TAG_LEN;
             if (current_total < pad_target) {
-                const pad_needed = pad_target - current_total;
-                var p: usize = 0;
-                while (p < pad_needed) : (p += 1) {
-                    writer.writeByte(0x00) catch break; // PADDING frame (best-effort)
-                }
+                const pad_needed = @min(pad_target - current_total, tmp.len - fbs.pos);
+                @memset(tmp[fbs.pos..][0..pad_needed], 0x00);
+                fbs.pos += pad_needed;
             }
         }
 
@@ -672,10 +670,8 @@ pub const PacketPacker = struct {
         const overhead = payload_start + AEAD_TAG_LEN;
         if (target_size > overhead) {
             const pad_needed = target_size - overhead - (fbs.pos - payload_start);
-            var p: usize = 0;
-            while (p < pad_needed) : (p += 1) {
-                try writer.writeByte(0x00);
-            }
+            @memset(tmp[fbs.pos..][0..pad_needed], 0x00);
+            fbs.pos += pad_needed;
         }
 
         const plaintext_payload = tmp[payload_start..fbs.pos];

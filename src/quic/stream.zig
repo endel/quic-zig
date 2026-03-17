@@ -800,48 +800,44 @@ pub const StreamsMap = struct {
     ///   - Incremental: all of them (round-robin interleaved).
     /// Returns the count of streams written to `out`.
     pub fn getScheduledStreams(self: *StreamsMap, out: *[MAX_SCHEDULABLE]*Stream) usize {
-        // Pass 1: find minimum urgency among streams with data
-        // Include closed_for_gc streams that have retransmit data — PTO probes
-        // must carry the actual stream data, not just PINGs.
+        // Single pass: find min urgency and collect candidate streams simultaneously.
+        // Candidates at non-min urgency are overwritten as we discover lower urgencies.
         var min_urgency: u3 = 7;
-        var has_any = false;
-        var it1 = self.streams.valueIterator();
-        while (it1.next()) |sp| {
-            const s = sp.*;
-            if (s.send.hasData() and (!s.closed_for_gc or s.send.retransmit_count > 0)) {
-                if (s.send.urgency < min_urgency) min_urgency = s.send.urgency;
-                has_any = true;
-            }
-        }
-        if (!has_any) return 0;
-
-        // Pass 2: collect streams at min_urgency
         var count: usize = 0;
         var found_non_incremental = false;
-        var it2 = self.streams.valueIterator();
-        while (it2.next()) |sp| {
+        var it = self.streams.valueIterator();
+        while (it.next()) |sp| {
             const s = sp.*;
-            if (s.send.urgency != min_urgency or !s.send.hasData() or (s.closed_for_gc and s.send.retransmit_count == 0)) continue;
+            if (!s.send.hasData() or (s.closed_for_gc and s.send.retransmit_count == 0)) continue;
+
+            if (s.send.urgency < min_urgency) {
+                // Found lower urgency — reset collection
+                min_urgency = s.send.urgency;
+                count = 0;
+                found_non_incremental = false;
+            }
+
+            if (s.send.urgency != min_urgency) continue;
+
             if (!s.send.incremental) {
                 if (!found_non_incremental) {
-                    if (count >= MAX_SCHEDULABLE) break;
+                    if (count >= MAX_SCHEDULABLE) continue;
                     out[count] = s;
                     count += 1;
                     found_non_incremental = true;
                 }
-                // Skip additional non-incremental streams (sequential rule)
             } else {
-                if (count >= MAX_SCHEDULABLE) break;
+                if (count >= MAX_SCHEDULABLE) continue;
                 out[count] = s;
                 count += 1;
             }
         }
+        if (count == 0) return 0;
 
         // Rotate incremental streams for fairness
         if (count > 1) {
             const rotation = self.rr_index % count;
             if (rotation > 0) {
-                // Simple in-place rotation using a temp buffer
                 var tmp: [MAX_SCHEDULABLE]*Stream = undefined;
                 for (0..count) |i| {
                     tmp[i] = out[(i + rotation) % count];
