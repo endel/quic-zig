@@ -17,7 +17,6 @@ const event_loop = lib.event_loop;
 const connection = lib.connection;
 const quic_crypto = lib.crypto;
 const tls13 = lib.tls13;
-const h0 = lib.h0;
 const qpack = lib.qpack;
 const transport_params = lib.transport_params;
 
@@ -262,11 +261,24 @@ pub fn main() !void {
 }
 
 fn readFileFromWww(alloc: std.mem.Allocator, www_dir: []const u8, path: []const u8) ![]u8 {
-    var clean_path_buf: [4096]u8 = undefined;
-    var full_path_buf: [4096]u8 = undefined;
-    const full_path = try h0.buildSafeFilePath(www_dir, path, &clean_path_buf, &full_path_buf);
+    var clean_path = path;
+    while (clean_path.len > 0 and clean_path[0] == '/') {
+        clean_path = clean_path[1..];
+    }
+    if (clean_path.len == 0) clean_path = "index.html";
 
-    return std.fs.cwd().readFileAlloc(alloc, full_path, 10 * 1024 * 1024);
+    var full_path_buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    @memcpy(full_path_buf[pos..][0..www_dir.len], www_dir);
+    pos += www_dir.len;
+    if (www_dir.len > 0 and www_dir[www_dir.len - 1] != '/') {
+        full_path_buf[pos] = '/';
+        pos += 1;
+    }
+    @memcpy(full_path_buf[pos..][0..clean_path.len], clean_path);
+    pos += clean_path.len;
+
+    return std.fs.cwd().readFileAlloc(alloc, full_path_buf[0..pos], 10 * 1024 * 1024);
 }
 
 fn loadFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
