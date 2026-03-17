@@ -154,6 +154,82 @@ pub fn main() !void {
 }
 ```
 
+### High-level API (event loop client)
+
+The client mirrors the server pattern — define a handler struct, and `Client(Handler)` manages the QUIC handshake, H3/WebTransport setup, and Extended CONNECT automatically:
+
+```zig
+const quic = @import("quic");
+const event_loop = quic.event_loop;
+
+const MyHandler = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+
+    pub fn onSessionReady(_: *MyHandler, session: *event_loop.ClientSession, session_id: u64) void {
+        const stream_id = session.openBidiStream(session_id) catch return;
+        session.sendStreamData(stream_id, "Hello!") catch {};
+        session.closeStream(stream_id);
+
+        session.sendDatagram(session_id, "Hello via datagram!") catch {};
+    }
+
+    pub fn onStreamData(_: *MyHandler, session: *event_loop.ClientSession, stream_id: u64, data: []const u8) void {
+        std.debug.print("Response on stream {d}: {s}\n", .{ stream_id, data });
+        session.closeConnection();
+    }
+
+    pub fn onDatagram(_: *MyHandler, session: *event_loop.ClientSession, session_id: u64, data: []const u8) void {
+        std.debug.print("Datagram: {s}\n", .{data});
+        _ = session_id;
+    }
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+
+    var handler = MyHandler{};
+    var client = try event_loop.Client(MyHandler).init(alloc, &handler, .{
+        .address = "127.0.0.1",
+        .port = 4433,
+        .server_name = "localhost",
+        .ca_cert_path = "ca.crt",
+    });
+    defer client.deinit();
+    try client.run();
+}
+```
+
+`ClientConfig` options:
+
+| Field | Default | Description |
+|---|---|---|
+| `address` | `"127.0.0.1"` | Server IP address |
+| `port` | `4433` | Server port |
+| `server_name` | `"localhost"` | TLS SNI / CONNECT authority |
+| `path` | `"/.well-known/webtransport"` | WebTransport CONNECT path |
+| `ca_cert_path` | `null` | CA certificate for TLS verification |
+| `skip_cert_verify` | `false` | Skip certificate verification (testing only) |
+| `max_datagram_frame_size` | `65536` | QUIC datagram frame size limit |
+| `ipv6` | `false` | Use IPv6 dual-stack socket |
+| `tls_config` | `null` | Override TLS config directly |
+| `conn_config` | `null` | Override QUIC connection config |
+
+Handler callbacks (all optional):
+
+| Callback | Description |
+|---|---|
+| `onConnected(session)` | QUIC handshake complete |
+| `onSessionReady(session, session_id)` | WebTransport session established |
+| `onSessionRejected(session, session_id, status)` | Server rejected CONNECT |
+| `onStreamData(session, stream_id, data[, fin])` | Data received on a stream |
+| `onDatagram(session, session_id, data)` | Datagram received |
+| `onBidiStream(session, session_id, stream_id)` | Incoming bidi stream opened |
+| `onUniStream(session, session_id, stream_id)` | Incoming uni stream opened |
+| `onSessionClosed(session, session_id, error_code, reason)` | Session closed |
+| `onSessionDraining(session, session_id)` | Session draining |
+| `onPollComplete(session)` | Called each poll cycle |
+
 ### Low-level API (direct connection control)
 
 ```zig

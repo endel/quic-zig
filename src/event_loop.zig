@@ -16,6 +16,7 @@ const h3 = @import("h3/connection.zig");
 const h0 = @import("h0/connection.zig");
 const qpack = @import("h3/qpack.zig");
 const wt = @import("webtransport/session.zig");
+const Certificate = std.crypto.Certificate;
 
 pub const Protocol = enum { quic, h3, h0, webtransport };
 
@@ -837,6 +838,631 @@ pub fn Server(comptime Handler: type) type {
             // Convert ns to ms (truncate, don't add extra ms)
             const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
             return if (ms == 0) 1 else ms;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+pub const ClientConfig = struct {
+    // Target server
+    address: []const u8 = "127.0.0.1",
+    port: u16 = 4433,
+    server_name: []const u8 = "localhost",
+
+    // WebTransport session path (auto-CONNECT on handshake complete)
+    path: []const u8 = "/.well-known/webtransport",
+
+    // TLS verification
+    ca_cert_path: ?[]const u8 = null,
+    skip_cert_verify: bool = false,
+
+    // QUIC transport
+    max_datagram_frame_size: u64 = 65536,
+
+    // Advanced overrides
+    tls_config: ?tls13.TlsConfig = null,
+    conn_config: ?connection.ConnectionConfig = null,
+
+    // IPv6
+    ipv6: bool = false,
+};
+
+/// ClientSession wraps a single client-side connection and provides the same
+/// convenience methods as the server-side Session.
+pub const ClientSession = struct {
+    conn: *connection.Connection,
+    h3_conn: ?*h3.H3Connection = null,
+    wt_conn: ?*wt.WebTransportConnection = null,
+
+    // --- WebTransport methods ---
+
+    pub fn sendStreamData(self: *ClientSession, stream_id: u64, data: []const u8) !void {
+        if (self.wt_conn) |wtc| {
+            try wtc.sendStreamData(stream_id, data);
+        }
+    }
+
+    pub fn sendDatagram(self: *ClientSession, session_id: u64, data: []const u8) !void {
+        if (self.wt_conn) |wtc| {
+            try wtc.sendDatagram(session_id, data);
+        }
+    }
+
+    pub fn closeStream(self: *ClientSession, stream_id: u64) void {
+        if (self.wt_conn) |wtc| {
+            wtc.closeStream(stream_id);
+        }
+    }
+
+    pub fn openBidiStream(self: *ClientSession, session_id: u64) !u64 {
+        if (self.wt_conn) |wtc| {
+            return try wtc.openBidiStream(session_id);
+        }
+        return error.NoWtConnection;
+    }
+
+    pub fn openUniStream(self: *ClientSession, session_id: u64) !u64 {
+        if (self.wt_conn) |wtc| {
+            return try wtc.openUniStream(session_id);
+        }
+        return error.NoWtConnection;
+    }
+
+    pub fn closeSession(self: *ClientSession, session_id: u64) void {
+        if (self.wt_conn) |wtc| {
+            wtc.closeSession(session_id);
+        }
+    }
+
+    pub fn closeSessionWithError(self: *ClientSession, session_id: u64, error_code: u32, reason: []const u8) !void {
+        if (self.wt_conn) |wtc| {
+            try wtc.closeSessionWithError(session_id, error_code, reason);
+        }
+    }
+
+    pub fn resetStream(self: *ClientSession, stream_id: u64, error_code: u32) void {
+        if (self.wt_conn) |wtc| {
+            wtc.resetStream(stream_id, error_code);
+        }
+    }
+
+    pub fn drainSession(self: *ClientSession, session_id: u64) !void {
+        if (self.wt_conn) |wtc| {
+            try wtc.drainSession(session_id);
+        }
+    }
+
+    pub fn closeConnection(self: *ClientSession) void {
+        self.conn.close(0, "");
+    }
+
+    pub fn isDatagramSendQueueFull(self: *const ClientSession) bool {
+        if (self.wt_conn) |wtc| {
+            return wtc.isDatagramSendQueueFull();
+        }
+        return true;
+    }
+
+    pub fn maxDatagramPayloadSize(self: *const ClientSession, session_id: u64) ?usize {
+        if (self.wt_conn) |wtc| {
+            return wtc.maxDatagramPayloadSize(session_id);
+        }
+        return null;
+    }
+
+    pub fn sendKeepAlive(self: *ClientSession) void {
+        self.conn.sendKeepAlive();
+    }
+};
+
+pub fn Client(comptime Handler: type) type {
+    comptime {
+        if (!@hasDecl(Handler, "protocol")) {
+            @compileError("Handler must declare 'pub const protocol: event_loop.Protocol'");
+        }
+
+        const known = [_][]const u8{
+            "onConnected",        "onSessionReady",    "onSessionRejected",
+            "onStreamData",       "onDatagram",        "onSessionClosed",
+            "onSessionDraining",  "onBidiStream",      "onUniStream",
+            "onPollComplete",
+        };
+
+        for (@typeInfo(Handler).@"struct".decls) |decl| {
+            if (decl.name.len >= 2 and decl.name[0] == 'o' and decl.name[1] == 'n') {
+                var found = false;
+                for (known) |k| {
+                    if (std.mem.eql(u8, decl.name, k)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    @compileError("Handler has unrecognized callback '" ++ decl.name ++
+                        "'. Known client callbacks: onConnected, onSessionReady, onSessionRejected, " ++
+                        "onStreamData, onDatagram, onSessionClosed, onSessionDraining, " ++
+                        "onBidiStream, onUniStream, onPollComplete");
+                }
+            }
+        }
+
+        if (@hasDecl(Handler, "onStreamData")) {
+            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params;
+            if (params.len != 4 and params.len != 5) {
+                @compileError("onStreamData must have 4 params (self, session, stream_id, data) " ++
+                    "or 5 params (self, session, stream_id, data, fin)");
+            }
+        }
+    }
+
+    return struct {
+        const Self = @This();
+
+        allocator: std.mem.Allocator,
+        handler: *Handler,
+
+        // libxev
+        loop: xev.Loop,
+        file: xev.File,
+        timer: xev.Timer,
+        poll_completion: xev.Completion,
+        timer_completion: xev.Completion,
+        timer_cancel_completion: xev.Completion,
+        timer_armed: bool,
+        started: bool,
+        stopping: bool,
+
+        // I/O
+        sockfd: posix.socket_t,
+        local_addr: posix.sockaddr.storage,
+        batch: ecn_socket.SendBatch,
+        recv_buf: [8192]u8,
+        out_buf: [1500]u8,
+
+        // Single QUIC connection
+        conn: *connection.Connection,
+        remote_addr: posix.sockaddr.storage,
+
+        // Protocol layers (initialized after handshake)
+        h3_conn: ?h3.H3Connection,
+        wt_conn: ?wt.WebTransportConnection,
+        protocol_initialized: bool,
+        session_id: ?u64,
+
+        // Config retained for protocol init
+        server_name: []const u8,
+        path: []const u8,
+
+        pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: ClientConfig) !Self {
+            // Build TLS config
+            const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
+                const alpn = try alloc.alloc([]const u8, 1);
+                alpn[0] = "h3";
+
+                var ca_bundle: ?*Certificate.Bundle = null;
+                if (config.ca_cert_path) |ca_path| {
+                    const bundle_ptr = try alloc.create(Certificate.Bundle);
+                    bundle_ptr.* = .{};
+                    try bundle_ptr.addCertsFromFilePath(alloc, std.fs.cwd(), ca_path);
+                    ca_bundle = bundle_ptr;
+                }
+
+                break :blk .{
+                    .cert_chain_der = &.{},
+                    .private_key_bytes = &.{},
+                    .alpn = alpn,
+                    .server_name = config.server_name,
+                    .skip_cert_verify = config.skip_cert_verify,
+                    .ca_bundle = ca_bundle,
+                };
+            };
+
+            // Connection config
+            const conn_config: connection.ConnectionConfig = if (config.conn_config) |cc| cc else cc_blk: {
+                var cc: connection.ConnectionConfig = .{};
+                if (Handler.protocol == .webtransport or Handler.protocol == .quic) {
+                    cc.max_datagram_frame_size = config.max_datagram_frame_size;
+                }
+                break :cc_blk cc;
+            };
+
+            // Create QUIC client connection
+            const conn = try connection.connect(
+                alloc,
+                config.server_name,
+                conn_config,
+                tls_config,
+                null,
+            );
+            // Heap-allocate so pointers remain stable
+            const conn_ptr = try alloc.create(connection.Connection);
+            conn_ptr.* = conn;
+
+            // Resolve remote address
+            const remote_addr = if (config.ipv6) blk: {
+                const addr6 = try std.net.Address.parseIp6(config.address, config.port);
+                break :blk connection.sockaddrToStorage(&addr6.any);
+            } else blk: {
+                const addr4 = try std.net.Address.parseIp4(config.address, config.port);
+                break :blk connection.sockaddrToStorage(&addr4.any);
+            };
+
+            // Create non-blocking UDP socket, bind to ephemeral port
+            const sockfd, const local_addr = if (config.ipv6) blk: {
+                const addr6 = try std.net.Address.parseIp6("::", 0);
+                const fd = try posix.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+                errdefer posix.close(fd);
+                const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
+                const zero_val: c_int = 0;
+                posix.setsockopt(fd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero_val)) catch {};
+                try posix.bind(fd, &addr6.any, addr6.getOsSockLen());
+                break :blk .{ fd, addr6 };
+            } else blk: {
+                const addr4 = try std.net.Address.parseIp4("0.0.0.0", 0);
+                const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+                errdefer posix.close(fd);
+                try posix.bind(fd, &addr4.any, addr4.getOsSockLen());
+                break :blk .{ fd, addr4 };
+            };
+            ecn_socket.enableEcnRecv(sockfd) catch {};
+
+            // Init libxev
+            const loop = try xev.Loop.init(.{});
+            const file_handle = xev.File.initFd(sockfd);
+            const timer_handle = try xev.Timer.init();
+
+            return .{
+                .allocator = alloc,
+                .handler = handler,
+                .loop = loop,
+                .file = file_handle,
+                .timer = timer_handle,
+                .poll_completion = .{},
+                .timer_completion = .{},
+                .timer_cancel_completion = .{},
+                .timer_armed = false,
+                .started = false,
+                .stopping = false,
+                .sockfd = sockfd,
+                .local_addr = connection.sockaddrToStorage(&local_addr.any),
+                .batch = ecn_socket.SendBatch.init(sockfd),
+                .recv_buf = undefined,
+                .out_buf = undefined,
+                .conn = conn_ptr,
+                .remote_addr = remote_addr,
+                .h3_conn = null,
+                .wt_conn = null,
+                .protocol_initialized = false,
+                .session_id = null,
+                .server_name = config.server_name,
+                .path = config.path,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.wt_conn) |*wtc| wtc.deinit();
+            if (self.h3_conn) |*h3c| h3c.deinit();
+            self.timer.deinit();
+            self.loop.deinit();
+            posix.close(self.sockfd);
+            self.conn.deinit();
+            self.allocator.destroy(self.conn);
+        }
+
+        pub fn start(self: *Self) void {
+            self.file.poll(&self.loop, &self.poll_completion, .read, Self, self, onReadable);
+            self.timer.run(&self.loop, &self.timer_completion, 1, Self, self, onTimer);
+            self.timer_armed = true;
+            self.started = true;
+        }
+
+        pub fn run(self: *Self) !void {
+            self.start();
+            try self.loop.run(.until_done);
+        }
+
+        pub fn tick(self: *Self) !void {
+            if (!self.started) self.start();
+            try self.loop.run(.no_wait);
+        }
+
+        pub fn flush(self: *Self) void {
+            const conn = self.conn;
+            if (conn.isClosed()) return;
+            const send_addr: *const posix.sockaddr.storage = if (conn.isEstablished())
+                conn.peerAddress()
+            else
+                &self.remote_addr;
+            var send_count: usize = 0;
+            while (send_count < 1000) : (send_count += 1) {
+                const bytes_written = conn.send(&self.out_buf) catch break;
+                if (bytes_written == 0) break;
+                self.batch.add(
+                    self.out_buf[0..bytes_written],
+                    @ptrCast(send_addr),
+                    connection.sockaddrLen(send_addr),
+                    conn.getEcnMark(),
+                );
+            }
+            self.batch.flush();
+            self.rescheduleTimer();
+        }
+
+        pub fn stop(self: *Self) void {
+            self.stopping = true;
+            const conn = self.conn;
+            if (!conn.isClosed() and conn.state != .closing and conn.state != .draining) {
+                conn.close(0, "client shutdown");
+            }
+        }
+
+        // ---- Internal callbacks ----
+
+        fn onReadable(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.File,
+            r: xev.PollError!xev.PollEvent,
+        ) xev.CallbackAction {
+            _ = r catch return .rearm;
+            const self = self_opt orelse return .disarm;
+
+            self.recvAllPackets();
+            self.processConnection();
+            self.tickAndSend();
+
+            if (self.stopping and self.conn.isClosed()) {
+                self.loop.stop();
+                return .disarm;
+            }
+
+            self.rescheduleTimer();
+            return .rearm;
+        }
+
+        fn onTimer(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            r: xev.Timer.RunError!void,
+        ) xev.CallbackAction {
+            _ = r catch return .disarm;
+            const self = self_opt orelse return .disarm;
+            self.timer_armed = false;
+
+            self.processConnection();
+            self.tickAndSend();
+
+            if (self.stopping and self.conn.isClosed()) {
+                self.loop.stop();
+                return .disarm;
+            }
+
+            self.rescheduleTimer();
+            return .disarm;
+        }
+
+        fn recvAllPackets(self: *Self) void {
+            while (true) {
+                const recv_result = ecn_socket.recvmsgEcn(self.sockfd, &self.recv_buf) catch |err| {
+                    if (err == error.WouldBlock) break;
+                    break;
+                };
+
+                // Update remote addr (may change due to preferred address migration)
+                self.remote_addr = recv_result.from_addr;
+
+                self.conn.handleDatagram(self.recv_buf[0..recv_result.bytes_read], .{
+                    .to = self.local_addr,
+                    .from = recv_result.from_addr,
+                    .ecn = recv_result.ecn,
+                    .datagram_size = recv_result.bytes_read,
+                });
+
+                // Send one response packet immediately (e.g. ACKs during handshake)
+                const bytes_written = self.conn.send(&self.out_buf) catch continue;
+                if (bytes_written > 0) {
+                    self.batch.add(
+                        self.out_buf[0..bytes_written],
+                        @ptrCast(&self.remote_addr),
+                        connection.sockaddrLen(&self.remote_addr),
+                        self.conn.getEcnMark(),
+                    );
+                }
+            }
+            self.batch.flush();
+        }
+
+        fn processConnection(self: *Self) void {
+            const conn = self.conn;
+
+            // Initialize protocol layer once handshake completes
+            if (conn.isEstablished() and !self.protocol_initialized) {
+                self.initProtocol();
+
+                if (@hasDecl(Handler, "onConnected")) {
+                    var session = self.makeSession();
+                    self.handler.onConnected(&session);
+                }
+            }
+
+            // Poll events and dispatch to handler
+            switch (Handler.protocol) {
+                .webtransport => self.pollWtEvents(),
+                else => {},
+            }
+        }
+
+        fn initProtocol(self: *Self) void {
+            switch (Handler.protocol) {
+                .webtransport => {
+                    self.h3_conn = h3.H3Connection.init(self.allocator, self.conn, false);
+                    self.h3_conn.?.local_settings = .{
+                        .enable_connect_protocol = true,
+                        .h3_datagram = true,
+                        .enable_webtransport = true,
+                        .webtransport_max_sessions = 1,
+                    };
+                    self.h3_conn.?.initConnection() catch return;
+
+                    self.wt_conn = wt.WebTransportConnection.init(
+                        self.allocator,
+                        &self.h3_conn.?,
+                        self.conn,
+                        false,
+                    );
+
+                    // Send Extended CONNECT to establish WebTransport session
+                    const session_id = self.wt_conn.?.connect(
+                        self.server_name,
+                        self.path,
+                    ) catch return;
+                    self.session_id = session_id;
+                },
+                else => {},
+            }
+            self.protocol_initialized = true;
+        }
+
+        fn pollWtEvents(self: *Self) void {
+            if (self.wt_conn == null) return;
+            var wtc = &self.wt_conn.?;
+            var session = self.makeSession();
+
+            if (@hasDecl(Handler, "onPollComplete")) {
+                self.handler.onPollComplete(&session);
+            }
+
+            while (true) {
+                const event = wtc.poll() catch break;
+                if (event == null) break;
+
+                switch (event.?) {
+                    .session_ready => |sr| {
+                        if (@hasDecl(Handler, "onSessionReady")) {
+                            self.handler.onSessionReady(&session, sr.session_id);
+                        }
+                    },
+                    .session_rejected => |rej| {
+                        if (@hasDecl(Handler, "onSessionRejected")) {
+                            self.handler.onSessionRejected(&session, rej.session_id, rej.status);
+                        }
+                    },
+                    .stream_data => |sd| {
+                        if (@hasDecl(Handler, "onStreamData")) {
+                            if (@typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params.len == 5) {
+                                self.handler.onStreamData(&session, sd.stream_id, sd.data, sd.fin);
+                            } else {
+                                self.handler.onStreamData(&session, sd.stream_id, sd.data);
+                            }
+                        }
+                    },
+                    .datagram => |dg| {
+                        if (@hasDecl(Handler, "onDatagram")) {
+                            self.handler.onDatagram(&session, dg.session_id, dg.data);
+                        }
+                        if (dg.data.len > 0) self.allocator.free(dg.data);
+                    },
+                    .session_closed => |cls| {
+                        if (@hasDecl(Handler, "onSessionClosed")) {
+                            self.handler.onSessionClosed(&session, cls.session_id, cls.error_code, cls.reason);
+                        }
+                    },
+                    .session_draining => |drain| {
+                        if (@hasDecl(Handler, "onSessionDraining")) {
+                            self.handler.onSessionDraining(&session, drain.session_id);
+                        }
+                    },
+                    .bidi_stream => |bs| {
+                        if (@hasDecl(Handler, "onBidiStream")) {
+                            self.handler.onBidiStream(&session, bs.session_id, bs.stream_id);
+                        }
+                    },
+                    .uni_stream => |us| {
+                        if (@hasDecl(Handler, "onUniStream")) {
+                            self.handler.onUniStream(&session, us.session_id, us.stream_id);
+                        }
+                    },
+                    .connect_request => {},
+                }
+            }
+        }
+
+        fn tickAndSend(self: *Self) void {
+            const conn = self.conn;
+            conn.onTimeout() catch {};
+
+            if (conn.isClosed()) {
+                if (self.stopping) self.loop.stop();
+                return;
+            }
+
+            // Use remote_addr for pre-handshake, peer address after connection established
+            const send_addr: *const posix.sockaddr.storage = if (conn.isEstablished())
+                conn.peerAddress()
+            else
+                &self.remote_addr;
+
+            const max_burst_packets = 1000;
+            var send_count: usize = 0;
+            while (send_count < max_burst_packets) : (send_count += 1) {
+                const bytes_written = conn.send(&self.out_buf) catch break;
+                if (bytes_written == 0) break;
+                self.batch.add(
+                    self.out_buf[0..bytes_written],
+                    @ptrCast(send_addr),
+                    connection.sockaddrLen(send_addr),
+                    conn.getEcnMark(),
+                );
+            }
+            self.batch.flush();
+        }
+
+        fn rescheduleTimer(self: *Self) void {
+            const next_ms = self.computeNextTimeoutMs() orelse return;
+
+            if (self.timer_armed) {
+                self.timer.reset(
+                    &self.loop,
+                    &self.timer_completion,
+                    &self.timer_cancel_completion,
+                    next_ms,
+                    Self,
+                    self,
+                    onTimer,
+                );
+            } else {
+                self.timer.run(
+                    &self.loop,
+                    &self.timer_completion,
+                    next_ms,
+                    Self,
+                    self,
+                    onTimer,
+                );
+            }
+            self.timer_armed = true;
+        }
+
+        fn computeNextTimeoutMs(self: *Self) ?u64 {
+            const deadline = self.conn.nextTimeoutNs() orelse return null;
+            const now: i64 = @intCast(std.time.nanoTimestamp());
+            const delta_ns = deadline - now;
+            if (delta_ns <= 0) return 1;
+            const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
+            return if (ms == 0) 1 else ms;
+        }
+
+        fn makeSession(self: *Self) ClientSession {
+            return .{
+                .conn = self.conn,
+                .h3_conn = if (self.h3_conn != null) &self.h3_conn.? else null,
+                .wt_conn = if (self.wt_conn != null) &self.wt_conn.? else null,
+            };
         }
     };
 }
