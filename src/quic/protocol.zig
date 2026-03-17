@@ -31,3 +31,25 @@ pub fn quicLabel(version: u32, comptime base: enum { key, iv, hp, ku }) []const 
         .ku => "quic ku",
     };
 }
+
+const testing = @import("std").testing;
+
+test "isSupportedVersion" {
+    try testing.expect(isSupportedVersion(QUIC_V1));
+    try testing.expect(isSupportedVersion(QUIC_V2));
+    try testing.expect(!isSupportedVersion(0xdeadbeef));
+    try testing.expect(!isSupportedVersion(0));
+}
+
+test "isV2" {
+    try testing.expect(!isV2(QUIC_V1));
+    try testing.expect(isV2(QUIC_V2));
+}
+
+test "quicLabel: v1 vs v2" {
+    try testing.expectEqualStrings("quic key", quicLabel(QUIC_V1, .key));
+    try testing.expectEqualStrings("quicv2 key", quicLabel(QUIC_V2, .key));
+    try testing.expectEqualStrings("quic iv", quicLabel(QUIC_V1, .iv));
+    try testing.expectEqualStrings("quicv2 hp", quicLabel(QUIC_V2, .hp));
+    try testing.expectEqualStrings("quic ku", quicLabel(QUIC_V1, .ku));
+}

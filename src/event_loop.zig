@@ -1479,3 +1479,137 @@ pub fn Client(comptime Handler: type) type {
         }
     };
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const crypto = std.crypto;
+const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
+
+fn makeTestTlsConfig() tls13.TlsConfig {
+    const server_key_pair = EcdsaP256Sha256.KeyPair.generate();
+    const S = struct {
+        var secret_key_bytes: [32]u8 = undefined;
+        var pub_key_bytes: [65]u8 = undefined;
+        var cert_chain: [1][]const u8 = undefined;
+        var alpn: [1][]const u8 = undefined;
+        var ticket_key: [16]u8 = undefined;
+    };
+    S.secret_key_bytes = server_key_pair.secret_key.toBytes();
+    S.pub_key_bytes = server_key_pair.public_key.toUncompressedSec1();
+    S.cert_chain = .{&S.pub_key_bytes};
+    S.alpn = .{"h3"};
+    crypto.random.bytes(&S.ticket_key);
+    return .{
+        .cert_chain_der = &S.cert_chain,
+        .private_key_bytes = &S.secret_key_bytes,
+        .alpn = &S.alpn,
+        .ticket_key = S.ticket_key,
+    };
+}
+
+// Handler with compile-time validation
+const TestWtHandler = struct {
+    pub const protocol: Protocol = .webtransport;
+    session_ready_count: u32 = 0,
+    stream_data_count: u32 = 0,
+    connect_request_count: u32 = 0,
+
+    pub fn onConnectRequest(self: *TestWtHandler, session: *Session, session_id: u64, _: []const u8) void {
+        self.connect_request_count += 1;
+        session.acceptSession(session_id) catch {};
+    }
+    pub fn onSessionReady(self: *TestWtHandler, _: *Session, _: u64) void {
+        self.session_ready_count += 1;
+    }
+    pub fn onStreamData(self: *TestWtHandler, session: *Session, stream_id: u64, data: []const u8) void {
+        self.stream_data_count += 1;
+        // Echo back
+        session.sendStreamData(stream_id, data) catch {};
+        session.closeStream(stream_id);
+    }
+    pub fn onDatagram(_: *TestWtHandler, _: *Session, _: u64, _: []const u8) void {}
+    pub fn onSessionClosed(_: *TestWtHandler, _: *Session, _: u64, _: u32, _: []const u8) void {}
+};
+
+const TestH3Handler = struct {
+    pub const protocol: Protocol = .h3;
+    request_count: u32 = 0,
+
+    pub fn onRequest(self: *TestH3Handler, session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        self.request_count += 1;
+        const resp = [_]qpack.Header{.{ .name = ":status", .value = "200" }};
+        session.sendResponse(stream_id, &resp, "OK") catch {};
+    }
+};
+
+// Compile-time handler validation: unrecognized callback should fail
+// (can't test compile errors in Zig tests, but we verify valid handlers compile)
+test "Server: handler validation compiles for valid handlers" {
+    // These should compile without error
+    _ = Server(TestWtHandler);
+    _ = Server(TestH3Handler);
+}
+
+test "Client: handler validation compiles for valid handlers" {
+    const TestClientHandler = struct {
+        pub const protocol: Protocol = .webtransport;
+        pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+        pub fn onDatagram(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+    };
+    _ = Client(TestClientHandler);
+}
+
+test "Server: init and deinit with in-memory TLS config" {
+    const tls_config = makeTestTlsConfig();
+    var handler = TestH3Handler{};
+    var server = try Server(TestH3Handler).init(testing.allocator, &handler, .{
+        .port = 0, // ephemeral port
+        .tls_config = tls_config,
+    });
+    defer server.deinit();
+
+    // Server should be in initial state
+    try testing.expect(!server.started);
+    try testing.expect(!server.stopping);
+}
+
+test "Client: init and deinit with in-memory TLS config" {
+    var handler = struct {
+        pub const protocol: Protocol = .webtransport;
+        pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19876,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try testing.expect(!client.started);
+    try testing.expect(!client.stopping);
+    try testing.expect(!client.protocol_initialized);
+    try testing.expect(client.session_id == null);
+}
+
+test "Server: start, tick, stop lifecycle" {
+    const tls_config = makeTestTlsConfig();
+    var handler = TestH3Handler{};
+    var server = try Server(TestH3Handler).init(testing.allocator, &handler, .{
+        .port = 0,
+        .tls_config = tls_config,
+    });
+    defer server.deinit();
+
+    // tick() should auto-start
+    try server.tick();
+    try testing.expect(server.started);
+
+    // stop() should set stopping flag
+    server.stop();
+    try testing.expect(server.stopping);
+
+    // tick after stop with no connections should be fine
+    try server.tick();
+}
