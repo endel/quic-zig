@@ -1827,23 +1827,21 @@ pub const Tls13Handshake = struct {
 
         // Decrypt ticket identity to get PSK
         if (identity_len < 16 + 1) return; // at least tag + 1 byte
+        var decrypted: [64]u8 = undefined;
+        var ct_copy: [decrypted.len + 16]u8 = undefined;
+        if (identity_len > ct_copy.len) return;
         const ciphertext_len = identity_len - 16;
-        const max_ticket_plaintext_len = 64;
-        const max_ticket_identity_len = max_ticket_plaintext_len + 16;
-        if (identity_len > max_ticket_identity_len) return;
-        if (ciphertext_len > max_ticket_plaintext_len) return;
+        if (ciphertext_len > decrypted.len) return;
 
         // Reconstruct nonce from ticket (we use the last 4 bytes of identity as hint)
         var ticket_nonce: [12]u8 = .{0} ** 12;
         // Use zeros as nonce — server encrypts with incrementing nonce_buf in [8..12]
         // We need to try nonce counter values. For simplicity, try a few.
-        var decrypted: [64]u8 = undefined;
         var psk_found = false;
         var found_psk: [32]u8 = undefined;
 
         for (0..256) |nonce_try| {
             std.mem.writeInt(u32, ticket_nonce[8..12], @intCast(nonce_try), .big);
-            var ct_copy: [80]u8 = undefined;
             @memcpy(ct_copy[0..identity_len], identity[0..identity_len]);
             const tag_start = ciphertext_len;
             const tag: [16]u8 = ct_copy[tag_start..][0..16].*;
