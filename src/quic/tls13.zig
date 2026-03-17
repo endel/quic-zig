@@ -53,8 +53,11 @@ const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
 const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
 const SIG_RSA_PSS_RSAE_SHA512: u16 = 0x0806;
 
-// Named group: x25519
+// Named groups
+const GROUP_SECP256R1: u16 = 0x0017;
 const GROUP_X25519: u16 = 0x001d;
+
+const P256 = crypto.ecc.P256;
 
 // TLS 1.3 version
 const TLS13_VERSION: u16 = 0x0304;
@@ -627,6 +630,12 @@ pub const Tls13Handshake = struct {
     x25519_public: [32]u8 = undefined,
     peer_x25519_public: [32]u8 = undefined,
 
+    // P-256 key exchange
+    p256_secret: [32]u8 = undefined,
+    p256_public: [65]u8 = undefined, // our uncompressed public point
+    peer_p256_public: [65]u8 = undefined, // peer's uncompressed public point
+    negotiated_group: u16 = GROUP_X25519,
+
     // Output buffer for built messages (32KB for large cert chains, e.g. 9-cert amplificationlimit test)
     out_buf: [32768]u8 = undefined,
     out_len: usize = 0,
@@ -719,6 +728,14 @@ pub const Tls13Handshake = struct {
             break :blk X25519.recoverPublicKey(self.x25519_secret) catch unreachable;
         };
 
+        // Generate P-256 key pair (offered alongside X25519 in ClientHello)
+        crypto.random.bytes(&self.p256_secret);
+        self.p256_public = (P256.basePoint.mulPublic(self.p256_secret, .big) catch blk: {
+            crypto.random.bytes(&self.p256_secret);
+            break :blk P256.basePoint.mulPublic(self.p256_secret, .big) catch unreachable;
+        }).toUncompressedSec1();
+        self.negotiated_group = GROUP_X25519;
+
         return self;
     }
 
@@ -762,6 +779,7 @@ pub const Tls13Handshake = struct {
             crypto.random.bytes(&self.x25519_secret);
             break :blk X25519.recoverPublicKey(self.x25519_secret) catch unreachable;
         };
+        self.negotiated_group = GROUP_X25519;
 
         return self;
     }
@@ -897,6 +915,7 @@ pub const Tls13Handshake = struct {
             &buf,
             &self.client_random,
             &self.x25519_public,
+            &self.p256_public,
             self.config.alpn,
             self.config.server_name,
             self.tp_encoded[0..self.tp_encoded_len],
@@ -976,14 +995,21 @@ pub const Tls13Handshake = struct {
             ext_pos += 2;
 
             if (etype == @intFromEnum(ExtType.key_share)) {
-                // key_share: named_group(2) + key_exchange_length(2) + key_exchange(32)
-                if (elen < 36) return error.DecodeError;
+                // key_share: named_group(2) + key_exchange_length(2) + key_exchange(...)
+                if (elen < 4) return error.DecodeError;
                 const group = readU16(ext_data[ext_pos..]);
-                if (group != GROUP_X25519) return error.NoKeyShare;
                 const kelen = readU16(ext_data[ext_pos + 2 ..]);
-                if (kelen != 32) return error.NoKeyShare;
-                @memcpy(&self.peer_x25519_public, ext_data[ext_pos + 4 ..][0..32]);
-                found_key_share = true;
+                if (group == GROUP_X25519 and kelen == 32 and ext_pos + 4 + 32 <= ext_data.len) {
+                    @memcpy(&self.peer_x25519_public, ext_data[ext_pos + 4 ..][0..32]);
+                    self.negotiated_group = GROUP_X25519;
+                    found_key_share = true;
+                } else if (group == GROUP_SECP256R1 and kelen == 65 and ext_pos + 4 + 65 <= ext_data.len) {
+                    @memcpy(&self.peer_p256_public, ext_data[ext_pos + 4 ..][0..65]);
+                    self.negotiated_group = GROUP_SECP256R1;
+                    found_key_share = true;
+                } else {
+                    return error.NoKeyShare;
+                }
             } else if (etype == @intFromEnum(ExtType.pre_shared_key)) {
                 // Server accepted PSK: selected_identity(2) = 0x0000
                 if (elen >= 2) {
@@ -1001,8 +1027,16 @@ pub const Tls13Handshake = struct {
         // Update transcript with ServerHello
         self.transcript.update(msg);
 
-        // Compute shared secret
-        const shared_secret = X25519.scalarmult(self.x25519_secret, self.peer_x25519_public) catch return error.KeyScheduleError;
+        // Compute shared secret based on negotiated group
+        var shared_secret: [32]u8 = undefined;
+        if (self.negotiated_group == GROUP_SECP256R1) {
+            const peer_point = P256.fromSec1(self.peer_p256_public[0..65]) catch return error.KeyScheduleError;
+            const shared_point = peer_point.mulPublic(self.p256_secret, .big) catch return error.KeyScheduleError;
+            const shared_uncompressed = shared_point.toUncompressedSec1();
+            @memcpy(&shared_secret, shared_uncompressed[1..33]);
+        } else {
+            shared_secret = X25519.scalarmult(self.x25519_secret, self.peer_x25519_public) catch return error.KeyScheduleError;
+        }
 
         // Derive handshake secrets
         const transcript_hash = self.transcript.current();
@@ -1317,8 +1351,10 @@ pub const Tls13Handshake = struct {
             if (ext_pos + elen > ext_data.len) break;
 
             if (etype == @intFromEnum(ExtType.key_share)) {
-                // client_shares_len(2) + [named_group(2) + key_len(2) + key(32)]
+                // client_shares_len(2) + [named_group(2) + key_len(2) + key(...)]
+                // Prefer X25519, fall back to secp256r1 (P-256)
                 if (elen >= 2) {
+                    var found_p256 = false;
                     var share_pos: usize = 2; // skip client_shares_len
                     while (share_pos + 4 <= elen) {
                         const group = readU16(ext_data[ext_pos + share_pos ..]);
@@ -1326,10 +1362,19 @@ pub const Tls13Handshake = struct {
                         share_pos += 4;
                         if (group == GROUP_X25519 and kelen == 32 and share_pos + 32 <= elen) {
                             @memcpy(&self.peer_x25519_public, ext_data[ext_pos + share_pos ..][0..32]);
+                            self.negotiated_group = GROUP_X25519;
                             found_key_share = true;
                             break;
+                        } else if (group == GROUP_SECP256R1 and kelen == 65 and share_pos + 65 <= elen) {
+                            @memcpy(&self.peer_p256_public, ext_data[ext_pos + share_pos ..][0..65]);
+                            found_p256 = true;
                         }
                         share_pos += kelen;
+                    }
+                    // Use P-256 if X25519 not found
+                    if (!found_key_share and found_p256) {
+                        self.negotiated_group = GROUP_SECP256R1;
+                        found_key_share = true;
                     }
                 }
             } else if (etype == @intFromEnum(ExtType.quic_transport_parameters)) {
@@ -1430,11 +1475,26 @@ pub const Tls13Handshake = struct {
     fn serverBuildServerHello(self: *Tls13Handshake) !Action {
         crypto.random.bytes(&self.server_random);
 
+        // Prepare key share based on negotiated group
+        var ks_data_buf: [65]u8 = undefined;
+        var ks_data: []const u8 = undefined;
+        if (self.negotiated_group == GROUP_SECP256R1) {
+            // Generate P-256 ephemeral key pair
+            crypto.random.bytes(&self.p256_secret);
+            self.p256_public = (P256.basePoint.mulPublic(self.p256_secret, .big) catch return error.KeyScheduleError).toUncompressedSec1();
+            @memcpy(&ks_data_buf, &self.p256_public);
+            ks_data = ks_data_buf[0..65];
+        } else {
+            @memcpy(ks_data_buf[0..32], &self.x25519_public);
+            ks_data = ks_data_buf[0..32];
+        }
+
         var buf: [512]u8 = undefined;
         const msg = buildServerHello(
             &buf,
             &self.server_random,
-            &self.x25519_public,
+            self.negotiated_group,
+            ks_data,
             self.peer_session_id[0..self.peer_session_id_len],
             self.using_psk,
             self.negotiated_cipher_suite,
@@ -1443,8 +1503,18 @@ pub const Tls13Handshake = struct {
         self.transcript.update(msg);
         std.log.info("server transcript after SH ({d} bytes): {x}", .{ msg.len, self.transcript.current() });
 
-        // Compute shared secret
-        const shared_secret = X25519.scalarmult(self.x25519_secret, self.peer_x25519_public) catch return error.KeyScheduleError;
+        // Compute shared secret based on negotiated group
+        var shared_secret: [32]u8 = undefined;
+        if (self.negotiated_group == GROUP_SECP256R1) {
+            // P-256 ECDH: multiply peer's public key by our secret
+            const peer_point = P256.fromSec1(self.peer_p256_public[0..65]) catch return error.KeyScheduleError;
+            const shared_point = peer_point.mulPublic(self.p256_secret, .big) catch return error.KeyScheduleError;
+            // Extract X coordinate (bytes 1..33 of uncompressed point)
+            const shared_uncompressed = shared_point.toUncompressedSec1();
+            @memcpy(&shared_secret, shared_uncompressed[1..33]);
+        } else {
+            shared_secret = X25519.scalarmult(self.x25519_secret, self.peer_x25519_public) catch return error.KeyScheduleError;
+        }
 
         // Derive handshake secrets
         const transcript_hash = self.transcript.current();
@@ -1974,6 +2044,7 @@ fn buildClientHello(
     buf: []u8,
     client_random: *const [32]u8,
     x25519_pub: *const [32]u8,
+    p256_pub: *const [65]u8,
     alpn_list: []const []const u8,
     server_name: ?[]const u8,
     tp_encoded_data: []const u8,
@@ -2032,16 +2103,27 @@ fn buildClientHello(
     writeU16(buf[pos..], TLS13_VERSION);
     pos += 2;
 
-    // key_share extension (X25519)
-    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.key_share), 2 + 2 + 2 + 32);
-    writeU16(buf[pos..], 2 + 2 + 32); // client_shares length
+    // key_share extension (X25519 + P-256)
+    const x25519_share_len = 2 + 2 + 32; // group(2) + len(2) + key(32)
+    const p256_share_len = 2 + 2 + 65; // group(2) + len(2) + key(65)
+    const shares_total: u16 = x25519_share_len + p256_share_len;
+    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.key_share), 2 + shares_total);
+    writeU16(buf[pos..], shares_total); // client_shares length
     pos += 2;
+    // X25519 share (preferred)
     writeU16(buf[pos..], GROUP_X25519);
     pos += 2;
-    writeU16(buf[pos..], 32); // key_exchange length
+    writeU16(buf[pos..], 32);
     pos += 2;
     @memcpy(buf[pos..][0..32], x25519_pub);
     pos += 32;
+    // P-256 share (fallback)
+    writeU16(buf[pos..], GROUP_SECP256R1);
+    pos += 2;
+    writeU16(buf[pos..], 65);
+    pos += 2;
+    @memcpy(buf[pos..][0..65], p256_pub);
+    pos += 65;
 
     // signature_algorithms extension
     pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.signature_algorithms), 2 + 8);
@@ -2057,10 +2139,12 @@ fn buildClientHello(
     pos += 2;
 
     // supported_groups extension
-    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.supported_groups), 2 + 2);
-    writeU16(buf[pos..], 2); // list length
+    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.supported_groups), 2 + 4);
+    writeU16(buf[pos..], 4); // list length (2 groups x 2 bytes)
     pos += 2;
     writeU16(buf[pos..], GROUP_X25519);
+    pos += 2;
+    writeU16(buf[pos..], GROUP_SECP256R1);
     pos += 2;
 
     // SNI extension
@@ -2196,7 +2280,8 @@ fn buildClientHello(
 fn buildServerHello(
     buf: []u8,
     server_random: *const [32]u8,
-    x25519_pub: *const [32]u8,
+    key_share_group: u16,
+    key_share_data: []const u8,
     session_id_echo: []const u8,
     using_psk: bool,
     cipher_suite: quic_crypto.CipherSuite,
@@ -2238,13 +2323,14 @@ fn buildServerHello(
     pos += 2;
 
     // key_share (server's key)
-    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.key_share), 2 + 2 + 32);
-    writeU16(buf[pos..], GROUP_X25519);
+    const ks_len: u16 = @intCast(2 + 2 + key_share_data.len);
+    pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.key_share), ks_len);
+    writeU16(buf[pos..], key_share_group);
     pos += 2;
-    writeU16(buf[pos..], 32);
+    writeU16(buf[pos..], @intCast(key_share_data.len));
     pos += 2;
-    @memcpy(buf[pos..][0..32], x25519_pub);
-    pos += 32;
+    @memcpy(buf[pos..][0..key_share_data.len], key_share_data);
+    pos += key_share_data.len;
 
     // pre_shared_key extension (selected_identity = 0)
     if (using_psk) {
@@ -2666,10 +2752,13 @@ test "buildClientHello: produces valid message" {
 
     var ks = KeySchedule.init();
     var buf: [4096]u8 = undefined;
+    var p256_pub: [65]u8 = undefined;
+    @memset(&p256_pub, 0xCC);
     const msg = try buildClientHello(
         &buf,
         &random,
         &pub_key,
+        &p256_pub,
         &[_][]const u8{"h3"},
         "example.com",
         tp_encoded,
@@ -2699,7 +2788,7 @@ test "buildServerHello: produces valid message" {
     @memset(&client_random, 0xAA);
 
     var buf: [512]u8 = undefined;
-    const msg = try buildServerHello(&buf, &random, &pub_key, &client_random, false, .aes_128_gcm_sha256);
+    const msg = try buildServerHello(&buf, &random, GROUP_X25519, &pub_key, &client_random, false, .aes_128_gcm_sha256);
 
     try std.testing.expectEqual(@as(u8, @intFromEnum(MsgType.server_hello)), msg[0]);
     const body_len = (@as(usize, msg[1]) << 16) | (@as(usize, msg[2]) << 8) | @as(usize, msg[3]);
