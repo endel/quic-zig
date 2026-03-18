@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WebTransport Latency Benchmark</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: monospace; background: #0f1117; color: #e1e4e8; padding: 24px; max-width: 700px; margin: 0 auto; }
+  h1 { font-size: 1.2rem; margin-bottom: 16px; color: #58a6ff; }
+  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+  label { font-size: 0.8rem; color: #8b949e; }
+  input { width: 100%; padding: 6px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e1e4e8; font-family: monospace; font-size: 0.85rem; margin: 4px 0 8px; }
+  button { padding: 8px 16px; border: none; border-radius: 6px; font-size: 0.85rem; cursor: pointer; font-weight: 500; margin-right: 8px; }
+  .btn-go { background: #238636; color: #fff; }
+  .btn-go:hover { background: #2ea043; }
+  .btn-go:disabled { background: #1a3a2a; color: #4a7a5a; cursor: default; }
+  #results { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px; min-height: 200px; overflow-y: auto; max-height: 400px; font-size: 0.8rem; line-height: 1.6; white-space: pre-wrap; }
+  .good { color: #3fb950; }
+  .ok { color: #d29922; }
+  .bad { color: #f85149; }
+  .info { color: #58a6ff; }
+  .dim { color: #484f58; }
+</style>
+</head>
+<body>
+
+<h1>WebTransport Latency Benchmark</h1>
+
+<div class="panel">
+  <label>Server URL</label>
+  <input type="text" id="url" value="https://127.0.0.1:4433">
+  <label>Certificate SHA-256 (hex)</label>
+  <input type="text" id="hash" placeholder="paste hex hash from server output">
+  <label>Iterations</label>
+  <input type="text" id="iterations" value="20">
+  <button class="btn-go" id="btnRun" onclick="runBenchmark()">Run Benchmark</button>
+</div>
+
+<div id="results"></div>
+
+<script>
+const out = document.getElementById('results');
+function log(msg, cls = '') {
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = msg + '\n';
+  out.appendChild(span);
+  out.scrollTop = out.scrollHeight;
+}
+
+function hexToBytes(hex) {
+  hex = hex.replace(/\s+/g, '');
+  const b = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return b;
+}
+
+function statsLine(times) {
+  const sorted = [...times].sort((a,b) => a-b);
+  const n = sorted.length;
+  const avg = times.reduce((a,b) => a+b, 0) / n;
+  const med = sorted[Math.floor(n/2)];
+  const p95 = sorted[Math.floor(n*0.95)];
+  const p99 = sorted[Math.floor(n*0.99)];
+  const min = sorted[0];
+  const max = sorted[n-1];
+  const variance = times.reduce((s,x) => s + (x-avg)**2, 0) / n;
+  const stddev = Math.sqrt(variance);
+  return `  med=${med.toFixed(2)}  avg=${avg.toFixed(2)}  p95=${p95.toFixed(2)}  p99=${p99.toFixed(2)}  min=${min.toFixed(2)}  max=${max.toFixed(2)}  stddev=${stddev.toFixed(2)}`;
+}
+
+function latencyClass(ms) {
+  if (ms < 5) return 'good';
+  if (ms < 20) return 'ok';
+  return 'bad';
+}
+
+async function runBenchmark() {
+  out.innerHTML = '';
+  const url = document.getElementById('url').value.trim();
+  const hashHex = document.getElementById('hash').value.trim();
+  const iterations = parseInt(document.getElementById('iterations').value) || 20;
+
+  if (!hashHex || hashHex.length !== 64) {
+    log('Certificate hash must be 64 hex chars', 'bad');
+    return;
+  }
+
+  document.getElementById('btnRun').disabled = true;
+
+  try {
+    // Connect
+    log(`Connecting to ${url}...`, 'info');
+    const t0 = performance.now();
+    const transport = new WebTransport(url, {
+      serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBytes(hashHex).buffer }]
+    });
+    await transport.ready;
+    const connMs = (performance.now() - t0).toFixed(1);
+    log(`Connected in ${connMs}ms`, 'info');
+    log('');
+
+    // --- Bidi stream benchmark ---
+    log(`=== Bidi Stream (${iterations} iterations) ===`, 'info');
+    const bidiTimes = [];
+    for (let i = 0; i < iterations; i++) {
+      const start = performance.now();
+      const stream = await transport.createBidirectionalStream();
+      const writer = stream.writable.getWriter();
+      await writer.write(new TextEncoder().encode('ping'));
+      await writer.close();
+      const reader = stream.readable.getReader();
+      let resp = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        resp += new TextDecoder().decode(value);
+      }
+      const elapsed = performance.now() - start;
+      bidiTimes.push(elapsed);
+      log(`  #${String(i+1).padStart(2)} ${elapsed.toFixed(1).padStart(6)}ms  ${resp}`, latencyClass(elapsed));
+    }
+
+    log('');
+    log(statsLine(bidiTimes), 'info');
+    log('');
+
+    // --- Datagram benchmark ---
+    log(`=== Datagram (${iterations} iterations) ===`, 'info');
+    const dgTimes = [];
+    const dgReader = transport.datagrams.readable.getReader();
+
+    for (let i = 0; i < iterations; i++) {
+      const start = performance.now();
+      const dgWriter = transport.datagrams.writable.getWriter();
+      await dgWriter.write(new TextEncoder().encode('ping'));
+      dgWriter.releaseLock();
+      const { value } = await dgReader.read();
+      const elapsed = performance.now() - start;
+      dgTimes.push(elapsed);
+      const resp = new TextDecoder().decode(value);
+      log(`  #${String(i+1).padStart(2)} ${elapsed.toFixed(1).padStart(6)}ms  ${resp}`, latencyClass(elapsed));
+    }
+
+    log('');
+    log(statsLine(dgTimes), 'info');
+    log('');
+
+    // Cleanup
+    transport.close();
+    log('Done. Connection closed.', 'dim');
+
+  } catch (err) {
+    log(`Error: ${err}`, 'bad');
+  }
+
+  document.getElementById('btnRun').disabled = false;
+}
+</script>
+</body>
+</html>
