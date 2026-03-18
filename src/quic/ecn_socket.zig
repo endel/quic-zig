@@ -238,7 +238,8 @@ pub const SendBatch = struct {
         self.count += 1;
     }
 
-    /// Send all queued packets. Caches ECN marks to avoid redundant setsockopt calls.
+    /// Send all queued packets via sendmsg (matches quic-go's approach).
+    /// Uses sendmsg instead of sendto for more reliable delivery on macOS loopback.
     pub fn flush(self: *SendBatch) void {
         if (self.count == 0) return;
 
@@ -249,13 +250,20 @@ pub const SendBatch = struct {
                 setEcnMark(self.sockfd, self.current_ecn) catch {};
             }
             const data = self.data_buf[self.offsets[i]..][0..self.lengths[i]];
-            _ = posix.sendto(
-                self.sockfd,
-                data,
-                0,
-                @ptrCast(&self.addrs[i]),
-                self.addr_lens[i],
-            ) catch {};
+            var iov = [1]posix.iovec_const{.{
+                .base = data.ptr,
+                .len = data.len,
+            }};
+            const msg = std.c.msghdr_const{
+                .name = @ptrCast(&self.addrs[i]),
+                .namelen = self.addr_lens[i],
+                .iov = &iov,
+                .iovlen = 1,
+                .control = null,
+                .controllen = 0,
+                .flags = 0,
+            };
+            _ = std.c.sendmsg(self.sockfd, &msg, 0);
         }
 
         self.count = 0;

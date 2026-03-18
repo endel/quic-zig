@@ -155,6 +155,24 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args_b| run_bench.addArgs(args_b);
     b.step("run-bench", "Run benchmark client").dependOn(&run_bench.step);
 
+    // kqueue latency benchmark (raw kqueue vs libxev)
+    const exe_bench_kq = b.addExecutable(.{
+        .name = "bench-kqueue",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/bench_kqueue.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = need_libc,
+            .imports = &.{
+                .{ .name = "xev", .module = xev_dep.module("xev") },
+            },
+        }),
+    });
+    b.installArtifact(exe_bench_kq);
+    const run_bench_kq = b.addRunArtifact(exe_bench_kq);
+    run_bench_kq.step.dependOn(b.getInstallStep());
+    b.step("run-bench-kqueue", "Run kqueue latency benchmark").dependOn(&run_bench_kq.step);
+
     // Tests
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
