@@ -8,6 +8,7 @@ pub const transport_params = @import("quic/transport_params.zig");
 pub const stateless_reset = @import("quic/stateless_reset.zig");
 pub const h3 = @import("h3/connection.zig");
 pub const h0 = @import("h0/connection.zig");
+pub const http1 = @import("http1/server.zig");
 pub const qpack = @import("h3/qpack.zig");
 pub const webtransport = @import("webtransport/session.zig");
 pub const quic_lb = @import("quic/quic_lb.zig");

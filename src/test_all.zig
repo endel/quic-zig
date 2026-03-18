@@ -26,4 +26,6 @@ test {
     _ = @import("h3/connection.zig");
     _ = @import("webtransport/session.zig");
     _ = @import("h3/capsule.zig");
+    _ = @import("http1/server.zig");
+    _ = @import("http1/tls.zig");
 }

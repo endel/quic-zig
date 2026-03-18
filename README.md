@@ -16,6 +16,7 @@ and goals of this project!
 - **Loss Detection & Congestion Control** (RFC 9002) — CUBIC, PTO, token bucket pacer
 - **HTTP/3** (RFC 9114) — QPACK static table, request/response, priority scheduling (RFC 9218)
 - **WebTransport** (draft-ietf-webtrans-http3) — bidi/uni streams, datagrams, Extended CONNECT, browser support
+- **HTTP/1.1+TLS** — static file server on TCP, same cert as QUIC, Alt-Svc for HTTP/3 upgrade
 
 ## The Story
 
@@ -117,6 +118,38 @@ pub fn main() !void {
     try server.run();
 }
 ```
+
+### Serving static files over HTTPS (HTTP/1.1+TLS)
+
+The server can optionally serve static files over HTTP/1.1+TLS on the same port
+alongside QUIC. TCP and UDP are separate namespaces, so the same port works for
+both. The same TLS certificate is shared. An `Alt-Svc` header is automatically
+included to advertise HTTP/3 to browsers.
+
+```zig
+var server = try event_loop.Server(MyHandler).init(alloc, &handler, .{
+    .port = 4433,
+    .cert_path = "cert.pem",
+    .key_path = "key.pem",
+    .http1 = .{ .static_dir = "public" },
+});
+```
+
+This is particularly useful for browser WebTransport — the browser loads the
+HTML/JS page over HTTPS, then upgrades to WebTransport over QUIC:
+
+| Transport | Port | Protocol |
+|-----------|------|----------|
+| UDP | 4433 | QUIC / H3 / WebTransport (TLS 1.3) |
+| TCP | 4433 | HTTP/1.1 static files (TLS 1.3) |
+
+`Http1Config` options:
+
+| Field | Default | Description |
+|---|---|---|
+| `static_dir` | *(required)* | Directory to serve files from |
+| `port` | same as QUIC | TCP port override |
+| `alt_svc` | `true` | Send `Alt-Svc: h3=":port"` header |
 
 ### Graceful shutdown
 

@@ -134,9 +134,11 @@ pub fn main() !void {
         .cert_path = cert_path,
         .key_path = key_path,
         .conn_config = conn_config,
+        .http1 = .{ .static_dir = "interop/browser" },
     });
     defer server.deinit();
 
-    std.debug.print("Listening on https://0.0.0.0:{d}\n\n", .{port});
+    std.debug.print("Listening on https://0.0.0.0:{d} (QUIC/WebTransport)\n", .{port});
+    std.debug.print("Serving static files on https://0.0.0.0:{d} (HTTP/1.1+TLS)\n\n", .{port});
     try server.run();
 }

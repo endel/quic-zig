@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const builtin = @import("builtin");
+const log = std.log.scoped(.event_loop);
 const xev_mod = @import("xev");
 
 // Default backend: io_uring on Linux, kqueue on macOS.
@@ -14,11 +15,14 @@ const tls13 = @import("quic/tls13.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
 const h0 = @import("h0/connection.zig");
+const http1 = @import("http1/server.zig");
 const qpack = @import("h3/qpack.zig");
 const wt = @import("webtransport/session.zig");
 const Certificate = std.crypto.Certificate;
 
 pub const Protocol = enum { quic, h3, h0, webtransport };
+
+pub const Http1Config = http1.Http1Config;
 
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
@@ -43,6 +47,11 @@ pub const Config = struct {
     // When set, a second socket is created on this port so that clients
     // migrating to the server's preferred address can reach us.
     preferred_port: ?u16 = null,
+
+    /// Enable HTTP/1.1 static file server on TCP alongside QUIC on UDP.
+    /// Uses the same port (TCP and UDP are separate namespaces) by default.
+    /// Serves files from static_dir and advertises HTTP/3 via Alt-Svc header.
+    http1: ?Http1Config = null,
 };
 
 /// Session wraps a ConnEntry and provides convenience methods for sending data.
@@ -254,6 +263,9 @@ pub fn Server(comptime Handler: type) type {
         /// clients migrate there. This socket receives and responds on that port.
         preferred: ?PreferredSocket,
 
+        /// Optional HTTP/1.1 static file server (runs on a separate thread).
+        http1_server: ?http1.Http1Server,
+
         const PreferredSocket = struct {
             sockfd: posix.socket_t,
             local_addr: posix.sockaddr.storage,
@@ -376,6 +388,15 @@ pub fn Server(comptime Handler: type) type {
             const file_handle = xev.File.initFd(sockfd);
             const timer_handle = try xev.Timer.init();
 
+            // Optional HTTP/1.1 static file server
+            const http1_server: ?http1.Http1Server = if (config.http1) |h1cfg|
+                try http1.Http1Server.init(config.address, h1cfg, config.port, .{
+                    .cert_chain_der = tls_config.cert_chain_der,
+                    .private_key_bytes = tls_config.private_key_bytes,
+                })
+            else
+                null;
+
             return .{
                 .allocator = alloc,
                 .handler = handler,
@@ -395,10 +416,14 @@ pub fn Server(comptime Handler: type) type {
                 .recv_buf = undefined,
                 .out_buf = undefined,
                 .preferred = preferred,
+                .http1_server = http1_server,
             };
         }
 
         pub fn deinit(self: *Self) void {
+            // Stop HTTP/1.1 server
+            if (self.http1_server) |*h1| h1.deinit();
+
             // Clean up H0 connections (heap-allocated pointers)
             for (self.conn_mgr.entries.items) |entry| {
                 if (entry.h0_conn) |h0c| {
@@ -421,6 +446,12 @@ pub fn Server(comptime Handler: type) type {
             // Register preferred socket if present
             if (self.preferred) |*p| {
                 p.file.poll(&self.loop, &p.poll_completion, .read, Self, self, onReadable);
+            }
+            // Start HTTP/1.1 server thread if configured
+            if (self.http1_server) |*h1| {
+                h1.start() catch |err| {
+                    log.err("Failed to start HTTP/1.1 server: {any}", .{err});
+                };
             }
             // Arm initial timer (1ms to kick things off)
             self.timer.run(&self.loop, &self.timer_completion, 1, Self, self, onTimer);
