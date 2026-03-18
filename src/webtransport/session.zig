@@ -430,6 +430,24 @@ pub const WebTransportConnection = struct {
         }
     }
 
+    /// Drain the QUIC-layer disposal queue and clean up corresponding WT bookkeeping.
+    /// O(k) where k = number of streams just disposed (typically 0-2 per cycle).
+    pub fn drainDisposalQueue(self: *WebTransportConnection) void {
+        const disposed = self.quic.streams.disposal_queue[0..self.quic.streams.disposal_count];
+        for (disposed) |id| {
+            _ = self.wt_bidi_streams.remove(id);
+            _ = self.wt_uni_streams.remove(id);
+            _ = self.fin_delivered.remove(id);
+            _ = self.h3.excluded_bidi_streams.remove(id);
+            _ = self.h3.finished_streams.remove(id);
+            _ = self.h3.headers_received_streams.remove(id);
+            if (self.stream_bufs.fetchRemove(id)) |kv| {
+                var buf = kv.value;
+                buf.deinit(self.allocator);
+            }
+        }
+    }
+
     /// Poll for the next WebTransport event.
     pub fn poll(self: *WebTransportConnection) !?WtEvent {
         // 1. Check CONNECT streams for CLOSE_WEBTRANSPORT_SESSION

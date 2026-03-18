@@ -2,6 +2,10 @@ const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
 
+pub const std_options: std.Options = .{
+    .log_level = .err,
+};
+
 const EchoHandler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
 
@@ -17,14 +21,16 @@ const EchoHandler = struct {
         std.log.info("WT session {d} ready", .{sid});
     }
 
-    pub fn onStreamData(_: *EchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
-        std.log.info("WT stream {d}: {s}", .{ stream_id, data });
-        var echo_buf: [1024]u8 = undefined;
-        const echo_msg = std.fmt.bufPrint(&echo_buf, "Echo: {s}", .{data}) catch return;
-        session.sendStreamData(stream_id, echo_msg) catch |err| {
-            std.log.err("sendStreamData error: {any}", .{err});
-        };
-        session.closeStream(stream_id);
+    pub fn onStreamData(_: *EchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
+        if (data.len == 0 and !fin) return;
+        if (data.len > 0) {
+            var echo_buf: [1024]u8 = undefined;
+            const echo_msg = std.fmt.bufPrint(&echo_buf, "Echo: {s}", .{data}) catch return;
+            session.sendStreamData(stream_id, echo_msg) catch return;
+        }
+        if (fin) {
+            session.closeStream(stream_id);
+        }
     }
 
     pub fn onDatagram(_: *EchoHandler, session: *event_loop.Session, session_id: u64, data: []const u8) void {

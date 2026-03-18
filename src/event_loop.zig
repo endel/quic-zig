@@ -592,6 +592,14 @@ pub fn Server(comptime Handler: type) type {
                     .h0 => self.pollH0Events(entry),
                     .quic => {},
                 }
+
+                // Remove streams that were queued for disposal during this cycle.
+                // WT layer reads the queue first (to clean its own maps), then
+                // QUIC layer drains it (actually removing stream objects).
+                if (Handler.protocol == .webtransport) {
+                    if (entry.wt_conn) |*wtc| wtc.drainDisposalQueue();
+                }
+                conn.streams.drainDisposalQueue();
             }
         }
 

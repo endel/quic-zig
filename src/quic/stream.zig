@@ -635,6 +635,12 @@ pub const StreamsMap = struct {
     /// Round-robin index for fair scheduling of incremental streams (RFC 9218).
     rr_index: u64 = 0,
 
+    /// Targeted disposal queue: stream IDs ready for removal. Populated by
+    /// queueDisposal() at the point where a stream is known to be fully done,
+    /// drained by drainDisposalQueue() once per event loop cycle. O(k) not O(n).
+    disposal_queue: [64]u64 = undefined,
+    disposal_count: usize = 0,
+
     pub fn init(allocator: Allocator, is_server: bool) StreamsMap {
         // Stream IDs: client bidi = 0, 4, 8, ...; server bidi = 1, 5, 9, ...
         // Client uni = 2, 6, 10, ...; server uni = 3, 7, 11, ...
@@ -857,8 +863,7 @@ pub const StreamsMap = struct {
     /// and call closeStream for each. This ensures consumed_*_streams advances even when
     /// the close was never triggered by a received STREAM/RESET_STREAM frame.
     pub fn collectClosedStreams(self: *StreamsMap) void {
-        // Mark fully-closed streams for consumed counting. Streams stay in the map
-        // so that loss detection can still find them for retransmission.
+        // Mark fully-closed streams for consumed counting and queue for disposal.
         var it = self.streams.iterator();
         while (it.next()) |kv| {
             const s = kv.value_ptr.*;
@@ -866,6 +871,9 @@ pub const StreamsMap = struct {
             {
                 s.closed_for_gc = true;
                 self.closeStream(s.stream_id);
+                if (s.send.retransmit_count == 0) {
+                    self.queueDisposal(s.stream_id);
+                }
             }
         }
     }
@@ -879,6 +887,34 @@ pub const StreamsMap = struct {
             if (self.open_uni_streams > 0) self.open_uni_streams -= 1;
             if (peer_initiated) self.consumed_uni_streams += 1;
         }
+    }
+
+    /// Queue a stream for removal. O(1) — called when a stream is known to be
+    /// fully closed (closed_for_gc set, no pending retransmissions).
+    pub fn queueDisposal(self: *StreamsMap, stream_id: u64) void {
+        if (self.disposal_count < self.disposal_queue.len) {
+            self.disposal_queue[self.disposal_count] = stream_id;
+            self.disposal_count += 1;
+        }
+    }
+
+    /// Drain the disposal queue: remove queued streams from the maps. O(k)
+    /// where k = number of streams queued since last drain (typically 0-2).
+    pub fn drainDisposalQueue(self: *StreamsMap) void {
+        if (self.disposal_count == 0) return;
+        for (self.disposal_queue[0..self.disposal_count]) |id| {
+            if (self.streams.fetchRemove(id)) |kv| {
+                var s = kv.value;
+                s.deinit();
+                self.allocator.destroy(s);
+            }
+            if (self.recv_streams.fetchRemove(id)) |kv| {
+                var rs = kv.value;
+                rs.deinit();
+                self.allocator.destroy(rs);
+            }
+        }
+        self.disposal_count = 0;
     }
 
     /// Check if MAX_STREAMS updates should be sent (sliding window pattern).

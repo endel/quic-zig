@@ -1645,6 +1645,9 @@ pub const Connection = struct {
                     if (s.fin and (strm.send.fin_sent or strm.send.reset_err != null) and !strm.closed_for_gc) {
                         strm.closed_for_gc = true;
                         self.streams.closeStream(s.stream_id);
+                        if (strm.send.retransmit_count == 0) {
+                            self.streams.queueDisposal(s.stream_id);
+                        }
                     }
                 } else {
                     // Unidirectional stream — route to recv_streams
