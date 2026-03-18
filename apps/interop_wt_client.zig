@@ -614,6 +614,7 @@ fn pollWtEvents(
                 }
                 if (sd.data.len > 0) alloc.free(sd.data);
             },
+            .stream_finished => {},
 
             .datagram => |dg| {
                 handleDatagram(alloc, wt, state, testcase, dg.session_id, dg.data);

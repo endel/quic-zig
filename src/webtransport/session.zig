@@ -69,7 +69,8 @@ pub const WtEvent = union(enum) {
     connect_request: struct { session_id: u64, protocol: []const u8, authority: []const u8, path: []const u8, headers: []const qpack.Header = &.{} },
     bidi_stream: struct { session_id: u64, stream_id: u64 },
     uni_stream: struct { session_id: u64, stream_id: u64 },
-    stream_data: struct { stream_id: u64, data: []const u8, fin: bool = false },
+    stream_data: struct { stream_id: u64, data: []const u8 },
+    stream_finished: struct { stream_id: u64 },
     datagram: struct { session_id: u64, data: []const u8 },
     session_closed: struct { session_id: u64, error_code: u32, reason: []const u8 },
     session_draining: struct { session_id: u64 },
@@ -747,20 +748,14 @@ pub const WebTransportConnection = struct {
 
             if (self.quic.streams.getStream(stream_id)) |stream| {
                 if (stream.recv.read()) |data| {
-                    const is_fin = stream.recv.finished;
-                    if (is_fin) self.fin_delivered.put(stream_id, {}) catch {};
+                    if (stream.recv.finished) self.fin_delivered.put(stream_id, {}) catch {};
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = data,
-                        .fin = is_fin,
                     } };
                 } else if (stream.recv.finished and !self.fin_delivered.contains(stream_id)) {
                     self.fin_delivered.put(stream_id, {}) catch {};
-                    return .{ .stream_data = .{
-                        .stream_id = stream_id,
-                        .data = &.{},
-                        .fin = true,
-                    } };
+                    return .{ .stream_finished = .{ .stream_id = stream_id } };
                 }
             }
         }
@@ -787,20 +782,14 @@ pub const WebTransportConnection = struct {
 
             if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
                 if (recv_stream.read()) |data| {
-                    const is_fin = recv_stream.finished;
-                    if (is_fin) self.fin_delivered.put(stream_id, {}) catch {};
+                    if (recv_stream.finished) self.fin_delivered.put(stream_id, {}) catch {};
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = data,
-                        .fin = is_fin,
                     } };
                 } else if (recv_stream.finished and !self.fin_delivered.contains(stream_id)) {
                     self.fin_delivered.put(stream_id, {}) catch {};
-                    return .{ .stream_data = .{
-                        .stream_id = stream_id,
-                        .data = &.{},
-                        .fin = true,
-                    } };
+                    return .{ .stream_finished = .{ .stream_id = stream_id } };
                 }
             }
         }

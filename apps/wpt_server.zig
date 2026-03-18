@@ -290,20 +290,19 @@ const WptHandler = struct {
         });
     }
 
-    pub fn onStreamData(self: *WptHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
+    pub fn onStreamData(self: *WptHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
         // Find which session this stream belongs to
         const session_id = self.findSessionForStream(session) orelse return;
         const info = self.session_state.get(session_id) orelse return;
 
-        std.log.info("[wpt] stream data: handler={s} stream={d} len={d} fin={}", .{
-            @tagName(info.handler), stream_id, data.len, fin,
+        std.log.info("[wpt] stream data: handler={s} stream={d} len={d}", .{
+            @tagName(info.handler), stream_id, data.len,
         });
 
         switch (info.handler) {
             .echo, .echo_raw => {
                 if (isUniStream(stream_id)) {
                     // Unidirectional: echo on a single outgoing uni stream per incoming stream.
-                    // Open on first data chunk, close on FIN.
                     const out_id: ?u64 = self.uni_echo_streams.get(stream_id) orelse blk: {
                         const new_id = session.openUniStream(session_id) catch |err| {
                             std.log.err("[wpt] openUniStream failed: {any}", .{err});
@@ -313,16 +312,11 @@ const WptHandler = struct {
                         break :blk new_id;
                     };
                     if (out_id) |oid| {
-                        if (data.len > 0) session.sendStreamData(oid, data) catch {};
-                        if (fin) {
-                            session.closeStream(oid);
-                            _ = self.uni_echo_streams.remove(stream_id);
-                        }
+                        session.sendStreamData(oid, data) catch {};
                     }
                 } else {
-                    // Bidirectional: echo back on same stream, close only after FIN
-                    if (data.len > 0) session.sendStreamData(stream_id, data) catch {};
-                    if (fin) session.closeStream(stream_id);
+                    // Bidirectional: echo back on same stream
+                    session.sendStreamData(stream_id, data) catch {};
                 }
             },
             .server_read_then_close => {
@@ -331,6 +325,25 @@ const WptHandler = struct {
             },
             .client_close => {
                 // Stash stream data for later query
+            },
+            else => {},
+        }
+    }
+
+    pub fn onStreamFinished(self: *WptHandler, session: *event_loop.Session, stream_id: u64) void {
+        const session_id = self.findSessionForStream(session) orelse return;
+        const info = self.session_state.get(session_id) orelse return;
+
+        switch (info.handler) {
+            .echo, .echo_raw => {
+                if (isUniStream(stream_id)) {
+                    if (self.uni_echo_streams.get(stream_id)) |oid| {
+                        session.closeStream(oid);
+                        _ = self.uni_echo_streams.remove(stream_id);
+                    }
+                } else {
+                    session.closeStream(stream_id);
+                }
             },
             else => {},
         }

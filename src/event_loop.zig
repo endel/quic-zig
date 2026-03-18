@@ -167,9 +167,9 @@ pub fn Server(comptime Handler: type) type {
 
         const known = [_][]const u8{
             "onConnectRequest", "onSessionReady",  "onStreamData",
-            "onDatagram",       "onSessionClosed",  "onSessionDraining",
-            "onBidiStream",     "onUniStream",      "onPollComplete",
-            "onRequest",        "onData",
+            "onStreamFinished", "onDatagram",       "onSessionClosed",
+            "onSessionDraining","onBidiStream",     "onUniStream",
+            "onPollComplete",   "onRequest",        "onData",
             "onH0Request",      "onH0Data",         "onH0Finished",
         };
 
@@ -185,7 +185,7 @@ pub fn Server(comptime Handler: type) type {
                 if (!found) {
                     @compileError("Handler has unrecognized callback '" ++ decl.name ++
                         "'. Known callbacks: onRequest, onData, onConnectRequest, " ++
-                        "onSessionReady, onStreamData, onDatagram, onSessionClosed, " ++
+                        "onSessionReady, onStreamData, onStreamFinished, onDatagram, onSessionClosed, " ++
                         "onSessionDraining, onBidiStream, onUniStream, onPollComplete, " ++
                         "onH0Request, onH0Data, onH0Finished");
                 }
@@ -663,12 +663,12 @@ pub fn Server(comptime Handler: type) type {
                     },
                     .stream_data => |sd| {
                         if (@hasDecl(Handler, "onStreamData")) {
-                            // Support both 4-arg (with fin) and 3-arg (without fin) signatures
-                            if (@typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params.len == 5) {
-                                self.handler.onStreamData(&session, sd.stream_id, sd.data, sd.fin);
-                            } else {
-                                self.handler.onStreamData(&session, sd.stream_id, sd.data);
-                            }
+                            self.handler.onStreamData(&session, sd.stream_id, sd.data);
+                        }
+                    },
+                    .stream_finished => |sf| {
+                        if (@hasDecl(Handler, "onStreamFinished")) {
+                            self.handler.onStreamFinished(&session, sf.stream_id);
                         }
                     },
                     .datagram => |dg| {
@@ -977,9 +977,9 @@ pub fn Client(comptime Handler: type) type {
 
         const known = [_][]const u8{
             "onConnected",        "onSessionReady",    "onSessionRejected",
-            "onStreamData",       "onDatagram",        "onSessionClosed",
-            "onSessionDraining",  "onBidiStream",      "onUniStream",
-            "onPollComplete",
+            "onStreamData",       "onStreamFinished",  "onDatagram",
+            "onSessionClosed",    "onSessionDraining", "onBidiStream",
+            "onUniStream",        "onPollComplete",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -1372,11 +1372,12 @@ pub fn Client(comptime Handler: type) type {
                     },
                     .stream_data => |sd| {
                         if (@hasDecl(Handler, "onStreamData")) {
-                            if (@typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params.len == 5) {
-                                self.handler.onStreamData(&session, sd.stream_id, sd.data, sd.fin);
-                            } else {
-                                self.handler.onStreamData(&session, sd.stream_id, sd.data);
-                            }
+                            self.handler.onStreamData(&session, sd.stream_id, sd.data);
+                        }
+                    },
+                    .stream_finished => |sf| {
+                        if (@hasDecl(Handler, "onStreamFinished")) {
+                            self.handler.onStreamFinished(&session, sf.stream_id);
                         }
                     },
                     .datagram => |dg| {
