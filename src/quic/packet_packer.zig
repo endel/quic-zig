@@ -334,8 +334,15 @@ pub const PacketPacker = struct {
         // 0-RTT packets only contain STREAM and DATAGRAM frames — skip ACK, CRYPTO, control
         if (!zero_rtt) {
             // 1. ACK frame (always first if pending)
+            // When sending data (!ack_only), piggyback ACK on every packet that has
+            // unacknowledged ack-eliciting packets (RFC 9000 §13.2.1 recommendation).
+            // When ack_only (congestion-limited), respect normal threshold/alarm timing.
             const ack_delay_exp: u64 = 3;
-            if (pkt_handler.getAckFrame(level, now, ack_delay_exp)) |ack_frame| {
+            const ack_frame_opt: ?Frame = if (!ack_only and pkt_handler.hasUnackedAckEliciting(level))
+                pkt_handler.getAckFrameForced(level, now, ack_delay_exp)
+            else
+                pkt_handler.getAckFrame(level, now, ack_delay_exp);
+            if (ack_frame_opt) |ack_frame| {
                 // Record the largest_ack for ACK-of-ACK pruning (RFC 9000 §13.2.4)
                 switch (ack_frame) {
                     .ack => |a| ack_largest_sent = a.largest_ack,

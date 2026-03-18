@@ -387,8 +387,24 @@ pub const ReceivedPacketTracker = struct {
         self.received.removeBelow(below);
     }
 
+    /// Check if there are any unacknowledged ack-eliciting packets.
+    /// Used by the packet packer to piggyback ACKs on outgoing data packets.
+    pub fn hasUnackedAckEliciting(self: *const ReceivedPacketTracker) bool {
+        return self.ack_eliciting_since_last_ack > 0;
+    }
+
     pub fn getAckFrame(self: *ReceivedPacketTracker, now: i64, ack_delay_exponent: u64) ?Frame {
-        if (!self.ack_queued) {
+        return self.getAckFrameImpl(now, ack_delay_exponent, false);
+    }
+
+    /// Generate an ACK frame regardless of threshold/alarm timers.
+    /// Used to piggyback ACKs on outgoing data packets (RFC 9000 §13.2.1).
+    pub fn getAckFrameForced(self: *ReceivedPacketTracker, now: i64, ack_delay_exponent: u64) ?Frame {
+        return self.getAckFrameImpl(now, ack_delay_exponent, true);
+    }
+
+    fn getAckFrameImpl(self: *ReceivedPacketTracker, now: i64, ack_delay_exponent: u64, force: bool) ?Frame {
+        if (!force and !self.ack_queued) {
             if (self.ack_alarm) |alarm| {
                 if (now < alarm) return null;
             } else {
@@ -562,6 +578,19 @@ pub const PacketHandler = struct {
     pub fn getAckFrame(self: *PacketHandler, level: EncLevel, now: i64, ack_delay_exponent: u64) ?Frame {
         const idx = @intFromEnum(level);
         return self.recv[idx].getAckFrame(now, ack_delay_exponent);
+    }
+
+    /// Generate an ACK frame regardless of threshold/alarm timers.
+    /// Used to piggyback ACKs when the packet already carries data.
+    pub fn getAckFrameForced(self: *PacketHandler, level: EncLevel, now: i64, ack_delay_exponent: u64) ?Frame {
+        const idx = @intFromEnum(level);
+        return self.recv[idx].getAckFrameForced(now, ack_delay_exponent);
+    }
+
+    /// Check if there are unacked ack-eliciting packets at the given level.
+    pub fn hasUnackedAckEliciting(self: *const PacketHandler, level: EncLevel) bool {
+        const idx = @intFromEnum(level);
+        return self.recv[idx].hasUnackedAckEliciting();
     }
 
     /// Compute PTO deadline for a single packet number space.
