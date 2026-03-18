@@ -73,6 +73,29 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_client.addArgs(args);
     b.step("run-client", "Run QUIC client").dependOn(&run_client.step);
 
+    // H3 client (event_loop)
+    const exe_h3_client = App.add(b, "h3-client", "apps/h3_client.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_h3_client);
+    const run_h3_client = b.addRunArtifact(exe_h3_client);
+    run_h3_client.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_h3_client.addArgs(args);
+    b.step("run-h3-client", "Run H3 client").dependOn(&run_h3_client.step);
+
+    // Raw QUIC server (event_loop)
+    const exe_quic_server = App.add(b, "quic-server", "apps/quic_server.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_quic_server);
+    const run_quic_server = b.addRunArtifact(exe_quic_server);
+    run_quic_server.step.dependOn(b.getInstallStep());
+    b.step("run-quic-server", "Run raw QUIC echo server").dependOn(&run_quic_server.step);
+
+    // Raw QUIC client (event_loop)
+    const exe_quic_client = App.add(b, "quic-client", "apps/quic_client.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_quic_client);
+    const run_quic_client = b.addRunArtifact(exe_quic_client);
+    run_quic_client.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_quic_client.addArgs(args);
+    b.step("run-quic-client", "Run raw QUIC echo client").dependOn(&run_quic_client.step);
+
     // WebTransport server
     const exe_wt_server = App.add(b, "wt-server", "apps/wt_server.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_wt_server);

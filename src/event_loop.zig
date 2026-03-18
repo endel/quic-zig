@@ -138,6 +138,29 @@ pub const Session = struct {
         return null;
     }
 
+    // --- Raw QUIC methods ---
+
+    pub fn writeStream(self: *Session, stream_id: u64, data: []const u8) !void {
+        const stream = self.entry.conn.streams.getStream(stream_id) orelse return error.StreamNotFound;
+        try stream.send.writeData(data);
+    }
+
+    pub fn closeQuicStream(self: *Session, stream_id: u64) void {
+        if (self.entry.conn.streams.getStream(stream_id)) |stream| {
+            stream.send.close();
+        }
+    }
+
+    pub fn readStream(self: *Session, stream_id: u64) ?[]const u8 {
+        const stream = self.entry.conn.streams.getStream(stream_id) orelse return null;
+        return stream.recv.read();
+    }
+
+    pub fn openStream(self: *Session) !u64 {
+        const stream = try self.entry.conn.openStream();
+        return stream.stream_id;
+    }
+
     // --- H0 methods ---
 
     pub fn serveFile(self: *Session, stream_id: u64, root_dir: []const u8, path: []const u8) !void {
@@ -590,7 +613,7 @@ pub fn Server(comptime Handler: type) type {
                     .webtransport => self.pollWtEvents(entry),
                     .h3 => self.pollH3Events(entry),
                     .h0 => self.pollH0Events(entry),
-                    .quic => {},
+                    .quic => self.pollQuicEvents(entry),
                 }
 
                 // Remove streams that were queued for disposal during this cycle.
@@ -764,6 +787,34 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
+        fn pollQuicEvents(self: *Self, entry: *ConnEntry) void {
+            const conn = entry.conn;
+            var session = Session{ .entry = entry };
+
+            if (@hasDecl(Handler, "onPollComplete")) {
+                self.handler.onPollComplete(&session);
+            }
+
+            var stream_it = conn.streams.streams.iterator();
+            while (stream_it.next()) |kv| {
+                const stream_id = kv.key_ptr.*;
+                const stream = kv.value_ptr.*;
+
+                if (stream.recv.read()) |data| {
+                    if (@hasDecl(Handler, "onStreamData")) {
+                        self.handler.onStreamData(&session, stream_id, data);
+                    }
+                    self.allocator.free(data);
+                }
+                if (stream.recv.finished and !entry.finished_streams.contains(stream_id)) {
+                    entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
+                    if (@hasDecl(Handler, "onStreamFinished")) {
+                        self.handler.onStreamFinished(&session, stream_id);
+                    }
+                }
+            }
+        }
+
         fn tickAndSend(self: *Self) void {
             var i: usize = 0;
             while (i < self.conn_mgr.entries.items.len) {
@@ -866,6 +917,9 @@ pub const ClientConfig = struct {
     // WebTransport session path (auto-CONNECT on handshake complete)
     path: []const u8 = "/.well-known/webtransport",
 
+    // TLS ALPN override (when null, derived from handler protocol: "h3" for h3/webtransport)
+    alpn: ?[]const u8 = null,
+
     // TLS verification
     ca_cert_path: ?[]const u8 = null,
     skip_cert_verify: bool = false,
@@ -887,6 +941,56 @@ pub const ClientSession = struct {
     conn: *connection.Connection,
     h3_conn: ?*h3.H3Connection = null,
     wt_conn: ?*wt.WebTransportConnection = null,
+
+    // --- H3 methods ---
+
+    pub fn sendRequest(self: *ClientSession, headers: []const qpack.Header, body: ?[]const u8) !u64 {
+        if (self.h3_conn) |h3c| {
+            return try h3c.sendRequest(headers, body);
+        }
+        return error.NoH3Connection;
+    }
+
+    pub fn sendResponse(self: *ClientSession, stream_id: u64, headers: []const qpack.Header, body: []const u8) !void {
+        if (self.h3_conn) |h3c| {
+            try h3c.sendResponse(stream_id, headers, body);
+        } else return error.NoH3Connection;
+    }
+
+    pub fn recvBody(self: *ClientSession, buf: []u8) usize {
+        if (self.h3_conn) |h3c| {
+            return h3c.recvBody(buf);
+        }
+        return 0;
+    }
+
+    // --- Raw QUIC methods ---
+
+    pub fn openStream(self: *ClientSession) !u64 {
+        const stream = try self.conn.openStream();
+        return stream.stream_id;
+    }
+
+    pub fn openQuicUniStream(self: *ClientSession) !u64 {
+        const send_stream = try self.conn.openUniStream();
+        return send_stream.stream_id;
+    }
+
+    pub fn writeStream(self: *ClientSession, stream_id: u64, data: []const u8) !void {
+        const stream = self.conn.streams.getStream(stream_id) orelse return error.StreamNotFound;
+        try stream.send.writeData(data);
+    }
+
+    pub fn closeQuicStream(self: *ClientSession, stream_id: u64) void {
+        if (self.conn.streams.getStream(stream_id)) |stream| {
+            stream.send.close();
+        }
+    }
+
+    pub fn readStream(self: *ClientSession, stream_id: u64) ?[]const u8 {
+        const stream = self.conn.streams.getStream(stream_id) orelse return null;
+        return stream.recv.read();
+    }
 
     // --- WebTransport methods ---
 
@@ -976,10 +1080,17 @@ pub fn Client(comptime Handler: type) type {
         }
 
         const known = [_][]const u8{
-            "onConnected",        "onSessionReady",    "onSessionRejected",
-            "onStreamData",       "onStreamFinished",  "onDatagram",
-            "onSessionClosed",    "onSessionDraining", "onBidiStream",
-            "onUniStream",        "onPollComplete",
+            // Common
+            "onConnected",        "onPollComplete",
+            // H3
+            "onHeaders",          "onData",            "onFinished",
+            "onSettings",         "onGoaway",
+            // Raw QUIC
+            "onStreamData",       "onStreamFinished",
+            // WebTransport
+            "onSessionReady",     "onSessionRejected",
+            "onDatagram",         "onSessionClosed",
+            "onSessionDraining",  "onBidiStream",      "onUniStream",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -993,9 +1104,11 @@ pub fn Client(comptime Handler: type) type {
                 }
                 if (!found) {
                     @compileError("Handler has unrecognized callback '" ++ decl.name ++
-                        "'. Known client callbacks: onConnected, onSessionReady, onSessionRejected, " ++
-                        "onStreamData, onDatagram, onSessionClosed, onSessionDraining, " ++
-                        "onBidiStream, onUniStream, onPollComplete");
+                        "'. Known client callbacks: onConnected, onPollComplete, " ++
+                        "onHeaders, onData, onFinished, onSettings, onGoaway, " ++
+                        "onStreamData, onStreamFinished, " ++
+                        "onSessionReady, onSessionRejected, onDatagram, onSessionClosed, " ++
+                        "onSessionDraining, onBidiStream, onUniStream");
                 }
             }
         }
@@ -1043,6 +1156,9 @@ pub fn Client(comptime Handler: type) type {
         protocol_initialized: bool,
         session_id: ?u64,
 
+        // For raw QUIC: track streams whose fin has been delivered
+        finished_streams: std.AutoHashMap(u64, void),
+
         // Config retained for protocol init
         server_name: []const u8,
         path: []const u8,
@@ -1051,7 +1167,10 @@ pub fn Client(comptime Handler: type) type {
             // Build TLS config
             const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
                 const alpn = try alloc.alloc([]const u8, 1);
-                alpn[0] = "h3";
+                alpn[0] = if (config.alpn) |a| a else switch (Handler.protocol) {
+                    .h3, .webtransport => "h3",
+                    .quic, .h0 => "h3", // default; override via config.alpn for custom protocols
+                };
 
                 var ca_bundle: ?*Certificate.Bundle = null;
                 if (config.ca_cert_path) |ca_path| {
@@ -1153,6 +1272,7 @@ pub fn Client(comptime Handler: type) type {
                 .wt_conn = null,
                 .protocol_initialized = false,
                 .session_id = null,
+                .finished_streams = std.AutoHashMap(u64, void).init(alloc),
                 .server_name = config.server_name,
                 .path = config.path,
             };
@@ -1161,6 +1281,7 @@ pub fn Client(comptime Handler: type) type {
         pub fn deinit(self: *Self) void {
             if (self.wt_conn) |*wtc| wtc.deinit();
             if (self.h3_conn) |*h3c| h3c.deinit();
+            self.finished_streams.deinit();
             self.timer.deinit();
             self.loop.deinit();
             posix.close(self.sockfd);
@@ -1311,8 +1432,16 @@ pub fn Client(comptime Handler: type) type {
             // Poll events and dispatch to handler
             switch (Handler.protocol) {
                 .webtransport => self.pollWtEvents(),
-                else => {},
+                .h3 => self.pollH3Events(),
+                .quic => self.pollQuicEvents(),
+                .h0 => {},
             }
+
+            // Drain disposal queues
+            if (Handler.protocol == .webtransport) {
+                if (self.wt_conn) |*wtc| wtc.drainDisposalQueue();
+            }
+            conn.streams.drainDisposalQueue();
         }
 
         fn initProtocol(self: *Self) void {
@@ -1341,7 +1470,11 @@ pub fn Client(comptime Handler: type) type {
                     ) catch return;
                     self.session_id = session_id;
                 },
-                else => {},
+                .h3 => {
+                    self.h3_conn = h3.H3Connection.init(self.allocator, self.conn, false);
+                    self.h3_conn.?.initConnection() catch return;
+                },
+                .quic, .h0 => {},
             }
             self.protocol_initialized = true;
         }
@@ -1407,6 +1540,83 @@ pub fn Client(comptime Handler: type) type {
                         }
                     },
                     .connect_request => {},
+                }
+            }
+        }
+
+        fn pollH3Events(self: *Self) void {
+            if (self.h3_conn == null) return;
+            var h3c = &self.h3_conn.?;
+            var session = self.makeSession();
+
+            if (@hasDecl(Handler, "onPollComplete")) {
+                self.handler.onPollComplete(&session);
+            }
+
+            while (true) {
+                const event = h3c.poll() catch break;
+                if (event == null) break;
+
+                switch (event.?) {
+                    .headers => |hdr| {
+                        if (@hasDecl(Handler, "onHeaders")) {
+                            self.handler.onHeaders(&session, hdr.stream_id, hdr.headers);
+                        }
+                    },
+                    .data => |d| {
+                        if (@hasDecl(Handler, "onData")) {
+                            self.handler.onData(&session, d.stream_id, d.len);
+                        } else {
+                            // Drain body even if handler doesn't consume it
+                            var sink: [4096]u8 = undefined;
+                            while (h3c.recvBody(&sink) > 0) {}
+                        }
+                    },
+                    .finished => |stream_id| {
+                        if (@hasDecl(Handler, "onFinished")) {
+                            self.handler.onFinished(&session, stream_id);
+                        }
+                    },
+                    .settings => |settings| {
+                        if (@hasDecl(Handler, "onSettings")) {
+                            self.handler.onSettings(&session, settings);
+                        }
+                    },
+                    .goaway => |id| {
+                        if (@hasDecl(Handler, "onGoaway")) {
+                            self.handler.onGoaway(&session, id);
+                        }
+                    },
+                    .connect_request, .shutdown_complete, .request_cancelled => {},
+                }
+            }
+        }
+
+        fn pollQuicEvents(self: *Self) void {
+            const conn = self.conn;
+            var session = self.makeSession();
+
+            if (@hasDecl(Handler, "onPollComplete")) {
+                self.handler.onPollComplete(&session);
+            }
+
+            // Poll bidi streams for incoming data
+            var stream_it = conn.streams.streams.iterator();
+            while (stream_it.next()) |entry| {
+                const stream_id = entry.key_ptr.*;
+                const stream = entry.value_ptr.*;
+
+                if (stream.recv.read()) |data| {
+                    if (@hasDecl(Handler, "onStreamData")) {
+                        self.handler.onStreamData(&session, stream_id, data);
+                    }
+                    self.allocator.free(data);
+                }
+                if (stream.recv.finished and !self.finished_streams.contains(stream_id)) {
+                    self.finished_streams.put(stream_id, {}) catch {};
+                    if (@hasDecl(Handler, "onStreamFinished")) {
+                        self.handler.onStreamFinished(&session, stream_id);
+                    }
                 }
             }
         }
@@ -1560,13 +1770,35 @@ test "Server: handler validation compiles for valid handlers" {
 }
 
 test "Client: handler validation compiles for valid handlers" {
-    const TestClientHandler = struct {
+    // WebTransport client handler
+    const TestWtClientHandler = struct {
         pub const protocol: Protocol = .webtransport;
         pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64) void {}
         pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
         pub fn onDatagram(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
     };
-    _ = Client(TestClientHandler);
+    _ = Client(TestWtClientHandler);
+
+    // H3 client handler
+    const TestH3ClientHandler = struct {
+        pub const protocol: Protocol = .h3;
+        pub fn onConnected(_: *@This(), _: *ClientSession) void {}
+        pub fn onHeaders(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+        pub fn onData(_: *@This(), _: *ClientSession, _: u64, _: usize) void {}
+        pub fn onFinished(_: *@This(), _: *ClientSession, _: u64) void {}
+        pub fn onSettings(_: *@This(), _: *ClientSession, _: h3.H3Connection.Settings) void {}
+        pub fn onGoaway(_: *@This(), _: *ClientSession, _: u64) void {}
+    };
+    _ = Client(TestH3ClientHandler);
+
+    // Raw QUIC client handler
+    const TestQuicClientHandler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onConnected(_: *@This(), _: *ClientSession) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+        pub fn onStreamFinished(_: *@This(), _: *ClientSession, _: u64) void {}
+    };
+    _ = Client(TestQuicClientHandler);
 }
 
 test "Server: init and deinit with in-memory TLS config" {
@@ -1620,4 +1852,76 @@ test "Server: start, tick, stop lifecycle" {
 
     // tick after stop with no connections should be fine
     try server.tick();
+}
+
+test "Client H3: init and deinit" {
+    var handler = struct {
+        pub const protocol: Protocol = .h3;
+        pub fn onHeaders(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19877,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try testing.expect(!client.started);
+    try testing.expect(!client.protocol_initialized);
+    try testing.expect(client.h3_conn == null);
+}
+
+test "Client QUIC: init and deinit" {
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19878,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try testing.expect(!client.started);
+    try testing.expect(!client.protocol_initialized);
+    try testing.expect(client.h3_conn == null);
+}
+
+test "Client H3: start, tick, stop lifecycle" {
+    var handler = struct {
+        pub const protocol: Protocol = .h3;
+        pub fn onHeaders(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19879,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try client.tick();
+    try testing.expect(client.started);
+
+    client.stop();
+    try testing.expect(client.stopping);
+}
+
+test "Client QUIC: start, tick, stop lifecycle" {
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19880,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try client.tick();
+    try testing.expect(client.started);
+
+    client.stop();
+    try testing.expect(client.stopping);
 }

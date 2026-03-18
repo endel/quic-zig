@@ -50,6 +50,9 @@ pub const ConnEntry = struct {
     h0_conn: ?*h0.H0Connection = null,
     wt_conn: ?wt.WebTransportConnection = null,
 
+    // For raw QUIC protocol: track streams whose fin has been delivered to handler
+    finished_streams: std.AutoHashMapUnmanaged(u64, void) = .{},
+
     // Track which CIDs are registered in the routing map for this connection.
     // Max 8 from LocalCidPool + 1 initial client DCID = 9.
     registered_cids: [9]CidKey = .{CidKey{}} ** 9,
@@ -126,6 +129,7 @@ pub const ConnectionManager = struct {
     pub fn deinit(self: *ConnectionManager) void {
         // Clean up all connections
         for (self.entries.items) |entry| {
+            entry.finished_streams.deinit(self.allocator);
             entry.conn.deinit();
             self.allocator.destroy(entry.conn);
             self.allocator.destroy(entry);
@@ -229,6 +233,7 @@ pub const ConnectionManager = struct {
         }
 
         // Free connection and entry
+        entry.finished_streams.deinit(self.allocator);
         entry.conn.deinit();
         self.allocator.destroy(entry.conn);
         self.allocator.destroy(entry);
