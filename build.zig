@@ -10,8 +10,8 @@ pub fn build(b: *std.Build) void {
     // libxev dependency (used by event-loop-based servers)
     const xev_dep = b.dependency("libxev", .{ .target = target, .optimize = optimize });
 
-    // Library module — shared by all apps
-    const lib_mod = b.createModule(.{
+    // Library module — shared by all apps and exposed to downstream dependencies
+    const lib_mod = b.addModule("quic", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
