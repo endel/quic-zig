@@ -50,6 +50,9 @@ pub const ConnEntry = struct {
     h0_conn: ?*h0.H0Connection = null,
     wt_conn: ?wt.WebTransportConnection = null,
 
+    /// Type-erased handler pointer for zero-copy datagram callback.
+    datagram_handler_ctx: ?*anyopaque = null,
+
     // For raw QUIC protocol: track streams whose fin has been delivered to handler
     finished_streams: std.AutoHashMapUnmanaged(u64, void) = .{},
 

@@ -181,7 +181,7 @@ pub const Frame = union(FrameType) {
     },
 
     datagram_with_length: struct {
-        data: []u8,
+        data: []const u8,
     },
 
     // draft-ietf-quic-ack-frequency

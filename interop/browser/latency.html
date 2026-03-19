@@ -98,34 +98,10 @@ async function runBenchmark() {
     await transport.ready;
     const connMs = (performance.now() - t0).toFixed(1);
     log(`Connected in ${connMs}ms`, 'info');
+    log(`Timer resolution: ${crossOriginIsolated ? 'high (cross-origin isolated)' : 'LOW (1ms, not isolated)'}`, crossOriginIsolated ? 'info' : 'bad');
     log('');
 
-    // --- Bidi stream benchmark ---
-    log(`=== Bidi Stream (${iterations} iterations) ===`, 'info');
-    const bidiTimes = [];
-    for (let i = 0; i < iterations; i++) {
-      const start = performance.now();
-      const stream = await transport.createBidirectionalStream();
-      const writer = stream.writable.getWriter();
-      await writer.write(new TextEncoder().encode('ping'));
-      await writer.close();
-      const reader = stream.readable.getReader();
-      let resp = '';
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        resp += new TextDecoder().decode(value);
-      }
-      const elapsed = performance.now() - start;
-      bidiTimes.push(elapsed);
-      log(`  #${String(i+1).padStart(2)} ${elapsed.toFixed(1).padStart(6)}ms  ${resp}`, latencyClass(elapsed));
-    }
-
-    log('');
-    log(statsLine(bidiTimes), 'info');
-    log('');
-
-    // --- Datagram benchmark ---
+    // --- Datagram benchmark (bidi disabled for net-export analysis) ---
     log(`=== Datagram (${iterations} iterations) ===`, 'info');
     const dgTimes = [];
     const dgReader = transport.datagrams.readable.getReader();

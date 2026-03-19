@@ -181,6 +181,10 @@ pub const Http1Server = struct {
         hdr_len += (std.fmt.bufPrint(hdr_buf[hdr_len..], "Content-Length: {d}\r\n", .{file_size}) catch return).len;
         hdr_len += (std.fmt.bufPrint(hdr_buf[hdr_len..], "Connection: close\r\n", .{}) catch return).len;
         hdr_len += (std.fmt.bufPrint(hdr_buf[hdr_len..], "Access-Control-Allow-Origin: *\r\n", .{}) catch return).len;
+        // Cross-Origin Isolation: enables high-resolution performance.now() in Chrome
+        // (sub-millisecond instead of 1ms coarsened for Spectre mitigations).
+        hdr_len += (std.fmt.bufPrint(hdr_buf[hdr_len..], "Cross-Origin-Opener-Policy: same-origin\r\n", .{}) catch return).len;
+        hdr_len += (std.fmt.bufPrint(hdr_buf[hdr_len..], "Cross-Origin-Embedder-Policy: require-corp\r\n", .{}) catch return).len;
 
         if (self.alt_svc_len > 0) {
             hdr_len += (std.fmt.bufPrint(hdr_buf[hdr_len..], "Alt-Svc: {s}\r\n", .{self.alt_svc_value[0..self.alt_svc_len]}) catch return).len;

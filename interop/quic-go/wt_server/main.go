@@ -80,7 +80,6 @@ func handleSession(sess *webtransport.Session) {
 		for {
 			stream, err := sess.AcceptStream(ctx)
 			if err != nil {
-				log.Printf("AcceptStream error: %v", err)
 				return
 			}
 			go handleBidiStream(stream)
@@ -92,7 +91,6 @@ func handleSession(sess *webtransport.Session) {
 		for {
 			stream, err := sess.AcceptUniStream(ctx)
 			if err != nil {
-				log.Printf("AcceptUniStream error: %v", err)
 				return
 			}
 			go handleUniStream(sess, stream)
@@ -104,15 +102,10 @@ func handleSession(sess *webtransport.Session) {
 		for {
 			data, err := sess.ReceiveDatagram(ctx)
 			if err != nil {
-				log.Printf("ReceiveDatagram error: %v", err)
 				return
 			}
-			log.Printf("Received datagram: %s", string(data))
 			echo := fmt.Sprintf("Echo: %s", string(data))
-			err = sess.SendDatagram([]byte(echo))
-			if err != nil {
-				log.Printf("SendDatagram error: %v", err)
-			}
+			sess.SendDatagram([]byte(echo))
 		}
 	}()
 
@@ -123,40 +116,23 @@ func handleSession(sess *webtransport.Session) {
 func handleBidiStream(stream *webtransport.Stream) {
 	data, err := io.ReadAll(stream)
 	if err != nil {
-		log.Printf("read bidi stream error: %v", err)
 		return
 	}
-	log.Printf("Received on bidi stream: %s", string(data))
-
 	echo := fmt.Sprintf("Echo: %s", string(data))
-	_, err = stream.Write([]byte(echo))
-	if err != nil {
-		log.Printf("write bidi stream error: %v", err)
-		return
-	}
+	stream.Write([]byte(echo))
 	stream.Close()
-	log.Printf("Sent echo on bidi stream: %s", echo)
 }
 
 func handleUniStream(sess *webtransport.Session, stream *webtransport.ReceiveStream) {
 	data, err := io.ReadAll(stream)
 	if err != nil {
-		log.Printf("read uni stream error: %v", err)
 		return
 	}
-	log.Printf("Received on uni stream: %s", string(data))
-
-	// Echo back via a new uni stream
 	sendStream, err := sess.OpenUniStream()
 	if err != nil {
-		log.Printf("open uni stream error: %v", err)
 		return
 	}
 	echo := fmt.Sprintf("Echo: %s", string(data))
-	_, err = sendStream.Write([]byte(echo))
-	if err != nil {
-		log.Printf("write uni stream error: %v", err)
-		return
-	}
+	sendStream.Write([]byte(echo))
 	sendStream.Close()
 }

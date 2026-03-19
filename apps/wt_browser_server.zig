@@ -7,42 +7,22 @@ const quic_lb = quic.quic_lb;
 
 const EchoHandler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
-
-    pub fn onConnectRequest(_: *EchoHandler, session: *event_loop.Session, session_id: u64, path: []const u8) void {
-        std.debug.print("WT session request (session_id={d}, path={s})\n", .{ session_id, path });
-        session.acceptSession(session_id) catch |err| {
-            std.log.err("WT accept error: {any}", .{err});
-            return;
-        };
-        std.debug.print("WT session accepted (session_id={d})\n", .{session_id});
-    }
-
-    pub fn onSessionReady(_: *EchoHandler, _: *event_loop.Session, sid: u64) void {
-        std.debug.print("WT: session {d} ready\n", .{sid});
+    pub fn onConnectRequest(_: *EchoHandler, session: *event_loop.Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch return;
     }
 
     pub fn onStreamData(_: *EchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
-        if (data.len == 0) return; // Ignore empty FIN-only notifications
-        std.debug.print("WT: stream {d} data: {s}\n", .{ stream_id, data });
+        if (data.len == 0) return;
         var echo_buf: [1024]u8 = undefined;
         const echo_msg = std.fmt.bufPrint(&echo_buf, "Echo: {s}", .{data}) catch return;
-        session.sendStreamData(stream_id, echo_msg) catch |err| {
-            std.log.err("WT sendStreamData error: {any}", .{err});
-        };
+        session.sendStreamData(stream_id, echo_msg) catch return;
         session.closeStream(stream_id);
     }
 
     pub fn onDatagram(_: *EchoHandler, session: *event_loop.Session, session_id: u64, data: []const u8) void {
-        std.debug.print("WT: datagram from session {d}: {s}\n", .{ session_id, data });
         var echo_buf: [1024]u8 = undefined;
         const echo_msg = std.fmt.bufPrint(&echo_buf, "Echo: {s}", .{data}) catch return;
-        session.sendDatagram(session_id, echo_msg) catch |err| {
-            std.log.err("WT sendDatagram error: {any}", .{err});
-        };
-    }
-
-    pub fn onSessionClosed(_: *EchoHandler, _: *event_loop.Session, session_id: u64, error_code: u32, reason: []const u8) void {
-        std.debug.print("WT: session {d} closed (code={d}, reason={s})\n", .{ session_id, error_code, reason });
+        session.sendDatagram(session_id, echo_msg) catch return;
     }
 };
 

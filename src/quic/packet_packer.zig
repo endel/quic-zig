@@ -514,20 +514,19 @@ pub const PacketPacker = struct {
         // Only pack datagrams when CC allows (i.e. not in ack_only mode).
         if (level == .application and !ack_only) {
             if (datagram_queue) |dq| {
-                var dgram_buf: [conn_mod.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
                 while (true) {
-                    // Peek at the next datagram's size before popping to avoid
-                    // consuming datagrams that won't fit in the packet.
-                    const peek_len = dq.peekLen() orelse break;
+                    // Zero-copy peek: read directly from ring buffer without
+                    // copying to an intermediate stack buffer.
+                    const dgram_data = dq.peekData() orelse break;
                     // DATAGRAM_WITH_LENGTH frame: type(1) + varint(len) + payload
-                    const varint_overhead: usize = if (peek_len <= 63) 1 else 2;
-                    const frame_size = 1 + varint_overhead + peek_len;
+                    const varint_overhead: usize = if (dgram_data.len <= 63) 1 else 2;
+                    const frame_size = 1 + varint_overhead + dgram_data.len;
                     if (fbs.pos + frame_size + AEAD_TAG_LEN > effective_max) break;
-                    const dgram_len = dq.pop(&dgram_buf) orelse break;
                     const dgram_frame = Frame{ .datagram_with_length = .{
-                        .data = dgram_buf[0..dgram_len],
+                        .data = dgram_data,
                     } };
                     try dgram_frame.write(writer);
+                    dq.consume();
                     ack_eliciting = true;
                 }
             }

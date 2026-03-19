@@ -641,6 +641,18 @@ pub const StreamsMap = struct {
     disposal_queue: [64]u64 = undefined,
     disposal_count: usize = 0,
 
+    /// Highest peer-initiated bidi stream ID that has been opened.
+    /// Upper layers (WT/H3) compare this with their own "next to examine"
+    /// counter to discover new streams in O(1) — same pattern as quic-go's
+    /// nextStreamToAccept / nextStreamToOpen.
+    highest_peer_bidi_stream_id: ?u64 = null,
+
+    /// Flag: set when a stream's FIN is received or sent, indicating that
+    /// collectClosedStreams() needs to scan. Cleared after scan completes.
+    /// Avoids O(n) scan on every send() when no streams are closing.
+    needs_gc_scan: bool = false,
+
+
     pub fn init(allocator: Allocator, is_server: bool) StreamsMap {
         // Stream IDs: client bidi = 0, 4, 8, ...; server bidi = 1, 5, 9, ...
         // Client uni = 2, 6, 10, ...; server uni = 3, 7, 11, ...
@@ -775,6 +787,11 @@ pub const StreamsMap = struct {
         s.recv.receive_window_size = self.local_max_stream_data_bidi_remote;
         try self.streams.put(stream_id, s);
         self.open_bidi_streams += 1;
+        self.needs_gc_scan = true; // New stream will eventually need GC
+        // Track highest peer-initiated bidi stream ID for O(1) discovery
+        if (self.highest_peer_bidi_stream_id == null or stream_id > self.highest_peer_bidi_stream_id.?) {
+            self.highest_peer_bidi_stream_id = stream_id;
+        }
         return s;
     }
 
@@ -863,7 +880,10 @@ pub const StreamsMap = struct {
     /// and call closeStream for each. This ensures consumed_*_streams advances even when
     /// the close was never triggered by a received STREAM/RESET_STREAM frame.
     pub fn collectClosedStreams(self: *StreamsMap) void {
+        if (!self.needs_gc_scan) return; // No FIN events since last scan
+
         // Mark fully-closed streams for consumed counting and queue for disposal.
+        var found_pending = false;
         var it = self.streams.iterator();
         while (it.next()) |kv| {
             const s = kv.value_ptr.*;
@@ -874,8 +894,13 @@ pub const StreamsMap = struct {
                 if (s.send.retransmit_count == 0) {
                     self.queueDisposal(s.stream_id);
                 }
+            } else if (!s.closed_for_gc) {
+                // At least one stream is still pending close
+                found_pending = true;
             }
         }
+        // Clear flag only if no unclosed streams remain
+        if (!found_pending) self.needs_gc_scan = false;
     }
 
     pub fn closeStream(self: *StreamsMap, stream_id: u64) void {

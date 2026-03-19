@@ -18,6 +18,7 @@ const h0 = @import("h0/connection.zig");
 const http1 = @import("http1/server.zig");
 const qpack = @import("h3/qpack.zig");
 const wt = @import("webtransport/session.zig");
+const packet = @import("quic/packet.zig");
 const Certificate = std.crypto.Certificate;
 
 pub const Protocol = enum { quic, h3, h0, webtransport };
@@ -612,9 +613,6 @@ pub fn Server(comptime Handler: type) type {
                 }
             }
 
-            // No flush here — tickAndSend handles flushing so that ACKs
-            // from recv processing and stream data from event handlers are
-            // coalesced into fewer packets (reducing round-trips).
             return received;
         }
 
@@ -657,6 +655,28 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
+        /// Zero-copy datagram callback: fires during QUIC packet processing,
+        /// before the data is copied to any ring buffer. `data` is a slice into
+        /// the decrypted packet and is only valid for the duration of this call.
+        fn datagramRecvCallback(data: []const u8, ctx: ?*anyopaque) void {
+            const entry: *ConnEntry = @ptrCast(@alignCast(ctx orelse return));
+            var wtc = &(entry.wt_conn orelse return);
+
+            // Parse WT quarter_stream_id prefix inline
+            var fbs = std.io.fixedBufferStream(data);
+            const reader = fbs.reader();
+            const quarter_id = packet.readVarInt(reader) catch return;
+            const session_id = quarter_id * 4;
+
+            if (wtc.getSession(session_id) == null) return;
+            const payload = data[fbs.pos..];
+
+            // Deliver directly to handler — bypasses ring buffer + poll chain entirely.
+            const handler_ptr: *Handler = @ptrCast(@alignCast(entry.datagram_handler_ctx orelse return));
+            var session = Session{ .entry = entry };
+            handler_ptr.onDatagram(&session, session_id, payload);
+        }
+
         fn initProtocol(self: *Self, entry: *ConnEntry) void {
             switch (Handler.protocol) {
                 .webtransport => {
@@ -674,6 +694,15 @@ pub fn Server(comptime Handler: type) type {
                         entry.conn,
                         true,
                     );
+
+                    // Install zero-copy datagram callback on the QUIC connection.
+                    // Datagrams will be delivered directly during packet processing,
+                    // bypassing the recv ring buffer entirely.
+                    if (@hasDecl(Handler, "onDatagram")) {
+                        entry.conn.datagram_recv_callback = datagramRecvCallback;
+                        entry.conn.datagram_recv_ctx = @ptrCast(entry);
+                        entry.datagram_handler_ctx = @ptrCast(self.handler);
+                    }
                 },
                 .h3 => {
                     entry.h3_conn = h3.H3Connection.init(self.allocator, entry.conn, true);
@@ -698,6 +727,18 @@ pub fn Server(comptime Handler: type) type {
             // Allow handler to run deferred work each poll cycle
             if (@hasDecl(Handler, "onPollComplete")) {
                 self.handler.onPollComplete(&session);
+            }
+
+            // Fast-path: drain datagrams directly without going through the
+            // full wt.poll() chain. This avoids O(event_types) overhead per
+            // datagram by calling pollDatagrams() directly.
+            if (@hasDecl(Handler, "onDatagram")) {
+                while (wtc.pollDatagrams()) |dg_event| {
+                    switch (dg_event) {
+                        .datagram => |dg| self.handler.onDatagram(&session, dg.session_id, dg.data),
+                        else => unreachable,
+                    }
+                }
             }
 
             while (true) {
@@ -729,7 +770,6 @@ pub fn Server(comptime Handler: type) type {
                         if (@hasDecl(Handler, "onDatagram")) {
                             self.handler.onDatagram(&session, dg.session_id, dg.data);
                         }
-                        if (dg.data.len > 0) self.allocator.free(dg.data);
                     },
                     .session_closed => |cls| {
                         if (@hasDecl(Handler, "onSessionClosed")) {
@@ -852,8 +892,6 @@ pub fn Server(comptime Handler: type) type {
                 const entry = self.conn_mgr.entries.items[i];
 
                 if (!self.conn_mgr.tickEntry(entry)) {
-                    // Entry was removed — clean up H0 pointer if present
-                    // (tickEntry already freed the entry, but we cleaned h0 before tick)
                     continue; // removed, don't increment
                 }
 
@@ -865,6 +903,7 @@ pub fn Server(comptime Handler: type) type {
                     const bytes_written = conn.send(&self.out_buf) catch break;
                     if (bytes_written == 0) break;
                     const send_addr = conn.peerAddress();
+
                     batch.add(
                         self.out_buf[0..bytes_written],
                         @ptrCast(send_addr),
@@ -927,10 +966,9 @@ pub fn Server(comptime Handler: type) type {
 
             const deadline = earliest orelse return null;
             const delta_ns = deadline - now;
-            if (delta_ns <= 0) return 1; // fire immediately (overdue)
-            // Convert ns to ms (truncate, don't add extra ms)
+            if (delta_ns <= 0) return 1; // overdue — fire on next tick
             const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
-            return if (ms == 0) 1 else ms;
+            return ms;
         }
     };
 }
@@ -1548,7 +1586,6 @@ pub fn Client(comptime Handler: type) type {
                         if (@hasDecl(Handler, "onDatagram")) {
                             self.handler.onDatagram(&session, dg.session_id, dg.data);
                         }
-                        if (dg.data.len > 0) self.allocator.free(dg.data);
                     },
                     .session_closed => |cls| {
                         if (@hasDecl(Handler, "onSessionClosed")) {

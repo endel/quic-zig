@@ -271,6 +271,30 @@ pub const SendBatch = struct {
     }
 };
 
+/// Send a single packet directly from the caller's buffer (zero-copy send path).
+/// Avoids the batch memcpy overhead for single-packet sends — the common case
+/// for latency-sensitive echo/datagram workloads.
+pub fn sendDirect(sockfd: posix.socket_t, data: []const u8, addr: *const posix.sockaddr.storage, addr_len: posix.socklen_t, ecn: u2, current_ecn: *u2) void {
+    if (ecn != current_ecn.*) {
+        current_ecn.* = ecn;
+        setEcnMark(sockfd, ecn) catch {};
+    }
+    var iov = [1]posix.iovec_const{.{
+        .base = data.ptr,
+        .len = data.len,
+    }};
+    const msg = std.c.msghdr_const{
+        .name = @ptrCast(addr),
+        .namelen = addr_len,
+        .iov = &iov,
+        .iovlen = 1,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    _ = std.c.sendmsg(sockfd, &msg, 0);
+}
+
 // Tests — ECN ancillary data tests only run on POSIX platforms.
 test "enableEcnRecv on a real socket" {
     if (comptime is_windows) return error.SkipZigTest;

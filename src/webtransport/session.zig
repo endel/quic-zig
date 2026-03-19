@@ -92,6 +92,16 @@ pub const WebTransportConnection = struct {
     // Streams whose type prefix hasn't been read yet
     pending_uni_streams: std.AutoHashMap(u64, void),
 
+    // Next peer-initiated bidi stream ID to examine for WT type prefix.
+    // Peer-initiated bidi IDs are sequential: server sees 0, 4, 8, 12...
+    // This counter advances as streams are identified, giving O(1) discovery
+    // per new stream — same pattern as quic-go's nextStreamToAccept.
+    next_peer_bidi_to_examine: u64 = 0,
+
+    // Persistent buffer for datagram polling — avoids heap allocation per datagram.
+    // Valid until the next pollDatagrams() call.
+    dgram_poll_buf: [quic_connection.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined,
+
     // Buffered data for WT streams (data after type prefix, or data read before poll)
     stream_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
 
@@ -110,6 +120,9 @@ pub const WebTransportConnection = struct {
             .pending_uni_streams = std.AutoHashMap(u64, void).init(allocator),
             .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
             .fin_delivered = std.AutoHashMap(u64, void).init(allocator),
+            // Peer-initiated bidi stream IDs: server examines 0, 4, 8...
+            // client examines 1, 5, 9... (RFC 9000 §2.1)
+            .next_peer_bidi_to_examine = if (is_server) 0 else 1,
             .allocator = allocator,
         };
     }
@@ -128,7 +141,7 @@ pub const WebTransportConnection = struct {
     }
 
     /// Find a session by ID.
-    fn getSession(self: *WebTransportConnection, session_id: u64) ?*Session {
+    pub fn getSession(self: *WebTransportConnection, session_id: u64) ?*Session {
         for (&self.sessions) |*s| {
             if (s.occupied and s.session_id == session_id) return s;
         }
@@ -556,24 +569,22 @@ pub const WebTransportConnection = struct {
     }
 
     /// Check for incoming QUIC DATAGRAM frames and demux by quarter_stream_id.
-    fn pollDatagrams(self: *WebTransportConnection) ?WtEvent {
-        var dgram_buf: [quic_connection.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
-        const dgram_len = self.quic.recvDatagram(&dgram_buf) orelse return null;
+    pub fn pollDatagrams(self: *WebTransportConnection) ?WtEvent {
+        // Pop datagram into persistent member buffer — one copy, no heap allocation.
+        // The slice is valid until the next pollDatagrams() call.
+        const dgram_len = self.quic.recvDatagram(&self.dgram_poll_buf) orelse return null;
         if (dgram_len == 0) return null;
 
         // Parse quarter_stream_id
-        var fbs = io.fixedBufferStream(dgram_buf[0..dgram_len]);
+        var fbs = io.fixedBufferStream(self.dgram_poll_buf[0..dgram_len]);
         const reader = fbs.reader();
         const quarter_id = packet.readVarInt(reader) catch return null;
         const session_id = quarter_id * 4;
 
         if (self.getSession(session_id)) |_| {
-            // Heap-allocate data so the slice outlives this stack frame
-            const payload = dgram_buf[fbs.pos..dgram_len];
-            const data = self.allocator.dupe(u8, payload) catch return null;
             return .{ .datagram = .{
                 .session_id = session_id,
-                .data = data,
+                .data = self.dgram_poll_buf[fbs.pos..dgram_len],
             } };
         }
 
@@ -647,22 +658,23 @@ pub const WebTransportConnection = struct {
 
     /// Identify incoming WT bidirectional streams by reading type prefix.
     fn identifyWtBidiStreams(self: *WebTransportConnection) !?WtEvent {
-        var stream_it = self.quic.streams.streams.iterator();
-        while (stream_it.next()) |entry| {
-            const stream_id = entry.key_ptr.*;
-            const stream = entry.value_ptr.*;
+        // Sequential counter approach (same pattern as quic-go's nextStreamToAccept):
+        // Peer-initiated bidi IDs are 0, 4, 8... (server) or 1, 5, 9... (client).
+        // Compare our counter against highest_peer_bidi_stream_id to know if new
+        // streams exist, then advance by 4 for each examined. O(1) per new stream.
+        const highest = self.quic.streams.highest_peer_bidi_stream_id orelse return null;
+        while (self.next_peer_bidi_to_examine <= highest) {
+            const stream_id = self.next_peer_bidi_to_examine;
+            self.next_peer_bidi_to_examine += 4; // Next peer-initiated bidi ID
 
             // Skip already-identified streams
             if (self.wt_bidi_streams.contains(stream_id)) continue;
             // Skip streams we opened (they don't have type prefix to read)
             if (self.h3.finished_streams.contains(stream_id)) continue;
-            // Skip streams initiated by us (client: even IDs, server: odd IDs)
-            // WT type prefix only appears on peer-initiated bidi streams
-            const is_client_initiated = (stream_id % 4) == 0;
-            if (is_client_initiated and !self.is_server) continue;
-            if (!is_client_initiated and self.is_server) continue;
             // Also skip our CONNECT session streams
             if (self.getSession(stream_id) != null) continue;
+
+            const stream = self.quic.streams.getStream(stream_id) orelse continue;
 
             // Try to read prefix data (read() transfers ownership)
             const data = stream.recv.read() orelse continue;
@@ -687,15 +699,27 @@ pub const WebTransportConnection = struct {
                     // Exclude from H3 processing
                     try self.h3.excluded_bidi_streams.put(stream_id, {});
 
-                    // If there's remaining data after the prefix, buffer it in WT buffer
+                    // Fuse: if there's data after the prefix, deliver it immediately
+                    // as stream_data instead of returning bidi_stream first (saves a poll cycle).
                     if (fbs.pos < data.len) {
                         const remaining = data[fbs.pos..];
-                        var buf = self.stream_bufs.getPtr(stream_id) orelse blk: {
-                            const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-                            try self.stream_bufs.put(stream_id, new_buf);
-                            break :blk self.stream_bufs.getPtr(stream_id).?;
+                        const owned = self.allocator.dupe(u8, remaining) catch {
+                            // Fall back to buffering
+                            var buf = self.stream_bufs.getPtr(stream_id) orelse blk: {
+                                const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                                try self.stream_bufs.put(stream_id, new_buf);
+                                break :blk self.stream_bufs.getPtr(stream_id).?;
+                            };
+                            try buf.appendSlice(self.allocator, remaining);
+                            return .{ .bidi_stream = .{
+                                .session_id = session_id,
+                                .stream_id = stream_id,
+                            } };
                         };
-                        try buf.appendSlice(self.allocator, remaining);
+                        return .{ .stream_data = .{
+                            .stream_id = stream_id,
+                            .data = owned,
+                        } };
                     }
 
                     return .{ .bidi_stream = .{
@@ -709,14 +733,15 @@ pub const WebTransportConnection = struct {
                         s.recv.stopSending(WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
                     }
                 }
+            } else {
+                // Not a WT stream — buffer for H3 to handle
+                var buf = self.h3.stream_bufs.getPtr(stream_id) orelse blk: {
+                    const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                    try self.h3.stream_bufs.put(stream_id, new_buf);
+                    break :blk self.h3.stream_bufs.getPtr(stream_id).?;
+                };
+                try buf.appendSlice(self.allocator, data);
             }
-            // Not a WT stream — buffer for H3 to handle
-            var buf = self.h3.stream_bufs.getPtr(stream_id) orelse blk: {
-                const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-                try self.h3.stream_bufs.put(stream_id, new_buf);
-                break :blk self.h3.stream_bufs.getPtr(stream_id).?;
-            };
-            try buf.appendSlice(self.allocator, data);
         }
         return null;
     }
@@ -1315,18 +1340,10 @@ test "WT integration: bidi stream with trailing data buffers remainder" {
     const stream = try setup.quic_conn.streams.getOrCreateStream(4);
     try stream.recv.handleStreamFrame(0, buf[0..total_len], false);
 
-    // First poll: bidi_stream event
+    // Fused poll: stream_data delivered directly (bidi identification + data in one step)
     const ev1 = try setup.wt.poll();
     try testing.expect(ev1 != null);
     switch (ev1.?) {
-        .bidi_stream => {},
-        else => return error.UnexpectedEvent,
-    }
-
-    // Second poll: stream_data with the buffered remainder
-    const ev2 = try setup.wt.poll();
-    try testing.expect(ev2 != null);
-    switch (ev2.?) {
         .stream_data => |sd| {
             try testing.expectEqual(@as(u64, 4), sd.stream_id);
             try testing.expectEqualStrings(extra, sd.data);
@@ -1377,7 +1394,6 @@ test "WT integration: poll receives datagram demuxed by session" {
         .datagram => |dg| {
             try testing.expectEqual(session_id, dg.session_id);
             try testing.expectEqualStrings("hello dgram", dg.data);
-            testing.allocator.free(dg.data);
         },
         else => return error.UnexpectedEvent,
     }

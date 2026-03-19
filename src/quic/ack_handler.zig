@@ -128,7 +128,11 @@ pub const AckResult = struct {
 /// Tracks sent packets and handles loss detection for a single packet number space.
 pub const SentPacketTracker = struct {
     allocator: Allocator,
-    sent_packets: std.AutoHashMap(u64, SentPacket),
+    /// Dense array-backed map: no tombstones on removal, so iterator() is always
+    /// O(count) not O(capacity). Critical for detectLostPackets() which iterates
+    /// on every ACK — with AutoHashMap, tombstone bloat after thousands of
+    /// insert/remove cycles caused progressive latency degradation.
+    sent_packets: std.AutoArrayHashMap(u64, SentPacket),
     largest_sent: ?u64 = null,
     largest_acked: ?u64 = null,
     loss_time: ?i64 = null,
@@ -140,7 +144,7 @@ pub const SentPacketTracker = struct {
     pub fn init(allocator: Allocator) SentPacketTracker {
         return .{
             .allocator = allocator,
-            .sent_packets = std.AutoHashMap(u64, SentPacket).init(allocator),
+            .sent_packets = std.AutoArrayHashMap(u64, SentPacket).init(allocator),
         };
     }
 
@@ -179,7 +183,7 @@ pub const SentPacketTracker = struct {
             const range_start = largest_ack -| first_ack_range;
             var pn = range_start;
             while (pn <= largest_ack) : (pn += 1) {
-                if (self.sent_packets.fetchRemove(pn)) |kv| {
+                if (self.sent_packets.fetchSwapRemove(pn)) |kv| {
                     const pkt = kv.value;
                     if (pkt.ack_eliciting) {
                         self.ack_eliciting_in_flight -|= 1;
@@ -200,7 +204,7 @@ pub const SentPacketTracker = struct {
         for (ack_ranges) |range| {
             var pn = range.start;
             while (pn <= range.end) : (pn += 1) {
-                if (self.sent_packets.fetchRemove(pn)) |kv| {
+                if (self.sent_packets.fetchSwapRemove(pn)) |kv| {
                     const pkt = kv.value;
                     if (pkt.ack_eliciting) {
                         self.ack_eliciting_in_flight -|= 1;
@@ -273,7 +277,7 @@ pub const SentPacketTracker = struct {
         }
 
         for (to_remove.constSlice()) |pn| {
-            _ = self.sent_packets.remove(pn);
+            _ = self.sent_packets.swapRemove(pn);
         }
 
         // Persistent congestion: if the time span of lost ack-eliciting packets

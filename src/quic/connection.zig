@@ -398,6 +398,21 @@ pub const DatagramQueue = struct {
         if (self.count == 0) return null;
         return self.getLen(self.head).*;
     }
+
+    /// Return a slice into the ring buffer entry without copying.
+    /// The slice is valid until the next pop() or consume() call.
+    pub fn peekData(self: *DatagramQueue) ?[]const u8 {
+        if (self.count == 0) return null;
+        const len = self.getLen(self.head).*;
+        return self.getBuf(self.head)[0..len];
+    }
+
+    /// Advance past the head entry (after peekData was used).
+    pub fn consume(self: *DatagramQueue) void {
+        if (self.count == 0) return;
+        self.head = (self.head + 1) % self.max_items;
+        self.count -= 1;
+    }
 };
 
 pub const ConnectionError = struct {
@@ -535,6 +550,14 @@ pub const Connection = struct {
     datagram_recv_queue: DatagramQueue = .{},
     datagram_send_queue: DatagramQueue = .{},
     datagrams_enabled: bool = false,
+
+    /// Optional zero-copy datagram callback. When set, incoming DATAGRAM frames
+    /// are delivered directly during packet processing (inside recv()) instead of
+    /// being copied to the ring buffer. The data slice points into the decrypted
+    /// packet buffer and is only valid for the duration of the callback.
+    /// This eliminates 2 memcpy operations per datagram on the receive path.
+    datagram_recv_callback: ?*const fn (data: []const u8, ctx: ?*anyopaque) void = null,
+    datagram_recv_ctx: ?*anyopaque = null,
 
     // draft-ietf-quic-ack-frequency
     peer_supports_ack_freq: bool = false,
@@ -1640,6 +1663,7 @@ pub const Connection = struct {
                         },
                         else => return err,
                     };
+                    if (s.fin) self.streams.needs_gc_scan = true;
 
                     // Check if stream is fully closed (both directions done)
                     if (s.fin and (strm.send.fin_sent or strm.send.reset_err != null) and !strm.closed_for_gc) {
@@ -1865,13 +1889,21 @@ pub const Connection = struct {
 
             .datagram => |d| {
                 if (self.datagrams_enabled) {
-                    _ = self.datagram_recv_queue.push(d.data);
+                    if (self.datagram_recv_callback) |cb| {
+                        cb(d.data, self.datagram_recv_ctx);
+                    } else {
+                        _ = self.datagram_recv_queue.push(d.data);
+                    }
                 }
             },
 
             .datagram_with_length => |d| {
                 if (self.datagrams_enabled) {
-                    _ = self.datagram_recv_queue.push(d.data);
+                    if (self.datagram_recv_callback) |cb| {
+                        cb(d.data, self.datagram_recv_ctx);
+                    } else {
+                        _ = self.datagram_recv_queue.push(d.data);
+                    }
                 }
             },
 
@@ -2241,16 +2273,12 @@ pub const Connection = struct {
                         self.packer.send_handshake_done = true;
                         self.handshake_done_pending = true;
 
-                        // draft-ietf-quic-ack-frequency: send ACK_FREQUENCY to reduce client ACK rate
-                        if (self.peer_supports_ack_freq) {
-                            self.pending_frames.push(.{ .ack_frequency = .{
-                                .sequence_number = self.ack_freq_send_seq,
-                                .ack_eliciting_threshold = 10,
-                                .request_max_ack_delay = 25000, // 25ms in microseconds
-                                .reordering_threshold = 1,
-                            } });
-                            self.ack_freq_send_seq += 1;
-                        }
+                        // draft-ietf-quic-ack-frequency: disabled for now.
+                        // Sending ACK_FREQUENCY changes the browser's ACK behavior,
+                        // which can negatively impact datagram latency in ping-pong patterns.
+                        // The RFC 9000 default (ACK every 2 ack-eliciting packets) works well
+                        // for interactive workloads. Re-enable for bulk transfer scenarios.
+                        // if (self.peer_supports_ack_freq) { ... }
                     }
                     // Client: Keep Handshake keys until HANDSHAKE_DONE received (RFC 9001 §4.9.2)
                     // This allows the client to ACK server's Handshake retransmissions under loss
@@ -3371,6 +3399,17 @@ pub const Connection = struct {
         return self.datagram_recv_queue.pop(buf);
     }
 
+    /// Zero-copy datagram receive: returns a slice into the internal ring buffer.
+    /// Caller MUST call consumeDatagram() after processing the data.
+    pub fn peekDatagram(self: *Connection) ?[]const u8 {
+        return self.datagram_recv_queue.peekData();
+    }
+
+    /// Advance past the datagram returned by peekDatagram().
+    pub fn consumeDatagram(self: *Connection) void {
+        self.datagram_recv_queue.consume();
+    }
+
     pub fn isClosed(self: *const Connection) bool {
         return self.state == .terminated;
     }
@@ -3452,6 +3491,16 @@ pub const Connection = struct {
             const timeout = sent_pkt.time_sent + pto_duration;
             if (earliest == null or timeout < earliest.?) {
                 earliest = timeout;
+            }
+        }
+
+        // ACK alarm: if we have pending ACKs to send (delayed ACK timer),
+        // include the alarm deadline so the event loop wakes up in time (RFC 9000 §13.2.1).
+        for (self.pkt_handler.recv) |tracker| {
+            if (tracker.ack_alarm) |alarm| {
+                if (earliest == null or alarm < earliest.?) {
+                    earliest = alarm;
+                }
             }
         }
 
