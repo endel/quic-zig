@@ -1345,7 +1345,12 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
                     }
 
-                    self.cc.onPacketAcked(pkt.size, pkt.time_sent);
+                    self.cc.onPacketAckedWithRtt(
+                        pkt.size,
+                        pkt.time_sent,
+                        self.pkt_handler.rtt_stats.latest_rtt,
+                        if (self.pkt_handler.sent[@intFromEnum(enc_level)].largest_sent) |ls| ls else null,
+                    );
 
                     // Track whether a packet sent with current keys has been ACKed
                     if (enc_level == .application) {
@@ -1452,7 +1457,12 @@ pub const Connection = struct {
                         self.pacer.max_datagram_size = new_mtu;
                         std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
                     }
-                    self.cc.onPacketAcked(pkt.size, pkt.time_sent);
+                    self.cc.onPacketAckedWithRtt(
+                        pkt.size,
+                        pkt.time_sent,
+                        self.pkt_handler.rtt_stats.latest_rtt,
+                        if (self.pkt_handler.sent[@intFromEnum(enc_level)].largest_sent) |ls| ls else null,
+                    );
 
                     // Stop including HANDSHAKE_DONE once a packet containing it is ACKed
                     if (pkt.has_handshake_done) {
