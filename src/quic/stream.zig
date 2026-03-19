@@ -154,7 +154,7 @@ pub const FrameSorter = struct {
         }
 
         if (self.chunks.get(self.read_pos)) |data| {
-            _ = self.chunks.orderedRemove(self.read_pos);
+            _ = self.chunks.swapRemove(self.read_pos);
             self.read_pos += data.len;
             return data;
         }
