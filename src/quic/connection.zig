@@ -2977,13 +2977,13 @@ pub const Connection = struct {
         }
 
         // Check idle timeout (RFC 9000 §10.1, §10.1.2)
-        // The effective idle timeout MUST be at least 3× the current PTO (with backoff)
-        // to avoid terminating the connection while waiting for backed-off retransmissions.
+        // The effective idle timeout MUST be at least 3× the *base* PTO (without backoff)
+        // to avoid terminating the connection before probes have a chance to be answered.
+        // Using base PTO (not backed-off) matches quic-go and quiche behavior: the idle
+        // timeout should not extend indefinitely as pto_count grows.
         {
-            var current_pto = self.pkt_handler.rtt_stats.pto();
-            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
-            current_pto = @min(current_pto << shift, 60_000_000_000); // cap at 60s
-            const effective_idle = @max(self.idle_timeout_ns, 3 * current_pto);
+            const base_pto = self.pkt_handler.rtt_stats.pto();
+            const effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
             // RFC 9000 §10.1.2: Before handshake confirmed, also defer idle timeout
             // when sending ack-eliciting packets (to avoid premature timeout during
             // handshake retransmission). After handshake confirmed, only received
@@ -3440,12 +3440,10 @@ pub const Connection = struct {
             return null;
         }
 
-        // Idle timeout
+        // Idle timeout — use base PTO (no backoff), matching quic-go/quiche
         {
-            var current_pto = self.pkt_handler.rtt_stats.pto();
-            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
-            current_pto = @min(current_pto << shift, 60_000_000_000);
-            const effective_idle = @max(self.idle_timeout_ns, 3 * current_pto);
+            const base_pto = self.pkt_handler.rtt_stats.pto();
+            const effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
             const last_activity = if (!self.handshake_confirmed)
                 @max(self.last_packet_received_time, self.last_packet_sent_time)
             else
