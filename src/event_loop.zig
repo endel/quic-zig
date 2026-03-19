@@ -901,7 +901,21 @@ pub fn Server(comptime Handler: type) type {
                 var send_count: usize = 0;
                 while (send_count < max_burst_packets) : (send_count += 1) {
                     const bytes_written = conn.send(&self.out_buf) catch break;
-                    if (bytes_written == 0) break;
+                    if (bytes_written == 0) {
+                        // Sub-ms pacing: if the pacer wants a short delay (< 1ms),
+                        // spin-wait here instead of returning to the event loop
+                        // which has only ms-resolution timers. This gives us ~µs
+                        // pacing precision similar to the kernel's hrtimer approach.
+                        if (conn.pacer.bandwidth_shifted > 0) {
+                            const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+                            const pacer_delay = conn.pacer.timeUntilSend(now_ns);
+                            if (pacer_delay > 0 and pacer_delay < 1_000_000) { // < 1ms
+                                std.Thread.sleep(@intCast(pacer_delay));
+                                continue; // Retry send after micro-sleep
+                            }
+                        }
+                        break;
+                    }
                     const send_addr = conn.peerAddress();
 
                     batch.add(
@@ -1710,7 +1724,18 @@ pub fn Client(comptime Handler: type) type {
             var send_count: usize = 0;
             while (send_count < max_burst_packets) : (send_count += 1) {
                 const bytes_written = conn.send(&self.out_buf) catch break;
-                if (bytes_written == 0) break;
+                if (bytes_written == 0) {
+                    // Sub-ms pacing spin-wait (see server tickAndSend for details)
+                    if (conn.pacer.bandwidth_shifted > 0) {
+                        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+                        const pacer_delay = conn.pacer.timeUntilSend(now_ns);
+                        if (pacer_delay > 0 and pacer_delay < 1_000_000) {
+                            std.Thread.sleep(@intCast(pacer_delay));
+                            continue;
+                        }
+                    }
+                    break;
+                }
                 self.batch.add(
                     self.out_buf[0..bytes_written],
                     @ptrCast(send_addr),
