@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>quic-zig WASM Demo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1117; color: #c9d1d9; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; padding: 20px; }
+  h1 { color: #58a6ff; font-size: 22px; margin-bottom: 4px; }
+  .subtitle { color: #8b949e; font-size: 13px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+  .panel h2 { color: #58a6ff; font-size: 15px; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  .status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
+  .status.idle { background: #484f58; }
+  .status.connecting { background: #d29922; }
+  .status.connected { background: #3fb950; }
+  .status.closed { background: #f85149; }
+  .info { color: #8b949e; font-size: 12px; margin-bottom: 8px; }
+  .log { background: #0d1117; border: 1px solid #21262d; border-radius: 4px; padding: 10px; height: 220px; overflow-y: auto; font-size: 12px; line-height: 1.6; }
+  .log .ts { color: #484f58; }
+  .log .info { color: #8b949e; margin: 0; }
+  .log .send { color: #3fb950; }
+  .log .recv { color: #58a6ff; }
+  .log .err { color: #f85149; }
+  .log .evt { color: #d2a8ff; }
+  .controls { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+  .controls h2 { color: #58a6ff; font-size: 15px; margin-bottom: 10px; }
+  .btn-row { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-family: inherit; font-size: 13px; transition: all 0.15s; }
+  button:hover { background: #30363d; border-color: #58a6ff; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: #238636; border-color: #238636; }
+  button.primary:hover { background: #2ea043; }
+  button.danger { background: #da3633; border-color: #da3633; }
+  button.danger:hover { background: #f85149; }
+  input[type="text"] { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; font-family: inherit; font-size: 13px; flex: 1; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+  .stat { background: #0d1117; border: 1px solid #21262d; border-radius: 4px; padding: 8px; text-align: center; }
+  .stat .label { color: #484f58; font-size: 11px; }
+  .stat .value { color: #c9d1d9; font-size: 18px; font-weight: bold; }
+  .diagram { text-align: center; padding: 10px; color: #484f58; font-size: 12px; white-space: pre; line-height: 1.4; }
+</style>
+</head>
+<body>
+
+<h1>quic-zig WASM Demo</h1>
+<p class="subtitle">Full QUIC + TLS 1.3 handshake running in your browser, zero network</p>
+
+<div class="diagram">WASM Client  &lt;----  JS Packet Router  ----&gt;  WASM Server
+(QUIC+TLS)       (simulated network)        (QUIC+TLS)</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2><span class="status idle" id="client-status"></span> Client</h2>
+    <div class="info" id="client-info">Not started</div>
+    <div class="log" id="client-log"></div>
+  </div>
+  <div class="panel">
+    <h2><span class="status idle" id="server-status"></span> Server</h2>
+    <div class="info" id="server-info">Not started</div>
+    <div class="log" id="server-log"></div>
+  </div>
+</div>
+
+<div class="controls">
+  <h2>Controls</h2>
+  <div class="btn-row">
+    <button id="btn-start" class="primary" onclick="startDemo()">Start Handshake</button>
+    <button id="btn-stop" class="danger" onclick="stopDemo()" disabled>Stop</button>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="label">Packets Exchanged</div><div class="value" id="stat-packets">0</div></div>
+    <div class="stat"><div class="label">Client State</div><div class="value" id="stat-client">idle</div></div>
+    <div class="stat"><div class="label">Server State</div><div class="value" id="stat-server">idle</div></div>
+  </div>
+</div>
+
+<script>
+// ---- WASM Loader & State ----
+
+let clientInstance = null;
+let serverInstance = null;
+let clientWasm = null;
+let serverWasm = null;
+let running = false;
+let rafId = null;
+let packetCount = 0;
+let startTime = 0;
+
+function now_ns() {
+  return BigInt(Math.round(performance.now() * 1_000_000));
+}
+
+function makeImports(role) {
+  return {
+    env: {
+      get_time_ns: () => now_ns(),
+      console_log: (ptr, len) => {
+        const mem = (role === 'client' ? clientInstance : serverInstance).exports.memory;
+        const bytes = new Uint8Array(mem.buffer, ptr, len);
+        const msg = new TextDecoder().decode(bytes);
+        log(role, 'info', msg);
+      },
+      random_fill: (ptr, len) => {
+        const mem = (role === 'client' ? clientInstance : serverInstance).exports.memory;
+        const bytes = new Uint8Array(mem.buffer, ptr, len);
+        crypto.getRandomValues(bytes);
+      },
+    },
+  };
+}
+
+// ---- Logging ----
+
+function log(role, cls, msg) {
+  const el = document.getElementById(role + '-log');
+  const ts = performance.now().toFixed(1);
+  const line = document.createElement('div');
+  line.innerHTML = `<span class="ts">[${ts}ms]</span> <span class="${cls}">${escapeHtml(msg)}</span>`;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function setStatus(role, state) {
+  const el = document.getElementById(role + '-status');
+  el.className = 'status ' + state;
+  document.getElementById('stat-' + role).textContent = state;
+  document.getElementById(role + '-info').textContent = state.charAt(0).toUpperCase() + state.slice(1);
+}
+
+// ---- Packet Router ----
+
+function drainPackets(sourceExports, sourceRole, destExports, destRole) {
+  const outBuf = 65536;
+  const outPtr = sourceExports.qz_alloc(outBuf);
+  if (!outPtr) return;
+
+  const totalBytes = sourceExports.qz_send_packets(outPtr, outBuf);
+  if (totalBytes === 0) {
+    sourceExports.qz_free(outPtr, outBuf);
+    return;
+  }
+
+  // Copy packet data out of WASM memory into JS before any further WASM calls
+  // (WASM memory.grow may detach the underlying ArrayBuffer)
+  const srcView = new Uint8Array(sourceExports.memory.buffer, outPtr, totalBytes);
+  const packetData = new Uint8Array(srcView); // copy to JS
+  sourceExports.qz_free(outPtr, outBuf);
+
+  let offset = 0;
+  while (offset + 4 <= totalBytes) {
+    const pktLen = (packetData[offset] << 24) | (packetData[offset+1] << 16) |
+                   (packetData[offset+2] << 8) | packetData[offset+3];
+    offset += 4;
+    if (offset + pktLen > totalBytes) break;
+
+    const pktSlice = packetData.slice(offset, offset + pktLen);
+
+    // Copy packet into dest WASM memory
+    const pktPtr = destExports.qz_alloc(pktLen);
+    if (!pktPtr) break;
+    // Re-create view after alloc (memory may have grown)
+    new Uint8Array(destExports.memory.buffer, pktPtr, pktLen).set(pktSlice);
+
+    destExports.qz_recv_packet(pktPtr, pktLen);
+    // Re-fetch buffer reference after recv (memory may have grown)
+    destExports.qz_free(pktPtr, pktLen);
+
+    packetCount++;
+    offset += pktLen;
+    log(sourceRole, 'send', `-> ${destRole}: ${pktLen} bytes`);
+    log(destRole, 'recv', `<- ${sourceRole}: ${pktLen} bytes`);
+  }
+
+  document.getElementById('stat-packets').textContent = packetCount;
+}
+
+function pollEvents(exports, role) {
+  const bufLen = 1024;
+  const bufPtr = exports.qz_alloc(bufLen);
+  if (!bufPtr) return;
+
+  while (true) {
+    const n = exports.qz_poll_event(bufPtr, bufLen);
+    if (n === 0) break;
+    // Re-create view after poll (memory may have grown)
+    const data = new Uint8Array(exports.memory.buffer, bufPtr, n);
+    const evtType = data[0];
+
+    switch (evtType) {
+      case 0x01: // EVT_ESTABLISHED
+        log(role, 'evt', 'Connection established!');
+        setStatus(role, 'connected');
+        break;
+      case 0x02: // EVT_CLOSED
+        log(role, 'evt', 'Connection closed');
+        setStatus(role, 'closed');
+        break;
+      case 0x03: // EVT_STREAM_DATA
+        log(role, 'evt', 'Stream data event');
+        break;
+      case 0x05: // EVT_WT_SESSION
+        log(role, 'evt', 'WebTransport session request');
+        break;
+      default:
+        log(role, 'evt', `Event type: 0x${evtType.toString(16)}`);
+    }
+  }
+  exports.qz_free(bufPtr, bufLen);
+}
+
+// ---- Main Loop ----
+
+let prevClientEstablished = false;
+let prevServerEstablished = false;
+
+function tick() {
+  if (!running) return;
+
+  const ce = clientWasm;
+  const se = serverWasm;
+
+  try {
+    // Check timeouts
+    ce.qz_on_timeout();
+    se.qz_on_timeout();
+
+    // Route packets: client -> server
+    drainPackets(ce, 'client', se, 'server');
+
+    // Route packets: server -> client
+    drainPackets(se, 'server', ce, 'client');
+
+    // Poll events
+    pollEvents(ce, 'client');
+    pollEvents(se, 'server');
+
+    // Update status based on state
+    const clientEstablished = ce.qz_is_established();
+    const serverEstablished = se.qz_is_established();
+
+    if (clientEstablished && !prevClientEstablished) {
+      setStatus('client', 'connected');
+      log('client', 'evt', 'TLS 1.3 handshake complete!');
+    }
+    if (serverEstablished && !prevServerEstablished) {
+      setStatus('server', 'connected');
+      log('server', 'evt', 'TLS 1.3 handshake complete!');
+    }
+    prevClientEstablished = clientEstablished;
+    prevServerEstablished = serverEstablished;
+
+    if (ce.qz_is_closed()) setStatus('client', 'closed');
+    if (se.qz_is_closed()) setStatus('server', 'closed');
+
+    // Keep running for ongoing packet exchange
+    if (!ce.qz_is_closed() || !se.qz_is_closed()) {
+      rafId = requestAnimationFrame(tick);
+    } else {
+      log('client', 'info', 'Demo complete');
+      running = false;
+      document.getElementById('btn-start').disabled = false;
+      document.getElementById('btn-stop').disabled = true;
+    }
+  } catch (e) {
+    console.error('WASM error:', e.message);
+    log('client', 'err', 'Error: ' + e.message);
+    running = false;
+    document.getElementById('btn-start').disabled = false;
+    document.getElementById('btn-stop').disabled = true;
+  }
+}
+
+// ---- Demo Control ----
+
+async function startDemo() {
+  document.getElementById('btn-start').disabled = true;
+  document.getElementById('btn-stop').disabled = false;
+  document.getElementById('client-log').innerHTML = '';
+  document.getElementById('server-log').innerHTML = '';
+  packetCount = 0;
+  prevClientEstablished = false;
+  prevServerEstablished = false;
+  document.getElementById('stat-packets').textContent = '0';
+
+  try {
+    log('client', 'info', 'Loading WASM module...');
+    log('server', 'info', 'Loading WASM module...');
+
+    const wasmBytes = await fetch('quic.wasm').then(r => r.arrayBuffer());
+
+    // Instantiate two separate WASM instances
+    const serverResult = await WebAssembly.instantiate(wasmBytes, makeImports('server'));
+    serverInstance = serverResult.instance;
+    serverWasm = serverInstance.exports;
+
+    const clientResult = await WebAssembly.instantiate(wasmBytes, makeImports('client'));
+    clientInstance = clientResult.instance;
+    clientWasm = clientInstance.exports;
+
+    log('server', 'info', `WASM loaded (${(wasmBytes.byteLength / 1024).toFixed(0)} KB)`);
+    log('client', 'info', `WASM loaded (${(wasmBytes.byteLength / 1024).toFixed(0)} KB)`);
+
+    // Init server first
+    const serverRet = serverWasm.qz_init_server();
+    if (serverRet !== 0) throw new Error('Server init failed: ' + serverRet);
+    log('server', 'info', 'Server initialized, waiting for connection...');
+    setStatus('server', 'idle');
+
+    // Init client (generates ClientHello)
+    const clientRet = clientWasm.qz_init_client();
+    if (clientRet !== 0) throw new Error('Client init failed: ' + clientRet);
+    log('client', 'info', 'Client initialized, starting handshake...');
+    setStatus('client', 'connecting');
+    setStatus('server', 'connecting');
+
+    running = true;
+    startTime = performance.now();
+    rafId = requestAnimationFrame(tick);
+
+  } catch (e) {
+    log('client', 'err', 'Error: ' + e.message);
+    console.error(e);
+    document.getElementById('btn-start').disabled = false;
+    document.getElementById('btn-stop').disabled = true;
+  }
+}
+
+function stopDemo() {
+  running = false;
+  if (rafId) cancelAnimationFrame(rafId);
+  if (clientWasm) clientWasm.qz_deinit();
+  if (serverWasm) serverWasm.qz_deinit();
+  setStatus('client', 'closed');
+  setStatus('server', 'closed');
+  log('client', 'info', 'Stopped');
+  log('server', 'info', 'Stopped');
+  document.getElementById('btn-start').disabled = false;
+  document.getElementById('btn-stop').disabled = true;
+}
+</script>
+
+</body>
+</html>

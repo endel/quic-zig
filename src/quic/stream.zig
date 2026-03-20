@@ -101,7 +101,7 @@ pub const FrameSorter = struct {
         var effective_data = data;
         if (offset < self.read_pos) {
             const skip = self.read_pos - offset;
-            effective_data = data[skip..];
+            effective_data = data[@as(usize, @intCast(skip))..];
             effective_offset = self.read_pos;
         }
 
@@ -473,7 +473,7 @@ pub const SendStream = struct {
 
         // Save the original offset before modifying the range
         const frame_offset = range.offset;
-        const data = if (data_len > 0) buffered[frame_offset..][0..data_len] else &[_]u8{};
+        const data = if (data_len > 0) buffered[@as(usize, @intCast(frame_offset))..][0..@as(usize, @intCast(data_len))] else &[_]u8{};
         // FIN should be set if this range had FIN and we're sending all of its data
         const fin = range.fin and (frame_offset + data_len == self.write_offset);
 
@@ -525,7 +525,7 @@ pub const SendStream = struct {
         // and would cause the receiver to interpret following frame bytes as stream data
         if (data_len == 0 and !fin) return null;
 
-        const data = if (data_len > 0) buffered[unsent_start..][0..data_len] else &[_]u8{};
+        const data = if (data_len > 0) buffered[@as(usize, @intCast(unsent_start))..][0..@as(usize, @intCast(data_len))] else &[_]u8{};
 
         self.send_offset += data_len;
         if (fin) self.fin_sent = true;
@@ -863,7 +863,7 @@ pub const StreamsMap = struct {
             if (rotation > 0) {
                 var tmp: [MAX_SCHEDULABLE]*Stream = undefined;
                 for (0..count) |i| {
-                    tmp[i] = out[(i + rotation) % count];
+                    tmp[i] = out[@as(usize, @intCast((i + rotation) % count))];
                 }
                 for (0..count) |i| {
                     out[i] = tmp[i];

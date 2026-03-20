@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 
-const posix = std.posix;
+const platform = @import("platform.zig");
 
 const packet = @import("packet.zig");
 const protocol = @import("protocol.zig");
@@ -53,9 +53,9 @@ pub const PreferredAddress = struct {
         return self.cid_buf[0..self.cid_len];
     }
 
-    pub fn toSockaddrV4(self: *const PreferredAddress) posix.sockaddr.storage {
-        var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-        const addr_in: *posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+    pub fn toSockaddrV4(self: *const PreferredAddress) platform.sockaddr_storage {
+        var storage: platform.sockaddr_storage = std.mem.zeroes(platform.sockaddr_storage);
+        const addr_in: *platform.sockaddr_in = @ptrCast(@alignCast(&storage));
         addr_in.* = .{
             .port = std.mem.nativeToBig(u16, self.ipv4_port),
             .addr = @bitCast(self.ipv4_addr),
@@ -63,9 +63,9 @@ pub const PreferredAddress = struct {
         return storage;
     }
 
-    pub fn toSockaddrV6(self: *const PreferredAddress) posix.sockaddr.storage {
-        var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-        const addr_in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+    pub fn toSockaddrV6(self: *const PreferredAddress) platform.sockaddr_storage {
+        var storage: platform.sockaddr_storage = std.mem.zeroes(platform.sockaddr_storage);
+        const addr_in6: *platform.sockaddr_in6 = @ptrCast(@alignCast(&storage));
         addr_in6.port = std.mem.nativeToBig(u16, self.ipv6_port);
         addr_in6.addr = self.ipv6_addr;
         return storage;
@@ -235,7 +235,7 @@ pub const TransportParams = struct {
             const grease_val_len: u64 = @as(u64, grease_entropy[1] & 0x03) + 1;
             try packet.writeVarInt(writer, grease_id);
             try packet.writeVarInt(writer, grease_val_len);
-            try writer.writeAll(grease_entropy[2..][0..grease_val_len]);
+            try writer.writeAll(grease_entropy[2..][0..@as(usize, @intCast(grease_val_len))]);
         }
 
         // RFC 9368: version_information
@@ -259,7 +259,8 @@ pub const TransportParams = struct {
 
         while (fbs.pos < data.len) {
             const param_id = try packet.readVarInt(reader);
-            const param_len = try packet.readVarInt(reader);
+            const param_len_raw = try packet.readVarInt(reader);
+            const param_len: usize = @intCast(param_len_raw);
             const param_start = fbs.pos;
 
             switch (param_id) {
@@ -470,8 +471,8 @@ test "PreferredAddress: toSockaddrV4" {
     try testing.expect(!pref.hasIpv6());
 
     const sa = pref.toSockaddrV4();
-    const sa_in: *const posix.sockaddr.in = @ptrCast(@alignCast(&sa));
-    try testing.expectEqual(posix.AF.INET, sa_in.family);
+    const sa_in: *const platform.sockaddr_in = @ptrCast(@alignCast(&sa));
+    try testing.expectEqual(platform.AF.INET, sa_in.family);
     try testing.expectEqual(std.mem.nativeToBig(u16, 4433), sa_in.port);
 }
 

@@ -308,7 +308,7 @@ pub const Frame = union(FrameType) {
                 return .{
                     .crypto = .{
                         .offset = offset,
-                        .data = bytes[stream.pos..(stream.pos + length)],
+                        .data = bytes[stream.pos..][0..@as(usize, @intCast(length))],
                     },
                 };
             },
@@ -317,7 +317,7 @@ pub const Frame = union(FrameType) {
             0x07 => {
                 const len = try packet.readVarInt(reader);
                 return .{
-                    .new_token = bytes[stream.pos..(stream.pos + len)],
+                    .new_token = bytes[stream.pos..][0..@as(usize, @intCast(len))],
                 };
             },
 
@@ -439,7 +439,7 @@ pub const Frame = union(FrameType) {
                     .frame_type = try packet.readVarInt(reader),
                     .reason = blk: {
                         const len = try packet.readVarInt(reader);
-                        break :blk bytes[stream.pos..(stream.pos + len)];
+                        break :blk bytes[stream.pos..][0..@as(usize, @intCast(len))];
                     },
                 },
             },
@@ -450,7 +450,7 @@ pub const Frame = union(FrameType) {
                     .error_code = try packet.readVarInt(reader),
                     .reason = blk: {
                         const len = try packet.readVarInt(reader);
-                        break :blk bytes[stream.pos..(stream.pos + len)];
+                        break :blk bytes[stream.pos..][0..@as(usize, @intCast(len))];
                     },
                 },
             },

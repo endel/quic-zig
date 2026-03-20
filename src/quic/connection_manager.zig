@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const posix = std.posix;
+const platform = @import("platform.zig");
 const io = std.io;
 
 const connection = @import("connection.zig");
@@ -152,8 +152,8 @@ pub const ConnectionManager = struct {
     pub fn acceptConnection(
         self: *ConnectionManager,
         header: packet.Header,
-        local: posix.sockaddr.storage,
-        remote: posix.sockaddr.storage,
+        local: platform.sockaddr_storage,
+        remote: platform.sockaddr_storage,
         odcid: ?[]const u8,
         retry_scid: ?[]const u8,
     ) !*ConnEntry {
@@ -261,8 +261,8 @@ pub const ConnectionManager = struct {
     pub fn recvDatagram(
         self: *ConnectionManager,
         bytes: []u8,
-        from: posix.sockaddr.storage,
-        local: posix.sockaddr.storage,
+        from: platform.sockaddr_storage,
+        local: platform.sockaddr_storage,
         ecn_val: u2,
         out_buf: []u8,
     ) RecvAction {

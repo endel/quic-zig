@@ -175,7 +175,8 @@ fn decodeInteger(data: []const u8, pos: *usize, prefix_bits: u4) !usize {
     while (pos.* < data.len) {
         const b = data[pos.*];
         pos.* += 1;
-        value += @as(usize, b & 0x7f) << shift;
+        const shift_clamped = @as(std.math.Log2Int(usize), @intCast(@min(shift, @bitSizeOf(usize) - 1)));
+        value += @as(usize, b & 0x7f) << shift_clamped;
         if (b & 0x80 == 0) return value;
         shift += 7;
     }
@@ -320,7 +321,7 @@ pub const DynamicTable = struct {
         // The newest entry is at (head - 1), abs_idx = insert_count - 1
         // offset from newest = (insert_count - 1) - abs_idx
         const offset_from_newest = self.insert_count - 1 - abs_idx;
-        const ring_idx = (self.head + MAX_ENTRIES - 1 - offset_from_newest) % MAX_ENTRIES;
+        const ring_idx = @as(usize, @intCast((self.head + MAX_ENTRIES - 1 - offset_from_newest) % MAX_ENTRIES));
         return &self.entries[ring_idx];
     }
 
@@ -836,7 +837,7 @@ pub const QpackDecoder = struct {
         var pos = self.instruction_len;
         if (pos + 8 > self.instruction_buf.len) return;
         // Header Ack: 1XXXXXXX — 7-bit stream ID
-        encodeInteger(&self.instruction_buf, &pos, stream_id, 7, 0x80);
+        encodeInteger(&self.instruction_buf, &pos, @as(usize, @intCast(stream_id)), 7, 0x80);
         self.instruction_len = pos;
     }
 

@@ -150,7 +150,7 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
     const length = packet.readVarInt(reader) catch return error.BufferTooShort;
 
     const header_size = fbs.pos;
-    const total_size = header_size + length;
+    const total_size: usize = header_size + @as(usize, @intCast(length));
 
     if (data.len < total_size) return error.BufferTooShort;
 

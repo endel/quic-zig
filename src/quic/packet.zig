@@ -1,8 +1,7 @@
 const std = @import("std");
 const io = std.io;
-const posix = std.posix;
+const platform = @import("platform.zig");
 const log = std.log;
-const time = std.time;
 const assert = std.debug.assert;
 const random = std.crypto.random;
 // const tls = std.crypto.tls;
@@ -539,11 +538,11 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
 
                 const token_length = try readVarInt(reader);
                 if (token_length > 0) {
-                    header.token = fbs.buffer[fbs.pos..(fbs.pos + token_length)];
+                    header.token = fbs.buffer[fbs.pos..][0..@as(usize, @intCast(token_length))];
                     try fbs.seekBy(@intCast(token_length));
                 }
 
-                header.remainder_len = try readVarInt(reader);
+                header.remainder_len = @intCast(try readVarInt(reader));
             },
 
             PacketType.retry => {
@@ -560,7 +559,7 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
 
             PacketType.handshake, PacketType.zero_rtt => {
                 // Long header packets (like Initial but without Token field)
-                header.remainder_len = try readVarInt(reader);
+                header.remainder_len = @intCast(try readVarInt(reader));
             },
 
             PacketType.one_rtt => {
@@ -575,7 +574,7 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
 
             else => {
                 std.log.err("Packet type not recognized: {any}", .{header.packet_type});
-                header.remainder_len = try readVarInt(reader);
+                header.remainder_len = @intCast(try readVarInt(reader));
             },
         }
     } else {
@@ -703,7 +702,7 @@ pub const TOKEN_MAX_PLAINTEXT_LEN = 1 + 20 + 1 + 20 + 8 + 14; // 64
 pub const TOKEN_MAX_LEN = TOKEN_NONCE_LEN + TOKEN_MAX_PLAINTEXT_LEN + TOKEN_TAG_LEN; // 92
 
 /// Extract the 14 address-data bytes from a sockaddr.storage (same layout as sockaddr.data).
-fn addrDataBytes(addr: *const posix.sockaddr.storage) *const [14]u8 {
+fn addrDataBytes(addr: *const platform.sockaddr_storage) *const [14]u8 {
     const raw: [*]const u8 = @ptrCast(addr);
     return raw[2..16];
 }
@@ -712,7 +711,7 @@ pub fn generateRetryToken(
     out: []u8,
     odcid: []const u8,
     retry_scid: []const u8,
-    client_addr: posix.sockaddr.storage,
+    client_addr: platform.sockaddr_storage,
     token_key: [crypto.key_len]u8,
 ) !usize {
     if (out.len < TOKEN_MAX_LEN) return error.BufferTooSmall;
@@ -730,7 +729,7 @@ pub fn generateRetryToken(
     try pt_writer.writeAll(odcid);
     try pt_writer.writeByte(@intCast(retry_scid.len));
     try pt_writer.writeAll(retry_scid);
-    const now: i64 = @intCast(time.nanoTimestamp());
+    const now: i64 = platform.nanoTimestamp();
     try pt_writer.writeInt(i64, now, ENDIAN);
     // Write first 14 bytes of sockaddr.data (covers IPv4 port+addr)
     try pt_writer.writeAll(addrDataBytes(&client_addr));
@@ -772,11 +771,11 @@ pub const ValidatedToken = struct {
 };
 
 // Token validity duration: 60 seconds
-const TOKEN_MAX_AGE_NS: i64 = 60 * std.time.ns_per_s;
+const TOKEN_MAX_AGE_NS: i64 = 60 * platform.ns_per_s;
 
 pub fn validateRetryToken(
     token_data: []const u8,
-    client_addr: posix.sockaddr.storage,
+    client_addr: platform.sockaddr_storage,
     token_key: [crypto.key_len]u8,
 ) !?ValidatedToken {
     if (token_data.len < TOKEN_NONCE_LEN + TOKEN_TAG_LEN + 2) return null;
@@ -815,7 +814,7 @@ pub fn validateRetryToken(
 
     // Read timestamp and check age
     const timestamp = pt_reader.readInt(i64, ENDIAN) catch return null;
-    const now: i64 = @intCast(time.nanoTimestamp());
+    const now: i64 = platform.nanoTimestamp();
     if (now - timestamp > TOKEN_MAX_AGE_NS or timestamp > now) return null;
 
     // Check address
@@ -835,7 +834,7 @@ const NEW_TOKEN_MAX_LEN: usize = TOKEN_NONCE_LEN + NEW_TOKEN_PLAINTEXT_LEN + TOK
 
 pub fn generateNewToken(
     out: []u8,
-    client_addr: posix.sockaddr.storage,
+    client_addr: platform.sockaddr_storage,
     token_key: [crypto.key_len]u8,
 ) !usize {
     if (out.len < NEW_TOKEN_MAX_LEN) return error.BufferTooSmall;
@@ -847,7 +846,7 @@ pub fn generateNewToken(
     var plaintext: [NEW_TOKEN_PLAINTEXT_LEN]u8 = undefined;
     var pt_fbs = io.fixedBufferStream(&plaintext);
     const pt_writer = pt_fbs.writer();
-    const now: i64 = @intCast(time.nanoTimestamp());
+    const now: i64 = platform.nanoTimestamp();
     try pt_writer.writeInt(i64, now, ENDIAN);
     try pt_writer.writeAll(addrDataBytes(&client_addr));
 
@@ -870,7 +869,7 @@ pub fn generateNewToken(
 
 pub fn validateNewToken(
     token_data: []const u8,
-    client_addr: posix.sockaddr.storage,
+    client_addr: platform.sockaddr_storage,
     token_key: [crypto.key_len]u8,
 ) bool {
     if (token_data.len != NEW_TOKEN_MAX_LEN) return false;
@@ -893,7 +892,7 @@ pub fn validateNewToken(
     const pt_reader = pt_fbs.reader();
 
     const timestamp = pt_reader.readInt(i64, ENDIAN) catch return false;
-    const now: i64 = @intCast(time.nanoTimestamp());
+    const now: i64 = platform.nanoTimestamp();
     if (now - timestamp > TOKEN_MAX_AGE_NS or timestamp > now) return false;
 
     var addr_data: [14]u8 = undefined;
@@ -1049,8 +1048,8 @@ test "Retry token: generate and validate roundtrip" {
 
     const odcid = &[_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
     const retry_scid = &[_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
-    var addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-    addr.family = posix.AF.INET;
+    var addr: platform.sockaddr_storage = std.mem.zeroes(platform.sockaddr_storage);
+    addr.family = platform.AF.INET;
     addr.padding[0] = 0x11; // port high byte
     addr.padding[1] = 0x51; // port low byte
     addr.padding[2] = 127;
@@ -1076,8 +1075,8 @@ test "Retry token: wrong address rejected" {
 
     const odcid = &[_]u8{ 0x01, 0x02, 0x03, 0x04 };
     const retry_scid = &[_]u8{ 0x11, 0x12, 0x13, 0x14 };
-    var addr1: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-    addr1.family = posix.AF.INET;
+    var addr1: platform.sockaddr_storage = std.mem.zeroes(platform.sockaddr_storage);
+    addr1.family = platform.AF.INET;
     addr1.padding[2] = 127;
     addr1.padding[5] = 1;
 
@@ -1098,8 +1097,8 @@ test "Retry token: wrong key rejected" {
 
     const odcid = &[_]u8{ 0x01, 0x02, 0x03, 0x04 };
     const retry_scid = &[_]u8{ 0x11, 0x12, 0x13, 0x14 };
-    var addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-    addr.family = posix.AF.INET;
+    var addr: platform.sockaddr_storage = std.mem.zeroes(platform.sockaddr_storage);
+    addr.family = platform.AF.INET;
 
     var out: [TOKEN_MAX_LEN]u8 = undefined;
     const token_len = try generateRetryToken(&out, odcid, retry_scid, addr, token_key);

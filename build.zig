@@ -117,6 +117,13 @@ pub fn build(b: *std.Build) void {
     run_wt_browser.step.dependOn(b.getInstallStep());
     b.step("run-wt-browser-server", "Run WebTransport browser server").dependOn(&run_wt_browser.step);
 
+    // WebTransport browser server (manual, no event loop)
+    const exe_wt_browser_manual = App.add(b, "wt-browser-server-manual", "apps/wt_browser_server_manual.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_wt_browser_manual);
+    const run_wt_browser_manual = b.addRunArtifact(exe_wt_browser_manual);
+    run_wt_browser_manual.step.dependOn(b.getInstallStep());
+    b.step("run-wt-browser-server-manual", "Run WebTransport browser server (manual)").dependOn(&run_wt_browser_manual.step);
+
     // WebTransport echo server (production deployment)
     const exe_wt_echo = App.add(b, "wt-echo-server", "apps/wt_echo_server.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_wt_echo);
@@ -223,4 +230,36 @@ pub fn build(b: *std.Build) void {
     });
     const run_fuzz = b.addRunArtifact(exe_fuzz);
     b.step("fuzz", "Run fuzz tests").dependOn(&run_fuzz.step);
+
+    // WASM build — compiles QUIC state machine to wasm32-freestanding
+    {
+        const wasm_target = b.resolveTargetQuery(.{
+            .cpu_arch = .wasm32,
+            .os_tag = .freestanding,
+        });
+
+        const wasm_core_mod = b.addModule("quic_core", .{
+            .root_source_file = b.path("src/quic_core.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+        });
+
+        const wasm_exe = b.addExecutable(.{
+            .name = "quic",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/wasm_api.zig"),
+                .target = wasm_target,
+                .optimize = .ReleaseSmall,
+                .imports = &.{.{ .name = "quic_core", .module = wasm_core_mod }},
+            }),
+        });
+        wasm_exe.entry = .disabled;
+        wasm_exe.rdynamic = true;
+        wasm_exe.stack_size = 5 * 1024 * 1024; // 5MB stack for TLS handshake + deep QUIC call chains
+
+        const wasm_install = b.addInstallArtifact(wasm_exe, .{
+            .dest_dir = .{ .override = .{ .custom = "../wasm" } },
+        });
+        b.step("wasm", "Build WASM QUIC state machine").dependOn(&wasm_install.step);
+    }
 }

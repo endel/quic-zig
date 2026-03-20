@@ -1,6 +1,6 @@
 const std = @import("std");
 const net = std.net;
-const posix = std.posix;
+const platform = @import("platform.zig");
 const crypto = std.crypto;
 
 const protocol = @import("protocol.zig");
@@ -52,7 +52,7 @@ pub const PathValidator = struct {
     pub fn startChallenge(self: *PathValidator) [8]u8 {
         crypto.random.bytes(&self.challenge_data);
         self.state = .pending;
-        self.challenge_sent_time = @intCast(std.time.nanoTimestamp());
+        self.challenge_sent_time = platform.nanoTimestamp();
         self.retries = 0;
         return self.challenge_data;
     }
@@ -85,13 +85,13 @@ pub const PathValidator = struct {
 
     pub fn retry(self: *PathValidator) void {
         self.retries += 1;
-        self.challenge_sent_time = @intCast(std.time.nanoTimestamp());
+        self.challenge_sent_time = platform.nanoTimestamp();
     }
 };
 
 pub const NetworkPath = struct {
-    local_addr: posix.sockaddr.storage,
-    peer_addr: posix.sockaddr.storage,
+    local_addr: platform.sockaddr_storage,
+    peer_addr: platform.sockaddr_storage,
     is_initial: bool,
 
     /// Bytes received on this path (for amplification limit).
@@ -107,8 +107,8 @@ pub const NetworkPath = struct {
     validator: PathValidator = .{},
 
     pub fn init(
-        local_addr: posix.sockaddr.storage,
-        peer_addr: posix.sockaddr.storage,
+        local_addr: platform.sockaddr_storage,
+        peer_addr: platform.sockaddr_storage,
         is_initial: bool,
     ) NetworkPath {
         return .{
@@ -428,8 +428,8 @@ pub const ECN_ECT0: u2 = 0b10;
 pub const ECN_CE: u2 = 0b11;
 
 pub const RecvInfo = struct {
-    to: posix.sockaddr.storage,
-    from: posix.sockaddr.storage,
+    to: platform.sockaddr_storage,
+    from: platform.sockaddr_storage,
     // ECN codepoint from IP header (0=Not-ECT, 1=ECT(1), 2=ECT(0), 3=CE)
     ecn: u2 = ECN_NOT_ECT,
     // Size of the UDP datagram (for amplification limit accounting).
@@ -630,8 +630,8 @@ pub const Connection = struct {
     pub fn accept(
         allocator: std.mem.Allocator,
         header: packet.Header,
-        local: posix.sockaddr.storage,
-        remote: posix.sockaddr.storage,
+        local: platform.sockaddr_storage,
+        remote: platform.sockaddr_storage,
         comptime is_server: bool,
         config: ConnectionConfig,
         tls_config: ?tls13.TlsConfig,
@@ -643,7 +643,7 @@ pub const Connection = struct {
         if (odcid != null) {
             initial_path.is_validated = true;
         }
-        const now: i64 = @intCast(std.time.nanoTimestamp());
+        const now: i64 = platform.nanoTimestamp();
 
         var conn = Connection{
             .allocator = allocator,
@@ -817,7 +817,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         if (self.qlog_writer) |*ql| {
-            const now: i64 = @intCast(std.time.nanoTimestamp());
+            const now: i64 = platform.nanoTimestamp();
             ql.connectionClosed(now, "application", 0);
             ql.deinit();
             self.qlog_writer = null;
@@ -940,12 +940,12 @@ pub const Connection = struct {
         // Guard: don't process packets in terminal states (RFC 9000 §10)
         if (self.state == .terminated) return;
         if (self.state == .draining) {
-            self.last_packet_received_time = @intCast(std.time.nanoTimestamp());
+            self.last_packet_received_time = platform.nanoTimestamp();
             return;
         }
         if (self.state == .closing) {
             self.needs_close_retransmit = true;
-            self.last_packet_received_time = @intCast(std.time.nanoTimestamp());
+            self.last_packet_received_time = platform.nanoTimestamp();
             return;
         }
 
@@ -1005,7 +1005,7 @@ pub const Connection = struct {
                 return error.InvalidPacket;
             }
 
-            const now: i64 = @intCast(std.time.nanoTimestamp());
+            const now: i64 = platform.nanoTimestamp();
             self.last_packet_received_time = now;
             self.keep_alive_ping_sent = false;
             if (info.datagram_size > 0) {
@@ -1077,7 +1077,7 @@ pub const Connection = struct {
             return error.ProtocolViolation;
         }
 
-        const now: i64 = @intCast(std.time.nanoTimestamp());
+        const now: i64 = platform.nanoTimestamp();
         self.last_packet_received_time = now;
         self.keep_alive_ping_sent = false;
 
@@ -2201,14 +2201,14 @@ pub const Connection = struct {
                                 }
                             }
                             if (self.qlog_writer) |*ql| {
-                                const now_ql: i64 = @intCast(std.time.nanoTimestamp());
+                                const now_ql: i64 = platform.nanoTimestamp();
                                 ql.keyUpdated(now_ql, "tls", if (self.is_server) "server_0rtt_secret" else "client_0rtt_secret");
                             }
                         },
                         .handshake => {
                             self.installHandshakeKeys(ik.open, ik.seal);
                             if (self.qlog_writer) |*ql| {
-                                const now_ql: i64 = @intCast(std.time.nanoTimestamp());
+                                const now_ql: i64 = platform.nanoTimestamp();
                                 ql.keyUpdated(now_ql, "tls", "server_handshake_secret");
                                 ql.keyUpdated(now_ql, "tls", "client_handshake_secret");
                             }
@@ -2221,7 +2221,7 @@ pub const Connection = struct {
                         .application => {
                             self.installAppKeys(ik.open, ik.seal);
                             if (self.qlog_writer) |*ql| {
-                                const now_ql: i64 = @intCast(std.time.nanoTimestamp());
+                                const now_ql: i64 = platform.nanoTimestamp();
                                 ql.keyUpdated(now_ql, "tls", "server_1rtt_secret");
                                 ql.keyUpdated(now_ql, "tls", "client_1rtt_secret");
                             }
@@ -2623,7 +2623,7 @@ pub const Connection = struct {
         // Draining/terminated: do not send anything
         if (self.state == .draining or self.state == .terminated) return 0;
 
-        const now: i64 = @intCast(std.time.nanoTimestamp());
+        const now: i64 = platform.nanoTimestamp();
 
         // Closing: retransmit saved close packet on each incoming packet (RFC 9000 §10.2.1)
         if (self.state == .closing) {
@@ -2726,7 +2726,7 @@ pub const Connection = struct {
                 if (active_path.bytes_sent >= budget) return 0;
                 const remaining = budget - active_path.bytes_sent;
                 if (remaining < out_buf.len) {
-                    send_buf = out_buf[0..remaining];
+                    send_buf = out_buf[0..@as(usize, @intCast(remaining))];
                 }
             }
         }
@@ -2867,7 +2867,7 @@ pub const Connection = struct {
                 if (active_path.bytes_sent >= budget) return 0;
                 const remaining = budget - active_path.bytes_sent;
                 if (remaining < out_buf.len) {
-                    send_buf = out_buf[0..remaining];
+                    send_buf = out_buf[0..@as(usize, @intCast(remaining))];
                 }
             }
         }
@@ -2908,7 +2908,7 @@ pub const Connection = struct {
 
     /// Handle connection migration (RFC 9000 Section 9).
     /// Called when a 1-RTT packet with non-probing frames arrives from a different address.
-    fn handleMigration(self: *Connection, new_peer_addr: posix.sockaddr.storage, local_addr: posix.sockaddr.storage, now: i64) void {
+    fn handleMigration(self: *Connection, new_peer_addr: platform.sockaddr_storage, local_addr: platform.sockaddr_storage, now: i64) void {
         // Check if peer disabled active migration
         if (self.peer_params) |pp| {
             if (pp.disable_active_migration) {
@@ -2961,7 +2961,7 @@ pub const Connection = struct {
     pub fn onTimeout(self: *Connection) !void {
         if (self.state == .terminated) return;
 
-        const now: i64 = @intCast(std.time.nanoTimestamp());
+        const now: i64 = platform.nanoTimestamp();
 
         // Closing/draining: wait 3×PTO then terminate (RFC 9000 §10.2)
         if (self.state == .closing or self.state == .draining) {
@@ -3217,7 +3217,7 @@ pub const Connection = struct {
     pub fn close(self: *Connection, error_code: u64, reason: []const u8) void {
         if (self.state == .closing or self.state == .draining or self.state == .terminated) return;
         self.state = .closing;
-        self.closing_start_time = @intCast(std.time.nanoTimestamp());
+        self.closing_start_time = platform.nanoTimestamp();
         self.local_err = .{
             .is_app = true,
             .code = error_code,
@@ -3328,7 +3328,7 @@ pub const Connection = struct {
     pub fn closeWithTransportError(self: *Connection, error_code: u64, frame_type: u64, reason: []const u8) void {
         if (self.state == .closing or self.state == .draining or self.state == .terminated) return;
         self.state = .closing;
-        self.closing_start_time = @intCast(std.time.nanoTimestamp());
+        self.closing_start_time = platform.nanoTimestamp();
         self.local_err = .{
             .is_app = false,
             .code = error_code,
@@ -3505,7 +3505,7 @@ pub const Connection = struct {
         // Pacer: if the pacer has bandwidth set (active transfer), include its
         // next-send time so the event loop wakes up promptly to send more data.
         if (self.pacer.bandwidth_shifted > 0 and self.state == .connected) {
-            const now: i64 = @intCast(std.time.nanoTimestamp());
+            const now: i64 = platform.nanoTimestamp();
             // Estimate pacer delay without mutating: budget is replenished by elapsed time
             const elapsed = now - self.pacer.last_sent_time;
             var budget = self.pacer.budget;
@@ -3547,7 +3547,7 @@ pub const Connection = struct {
 
     pub fn dropHandshakeKeys(self: *Connection) void {
         if (self.qlog_writer) |*ql| {
-            const now_ql: i64 = @intCast(std.time.nanoTimestamp());
+            const now_ql: i64 = platform.nanoTimestamp();
             ql.keyDiscarded(now_ql, "client_initial_secret");
             ql.keyDiscarded(now_ql, "server_initial_secret");
             ql.keyDiscarded(now_ql, "client_handshake_secret");
@@ -3569,7 +3569,7 @@ pub const Connection = struct {
     pub fn initiateKeyUpdate(self: *Connection) bool {
         if (self.key_update) |*ku| {
             if (ku.canUpdate()) {
-                const now = @as(i64, @intCast(std.time.nanoTimestamp()));
+                const now: i64 = platform.nanoTimestamp();
                 const pto_ns = self.pkt_handler.rtt_stats.pto();
                 ku.rollKeys(now, pto_ns);
                 self.packer.key_phase = ku.key_phase;
@@ -3613,12 +3613,12 @@ pub const Connection = struct {
 
     /// Return the peer address on the active path.
     /// This may change after connection migration or preferred address selection.
-    pub fn peerAddress(self: *const Connection) *const posix.sockaddr.storage {
+    pub fn peerAddress(self: *const Connection) *const platform.sockaddr_storage {
         return &self.paths[self.active_path_idx].peer_addr;
     }
 
     /// Return the local address on the active path.
-    pub fn localAddress(self: *const Connection) *const posix.sockaddr.storage {
+    pub fn localAddress(self: *const Connection) *const platform.sockaddr_storage {
         return &self.paths[self.active_path_idx].local_addr;
     }
 
@@ -3690,9 +3690,9 @@ pub const Connection = struct {
 /// Compare two sockaddrs for equality (IPv4: port + address).
 /// Uses byte-level reads to avoid alignment issues with posix.sockaddr (align=1).
 /// Check if an AF_INET6 address is IPv4-mapped (::ffff:a.b.c.d).
-pub fn isV4Mapped(addr: *const posix.sockaddr.storage) bool {
-    if (addr.family != posix.AF.INET6) return false;
-    const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
+pub fn isV4Mapped(addr: *const platform.sockaddr_storage) bool {
+    if (addr.family != platform.AF.INET6) return false;
+    const in6: *const platform.sockaddr_in6 = @ptrCast(@alignCast(addr));
     // ::ffff:0:0/96 — first 10 bytes zero, bytes 10-11 are 0xff
     for (0..10) |i| {
         if (in6.addr[i] != 0) return false;
@@ -3701,67 +3701,67 @@ pub fn isV4Mapped(addr: *const posix.sockaddr.storage) bool {
 }
 
 /// Check if an address is effectively IPv4 (AF_INET or IPv4-mapped AF_INET6).
-pub fn isEffectivelyV4(addr: *const posix.sockaddr.storage) bool {
-    return addr.family == posix.AF.INET or isV4Mapped(addr);
+pub fn isEffectivelyV4(addr: *const platform.sockaddr_storage) bool {
+    return addr.family == platform.AF.INET or isV4Mapped(addr);
 }
 
-pub fn sockaddrEql(a: *const posix.sockaddr.storage, b: *const posix.sockaddr.storage) bool {
+pub fn sockaddrEql(a: *const platform.sockaddr_storage, b: *const platform.sockaddr_storage) bool {
     if (a.family != b.family) return false;
-    if (a.family == posix.AF.INET6) {
-        const a_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(a);
-        const b_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(b);
-        const a6 = std.mem.bytesToValue(posix.sockaddr.in6, a_bytes);
-        const b6 = std.mem.bytesToValue(posix.sockaddr.in6, b_bytes);
+    if (a.family == platform.AF.INET6) {
+        const a_bytes: *const [@sizeOf(platform.sockaddr_in6)]u8 = @ptrCast(a);
+        const b_bytes: *const [@sizeOf(platform.sockaddr_in6)]u8 = @ptrCast(b);
+        const a6 = std.mem.bytesToValue(platform.sockaddr_in6, a_bytes);
+        const b6 = std.mem.bytesToValue(platform.sockaddr_in6, b_bytes);
         return a6.port == b6.port and std.mem.eql(u8, &a6.addr, &b6.addr) and a6.scope_id == b6.scope_id;
     }
-    const a_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(a);
-    const b_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(b);
-    const a_in = std.mem.bytesToValue(posix.sockaddr.in, a_bytes);
-    const b_in = std.mem.bytesToValue(posix.sockaddr.in, b_bytes);
+    const a_bytes: *const [@sizeOf(platform.sockaddr_in)]u8 = @ptrCast(a);
+    const b_bytes: *const [@sizeOf(platform.sockaddr_in)]u8 = @ptrCast(b);
+    const a_in = std.mem.bytesToValue(platform.sockaddr_in, a_bytes);
+    const b_in = std.mem.bytesToValue(platform.sockaddr_in, b_bytes);
     return a_in.port == b_in.port and a_in.addr == b_in.addr;
 }
 
 /// Compare two sockaddrs for same IP address (ignoring port).
 /// Uses byte-level reads to avoid alignment issues with posix.sockaddr (align=1).
-pub fn sockaddrSameIp(a: *const posix.sockaddr.storage, b: *const posix.sockaddr.storage) bool {
+pub fn sockaddrSameIp(a: *const platform.sockaddr_storage, b: *const platform.sockaddr_storage) bool {
     if (a.family != b.family) return false;
-    if (a.family == posix.AF.INET6) {
-        const a_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(a);
-        const b_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(b);
-        const a6 = std.mem.bytesToValue(posix.sockaddr.in6, a_bytes);
-        const b6 = std.mem.bytesToValue(posix.sockaddr.in6, b_bytes);
+    if (a.family == platform.AF.INET6) {
+        const a_bytes: *const [@sizeOf(platform.sockaddr_in6)]u8 = @ptrCast(a);
+        const b_bytes: *const [@sizeOf(platform.sockaddr_in6)]u8 = @ptrCast(b);
+        const a6 = std.mem.bytesToValue(platform.sockaddr_in6, a_bytes);
+        const b6 = std.mem.bytesToValue(platform.sockaddr_in6, b_bytes);
         return std.mem.eql(u8, &a6.addr, &b6.addr);
     }
-    const a_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(a);
-    const b_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(b);
-    const a_in = std.mem.bytesToValue(posix.sockaddr.in, a_bytes);
-    const b_in = std.mem.bytesToValue(posix.sockaddr.in, b_bytes);
+    const a_bytes: *const [@sizeOf(platform.sockaddr_in)]u8 = @ptrCast(a);
+    const b_bytes: *const [@sizeOf(platform.sockaddr_in)]u8 = @ptrCast(b);
+    const a_in = std.mem.bytesToValue(platform.sockaddr_in, a_bytes);
+    const b_in = std.mem.bytesToValue(platform.sockaddr_in, b_bytes);
     return a_in.addr == b_in.addr;
 }
 
 /// Get the correct address length for sendto() based on the address family.
-pub fn sockaddrLen(addr: *const posix.sockaddr.storage) posix.socklen_t {
-    return if (addr.family == posix.AF.INET6) @sizeOf(posix.sockaddr.in6) else @sizeOf(posix.sockaddr.in);
+pub fn sockaddrLen(addr: *const platform.sockaddr_storage) platform.socklen_t {
+    return if (addr.family == platform.AF.INET6) @sizeOf(platform.sockaddr_in6) else @sizeOf(platform.sockaddr_in);
 }
 
 /// Extract port from a sockaddr in host byte order.
-pub fn sockaddrPort(addr: *const posix.sockaddr.storage) u16 {
-    if (addr.family == posix.AF.INET6) {
-        const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
+pub fn sockaddrPort(addr: *const platform.sockaddr_storage) u16 {
+    if (addr.family == platform.AF.INET6) {
+        const in6: *const platform.sockaddr_in6 = @ptrCast(@alignCast(addr));
         return std.mem.bigToNative(u16, in6.port);
-    } else if (addr.family == posix.AF.INET) {
-        const in4: *const posix.sockaddr.in = @ptrCast(@alignCast(addr));
+    } else if (addr.family == platform.AF.INET) {
+        const in4: *const platform.sockaddr_in = @ptrCast(@alignCast(addr));
         return std.mem.bigToNative(u16, in4.port);
     }
     return 0;
 }
 
-/// Convert a posix.sockaddr (from std.net.Address.any) to posix.sockaddr.storage.
-pub fn sockaddrToStorage(addr: *const posix.sockaddr) posix.sockaddr.storage {
-    var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+/// Convert a platform.sockaddr (from std.net.Address.any) to platform.sockaddr_storage.
+pub fn sockaddrToStorage(addr: *const platform.sockaddr) platform.sockaddr_storage {
+    var storage: platform.sockaddr_storage = std.mem.zeroes(platform.sockaddr_storage);
     const src_bytes: [*]const u8 = @ptrCast(addr);
     const dst_bytes: [*]u8 = @ptrCast(&storage);
-    const len: usize = if (addr.family == posix.AF.INET6) @sizeOf(posix.sockaddr.in6) else @sizeOf(posix.sockaddr.in);
+    const len: usize = if (addr.family == platform.AF.INET6) @sizeOf(platform.sockaddr_in6) else @sizeOf(platform.sockaddr_in);
     @memcpy(dst_bytes[0..len], src_bytes[0..len]);
     return storage;
 }
@@ -3784,7 +3784,7 @@ pub fn connect(
     tls_config: ?tls13.TlsConfig,
     initial_token: ?[]const u8,
 ) !Connection {
-    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const now: i64 = platform.nanoTimestamp();
     var scid: [8]u8 = undefined;
     var dcid: [8]u8 = undefined;
     generateConnectionId(&scid);
@@ -4196,17 +4196,17 @@ test "DatagramQueue: pop with small buffer" {
 
 // --- Address utility function tests ---
 
-fn makeIpv4Addr(a: u8, b: u8, c: u8, d: u8, port: u16) posix.sockaddr.storage {
-    var in4: posix.sockaddr.in = std.mem.zeroes(posix.sockaddr.in);
-    in4.family = posix.AF.INET;
+fn makeIpv4Addr(a: u8, b: u8, c: u8, d: u8, port: u16) platform.sockaddr_storage {
+    var in4: platform.sockaddr_in = std.mem.zeroes(platform.sockaddr_in);
+    in4.family = platform.AF.INET;
     in4.port = std.mem.nativeToBig(u16, port);
     in4.addr = (@as(u32, d) << 24) | (@as(u32, c) << 16) | (@as(u32, b) << 8) | @as(u32, a);
     return sockaddrToStorage(@ptrCast(&in4));
 }
 
-fn makeIpv6Addr(addr_bytes_in: [16]u8, port: u16) posix.sockaddr.storage {
-    var in6: posix.sockaddr.in6 = std.mem.zeroes(posix.sockaddr.in6);
-    in6.family = posix.AF.INET6;
+fn makeIpv6Addr(addr_bytes_in: [16]u8, port: u16) platform.sockaddr_storage {
+    var in6: platform.sockaddr_in6 = std.mem.zeroes(platform.sockaddr_in6);
+    in6.family = platform.AF.INET6;
     in6.port = std.mem.nativeToBig(u16, port);
     in6.addr = addr_bytes_in;
     return sockaddrToStorage(@ptrCast(&in6));
@@ -4295,12 +4295,12 @@ test "isEffectivelyV4: native IPv6 is not v4" {
 
 test "sockaddrLen: IPv4 vs IPv6" {
     const v4 = makeIpv4Addr(127, 0, 0, 1, 80);
-    try std.testing.expectEqual(@as(posix.socklen_t, @sizeOf(posix.sockaddr.in)), sockaddrLen(&v4));
+    try std.testing.expectEqual(@as(platform.socklen_t, @sizeOf(platform.sockaddr_in)), sockaddrLen(&v4));
 
     var v6_bytes = [_]u8{0} ** 16;
     v6_bytes[15] = 1;
     const v6 = makeIpv6Addr(v6_bytes, 80);
-    try std.testing.expectEqual(@as(posix.socklen_t, @sizeOf(posix.sockaddr.in6)), sockaddrLen(&v6));
+    try std.testing.expectEqual(@as(platform.socklen_t, @sizeOf(platform.sockaddr_in6)), sockaddrLen(&v6));
 }
 
 // --- Connection state and method tests ---
@@ -4707,7 +4707,7 @@ test "keep_alive_ping_sent resets on packet receipt simulation" {
 
     conn.keep_alive_ping_sent = true;
     // Simulate what recv() does
-    conn.last_packet_received_time = @intCast(std.time.nanoTimestamp());
+    conn.last_packet_received_time = platform.nanoTimestamp();
     conn.keep_alive_ping_sent = false;
     try std.testing.expect(!conn.keep_alive_ping_sent);
 }

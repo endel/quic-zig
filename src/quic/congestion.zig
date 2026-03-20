@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const platform = @import("platform.zig");
 
 const rtt_mod = @import("rtt.zig");
 const RttStats = rtt_mod.RttStats;
@@ -263,7 +264,7 @@ pub const Cubic = struct {
     fn cubicUpdate(self: *Cubic, acked_bytes: u64) void {
         // Initialize epoch on first ACK after congestion event
         if (self.epoch_start == null) {
-            self.epoch_start = @intCast(std.time.nanoTimestamp());
+            self.epoch_start = platform.nanoTimestamp();
             if (self.congestion_window < self.w_max) {
                 // Compute K = cbrt(W_max * (1-beta) / C) in MSS units, then convert to nanoseconds
                 // K_mss = cbrt((W_max/MSS) * 0.3 / 0.4) = cbrt((W_max/MSS) * 3/4)
@@ -280,7 +281,7 @@ pub const Cubic = struct {
             self.w_est = self.congestion_window;
         }
 
-        const now: i64 = @intCast(std.time.nanoTimestamp());
+        const now: i64 = platform.nanoTimestamp();
         const t_ns = now - (self.epoch_start orelse now); // time since epoch start in ns
 
         // W_cubic(t) = C * (t - K)^3 + W_max
