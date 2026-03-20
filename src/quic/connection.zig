@@ -1016,7 +1016,10 @@ pub const Connection = struct {
             var remaining = payload;
             var ack_eliciting = false;
             while (remaining.len > 0) {
-                if (remaining[0] == 0x00) { remaining = remaining[1..]; continue; }
+                if (remaining[0] == 0x00) {
+                    remaining = remaining[1..];
+                    continue;
+                }
                 const frame = Frame.parse(remaining) catch break;
                 // Enforce frame-in-correct-space (RFC 9000 §12.5)
                 if (!frame.isAllowedIn(.zero_rtt)) {

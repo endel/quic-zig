@@ -5,6 +5,10 @@ const tls13 = quic.tls13;
 const connection = quic.connection;
 const quic_lb = quic.quic_lb;
 
+pub const std_options: std.Options = .{
+    .log_level = .err,
+};
+
 const EchoHandler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
     pub fn onConnectRequest(_: *EchoHandler, session: *event_loop.Session, session_id: u64, _: []const u8) void {
@@ -37,6 +41,7 @@ pub fn main() !void {
     var key_path: []const u8 = "interop/browser/certs/server.key";
     var server_id_hex: ?[]const u8 = null;
     var lb_key_hex: ?[]const u8 = null;
+    var disable_pmtud = false;
 
     var args = std.process.args();
     _ = args.next();
@@ -51,12 +56,21 @@ pub fn main() !void {
             if (args.next()) |v| server_id_hex = v;
         } else if (std.mem.eql(u8, arg, "--lb-key")) {
             if (args.next()) |v| lb_key_hex = v;
+        } else if (std.mem.eql(u8, arg, "--disable-pmtud")) {
+            disable_pmtud = true;
         }
     }
 
     // Build QUIC-LB config if --server-id is provided
     var lb_config: ?quic_lb.Config = null;
+    var conn_config_value: connection.ConnectionConfig = .{
+        .max_datagram_frame_size = 65536,
+    };
     var conn_config: ?connection.ConnectionConfig = null;
+    if (disable_pmtud) {
+        conn_config_value.disable_pmtud = true;
+        conn_config = conn_config_value;
+    }
     if (server_id_hex) |sid_hex| {
         var cfg = quic_lb.Config{
             .config_id = 0,
@@ -80,7 +94,8 @@ pub fn main() !void {
             cfg.key = key;
         }
         lb_config = cfg;
-        conn_config = .{ .quic_lb = cfg };
+        conn_config_value.quic_lb = cfg;
+        conn_config = conn_config_value;
         std.debug.print("QUIC-LB: server_id={s}, nonce_len={d}, encrypted={}\n", .{
             sid_hex, cfg.nonce_len, cfg.key != null,
         });
