@@ -487,12 +487,24 @@ pub fn Server(comptime Handler: type) type {
                     const bytes_written = conn.send(&self.out_buf) catch break;
                     if (bytes_written == 0) break;
                     const send_addr = conn.peerAddress();
-                    batch.add(
-                        self.out_buf[0..bytes_written],
-                        @ptrCast(send_addr),
-                        connection.sockaddrLen(send_addr),
-                        conn.getEcnMark(),
-                    );
+
+                    if (send_count == 0 and batch.count == 0) {
+                        ecn_socket.sendDirect(
+                            batch.sockfd,
+                            self.out_buf[0..bytes_written],
+                            send_addr,
+                            connection.sockaddrLen(send_addr),
+                            conn.getEcnMark(),
+                            &batch.current_ecn,
+                        );
+                    } else {
+                        batch.add(
+                            self.out_buf[0..bytes_written],
+                            @ptrCast(send_addr),
+                            connection.sockaddrLen(send_addr),
+                            conn.getEcnMark(),
+                        );
+                    }
                 }
             }
             self.batch.flush();
@@ -904,12 +916,23 @@ pub fn Server(comptime Handler: type) type {
                     if (bytes_written == 0) break;
                     const send_addr = conn.peerAddress();
 
-                    batch.add(
-                        self.out_buf[0..bytes_written],
-                        @ptrCast(send_addr),
-                        connection.sockaddrLen(send_addr),
-                        conn.getEcnMark(),
-                    );
+                    if (send_count == 0 and batch.count == 0) {
+                        ecn_socket.sendDirect(
+                            batch.sockfd,
+                            self.out_buf[0..bytes_written],
+                            send_addr,
+                            connection.sockaddrLen(send_addr),
+                            conn.getEcnMark(),
+                            &batch.current_ecn,
+                        );
+                    } else {
+                        batch.add(
+                            self.out_buf[0..bytes_written],
+                            @ptrCast(send_addr),
+                            connection.sockaddrLen(send_addr),
+                            conn.getEcnMark(),
+                        );
+                    }
                 }
 
                 i += 1;
