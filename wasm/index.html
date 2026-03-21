@@ -277,6 +277,25 @@ function tick() {
   }
 }
 
+// ---- Certificate Setup ----
+
+function setCertKey(wasm, role, certBuf, keyBuf) {
+  const cert = new Uint8Array(certBuf);
+  const key = new Uint8Array(keyBuf);
+
+  const certPtr = wasm.qz_alloc(cert.byteLength);
+  new Uint8Array(wasm.memory.buffer, certPtr, cert.byteLength).set(cert);
+  wasm.qz_set_cert(certPtr, cert.byteLength);
+  wasm.qz_free(certPtr, cert.byteLength);
+
+  const keyPtr = wasm.qz_alloc(key.byteLength);
+  new Uint8Array(wasm.memory.buffer, keyPtr, key.byteLength).set(key);
+  wasm.qz_set_key(keyPtr, key.byteLength);
+  wasm.qz_free(keyPtr, key.byteLength);
+
+  log(role, 'info', `Loaded runtime cert (${cert.byteLength}B) + key (${key.byteLength}B)`);
+}
+
 // ---- Demo Control ----
 
 async function startDemo() {
@@ -293,7 +312,12 @@ async function startDemo() {
     log('client', 'info', 'Loading WASM module...');
     log('server', 'info', 'Loading WASM module...');
 
-    const wasmBytes = await fetch('quic.wasm').then(r => r.arrayBuffer());
+    // Load WASM binary and certificate DER files in parallel
+    const [wasmBytes, certDer, keyDer] = await Promise.all([
+      fetch('quic.wasm').then(r => r.arrayBuffer()),
+      fetch('certs/cert.der').then(r => r.arrayBuffer()).catch(() => null),
+      fetch('certs/key.der').then(r => r.arrayBuffer()).catch(() => null),
+    ]);
 
     // Instantiate two separate WASM instances
     const serverResult = await WebAssembly.instantiate(wasmBytes, makeImports('server'));
@@ -306,6 +330,15 @@ async function startDemo() {
 
     log('server', 'info', `WASM loaded (${(wasmBytes.byteLength / 1024).toFixed(0)} KB)`);
     log('client', 'info', `WASM loaded (${(wasmBytes.byteLength / 1024).toFixed(0)} KB)`);
+
+    // Set runtime certificates from fetched DER files (falls back to embedded if fetch failed)
+    if (certDer && keyDer) {
+      setCertKey(serverWasm, 'server', certDer, keyDer);
+      setCertKey(clientWasm, 'client', certDer, keyDer);
+    } else {
+      log('server', 'info', 'Using embedded certificates (DER files not found)');
+      log('client', 'info', 'Using embedded certificates (DER files not found)');
+    }
 
     // Init server first
     const serverRet = serverWasm.qz_init_server();

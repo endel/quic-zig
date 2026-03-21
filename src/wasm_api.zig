@@ -39,22 +39,29 @@ fn wasmCryptoRandomSeed(buffer: []u8) void {
     random_fill(buffer.ptr, buffer.len);
 }
 
-// ── Embedded certificates ─────────────────────────────────────────────
+// ── Certificates (runtime-settable from JS, with embedded fallback) ──
 
-const cert_der = @embedFile("wasm_certs/cert.der");
-const key_der = @embedFile("wasm_certs/key.der");
+const embedded_cert_der = @embedFile("wasm_certs/cert.der");
+const embedded_key_der = @embedFile("wasm_certs/key.der");
 
-fn extractRawKey() [32]u8 {
+fn extractRawKeyFromDer(der: []const u8) [32]u8 {
     var raw: [32]u8 = undefined;
-    if (key_der.len >= 39 and key_der[5] == 0x04 and key_der[6] == 0x20) {
-        @memcpy(&raw, key_der[7..39]);
+    if (der.len >= 39 and der[5] == 0x04 and der[6] == 0x20) {
+        @memcpy(&raw, der[7..39]);
     } else {
         @memset(&raw, 0);
     }
     return raw;
 }
 
-const raw_private_key: [32]u8 = extractRawKey();
+const embedded_raw_key: [32]u8 = extractRawKeyFromDer(embedded_key_der);
+
+// Runtime cert/key storage (heap-allocated by qz_set_cert / qz_set_key)
+var runtime_cert: ?[]u8 = null;
+var runtime_raw_key: ?[32]u8 = null;
+
+// Stable backing for the cert_chain_der slice-of-slices
+var runtime_cert_slice: [1][]const u8 = undefined;
 
 // ── Allocator: use WASM page allocator (supports free + memory growth) ──
 
@@ -117,13 +124,24 @@ const EVT_WT_SESSION: u8 = 0x05;
 
 // ── Config helpers ────────────────────────────────────────────────────
 
-const cert_slices = [_][]const u8{cert_der};
+const embedded_cert_slices = [_][]const u8{embedded_cert_der};
 const alpn_slices = [_][]const u8{"h3"};
 
 fn makeTlsConfig(is_server: bool) quic.tls13.TlsConfig {
+    // Use runtime cert/key if provided, otherwise fall back to embedded
+    const cert_chain: []const []const u8 = if (runtime_cert) |cert| blk: {
+        runtime_cert_slice = [1][]const u8{cert};
+        break :blk &runtime_cert_slice;
+    } else &embedded_cert_slices;
+
+    const key_bytes: []const u8 = if (runtime_raw_key) |*key|
+        key
+    else
+        &embedded_raw_key;
+
     return .{
-        .cert_chain_der = &cert_slices,
-        .private_key_bytes = &raw_private_key,
+        .cert_chain_der = cert_chain,
+        .private_key_bytes = key_bytes,
         .alpn = &alpn_slices,
         .server_name = if (!is_server) "localhost" else null,
         .skip_cert_verify = true,
@@ -144,6 +162,23 @@ fn makeConnConfig() quic.connection.ConnectionConfig {
 }
 
 // ── Exported API ──────────────────────────────────────────────────────
+
+/// Set certificate DER bytes from JS. Call before qz_init_server/qz_init_client.
+export fn qz_set_cert(ptr: [*]const u8, len: u32) i32 {
+    if (runtime_cert) |old| allocator.free(old);
+    const cert = allocator.alloc(u8, len) catch return -1;
+    @memcpy(cert, ptr[0..len]);
+    runtime_cert = cert;
+    return 0;
+}
+
+/// Set private key DER bytes from JS. Call before qz_init_server/qz_init_client.
+/// Accepts a DER-encoded EC private key and extracts the raw 32-byte P-256 scalar.
+export fn qz_set_key(ptr: [*]const u8, len: u32) i32 {
+    const der = ptr[0..len];
+    runtime_raw_key = extractRawKeyFromDer(der);
+    return 0;
+}
 
 export fn qz_init_server() i32 {
     return initInstance(true) catch return -1;
@@ -332,10 +367,25 @@ export fn qz_stream_close(stream_id: u64) void {
     stream.send.close();
 }
 
+export fn qz_stream_read(stream_id: u64, out_ptr: [*]u8, out_len: u32) i32 {
+    const inst = instance orelse return -1;
+    const stream = inst.conn.streams.getStream(stream_id) orelse return -1;
+    const data = stream.recv.read() orelse return 0;
+    const copy_len = @min(data.len, out_len);
+    @memcpy(out_ptr[0..copy_len], data[0..copy_len]);
+    return @intCast(copy_len);
+}
+
 export fn qz_datagram_send(data_ptr: [*]const u8, data_len: u32) i32 {
     const inst = instance orelse return -1;
     inst.conn.sendDatagram(data_ptr[0..data_len]) catch return -1;
     return 0;
+}
+
+export fn qz_datagram_recv(out_ptr: [*]u8, out_len: u32) i32 {
+    const inst = instance orelse return -1;
+    const len = inst.conn.recvDatagram(out_ptr[0..out_len]) orelse return 0;
+    return @intCast(len);
 }
 
 export fn qz_alloc(len: u32) ?[*]u8 {
