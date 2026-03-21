@@ -9,6 +9,7 @@ const quic = @import("quic_core");
 const platform = quic.platform;
 const Connection = quic.connection.Connection;
 const H3Connection = quic.h3.H3Connection;
+const WebTransportConnection = quic.webtransport.WebTransportConnection;
 
 // ── WASM imports (provided by JS) ─────────────────────────────────────
 
@@ -79,6 +80,7 @@ const MAX_EVENTS = 32;
 const Instance = struct {
     conn: *Connection, // heap-allocated (Connection is ~50KB with TLS buffers)
     h3: ?H3Connection = null,
+    wt: ?WebTransportConnection = null,
     is_server: bool,
     initialized: bool = false,
 
@@ -115,12 +117,18 @@ const Instance = struct {
 var instance: ?*Instance = null;
 
 // ── Event type bytes ──────────────────────────────────────────────────
+// See wasm/README.md for payload formats.
 
-const EVT_ESTABLISHED: u8 = 0x01;
-const EVT_CLOSED: u8 = 0x02;
-const EVT_STREAM_DATA: u8 = 0x03;
-const EVT_DATAGRAM: u8 = 0x04;
-const EVT_WT_SESSION: u8 = 0x05;
+const EVT_ESTABLISHED: u8 = 0x01; // QUIC connected (no payload)
+const EVT_CLOSED: u8 = 0x02; // Connection closed (no payload)
+const EVT_STREAM_DATA: u8 = 0x03; // H3 stream data: [stream_id:u64 BE][len:u64 BE]
+const EVT_DATAGRAM: u8 = 0x04; // Raw QUIC datagram (reserved)
+const EVT_WT_SESSION: u8 = 0x05; // WT CONNECT request: [session_id:u64 BE]
+const EVT_WT_BIDI_STREAM: u8 = 0x06; // New WT bidi stream: [session_id:u64 BE][stream_id:u64 BE]
+const EVT_WT_STREAM_DATA: u8 = 0x07; // WT stream data: [stream_id:u64 BE][len:u64 BE]
+const EVT_WT_STREAM_FIN: u8 = 0x08; // WT stream finished: [stream_id:u64 BE]
+const EVT_WT_DATAGRAM: u8 = 0x09; // WT datagram: [session_id:u64 BE][len:u64 BE]
+const EVT_WT_SESSION_CLOSED: u8 = 0x0A; // WT session closed: [session_id:u64 BE][error_code:u32 BE]
 
 // ── Config helpers ────────────────────────────────────────────────────
 
@@ -271,6 +279,7 @@ export fn qz_recv_packet(data_ptr: [*]const u8, data_len: u32) i32 {
     // Check for state transitions
     if (inst.conn.state == .connected and inst.h3 == null) {
         inst.h3 = H3Connection.init(allocator, inst.conn, inst.is_server);
+        inst.wt = WebTransportConnection.init(allocator, &inst.h3.?, inst.conn, inst.is_server);
         var evt = [_]u8{EVT_ESTABLISHED};
         inst.pushEvent(&evt);
     }
@@ -328,22 +337,50 @@ export fn qz_is_closed() bool {
 export fn qz_poll_event(buf_ptr: [*]u8, buf_len: u32) u32 {
     const inst = instance orelse return 0;
 
-    if (inst.h3) |*h3| {
-        while (true) {
-            const event = h3.poll() catch break;
+    // Poll through WebTransportConnection (wraps H3 → QUIC)
+    if (inst.wt) |*wt| {
+        while (inst.event_count < MAX_EVENTS) {
+            const event = wt.poll() catch break;
             const ev = event orelse break;
             switch (ev) {
-                .headers => |hdr| {
+                .connect_request => |cr| {
                     var evt: [9]u8 = undefined;
                     evt[0] = EVT_WT_SESSION;
-                    std.mem.writeInt(u64, evt[1..9], hdr.stream_id, .big);
+                    std.mem.writeInt(u64, evt[1..9], cr.session_id, .big);
                     inst.pushEvent(&evt);
                 },
-                .data => |d| {
+                .bidi_stream => |bs| {
                     var evt: [17]u8 = undefined;
-                    evt[0] = EVT_STREAM_DATA;
-                    std.mem.writeInt(u64, evt[1..9], d.stream_id, .big);
-                    std.mem.writeInt(u64, evt[9..17], @intCast(d.len), .big);
+                    evt[0] = EVT_WT_BIDI_STREAM;
+                    std.mem.writeInt(u64, evt[1..9], bs.session_id, .big);
+                    std.mem.writeInt(u64, evt[9..17], bs.stream_id, .big);
+                    inst.pushEvent(&evt);
+                },
+                .stream_data => |sd| {
+                    var evt: [17]u8 = undefined;
+                    evt[0] = EVT_WT_STREAM_DATA;
+                    std.mem.writeInt(u64, evt[1..9], sd.stream_id, .big);
+                    std.mem.writeInt(u64, evt[9..17], @intCast(sd.data.len), .big);
+                    inst.pushEvent(&evt);
+                },
+                .stream_finished => |sf| {
+                    var evt: [9]u8 = undefined;
+                    evt[0] = EVT_WT_STREAM_FIN;
+                    std.mem.writeInt(u64, evt[1..9], sf.stream_id, .big);
+                    inst.pushEvent(&evt);
+                },
+                .datagram => |dg| {
+                    var evt: [17]u8 = undefined;
+                    evt[0] = EVT_WT_DATAGRAM;
+                    std.mem.writeInt(u64, evt[1..9], dg.session_id, .big);
+                    std.mem.writeInt(u64, evt[9..17], @intCast(dg.data.len), .big);
+                    inst.pushEvent(&evt);
+                },
+                .session_closed => |sc| {
+                    var evt: [13]u8 = undefined;
+                    evt[0] = EVT_WT_SESSION_CLOSED;
+                    std.mem.writeInt(u64, evt[1..9], sc.session_id, .big);
+                    std.mem.writeInt(u32, evt[9..13], sc.error_code, .big);
                     inst.pushEvent(&evt);
                 },
                 else => {},
@@ -386,6 +423,59 @@ export fn qz_datagram_recv(out_ptr: [*]u8, out_len: u32) i32 {
     const inst = instance orelse return -1;
     const len = inst.conn.recvDatagram(out_ptr[0..out_len]) orelse return 0;
     return @intCast(len);
+}
+
+// ── WebTransport API ─────────────────────────────────────────────────
+
+/// Accept a WT session (server-side). Call after receiving EVT_WT_SESSION.
+/// Sends an HTTP/3 200 response on the CONNECT stream.
+export fn qz_wt_accept_session(session_id: u64) i32 {
+    const inst = instance orelse return -1;
+    var wt = &(inst.wt orelse return -1);
+    wt.acceptSession(session_id) catch return -1;
+    return 0;
+}
+
+/// Read data from a WT stream. Call after receiving EVT_WT_STREAM_DATA.
+/// Returns bytes read, 0 if nothing available, -1 on error.
+export fn qz_wt_read_stream(stream_id: u64, out_ptr: [*]u8, out_len: u32) i32 {
+    const inst = instance orelse return -1;
+    const stream = inst.conn.streams.getStream(stream_id) orelse return -1;
+    const data = stream.recv.read() orelse return 0;
+    const copy_len = @min(data.len, out_len);
+    @memcpy(out_ptr[0..copy_len], data[0..copy_len]);
+    return @intCast(copy_len);
+}
+
+/// Write data to a WT stream. Returns 0 on success, -1 on error.
+export fn qz_wt_send_stream(stream_id: u64, data_ptr: [*]const u8, data_len: u32) i32 {
+    const inst = instance orelse return -1;
+    var wt = &(inst.wt orelse return -1);
+    wt.sendStreamData(stream_id, data_ptr[0..data_len]) catch return -1;
+    return 0;
+}
+
+/// Close (FIN) a WT stream.
+export fn qz_wt_close_stream(stream_id: u64) void {
+    const inst = instance orelse return;
+    var wt = &(inst.wt orelse return);
+    wt.closeStream(stream_id);
+}
+
+/// Send a WT datagram on a session. Returns 0 on success, -1 on error.
+export fn qz_wt_send_datagram(session_id: u64, data_ptr: [*]const u8, data_len: u32) i32 {
+    const inst = instance orelse return -1;
+    var wt = &(inst.wt orelse return -1);
+    wt.sendDatagram(session_id, data_ptr[0..data_len]) catch return -1;
+    return 0;
+}
+
+/// Close a WT session with an error code and optional reason.
+export fn qz_wt_close_session(session_id: u64, error_code: u32, reason_ptr: [*]const u8, reason_len: u32) i32 {
+    const inst = instance orelse return -1;
+    var wt = &(inst.wt orelse return -1);
+    wt.closeSessionWithError(session_id, error_code, reason_ptr[0..reason_len]) catch return -1;
+    return 0;
 }
 
 export fn qz_alloc(len: u32) ?[*]u8 {

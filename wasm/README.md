@@ -192,47 +192,18 @@ Event format — first byte is the type, followed by type-specific payload:
 
 | Byte | Type               | Payload                                  |
 |------|--------------------|------------------------------------------|
-| 0x01 | `ESTABLISHED`      | *(none)* — TLS handshake complete        |
+| 0x01 | `ESTABLISHED`      | *(none)* — QUIC+TLS handshake complete   |
 | 0x02 | `CLOSED`           | *(none)* — connection closed             |
 | 0x03 | `STREAM_DATA`      | `stream_id: u64 BE` + `length: u64 BE`  |
 | 0x04 | `DATAGRAM`         | *(reserved)*                             |
-| 0x05 | `WT_SESSION`       | `stream_id: u64 BE`                      |
+| 0x05 | `WT_SESSION`       | `session_id: u64 BE` — CONNECT request, call `qz_wt_accept_session` |
+| 0x06 | `WT_BIDI_STREAM`   | `session_id: u64 BE` + `stream_id: u64 BE` |
+| 0x07 | `WT_STREAM_DATA`   | `stream_id: u64 BE` + `length: u64 BE`  |
+| 0x08 | `WT_STREAM_FIN`    | `stream_id: u64 BE` — remote closed stream |
+| 0x09 | `WT_DATAGRAM`      | `session_id: u64 BE` + `length: u64 BE` |
+| 0x0A | `WT_SESSION_CLOSED`| `session_id: u64 BE` + `error_code: u32 BE` |
 
-```js
-function pollEvents(wasm) {
-  const bufLen = 1024;
-  const ptr = wasm.qz_alloc(bufLen);
-
-  while (true) {
-    const n = wasm.qz_poll_event(ptr, bufLen);
-    if (n === 0) break;
-
-    const view = new DataView(wasm.memory.buffer, ptr, n);
-    const type = view.getUint8(0);
-
-    switch (type) {
-      case 0x01:
-        console.log('Connection established');
-        break;
-      case 0x03: {
-        const streamId = view.getBigUint64(1);
-        const length = view.getBigUint64(9);
-        console.log(`Stream ${streamId}: ${length} bytes available`);
-        // Call qz_stream_read to get the data
-        break;
-      }
-      case 0x05: {
-        const streamId = view.getBigUint64(1);
-        console.log(`WebTransport session request on stream ${streamId}`);
-        break;
-      }
-    }
-  }
-  wasm.qz_free(ptr, bufLen);
-}
-```
-
-### Stream I/O
+### Raw QUIC stream I/O
 
 | Export                                              | Returns | Description |
 |-----------------------------------------------------|---------|-------------|
@@ -240,114 +211,49 @@ function pollEvents(wasm) {
 | `qz_stream_send(stream_id: u64, data_ptr, len)`    | `i32`   | Write data to a send stream. Returns 0 on success. |
 | `qz_stream_close(stream_id: u64)`                  | `void`  | Close (FIN) a send stream. |
 
-Reading stream data after an `EVT_STREAM_DATA` event:
-
-```js
-function readStream(wasm, streamId /* BigInt */) {
-  const bufLen = 65536;
-  const ptr = wasm.qz_alloc(bufLen);
-  const chunks = [];
-
-  while (true) {
-    const n = wasm.qz_stream_read(streamId, ptr, bufLen);
-    if (n <= 0) break;
-    // Copy out before next WASM call
-    chunks.push(new Uint8Array(new Uint8Array(wasm.memory.buffer, ptr, n)));
-  }
-
-  wasm.qz_free(ptr, bufLen);
-  return chunks;
-}
-```
-
-Writing to a stream:
-
-```js
-function writeStream(wasm, streamId /* BigInt */, data /* Uint8Array */) {
-  const ptr = wasm.qz_alloc(data.byteLength);
-  new Uint8Array(wasm.memory.buffer, ptr, data.byteLength).set(data);
-  wasm.qz_stream_send(streamId, ptr, data.byteLength);
-  wasm.qz_free(ptr, data.byteLength);
-}
-```
-
-### Datagram I/O
+### Raw QUIC datagram I/O
 
 | Export                                       | Returns | Description |
 |----------------------------------------------|---------|-------------|
 | `qz_datagram_send(data_ptr, len: u32)`       | `i32`   | Send an unreliable datagram. Returns 0 on success. |
 | `qz_datagram_recv(out_ptr, out_len: u32)`    | `i32`   | Receive next queued datagram. Returns bytes read, 0 if empty, -1 on error. |
 
-```js
-// Send
-function sendDatagram(wasm, data /* Uint8Array */) {
-  const ptr = wasm.qz_alloc(data.byteLength);
-  new Uint8Array(wasm.memory.buffer, ptr, data.byteLength).set(data);
-  wasm.qz_datagram_send(ptr, data.byteLength);
-  wasm.qz_free(ptr, data.byteLength);
-}
+### WebTransport API
 
-// Receive (call in your event/tick loop)
-function recvDatagrams(wasm) {
-  const bufLen = 1200;
-  const ptr = wasm.qz_alloc(bufLen);
-  const datagrams = [];
+| Export                                                            | Returns | Description |
+|-------------------------------------------------------------------|---------|-------------|
+| `qz_wt_accept_session(session_id: u64)`                          | `i32`   | Accept a WT session (sends HTTP/3 200 response). Call after `EVT_WT_SESSION`. |
+| `qz_wt_read_stream(stream_id: u64, out_ptr, out_len)`            | `i32`   | Read data from a WT stream. Returns bytes read, 0 if empty, -1 on error. |
+| `qz_wt_send_stream(stream_id: u64, data_ptr, len)`               | `i32`   | Write data to a WT stream. Returns 0 on success. |
+| `qz_wt_close_stream(stream_id: u64)`                             | `void`  | Close (FIN) a WT stream. |
+| `qz_wt_send_datagram(session_id: u64, data_ptr, len)`            | `i32`   | Send a WT datagram. Returns 0 on success. |
+| `qz_wt_close_session(session_id: u64, error_code, reason_ptr, reason_len)` | `i32` | Close a WT session with error code and reason. |
 
-  while (true) {
-    const n = wasm.qz_datagram_recv(ptr, bufLen);
-    if (n <= 0) break;
-    datagrams.push(new Uint8Array(new Uint8Array(wasm.memory.buffer, ptr, n)));
-  }
+## WebTransport echo server example
 
-  wasm.qz_free(ptr, bufLen);
-  return datagrams;
-}
+See [`webtransport-example.js`](webtransport-example.js) for a fully commented example showing:
+- Where raw UDP packets enter the WASM state machine
+- Where decoded application data is available to read
+- Where to write response data back into the state machine
+- Where encrypted response packets come out to send back
+
+Summary of the data flow:
 ```
-
-## Full example: WASM QUIC server on a browser UDPSocket
-
-```js
-// -- Load & init --
-const { instance } = await WebAssembly.instantiate(wasmBytes, makeImports());
-const wasm = instance.exports;
-
-// Set runtime certificates (optional — omit to use embedded)
-setCert(wasm, certDer);
-setKey(wasm, keyDer);
-
-wasm.qz_init_server();
-
-// -- UDP socket (browser Direct Sockets API) --
-const socket = new UDPSocket({ localPort: 4433, localAddress: '0.0.0.0' });
-const { readable, writable } = await socket.opened;
-const writer = writable.getWriter();
-let lastRemote = null;
-
-// -- Receive loop --
-readable.pipeTo(new WritableStream({
-  write({ data, remoteAddress, remotePort }) {
-    lastRemote = { address: remoteAddress, port: remotePort };
-    feedPacket(wasm, new Uint8Array(data));
-
-    for (const pkt of drainPackets(wasm)) {
-      writer.write({ data: pkt, remoteAddress, remotePort });
-    }
-
-    pollEvents(wasm);
-  }
-}));
-
-// -- Timer loop (retransmits, keepalives) --
-setInterval(() => {
-  wasm.qz_on_timeout();
-  if (lastRemote) {
-    for (const pkt of drainPackets(wasm)) {
-      writer.write({
-        data: pkt,
-        remoteAddress: lastRemote.address,
-        remotePort: lastRemote.port,
-      });
-    }
-  }
-}, 50);
+UDP packet in → feedPacket() → qz_recv_packet()
+                                    │
+                             qz_poll_event()
+                                    │
+              ┌─────────────────────┼──────────────────────┐
+              │                     │                      │
+       EVT_WT_SESSION        EVT_WT_STREAM_DATA      EVT_WT_DATAGRAM
+              │                     │                      │
+   qz_wt_accept_session()  qz_wt_read_stream()    qz_datagram_recv()
+                             ← decoded data here    ← decoded data here
+                                    │                      │
+                            qz_wt_send_stream()    qz_wt_send_datagram()
+                             → write response here  → write response here
+                                    │                      │
+                              qz_send_packets()
+                                    │
+                             encrypted QUIC packets → send to network
 ```

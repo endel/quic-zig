@@ -467,7 +467,7 @@ pub const QpackEncoder = struct {
                         // Indexed dynamic: 10NNNNNN (T=0, relative index)
                         const base = self.dynamic.insert_count;
                         const rel_idx = base - dmatch.abs_index - 1;
-                        encodeInteger(&field_buf, &field_pos, rel_idx, 6, 0x80);
+                        encodeInteger(&field_buf, &field_pos, @intCast(rel_idx), 6, 0x80);
                         used_dynamic = true;
                         continue;
                     }
@@ -487,13 +487,13 @@ pub const QpackEncoder = struct {
                 const base = self.dynamic.insert_count;
                 if (dmatch.full_match) {
                     // Indexed dynamic: 10NNNNNN
-                    const rel_idx = base - dmatch.abs_index - 1;
+                    const rel_idx: usize = @intCast(base - dmatch.abs_index - 1);
                     encodeInteger(&field_buf, &field_pos, rel_idx, 6, 0x80);
                     used_dynamic = true;
                     continue;
                 }
                 // Dynamic name match — literal with dynamic name ref
-                const rel_idx = base - dmatch.abs_index - 1;
+                const rel_idx: usize = @intCast(base - dmatch.abs_index - 1);
                 encodeInteger(&field_buf, &field_pos, rel_idx, 4, 0x40);
                 encodeString(&field_buf, &field_pos, h.value);
 
@@ -522,7 +522,7 @@ pub const QpackEncoder = struct {
             _ = ric_start;
             const max_entries = self.dynamic.maxEntries();
             const encoded_ric = encodeRequiredInsertCount(ric, max_entries);
-            encodeInteger(&prefix_buf, &prefix_pos, encoded_ric, 8, 0x00);
+            encodeInteger(&prefix_buf, &prefix_pos, @intCast(encoded_ric), 8, 0x00);
             // Delta Base = 0 (base == RIC), sign = 0
             encodeInteger(&prefix_buf, &prefix_pos, 0, 7, 0x00);
         } else {
