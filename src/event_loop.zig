@@ -545,6 +545,11 @@ pub fn Server(comptime Handler: type) type {
                 const received = self.recvAllPackets();
                 self.processConnections();
                 self.tickAndSend();
+                // Free entries that were invalidated during tickAndSend.
+                // Deferred so that stale Session pointers from processConnections
+                // (which may still be on the stack) safely see wt_conn == null
+                // instead of accessing freed memory.
+                self.conn_mgr.freeDeadEntries();
 
                 // If no new packets arrived during this cycle, we're done.
                 // On the first iteration we always process (triggered by poll event).
@@ -581,6 +586,7 @@ pub fn Server(comptime Handler: type) type {
 
             // Tick + burst send (after processing, so generated data is included)
             self.tickAndSend();
+            self.conn_mgr.freeDeadEntries();
 
             if (self.stopping and self.allConnectionsClosed()) {
                 self.loop.stop();
@@ -903,8 +909,19 @@ pub fn Server(comptime Handler: type) type {
             while (i < self.conn_mgr.entries.items.len) {
                 const entry = self.conn_mgr.entries.items[i];
 
-                if (!self.conn_mgr.tickEntry(entry)) {
-                    continue; // removed, don't increment
+                entry.conn.onTimeout() catch {};
+                if (entry.conn.isClosed()) {
+                    // Fire onSessionClosed BEFORE removeConnection invalidates
+                    // the entry, so the handler can mark clients as disconnected.
+                    // Without this, PTO-killed connections never get a session_closed
+                    // event because the entry is removed from the list before the
+                    // WT layer can generate one.
+                    if (@hasDecl(Handler, "onSessionClosed")) {
+                        var session = Session{ .entry = entry };
+                        self.handler.onSessionClosed(&session, 0, 0, "");
+                    }
+                    self.conn_mgr.removeConnection(entry);
+                    continue;
                 }
 
                 const conn = entry.conn;
