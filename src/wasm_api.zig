@@ -279,6 +279,11 @@ export fn qz_recv_packet(data_ptr: [*]const u8, data_len: u32) i32 {
     // Check for state transitions
     if (inst.conn.state == .connected and inst.h3 == null) {
         inst.h3 = H3Connection.init(allocator, inst.conn, inst.is_server);
+        // Set WebTransport settings BEFORE initConnection sends the SETTINGS frame
+        inst.h3.?.local_settings.enable_connect_protocol = true;
+        inst.h3.?.local_settings.enable_webtransport = true;
+        inst.h3.?.local_settings.h3_datagram = true;
+        inst.h3.?.initConnection() catch {};
         inst.wt = WebTransportConnection.init(allocator, &inst.h3.?, inst.conn, inst.is_server);
         var evt = [_]u8{EVT_ESTABLISHED};
         inst.pushEvent(&evt);
