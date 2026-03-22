@@ -110,6 +110,11 @@ pub const ConnectionManager = struct {
     /// When true, Initial packets without a valid token get a Retry response.
     require_retry: bool = false,
 
+    // Deferred free queue: entries invalidated by removeConnection are held
+    // here until freeDeadEntries() is called after all event processing.
+    dead_entries_buf: [MAX_CONNECTIONS]*ConnEntry = undefined,
+    dead_entry_count: usize = 0,
+
     pub fn init(
         allocator: Allocator,
         tls_config: tls13.TlsConfig,
@@ -130,7 +135,9 @@ pub const ConnectionManager = struct {
     }
 
     pub fn deinit(self: *ConnectionManager) void {
-        // Clean up all connections
+        // Free deferred-dead entries first
+        self.freeDeadEntries();
+        // Clean up all live connections
         for (self.entries.items) |entry| {
             entry.finished_streams.deinit(self.allocator);
             entry.conn.deinit();
@@ -219,12 +226,21 @@ pub const ConnectionManager = struct {
         }
     }
 
-    /// Remove a terminated connection, freeing all resources.
+    /// Remove a terminated connection. Invalidates the entry immediately
+    /// (nulls wt_conn, removes from routing) and defers memory freeing so
+    /// that any stale Session pointers safely see wt_conn == null instead
+    /// of accessing freed memory.
     pub fn removeConnection(self: *ConnectionManager, entry: *ConnEntry) void {
         // Unregister all CIDs from the routing map
         for (entry.registered_cids[0..entry.registered_cid_count]) |key| {
             _ = self.cid_map.remove(key);
         }
+
+        // Invalidate transport layers so stale Session pointers are safe.
+        // Session.sendDatagram/sendStreamData check `if (entry.wt_conn)`
+        // and will skip the send instead of dereferencing freed sub-objects.
+        entry.wt_conn = null;
+        entry.h3_conn = null;
 
         // Swap-remove from entries list
         var idx: usize = 0;
@@ -235,11 +251,21 @@ pub const ConnectionManager = struct {
             }
         }
 
-        // Free connection and entry
-        entry.finished_streams.deinit(self.allocator);
-        entry.conn.deinit();
-        self.allocator.destroy(entry.conn);
-        self.allocator.destroy(entry);
+        // Queue for deferred free (entry memory stays valid until freeDeadEntries)
+        self.dead_entries_buf[self.dead_entry_count] = entry;
+        self.dead_entry_count = @min(self.dead_entry_count + 1, self.dead_entries_buf.len);
+    }
+
+    /// Free entries that were invalidated by removeConnection.
+    /// Call after all event processing is complete for the current cycle.
+    pub fn freeDeadEntries(self: *ConnectionManager) void {
+        for (self.dead_entries_buf[0..self.dead_entry_count]) |entry| {
+            entry.finished_streams.deinit(self.allocator);
+            entry.conn.deinit();
+            self.allocator.destroy(entry.conn);
+            self.allocator.destroy(entry);
+        }
+        self.dead_entry_count = 0;
     }
 
     /// Result of processing a received UDP datagram.
