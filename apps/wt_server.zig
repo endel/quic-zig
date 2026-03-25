@@ -18,14 +18,18 @@ const EchoHandler = struct {
         std.debug.print("WT: session {d} ready\n", .{sid});
     }
 
-    pub fn onStreamData(_: *EchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
-        std.debug.print("WT: stream {d} data: {s}\n", .{ stream_id, data });
-        var echo_buf: [1024]u8 = undefined;
-        const echo_msg = std.fmt.bufPrint(&echo_buf, "Echo: {s}", .{data}) catch return;
-        session.sendStreamData(stream_id, echo_msg) catch |err| {
-            std.log.err("WT sendStreamData error: {any}", .{err});
-        };
-        session.closeStream(stream_id);
+    pub fn onStreamData(_: *EchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
+        if (data.len > 0) {
+            std.debug.print("WT: stream {d} data: {s}\n", .{ stream_id, data });
+            var echo_buf: [1024]u8 = undefined;
+            const echo_msg = std.fmt.bufPrint(&echo_buf, "Echo: {s}", .{data}) catch return;
+            session.sendStreamData(stream_id, echo_msg) catch |err| {
+                std.log.err("WT sendStreamData error: {any}", .{err});
+            };
+        }
+        if (fin) {
+            session.closeStream(stream_id);
+        }
     }
 
     pub fn onDatagram(_: *EchoHandler, session: *event_loop.Session, session_id: u64, data: []const u8) void {

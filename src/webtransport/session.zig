@@ -69,8 +69,7 @@ pub const WtEvent = union(enum) {
     connect_request: struct { session_id: u64, protocol: []const u8, authority: []const u8, path: []const u8, headers: []const qpack.Header = &.{} },
     bidi_stream: struct { session_id: u64, stream_id: u64 },
     uni_stream: struct { session_id: u64, stream_id: u64 },
-    stream_data: struct { stream_id: u64, data: []const u8 },
-    stream_finished: struct { stream_id: u64 },
+    stream_data: struct { stream_id: u64, data: []const u8, fin: bool = false },
     datagram: struct { session_id: u64, data: []const u8 },
     session_closed: struct { session_id: u64, error_code: u32, reason: []const u8 },
     session_draining: struct { session_id: u64 },
@@ -716,9 +715,12 @@ pub const WebTransportConnection = struct {
                                 .stream_id = stream_id,
                             } };
                         };
+                        const fin = stream.recv.finished or stream.recv.sorter.isComplete();
+                        if (fin) self.fin_delivered.put(stream_id, {}) catch {};
                         return .{ .stream_data = .{
                             .stream_id = stream_id,
                             .data = owned,
+                            .fin = fin,
                         } };
                     }
 
@@ -764,23 +766,35 @@ pub const WebTransportConnection = struct {
                         continue;
                     };
                     buf.items.len = 0;
+                    const fin = if (self.quic.streams.getStream(stream_id)) |stream|
+                        stream.recv.finished or stream.recv.sorter.isComplete()
+                    else
+                        false;
+                    if (fin) self.fin_delivered.put(stream_id, {}) catch {};
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = data_slice,
+                        .fin = fin,
                     } };
                 }
             }
 
             if (self.quic.streams.getStream(stream_id)) |stream| {
                 if (stream.recv.read()) |data| {
-                    if (stream.recv.finished) self.fin_delivered.put(stream_id, {}) catch {};
+                    const fin = stream.recv.finished or stream.recv.sorter.isComplete();
+                    if (fin) self.fin_delivered.put(stream_id, {}) catch {};
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = data,
+                        .fin = fin,
                     } };
                 } else if (stream.recv.finished and !self.fin_delivered.contains(stream_id)) {
                     self.fin_delivered.put(stream_id, {}) catch {};
-                    return .{ .stream_finished = .{ .stream_id = stream_id } };
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = &[_]u8{},
+                        .fin = true,
+                    } };
                 }
             }
         }
@@ -798,23 +812,35 @@ pub const WebTransportConnection = struct {
                         continue;
                     };
                     buf.items.len = 0;
+                    const fin = if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream|
+                        recv_stream.finished or recv_stream.sorter.isComplete()
+                    else
+                        false;
+                    if (fin) self.fin_delivered.put(stream_id, {}) catch {};
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = data_slice,
+                        .fin = fin,
                     } };
                 }
             }
 
             if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
                 if (recv_stream.read()) |data| {
-                    if (recv_stream.finished) self.fin_delivered.put(stream_id, {}) catch {};
+                    const fin = recv_stream.finished or recv_stream.sorter.isComplete();
+                    if (fin) self.fin_delivered.put(stream_id, {}) catch {};
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = data,
+                        .fin = fin,
                     } };
                 } else if (recv_stream.finished and !self.fin_delivered.contains(stream_id)) {
                     self.fin_delivered.put(stream_id, {}) catch {};
-                    return .{ .stream_finished = .{ .stream_id = stream_id } };
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = &[_]u8{},
+                        .fin = true,
+                    } };
                 }
             }
         }
@@ -1347,6 +1373,7 @@ test "WT integration: bidi stream with trailing data buffers remainder" {
         .stream_data => |sd| {
             try testing.expectEqual(@as(u64, 4), sd.stream_id);
             try testing.expectEqualStrings(extra, sd.data);
+            try testing.expect(!sd.fin);
             // Caller owns this data — free it
             testing.allocator.free(sd.data);
         },
@@ -1603,6 +1630,7 @@ test "WT integration: poll returns stream_data on known bidi stream" {
         .stream_data => |sd| {
             try testing.expectEqual(@as(u64, 4), sd.stream_id);
             try testing.expectEqualStrings("stream payload", sd.data);
+            try testing.expect(!sd.fin);
             // Caller owns data from FrameSorter — free it
             testing.allocator.free(sd.data);
         },
@@ -1639,7 +1667,91 @@ test "WT integration: poll returns stream_data on known uni stream" {
         .stream_data => |sd| {
             try testing.expectEqual(@as(u64, 14), sd.stream_id);
             try testing.expectEqualStrings("uni payload", sd.data);
+            try testing.expect(!sd.fin);
             testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: poll returns stream_data with fin on completed bidi stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtBidiPrefix(&prefix_buf, session_id);
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    const ev1 = try setup.wt.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .bidi_stream => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, "done", true);
+
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 4), sd.stream_id);
+            try testing.expectEqualStrings("done", sd.data);
+            try testing.expect(sd.fin);
+            testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    const ev3 = try setup.wt.poll();
+    try testing.expect(ev3 == null);
+}
+
+test "WT integration: poll returns empty fin event when stream ends after buffered data" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    const ev1 = try setup.wt.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .uni_stream => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    const offset = rs.sorter.highestReceived();
+    try rs.handleStreamFrame(offset, "tail", false);
+
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 14), sd.stream_id);
+            try testing.expectEqualStrings("tail", sd.data);
+            try testing.expect(!sd.fin);
+            testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    const fin_offset = rs.sorter.highestReceived();
+    try rs.handleStreamFrame(fin_offset, "", true);
+
+    const ev3 = try setup.wt.poll();
+    try testing.expect(ev3 != null);
+    switch (ev3.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 14), sd.stream_id);
+            try testing.expectEqual(@as(usize, 0), sd.data.len);
+            try testing.expect(sd.fin);
         },
         else => return error.UnexpectedEvent,
     }

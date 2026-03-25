@@ -654,7 +654,6 @@ pub const StreamsMap = struct {
     /// Avoids O(n) scan on every send() when no streams are closing.
     needs_gc_scan: bool = false,
 
-
     pub fn init(allocator: Allocator, is_server: bool) StreamsMap {
         // Stream IDs: client bidi = 0, 4, 8, ...; server bidi = 1, 5, 9, ...
         // Client uni = 2, 6, 10, ...; server uni = 3, 7, 11, ...
@@ -889,8 +888,7 @@ pub const StreamsMap = struct {
         var it = self.streams.iterator();
         while (it.next()) |kv| {
             const s = kv.value_ptr.*;
-            if (!s.closed_for_gc and (s.recv.finished or s.recv.fin_received) and s.send.fin_sent)
-            {
+            if (!s.closed_for_gc and (s.recv.finished or s.recv.fin_received) and s.send.fin_sent) {
                 s.closed_for_gc = true;
                 self.closeStream(s.stream_id);
                 if (s.send.retransmit_count == 0) {
@@ -1076,6 +1074,22 @@ test "ReceiveStream: RESET_STREAM consistent with FIN" {
     // RESET_STREAM with different final_size must fail
     const err = rs.handleResetStream(0x02, 10);
     try testing.expectError(error.FinalSizeError, err);
+}
+
+test "ReceiveStream: read returns final chunk before finished flips" {
+    var rs = ReceiveStream.init(testing.allocator, 1024);
+    defer rs.deinit();
+
+    try rs.handleStreamFrame(0, "done", true);
+
+    const data = rs.read();
+    try testing.expect(data != null);
+    try testing.expectEqualStrings("done", data.?);
+    try testing.expect(!rs.finished);
+    testing.allocator.free(data.?);
+
+    try testing.expect(rs.read() == null);
+    try testing.expect(rs.finished);
 }
 
 test "SendStream: basic write and pop" {

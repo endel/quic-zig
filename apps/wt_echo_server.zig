@@ -21,14 +21,15 @@ const EchoHandler = struct {
         std.log.info("WT session {d} ready", .{sid});
     }
 
-    pub fn onStreamData(_: *EchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
-        var echo_buf: [1024]u8 = undefined;
-        const echo_msg = std.fmt.bufPrint(&echo_buf, "Echo: {s}", .{data}) catch return;
-        session.sendStreamData(stream_id, echo_msg) catch return;
-    }
-
-    pub fn onStreamFinished(_: *EchoHandler, session: *event_loop.Session, stream_id: u64) void {
-        session.closeStream(stream_id);
+    pub fn onStreamData(_: *EchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
+        if (data.len > 0) {
+            var echo_buf: [1024]u8 = undefined;
+            const echo_msg = std.fmt.bufPrint(&echo_buf, "Echo: {s}", .{data}) catch return;
+            session.sendStreamData(stream_id, echo_msg) catch return;
+        }
+        if (fin) {
+            session.closeStream(stream_id);
+        }
     }
 
     pub fn onDatagram(_: *EchoHandler, session: *event_loop.Session, session_id: u64, data: []const u8) void {

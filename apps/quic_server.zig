@@ -5,19 +5,20 @@ const event_loop = quic.event_loop;
 const QuicEchoHandler = struct {
     pub const protocol: event_loop.Protocol = .quic;
 
-    pub fn onStreamData(_: *QuicEchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
-        std.log.info("stream {d} received: {s}", .{ stream_id, data });
-        // Echo back
-        session.writeStream(stream_id, data) catch |err| {
-            std.log.err("writeStream error: {any}", .{err});
-            return;
-        };
-        session.closeQuicStream(stream_id);
-        std.log.info("stream {d} echoed {d} bytes", .{ stream_id, data.len });
-    }
-
-    pub fn onStreamFinished(_: *QuicEchoHandler, _: *event_loop.Session, stream_id: u64) void {
-        std.log.info("stream {d} finished", .{stream_id});
+    pub fn onStreamData(_: *QuicEchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
+        if (data.len > 0) {
+            std.log.info("stream {d} received: {s}", .{ stream_id, data });
+            // Echo back
+            session.writeStream(stream_id, data) catch |err| {
+                std.log.err("writeStream error: {any}", .{err});
+                return;
+            };
+            std.log.info("stream {d} echoed {d} bytes", .{ stream_id, data.len });
+        }
+        if (fin) {
+            session.closeQuicStream(stream_id);
+            std.log.info("stream {d} finished", .{stream_id});
+        }
     }
 };
 

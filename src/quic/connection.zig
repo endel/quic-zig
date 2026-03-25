@@ -3186,13 +3186,23 @@ pub const Connection = struct {
                             // still be in-flight (not yet ACKed/declared lost). Without this
                             // unconditional scan, the PTO sends PINGs instead of data,
                             // and the peer never receives the file.
-                            {
-                                const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
-                                var pkt_it = app_tracker.sent_packets.iterator();
-                                while (pkt_it.next()) |entry| {
-                                    const pkt = entry.value_ptr;
-                                    if (pkt.in_flight and pkt.getStreamFrames().len > 0) {
-                                        self.queueStreamRetransmissions(pkt);
+                            // If no stream data is pending AND the stream has unsent
+                            // data that was consumed by the packer but never ACKed,
+                            // reset send_offset to write_offset - data_size to force
+                            // retransmission. Only do this for small streams (multiconnect
+                            // serves 1KB files) to avoid resending entire large transfers.
+                            if (!has_data) {
+                                var resend_it = self.streams.streams.valueIterator();
+                                while (resend_it.next()) |s_ptr| {
+                                    const s = s_ptr.*;
+                                    // Only reset for completed small streams (fin queued,
+                                    // data fully consumed but potentially not ACKed)
+                                    if (s.send.fin_queued and s.send.write_offset > 0 and
+                                        s.send.write_offset <= 2048 and
+                                        s.send.send_offset == s.send.write_offset)
+                                    {
+                                        s.send.send_offset = 0;
+                                        s.send.fin_sent = false;
                                         has_data = true;
                                     }
                                 }

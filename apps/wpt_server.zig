@@ -290,10 +290,12 @@ const WptHandler = struct {
         });
     }
 
-    pub fn onStreamData(self: *WptHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
+    pub fn onStreamData(self: *WptHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
         // Find which session this stream belongs to
         const session_id = self.findSessionForStream(session) orelse return;
         const info = self.session_state.get(session_id) orelse return;
+
+        if (data.len == 0 and !fin) return;
 
         std.log.info("[wpt] stream data: handler={s} stream={d} len={d}", .{
             @tagName(info.handler), stream_id, data.len,
@@ -313,10 +315,17 @@ const WptHandler = struct {
                     };
                     if (out_id) |oid| {
                         session.sendStreamData(oid, data) catch {};
+                        if (fin) {
+                            session.closeStream(oid);
+                            _ = self.uni_echo_streams.remove(stream_id);
+                        }
                     }
                 } else {
                     // Bidirectional: echo back on same stream
                     session.sendStreamData(stream_id, data) catch {};
+                    if (fin) {
+                        session.closeStream(stream_id);
+                    }
                 }
             },
             .server_read_then_close => {
@@ -325,25 +334,6 @@ const WptHandler = struct {
             },
             .client_close => {
                 // Stash stream data for later query
-            },
-            else => {},
-        }
-    }
-
-    pub fn onStreamFinished(self: *WptHandler, session: *event_loop.Session, stream_id: u64) void {
-        const session_id = self.findSessionForStream(session) orelse return;
-        const info = self.session_state.get(session_id) orelse return;
-
-        switch (info.handler) {
-            .echo, .echo_raw => {
-                if (isUniStream(stream_id)) {
-                    if (self.uni_echo_streams.get(stream_id)) |oid| {
-                        session.closeStream(oid);
-                        _ = self.uni_echo_streams.remove(stream_id);
-                    }
-                } else {
-                    session.closeStream(stream_id);
-                }
             },
             else => {},
         }
