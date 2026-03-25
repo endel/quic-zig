@@ -889,14 +889,9 @@ pub const StreamsMap = struct {
             if (!s.closed_for_gc and (s.recv.finished or s.recv.fin_received) and s.send.fin_sent) {
                 s.closed_for_gc = true;
                 self.closeStream(s.stream_id);
-                if (s.send.retransmit_count == 0) {
-                    // Don't dispose small streams immediately — keep them in the
-                    // map so PTO can reset send_offset for retransmission under loss.
-                    // Large streams are disposed normally to free memory.
-                    if (s.send.write_offset > 2048) {
-                        self.queueDisposal(s.stream_id);
-                    }
-                }
+                // Delay disposal: keep the stream in the map so PTO can
+                // reset send_offset for retransmission under loss.
+                // Stream will be cleaned up when the connection closes.
             } else if (!s.closed_for_gc) {
                 // At least one stream is still pending close
                 found_pending = true;
