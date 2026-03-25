@@ -140,6 +140,9 @@ pub const SentPacketTracker = struct {
     /// Time of the most recent ack-eliciting packet sent in this space.
     /// Used as PTO baseline when ack_eliciting_in_flight drops to 0 during handshake.
     last_ack_eliciting_sent_time: ?i64 = null,
+    /// Per-space PTO count (exponential backoff). Reset when ACK is received
+    /// for this space. Separate from other spaces to allow independent backoff.
+    pto_count: u32 = 0,
 
     pub fn init(allocator: Allocator) SentPacketTracker {
         return .{
@@ -575,6 +578,7 @@ pub const PacketHandler = struct {
         }
 
         self.pto_count = 0;
+        self.sent[idx].pto_count = 0;
 
         return result;
     }
@@ -624,7 +628,8 @@ pub const PacketHandler = struct {
         else
             self.rtt_stats.ptoNoAckDelay();
 
-        const shift: u6 = @intCast(@min(self.pto_count, 30));
+        // Use per-space PTO count for independent backoff per encryption level
+        const shift: u6 = @intCast(@min(tracker.pto_count, 30));
         pto_duration = pto_duration << shift;
         const max_pto = if (idx == @intFromEnum(EncLevel.application)) MAX_PTO else MAX_HANDSHAKE_PTO;
         pto_duration = @min(pto_duration, max_pto);
