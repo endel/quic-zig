@@ -343,8 +343,18 @@ fn downloadAll(
     const handshake_timeout_ns: i128 = if (skip_ticket_and_drain) MULTICONNECT_HANDSHAKE_TIMEOUT_S * std.time.ns_per_s else DEFAULT_TIMEOUT_S * std.time.ns_per_s;
 
     while (!handshake_complete and (std.time.nanoTimestamp() - handshake_start) < handshake_timeout_ns) {
-        // Fire PTO timer for handshake retransmissions
-        conn.onTimeout() catch {};
+        // Fire ALL expired PTO timers (multiple spaces may expire simultaneously)
+        {
+            var ti: usize = 0;
+            while (ti < 8) : (ti += 1) {
+                conn.onTimeout() catch {};
+                if (conn.state == .terminated or conn.state == .closing) break;
+                const next = conn.nextTimeoutNs();
+                if (next == null) break;
+                const now_check: i64 = @intCast(std.time.nanoTimestamp());
+                if (next.? > now_check) break;
+            }
+        }
 
         // Send packets (burst up to 10 to handle coalesced Initial+Handshake)
         var sent_any = false;

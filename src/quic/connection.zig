@@ -3146,9 +3146,10 @@ pub const Connection = struct {
             self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
         }
 
-        // Check PTO — prefer retransmitting data over PING (RFC 9002 §6.2.4)
-        // Only fires when no loss_time triggered above.
-        else if (self.pkt_handler.getPtoTimeout()) |pto_time| {
+        // Check PTO — fire even if loss detection triggered above.
+        // Loss detection requeues data; PTO ensures it bypasses congestion control
+        // and gets sent immediately. quic-go fires PTO independently of loss detection.
+        if (self.pkt_handler.getPtoTimeout()) |pto_time| {
             if (now >= pto_time) {
                 self.pkt_handler.pto_count += 1;
 
