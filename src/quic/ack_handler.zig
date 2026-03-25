@@ -601,9 +601,12 @@ pub const PacketHandler = struct {
     /// Returns null if the space should not arm PTO (no data, application space idle).
     /// RFC 9002 §6.2.2.1: handshake spaces arm PTO even with no packets in flight.
     pub fn spacePtoDeadline(self: *const PacketHandler, tracker: SentPacketTracker, idx: usize) ?i64 {
-        const is_handshake_space = (idx != @intFromEnum(EncLevel.application));
         if (tracker.ack_eliciting_in_flight == 0) {
-            if (!(is_handshake_space and tracker.last_ack_eliciting_sent_time != null)) {
+            // Arm PTO when we've previously sent data but all packets were lost/ACKed.
+            // For handshake spaces, this is required by RFC 9002 §6.2.2.1.
+            // For application space, this ensures retransmissions proceed after loss
+            // detection drops in_flight to 0 while streams still have data to send.
+            if (tracker.last_ack_eliciting_sent_time == null) {
                 return null;
             }
         }
