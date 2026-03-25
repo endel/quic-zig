@@ -465,6 +465,8 @@ pub const ConnectionConfig = struct {
     // Datagram queue capacity (per direction). Default 32. Increase for apps
     // that send/receive large bursts of datagrams (e.g. WebTransport datagram tests).
     datagram_queue_capacity: usize = DatagramQueue.DEFAULT_MAX_ITEMS,
+    // Auto-close connection when all data is sent and acknowledged.
+    close_when_idle: bool = false,
 };
 
 /// A QUIC connection.
@@ -537,6 +539,12 @@ pub const Connection = struct {
     keep_alive_interval_ns: i64 = 0,
     // True after a keep-alive PING has been sent; reset on packet receipt
     keep_alive_ping_sent: bool = false,
+    // When true, the connection will close as soon as all stream data has been
+    // sent and acknowledged, or after too many idle PTO cycles.
+    close_when_idle: bool = false,
+    // Counter for consecutive PTO fires with no data to send.
+    // Unlike pto_count, this is NOT reset by received ACKs.
+    idle_pto_count: u32 = 0,
 
     // Path MTU Discovery (DPLPMTUD, RFC 8899)
     mtu_discoverer: mtu_mod.MtuDiscoverer = .{},
@@ -735,6 +743,7 @@ pub const Connection = struct {
             const ka_ns: i64 = @intCast(config.keep_alive_period * 1_000_000);
             conn.keep_alive_interval_ns = @min(ka_ns, @divTrunc(conn.idle_timeout_ns, 2));
         }
+        conn.close_when_idle = config.close_when_idle;
 
         // Initialize TLS 1.3 handshake if config provided
         if (tls_config) |tc| {
@@ -3017,6 +3026,39 @@ pub const Connection = struct {
             }
         }
 
+        // Auto-close: when close_when_idle is set, close the connection once all
+        // stream data has been sent and acknowledged (no pending data, nothing in
+        // flight), OR after too many PTO retransmissions without progress (the peer
+        // likely moved on to a new connection).
+        if (self.close_when_idle and self.handshake_confirmed) {
+            const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+            const app_in_flight = self.pkt_handler.sent[app_idx].ack_eliciting_in_flight;
+
+            // Close immediately when all data is delivered
+            if (app_in_flight == 0) {
+                var all_done = true;
+                var stream_it = self.streams.streams.valueIterator();
+                while (stream_it.next()) |s_ptr| {
+                    if (s_ptr.*.send.hasData()) {
+                        all_done = false;
+                        break;
+                    }
+                }
+                if (all_done) {
+                    self.close(0, "");
+                    return;
+                }
+            }
+
+            // Close after consecutive idle PTOs — peer likely abandoned the connection.
+            // idle_pto_count increments on each PTO with has_data=false (no stream data),
+            // and is NOT reset by received ACKs (unlike pto_count).
+            if (self.idle_pto_count >= 2) {
+                self.state = .terminated;
+                return;
+            }
+        }
+
         // Loss detection timer: check loss_time BEFORE PTO (RFC 9002 §6.2.1).
         // Loss timers don't increment pto_count — they run loss detection directly.
         if (self.pkt_handler.getExpiredLossTime(now)) |loss_level| {
@@ -3163,6 +3205,9 @@ pub const Connection = struct {
                 // in 1-RTT packets, confusing the peer's ACK behavior.
                 if (!has_data) {
                     self.pending_frames.push(.{ .ping = {} });
+                    self.idle_pto_count += 1;
+                } else {
+                    self.idle_pto_count = 0;
                 }
                 self.pto_probe_pending = 1;
                 if (self.pkt_handler.getPtoSpace()) |space| {
@@ -3516,22 +3561,9 @@ pub const Connection = struct {
             }
         }
 
-        // Pending send data: if streams have retransmission data queued (from loss
-        // detection) but ack_eliciting_in_flight dropped to 0 (all lost), PTO won't
-        // arm. Wake up immediately to send the queued retransmissions.
-        if (earliest == null and self.state == .connected) {
-            var has_send_data = false;
-            var stream_it = self.streams.streams.valueIterator();
-            while (stream_it.next()) |s_ptr| {
-                if (s_ptr.*.send.hasData()) {
-                    has_send_data = true;
-                    break;
-                }
-            }
-            if (has_send_data) {
-                earliest = @intCast(std.time.nanoTimestamp());
-            }
-        }
+        // No pending data check needed — spacePtoDeadline handles this via
+        // last_ack_eliciting_sent_time for handshake spaces. For application space,
+        // the loss detection timer + send loop handles retransmissions.
 
         // ACK alarm: if we have pending ACKs to send (delayed ACK timer),
         // include the alarm deadline so the event loop wakes up in time (RFC 9000 §13.2.1).
@@ -3891,6 +3923,7 @@ pub fn connect(
         const ka_ns: i64 = @intCast(config.keep_alive_period * 1_000_000);
         conn.keep_alive_interval_ns = @min(ka_ns, @divTrunc(conn.idle_timeout_ns, 2));
     }
+    conn.close_when_idle = config.close_when_idle;
 
     // Initialize QLOG if configured
     if (config.qlog_dir) |dir| {
