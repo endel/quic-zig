@@ -911,7 +911,23 @@ pub fn Server(comptime Handler: type) type {
             while (i < self.conn_mgr.entries.items.len) {
                 const entry = self.conn_mgr.entries.items[i];
 
-                entry.conn.onTimeout() catch {};
+                // Call onTimeout() in a loop to fire ALL expired PTO deadlines.
+                // quic-go fires PTO for each space independently; without this loop,
+                // we only fire the earliest space per tick, requiring separate timer
+                // events for each space. Under burst loss, coalescing all PTO fires
+                // sends more diverse packets in one burst.
+                {
+                    var timeout_iter: usize = 0;
+                    while (timeout_iter < 8) : (timeout_iter += 1) {
+                        entry.conn.onTimeout() catch {};
+                        if (entry.conn.isClosed()) break;
+                        // Check if there are more expired timeouts
+                        const next = entry.conn.nextTimeoutNs();
+                        if (next == null) break;
+                        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+                        if (next.? > now_ns) break;
+                    }
+                }
                 if (entry.conn.isClosed()) {
                     // Fire onSessionClosed BEFORE removeConnection invalidates
                     // the entry, so the handler can mark clients as disconnected.
@@ -1737,9 +1753,21 @@ pub fn Client(comptime Handler: type) type {
 
         fn tickAndSend(self: *Self) void {
             const conn = self.conn;
-            conn.onTimeout() catch |err| {
-                std.log.warn("client onTimeout error: {}", .{err});
-            };
+            // Loop to fire ALL expired PTO deadlines in one tick
+            {
+                var timeout_iter: usize = 0;
+                while (timeout_iter < 8) : (timeout_iter += 1) {
+                    conn.onTimeout() catch |err| {
+                        std.log.warn("client onTimeout error: {}", .{err});
+                        break;
+                    };
+                    if (conn.isClosed()) break;
+                    const next = conn.nextTimeoutNs();
+                    if (next == null) break;
+                    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+                    if (next.? > now_ns) break;
+                }
+            }
 
             if (conn.isClosed()) {
                 if (self.stopping) self.loop.stop();
