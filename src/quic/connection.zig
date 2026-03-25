@@ -3170,31 +3170,30 @@ pub const Connection = struct {
                                 has_data = true;
                             }
                             // Check if any stream has data to send
-                            var has_stream_data = false;
-                            var stream_it = self.streams.streams.valueIterator();
-                            while (stream_it.next()) |s_ptr| {
-                                if (s_ptr.*.send.hasData()) {
-                                    has_stream_data = true;
-                                    has_data = true;
-                                    break;
+                            {
+                                var stream_it = self.streams.streams.valueIterator();
+                                while (stream_it.next()) |s_ptr| {
+                                    if (s_ptr.*.send.hasData()) {
+                                        has_data = true;
+                                        break;
+                                    }
                                 }
                             }
-                            // If no stream has pending data, check in-flight packets for
-                            // stream data to retransmit (RFC 9002 §6.2.4: prefer data over PING).
-                            // Use has_stream_data (not has_data) so HANDSHAKE_DONE being
-                            // in-flight doesn't prevent stream retransmission.
-                            if (!has_stream_data) {
+                            // Always scan in-flight packets for stream data to retransmit
+                            // (RFC 9002 §6.2.4: prefer data over PING). This is critical
+                            // under loss: after the packer consumes retransmission data,
+                            // hasData() returns false, but the retransmission packet might
+                            // still be in-flight (not yet ACKed/declared lost). Without this
+                            // unconditional scan, the PTO sends PINGs instead of data,
+                            // and the peer never receives the file.
+                            {
                                 const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
-                                if (app_tracker.ack_eliciting_in_flight > 0) {
-                                    var pkt_it = app_tracker.sent_packets.iterator();
-                                    while (pkt_it.next()) |entry| {
-                                        const pkt = entry.value_ptr;
-                                        if (pkt.in_flight and pkt.getStreamFrames().len > 0) {
-                                            self.queueStreamRetransmissions(pkt);
-                                            has_data = true;
-                                            // Don't break: retransmit ALL in-flight stream data
-                                            // for faster recovery under loss conditions.
-                                        }
+                                var pkt_it = app_tracker.sent_packets.iterator();
+                                while (pkt_it.next()) |entry| {
+                                    const pkt = entry.value_ptr;
+                                    if (pkt.in_flight and pkt.getStreamFrames().len > 0) {
+                                        self.queueStreamRetransmissions(pkt);
+                                        has_data = true;
                                     }
                                 }
                             }
