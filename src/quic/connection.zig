@@ -2850,6 +2850,28 @@ pub const Connection = struct {
             self.pacer.onPacketSent(bytes_written, now);
             self.last_packet_sent_time = now;
 
+            // If more PTO probes are pending, re-queue stream data + crypto data
+            // so the next probe ALSO carries the retransmission (not just a PING).
+            // Under burst-3 loss, both probes carrying data doubles the delivery chance.
+            if (self.pto_probe_pending > 0) {
+                // Re-queue crypto retransmissions
+                if (self.pkt_num_spaces[0].crypto_seal != null) {
+                    self.queueCryptoRetransmission(.initial);
+                }
+                if (self.pkt_num_spaces[1].crypto_seal != null) {
+                    self.queueCryptoRetransmission(.handshake);
+                }
+                // Reset stream send_offset for unACKed data
+                var resend_it = self.streams.streams.valueIterator();
+                while (resend_it.next()) |s_ptr| {
+                    const s = s_ptr.*;
+                    if (s.send.hasUnackedData()) {
+                        s.send.send_offset = s.send.ack_offset;
+                        if (s.send.fin_queued) s.send.fin_sent = false;
+                    }
+                }
+            }
+
             // Client: auto-clear Handshake keys once Finished has been sent AND acknowledged
             // RFC 9001 §4.9.2: "A client MUST NOT discard keys for the Handshake packet
             // number space until ... its HANDSHAKE packets have been acknowledged."
