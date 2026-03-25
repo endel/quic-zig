@@ -3151,6 +3151,10 @@ pub const Connection = struct {
         if (self.pkt_handler.getPtoTimeout()) |pto_time| {
             if (now >= pto_time) {
                 self.pkt_handler.pto_count += 1;
+                // Increment per-space PTO count for the space that triggered
+                if (self.pkt_handler.getPtoSpace()) |pto_space| {
+                    self.pkt_handler.sent[@intFromEnum(pto_space)].pto_count += 1;
+                }
 
                 // Force-arm ACKs so probes include acknowledgements.
                 // When a PTO fires, our previous packets (which carried ACK frames) likely
