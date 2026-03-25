@@ -3169,18 +3169,16 @@ pub const Connection = struct {
                     }
                 }
 
-                // Application space
-                if (self.pkt_handler.getPtoSpace()) |pto_level| {
-                    switch (pto_level) {
-                        .initial, .handshake => {},  // already handled above
-                        .application => {
-                            // Client: also retransmit Handshake Finished when Application
-                            // PTO fires but the handshake is not yet confirmed. Otherwise
-                            // the server stays stuck waiting for Finished while we only
-                            // retransmit 1-RTT data it cannot respond to.
-                            if (!self.is_server and !self.handshake_confirmed) {
-                                self.queueCryptoRetransmission(.handshake);
-                                if (self.crypto_streams.getStream(2).hasData()) {
+                // Application space — always process, not just when it's the earliest.
+                // quic-go fires PTO for each space independently; we process all
+                // spaces in a single onTimeout() to maximize packet diversity.
+                {
+                    {
+                        // Client: also retransmit Handshake Finished when Application
+                        // PTO fires but the handshake is not yet confirmed.
+                        if (!self.is_server and !self.handshake_confirmed) {
+                            self.queueCryptoRetransmission(.handshake);
+                            if (self.crypto_streams.getStream(2).hasData()) {
                                     has_data = true;
                                 }
                             }
@@ -3231,7 +3229,6 @@ pub const Connection = struct {
                                     }
                                 }
                             }
-                        },
                     }
                 }
 
