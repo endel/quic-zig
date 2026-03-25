@@ -3146,9 +3146,8 @@ pub const Connection = struct {
             self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
         }
 
-        // Check PTO — fire even if loss detection triggered above.
-        // Loss detection requeues data; PTO ensures it bypasses congestion control
-        // and gets sent immediately. quic-go fires PTO independently of loss detection.
+        // Check PTO — fire when any space has an expired deadline.
+        // Loss detection and PTO can both fire in the same onTimeout() call.
         if (self.pkt_handler.getPtoTimeout()) |pto_time| {
             if (now >= pto_time) {
                 self.pkt_handler.pto_count += 1;
@@ -3296,7 +3295,7 @@ pub const Connection = struct {
         // is not confirmed, the server might be blocked by the anti-amplification
         // limit. The client MUST arm a PTO timer to send packets that unblock the
         // server (e.g. a PING in a Handshake or padded Initial packet).
-        else if (!self.is_server and !self.handshake_confirmed) {
+        if (!self.is_server and !self.handshake_confirmed) {
             // Compute PTO based on time since handshake start (creation_time)
             var pto_duration = self.pkt_handler.rtt_stats.ptoNoAckDelay();
             const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
