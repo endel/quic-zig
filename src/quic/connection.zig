@@ -2210,6 +2210,13 @@ pub const Connection = struct {
                         },
                         .handshake => {
                             self.installHandshakeKeys(ik.open, ik.seal);
+                            // RFC 9001 §4.9.1: client stops sending Initial packets after
+                            // receiving the first Handshake packet (which installs these keys).
+                            // Drop the Initial seal to prevent the packer from generating
+                            // Initial packets with the (now shorter) DCID.
+                            if (!self.is_server) {
+                                self.pkt_num_spaces[0].crypto_seal = null;
+                            }
                             if (self.qlog_writer) |*ql| {
                                 const now_ql: i64 = platform.nanoTimestamp();
                                 ql.keyUpdated(now_ql, "tls", "server_handshake_secret");
@@ -2759,6 +2766,8 @@ pub const Connection = struct {
 
         self.packer.conn_flow_ctrl = &self.conn_flow_ctrl;
         self.packer.ecn_mark = self.ecn_validator.shouldMark();
+
+
         const bytes_written = try self.packer.packCoalesced(
             send_buf,
             &self.pkt_handler,
@@ -2773,6 +2782,13 @@ pub const Connection = struct {
             dq,
             false, // ack_only
         );
+
+        // Always consume PTO probe slots, even if nothing was packed.
+        // Without this, an empty second probe leaves pto_probe_pending=1 forever,
+        // blocking all subsequent PTO fires from re-queuing crypto data.
+        if (bytes_written == 0 and self.pto_probe_pending > 0) {
+            self.pto_probe_pending -|= 1;
+        }
 
         if (bytes_written > 0) {
             // QLOG: packet_sent (log using the highest encryption level that was packed)
@@ -3069,16 +3085,18 @@ pub const Connection = struct {
                             // Coalesced packets share fate: if an Initial+Handshake datagram
                             // is lost, BOTH levels need retransmission. Always re-queue both
                             // directions when either level fires PTO.
-                            self.queueCryptoRetransmission(pto_level);
-                            if (pto_level == .handshake) {
-                                // Also retransmit Initial crypto data if still outstanding
+                            //
+                            // Exception: once handshake keys are installed (client received
+                            // ServerHello), skip Initial retransmission. The server already
+                            // processed our ClientHello. Retransmitting Initial with the
+                            // updated (shorter) DCID causes quic-go to reject the packet
+                            // with "too short connection ID". Instead, send Handshake data
+                            // (ACKs) which the server needs to lift the amplification limit.
+                            const has_hs_keys = self.pkt_num_spaces[1].crypto_seal != null;
+                            if (!has_hs_keys) {
                                 self.queueCryptoRetransmission(.initial);
                             }
-                            if (pto_level == .initial) {
-                                // Also retransmit Handshake crypto data if still outstanding
-                                // (server sends ServerHello + Certificate in one datagram)
-                                self.queueCryptoRetransmission(.handshake);
-                            }
+                            self.queueCryptoRetransmission(.handshake);
                             // Check both levels for data
                             if (self.crypto_streams.getStream(0).hasData() or
                                 self.crypto_streams.getStream(2).hasData())
@@ -3138,16 +3156,15 @@ pub const Connection = struct {
                     }
                 }
 
-                // RFC 9002 §6.2.4: Send 2 ack-eliciting datagrams on PTO.
-                // Only push PINGs when there's no crypto data to retransmit —
-                // crypto frames are already ack-eliciting. Stray PINGs end up in
-                // 1-RTT packets, which confuses peers into sending 1-RTT ACKs
-                // instead of Handshake ACKs during the handshake.
+                // RFC 9002 §6.2.4: Send ack-eliciting datagrams on PTO.
+                // Push PINGs when there's no crypto data to retransmit, as
+                // crypto frames are already ack-eliciting.
+                // During handshake, avoid unnecessary PINGs — they can end up
+                // in 1-RTT packets, confusing the peer's ACK behavior.
                 if (!has_data) {
                     self.pending_frames.push(.{ .ping = {} });
-                    self.pending_frames.push(.{ .ping = {} });
                 }
-                self.pto_probe_pending = 2;
+                self.pto_probe_pending = 1;
                 if (self.pkt_handler.getPtoSpace()) |space| {
                     std.log.info("PTO fired: count={d}, space={s}, has_data={}", .{ self.pkt_handler.pto_count, @tagName(space), has_data });
                 }
