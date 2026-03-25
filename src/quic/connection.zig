@@ -3193,9 +3193,6 @@ pub const Connection = struct {
                                 var resend_it = self.streams.streams.valueIterator();
                                 while (resend_it.next()) |s_ptr| {
                                     const s = s_ptr.*;
-                                    // Reset send_offset when all data was consumed by the
-                                    // packer but may not have been ACKed. The receiver's
-                                    // FrameSorter deduplicates already-received data.
                                     if (s.send.fin_queued and s.send.write_offset > 0 and
                                         s.send.send_offset == s.send.write_offset)
                                     {
