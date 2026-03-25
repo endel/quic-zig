@@ -79,12 +79,24 @@ else
     echo "    Pulling $PEER image..."
     $PYTHON pull.py -i "$PEER" 2>/dev/null || true
 
+    # Run each test individually with Docker cleanup between tests to avoid
+    # container race conditions (stale network simulator state).
+    IFS=',' read -ra TEST_ARRAY <<< "$TESTS"
+
     echo "    quic-zig server <-> $PEER client"
-    $PYTHON run.py -s quic-zig -c "$PEER" -t "$TESTS" -d || true
+    for t in "${TEST_ARRAY[@]}"; do
+        docker rm -f $(docker ps -aq) 2>/dev/null
+        docker network prune -f 2>/dev/null
+        $PYTHON run.py -s quic-zig -c "$PEER" -t "$t" -d || true
+    done
 
     echo ""
     echo "    $PEER server <-> quic-zig client"
-    $PYTHON run.py -s "$PEER" -c quic-zig -t "$TESTS" -d || true
+    for t in "${TEST_ARRAY[@]}"; do
+        docker rm -f $(docker ps -aq) 2>/dev/null
+        docker network prune -f 2>/dev/null
+        $PYTHON run.py -s "$PEER" -c quic-zig -t "$t" -d || true
+    done
 fi
 
 echo ""

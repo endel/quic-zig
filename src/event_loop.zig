@@ -4,9 +4,9 @@ const builtin = @import("builtin");
 const log = std.log.scoped(.event_loop);
 const xev_mod = @import("xev");
 
-// Default backend: io_uring on Linux, kqueue on macOS.
-// Callers can use ServerWithBackend(xev_mod.Epoll, H) for containers that block io_uring.
-const xev = xev_mod;
+// Default backend: epoll on Linux, kqueue on macOS.
+// io_uring init fails in some containers used by the interop runner.
+const xev = if (builtin.os.tag == .linux) xev_mod.Epoll else xev_mod;
 
 const connection = @import("quic/connection.zig");
 const connection_manager = @import("quic/connection_manager.zig");
@@ -200,10 +200,10 @@ pub fn Server(comptime Handler: type) type {
 
         const known = [_][]const u8{
             "onConnectRequest", "onSessionReady",  "onStreamData",
-            "onStreamFinished", "onDatagram",       "onSessionClosed",
-            "onSessionDraining","onBidiStream",     "onUniStream",
-            "onPollComplete",   "onRequest",        "onData",
-            "onH0Request",      "onH0Data",         "onH0Finished",
+            "onDatagram",       "onSessionClosed", "onSessionDraining",
+            "onBidiStream",     "onUniStream",     "onPollComplete",
+            "onRequest",        "onData",          "onH0Request",
+            "onH0Data",         "onH0Finished",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -218,7 +218,7 @@ pub fn Server(comptime Handler: type) type {
                 if (!found) {
                     @compileError("Handler has unrecognized callback '" ++ decl.name ++
                         "'. Known callbacks: onRequest, onData, onConnectRequest, " ++
-                        "onSessionReady, onStreamData, onStreamFinished, onDatagram, onSessionClosed, " ++
+                        "onSessionReady, onStreamData, onDatagram, onSessionClosed, " ++
                         "onSessionDraining, onBidiStream, onUniStream, onPollComplete, " ++
                         "onH0Request, onH0Data, onH0Finished");
                 }
@@ -775,14 +775,8 @@ pub fn Server(comptime Handler: type) type {
                         }
                     },
                     .stream_data => |sd| {
-                        if (@hasDecl(Handler, "onStreamData")) {
-                            self.handler.onStreamData(&session, sd.stream_id, sd.data);
-                        }
-                    },
-                    .stream_finished => |sf| {
-                        if (@hasDecl(Handler, "onStreamFinished")) {
-                            self.handler.onStreamFinished(&session, sf.stream_id);
-                        }
+                        self.dispatchStreamData(&session, sd.stream_id, sd.data, sd.fin);
+                        if (sd.data.len > 0) self.allocator.free(sd.data);
                     },
                     .datagram => |dg| {
                         if (@hasDecl(Handler, "onDatagram")) {
@@ -811,6 +805,16 @@ pub fn Server(comptime Handler: type) type {
                     },
                     .session_rejected => {},
                 }
+            }
+        }
+
+        fn dispatchStreamData(self: *Self, session: *Session, stream_id: u64, data: []const u8, fin: bool) void {
+            if (!@hasDecl(Handler, "onStreamData")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params.len == 5) {
+                self.handler.onStreamData(session, stream_id, data, fin);
+            } else if (data.len > 0) {
+                self.handler.onStreamData(session, stream_id, data);
             }
         }
 
@@ -890,16 +894,14 @@ pub fn Server(comptime Handler: type) type {
                 const stream = kv.value_ptr.*;
 
                 if (stream.recv.read()) |data| {
-                    if (@hasDecl(Handler, "onStreamData")) {
-                        self.handler.onStreamData(&session, stream_id, data);
-                    }
+                    const fin = stream.recv.finished;
+                    if (fin) entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
+                    self.dispatchStreamData(&session, stream_id, data, fin);
                     self.allocator.free(data);
                 }
                 if (stream.recv.finished and !entry.finished_streams.contains(stream_id)) {
                     entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
-                    if (@hasDecl(Handler, "onStreamFinished")) {
-                        self.handler.onStreamFinished(&session, stream_id);
-                    }
+                    self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
                 }
             }
         }
@@ -1190,16 +1192,18 @@ pub fn Client(comptime Handler: type) type {
 
         const known = [_][]const u8{
             // Common
-            "onConnected",        "onPollComplete",
+            "onConnected",       "onPollComplete",
             // H3
-            "onHeaders",          "onData",            "onFinished",
-            "onSettings",         "onGoaway",
+            "onHeaders",         "onData",
+            "onFinished",        "onSettings",
+            "onGoaway",
             // Raw QUIC
-            "onStreamData",       "onStreamFinished",
+                     "onStreamData",
             // WebTransport
-            "onSessionReady",     "onSessionRejected",
-            "onDatagram",         "onSessionClosed",
-            "onSessionDraining",  "onBidiStream",      "onUniStream",
+            "onSessionReady",    "onSessionRejected",
+            "onDatagram",        "onSessionClosed",
+            "onSessionDraining", "onBidiStream",
+            "onUniStream",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -1215,7 +1219,7 @@ pub fn Client(comptime Handler: type) type {
                     @compileError("Handler has unrecognized callback '" ++ decl.name ++
                         "'. Known client callbacks: onConnected, onPollComplete, " ++
                         "onHeaders, onData, onFinished, onSettings, onGoaway, " ++
-                        "onStreamData, onStreamFinished, " ++
+                        "onStreamData, " ++
                         "onSessionReady, onSessionRejected, onDatagram, onSessionClosed, " ++
                         "onSessionDraining, onBidiStream, onUniStream");
                 }
@@ -1265,7 +1269,7 @@ pub fn Client(comptime Handler: type) type {
         protocol_initialized: bool,
         session_id: ?u64,
 
-        // For raw QUIC: track streams whose fin has been delivered
+        // For raw QUIC: track streams whose fin has been delivered via onStreamData(..., fin)
         finished_streams: std.AutoHashMap(u64, void),
 
         // Config retained for protocol init
@@ -1613,14 +1617,8 @@ pub fn Client(comptime Handler: type) type {
                         }
                     },
                     .stream_data => |sd| {
-                        if (@hasDecl(Handler, "onStreamData")) {
-                            self.handler.onStreamData(&session, sd.stream_id, sd.data);
-                        }
-                    },
-                    .stream_finished => |sf| {
-                        if (@hasDecl(Handler, "onStreamFinished")) {
-                            self.handler.onStreamFinished(&session, sf.stream_id);
-                        }
+                        self.dispatchStreamData(&session, sd.stream_id, sd.data, sd.fin);
+                        if (sd.data.len > 0) self.allocator.free(sd.data);
                     },
                     .datagram => |dg| {
                         if (@hasDecl(Handler, "onDatagram")) {
@@ -1649,6 +1647,16 @@ pub fn Client(comptime Handler: type) type {
                     },
                     .connect_request => {},
                 }
+            }
+        }
+
+        fn dispatchStreamData(self: *Self, session: *ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
+            if (!@hasDecl(Handler, "onStreamData")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params.len == 5) {
+                self.handler.onStreamData(session, stream_id, data, fin);
+            } else if (data.len > 0) {
+                self.handler.onStreamData(session, stream_id, data);
             }
         }
 
@@ -1715,16 +1723,14 @@ pub fn Client(comptime Handler: type) type {
                 const stream = entry.value_ptr.*;
 
                 if (stream.recv.read()) |data| {
-                    if (@hasDecl(Handler, "onStreamData")) {
-                        self.handler.onStreamData(&session, stream_id, data);
-                    }
+                    const fin = stream.recv.finished;
+                    if (fin) self.finished_streams.put(stream_id, {}) catch {};
+                    self.dispatchStreamData(&session, stream_id, data, fin);
                     self.allocator.free(data);
                 }
                 if (stream.recv.finished and !self.finished_streams.contains(stream_id)) {
                     self.finished_streams.put(stream_id, {}) catch {};
-                    if (@hasDecl(Handler, "onStreamFinished")) {
-                        self.handler.onStreamFinished(&session, stream_id);
-                    }
+                    self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
                 }
             }
         }
@@ -1848,11 +1854,15 @@ const TestWtHandler = struct {
     pub fn onSessionReady(self: *TestWtHandler, _: *Session, _: u64) void {
         self.session_ready_count += 1;
     }
-    pub fn onStreamData(self: *TestWtHandler, session: *Session, stream_id: u64, data: []const u8) void {
+    pub fn onStreamData(self: *TestWtHandler, session: *Session, stream_id: u64, data: []const u8, fin: bool) void {
         self.stream_data_count += 1;
         // Echo back
-        session.sendStreamData(stream_id, data) catch {};
-        session.closeStream(stream_id);
+        if (data.len > 0) {
+            session.sendStreamData(stream_id, data) catch {};
+        }
+        if (fin) {
+            session.closeStream(stream_id);
+        }
     }
     pub fn onDatagram(_: *TestWtHandler, _: *Session, _: u64, _: []const u8) void {}
     pub fn onSessionClosed(_: *TestWtHandler, _: *Session, _: u64, _: u32, _: []const u8) void {}
@@ -1882,7 +1892,7 @@ test "Client: handler validation compiles for valid handlers" {
     const TestWtClientHandler = struct {
         pub const protocol: Protocol = .webtransport;
         pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64) void {}
-        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
         pub fn onDatagram(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
     };
     _ = Client(TestWtClientHandler);
@@ -1903,8 +1913,7 @@ test "Client: handler validation compiles for valid handlers" {
     const TestQuicClientHandler = struct {
         pub const protocol: Protocol = .quic;
         pub fn onConnected(_: *@This(), _: *ClientSession) void {}
-        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
-        pub fn onStreamFinished(_: *@This(), _: *ClientSession, _: u64) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
     };
     _ = Client(TestQuicClientHandler);
 }
@@ -1982,7 +1991,7 @@ test "Client H3: init and deinit" {
 test "Client QUIC: init and deinit" {
     var handler = struct {
         pub const protocol: Protocol = .quic;
-        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
     }{};
 
     var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
@@ -2018,7 +2027,7 @@ test "Client H3: start, tick, stop lifecycle" {
 test "Client QUIC: start, tick, stop lifecycle" {
     var handler = struct {
         pub const protocol: Protocol = .quic;
-        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
     }{};
 
     var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{

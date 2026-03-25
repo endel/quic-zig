@@ -600,7 +600,7 @@ pub const PacketHandler = struct {
     /// Compute PTO deadline for a single packet number space.
     /// Returns null if the space should not arm PTO (no data, application space idle).
     /// RFC 9002 §6.2.2.1: handshake spaces arm PTO even with no packets in flight.
-    fn spacePtoDeadline(self: *const PacketHandler, tracker: SentPacketTracker, idx: usize) ?i64 {
+    pub fn spacePtoDeadline(self: *const PacketHandler, tracker: SentPacketTracker, idx: usize) ?i64 {
         const is_handshake_space = (idx != @intFromEnum(EncLevel.application));
         if (tracker.ack_eliciting_in_flight == 0) {
             if (!(is_handshake_space and tracker.last_ack_eliciting_sent_time != null)) {
@@ -610,7 +610,10 @@ pub const PacketHandler = struct {
 
         const base_time = if (tracker.ack_eliciting_in_flight > 0) blk: {
             const largest_sent = tracker.largest_sent orelse return null;
-            const sent_pkt = tracker.sent_packets.get(largest_sent) orelse return null;
+            // Packet may have been removed from sent_packets after loss detection.
+            // Fall back to last_ack_eliciting_sent_time which is always maintained.
+            const sent_pkt = tracker.sent_packets.get(largest_sent) orelse
+                break :blk tracker.last_ack_eliciting_sent_time orelse return null;
             break :blk sent_pkt.time_sent;
         } else blk: {
             break :blk tracker.last_ack_eliciting_sent_time.?;
@@ -629,7 +632,7 @@ pub const PacketHandler = struct {
         return base_time + pto_duration;
     }
 
-    pub fn getPtoTimeout(self: *PacketHandler) ?i64 {
+    pub fn getPtoTimeout(self: *const PacketHandler) ?i64 {
         var earliest: ?i64 = null;
 
         for (self.sent, 0..) |tracker, idx| {

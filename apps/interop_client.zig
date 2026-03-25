@@ -25,10 +25,10 @@ const qpack = lib.qpack;
 const MAX_DATAGRAM_SIZE: usize = 1500;
 
 /// Per-connection timeouts for multiconnect mode (handshakeloss/handshakecorruption).
-/// These are short because 50 sequential connections must complete within the 300s test limit.
-/// Under 30% packet loss, the handshake needs ~10 PTO retries (capped at 3s each).
-const MULTICONNECT_HANDSHAKE_TIMEOUT_S: i128 = 25;
-const MULTICONNECT_DOWNLOAD_TIMEOUT_S: i128 = 20;
+/// 50 sequential connections must complete within the 60s test limit under 30% loss.
+/// Each connection budget: ~1s, with generous margin for PTO retries.
+const MULTICONNECT_HANDSHAKE_TIMEOUT_S: i128 = 10;
+const MULTICONNECT_DOWNLOAD_TIMEOUT_S: i128 = 10;
 const DEFAULT_TIMEOUT_S: i128 = 120;
 
 const TestCase = enum {

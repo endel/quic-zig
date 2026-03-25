@@ -166,7 +166,8 @@ pub fn main() !void {
 
     var key_der_buf: [4096]u8 = undefined;
     const key_der = try tls13.parsePemPrivateKey(key_pem, &key_der_buf);
-    const ec_private_key = try tls13.extractEcPrivateKey(key_der);
+    const ec_private_key = tls13.extractEcPrivateKey(key_der) catch
+        try tls13.extractPkcs8EcPrivateKey(key_der);
 
     const use_h3 = (testcase == .http3);
     const alpn = try alloc.alloc([]const u8, 1);
@@ -232,6 +233,11 @@ pub fn main() !void {
         .qlog_dir = qlog_dir,
         .initial_max_streams_bidi = 1000,
         .initial_max_streams_uni = 1000,
+        // Shorter idle timeout for multiconnect (50 sequential connections under loss).
+        // Default 30s is too long. Under 30% loss, PTO retransmissions need time:
+        // 3 retries at ~115ms, ~230ms, ~460ms = ~800ms worst case before data arrives.
+        // 2s gives enough margin while keeping connections from lingering too long.
+        .max_idle_timeout = if (testcase == .multiconnect) 500 else 30_000,
     };
 
     const config: event_loop.Config = .{
