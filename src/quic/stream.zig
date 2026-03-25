@@ -276,6 +276,11 @@ pub const SendStream = struct {
     /// Next offset to be sent.
     send_offset: u64 = 0,
 
+    /// Highest contiguous offset acknowledged by the peer.
+    /// Used by PTO to determine what needs retransmission — data between
+    /// ack_offset and write_offset may not have been received.
+    ack_offset: u64 = 0,
+
     /// Maximum data the peer allows us to send on this stream.
     send_window: u64 = std.math.maxInt(u64),
 
@@ -328,6 +333,14 @@ pub const SendStream = struct {
     /// Close the stream (queue FIN).
     pub fn close(self: *SendStream) void {
         self.fin_queued = true;
+    }
+
+    /// Update the acknowledged offset when a packet carrying stream frames is ACKed.
+    pub fn onAck(self: *SendStream, offset: u64, length: u64) void {
+        const end = offset + length;
+        if (end > self.ack_offset) {
+            self.ack_offset = end;
+        }
     }
 
     /// Cancel the stream with an error code (sends RESET_STREAM).
@@ -419,6 +432,13 @@ pub const SendStream = struct {
             self.fin_lost or
             self.send_offset < self.write_offset or
             (self.fin_queued and !self.fin_sent);
+    }
+
+    /// Check if there's data that has been sent but not yet acknowledged.
+    /// Used by PTO to determine if retransmission is needed.
+    pub fn hasUnackedData(self: *const SendStream) bool {
+        return self.ack_offset < self.write_offset or
+            (self.fin_queued and self.ack_offset < self.write_offset + 1);
     }
 
     /// Pop a STREAM frame with at most max_len bytes of payload.

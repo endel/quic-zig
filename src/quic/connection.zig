@@ -1359,6 +1359,19 @@ pub const Connection = struct {
 
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent);
 
+                    // Update stream ack_offset for ACKed stream frames
+                    for (pkt.getStreamFrames()) |sf| {
+                        if (stream_mod.isBidi(sf.stream_id)) {
+                            if (self.streams.getStream(sf.stream_id)) |s| {
+                                s.send.onAck(sf.offset, sf.length);
+                            }
+                        } else {
+                            if (self.streams.send_streams.get(sf.stream_id)) |s| {
+                                s.onAck(sf.offset, sf.length);
+                            }
+                        }
+                    }
+
                     // Track whether a packet sent with current keys has been ACKed
                     if (enc_level == .application) {
                         if (self.key_update) |*ku| {
@@ -1470,6 +1483,19 @@ pub const Connection = struct {
                     if (pkt.has_handshake_done) {
                         self.packer.send_handshake_done = false;
                         self.handshake_done_pending = false;
+                    }
+
+                    // Update stream ack_offset for ACKed stream frames
+                    for (pkt.getStreamFrames()) |sf| {
+                        if (stream_mod.isBidi(sf.stream_id)) {
+                            if (self.streams.getStream(sf.stream_id)) |s| {
+                                s.send.onAck(sf.offset, sf.length);
+                            }
+                        } else {
+                            if (self.streams.send_streams.get(sf.stream_id)) |s| {
+                                s.onAck(sf.offset, sf.length);
+                            }
+                        }
                     }
 
                     if (enc_level == .application) {
@@ -3189,15 +3215,18 @@ pub const Connection = struct {
                             // reset send_offset to write_offset - data_size to force
                             // retransmission. Only do this for small streams (multiconnect
                             // serves 1KB files) to avoid resending entire large transfers.
+                            // If no pending data but there IS unACKed data,
+                            // reset send_offset to ack_offset to retransmit
+                            // only the unACKed portion.
                             if (!has_data) {
                                 var resend_it = self.streams.streams.valueIterator();
                                 while (resend_it.next()) |s_ptr| {
                                     const s = s_ptr.*;
-                                    if (s.send.fin_queued and s.send.write_offset > 0 and
-                                        s.send.send_offset == s.send.write_offset)
-                                    {
-                                        s.send.send_offset = 0;
-                                        s.send.fin_sent = false;
+                                    if (s.send.hasUnackedData()) {
+                                        s.send.send_offset = s.send.ack_offset;
+                                        if (s.send.fin_queued) {
+                                            s.send.fin_sent = false;
+                                        }
                                         has_data = true;
                                     }
                                 }
