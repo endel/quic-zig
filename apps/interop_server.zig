@@ -246,10 +246,11 @@ pub fn main() !void {
         .initial_max_streams_bidi = 1000,
         .initial_max_streams_uni = 1000,
         // Shorter idle timeout for multiconnect (50 sequential connections under loss).
-        .max_idle_timeout = if (testcase == .multiconnect) 500 else 30_000,
-        // Auto-close connections after all data is delivered (multiconnect needs this
-        // to prevent PTO PING→ACK cycle from keeping finished connections alive).
-        .close_when_idle = (testcase == .multiconnect),
+        // Under 30% loss, PTO retransmissions can take up to ~3.5s (5-6 retries
+        // with exponential backoff: 115+230+460+920+1840ms). Use 5s to cover this.
+        // quic-go enforces a minimum of 5s regardless, so smaller values are ignored.
+        .max_idle_timeout = if (testcase == .multiconnect) 5_000 else 30_000,
+        .close_when_idle = false,
     };
 
     const config: event_loop.Config = .{
