@@ -3009,9 +3009,18 @@ pub const Connection = struct {
         // to avoid terminating the connection before probes have a chance to be answered.
         // Using base PTO (not backed-off) matches quic-go and quiche behavior: the idle
         // timeout should not extend indefinitely as pto_count grows.
+        //
+        // When data is in flight, extend idle to cover the current PTO backoff schedule.
+        // This prevents premature termination while actively retransmitting under loss.
         {
             const base_pto = self.pkt_handler.rtt_stats.pto();
-            const effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
+            var effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
+            const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+            if (self.handshake_confirmed and self.pkt_handler.sent[app_idx].ack_eliciting_in_flight > 0) {
+                const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
+                const backed_off_pto = @min(base_pto << shift, 60_000_000_000);
+                effective_idle = @max(effective_idle, 3 * backed_off_pto);
+            }
             // RFC 9000 §10.1.2: Before handshake confirmed, also defer idle timeout
             // when sending ack-eliciting packets (to avoid premature timeout during
             // handshake retransmission). After handshake confirmed, only received
@@ -3025,37 +3034,31 @@ pub const Connection = struct {
                 return;
             }
         }
-
+        // Auto-close: when close_when_idle is set and all stream data has been
+        // sent (FIN queued, no pending retransmissions), close the connection.
+        // Don't wait for control frame ACKs (HANDSHAKE_DONE, NEW_CONNECTION_ID)
+        // which can take multiple RTTs under loss.
         // Auto-close: when close_when_idle is set, close the connection once all
-        // stream data has been sent and acknowledged (no pending data, nothing in
-        // flight), OR after too many PTO retransmissions without progress (the peer
-        // likely moved on to a new connection).
-        if (self.close_when_idle and self.handshake_confirmed) {
-            const app_idx = @intFromEnum(ack_handler.EncLevel.application);
-            const app_in_flight = self.pkt_handler.sent[app_idx].ack_eliciting_in_flight;
-
-            // Close immediately when all data is delivered
-            if (app_in_flight == 0) {
-                var all_done = true;
+        // stream data has been queued for sending (FIN queued, no pending retransmissions).
+        // This triggers close BEFORE the data is necessarily ACKed — the CONNECTION_CLOSE
+        // is coalesced with or sent after the data, so the peer receives both. Under loss,
+        // if the data packet is lost, the CONNECTION_CLOSE packet still reaches the peer,
+        // which then closes its side. The server's draining period handles retransmission
+        // of the close frame.
+        if (self.close_when_idle and self.handshake_confirmed and self.state == .connected) {
+            if (self.streams.streams.count() > 0) {
+                var all_streams_done = true;
                 var stream_it = self.streams.streams.valueIterator();
                 while (stream_it.next()) |s_ptr| {
-                    if (s_ptr.*.send.hasData()) {
-                        all_done = false;
+                    if (s_ptr.*.send.hasData() or !s_ptr.*.send.fin_queued) {
+                        all_streams_done = false;
                         break;
                     }
                 }
-                if (all_done) {
+                if (all_streams_done) {
                     self.close(0, "");
                     return;
                 }
-            }
-
-            // Close after consecutive idle PTOs — peer likely abandoned the connection.
-            // idle_pto_count increments on each PTO with has_data=false (no stream data),
-            // and is NOT reset by received ACKs (unlike pto_count).
-            if (self.idle_pto_count >= 2) {
-                self.state = .terminated;
-                return;
             }
         }
 
@@ -3189,7 +3192,8 @@ pub const Connection = struct {
                                         if (pkt.in_flight and pkt.getStreamFrames().len > 0) {
                                             self.queueStreamRetransmissions(pkt);
                                             has_data = true;
-                                            break;
+                                            // Don't break: retransmit ALL in-flight stream data
+                                            // for faster recovery under loss conditions.
                                         }
                                     }
                                 }
@@ -3201,10 +3205,24 @@ pub const Connection = struct {
                 // RFC 9002 §6.2.4: Send ack-eliciting datagrams on PTO.
                 // Push PINGs when there's no crypto data to retransmit, as
                 // crypto frames are already ack-eliciting.
-                // During handshake, avoid unnecessary PINGs — they can end up
-                // in 1-RTT packets, confusing the peer's ACK behavior.
+                //
+                // Skip PINGs when has_data is false AND no in-flight packets carry
+                // stream data. At that point, all file data has been delivered and
+                // acknowledged. Suppressing PINGs allows the peer's idle timeout to
+                // fire, closing the connection naturally.
                 if (!has_data) {
-                    self.pending_frames.push(.{ .ping = {} });
+                    var has_stream_in_flight = false;
+                    const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
+                    var pkt_it = app_tracker.sent_packets.iterator();
+                    while (pkt_it.next()) |entry| {
+                        if (entry.value_ptr.in_flight and entry.value_ptr.getStreamFrames().len > 0) {
+                            has_stream_in_flight = true;
+                            break;
+                        }
+                    }
+                    if (has_stream_in_flight) {
+                        self.pending_frames.push(.{ .ping = {} });
+                    }
                     self.idle_pto_count += 1;
                 } else {
                     self.idle_pto_count = 0;
