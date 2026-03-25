@@ -109,12 +109,24 @@ const H0InteropHandler = struct {
     pub const protocol: event_loop.Protocol = .h0;
 
     www_dir: []const u8,
+    served_count: u32 = 0,
+    close_when_served: bool = false,
 
     pub fn onH0Request(self: *H0InteropHandler, session: *event_loop.Session, stream_id: u64, path: []const u8) void {
         std.log.info("H0: request for {s} on stream {d}", .{ path, stream_id });
         session.serveFile(stream_id, self.www_dir, path) catch |err| {
             std.log.err("H0: serveFile error: {any}", .{err});
         };
+        self.served_count += 1;
+    }
+
+    pub fn onH0Finished(self: *H0InteropHandler, session: *event_loop.Session, _: u64) void {
+        // For multiconnect: close connection when the client closes its request
+        // stream (FIN received). At this point, the server has already queued its
+        // response. Close proactively to avoid the PTO PING→ACK→idle cycle.
+        if (self.close_when_served and self.served_count > 0) {
+            session.closeConnection();
+        }
     }
 };
 
@@ -259,7 +271,10 @@ pub fn main() !void {
         defer server.deinit();
         try server.run();
     } else {
-        var handler = H0InteropHandler{ .www_dir = www_dir };
+        var handler = H0InteropHandler{
+            .www_dir = www_dir,
+            .close_when_served = (testcase == .multiconnect),
+        };
         var server = try event_loop.Server(H0InteropHandler).init(alloc, &handler, config);
         defer server.deinit();
         try server.run();
