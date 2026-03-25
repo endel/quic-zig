@@ -26,14 +26,13 @@ const QuicEchoClient = struct {
         std.debug.print("Sent on stream {d}: {s}\n", .{ sid, self.message });
     }
 
-    pub fn onStreamData(self: *QuicEchoClient, _: *event_loop.ClientSession, stream_id: u64, data: []const u8) void {
-        std.debug.print("Response on stream {d}: {s}\n", .{ stream_id, data });
-        self.got_response = true;
-    }
-
-    pub fn onStreamFinished(self: *QuicEchoClient, session: *event_loop.ClientSession, stream_id: u64) void {
-        std.debug.print("Stream {d} finished\n", .{stream_id});
-        if (self.got_response) {
+    pub fn onStreamData(self: *QuicEchoClient, session: *event_loop.ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
+        if (data.len > 0) {
+            std.debug.print("Response on stream {d}: {s}\n", .{ stream_id, data });
+            self.got_response = true;
+        }
+        if (fin and self.got_response) {
+            std.debug.print("Stream {d} finished\n", .{stream_id});
             session.closeConnection();
         }
     }

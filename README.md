@@ -91,9 +91,11 @@ const MyHandler = struct {
         session.acceptSession(session_id) catch return;
     }
 
-    pub fn onStreamData(_: *MyHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
-        session.sendStreamData(stream_id, data) catch {}; // echo
-        session.closeStream(stream_id);
+    pub fn onStreamData(_: *MyHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
+        if (data.len > 0) {
+            session.sendStreamData(stream_id, data) catch {}; // echo
+        }
+        if (fin) session.closeStream(stream_id);
     }
 
     pub fn onDatagram(_: *MyHandler, session: *event_loop.Session, session_id: u64, data: []const u8) void {
@@ -206,7 +208,8 @@ const MyHandler = struct {
         session.sendDatagram(session_id, "Hello via datagram!") catch {};
     }
 
-    pub fn onStreamData(_: *MyHandler, session: *event_loop.ClientSession, stream_id: u64, data: []const u8) void {
+    pub fn onStreamData(_: *MyHandler, session: *event_loop.ClientSession, stream_id: u64, data: []const u8, _: bool) void {
+        if (data.len == 0) return;
         std.debug.print("Response on stream {d}: {s}\n", .{ stream_id, data });
         session.closeConnection();
     }

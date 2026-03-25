@@ -15,12 +15,15 @@ const EchoHandler = struct {
         session.acceptSession(session_id) catch return;
     }
 
-    pub fn onStreamData(_: *EchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
-        if (data.len == 0) return;
+    pub fn onStreamData(_: *EchoHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
+        if (data.len == 0) {
+            if (fin) session.closeStream(stream_id);
+            return;
+        }
         var echo_buf: [1024]u8 = undefined;
         const echo_msg = std.fmt.bufPrint(&echo_buf, "Echo: {s}", .{data}) catch return;
         session.sendStreamData(stream_id, echo_msg) catch return;
-        session.closeStream(stream_id);
+        if (fin) session.closeStream(stream_id);
     }
 
     pub fn onDatagram(_: *EchoHandler, session: *event_loop.Session, session_id: u64, data: []const u8) void {

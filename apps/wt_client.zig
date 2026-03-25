@@ -32,7 +32,8 @@ const EchoClient = struct {
         std.debug.print("Sent datagram\n", .{});
     }
 
-    pub fn onStreamData(self: *EchoClient, session: *event_loop.ClientSession, stream_id: u64, data: []const u8) void {
+    pub fn onStreamData(self: *EchoClient, session: *event_loop.ClientSession, stream_id: u64, data: []const u8, _: bool) void {
+        if (data.len == 0) return;
         std.debug.print("Response on stream {d}: {s}\n", .{ stream_id, data });
         self.got_response = true;
         session.closeConnection();
