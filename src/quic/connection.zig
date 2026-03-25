@@ -3121,34 +3121,32 @@ pub const Connection = struct {
                     }
                 }
 
-                // Check if there's retransmittable data in the PTO space
+                // Queue retransmission for ALL spaces with outstanding data.
+                // quic-go fires PTO for each space separately, sending 2 probes per
+                // space. This maximizes the chance of at least one packet getting
+                // through burst loss (burst_to_client=3 drops 3 consecutive packets).
                 var has_data = false;
+
+                // Handshake spaces: re-queue crypto data
+                {
+                    const has_hs_keys = self.pkt_num_spaces[1].crypto_seal != null;
+                    if (!has_hs_keys and self.pkt_num_spaces[0].crypto_seal != null) {
+                        self.queueCryptoRetransmission(.initial);
+                    }
+                    if (self.pkt_num_spaces[1].crypto_seal != null) {
+                        self.queueCryptoRetransmission(.handshake);
+                    }
+                    if (self.crypto_streams.getStream(0).hasData() or
+                        self.crypto_streams.getStream(2).hasData())
+                    {
+                        has_data = true;
+                    }
+                }
+
+                // Application space
                 if (self.pkt_handler.getPtoSpace()) |pto_level| {
                     switch (pto_level) {
-                        .initial, .handshake => {
-                            // Re-queue crypto data for retransmission on PTO (RFC 9002 §6.2.4)
-                            // Coalesced packets share fate: if an Initial+Handshake datagram
-                            // is lost, BOTH levels need retransmission. Always re-queue both
-                            // directions when either level fires PTO.
-                            //
-                            // Exception: once handshake keys are installed (client received
-                            // ServerHello), skip Initial retransmission. The server already
-                            // processed our ClientHello. Retransmitting Initial with the
-                            // updated (shorter) DCID causes quic-go to reject the packet
-                            // with "too short connection ID". Instead, send Handshake data
-                            // (ACKs) which the server needs to lift the amplification limit.
-                            const has_hs_keys = self.pkt_num_spaces[1].crypto_seal != null;
-                            if (!has_hs_keys) {
-                                self.queueCryptoRetransmission(.initial);
-                            }
-                            self.queueCryptoRetransmission(.handshake);
-                            // Check both levels for data
-                            if (self.crypto_streams.getStream(0).hasData() or
-                                self.crypto_streams.getStream(2).hasData())
-                            {
-                                has_data = true;
-                            }
-                        },
+                        .initial, .handshake => {},  // already handled above
                         .application => {
                             // Client: also retransmit Handshake Finished when Application
                             // PTO fires but the handshake is not yet confirmed. Otherwise
@@ -3211,19 +3209,21 @@ pub const Connection = struct {
                     }
                 }
 
-                // RFC 9002 §6.2.4: Send ack-eliciting datagrams on PTO.
-                // Push PINGs when there's no crypto data to retransmit, as
-                // crypto frames are already ack-eliciting.
-                //
-                // Skip PINGs when has_data is false AND no in-flight packets carry
-                // stream data. At that point, all file data has been delivered and
-                // acknowledged. Suppressing PINGs allows the peer's idle timeout to
-                // fire, closing the connection naturally.
-                if (!has_data) {
+                // RFC 9002 §6.2.4: "An endpoint MUST send at least one
+                // ack-eliciting packet in the packet number space..."
+                // Always push a PING so the second probe (pto_probe_pending=2)
+                // has content even after the first probe consumed crypto data.
+                // For has_data=false, only push if there's stream data in flight
+                // (to allow idle timeout when all data is delivered).
+                if (has_data) {
+                    // PING for second probe (first probe has crypto/stream data)
+                    self.pending_frames.push(.{ .ping = {} });
+                    self.idle_pto_count = 0;
+                } else {
                     var has_stream_in_flight = false;
-                    const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
-                    var pkt_it = app_tracker.sent_packets.iterator();
-                    while (pkt_it.next()) |entry| {
+                    const app_tracker2 = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
+                    var pkt_it2 = app_tracker2.sent_packets.iterator();
+                    while (pkt_it2.next()) |entry| {
                         if (entry.value_ptr.in_flight and entry.value_ptr.getStreamFrames().len > 0) {
                             has_stream_in_flight = true;
                             break;
@@ -3233,10 +3233,12 @@ pub const Connection = struct {
                         self.pending_frames.push(.{ .ping = {} });
                     }
                     self.idle_pto_count += 1;
-                } else {
-                    self.idle_pto_count = 0;
                 }
-                self.pto_probe_pending = 1;
+                // RFC 9002 §6.2.4: "An endpoint MUST send at least one ack-eliciting
+                // packet in the packet number space..." — quic-go sends 2 probes per
+                // PTO fire for burst loss resilience. With burst_to_client=3, a single
+                // probe can be wiped; 2 probes double the chance of getting through.
+                self.pto_probe_pending = 2;
                 if (self.pkt_handler.getPtoSpace()) |space| {
                     std.log.info("PTO fired: count={d}, space={s}, has_data={}", .{ self.pkt_handler.pto_count, @tagName(space), has_data });
                 }
