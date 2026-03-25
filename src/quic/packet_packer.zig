@@ -137,11 +137,12 @@ pub const PacketPacker = struct {
         // Try packing Initial packet
         // Both client and server MUST pad UDP datagrams carrying ack-eliciting Initial
         // packets to >= 1200 bytes (RFC 9000 §14.1).
-        // Client: pad the Initial itself (0-RTT/Handshake go in next datagram).
-        // Server: don't pad the Initial here — pad the Handshake portion below
-        // so the coalesced datagram reaches 1200 bytes without overflowing.
+        // Client: when Handshake keys are available, DON'T pad the Initial — leave room
+        // for a coalesced Handshake packet (which carries the ACK the server needs to
+        // lift the amplification limit). The Handshake portion provides the padding.
+        // Server: don't pad the Initial here — pad the Handshake portion below.
         if (initial_seal != null) {
-            const pad_target: usize = if (!self.is_server) MIN_INITIAL_PACKET_SIZE else 0;
+            const pad_target: usize = if (!self.is_server and handshake_seal == null) MIN_INITIAL_PACKET_SIZE else 0;
             const initial_len = try self.packSinglePacket(
                 out_buf[offset..],
                 .initial,
@@ -184,16 +185,13 @@ pub const PacketPacker = struct {
         }
 
         // Try packing Handshake packet
-        // Padding logic:
-        // - Server: pad Handshake so coalesced datagram (Initial+Handshake) reaches 1200 bytes.
-        // - Client (standalone Handshake, no Initial coalesced): pad to 1200 bytes so
-        //   the server gets amplification credit and peers don't reject small datagrams
-        //   (RFC 9000 §14.1 recommends padding during handshake).
+        // Padding logic: the coalesced datagram (Initial+Handshake) must reach 1200 bytes.
+        // Both client and server pad the Handshake portion to fill the remainder.
         if (handshake_seal != null and offset < out_buf.len) {
-            const hs_pad: usize = if (self.is_server and offset > 0)
-                MIN_INITIAL_PACKET_SIZE -| offset
-            else if (!self.is_server and offset == 0 and initial_seal == null)
-                MIN_INITIAL_PACKET_SIZE
+            const hs_pad: usize = if (offset > 0)
+                MIN_INITIAL_PACKET_SIZE -| offset // Coalesced after Initial: pad remainder
+            else if (!self.is_server and initial_seal == null)
+                MIN_INITIAL_PACKET_SIZE // Standalone client Handshake: full pad
             else
                 0;
             const hs_len = try self.packSinglePacket(

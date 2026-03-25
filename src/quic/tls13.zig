@@ -2645,11 +2645,20 @@ pub fn extractPkcs8EcPrivateKey(der: []const u8) ![]const u8 {
     const ver_len = der[pos];
     pos += 1 + ver_len;
 
-    // Skip AlgorithmIdentifier SEQUENCE
+    // Skip AlgorithmIdentifier SEQUENCE (handle multi-byte length)
     if (pos >= der.len or der[pos] != 0x30) return error.DecodeError;
     pos += 1;
-    const alg_len = der[pos];
-    pos += 1 + alg_len;
+    var alg_len: usize = der[pos];
+    pos += 1;
+    if (alg_len & 0x80 != 0) {
+        const num = alg_len & 0x7f;
+        alg_len = 0;
+        for (0..num) |i| {
+            alg_len = (alg_len << 8) | der[pos + i];
+        }
+        pos += num;
+    }
+    pos += alg_len;
 
     // OCTET STRING containing ECPrivateKey
     if (pos >= der.len or der[pos] != 0x04) return error.DecodeError;

@@ -168,7 +168,8 @@ pub fn main() !void {
 
     var key_der_buf: [4096]u8 = undefined;
     const key_der = try tls13.parsePemPrivateKey(key_pem, &key_der_buf);
-    const ec_private_key = try tls13.extractEcPrivateKey(key_der);
+    const ec_private_key = tls13.extractEcPrivateKey(key_der) catch
+        try tls13.extractPkcs8EcPrivateKey(key_der);
 
     // ALPN: h3 for WebTransport
     const alpn = try alloc.alloc([]const u8, 1);
@@ -577,8 +578,22 @@ fn pollWtEvents(
                     buf.appendSlice(alloc, sd.data) catch {};
                 }
                 if (sd.data.len > 0) alloc.free(sd.data);
+                if (sd.fin) {
+                    if (state.bidi_bufs.get(sd.stream_id)) |buf| {
+                        handleBidiStreamComplete(alloc, wt, state, testcase, sd.stream_id, buf.items);
+                        if (state.bidi_bufs.getPtr(sd.stream_id)) |buf_ptr| {
+                            buf_ptr.deinit(alloc);
+                            _ = state.bidi_bufs.remove(sd.stream_id);
+                        }
+                    } else if (state.uni_bufs.get(sd.stream_id)) |buf| {
+                        handleUniStreamComplete(alloc, wt, state, testcase, sd.stream_id, buf.items);
+                        if (state.uni_bufs.getPtr(sd.stream_id)) |buf_ptr| {
+                            buf_ptr.deinit(alloc);
+                            _ = state.uni_bufs.remove(sd.stream_id);
+                        }
+                    }
+                }
             },
-            .stream_finished => {},
 
             .datagram => |dg| {
                 handleDatagram(alloc, wt, state, testcase, dg.session_id, dg.data);
@@ -603,9 +618,6 @@ fn pollWtEvents(
         }
     }
 
-    // Check for completed bidi/uni streams (FIN received) and process them
-    checkFinishedStreams(alloc, wt, state, testcase);
-
     // Check if *-send tests are done (all expected files received)
     if (state.files_expected > 0 and state.files_completed >= state.files_expected) {
         std.log.info("all {d} files received", .{state.files_expected});
@@ -616,78 +628,6 @@ fn pollWtEvents(
 }
 
 /// Check for streams that have received FIN and process accumulated data.
-fn checkFinishedStreams(
-    alloc: std.mem.Allocator,
-    wt: *webtransport.WebTransportConnection,
-    state: *ConnState,
-    testcase: TestCase,
-) void {
-    // Check bidi streams
-    var bidi_finished: [64]u64 = undefined;
-    var bidi_finished_count: usize = 0;
-    {
-        var it = state.bidi_bufs.iterator();
-        while (it.next()) |entry| {
-            const stream_id = entry.key_ptr.*;
-            // Read any remaining data
-            if (wt.quic.streams.getStream(stream_id)) |stream| {
-                if (stream.recv.read()) |data| {
-                    defer alloc.free(data);
-                    entry.value_ptr.appendSlice(alloc, data) catch {};
-                }
-                if (stream.recv.finished) {
-                    if (bidi_finished_count < 64) {
-                        bidi_finished[bidi_finished_count] = stream_id;
-                        bidi_finished_count += 1;
-                    }
-                }
-            }
-        }
-    }
-    for (bidi_finished[0..bidi_finished_count]) |stream_id| {
-        if (state.bidi_bufs.get(stream_id)) |buf| {
-            handleBidiStreamComplete(alloc, wt, state, testcase, stream_id, buf.items);
-            // Remove to prevent re-processing
-            if (state.bidi_bufs.getPtr(stream_id)) |buf_ptr| {
-                buf_ptr.deinit(alloc);
-                _ = state.bidi_bufs.remove(stream_id);
-            }
-        }
-    }
-
-    // Check uni streams
-    var uni_finished: [64]u64 = undefined;
-    var uni_finished_count: usize = 0;
-    {
-        var it = state.uni_bufs.iterator();
-        while (it.next()) |entry| {
-            const stream_id = entry.key_ptr.*;
-            if (wt.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
-                if (recv_stream.read()) |data| {
-                    defer alloc.free(data);
-                    entry.value_ptr.appendSlice(alloc, data) catch {};
-                }
-                if (recv_stream.finished) {
-                    if (uni_finished_count < 64) {
-                        uni_finished[uni_finished_count] = stream_id;
-                        uni_finished_count += 1;
-                    }
-                }
-            }
-        }
-    }
-    for (uni_finished[0..uni_finished_count]) |stream_id| {
-        if (state.uni_bufs.get(stream_id)) |buf| {
-            handleUniStreamComplete(alloc, wt, state, testcase, stream_id, buf.items);
-            // Remove to prevent re-processing
-            if (state.uni_bufs.getPtr(stream_id)) |buf_ptr| {
-                buf_ptr.deinit(alloc);
-                _ = state.uni_bufs.remove(stream_id);
-            }
-        }
-    }
-}
-
 /// Handle a completed bidi stream (client closed write side).
 fn handleBidiStreamComplete(
     alloc: std.mem.Allocator,

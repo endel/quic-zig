@@ -3043,17 +3043,20 @@ pub const Connection = struct {
             if (now >= pto_time) {
                 self.pkt_handler.pto_count += 1;
 
-                // Force-arm ACKs for the PTO level so probes include acknowledgements.
+                // Force-arm ACKs so probes include acknowledgements.
                 // When a PTO fires, our previous packets (which carried ACK frames) likely
                 // never reached the peer. getAckFrame() clears ack_queued on first call,
                 // so without re-arming, PTO probes go out without ACKs. This is critical
                 // for amplification-limited handshakes: the server needs ACKs to know the
                 // client received its data, and the client needs ACKs in its probes to
                 // give the server enough anti-amplification credit.
-                if (self.pkt_handler.getPtoSpace()) |pto_level_for_ack| {
-                    const ack_idx = @intFromEnum(pto_level_for_ack);
-                    if (self.pkt_handler.recv[ack_idx].largest_received != null) {
-                        self.pkt_handler.recv[ack_idx].ack_queued = true;
+                //
+                // Force-arm ALL spaces (not just the PTO space), because:
+                // - Initial PTO should include Handshake ACKs (coalesced packets)
+                // - The server needs Handshake ACKs to lift the amplification limit
+                for (&self.pkt_handler.recv) |*recv_tracker| {
+                    if (recv_tracker.largest_received != null) {
+                        recv_tracker.ack_queued = true;
                     }
                 }
 
@@ -3467,31 +3470,49 @@ pub const Connection = struct {
             }
         }
 
-        // Loss time and PTO from packet handler
-        for (self.pkt_handler.sent, 0..) |tracker, idx| {
+        // Loss detection timer — must fire immediately, no clamping
+        for (self.pkt_handler.sent) |tracker| {
             if (tracker.loss_time) |lt| {
                 if (earliest == null or lt < earliest.?) {
                     earliest = lt;
                 }
-                continue;
             }
+        }
 
-            if (tracker.ack_eliciting_in_flight == 0) continue;
+        // PTO timer — delegates to spacePtoDeadline which correctly handles
+        // handshake spaces per RFC 9002 §6.2.2.1.
+        // Clamp past deadlines to avoid spinning on stale handshake spaces
+        // (client waiting for HANDSHAKE_DONE after TLS completion).
+        {
+            var pto_earliest: ?i64 = null;
+            for (self.pkt_handler.sent, 0..) |tracker, idx| {
+                if (tracker.loss_time != null) continue; // handled above
+                const deadline = self.pkt_handler.spacePtoDeadline(tracker, idx) orelse continue;
+                if (pto_earliest == null or deadline < pto_earliest.?) {
+                    pto_earliest = deadline;
+                }
+            }
+            if (pto_earliest) |pto_deadline| {
+                if (earliest == null or pto_deadline < earliest.?) {
+                    earliest = pto_deadline;
+                }
+            }
+        }
 
-            const largest_sent = tracker.largest_sent orelse continue;
-            const sent_pkt = tracker.sent_packets.get(largest_sent) orelse continue;
-
-            var pto_duration = if (idx == @intFromEnum(ack_handler.EncLevel.application))
-                self.pkt_handler.rtt_stats.pto()
-            else
-                self.pkt_handler.rtt_stats.ptoNoAckDelay();
-
-            const pto_shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
-            pto_duration = @min(pto_duration << pto_shift, 60_000_000_000);
-
-            const timeout = sent_pkt.time_sent + pto_duration;
-            if (earliest == null or timeout < earliest.?) {
-                earliest = timeout;
+        // Pending send data: if streams have retransmission data queued (from loss
+        // detection) but ack_eliciting_in_flight dropped to 0 (all lost), PTO won't
+        // arm. Wake up immediately to send the queued retransmissions.
+        if (earliest == null and self.state == .connected) {
+            var has_send_data = false;
+            var stream_it = self.streams.streams.valueIterator();
+            while (stream_it.next()) |s_ptr| {
+                if (s_ptr.*.send.hasData()) {
+                    has_send_data = true;
+                    break;
+                }
+            }
+            if (has_send_data) {
+                earliest = @intCast(std.time.nanoTimestamp());
             }
         }
 
