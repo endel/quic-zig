@@ -306,6 +306,8 @@ pub const ReceivedPacketTracker = struct {
     ecn_ect0: u64 = 0,
     ecn_ect1: u64 = 0,
     ecn_ce: u64 = 0,
+    /// Highest PN that was pruned — any PN at or below this is a duplicate
+    largest_pruned: ?u64 = null,
 
     // draft-ietf-quic-ack-frequency: configurable ACK generation parameters
     ack_eliciting_threshold: u32 = ACK_ELICITING_THRESHOLD,
@@ -385,6 +387,11 @@ pub const ReceivedPacketTracker = struct {
     }
 
     pub fn isDuplicate(self: *const ReceivedPacketTracker, pn: u64) bool {
+        // Any PN at or below the largest pruned value is a duplicate
+        // (we already ACKed it and the peer confirmed receipt).
+        if (self.largest_pruned) |lp| {
+            if (pn <= lp) return true;
+        }
         return self.received.contains(pn);
     }
 
@@ -392,6 +399,12 @@ pub const ReceivedPacketTracker = struct {
     /// Called when the peer ACKs a packet that contained our ACK for ranges up to this value.
     pub fn pruneAckedRanges(self: *ReceivedPacketTracker, below: u64) void {
         self.received.removeBelow(below);
+        if (below > 0) {
+            const pruned = below - 1;
+            if (self.largest_pruned == null or pruned > self.largest_pruned.?) {
+                self.largest_pruned = pruned;
+            }
+        }
     }
 
     /// Check if there are any unacknowledged ack-eliciting packets.

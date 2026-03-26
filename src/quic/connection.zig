@@ -2725,21 +2725,23 @@ pub const Connection = struct {
             return 0;
         }
 
-        // Check if pacer allows sending
-        // Exception: PTO probes bypass pacing (RFC 9002 §6.2.4)
-        if (self.pto_probe_pending == 0) {
-            const pacer_delay = self.pacer.timeUntilSend(now);
-            if (pacer_delay > 0) {
-                return 0;
-            }
-        }
-
         // Check congestion window — only send ACKs + control frames when congestion-limited
         // Exception: PTO probes MUST bypass congestion control (RFC 9002 §6.2.4)
         // DATAGRAM frames are subject to CC per RFC 9221 §5: "DATAGRAM frames SHOULD be
         // subject to congestion control" — they piggyback on CC-allowed packets only.
         if (self.pkt_handler.bytes_in_flight >= self.cc.sendWindow() and self.pto_probe_pending == 0) {
+            // ACK-only packets bypass pacing (RFC 9002 §7.7)
             return try self.sendAckOnly(out_buf, now);
+        }
+
+        // Check if pacer allows sending
+        // Exception: PTO probes bypass pacing (RFC 9002 §6.2.4)
+        // Note: ACK-only path above bypasses pacer per RFC 9002 §7.7
+        if (self.pto_probe_pending == 0) {
+            const pacer_delay = self.pacer.timeUntilSend(now);
+            if (pacer_delay > 0) {
+                return 0;
+            }
         }
 
         // Queue flow control updates before packing

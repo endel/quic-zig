@@ -69,6 +69,8 @@ const ConnState = struct {
     files_completed: usize = 0,
     files_expected: usize = 0,
     dgram_get_offset: usize = 0,
+    // Timestamp of last GET datagram sent (for 20ms pacing like Go interop)
+    last_dgram_get_time: i128 = 0,
 
     fn init(alloc: std.mem.Allocator) ConnState {
         return .{
@@ -341,16 +343,20 @@ pub fn main() !void {
             if (conn_states.get(conn_key)) |state| {
                 sendPendingDgramReplies(alloc, state, conn);
                 // Continue drip-feeding GET requests for datagram-send test
+                // Pace at 20ms intervals (matching Go interop's time.Sleep(20ms))
                 if (state.dgram_get_offset < request_paths.items.len and state.session_ready) {
-                    var wt_for_dgram = &(state.wt_conn orelse continue);
-                    var batch: usize = 0;
-                    while (state.dgram_get_offset < request_paths.items.len and batch < 32) : (batch += 1) {
-                        if (conn.isDatagramSendQueueFull()) break;
-                        const filename = extractFilename(request_paths.items[state.dgram_get_offset]);
-                        var get_buf: [1024]u8 = undefined;
-                        const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{filename}) catch break;
-                        wt_for_dgram.sendDatagram(state.session_id.?, get_msg) catch break;
-                        state.dgram_get_offset += 1;
+                    const now_ns = std.time.nanoTimestamp();
+                    const elapsed = now_ns - state.last_dgram_get_time;
+                    if (elapsed >= 20 * std.time.ns_per_ms) {
+                        if (!conn.isDatagramSendQueueFull()) {
+                            var wt_for_dgram = &(state.wt_conn orelse continue);
+                            const filename = extractFilename(request_paths.items[state.dgram_get_offset]);
+                            var get_buf: [1024]u8 = undefined;
+                            const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{filename}) catch continue;
+                            wt_for_dgram.sendDatagram(state.session_id.?, get_msg) catch continue;
+                            state.dgram_get_offset += 1;
+                            state.last_dgram_get_time = now_ns;
+                        }
                     }
                 }
             }
@@ -464,10 +470,21 @@ fn pollWtEvents(
                 }
             },
             .transfer_datagram_send => {
-                // Client sends file data as datagrams; server just receives and saves.
+                // Server sends GET datagrams (paced at 20ms intervals, matching Go interop).
+                // Client's generic "transfer" handler responds with PUSH datagrams.
                 state.send_requests_initiated = true;
                 state.files_expected = request_paths.len;
-                state.dgram_get_offset = request_paths.len; // No GETs to send
+                // Send first GET immediately
+                if (request_paths.len > 0) {
+                    const filename = extractFilename(request_paths[0]);
+                    var get_buf: [1024]u8 = undefined;
+                    if (std.fmt.bufPrint(&get_buf, "GET {s}", .{filename})) |get_msg| {
+                        wt.sendDatagram(state.session_id.?, get_msg) catch {};
+                        std.log.info("sent GET {s} via datagram", .{filename});
+                        state.dgram_get_offset = 1;
+                        state.last_dgram_get_time = std.time.nanoTimestamp();
+                    } else |_| {}
+                }
             },
             else => {},
         }
@@ -749,6 +766,11 @@ fn handleDatagram(
                 const file_data = data[newline_pos + 1 ..];
                 var save_buf: [1024]u8 = undefined;
                 const save_path = std.fmt.bufPrint(&save_buf, "{s}/{s}", .{ state.sessionPath(), filename }) catch filename;
+                // Skip duplicate saves (datagrams may be delivered more than once)
+                if (fileExists("/downloads", save_path)) {
+                    std.log.info("dgram-send: skip duplicate {s}", .{save_path});
+                    return;
+                }
                 saveFile("/downloads", save_path, file_data) catch |err| {
                     std.log.err("failed to save {s}: {any}", .{ save_path, err });
                     return;
@@ -853,6 +875,21 @@ fn saveFile(dir: []const u8, filename: []const u8, data: []const u8) !void {
     defer file.close();
     try file.writeAll(data);
     std.log.info("saved {s} ({d} bytes)", .{ path, data.len });
+}
+
+fn fileExists(dir: []const u8, filename: []const u8) bool {
+    var path_buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    @memcpy(path_buf[pos..][0..dir.len], dir);
+    pos += dir.len;
+    if (dir.len > 0 and dir[dir.len - 1] != '/') {
+        path_buf[pos] = '/';
+        pos += 1;
+    }
+    @memcpy(path_buf[pos..][0..filename.len], filename);
+    pos += filename.len;
+    _ = std.fs.cwd().statFile(path_buf[0..pos]) catch return false;
+    return true;
 }
 
 fn loadFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
