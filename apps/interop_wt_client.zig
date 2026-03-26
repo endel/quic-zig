@@ -139,6 +139,8 @@ const SessionState = struct {
     files_expected: usize = 0,
     // Track drip-feed progress for datagram GET requests
     dgram_get_offset: usize = 0,
+    // Timestamp of last GET datagram sent (for 20ms pacing like Go interop)
+    last_dgram_get_time: i128 = 0,
 
     fn init(alloc: std.mem.Allocator, session_id: u64, endpoint: []const u8, files: []const []const u8) SessionState {
         return .{
@@ -458,14 +460,18 @@ pub fn main() !void {
         for (session_states.items) |*ss| {
             sendPendingDgramReplies(alloc, &wt, ss, &conn);
             // Continue drip-feeding GET requests for datagram-receive test
+            // Pace at 20ms intervals (matching Go interop's time.Sleep(20ms))
             if (ss.dgram_get_offset < ss.files.len and ss.session_ready) {
-                var batch: usize = 0;
-                while (ss.dgram_get_offset < ss.files.len and batch < 32) : (batch += 1) {
-                    if (wt.isDatagramSendQueueFull()) break;
-                    var get_buf: [1024]u8 = undefined;
-                    const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{ss.files[ss.dgram_get_offset]}) catch break;
-                    wt.sendDatagram(ss.session_id, get_msg) catch break;
-                    ss.dgram_get_offset += 1;
+                const now_ns = std.time.nanoTimestamp();
+                const elapsed = now_ns - ss.last_dgram_get_time;
+                if (elapsed >= 20 * std.time.ns_per_ms) {
+                    if (!wt.isDatagramSendQueueFull()) {
+                        var get_buf: [1024]u8 = undefined;
+                        const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{ss.files[ss.dgram_get_offset]}) catch continue;
+                        wt.sendDatagram(ss.session_id, get_msg) catch continue;
+                        ss.dgram_get_offset += 1;
+                        ss.last_dgram_get_time = now_ns;
+                    }
                 }
             }
         }
@@ -540,20 +546,15 @@ fn pollWtEvents(
                 }
             },
             .transfer_datagram_receive => {
-                // Drip-feed GET requests to avoid overflowing the datagram queue
-                var sent: usize = 0;
-                for (state.files) |filename| {
-                    if (wt.isDatagramSendQueueFull()) break;
+                // Send GET datagrams paced at 20ms intervals (matching Go interop).
+                // Send first one immediately, rest via drip-feed loop.
+                if (state.files.len > 0) {
                     var get_buf: [1024]u8 = undefined;
-                    const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{filename}) catch continue;
-                    wt.sendDatagram(state.session_id, get_msg) catch break;
-                    sent += 1;
-                }
-                // Track how many GETs we've queued so far
-                if (sent < state.files.len) {
-                    state.dgram_get_offset = sent;
-                } else {
-                    state.dgram_get_offset = state.files.len;
+                    if (std.fmt.bufPrint(&get_buf, "GET {s}", .{state.files[0]})) |get_msg| {
+                        wt.sendDatagram(state.session_id, get_msg) catch {};
+                        state.dgram_get_offset = 1;
+                        state.last_dgram_get_time = std.time.nanoTimestamp();
+                    } else |_| {}
                 }
             },
             .transfer => {
@@ -791,6 +792,11 @@ fn handleDatagram(
                 if (ep.len > 0 and ep[0] == '/') ep = ep[1..];
                 var path_buf: [1024]u8 = undefined;
                 const save_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ ep, filename }) catch return;
+                // Skip duplicate saves (datagrams may be delivered more than once)
+                if (fileExists("/downloads", save_path)) {
+                    std.log.info("dgram-recv: skip duplicate {s}", .{save_path});
+                    return;
+                }
                 saveFile("/downloads", save_path, file_data) catch |err| {
                     std.log.err("failed to save {s}: {any}", .{ save_path, err });
                     return;
@@ -876,6 +882,21 @@ fn readFileFromWww(alloc: std.mem.Allocator, www_dir: []const u8, endpoint: []co
     pos += filename.len;
 
     return std.fs.cwd().readFileAlloc(alloc, path_buf[0..pos], MAX_FILE_SIZE);
+}
+
+fn fileExists(dir: []const u8, filename: []const u8) bool {
+    var path_buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    @memcpy(path_buf[pos..][0..dir.len], dir);
+    pos += dir.len;
+    if (dir.len > 0 and dir[dir.len - 1] != '/') {
+        path_buf[pos] = '/';
+        pos += 1;
+    }
+    @memcpy(path_buf[pos..][0..filename.len], filename);
+    pos += filename.len;
+    _ = std.fs.cwd().statFile(path_buf[0..pos]) catch return false;
+    return true;
 }
 
 fn saveFile(dir: []const u8, filename: []const u8, data: []const u8) !void {

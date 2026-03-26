@@ -332,11 +332,11 @@ pub const PacketPacker = struct {
         // 0-RTT packets only contain STREAM and DATAGRAM frames — skip ACK, CRYPTO, control
         if (!zero_rtt) {
             // 1. ACK frame (always first if pending)
-            // When sending data (!ack_only), piggyback ACK on every packet that has
-            // unacknowledged ack-eliciting packets (RFC 9000 §13.2.1 recommendation).
-            // When ack_only (congestion-limited), respect normal threshold/alarm timing.
+            // Force ACK generation whenever there are unacknowledged ack-eliciting packets.
+            // In ack_only mode (congestion-limited), prompt ACKs are critical for the peer's
+            // CC to grow its window. Delaying ACKs starves the peer of feedback.
             const ack_delay_exp: u64 = 3;
-            const ack_frame_opt: ?Frame = if (!ack_only and pkt_handler.hasUnackedAckEliciting(level))
+            const ack_frame_opt: ?Frame = if (pkt_handler.hasUnackedAckEliciting(level))
                 pkt_handler.getAckFrameForced(level, now, ack_delay_exp)
             else
                 pkt_handler.getAckFrame(level, now, ack_delay_exp);
