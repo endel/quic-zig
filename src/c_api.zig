@@ -325,6 +325,10 @@ export fn qz_server_create(
 export fn qz_server_tick(handle: *anyopaque) i32 {
     const ws = getWtServer(handle);
     ws.server.tick() catch return -1;
+    // Explicitly drain socket and process connections on every tick.
+    // In no_wait mode, kqueue/epoll edge-triggered events can be missed
+    // between ticks, so we must poll directly to ensure packets are read.
+    ws.server.pollDirect();
     ws.handler.checkDisconnected();
     return 0;
 }
