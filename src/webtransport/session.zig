@@ -624,30 +624,24 @@ pub const WebTransportConnection = struct {
                     return null;
                 }
 
-                if (self.getSession(session_id) != null) {
-                    try self.wt_uni_streams.put(stream_id, session_id);
+                // Register the stream (even if session not yet accepted).
+                try self.wt_uni_streams.put(stream_id, session_id);
 
-                    // Buffer remaining data after the type prefix
-                    if (fbs.pos < data.len) {
-                        const remaining = data[fbs.pos..];
-                        var buf = self.stream_bufs.getPtr(stream_id) orelse blk: {
-                            const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-                            try self.stream_bufs.put(stream_id, new_buf);
-                            break :blk self.stream_bufs.getPtr(stream_id).?;
-                        };
-                        buf.appendSlice(self.allocator, remaining) catch {};
-                    }
-
-                    return .{ .uni_stream = .{
-                        .session_id = session_id,
-                        .stream_id = stream_id,
-                    } };
-                } else {
-                    // Session not found — reject buffered stream
-                    if (self.quic.streams.recv_streams.get(stream_id)) |rs| {
-                        rs.stopSending(WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
-                    }
+                // Buffer remaining data after the type prefix
+                if (fbs.pos < data.len) {
+                    const remaining = data[fbs.pos..];
+                    var buf = self.stream_bufs.getPtr(stream_id) orelse blk: {
+                        const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                        try self.stream_bufs.put(stream_id, new_buf);
+                        break :blk self.stream_bufs.getPtr(stream_id).?;
+                    };
+                    buf.appendSlice(self.allocator, remaining) catch {};
                 }
+
+                return .{ .uni_stream = .{
+                    .session_id = session_id,
+                    .stream_id = stream_id,
+                } };
             }
             // Not a WT stream — let H3 handle it by marking as pending
             try self.pending_uni_streams.put(stream_id, {});
@@ -657,10 +651,6 @@ pub const WebTransportConnection = struct {
 
     /// Identify incoming WT bidirectional streams by reading type prefix.
     fn identifyWtBidiStreams(self: *WebTransportConnection) !?WtEvent {
-        // Sequential counter approach (same pattern as quic-go's nextStreamToAccept):
-        // Peer-initiated bidi IDs are 0, 4, 8... (server) or 1, 5, 9... (client).
-        // Compare our counter against highest_peer_bidi_stream_id to know if new
-        // streams exist, then advance by 4 for each examined. O(1) per new stream.
         const highest = self.quic.streams.highest_peer_bidi_stream_id orelse return null;
         while (self.next_peer_bidi_to_examine <= highest) {
             const stream_id = self.next_peer_bidi_to_examine;
@@ -668,9 +658,7 @@ pub const WebTransportConnection = struct {
 
             // Skip already-identified streams
             if (self.wt_bidi_streams.contains(stream_id)) continue;
-            // Skip streams we opened (they don't have type prefix to read)
             if (self.h3.finished_streams.contains(stream_id)) continue;
-            // Also skip our CONNECT session streams
             if (self.getSession(stream_id) != null) continue;
 
             const stream = self.quic.streams.getStream(stream_id) orelse continue;
@@ -693,48 +681,27 @@ pub const WebTransportConnection = struct {
                     return null;
                 }
 
-                if (self.getSession(session_id) != null) {
-                    try self.wt_bidi_streams.put(stream_id, session_id);
-                    // Exclude from H3 processing
-                    try self.h3.excluded_bidi_streams.put(stream_id, {});
+                // Register the stream (even if session not yet accepted —
+                // the Go client may open bidi streams before CONNECT is processed).
+                try self.wt_bidi_streams.put(stream_id, session_id);
+                try self.h3.excluded_bidi_streams.put(stream_id, {});
 
-                    // Fuse: if there's data after the prefix, deliver it immediately
-                    // as stream_data instead of returning bidi_stream first (saves a poll cycle).
-                    if (fbs.pos < data.len) {
-                        const remaining = data[fbs.pos..];
-                        const owned = self.allocator.dupe(u8, remaining) catch {
-                            // Fall back to buffering
-                            var buf = self.stream_bufs.getPtr(stream_id) orelse blk: {
-                                const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-                                try self.stream_bufs.put(stream_id, new_buf);
-                                break :blk self.stream_bufs.getPtr(stream_id).?;
-                            };
-                            try buf.appendSlice(self.allocator, remaining);
-                            return .{ .bidi_stream = .{
-                                .session_id = session_id,
-                                .stream_id = stream_id,
-                            } };
-                        };
-                        const fin = stream.recv.finished or stream.recv.sorter.isComplete();
-                        if (fin) self.fin_delivered.put(stream_id, {}) catch {};
-                        return .{ .stream_data = .{
-                            .stream_id = stream_id,
-                            .data = owned,
-                            .fin = fin,
-                        } };
-                    }
-
-                    return .{ .bidi_stream = .{
-                        .session_id = session_id,
-                        .stream_id = stream_id,
-                    } };
-                } else {
-                    // Session not found — reject buffered stream
-                    if (self.quic.streams.getStream(stream_id)) |s| {
-                        s.send.reset(WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
-                        s.recv.stopSending(WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
-                    }
+                // Buffer remaining data for delivery via pollWtStreamData.
+                // Always return .bidi_stream first so the application can register
+                // the stream before receiving .stream_data events.
+                if (fbs.pos < data.len) {
+                    const remaining = data[fbs.pos..];
+                    var buf = self.stream_bufs.getPtr(stream_id) orelse blk: {
+                        const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                        try self.stream_bufs.put(stream_id, new_buf);
+                        break :blk self.stream_bufs.getPtr(stream_id).?;
+                    };
+                    try buf.appendSlice(self.allocator, remaining);
                 }
+                return .{ .bidi_stream = .{
+                    .session_id = session_id,
+                    .stream_id = stream_id,
+                } };
             } else {
                 // Not a WT stream — buffer for H3 to handle
                 var buf = self.h3.stream_bufs.getPtr(stream_id) orelse blk: {
@@ -1366,10 +1333,21 @@ test "WT integration: bidi stream with trailing data buffers remainder" {
     const stream = try setup.quic_conn.streams.getOrCreateStream(4);
     try stream.recv.handleStreamFrame(0, buf[0..total_len], false);
 
-    // Fused poll: stream_data delivered directly (bidi identification + data in one step)
+    // First poll: bidi_stream event (identification)
     const ev1 = try setup.wt.poll();
     try testing.expect(ev1 != null);
     switch (ev1.?) {
+        .bidi_stream => |bs| {
+            try testing.expectEqual(@as(u64, session_id), bs.session_id);
+            try testing.expectEqual(@as(u64, 4), bs.stream_id);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    // Second poll: stream_data with buffered remainder
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
         .stream_data => |sd| {
             try testing.expectEqual(@as(u64, 4), sd.stream_id);
             try testing.expectEqualStrings(extra, sd.data);
@@ -1932,10 +1910,15 @@ test "WT: uni stream to unknown session gets BUFFERED_STREAM_REJECTED" {
     try rs.handleStreamFrame(0, fbs.getWritten(), false);
 
     const ev = try setup.wt.poll();
-    // No event returned (stream rejected silently)
-    try testing.expect(ev == null);
-    // Recv stream should have STOP_SENDING with BUFFERED_STREAM_REJECTED
-    try testing.expectEqual(@as(?u64, WEBTRANSPORT_BUFFERED_STREAM_REJECTED), rs.stop_sending_err);
+    // Stream is registered even for unknown sessions (may arrive before CONNECT)
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .uni_stream => |us| {
+            try testing.expectEqual(@as(u64, 8), us.session_id);
+            try testing.expectEqual(@as(u64, 14), us.stream_id);
+        },
+        else => return error.UnexpectedEvent,
+    }
 }
 
 test "H3Frame: write and parse DRAIN_WEBTRANSPORT_SESSION" {

@@ -464,20 +464,10 @@ fn pollWtEvents(
                 }
             },
             .transfer_datagram_send => {
+                // Client sends file data as datagrams; server just receives and saves.
                 state.send_requests_initiated = true;
                 state.files_expected = request_paths.len;
-                // Drip-feed GET datagrams to avoid overflowing the send queue
-                var sent: usize = 0;
-                for (request_paths) |path| {
-                    if (wt.isDatagramSendQueueFull()) break;
-                    const filename = extractFilename(path);
-                    var get_buf: [1024]u8 = undefined;
-                    const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{filename}) catch continue;
-                    wt.sendDatagram(state.session_id.?, get_msg) catch break;
-                    std.log.info("sent GET {s} via datagram", .{filename});
-                    sent += 1;
-                }
-                state.dgram_get_offset = sent;
+                state.dgram_get_offset = request_paths.len; // No GETs to send
             },
             else => {},
         }
