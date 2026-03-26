@@ -224,6 +224,11 @@ pub const CApiHandler = struct {
         }) catch {
             if (reason_copy) |r| self.allocator.free(r);
         };
+
+        // Remove from lookup maps BEFORE the event loop frees the entry.
+        // Without this, checkDisconnected() dereferences freed memory.
+        _ = self.entry_to_client.remove(session.entry);
+        _ = self.client_to_entry.remove(client_id);
     }
 
     pub fn onSessionDraining(self: *CApiHandler, session: *event_loop.Session, session_id: u64) void {
@@ -357,6 +362,12 @@ export fn qz_server_destroy(handle: *anyopaque) void {
 export fn qz_server_connection_count(handle: *anyopaque) u32 {
     const ws = getWtServer(handle);
     return @intCast(ws.handler.client_to_entry.count());
+}
+
+export fn qz_is_client_connected(handle: *anyopaque, client_id: u64) i32 {
+    const ws = getWtServer(handle);
+    const entry = ws.handler.client_to_entry.get(client_id) orelse return 0;
+    return if (entry.conn.isClosed()) 0 else 1;
 }
 
 // ---------------------------------------------------------------------------
