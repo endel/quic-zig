@@ -3057,18 +3057,18 @@ pub const Connection = struct {
         // Check idle timeout (RFC 9000 §10.1, §10.1.2)
         // The effective idle timeout MUST be at least 3× the *base* PTO (without backoff)
         // to avoid terminating the connection before probes have a chance to be answered.
-        // Using base PTO (not backed-off) matches quic-go and quiche behavior: the idle
-        // timeout should not extend indefinitely as pto_count grows.
         //
-        // When data is in flight, extend idle to cover the current PTO backoff schedule.
-        // This prevents premature termination while actively retransmitting under loss.
+        // When data is in flight, extend idle to cover the current PTO backoff schedule,
+        // but cap at 5 retries to prevent indefinite extension (e.g. server broadcasting
+        // to a dead peer would otherwise grow effective_idle to 180s+).
         {
             const base_pto = self.pkt_handler.rtt_stats.pto();
             var effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
             const app_idx = @intFromEnum(ack_handler.EncLevel.application);
             if (self.handshake_confirmed and self.pkt_handler.sent[app_idx].ack_eliciting_in_flight > 0) {
-                const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
-                const backed_off_pto = @min(base_pto << shift, 60_000_000_000);
+                const capped_pto_count = @min(self.pkt_handler.pto_count, 5);
+                const shift: u6 = @intCast(capped_pto_count);
+                const backed_off_pto = base_pto << shift;
                 effective_idle = @max(effective_idle, 3 * backed_off_pto);
             }
             // RFC 9000 §10.1.2: Before handshake confirmed, also defer idle timeout

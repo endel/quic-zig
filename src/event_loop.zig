@@ -473,6 +473,16 @@ pub fn Server(comptime Handler: type) type {
             try self.loop.run(.no_wait);
         }
 
+        /// Explicitly drain the socket, process connections, and handle timeouts.
+        /// Use this from C API tick loops to avoid missing events between
+        /// non-blocking event loop polls (edge-triggered race in kqueue/epoll).
+        pub fn pollDirect(self: *Self) void {
+            _ = self.recvAllPackets();
+            self.processConnections();
+            self.tickAndSend();
+            self.conn_mgr.freeDeadEntries();
+        }
+
         /// Flush any data queued by external callers (e.g. C API handlers that
         /// called sendStreamData / acceptSession / sendDatagram between ticks).
         /// This ensures outgoing QUIC packets are built and sent immediately
