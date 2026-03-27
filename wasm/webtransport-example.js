@@ -355,19 +355,21 @@ async function main() {
       const response = encoder.encode("Echo: " + text);
       writeStreamData(wasm, streamId, response);
 
-      // Close the stream (sends FIN) — browser will see stream end
-      wasm.qz_wt_close_stream(streamId);
+      // Don't close the stream — keep it open for full-duplex.
+      // Close only when the remote sends FIN (onStreamFinished).
     },
 
     onStreamFinished(streamId) {
       console.log(`Stream ${streamId} finished (remote FIN)`);
+      // Peer closed their send side — close ours too.
+      wasm.qz_wt_close_stream(streamId);
     },
 
     onDatagram(sessionId, length) {
-      // Read datagram from the QUIC layer
+      // Read datagram stashed during WT poll
       const BUF = 1200;
       const ptr = wasm.qz_alloc(BUF);
-      const n = wasm.qz_datagram_recv(ptr, BUF);
+      const n = wasm.qz_wt_read_datagram(sessionId, ptr, BUF);
       if (n > 0) {
         //   ┌─────────────────────────────────────────────────┐
         //   │  READ: decoded datagram payload.                │

@@ -321,6 +321,8 @@ pub const SendStream = struct {
 
     /// Write data to the stream. Buffers it for later sending.
     pub fn writeData(self: *SendStream, data: []const u8) !void {
+        if (self.fin_queued or self.fin_sent) return error.StreamClosed;
+        if (self.reset_err != null) return error.StreamClosed;
         try self.write_buffer.appendSlice(self.allocator, data);
         self.write_offset += data.len;
     }
