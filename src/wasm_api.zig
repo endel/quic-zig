@@ -77,6 +77,18 @@ const EventEntry = struct {
 
 const MAX_EVENTS = 32;
 
+/// Buffered data from WT poll events (stream_data / datagram).
+/// The WT session's poll() consumes data from the FrameSorter, so we must
+/// stash it here for the JS side to retrieve via qz_wt_read_stream / qz_wt_read_datagram.
+const PendingData = struct {
+    stream_id: u64 = 0, // stream_id for stream data, session_id for datagrams
+    buf: [4096]u8 = undefined,
+    len: u32 = 0,
+    occupied: bool = false,
+};
+
+const MAX_PENDING = 16;
+
 const Instance = struct {
     conn: *Connection, // heap-allocated (Connection is ~50KB with TLS buffers)
     h3: ?H3Connection = null,
@@ -91,6 +103,9 @@ const Instance = struct {
     event_head: u16 = 0,
     event_tail: u16 = 0,
     event_count: u16 = 0,
+
+    pending_stream: [MAX_PENDING]PendingData = .{PendingData{}} ** MAX_PENDING,
+    pending_dgram: [MAX_PENDING]PendingData = .{PendingData{}} ** MAX_PENDING,
 
     fn pushEvent(self: *Instance, data: []const u8) void {
         if (self.event_count >= MAX_EVENTS) return;
@@ -111,6 +126,32 @@ const Instance = struct {
         self.event_head = (self.event_head + 1) % MAX_EVENTS;
         self.event_count -= 1;
         return len;
+    }
+
+    fn stashPending(slots: []PendingData, id: u64, data: []const u8) void {
+        for (slots) |*slot| {
+            if (!slot.occupied) {
+                const copy_len: u32 = @intCast(@min(data.len, slot.buf.len));
+                @memcpy(slot.buf[0..copy_len], data[0..copy_len]);
+                slot.stream_id = id;
+                slot.len = copy_len;
+                slot.occupied = true;
+                return;
+            }
+        }
+        // All slots full — data is dropped (event still fires with correct length)
+    }
+
+    fn takePending(slots: []PendingData, id: u64, out: []u8) i32 {
+        for (slots) |*slot| {
+            if (slot.occupied and slot.stream_id == id) {
+                const copy_len = @min(slot.len, @as(u32, @intCast(out.len)));
+                @memcpy(out[0..copy_len], slot.buf[0..copy_len]);
+                slot.occupied = false;
+                return @intCast(copy_len);
+            }
+        }
+        return 0;
     }
 };
 
@@ -367,6 +408,7 @@ export fn qz_poll_event(buf_ptr: [*]u8, buf_len: u32) u32 {
                     std.mem.writeInt(u64, evt[1..9], sd.stream_id, .big);
                     std.mem.writeInt(u64, evt[9..17], @intCast(sd.data.len), .big);
                     inst.pushEvent(&evt);
+                    Instance.stashPending(&inst.pending_stream, sd.stream_id, sd.data);
                 },
                 .stream_finished => |sf| {
                     var evt: [9]u8 = undefined;
@@ -380,6 +422,7 @@ export fn qz_poll_event(buf_ptr: [*]u8, buf_len: u32) u32 {
                     std.mem.writeInt(u64, evt[1..9], dg.session_id, .big);
                     std.mem.writeInt(u64, evt[9..17], @intCast(dg.data.len), .big);
                     inst.pushEvent(&evt);
+                    Instance.stashPending(&inst.pending_dgram, dg.session_id, dg.data);
                 },
                 .session_closed => |sc| {
                     var evt: [13]u8 = undefined;
@@ -445,11 +488,7 @@ export fn qz_wt_accept_session(session_id: u64) i32 {
 /// Returns bytes read, 0 if nothing available, -1 on error.
 export fn qz_wt_read_stream(stream_id: u64, out_ptr: [*]u8, out_len: u32) i32 {
     const inst = instance orelse return -1;
-    const stream = inst.conn.streams.getStream(stream_id) orelse return -1;
-    const data = stream.recv.read() orelse return 0;
-    const copy_len = @min(data.len, out_len);
-    @memcpy(out_ptr[0..copy_len], data[0..copy_len]);
-    return @intCast(copy_len);
+    return Instance.takePending(&inst.pending_stream, stream_id, out_ptr[0..out_len]);
 }
 
 /// Write data to a WT stream. Returns 0 on success, -1 on error.
@@ -465,6 +504,13 @@ export fn qz_wt_close_stream(stream_id: u64) void {
     const inst = instance orelse return;
     var wt = &(inst.wt orelse return);
     wt.closeStream(stream_id);
+}
+
+/// Read a received WT datagram. Call after receiving EVT_WT_DATAGRAM.
+/// Returns bytes read, 0 if nothing available, -1 on error.
+export fn qz_wt_read_datagram(session_id: u64, out_ptr: [*]u8, out_len: u32) i32 {
+    const inst = instance orelse return -1;
+    return Instance.takePending(&inst.pending_dgram, session_id, out_ptr[0..out_len]);
 }
 
 /// Send a WT datagram on a session. Returns 0 on success, -1 on error.
