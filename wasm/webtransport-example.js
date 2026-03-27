@@ -78,7 +78,9 @@ async function loadWasm(wasmUrl, certDerUrl, keyDerUrl) {
 
 // Copy a Uint8Array into WASM memory, call fn(ptr, len), then free.
 function copyToWasm(wasm, data, fn) {
+  if (data.byteLength === 0) return fn(0, 0);
   const ptr = wasm.qz_alloc(data.byteLength);
+  if (ptr === 0) throw new Error("WASM allocation failed for " + data.byteLength + " bytes");
   // NOTE: always create a fresh view — any prior WASM call may have
   // triggered memory.grow which detaches the old ArrayBuffer.
   new Uint8Array(wasm.memory.buffer, ptr, data.byteLength).set(data);

@@ -529,11 +529,14 @@ export fn qz_wt_close_session(session_id: u64, error_code: u32, reason_ptr: [*]c
     return 0;
 }
 
-export fn qz_alloc(len: u32) ?[*]u8 {
-    const slice = allocator.alloc(u8, len) catch return null;
-    return slice.ptr;
+export fn qz_alloc(len: u32) u32 {
+    if (len == 0) return 0;
+    const slice = allocator.alloc(u8, len) catch return 0;
+    return @intFromPtr(slice.ptr);
 }
 
-export fn qz_free(ptr: [*]u8, len: u32) void {
+export fn qz_free(ptr_int: u32, len: u32) void {
+    if (ptr_int == 0 or len == 0) return;
+    const ptr: [*]u8 = @ptrFromInt(ptr_int);
     allocator.free(ptr[0..len]);
 }
