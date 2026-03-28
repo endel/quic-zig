@@ -162,7 +162,7 @@ pub const NewReno = struct {
     }
 };
 
-/// CUBIC congestion control (RFC 8312).
+/// CUBIC congestion control (RFC 8312) with HyStart++ (RFC 9406).
 ///
 /// CUBIC uses a cubic function for window growth, providing better
 /// bandwidth utilization on high-BDP networks compared to NewReno.
@@ -171,6 +171,9 @@ pub const NewReno = struct {
 /// - Provides a TCP-friendly region for fairness with Reno flows
 /// - Beta = 0.7 (multiplicative decrease factor)
 /// - C = 0.4 (cubic scaling constant)
+///
+/// HyStart++ (RFC 9406) improves slow start exit by detecting RTT
+/// increases before actual packet loss, reducing bufferbloat.
 pub const Cubic = struct {
     /// Current congestion window in bytes.
     congestion_window: u64,
@@ -207,6 +210,37 @@ pub const Cubic = struct {
     /// W_est: estimated TCP-friendly window (for TCP-friendly region).
     w_est: u64 = 0,
 
+    // ── HyStart++ state (RFC 9406) ──
+
+    /// Current slow start phase
+    ss_phase: SlowStartPhase = .standard,
+
+    /// Packet number at which the current round ends.
+    /// A round ends when an ACK acknowledges a packet >= round_end_pn.
+    round_end_pn: ?u64 = null,
+
+    /// Minimum RTT observed in the current round (nanoseconds).
+    current_round_min_rtt: i64 = std.math.maxInt(i64),
+
+    /// Baseline min RTT from the previous round (nanoseconds).
+    /// Used to detect RTT increases.
+    last_round_min_rtt: i64 = std.math.maxInt(i64),
+
+    /// Number of RTT samples collected in the current round.
+    rtt_sample_count: u32 = 0,
+
+    /// Number of CSS rounds completed.
+    css_rounds: u32 = 0,
+
+    /// cwnd at the beginning of CSS (for ssthresh calculation).
+    css_baseline_cwnd: u64 = 0,
+
+    const SlowStartPhase = enum {
+        standard, // Normal exponential slow start
+        css, // Conservative Slow Start
+        done, // Exited slow start (won't re-enter)
+    };
+
     // ── Constants ──
     // Beta = 0.7 (RFC 8312 §4.5 recommends 0.7 for QUIC)
     const BETA_NUM: u64 = 7;
@@ -216,6 +250,13 @@ pub const Cubic = struct {
     // We scale by 1000 to avoid floating point: C_SCALED = 400
     const C_SCALED: u64 = 400;
     const C_DENOM: u64 = 1000;
+
+    // HyStart++ constants (RFC 9406 §4.2)
+    const MIN_RTT_THRESH: i64 = 4_000_000; // 4ms in ns
+    const MAX_RTT_THRESH: i64 = 16_000_000; // 16ms in ns
+    const N_RTT_SAMPLE: u32 = 8; // Min samples per round
+    const CSS_GROWTH_DIVISOR: u64 = 4; // cwnd += MSS/4 per ACK in CSS
+    const CSS_ROUNDS: u32 = 5; // CSS rounds before exiting to CA
 
     pub fn inSlowStart(self: *const Cubic) bool {
         return self.congestion_window < self.ssthresh;
@@ -242,7 +283,14 @@ pub const Cubic = struct {
     }
 
     /// Called when a packet is acknowledged.
+    /// `latest_rtt_ns` is the RTT sample from this ACK (0 if not a new sample).
+    /// `largest_pn` is the largest packet number being sent (for round tracking).
     pub fn onPacketAcked(self: *Cubic, acked_bytes: u64, sent_time: i64) void {
+        self.onPacketAckedWithRtt(acked_bytes, sent_time, 0, null);
+    }
+
+    /// Extended version with RTT sample for HyStart++.
+    pub fn onPacketAckedWithRtt(self: *Cubic, acked_bytes: u64, sent_time: i64, latest_rtt_ns: i64, largest_sent_pn: ?u64) void {
         // Don't grow window during recovery
         if (self.inCongestionRecovery(sent_time)) return;
 
@@ -250,13 +298,100 @@ pub const Cubic = struct {
         if (self.app_limited) return;
 
         if (self.inSlowStart()) {
-            // Slow start: increase by acked_bytes (same as NewReno)
-            self.congestion_window += acked_bytes;
+            self.slowStartOnAck(acked_bytes, latest_rtt_ns, largest_sent_pn);
             return;
         }
 
         // Congestion avoidance: use CUBIC function
         self.cubicUpdate(acked_bytes);
+    }
+
+    /// HyStart++ slow start logic (RFC 9406).
+    fn slowStartOnAck(self: *Cubic, acked_bytes: u64, latest_rtt_ns: i64, largest_sent_pn: ?u64) void {
+        // Initialize first round if needed
+        if (self.round_end_pn == null) {
+            if (largest_sent_pn) |pn| {
+                self.round_end_pn = pn + 1;
+            }
+        }
+
+        // Sample RTT
+        if (latest_rtt_ns > 0) {
+            self.rtt_sample_count += 1;
+            if (latest_rtt_ns < self.current_round_min_rtt) {
+                self.current_round_min_rtt = latest_rtt_ns;
+            }
+        }
+
+        switch (self.ss_phase) {
+            .standard => {
+                // Normal exponential growth
+                self.congestion_window += acked_bytes;
+
+                // Check for round end
+                if (self.isRoundEnd(largest_sent_pn)) {
+                    // Enough samples? Check RTT increase.
+                    if (self.rtt_sample_count >= N_RTT_SAMPLE and
+                        self.last_round_min_rtt < std.math.maxInt(i64))
+                    {
+                        const eta = clampRttThresh(self.last_round_min_rtt);
+                        if (self.current_round_min_rtt >= self.last_round_min_rtt + eta) {
+                            // RTT increased → enter CSS
+                            self.ss_phase = .css;
+                            self.css_rounds = 0;
+                            self.css_baseline_cwnd = self.congestion_window;
+                        }
+                    }
+                    self.advanceRound(largest_sent_pn);
+                }
+            },
+            .css => {
+                // Conservative Slow Start: grow by MSS / CSS_GROWTH_DIVISOR per ACK
+                self.congestion_window += self.max_datagram_size / CSS_GROWTH_DIVISOR;
+
+                // Check for round end
+                if (self.isRoundEnd(largest_sent_pn)) {
+                    self.css_rounds += 1;
+
+                    if (self.rtt_sample_count >= N_RTT_SAMPLE and
+                        self.last_round_min_rtt < std.math.maxInt(i64))
+                    {
+                        const eta = clampRttThresh(self.last_round_min_rtt);
+                        if (self.current_round_min_rtt < self.last_round_min_rtt + eta) {
+                            // RTT stabilized → back to standard slow start
+                            self.ss_phase = .standard;
+                        }
+                    }
+
+                    if (self.css_rounds >= CSS_ROUNDS) {
+                        // Exit slow start → congestion avoidance
+                        self.ssthresh = self.congestion_window;
+                        self.ss_phase = .done;
+                    }
+
+                    self.advanceRound(largest_sent_pn);
+                }
+            },
+            .done => {
+                // Shouldn't reach here (inSlowStart would be false)
+                self.cubicUpdate(acked_bytes);
+            },
+        }
+    }
+
+    /// Check if the current round has ended.
+    fn isRoundEnd(self: *const Cubic, largest_sent_pn: ?u64) bool {
+        const end_pn = self.round_end_pn orelse return false;
+        const sent_pn = largest_sent_pn orelse return false;
+        return sent_pn >= end_pn;
+    }
+
+    /// Advance to the next round: save RTT stats and set new round boundary.
+    fn advanceRound(self: *Cubic, largest_sent_pn: ?u64) void {
+        self.last_round_min_rtt = self.current_round_min_rtt;
+        self.current_round_min_rtt = std.math.maxInt(i64);
+        self.rtt_sample_count = 0;
+        self.round_end_pn = if (largest_sent_pn) |pn| pn + 1 else null;
     }
 
     /// CUBIC window update during congestion avoidance.
@@ -351,6 +486,9 @@ pub const Cubic = struct {
             MIN_WINDOW_PACKETS * self.max_datagram_size,
         );
         self.bytes_acked_in_round = 0;
+
+        // HyStart++: loss during slow start means we're done
+        self.ss_phase = .done;
     }
 
     /// Persistent congestion: reset to minimum window (RFC 9002 §7.6.2).
@@ -361,6 +499,14 @@ pub const Cubic = struct {
         self.epoch_start = null;
         self.w_max = 0;
         self.bytes_acked_in_round = 0;
+
+        // HyStart++: reset to standard for the new slow start phase
+        self.ss_phase = .standard;
+        self.round_end_pn = null;
+        self.current_round_min_rtt = std.math.maxInt(i64);
+        self.last_round_min_rtt = std.math.maxInt(i64);
+        self.rtt_sample_count = 0;
+        self.css_rounds = 0;
     }
 
     /// PTO does not reduce window (RFC 9002 §7.5).
@@ -385,6 +531,13 @@ pub const Cubic = struct {
         self.max_datagram_size = size;
     }
 };
+
+/// HyStart++ RTT threshold clamp (RFC 9406 §4.2):
+/// eta = clamp(lastRoundMinRTT / 8, MIN_RTT_THRESH, MAX_RTT_THRESH)
+fn clampRttThresh(last_round_min_rtt: i64) i64 {
+    const eighth = @divTrunc(last_round_min_rtt, 8);
+    return @max(Cubic.MIN_RTT_THRESH, @min(eighth, Cubic.MAX_RTT_THRESH));
+}
 
 /// Integer cube root approximation (Newton's method).
 fn icbrt(x: u64) u64 {
@@ -690,6 +843,125 @@ test "Cubic: PTO does not reduce window" {
     const window_before = cc.congestion_window;
     cc.onPtoExpired();
     try testing.expectEqual(window_before, cc.congestion_window);
+}
+
+// ── HyStart++ tests ──
+
+test "HyStart++: enters CSS on RTT increase" {
+    var cc = Cubic.init();
+    try testing.expect(cc.inSlowStart());
+    try testing.expectEqual(Cubic.SlowStartPhase.standard, cc.ss_phase);
+
+    const base_rtt: i64 = 20_000_000; // 20ms
+
+    // Simulate: sent packets 0..9, then ACK them all.
+    // largest_sent_pn=9 stays fixed during the entire ACK batch.
+    // First ACK initializes round_end_pn to 10.
+    // No round ends during this batch (all ACKed PNs < 10).
+    var i: u32 = 0;
+    while (i < Cubic.N_RTT_SAMPLE) : (i += 1) {
+        cc.onPacketAckedWithRtt(1200, 100, base_rtt, 9);
+    }
+    // round_end_pn = 10, no round ended yet (9 < 10)
+    try testing.expect(cc.round_end_pn != null);
+    try testing.expectEqual(@as(u64, 10), cc.round_end_pn.?);
+    try testing.expectEqual(@as(u32, 8), cc.rtt_sample_count);
+
+    // Now simulate: sent packets 10..19, ACK them.
+    // largest_sent_pn=19. First ACK with pn >= 10 triggers round end.
+    cc.onPacketAckedWithRtt(1200, 200, base_rtt, 19);
+    // Round ended: last_round_min_rtt = base_rtt, round_end_pn = 20
+    try testing.expectEqual(base_rtt, cc.last_round_min_rtt);
+    try testing.expectEqual(@as(u64, 20), cc.round_end_pn.?);
+
+    // Continue ACKing round 2 with increased RTT (+5ms > eta=4ms)
+    const increased_rtt: i64 = base_rtt + 5_000_000;
+    i = 0;
+    while (i < Cubic.N_RTT_SAMPLE - 1) : (i += 1) {
+        cc.onPacketAckedWithRtt(1200, 200, increased_rtt, 19);
+    }
+    // 8 total samples in round 2 (1 from above + 7 here), round hasn't ended yet
+
+    // Send packets 20..29, ACK triggers next round end
+    cc.onPacketAckedWithRtt(1200, 300, increased_rtt, 29);
+    // Round ended: RTT increased above threshold → should enter CSS
+    try testing.expectEqual(Cubic.SlowStartPhase.css, cc.ss_phase);
+}
+
+test "HyStart++: CSS exits to CA after CSS_ROUNDS" {
+    var cc = Cubic.init();
+
+    // Establish baseline RTT
+    const base_rtt: i64 = 20_000_000;
+    var pn: u64 = 0;
+
+    // First round: baseline
+    var i: u32 = 0;
+    while (i < Cubic.N_RTT_SAMPLE) : (i += 1) {
+        cc.onPacketAckedWithRtt(1200, 100, base_rtt, pn);
+        pn += 1;
+    }
+
+    // Force into CSS
+    cc.ss_phase = .css;
+    cc.css_rounds = 0;
+    cc.css_baseline_cwnd = cc.congestion_window;
+
+    // Run CSS_ROUNDS rounds with increasing RTT
+    var round: u32 = 0;
+    while (round < Cubic.CSS_ROUNDS) : (round += 1) {
+        const rtt = base_rtt + @as(i64, @intCast(round + 1)) * 2_000_000;
+        i = 0;
+        while (i < Cubic.N_RTT_SAMPLE) : (i += 1) {
+            cc.onPacketAckedWithRtt(1200, 200, rtt, pn);
+            pn += 1;
+        }
+    }
+
+    // Should have exited slow start
+    try testing.expectEqual(Cubic.SlowStartPhase.done, cc.ss_phase);
+    try testing.expect(!cc.inSlowStart()); // ssthresh was set
+}
+
+test "HyStart++: loss during slow start sets phase to done" {
+    var cc = Cubic.init();
+    try testing.expectEqual(Cubic.SlowStartPhase.standard, cc.ss_phase);
+
+    cc.onCongestionEvent(100, 200);
+    try testing.expectEqual(Cubic.SlowStartPhase.done, cc.ss_phase);
+}
+
+test "HyStart++: persistent congestion resets to standard" {
+    var cc = Cubic.init();
+    cc.ss_phase = .css;
+    cc.css_rounds = 3;
+
+    cc.onPersistentCongestion(1_000_000_000);
+    try testing.expectEqual(Cubic.SlowStartPhase.standard, cc.ss_phase);
+    try testing.expectEqual(@as(u32, 0), cc.css_rounds);
+    try testing.expect(cc.inSlowStart());
+}
+
+test "HyStart++: CSS grows slower than standard" {
+    var cc_std = Cubic.init();
+    var cc_css = Cubic.init();
+    cc_css.ss_phase = .css;
+    cc_css.css_baseline_cwnd = cc_css.congestion_window;
+
+    const initial_std = cc_std.congestion_window;
+    const initial_css = cc_css.congestion_window;
+
+    // Same ACK to both
+    cc_std.onPacketAckedWithRtt(1200, 100, 20_000_000, 10);
+    cc_css.onPacketAckedWithRtt(1200, 100, 20_000_000, 10);
+
+    const growth_std = cc_std.congestion_window - initial_std;
+    const growth_css = cc_css.congestion_window - initial_css;
+
+    // CSS should grow slower
+    try testing.expect(growth_css < growth_std);
+    // CSS growth = MSS / CSS_GROWTH_DIVISOR = 1200 / 4 = 300
+    try testing.expectEqual(@as(u64, DEFAULT_MAX_DATAGRAM_SIZE / Cubic.CSS_GROWTH_DIVISOR), growth_css);
 }
 
 // ── icbrt tests ──

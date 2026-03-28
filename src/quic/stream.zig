@@ -38,10 +38,16 @@ pub fn isLocal(stream_id: u64, is_server: bool) bool {
 
 /// Gap-based frame sorter for out-of-order reassembly of stream data.
 /// Tracks received byte ranges and returns contiguous data starting from read_pos.
+///
+/// Optimization (inspired by lxin/quic kernel): inline fast path for the common
+/// in-order case. When data arrives exactly at read_pos with no out-of-order chunks
+/// buffered, it's stored in a fixed inline buffer (zero heap allocation).
 pub const FrameSorter = struct {
+    const INLINE_BUF_SIZE = 1500;
+
     allocator: Allocator,
 
-    /// Buffered data chunks, keyed by offset.
+    /// Buffered data chunks, keyed by offset. Used for out-of-order delivery.
     chunks: std.AutoArrayHashMap(u64, []const u8),
 
     /// Next offset to be read by the application.
@@ -49,6 +55,11 @@ pub const FrameSorter = struct {
 
     /// The final offset (set when FIN is received).
     fin_offset: ?u64 = null,
+
+    /// Inline buffer for zero-alloc in-order fast path.
+    /// When data arrives at read_pos and chunks map is empty, copy here instead.
+    inline_buf: [INLINE_BUF_SIZE]u8 = undefined,
+    inline_len: u16 = 0,
 
     pub fn init(allocator: Allocator) FrameSorter {
         return .{
@@ -58,7 +69,6 @@ pub const FrameSorter = struct {
     }
 
     pub fn deinit(self: *FrameSorter) void {
-        // Free any owned data
         for (self.chunks.values()) |data| {
             self.allocator.free(data);
         }
@@ -68,6 +78,9 @@ pub const FrameSorter = struct {
     /// Return the highest byte offset buffered (or read_pos if no chunks).
     pub fn highestReceived(self: *const FrameSorter) u64 {
         var highest = self.read_pos;
+        if (self.inline_len > 0) {
+            highest = self.read_pos + self.inline_len;
+        }
         for (self.chunks.keys(), self.chunks.values()) |off, val| {
             const end = off + val.len;
             if (end > highest) highest = end;
@@ -79,24 +92,20 @@ pub const FrameSorter = struct {
     pub fn push(self: *FrameSorter, offset: u64, data: []const u8, fin: bool) !void {
         if (fin) {
             const new_fin = offset + data.len;
-            // RFC 9000 §4.5: final size cannot change once known
             if (self.fin_offset) |existing| {
                 if (existing != new_fin) return error.FinalSizeError;
             }
             self.fin_offset = new_fin;
         }
 
-        // RFC 9000 §4.5: data cannot exceed known final size
         if (self.fin_offset) |fs| {
             if (offset + data.len > fs) return error.FinalSizeError;
         }
 
         if (data.len == 0) return;
 
-        // Skip data that's already been read
         if (offset + data.len <= self.read_pos) return;
 
-        // Trim data that partially overlaps with already-read region
         var effective_offset = offset;
         var effective_data = data;
         if (offset < self.read_pos) {
@@ -105,20 +114,26 @@ pub const FrameSorter = struct {
             effective_offset = self.read_pos;
         }
 
-        // Check if there's already a chunk at this offset.
-        // Don't overwrite a longer chunk with a shorter one (retransmission
-        // with different fragmentation boundaries). Also free old data to
-        // prevent memory leaks.
+        // Fast path: in-order delivery, no buffered chunks, fits inline.
+        // Avoids hash map insertion + heap allocation entirely.
+        if (effective_offset == self.read_pos and
+            self.inline_len == 0 and
+            self.chunks.count() == 0 and
+            effective_data.len <= INLINE_BUF_SIZE)
+        {
+            @memcpy(self.inline_buf[0..effective_data.len], effective_data);
+            self.inline_len = @intCast(effective_data.len);
+            return;
+        }
+
+        // Slow path: out-of-order or inline buffer occupied
         if (self.chunks.get(effective_offset)) |existing| {
             if (existing.len >= effective_data.len) {
-                // Existing chunk covers at least as much data — skip.
                 return;
             }
-            // New chunk is longer — free old, overwrite below.
             self.allocator.free(existing);
         }
 
-        // Copy data to owned buffer
         const owned = try self.allocator.dupe(u8, effective_data);
         errdefer self.allocator.free(owned);
 
@@ -127,9 +142,19 @@ pub const FrameSorter = struct {
 
     /// Pop the next contiguous chunk of data from the read position.
     /// Returns null if there's no data available at the current read position.
+    /// Returned data is always heap-allocated — caller must free.
     pub fn pop(self: *FrameSorter) ?[]const u8 {
+        // Fast path: inline buffer → dupe to heap for caller ownership.
+        // The win is push() avoided hash map operations entirely.
+        if (self.inline_len > 0) {
+            const len = self.inline_len;
+            self.inline_len = 0;
+            self.read_pos += len;
+            return self.allocator.dupe(u8, self.inline_buf[0..len]) catch null;
+        }
+
         if (self.chunks.get(self.read_pos)) |data| {
-            _ = self.chunks.orderedRemove(self.read_pos);
+            _ = self.chunks.swapRemove(self.read_pos);
             self.read_pos += data.len;
             return data;
         }
@@ -139,7 +164,7 @@ pub const FrameSorter = struct {
     /// Check if all data has been received (FIN reached and all data consumed).
     pub fn isComplete(self: *const FrameSorter) bool {
         if (self.fin_offset) |fin| {
-            return self.read_pos >= fin;
+            return self.read_pos >= fin and self.inline_len == 0;
         }
         return false;
     }

@@ -4,6 +4,8 @@ const testing = std.testing;
 
 const ranges = @import("ranges.zig");
 const RangeSet = ranges.RangeSet;
+const Range = ranges.Range;
+const PacketNumberBitmap = ranges.PacketNumberBitmap;
 const rtt_mod = @import("rtt.zig");
 const RttStats = rtt_mod.RttStats;
 const frame_mod = @import("frame.zig");
@@ -295,9 +297,11 @@ pub const SentPacketTracker = struct {
 };
 
 /// Tracks received packets for generating ACK frames.
+/// Uses a fixed-size sliding-window bitmap for O(1) duplicate detection
+/// (inspired by lxin/quic kernel pnspace.c).
 pub const ReceivedPacketTracker = struct {
     allocator: Allocator,
-    received: RangeSet,
+    received: PacketNumberBitmap = .{},
     largest_received: ?u64 = null,
     largest_received_time: i64 = 0,
     ack_eliciting_since_last_ack: u32 = 0,
@@ -318,17 +322,15 @@ pub const ReceivedPacketTracker = struct {
     pub fn init(allocator: Allocator) ReceivedPacketTracker {
         return .{
             .allocator = allocator,
-            .received = RangeSet.init(allocator),
         };
     }
 
     pub fn deinit(self: *ReceivedPacketTracker) void {
-        self.received.deinit();
+        _ = self;
     }
 
     pub fn onPacketReceived(self: *ReceivedPacketTracker, pn: u64, ack_eliciting: bool, now: i64, ecn: u2) !void {
-        if (self.received.contains(pn)) return;
-        try self.received.add(pn);
+        if (!self.received.mark(pn)) return; // duplicate
 
         if (self.largest_received == null or pn > self.largest_received.?) {
             self.largest_received = pn;
@@ -407,6 +409,12 @@ pub const ReceivedPacketTracker = struct {
         }
     }
 
+    /// Backwards-compatible accessor: returns number of distinct ranges in the bitmap.
+    pub fn rangeCount(self: *const ReceivedPacketTracker) usize {
+        var buf: [MAX_ACK_RANGES + 1]Range = undefined;
+        return self.received.getRanges(&buf);
+    }
+
     /// Check if there are any unacknowledged ack-eliciting packets.
     /// Used by the packet packer to piggyback ACKs on outgoing data packets.
     pub fn hasUnackedAckEliciting(self: *const ReceivedPacketTracker) bool {
@@ -433,10 +441,14 @@ pub const ReceivedPacketTracker = struct {
         }
 
         const largest = self.largest_received orelse return null;
-        const recv_ranges = self.received.getRanges();
-        if (recv_ranges.len == 0) return null;
 
-        const first_range = recv_ranges[0];
+        // Scan bitmap to produce ranges in descending order.
+        // First slot is used for the first_ack_range; rest become additional ACK ranges.
+        var all_ranges: [MAX_ACK_RANGES + 1]Range = undefined;
+        const total = self.received.getRanges(&all_ranges);
+        if (total == 0) return null;
+
+        const first_range = all_ranges[0];
         const first_ack_range = largest - first_range.start;
 
         const ack_delay_ns = now - self.largest_received_time;
@@ -447,11 +459,11 @@ pub const ReceivedPacketTracker = struct {
         self.ack_alarm = null;
         self.ack_eliciting_since_last_ack = 0;
 
-        // Populate additional ACK ranges from received range set
+        // Populate additional ACK ranges from bitmap scan
         var ack_ranges: [MAX_ACK_RANGES]AckRange = undefined;
         var ack_range_count: u8 = 0;
-        if (recv_ranges.len > 1) {
-            for (recv_ranges[1..]) |r| {
+        if (total > 1) {
+            for (all_ranges[1..total]) |r| {
                 if (ack_range_count >= MAX_ACK_RANGES) break;
                 ack_ranges[ack_range_count] = .{ .start = r.start, .end = r.end };
                 ack_range_count += 1;
@@ -910,14 +922,15 @@ test "ReceivedPacketTracker: pruneAckedRanges removes old ranges" {
     }
 
     // Ranges should cover 0..9
-    try testing.expectEqual(@as(usize, 1), tracker.received.getRanges().len);
-    try testing.expectEqual(@as(u64, 0), tracker.received.getRanges()[0].start);
+    try testing.expectEqual(@as(usize, 1), tracker.rangeCount());
 
     // Prune below 5 — ranges should now start at 5
     tracker.pruneAckedRanges(5);
-    try testing.expectEqual(@as(usize, 1), tracker.received.getRanges().len);
-    try testing.expectEqual(@as(u64, 5), tracker.received.getRanges()[0].start);
-    try testing.expectEqual(@as(u64, 9), tracker.received.getRanges()[0].end);
+    try testing.expectEqual(@as(usize, 1), tracker.rangeCount());
+    // Verify 0-4 are gone, 5-9 remain
+    try testing.expect(!tracker.received.contains(4));
+    try testing.expect(tracker.received.contains(5));
+    try testing.expect(tracker.received.contains(9));
 }
 
 // App-limited cwnd suppression (RFC 9002 §7.8)
