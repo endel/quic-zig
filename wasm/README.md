@@ -90,7 +90,7 @@ wasm.qz_free(keyPtr, keyDer.byteLength);
 Generate a browser-compatible cert (ECDSA P-256, ≤14 days):
 ```sh
 openssl ecparam -name prime256v1 -genkey -noout -out key.pem
-openssl req -new -x509 -key key.pem -out cert.pem -days 13 -subj '/CN=localhost'
+openssl req -new -x509 -key key.pem -out cert.pem -days 13 -subj '/CN=127.0.0.1'
 openssl x509 -in cert.pem -outform der -out cert.der
 openssl ec -in key.pem -outform der -out key.der 2>/dev/null
 # SHA-256 digest for serverCertificateHashes:
