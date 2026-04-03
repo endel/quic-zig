@@ -403,18 +403,20 @@ export fn qz_poll_event(buf_ptr: [*]u8, buf_len: u32) u32 {
                     inst.pushEvent(&evt);
                 },
                 .stream_data => |sd| {
-                    var evt: [17]u8 = undefined;
-                    evt[0] = EVT_WT_STREAM_DATA;
-                    std.mem.writeInt(u64, evt[1..9], sd.stream_id, .big);
-                    std.mem.writeInt(u64, evt[9..17], @intCast(sd.data.len), .big);
-                    inst.pushEvent(&evt);
-                    Instance.stashPending(&inst.pending_stream, sd.stream_id, sd.data);
-                },
-                .stream_finished => |sf| {
-                    var evt: [9]u8 = undefined;
-                    evt[0] = EVT_WT_STREAM_FIN;
-                    std.mem.writeInt(u64, evt[1..9], sf.stream_id, .big);
-                    inst.pushEvent(&evt);
+                    if (sd.data.len > 0) {
+                        var evt: [17]u8 = undefined;
+                        evt[0] = EVT_WT_STREAM_DATA;
+                        std.mem.writeInt(u64, evt[1..9], sd.stream_id, .big);
+                        std.mem.writeInt(u64, evt[9..17], @intCast(sd.data.len), .big);
+                        inst.pushEvent(&evt);
+                        Instance.stashPending(&inst.pending_stream, sd.stream_id, sd.data);
+                    }
+                    if (sd.fin) {
+                        var fin_evt: [9]u8 = undefined;
+                        fin_evt[0] = EVT_WT_STREAM_FIN;
+                        std.mem.writeInt(u64, fin_evt[1..9], sd.stream_id, .big);
+                        inst.pushEvent(&fin_evt);
+                    }
                 },
                 .datagram => |dg| {
                     var evt: [17]u8 = undefined;
