@@ -517,11 +517,30 @@ pub const WebTransportConnection = struct {
 
             defer self.allocator.free(data);
 
-            // Try to parse capsules on the CONNECT stream (may be partial data)
-            const result = h3_frame.parse(data) catch |err| {
-                std.log.debug("WT capsule parse error: {}", .{err});
-                continue;
+            // Try to parse capsules on the CONNECT stream.
+            // Per RFC 9297 §3.3, capsules may be wrapped in H3 DATA frames
+            // (Chrome does this), or sent as bare capsule TLVs (Zig/Go clients).
+            // Try parsing the outer frame first, then unwrap DATA if needed.
+            const capsule_data = blk: {
+                const result = h3_frame.parse(data) catch break :blk data;
+                switch (result.frame) {
+                    // Bare capsule — already the right type
+                    .close_webtransport_session, .drain_webtransport_session => break :blk data,
+                    // DATA frame wrapping a capsule (RFC 9297 §3.3)
+                    .data => |payload| break :blk payload,
+                    else => {
+                        // Unexpected frame on CONNECT stream while draining
+                        if (session.state == .draining) {
+                            if (self.quic.streams.getStream(session.session_id)) |s| {
+                                s.send.reset(@intFromEnum(h3_conn.H3Error.message_error));
+                            }
+                        }
+                        continue;
+                    },
+                }
             };
+
+            const result = h3_frame.parse(capsule_data) catch continue;
             switch (result.frame) {
                 .close_webtransport_session => |cls| {
                     const sid = session.session_id;
@@ -554,8 +573,7 @@ pub const WebTransportConnection = struct {
                     }
                 },
                 else => {
-                    // Data on CONNECT stream after CLOSE_WEBTRANSPORT_SESSION
-                    // is a protocol violation — reset with H3_MESSAGE_ERROR
+                    // Unexpected capsule on CONNECT stream while draining
                     if (session.state == .draining) {
                         if (self.quic.streams.getStream(session.session_id)) |s| {
                             s.send.reset(@intFromEnum(h3_conn.H3Error.message_error));
