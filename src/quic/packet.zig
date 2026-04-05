@@ -780,9 +780,11 @@ pub fn validateRetryToken(
     token_key: [crypto.key_len]u8,
 ) !?ValidatedToken {
     if (token_data.len < TOKEN_NONCE_LEN + TOKEN_TAG_LEN + 2) return null;
+    if (token_data.len > TOKEN_MAX_LEN) return null;
 
     const nonce = token_data[0..TOKEN_NONCE_LEN].*;
     const ct_len = token_data.len - TOKEN_NONCE_LEN - TOKEN_TAG_LEN;
+    if (ct_len > TOKEN_MAX_PLAINTEXT_LEN) return null;
     const ciphertext = token_data[TOKEN_NONCE_LEN..][0..ct_len];
     const tag = token_data[token_data.len - TOKEN_TAG_LEN ..][0..TOKEN_TAG_LEN].*;
 
@@ -1108,6 +1110,18 @@ test "Retry token: wrong key rejected" {
     var wrong_key: [crypto.key_len]u8 = undefined;
     random.bytes(&wrong_key);
     const validated = try validateRetryToken(out[0..token_len], addr, wrong_key);
+    try std.testing.expect(validated == null);
+}
+
+test "Retry token: oversized token rejected before decrypt" {
+    var token_key: [crypto.key_len]u8 = undefined;
+    random.bytes(&token_key);
+
+    var addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    addr.family = posix.AF.INET;
+
+    var oversized: [TOKEN_MAX_LEN + 1]u8 = .{0} ** (TOKEN_MAX_LEN + 1);
+    const validated = try validateRetryToken(&oversized, addr, token_key);
     try std.testing.expect(validated == null);
 }
 
