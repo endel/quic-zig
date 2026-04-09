@@ -124,6 +124,12 @@ pub const Session = struct {
         }
     }
 
+    pub fn stopSending(self: *Session, stream_id: u64, error_code: u32) void {
+        if (self.entry.wt_conn) |*wtc| {
+            wtc.stopSending(stream_id, error_code);
+        }
+    }
+
     pub fn acceptSessionWithHeaders(self: *Session, session_id: u64, extra_headers: []const qpack.Header) !void {
         if (self.entry.wt_conn) |*wtc| {
             try wtc.acceptSessionWithHeaders(session_id, extra_headers);
@@ -1178,6 +1184,12 @@ pub const ClientSession = struct {
     pub fn resetStream(self: *ClientSession, stream_id: u64, error_code: u32) void {
         if (self.wt_conn) |wtc| {
             wtc.resetStream(stream_id, error_code);
+        }
+    }
+
+    pub fn stopSending(self: *ClientSession, stream_id: u64, error_code: u32) void {
+        if (self.wt_conn) |wtc| {
+            wtc.stopSending(stream_id, error_code);
         }
     }
 

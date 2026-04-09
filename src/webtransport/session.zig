@@ -375,6 +375,20 @@ pub const WebTransportConnection = struct {
         }
     }
 
+    /// Stop receiving on a WT stream (sends STOP_SENDING to peer).
+    /// Equivalent to browser's ReadableStream.cancel().
+    /// Unlike resetStream(), this does NOT reset the send side.
+    pub fn stopSending(self: *WebTransportConnection, stream_id: u64, error_code: u32) void {
+        const h3_code = appErrorCodeToH3(error_code);
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            stream.recv.stopSending(h3_code);
+            return;
+        }
+        if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
+            recv_stream.stopSending(h3_code);
+        }
+    }
+
     /// Mark a session as fully closed and release its slot.
     fn finalizeSession(self: *WebTransportConnection, session: *Session) void {
         session.state = .closed;
