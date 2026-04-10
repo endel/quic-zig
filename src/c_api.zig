@@ -416,14 +416,14 @@ export fn qz_stream_open_bidi(handle: *anyopaque, client_id: u64, session_id: u6
     const ws = getWtServer(handle);
     const entry = getEntry(ws, client_id) orelse return STREAM_ERROR;
     var session = event_loop.Session{ .entry = entry };
-    return session.openBidiStream(session_id) catch return STREAM_ERROR;
+    return session.openBidiStream(session_id, null) catch return STREAM_ERROR;
 }
 
 export fn qz_stream_open_uni(handle: *anyopaque, client_id: u64, session_id: u64) u64 {
     const ws = getWtServer(handle);
     const entry = getEntry(ws, client_id) orelse return STREAM_ERROR;
     var session = event_loop.Session{ .entry = entry };
-    return session.openUniStream(session_id) catch return STREAM_ERROR;
+    return session.openUniStream(session_id, null) catch return STREAM_ERROR;
 }
 
 export fn qz_stream_send(

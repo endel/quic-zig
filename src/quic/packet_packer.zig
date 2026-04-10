@@ -472,11 +472,11 @@ pub const PacketPacker = struct {
                 }
             }
 
-            // Unidirectional send streams
-            if (streams.send_streams.count() > 0) {
-            var uni_it = streams.send_streams.valueIterator();
-            while (uni_it.next()) |s_ptr| {
-                const s = s_ptr.*;
+            // Unidirectional send streams (priority-scheduled)
+            var uni_sched_buf: [stream_mod.StreamsMap.MAX_SCHEDULABLE]*stream_mod.SendStream = undefined;
+            const uni_sched_count = streams.getScheduledUniStreams(&uni_sched_buf);
+            if (uni_sched_count > 0) {
+            for (uni_sched_buf[0..uni_sched_count]) |s| {
                 if (fbs.pos + AEAD_TAG_LEN + 16 >= effective_max) break;
                 if (conn_budget == 0) break;
                 if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
@@ -510,12 +510,13 @@ pub const PacketPacker = struct {
 
         // 6. DATAGRAM frames (RFC 9221) — subject to congestion control (RFC 9221 §5)
         // Only pack datagrams when CC allows (i.e. not in ack_only mode).
+        var has_datagram = false;
         if (level == .application and !ack_only) {
             if (datagram_queue) |dq| {
                 while (true) {
                     // Zero-copy peek: read directly from ring buffer without
                     // copying to an intermediate stack buffer.
-                    const dgram_data = dq.peekData() orelse break;
+                    const dgram_data = dq.peekDataSkipExpired(now) orelse break;
                     // DATAGRAM_WITH_LENGTH frame: type(1) + varint(len) + payload
                     const varint_overhead: usize = if (dgram_data.len <= 63) 1 else 2;
                     const frame_size = 1 + varint_overhead + dgram_data.len;
@@ -526,6 +527,7 @@ pub const PacketPacker = struct {
                     try dgram_frame.write(writer);
                     dq.consume();
                     ack_eliciting = true;
+                    has_datagram = true;
                 }
             }
         }
@@ -620,6 +622,7 @@ pub const PacketPacker = struct {
             .enc_level = level,
             .has_crypto_data = has_crypto_data,
             .has_handshake_done = has_handshake_done,
+            .has_datagram = has_datagram,
             .ecn_marked = level == .application and self.ecn_mark,
             .largest_acked = ack_largest_sent,
         };

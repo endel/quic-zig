@@ -168,15 +168,15 @@ const WptHandler = struct {
                     session.closeSessionWithError(sid, info_ptr.deferred_code, info_ptr.getDeferredReason()) catch {};
                 },
                 .server_connection_close => {
-                    _ = session.openBidiStream(sid) catch {};
+                    _ = session.openBidiStream(sid, null) catch {};
                     session.closeConnection();
                 },
                 .abort_stream_from_server => {
-                    if (session.openUniStream(sid)) |stream_id| {
+                    if (session.openUniStream(sid, null)) |stream_id| {
                         session.sendStreamData(stream_id, "a") catch {};
                         session.resetStream(stream_id, info_ptr.deferred_code);
                     } else |_| {}
-                    if (session.openBidiStream(sid)) |stream_id| {
+                    if (session.openBidiStream(sid, null)) |stream_id| {
                         session.resetStream(stream_id, info_ptr.deferred_code);
                     } else |_| {}
                 },
@@ -253,12 +253,12 @@ const WptHandler = struct {
                 // Retrieve stashed data by token and send on a uni stream
                 const token = getQueryParam(path, "token") orelse "";
                 if (self.stash.get(token)) |data| {
-                    if (session.openUniStream(session_id)) |stream_id| {
+                    if (session.openUniStream(session_id, null)) |stream_id| {
                         session.sendStreamData(stream_id, data) catch {};
                         session.closeStream(stream_id);
                     } else |_| {}
                 } else {
-                    if (session.openUniStream(session_id)) |stream_id| {
+                    if (session.openUniStream(session_id, null)) |stream_id| {
                         session.sendStreamData(stream_id, "{}") catch {};
                         session.closeStream(stream_id);
                     } else |_| {}
@@ -306,7 +306,7 @@ const WptHandler = struct {
                 if (isUniStream(stream_id)) {
                     // Unidirectional: echo on a single outgoing uni stream per incoming stream.
                     const out_id: ?u64 = self.uni_echo_streams.get(stream_id) orelse blk: {
-                        const new_id = session.openUniStream(session_id) catch |err| {
+                        const new_id = session.openUniStream(session_id, null) catch |err| {
                             std.log.err("[wpt] openUniStream failed: {any}", .{err});
                             break :blk null;
                         };

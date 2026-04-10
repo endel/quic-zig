@@ -12,7 +12,7 @@ const EchoClient = struct {
         std.debug.print("WebTransport session ready (session_id={d})\n", .{session_id});
 
         // Open a bidi stream and send data
-        const stream_id = session.openBidiStream(session_id) catch |err| {
+        const stream_id = session.openBidiStream(session_id, null) catch |err| {
             std.debug.print("openBidiStream error: {any}\n", .{err});
             return;
         };

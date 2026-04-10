@@ -293,6 +293,10 @@ pub const SendStream = struct {
     /// RFC 9218 priority: incremental streams are interleaved round-robin.
     incremental: bool = false,
 
+    /// WebTransport sendOrder: higher values transmitted first. When set,
+    /// takes precedence over RFC 9218 urgency for scheduling.
+    send_order: ?i64 = null,
+
     /// Whether FIN has been queued.
     fin_queued: bool = false,
 
@@ -835,27 +839,43 @@ pub const StreamsMap = struct {
     /// Maximum number of streams returned by getScheduledStreams().
     pub const MAX_SCHEDULABLE: usize = 48;
 
-    /// Select bidi streams to send data on according to RFC 9218 priority.
-    /// Pass 1: find the minimum urgency level with data ready.
-    /// Pass 2: collect streams at that urgency.
-    ///   - Non-incremental: only the first one (sequential delivery).
-    ///   - Incremental: all of them (round-robin interleaved).
+    /// Select bidi streams to send data on, respecting both WebTransport sendOrder
+    /// and RFC 9218 priority. Two tiers:
+    ///   Tier 1: streams with send_order set — sorted descending (higher = more urgent).
+    ///   Tier 2: streams without send_order — RFC 9218 urgency-based scheduling.
     /// Returns the count of streams written to `out`.
     pub fn getScheduledStreams(self: *StreamsMap, out: *[MAX_SCHEDULABLE]*Stream) usize {
-        // Single pass: find min urgency and collect candidate streams simultaneously.
-        // Candidates at non-min urgency are overwritten as we discover lower urgencies.
-        var min_urgency: u3 = 7;
-        var count: usize = 0;
-        var found_non_incremental = false;
+        // Tier 1: collect streams with send_order set
+        var ordered_count: usize = 0;
         var it = self.streams.valueIterator();
         while (it.next()) |sp| {
             const s = sp.*;
             if (!s.send.hasData() or (s.closed_for_gc and s.send.retransmit_count == 0)) continue;
+            if (s.send.send_order != null) {
+                if (ordered_count >= MAX_SCHEDULABLE) continue;
+                out[ordered_count] = s;
+                ordered_count += 1;
+            }
+        }
+        // Sort tier 1 descending by send_order (higher first)
+        if (ordered_count > 1) {
+            sortStreamsBySendOrder(out[0..ordered_count]);
+        }
+
+        // Tier 2: streams without send_order — RFC 9218 urgency scheduling
+        var min_urgency: u3 = 7;
+        var urgency_count: usize = 0;
+        var found_non_incremental = false;
+        var urgency_buf: [MAX_SCHEDULABLE]*Stream = undefined;
+        var it2 = self.streams.valueIterator();
+        while (it2.next()) |sp| {
+            const s = sp.*;
+            if (!s.send.hasData() or (s.closed_for_gc and s.send.retransmit_count == 0)) continue;
+            if (s.send.send_order != null) continue; // already in tier 1
 
             if (s.send.urgency < min_urgency) {
-                // Found lower urgency — reset collection
                 min_urgency = s.send.urgency;
-                count = 0;
+                urgency_count = 0;
                 found_non_incremental = false;
             }
 
@@ -863,34 +883,76 @@ pub const StreamsMap = struct {
 
             if (!s.send.incremental) {
                 if (!found_non_incremental) {
-                    if (count >= MAX_SCHEDULABLE) continue;
-                    out[count] = s;
-                    count += 1;
+                    if (urgency_count >= MAX_SCHEDULABLE) continue;
+                    urgency_buf[urgency_count] = s;
+                    urgency_count += 1;
                     found_non_incremental = true;
                 }
             } else {
-                if (count >= MAX_SCHEDULABLE) continue;
-                out[count] = s;
-                count += 1;
+                if (urgency_count >= MAX_SCHEDULABLE) continue;
+                urgency_buf[urgency_count] = s;
+                urgency_count += 1;
             }
         }
-        if (count == 0) return 0;
 
-        // Rotate incremental streams for fairness
-        if (count > 1) {
-            const rotation = self.rr_index % count;
+        // Rotate tier 2 incremental streams for fairness
+        if (urgency_count > 1) {
+            const rotation = self.rr_index % urgency_count;
             if (rotation > 0) {
                 var tmp: [MAX_SCHEDULABLE]*Stream = undefined;
-                for (0..count) |i| {
-                    tmp[i] = out[(i + rotation) % count];
+                for (0..urgency_count) |i| {
+                    tmp[i] = urgency_buf[(i + rotation) % urgency_count];
                 }
-                for (0..count) |i| {
-                    out[i] = tmp[i];
+                for (0..urgency_count) |i| {
+                    urgency_buf[i] = tmp[i];
                 }
             }
         }
-        self.rr_index +%= 1;
-        return count;
+        if (urgency_count > 0) self.rr_index +%= 1;
+
+        // Append tier 2 after tier 1
+        const total = @min(ordered_count + urgency_count, MAX_SCHEDULABLE);
+        for (ordered_count..total) |i| {
+            out[i] = urgency_buf[i - ordered_count];
+        }
+        return total;
+    }
+
+    /// Select uni send streams to send data on, sorted by send_order (higher first).
+    /// Streams without send_order are appended after ordered ones.
+    pub fn getScheduledUniStreams(self: *StreamsMap, out: *[MAX_SCHEDULABLE]*SendStream) usize {
+        var ordered_count: usize = 0;
+        var unordered_count: usize = 0;
+        var unordered_buf: [MAX_SCHEDULABLE]*SendStream = undefined;
+
+        var it = self.send_streams.valueIterator();
+        while (it.next()) |s_ptr| {
+            const s = s_ptr.*;
+            if (!s.hasData()) continue;
+            if (s.send_order != null) {
+                if (ordered_count < MAX_SCHEDULABLE) {
+                    out[ordered_count] = s;
+                    ordered_count += 1;
+                }
+            } else {
+                if (unordered_count < MAX_SCHEDULABLE) {
+                    unordered_buf[unordered_count] = s;
+                    unordered_count += 1;
+                }
+            }
+        }
+
+        // Sort ordered streams descending by send_order
+        if (ordered_count > 1) {
+            sortSendStreamsBySendOrder(out[0..ordered_count]);
+        }
+
+        // Append unordered after ordered
+        const total = @min(ordered_count + unordered_count, MAX_SCHEDULABLE);
+        for (ordered_count..total) |i| {
+            out[i] = unordered_buf[i - ordered_count];
+        }
+        return total;
     }
 
     /// Mark a stream as fully closed and update consumed counters.
@@ -1002,6 +1064,40 @@ pub const StreamsMap = struct {
         return result;
     }
 };
+
+/// Sort bidi streams descending by send_order (higher first). Insertion sort for small N.
+fn sortStreamsBySendOrder(streams: []*Stream) void {
+    if (streams.len <= 1) return;
+    for (1..streams.len) |i| {
+        const key = streams[i];
+        const key_order = key.send.send_order orelse 0;
+        var j: usize = i;
+        while (j > 0) {
+            const prev_order = streams[j - 1].send.send_order orelse 0;
+            if (prev_order >= key_order) break;
+            streams[j] = streams[j - 1];
+            j -= 1;
+        }
+        streams[j] = key;
+    }
+}
+
+/// Sort uni send streams descending by send_order (higher first). Insertion sort for small N.
+fn sortSendStreamsBySendOrder(streams: []*SendStream) void {
+    if (streams.len <= 1) return;
+    for (1..streams.len) |i| {
+        const key = streams[i];
+        const key_order = key.send_order orelse 0;
+        var j: usize = i;
+        while (j > 0) {
+            const prev_order = streams[j - 1].send_order orelse 0;
+            if (prev_order >= key_order) break;
+            streams[j] = streams[j - 1];
+            j -= 1;
+        }
+        streams[j] = key;
+    }
+}
 
 // Tests
 
@@ -1707,4 +1803,113 @@ test "StreamsMap: getScheduledStreams mixed incremental and non-incremental" {
     const count = sm.getScheduledStreams(&out);
     // 1 non-incremental + 2 incremental = 3
     try testing.expectEqual(@as(usize, 3), count);
+}
+
+// sendOrder scheduling tests
+
+test "StreamsMap: send_order streams scheduled before urgency-based" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s0 = try sm.openBidiStream();
+    const s4 = try sm.openBidiStream();
+
+    // s0: urgency 0 (highest RFC 9218 priority), no send_order
+    try s0.send.writeData("urgency");
+    s0.send.urgency = 0;
+
+    // s4: urgency 7 (lowest), but has send_order
+    try s4.send.writeData("ordered");
+    s4.send.urgency = 7;
+    s4.send.send_order = 10;
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    const count = sm.getScheduledStreams(&out);
+    try testing.expectEqual(@as(usize, 2), count);
+    // send_order stream comes first (tier 1)
+    try testing.expectEqual(@as(u64, 4), out[0].stream_id);
+    // urgency-based stream second (tier 2)
+    try testing.expectEqual(@as(u64, 0), out[1].stream_id);
+}
+
+test "StreamsMap: send_order higher value scheduled first" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s0 = try sm.openBidiStream();
+    const s4 = try sm.openBidiStream();
+    const s8 = try sm.openBidiStream();
+
+    try s0.send.writeData("low");
+    s0.send.send_order = -5;
+
+    try s4.send.writeData("high");
+    s4.send.send_order = 100;
+
+    try s8.send.writeData("mid");
+    s8.send.send_order = 50;
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    const count = sm.getScheduledStreams(&out);
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expectEqual(@as(u64, 4), out[0].stream_id); // send_order=100
+    try testing.expectEqual(@as(u64, 8), out[1].stream_id); // send_order=50
+    try testing.expectEqual(@as(u64, 0), out[2].stream_id); // send_order=-5
+}
+
+test "StreamsMap: getScheduledUniStreams respects send_order" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const uni_a = try sm.openUniStream();
+    const uni_b = try sm.openUniStream();
+    const uni_c = try sm.openUniStream();
+
+    try uni_a.writeData("low");
+    uni_a.send_order = 1;
+
+    try uni_b.writeData("high");
+    uni_b.send_order = 100;
+
+    try uni_c.writeData("none"); // no send_order
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*SendStream = undefined;
+    const count = sm.getScheduledUniStreams(&out);
+    try testing.expectEqual(@as(usize, 3), count);
+    // uni stream IDs for client: 2, 6, 10
+    try testing.expectEqual(@as(u64, 6), out[0].stream_id); // send_order=100
+    try testing.expectEqual(@as(u64, 2), out[1].stream_id); // send_order=1
+    // out[2] is uni_c (no send_order, appended after ordered)
+    try testing.expectEqual(@as(u64, 10), out[2].stream_id);
+}
+
+test "StreamsMap: setSendOrder dynamically changes scheduling" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s0 = try sm.openBidiStream();
+    const s4 = try sm.openBidiStream();
+
+    try s0.send.writeData("a");
+    s0.send.send_order = 10;
+
+    try s4.send.writeData("b");
+    s4.send.send_order = 20;
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+
+    // s4 (send_order=20) should be first
+    var count = sm.getScheduledStreams(&out);
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(u64, 4), out[0].stream_id);
+
+    // Dynamically change: s0 gets higher priority
+    s0.send.send_order = 50;
+    count = sm.getScheduledStreams(&out);
+    try testing.expectEqual(@as(u64, 0), out[0].stream_id);
+    try testing.expectEqual(@as(u64, 4), out[1].stream_id);
 }

@@ -432,7 +432,7 @@ fn pollWtEvents(
                 state.files_expected = request_paths.len;
                 for (request_paths) |path| {
                     const filename = extractFilename(path);
-                    const stream_id = wt.openUniStream(state.session_id.?) catch |err| {
+                    const stream_id = wt.openUniStream(state.session_id.?, null) catch |err| {
                         std.log.err("failed to open uni stream: {any}", .{err});
                         continue;
                     };
@@ -452,7 +452,7 @@ fn pollWtEvents(
                 state.files_expected = request_paths.len;
                 for (request_paths) |path| {
                     const filename = extractFilename(path);
-                    const stream_id = wt.openBidiStream(state.session_id.?) catch |err| {
+                    const stream_id = wt.openBidiStream(state.session_id.?, null) catch |err| {
                         std.log.err("failed to open bidi stream: {any}", .{err});
                         continue;
                     };
@@ -699,7 +699,7 @@ fn handleUniStreamComplete(
                 };
                 defer alloc.free(file_data);
 
-                const new_stream_id = wt.openUniStream(state.session_id.?) catch |err| {
+                const new_stream_id = wt.openUniStream(state.session_id.?, null) catch |err| {
                     std.log.err("transfer uni: failed to open uni stream: {any}", .{err});
                     return;
                 };

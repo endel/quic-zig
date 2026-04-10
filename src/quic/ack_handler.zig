@@ -70,6 +70,9 @@ pub const SentPacket = struct {
     /// Whether this packet contains HANDSHAKE_DONE (for retransmission on loss).
     has_handshake_done: bool = false,
 
+    /// Whether this packet contains DATAGRAM frames (for stats tracking on loss).
+    has_datagram: bool = false,
+
     /// Record a stream frame carried by this packet.
     pub fn addStreamFrame(self: *SentPacket, info: StreamFrameInfo) void {
         if (self.stream_frame_count < MAX_STREAM_FRAMES_PER_PACKET) {

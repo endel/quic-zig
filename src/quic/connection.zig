@@ -321,6 +321,7 @@ pub const LocalCidPool = struct {
 };
 
 /// Fixed-capacity queue for QUIC DATAGRAM frames (RFC 9221).
+/// Supports optional max-age expiry and configurable high water mark.
 pub const DatagramQueue = struct {
     pub const DEFAULT_MAX_ITEMS: usize = 32;
     pub const MAX_DATAGRAM_SIZE: usize = 1200;
@@ -328,12 +329,21 @@ pub const DatagramQueue = struct {
     allocator: ?std.mem.Allocator = null,
     bufs_static: [DEFAULT_MAX_ITEMS][MAX_DATAGRAM_SIZE]u8 = undefined,
     lens_static: [DEFAULT_MAX_ITEMS]usize = .{0} ** DEFAULT_MAX_ITEMS,
+    times_static: [DEFAULT_MAX_ITEMS]i64 = .{0} ** DEFAULT_MAX_ITEMS,
     bufs_dynamic: ?[][MAX_DATAGRAM_SIZE]u8 = null,
     lens_dynamic: ?[]usize = null,
+    times_dynamic: ?[]i64 = null,
     max_items: usize = DEFAULT_MAX_ITEMS,
     head: usize = 0,
     tail: usize = 0,
     count: usize = 0,
+
+    /// Max age in nanoseconds. Datagrams older than this are dropped on read.
+    /// null = no age limit (default).
+    max_age_ns: ?i64 = null,
+
+    /// High water mark (max queued items). null = use max_items (default).
+    high_water_mark: ?usize = null,
 
     /// Resize the queue to a custom capacity (must be called before use).
     pub fn resize(self: *DatagramQueue, alloc: std.mem.Allocator, capacity: usize) !void {
@@ -341,7 +351,9 @@ pub const DatagramQueue = struct {
         self.allocator = alloc;
         self.bufs_dynamic = try alloc.alloc([MAX_DATAGRAM_SIZE]u8, capacity);
         self.lens_dynamic = try alloc.alloc(usize, capacity);
+        self.times_dynamic = try alloc.alloc(i64, capacity);
         @memset(self.lens_dynamic.?, 0);
+        @memset(self.times_dynamic.?, 0);
         self.max_items = capacity;
     }
 
@@ -349,6 +361,7 @@ pub const DatagramQueue = struct {
         if (self.allocator) |alloc| {
             if (self.bufs_dynamic) |b| alloc.free(b);
             if (self.lens_dynamic) |l| alloc.free(l);
+            if (self.times_dynamic) |t| alloc.free(t);
         }
     }
 
@@ -362,10 +375,20 @@ pub const DatagramQueue = struct {
         return &self.lens_static[idx];
     }
 
+    fn getTime(self: *DatagramQueue, idx: usize) *i64 {
+        if (self.times_dynamic) |t| return &t[idx];
+        return &self.times_static[idx];
+    }
+
+    fn effectiveCapacity(self: *const DatagramQueue) usize {
+        return self.high_water_mark orelse self.max_items;
+    }
+
     pub fn push(self: *DatagramQueue, data: []const u8) bool {
-        if (self.count >= self.max_items or data.len > MAX_DATAGRAM_SIZE) return false;
+        if (self.count >= self.effectiveCapacity() or data.len > MAX_DATAGRAM_SIZE) return false;
         @memcpy(self.getBuf(self.tail)[0..data.len], data);
         self.getLen(self.tail).* = data.len;
+        self.getTime(self.tail).* = @intCast(std.time.nanoTimestamp());
         self.tail = (self.tail + 1) % self.max_items;
         self.count += 1;
         return true;
@@ -381,12 +404,28 @@ pub const DatagramQueue = struct {
         return len;
     }
 
+    /// Pop the next non-expired datagram, dropping any expired entries.
+    /// Returns null if queue is empty or all remaining entries are expired.
+    pub fn popSkipExpired(self: *DatagramQueue, out: []u8, now: i64) ?usize {
+        const max_age = self.max_age_ns orelse return self.pop(out);
+        while (self.count > 0) {
+            const age = now - self.getTime(self.head).*;
+            if (age <= max_age) {
+                return self.pop(out);
+            }
+            // Expired — skip this entry
+            self.head = (self.head + 1) % self.max_items;
+            self.count -= 1;
+        }
+        return null;
+    }
+
     pub fn isEmpty(self: *const DatagramQueue) bool {
         return self.count == 0;
     }
 
     pub fn isFull(self: *const DatagramQueue) bool {
-        return self.count >= self.max_items;
+        return self.count >= self.effectiveCapacity();
     }
 
     pub fn queueLen(self: *const DatagramQueue) usize {
@@ -405,6 +444,22 @@ pub const DatagramQueue = struct {
         if (self.count == 0) return null;
         const len = self.getLen(self.head).*;
         return self.getBuf(self.head)[0..len];
+    }
+
+    /// Peek at next non-expired datagram, consuming any expired entries.
+    /// Returns null if queue is empty or all remaining entries are expired.
+    pub fn peekDataSkipExpired(self: *DatagramQueue, now: i64) ?[]const u8 {
+        const max_age = self.max_age_ns orelse return self.peekData();
+        while (self.count > 0) {
+            const age = now - self.getTime(self.head).*;
+            if (age <= max_age) {
+                return self.peekData();
+            }
+            // Expired — skip this entry
+            self.head = (self.head + 1) % self.max_items;
+            self.count -= 1;
+        }
+        return null;
     }
 
     /// Advance past the head entry (after peekData was used).
@@ -558,6 +613,13 @@ pub const Connection = struct {
     datagram_recv_queue: DatagramQueue = .{},
     datagram_send_queue: DatagramQueue = .{},
     datagrams_enabled: bool = false,
+
+    // Connection-level statistics counters
+    total_packets_sent: u64 = 0,
+    total_packets_received: u64 = 0,
+    total_packets_lost: u64 = 0,
+    datagrams_dropped_incoming: u64 = 0,
+    datagrams_lost_outgoing: u64 = 0,
 
     /// Optional zero-copy datagram callback. When set, incoming DATAGRAM frames
     /// are delivered directly during packet processing (inside recv()) instead of
@@ -1017,6 +1079,7 @@ pub const Connection = struct {
             const now: i64 = @intCast(std.time.nanoTimestamp());
             self.last_packet_received_time = now;
             self.keep_alive_ping_sent = false;
+            self.total_packets_received += 1;
             if (info.datagram_size > 0) {
                 self.paths[self.active_path_idx].bytes_received += info.datagram_size;
             }
@@ -1136,6 +1199,7 @@ pub const Connection = struct {
         }
 
         // Update network path stats (only once per datagram, not per coalesced packet)
+        self.total_packets_received += 1;
         if (info.datagram_size > 0) {
             self.paths[self.active_path_idx].bytes_received += info.datagram_size;
         }
@@ -1385,6 +1449,9 @@ pub const Connection = struct {
                 }
 
                 for (result.lost.constSlice()) |pkt| {
+                    self.total_packets_lost += 1;
+                    if (pkt.has_datagram) self.datagrams_lost_outgoing += 1;
+
                     // Check if this is an MTU probe loss — don't trigger CC
                     if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {
                         std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
@@ -1510,6 +1577,9 @@ pub const Connection = struct {
                 }
 
                 for (result.lost.constSlice()) |pkt| {
+                    self.total_packets_lost += 1;
+                    if (pkt.has_datagram) self.datagrams_lost_outgoing += 1;
+
                     if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {
                         std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
@@ -1930,7 +2000,9 @@ pub const Connection = struct {
                     if (self.datagram_recv_callback) |cb| {
                         cb(d.data, self.datagram_recv_ctx);
                     } else {
-                        _ = self.datagram_recv_queue.push(d.data);
+                        if (!self.datagram_recv_queue.push(d.data)) {
+                            self.datagrams_dropped_incoming += 1;
+                        }
                     }
                 }
             },
@@ -1940,7 +2012,9 @@ pub const Connection = struct {
                     if (self.datagram_recv_callback) |cb| {
                         cb(d.data, self.datagram_recv_ctx);
                     } else {
-                        _ = self.datagram_recv_queue.push(d.data);
+                        if (!self.datagram_recv_queue.push(d.data)) {
+                            self.datagrams_dropped_incoming += 1;
+                        }
                     }
                 }
             },
@@ -2849,6 +2923,7 @@ pub const Connection = struct {
 
             self.pto_probe_pending -|= 1;
             self.paths[self.active_path_idx].bytes_sent += bytes_written;
+            self.total_packets_sent += 1;
             self.pacer.onPacketSent(bytes_written, now);
             self.last_packet_sent_time = now;
 
@@ -2917,6 +2992,7 @@ pub const Connection = struct {
                     if (result.bytes_written > 0) {
                         self.mtu_discoverer.onProbeSent(result.pn, @intCast(probe_size), now);
                         self.paths[self.active_path_idx].bytes_sent += result.bytes_written;
+                        self.total_packets_sent += 1;
                         std.log.info("PMTUD: sent probe size={d} pn={d}", .{ probe_size, result.pn });
                         return result.bytes_written;
                     }
@@ -2978,6 +3054,7 @@ pub const Connection = struct {
         if (bytes_written > 0) {
             self.pto_probe_pending -|= 1;
             self.paths[self.active_path_idx].bytes_sent += bytes_written;
+            self.total_packets_sent += 1;
             // Don't update pacer — ACKs are not paced
         }
 
@@ -3119,6 +3196,9 @@ pub const Connection = struct {
             var has_non_probe_loss_lt = false;
             var earliest_lost_sent_time_lt: ?i64 = null;
             for (loss_result.lost.constSlice()) |pkt| {
+                self.total_packets_lost += 1;
+                if (pkt.has_datagram) self.datagrams_lost_outgoing += 1;
+
                 if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {} else {
                     has_non_probe_loss_lt = true;
                     if (earliest_lost_sent_time_lt == null or pkt.time_sent < earliest_lost_sent_time_lt.?) {
@@ -3544,18 +3624,40 @@ pub const Connection = struct {
     /// Receive a QUIC DATAGRAM frame (RFC 9221).
     /// Returns the number of bytes written to buf, or null if no datagram available.
     pub fn recvDatagram(self: *Connection, buf: []u8) ?usize {
-        return self.datagram_recv_queue.pop(buf);
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+        return self.datagram_recv_queue.popSkipExpired(buf, now);
     }
 
     /// Zero-copy datagram receive: returns a slice into the internal ring buffer.
     /// Caller MUST call consumeDatagram() after processing the data.
     pub fn peekDatagram(self: *Connection) ?[]const u8 {
-        return self.datagram_recv_queue.peekData();
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+        return self.datagram_recv_queue.peekDataSkipExpired(now);
     }
 
     /// Advance past the datagram returned by peekDatagram().
     pub fn consumeDatagram(self: *Connection) void {
         self.datagram_recv_queue.consume();
+    }
+
+    /// Set max age for incoming datagrams (milliseconds). null = no limit.
+    pub fn setIncomingDatagramMaxAge(self: *Connection, max_age_ms: ?u64) void {
+        self.datagram_recv_queue.max_age_ns = if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null;
+    }
+
+    /// Set max age for outgoing datagrams (milliseconds). null = no limit.
+    pub fn setOutgoingDatagramMaxAge(self: *Connection, max_age_ms: ?u64) void {
+        self.datagram_send_queue.max_age_ns = if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null;
+    }
+
+    /// Set high water mark for incoming datagram queue (count).
+    pub fn setIncomingDatagramHighWaterMark(self: *Connection, count: usize) void {
+        self.datagram_recv_queue.high_water_mark = count;
+    }
+
+    /// Set high water mark for outgoing datagram queue (count).
+    pub fn setOutgoingDatagramHighWaterMark(self: *Connection, count: usize) void {
+        self.datagram_send_queue.high_water_mark = count;
     }
 
     pub fn isClosed(self: *const Connection) bool {
@@ -3737,6 +3839,57 @@ pub const Connection = struct {
     pub fn sendKeepAlive(self: *Connection) void {
         if (self.state != .connected or !self.handshake_confirmed) return;
         self.pending_frames.push(.{ .ping = {} });
+    }
+
+    /// Connection-level statistics (matches browser WebTransport.getStats()).
+    pub const Stats = struct {
+        bytes_sent: u64,
+        bytes_received: u64,
+        packets_sent: u64,
+        packets_received: u64,
+        packets_lost: u64,
+        num_outgoing_streams_created: u64,
+        num_incoming_streams_created: u64,
+        smoothed_rtt_ns: i64,
+        rtt_variation_ns: i64,
+        min_rtt_ns: i64,
+        datagrams_dropped_incoming: u64,
+        datagrams_lost_outgoing: u64,
+    };
+
+    pub fn getStats(self: *const Connection) Stats {
+        // Aggregate bytes across all paths
+        var bytes_sent: u64 = 0;
+        var bytes_received: u64 = 0;
+        for (&self.paths) |*p| {
+            bytes_sent += p.bytes_sent;
+            bytes_received += p.bytes_received;
+        }
+
+        // Stream counts: derive from StreamsMap
+        const is_server = self.is_server;
+        const bidi_base: u64 = if (is_server) 1 else 0;
+        const uni_base: u64 = if (is_server) 3 else 2;
+        const outgoing_bidi = (self.streams.next_bidi_stream_id - bidi_base) / 4;
+        const outgoing_uni = (self.streams.next_uni_stream_id - uni_base) / 4;
+        // Incoming = peer-initiated streams we've seen (open + consumed)
+        const incoming_bidi = self.streams.open_bidi_streams + self.streams.consumed_bidi_streams;
+        const incoming_uni = self.streams.open_uni_streams + self.streams.consumed_uni_streams;
+
+        return .{
+            .bytes_sent = bytes_sent,
+            .bytes_received = bytes_received,
+            .packets_sent = self.total_packets_sent,
+            .packets_received = self.total_packets_received,
+            .packets_lost = self.total_packets_lost,
+            .num_outgoing_streams_created = outgoing_bidi + outgoing_uni,
+            .num_incoming_streams_created = incoming_bidi + incoming_uni,
+            .smoothed_rtt_ns = self.pkt_handler.rtt_stats.smoothed_rtt,
+            .rtt_variation_ns = self.pkt_handler.rtt_stats.rtt_var,
+            .min_rtt_ns = self.pkt_handler.rtt_stats.min_rtt,
+            .datagrams_dropped_incoming = self.datagrams_dropped_incoming,
+            .datagrams_lost_outgoing = self.datagrams_lost_outgoing,
+        };
     }
 
     /// Return the ECN codepoint to mark on outgoing packets.
@@ -4348,6 +4501,49 @@ test "DatagramQueue: pop with small buffer" {
     try std.testing.expect(q.pop(&small_buf) == null);
 }
 
+test "DatagramQueue: high water mark limits push" {
+    var q = DatagramQueue{};
+    q.high_water_mark = 3;
+
+    try std.testing.expect(q.push("one"));
+    try std.testing.expect(q.push("two"));
+    try std.testing.expect(q.push("three"));
+    // At high water mark — push should fail
+    try std.testing.expect(!q.push("four"));
+    try std.testing.expect(q.isFull());
+    try std.testing.expectEqual(@as(usize, 3), q.queueLen());
+
+    // Pop one, then push succeeds again
+    var buf: [1200]u8 = undefined;
+    _ = q.pop(&buf);
+    try std.testing.expect(q.push("four"));
+}
+
+test "DatagramQueue: max age expiry on pop" {
+    var q = DatagramQueue{};
+    q.max_age_ns = 10_000_000; // 10ms
+
+    try std.testing.expect(q.push("old"));
+    try std.testing.expect(q.push("new"));
+
+    // Both datagrams are fresh — popSkipExpired should return first
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    var buf: [1200]u8 = undefined;
+    const len = q.popSkipExpired(&buf, now);
+    try std.testing.expect(len != null);
+    try std.testing.expectEqualSlices(u8, "old", buf[0..len.?]);
+}
+
+test "DatagramQueue: peekDataSkipExpired with no max age" {
+    var q = DatagramQueue{};
+    // No max_age set — behaves like peekData
+    try std.testing.expect(q.push("data"));
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const peeked = q.peekDataSkipExpired(now);
+    try std.testing.expect(peeked != null);
+    try std.testing.expectEqualSlices(u8, "data", peeked.?);
+}
+
 // --- Address utility function tests ---
 
 fn makeIpv4Addr(a: u8, b: u8, c: u8, d: u8, port: u16) posix.sockaddr.storage {
@@ -4617,6 +4813,39 @@ test "Connection: datagram receive" {
     const len = conn.recvDatagram(&buf).?;
     try std.testing.expectEqualSlices(u8, "incoming data", buf[0..len]);
     try std.testing.expect(conn.recvDatagram(&buf) == null);
+}
+
+test "Connection: getStats returns counters" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // Initial stats should be zero
+    const stats0 = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats0.packets_sent);
+    try std.testing.expectEqual(@as(u64, 0), stats0.packets_received);
+    try std.testing.expectEqual(@as(u64, 0), stats0.packets_lost);
+    try std.testing.expectEqual(@as(u64, 0), stats0.bytes_sent);
+    try std.testing.expectEqual(@as(u64, 0), stats0.bytes_received);
+    try std.testing.expectEqual(@as(u64, 0), stats0.datagrams_dropped_incoming);
+    try std.testing.expectEqual(@as(u64, 0), stats0.datagrams_lost_outgoing);
+
+    // Manually bump counters to verify aggregation
+    conn.total_packets_sent = 10;
+    conn.total_packets_received = 20;
+    conn.total_packets_lost = 2;
+    conn.paths[0].bytes_sent = 5000;
+    conn.paths[0].bytes_received = 8000;
+    conn.datagrams_dropped_incoming = 3;
+    conn.datagrams_lost_outgoing = 1;
+
+    const stats1 = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 10), stats1.packets_sent);
+    try std.testing.expectEqual(@as(u64, 20), stats1.packets_received);
+    try std.testing.expectEqual(@as(u64, 2), stats1.packets_lost);
+    try std.testing.expectEqual(@as(u64, 5000), stats1.bytes_sent);
+    try std.testing.expectEqual(@as(u64, 8000), stats1.bytes_received);
+    try std.testing.expectEqual(@as(u64, 3), stats1.datagrams_dropped_incoming);
+    try std.testing.expectEqual(@as(u64, 1), stats1.datagrams_lost_outgoing);
 }
 
 test "Connection: getNewToken" {

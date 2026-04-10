@@ -512,7 +512,7 @@ fn pollWtEvents(
             },
             .transfer_unidirectional_receive => {
                 for (state.files) |filename| {
-                    const stream_id = wt.openUniStream(state.session_id) catch |err| {
+                    const stream_id = wt.openUniStream(state.session_id, null) catch |err| {
                         std.log.err("failed to open uni stream: {any}", .{err});
                         continue;
                     };
@@ -528,7 +528,7 @@ fn pollWtEvents(
             },
             .transfer_bidirectional_receive => {
                 for (state.files) |filename| {
-                    const stream_id = wt.openBidiStream(state.session_id) catch |err| {
+                    const stream_id = wt.openBidiStream(state.session_id, null) catch |err| {
                         std.log.err("failed to open bidi stream: {any}", .{err});
                         continue;
                     };
@@ -750,7 +750,7 @@ fn handleUniStreamComplete(
                 };
                 defer alloc.free(file_data);
 
-                const new_stream_id = wt.openUniStream(state.session_id) catch |err| {
+                const new_stream_id = wt.openUniStream(state.session_id, null) catch |err| {
                     std.log.err("transfer uni: open stream error: {any}", .{err});
                     return;
                 };

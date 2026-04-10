@@ -92,18 +92,24 @@ pub const Session = struct {
         }
     }
 
-    pub fn openBidiStream(self: *Session, session_id: u64) !u64 {
+    pub fn openBidiStream(self: *Session, session_id: u64, send_order: ?i64) !u64 {
         if (self.entry.wt_conn) |*wtc| {
-            return try wtc.openBidiStream(session_id);
+            return try wtc.openBidiStream(session_id, send_order);
         }
         return error.NoWtConnection;
     }
 
-    pub fn openUniStream(self: *Session, session_id: u64) !u64 {
+    pub fn openUniStream(self: *Session, session_id: u64, send_order: ?i64) !u64 {
         if (self.entry.wt_conn) |*wtc| {
-            return try wtc.openUniStream(session_id);
+            return try wtc.openUniStream(session_id, send_order);
         }
         return error.NoWtConnection;
+    }
+
+    pub fn setSendOrder(self: *Session, stream_id: u64, send_order: ?i64) void {
+        if (self.entry.wt_conn) |*wtc| {
+            wtc.setSendOrder(stream_id, send_order);
+        }
     }
 
     pub fn closeSession(self: *Session, session_id: u64) void {
@@ -136,8 +142,38 @@ pub const Session = struct {
         }
     }
 
+    pub fn getStats(self: *const Session) connection.Connection.Stats {
+        return self.entry.conn.getStats();
+    }
+
+    pub fn getSendStreamStats(self: *const Session, stream_id: u64) ?wt.SendStreamStats {
+        if (self.entry.wt_conn) |*wtc| return wtc.getSendStreamStats(stream_id);
+        return null;
+    }
+
+    pub fn getRecvStreamStats(self: *const Session, stream_id: u64) ?wt.RecvStreamStats {
+        if (self.entry.wt_conn) |*wtc| return wtc.getRecvStreamStats(stream_id);
+        return null;
+    }
+
     pub fn closeConnection(self: *Session) void {
         self.entry.conn.close(0, "");
+    }
+
+    pub fn setIncomingDatagramMaxAge(self: *Session, max_age_ms: ?u64) void {
+        self.entry.conn.setIncomingDatagramMaxAge(max_age_ms);
+    }
+
+    pub fn setOutgoingDatagramMaxAge(self: *Session, max_age_ms: ?u64) void {
+        self.entry.conn.setOutgoingDatagramMaxAge(max_age_ms);
+    }
+
+    pub fn setIncomingDatagramHighWaterMark(self: *Session, count: usize) void {
+        self.entry.conn.setIncomingDatagramHighWaterMark(count);
+    }
+
+    pub fn setOutgoingDatagramHighWaterMark(self: *Session, count: usize) void {
+        self.entry.conn.setOutgoingDatagramHighWaterMark(count);
     }
 
     pub fn isDatagramSendQueueFull(self: *const Session) bool {
@@ -1155,18 +1191,24 @@ pub const ClientSession = struct {
         }
     }
 
-    pub fn openBidiStream(self: *ClientSession, session_id: u64) !u64 {
+    pub fn openBidiStream(self: *ClientSession, session_id: u64, send_order: ?i64) !u64 {
         if (self.wt_conn) |wtc| {
-            return try wtc.openBidiStream(session_id);
+            return try wtc.openBidiStream(session_id, send_order);
         }
         return error.NoWtConnection;
     }
 
-    pub fn openUniStream(self: *ClientSession, session_id: u64) !u64 {
+    pub fn openUniStream(self: *ClientSession, session_id: u64, send_order: ?i64) !u64 {
         if (self.wt_conn) |wtc| {
-            return try wtc.openUniStream(session_id);
+            return try wtc.openUniStream(session_id, send_order);
         }
         return error.NoWtConnection;
+    }
+
+    pub fn setSendOrder(self: *ClientSession, stream_id: u64, send_order: ?i64) void {
+        if (self.wt_conn) |wtc| {
+            wtc.setSendOrder(stream_id, send_order);
+        }
     }
 
     pub fn closeSession(self: *ClientSession, session_id: u64) void {
@@ -1203,6 +1245,20 @@ pub const ClientSession = struct {
         self.conn.close(0, "");
     }
 
+    pub fn getStats(self: *const ClientSession) connection.Connection.Stats {
+        return self.conn.getStats();
+    }
+
+    pub fn getSendStreamStats(self: *const ClientSession, stream_id: u64) ?wt.SendStreamStats {
+        if (self.wt_conn) |wtc| return wtc.getSendStreamStats(stream_id);
+        return null;
+    }
+
+    pub fn getRecvStreamStats(self: *const ClientSession, stream_id: u64) ?wt.RecvStreamStats {
+        if (self.wt_conn) |wtc| return wtc.getRecvStreamStats(stream_id);
+        return null;
+    }
+
     pub fn isDatagramSendQueueFull(self: *const ClientSession) bool {
         if (self.wt_conn) |wtc| {
             return wtc.isDatagramSendQueueFull();
@@ -1215,6 +1271,22 @@ pub const ClientSession = struct {
             return wtc.maxDatagramPayloadSize(session_id);
         }
         return null;
+    }
+
+    pub fn setIncomingDatagramMaxAge(self: *ClientSession, max_age_ms: ?u64) void {
+        self.conn.setIncomingDatagramMaxAge(max_age_ms);
+    }
+
+    pub fn setOutgoingDatagramMaxAge(self: *ClientSession, max_age_ms: ?u64) void {
+        self.conn.setOutgoingDatagramMaxAge(max_age_ms);
+    }
+
+    pub fn setIncomingDatagramHighWaterMark(self: *ClientSession, count: usize) void {
+        self.conn.setIncomingDatagramHighWaterMark(count);
+    }
+
+    pub fn setOutgoingDatagramHighWaterMark(self: *ClientSession, count: usize) void {
+        self.conn.setOutgoingDatagramHighWaterMark(count);
     }
 
     pub fn sendKeepAlive(self: *ClientSession) void {

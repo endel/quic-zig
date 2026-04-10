@@ -75,6 +75,19 @@ pub const WtEvent = union(enum) {
     session_draining: struct { session_id: u64 },
 };
 
+/// Per-stream send statistics (matches browser WebTransportSendStream.getStats()).
+pub const SendStreamStats = struct {
+    bytes_written: u64,
+    bytes_sent: u64,
+    bytes_acknowledged: u64,
+};
+
+/// Per-stream receive statistics (matches browser WebTransportReceiveStream.getStats()).
+pub const RecvStreamStats = struct {
+    bytes_received: u64,
+    bytes_read: u64,
+};
+
 /// WebTransport connection wrapping H3Connection + QUIC Connection.
 pub const WebTransportConnection = struct {
     h3: *h3_conn.H3Connection,
@@ -213,9 +226,10 @@ pub const WebTransportConnection = struct {
     }
 
     /// Open a WT bidirectional stream: write type prefix 0x41 + session_id varint.
-    pub fn openBidiStream(self: *WebTransportConnection, session_id: u64) !u64 {
+    pub fn openBidiStream(self: *WebTransportConnection, session_id: u64, send_order: ?i64) !u64 {
         const stream = try self.quic.openStream();
         const stream_id = stream.stream_id;
+        stream.send.send_order = send_order;
 
         // Write WT bidi stream type prefix
         var prefix_buf: [16]u8 = undefined;
@@ -230,9 +244,10 @@ pub const WebTransportConnection = struct {
     }
 
     /// Open a WT unidirectional stream: write type prefix 0x54 + session_id varint.
-    pub fn openUniStream(self: *WebTransportConnection, session_id: u64) !u64 {
+    pub fn openUniStream(self: *WebTransportConnection, session_id: u64, send_order: ?i64) !u64 {
         const send_stream = try self.quic.openUniStream();
         const stream_id = send_stream.stream_id;
+        send_stream.send_order = send_order;
 
         // Write WT uni stream type prefix
         var prefix_buf: [16]u8 = undefined;
@@ -244,6 +259,17 @@ pub const WebTransportConnection = struct {
 
         try self.wt_uni_streams.put(stream_id, session_id);
         return stream_id;
+    }
+
+    /// Dynamically update the sendOrder on a stream. Higher values transmitted first.
+    pub fn setSendOrder(self: *WebTransportConnection, stream_id: u64, send_order: ?i64) void {
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            stream.send.send_order = send_order;
+            return;
+        }
+        if (self.quic.streams.send_streams.get(stream_id)) |send_stream| {
+            send_stream.send_order = send_order;
+        }
     }
 
     /// Send data on a WT stream (wraps it in a DATA frame).
@@ -282,6 +308,67 @@ pub const WebTransportConnection = struct {
         try packet.writeVarInt(w, quarter_id);
         try w.writeAll(data);
         try self.quic.sendDatagram(fbs.getWritten());
+    }
+
+    /// Returns connection-level statistics (matches browser WebTransport.getStats()).
+    pub fn getStats(self: *const WebTransportConnection) quic_connection.Connection.Stats {
+        return self.quic.getStats();
+    }
+
+    /// Get per-stream send statistics (bytesWritten, bytesSent, bytesAcknowledged).
+    pub fn getSendStreamStats(self: *const WebTransportConnection, stream_id: u64) ?SendStreamStats {
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            return .{
+                .bytes_written = stream.send.write_offset,
+                .bytes_sent = stream.send.send_offset,
+                .bytes_acknowledged = stream.send.ack_offset,
+            };
+        }
+        if (self.quic.streams.send_streams.get(stream_id)) |send_stream| {
+            return .{
+                .bytes_written = send_stream.write_offset,
+                .bytes_sent = send_stream.send_offset,
+                .bytes_acknowledged = send_stream.ack_offset,
+            };
+        }
+        return null;
+    }
+
+    /// Get per-stream receive statistics (bytesReceived, bytesRead).
+    pub fn getRecvStreamStats(self: *const WebTransportConnection, stream_id: u64) ?RecvStreamStats {
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            return .{
+                .bytes_received = stream.recv.sorter.highestReceived(),
+                .bytes_read = stream.recv.bytes_read,
+            };
+        }
+        if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
+            return .{
+                .bytes_received = recv_stream.sorter.highestReceived(),
+                .bytes_read = recv_stream.bytes_read,
+            };
+        }
+        return null;
+    }
+
+    /// Set max age for incoming datagrams (milliseconds). null = no limit.
+    pub fn setIncomingDatagramMaxAge(self: *WebTransportConnection, max_age_ms: ?u64) void {
+        self.quic.setIncomingDatagramMaxAge(max_age_ms);
+    }
+
+    /// Set max age for outgoing datagrams (milliseconds). null = no limit.
+    pub fn setOutgoingDatagramMaxAge(self: *WebTransportConnection, max_age_ms: ?u64) void {
+        self.quic.setOutgoingDatagramMaxAge(max_age_ms);
+    }
+
+    /// Set high water mark for incoming datagram queue (count).
+    pub fn setIncomingDatagramHighWaterMark(self: *WebTransportConnection, count: usize) void {
+        self.quic.setIncomingDatagramHighWaterMark(count);
+    }
+
+    /// Set high water mark for outgoing datagram queue (count).
+    pub fn setOutgoingDatagramHighWaterMark(self: *WebTransportConnection, count: usize) void {
+        self.quic.setOutgoingDatagramHighWaterMark(count);
     }
 
     /// Returns true if the datagram send queue is full.
@@ -1230,7 +1317,7 @@ test "WT integration: openBidiStream writes type prefix" {
     const session_id = try setup.initServer();
     defer setup.deinit();
 
-    const stream_id = try setup.wt.openBidiStream(session_id);
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
     const stream = setup.quic_conn.streams.getStream(stream_id).?;
 
     // Write buffer should contain WT bidi prefix: 0x41 + session_id
@@ -1252,7 +1339,7 @@ test "WT integration: openUniStream writes type prefix" {
     const session_id = try setup.initServer();
     defer setup.deinit();
 
-    const stream_id = try setup.wt.openUniStream(session_id);
+    const stream_id = try setup.wt.openUniStream(session_id, null);
     const send_stream = setup.quic_conn.streams.send_streams.get(stream_id).?;
 
     // Write buffer should contain WT uni prefix: 0x54 + session_id
@@ -1272,7 +1359,7 @@ test "WT integration: sendStreamData writes to bidi stream" {
     const session_id = try setup.initServer();
     defer setup.deinit();
 
-    const stream_id = try setup.wt.openBidiStream(session_id);
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
     try setup.wt.sendStreamData(stream_id, "Hello WT!");
 
     const stream = setup.quic_conn.streams.getStream(stream_id).?;
@@ -1283,16 +1370,70 @@ test "WT integration: sendStreamData writes to bidi stream" {
     try testing.expectEqualStrings("Hello WT!", items[items.len - 9 ..]);
 }
 
+test "WT integration: getSendStreamStats returns byte counters" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, "Hello WT!");
+
+    const stats = setup.wt.getSendStreamStats(stream_id).?;
+    // write_offset includes WT type prefix + session_id varint + "Hello WT!"
+    try testing.expect(stats.bytes_written > 9);
+    // Nothing sent to network yet (no packet packing happened)
+    try testing.expectEqual(@as(u64, 0), stats.bytes_sent);
+    try testing.expectEqual(@as(u64, 0), stats.bytes_acknowledged);
+}
+
+test "WT integration: getRecvStreamStats returns byte counters" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    const stats = setup.wt.getRecvStreamStats(stream_id).?;
+    // Fresh stream — no data received or read
+    try testing.expectEqual(@as(u64, 0), stats.bytes_received);
+    try testing.expectEqual(@as(u64, 0), stats.bytes_read);
+}
+
+test "WT integration: stream stats returns null for unknown stream" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    try testing.expect(setup.wt.getSendStreamStats(999) == null);
+    try testing.expect(setup.wt.getRecvStreamStats(999) == null);
+}
+
 test "WT integration: closeStream sends FIN" {
     var setup: WtTestSetup = undefined;
     const session_id = try setup.initServer();
     defer setup.deinit();
 
-    const stream_id = try setup.wt.openBidiStream(session_id);
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
     setup.wt.closeStream(stream_id);
 
     const stream = setup.quic_conn.streams.getStream(stream_id).?;
     try testing.expect(stream.send.fin_queued);
+}
+
+test "WT integration: stopSending sets stop_sending_err without resetting send" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, "data");
+
+    // stopSending should set recv stop_sending_err but NOT reset the send side
+    setup.wt.stopSending(stream_id, 42);
+
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    try testing.expect(stream.recv.stop_sending_err != null);
+    try testing.expect(stream.send.reset_err == null); // send side untouched
+    try testing.expect(!stream.send.fin_queued); // FIN not queued either
 }
 
 // ---- Group C: Incoming stream identification ----
@@ -1599,7 +1740,7 @@ test "WT integration: session cleanup resets associated streams" {
     defer setup.deinit();
 
     // Open a bidi stream belonging to this session
-    const wt_stream_id = try setup.wt.openBidiStream(session_id);
+    const wt_stream_id = try setup.wt.openBidiStream(session_id, null);
     try testing.expect(setup.wt.wt_bidi_streams.contains(wt_stream_id));
 
     // Close the session — should clean up associated streams
@@ -1772,7 +1913,7 @@ test "WT integration: sendStreamData on uni stream" {
     const session_id = try setup.initServer();
     defer setup.deinit();
 
-    const stream_id = try setup.wt.openUniStream(session_id);
+    const stream_id = try setup.wt.openUniStream(session_id, null);
     try setup.wt.sendStreamData(stream_id, "uni data");
 
     const send_stream = setup.quic_conn.streams.send_streams.get(stream_id).?;
@@ -1811,7 +1952,7 @@ test "WT: WEBTRANSPORT_SESSION_GONE used in stream cleanup" {
     defer setup.deinit();
 
     // Open a bidi stream
-    const wt_stream_id = try setup.wt.openBidiStream(session_id);
+    const wt_stream_id = try setup.wt.openBidiStream(session_id, null);
 
     // Close the session
     setup.wt.closeSession(session_id);
@@ -1872,7 +2013,7 @@ test "WT: resetStream maps app error code to H3 range" {
     const session_id = try setup.initServer();
     defer setup.deinit();
 
-    const stream_id = try setup.wt.openBidiStream(session_id);
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
     setup.wt.resetStream(stream_id, 42);
 
     const stream = setup.quic_conn.streams.getStream(stream_id).?;
