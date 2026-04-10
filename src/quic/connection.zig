@@ -545,7 +545,7 @@ pub const Connection = struct {
     tls13_hs: ?tls13.Tls13Handshake = null,
 
     // Network paths (active + candidate for migration)
-    paths: [2]NetworkPath = .{ undefined, undefined },
+    paths: [2]NetworkPath = .{ std.mem.zeroes(NetworkPath), std.mem.zeroes(NetworkPath) },
     active_path_idx: u8 = 0,
     path_initialized: bool = false,
 
