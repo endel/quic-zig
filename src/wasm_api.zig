@@ -427,11 +427,21 @@ export fn qz_poll_event(buf_ptr: [*]u8, buf_len: u32) u32 {
                     Instance.stashPending(&inst.pending_dgram, dg.session_id, dg.data);
                 },
                 .session_closed => |sc| {
-                    var evt: [13]u8 = undefined;
-                    evt[0] = EVT_WT_SESSION_CLOSED;
-                    std.mem.writeInt(u64, evt[1..9], sc.session_id, .big);
-                    std.mem.writeInt(u32, evt[9..13], sc.error_code, .big);
-                    inst.pushEvent(&evt);
+                    // WebTransport spec limits 'reason' to 1024 bytes.
+                    // Total max size: 1 (Type) + 8 (SessionID) + 4 (ErrorCode) 
+                    // + 2 (ReasonLen) + 1024 (Bytes) = 1039 bytes.
+                    const max_reason_len = @min(sc.reason.len, 1024);
+                    const total_size = 1 + 8 + 4 + 2 + max_reason_len;
+                    var evt_buf: [1039]u8 = undefined;
+                    evt_buf[0] = EVT_WT_SESSION_CLOSED;
+                    std.mem.writeInt(u64, evt_buf[1..9], sc.session_id, .big);
+                    std.mem.writeInt(u32, evt_buf[9..13], sc.error_code, .big);
+                    // Write 2-byte length for the reason byte sequence
+                    std.mem.writeInt(u16, evt_buf[13..15], @as(u16, @intCast(max_reason_len)), .big);
+                    // Copy the raw byte sequence
+                    @memcpy(evt_buf[15 .. 15 + max_reason_len], sc.reason[0..max_reason_len]);
+                    // Push the exactly sized slice
+                    inst.pushEvent(evt_buf[0..total_size]);
                 },
                 else => {},
             }
