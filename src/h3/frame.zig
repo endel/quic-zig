@@ -15,6 +15,10 @@ pub const H3FrameType = enum(u64) {
     priority_update = 0xF0700, // RFC 9218
     close_webtransport_session = 0x2843, // draft-ietf-webtrans-http3
     drain_webtransport_session = 0x78ae, // draft-ietf-webtrans-http3
+    // Sentinel for frame types not recognized by this implementation.
+    // Never sent on the wire; constructed only when parse() encounters an
+    // unknown type (e.g. RFC 9114 GREASE frames 0x1f*N+0x21).
+    unknown = std.math.maxInt(u64),
 
     pub fn fromInt(v: u64) ?H3FrameType {
         return switch (v) {
@@ -110,6 +114,7 @@ pub const H3Frame = union(H3FrameType) {
     priority_update: PriorityUpdate,
     close_webtransport_session: CloseWebtransportSession,
     drain_webtransport_session: void,
+    unknown: void,
 };
 
 /// HTTP/3 unidirectional stream types (RFC 9114 Section 6.2).
@@ -157,9 +162,12 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
     const payload = data[header_size..total_size];
 
     const frame_type = H3FrameType.fromInt(frame_type_raw) orelse {
-        // Unknown frame types MUST be ignored (RFC 9114 Section 7.2.8)
+        // Unknown frame types MUST be ignored (RFC 9114 §7.2.8).
+        // Return a distinct .unknown variant so callers don't confuse this
+        // with a real .data frame (which would be rejected on the control
+        // stream per RFC 9114 §7.2.1).
         return .{
-            .frame = .{ .data = &.{} }, // placeholder
+            .frame = .{ .unknown = {} },
             .consumed = total_size,
         };
     };
@@ -241,6 +249,7 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
             } };
         },
         .drain_webtransport_session => .{ .drain_webtransport_session = {} },
+        .unknown => unreachable, // .unknown is only produced by the fromInt fallback above
     };
 
     return .{
@@ -366,6 +375,7 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
             try packet.writeVarInt(writer, 0x78ae);
             try packet.writeVarInt(writer, 0); // zero-length payload
         },
+        .unknown => {}, // never serialized
     }
 }
 
@@ -381,6 +391,26 @@ pub fn readUniStreamType(reader: anytype) !UniStreamType {
 }
 
 // Tests
+
+test "H3Frame: unknown frame type parsed as .unknown (RFC 9114 §7.2.8 GREASE)" {
+    // GREASE frame type 0x1f*1+0x21 = 0x40 with 3-byte payload.
+    // Encoded: type=0x40 (2-byte varint), length=3, payload=0xaa 0xbb 0xcc, then
+    // a trailing real SETTINGS frame to verify consumed advances past the GREASE.
+    const grease_with_settings = [_]u8{
+        0x40, 0x40, // type 0x40 as 2-byte varint
+        0x03, // length 3
+        0xaa, 0xbb, 0xcc, // random payload
+        0x04, 0x00, // SETTINGS type=0x04, length=0 (empty settings)
+    };
+
+    const result = try parse(&grease_with_settings);
+    try testing.expectEqual(H3FrameType.unknown, std.meta.activeTag(result.frame));
+    try testing.expectEqual(@as(usize, 6), result.consumed);
+
+    // The next frame should parse as SETTINGS.
+    const next = try parse(grease_with_settings[result.consumed..]);
+    try testing.expectEqual(H3FrameType.settings, std.meta.activeTag(next.frame));
+}
 
 test "H3Frame: write and parse DATA" {
     var buf: [256]u8 = undefined;

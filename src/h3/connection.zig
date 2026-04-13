@@ -1052,7 +1052,7 @@ pub const H3Connection = struct {
                         }
                         if (payload.len == 0) {
                             self.consumeFrameFromBuf(buf, result.consumed);
-                            continue; // Skip GREASE/unknown frames
+                            continue; // Skip zero-length DATA (nothing to surface)
                         }
                         // Don't consume from buffer — recvBody() will read
                         // the payload and consume the full frame.
