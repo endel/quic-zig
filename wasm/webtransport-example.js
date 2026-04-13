@@ -227,10 +227,19 @@ function pollEvents(wasm, handlers) {
 
       // ── WT session closed by peer ──
       case EVT_WT_SESSION_CLOSED: {
-        const sessionId = view.getBigUint64(1);
-        const errorCode = view.getUint32(9);
-        handlers.onSessionClosed?.(sessionId, errorCode);
-        break;
+        // Use false for big-endian to match Zig's .big
+        const sessionId = view.getBigUint64(1, false);
+        const errorCode = view.getUint32(9, false);
+        // Read the 2-byte length of the reason sequence
+        const reasonLen = view.getUint16(13, false);
+        // Slice the byte sequence and decode it
+        const reasonBytes = new Uint8Array(
+          view.buffer,
+          view.byteOffset + 15,
+          reasonLen,
+        );
+        const reason = new TextDecoder().decode(reasonBytes);
+        handlers.onSessionClosed?.(sessionId, errorCode, reason);
       }
     }
   }
@@ -391,8 +400,8 @@ async function main() {
       wasm.qz_free(ptr, BUF);
     },
 
-    onSessionClosed(sessionId, errorCode) {
-      console.log(`WT session ${sessionId} closed, code=${errorCode}`);
+    onSessionClosed(sessionId, errorCode, reason) {
+      console.log(`WT session ${sessionId} closed, code=${errorCode}, reason=${reason}`);
     },
 
     onClosed() {
