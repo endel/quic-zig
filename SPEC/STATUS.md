@@ -554,3 +554,20 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | ~~8~~ | ~~Server Push (H3)~~ | ~~9114 §4.6~~ | ~~N/A~~ | ~~Deprecated (Chrome removed support)~~ |
 | ~~9~~ | ~~Graceful H3 shutdown~~ | ~~9114 §5.2~~ | ~~Done~~ | ~~Done~~ |
 | ~~10~~ | ~~Capsule Protocol~~ | ~~9297 §4~~ | ~~Done~~ | ~~Done~~ |
+
+---
+
+## QUIC Load Balancing (out-of-RFC)
+
+The QUIC WG's `draft-ietf-quic-load-balancers` never shipped as an RFC.
+This project implements two modes: draft-20 compatible CID encoding and a
+proprietary "netcode" mode with retry offload. See [QUIC_LB.md](QUIC_LB.md)
+for the tracked status.
+
+| Mode | Status | Tests |
+|---|---|---|
+| Draft-20 CID (plaintext / Feistel / single-pass AES) | ✅ Done | 9 unit tests |
+| Netcode CID (fixed 17-byte, single-block AES) | ✅ Done | 5 unit tests |
+| Retry Service (netcode) | ✅ Done | 6 unit tests |
+| LB↔backend envelope (HMAC-authenticated) | ✅ Done | 9 unit tests |
+| Zig + quic-go H3 clients through LB | ✅ Validated | `tools/test_lb_retry.sh` |

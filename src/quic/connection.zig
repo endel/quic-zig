@@ -5,6 +5,7 @@ const crypto = std.crypto;
 
 const protocol = @import("protocol.zig");
 const packet = @import("packet.zig");
+const retry_token = @import("retry_token.zig");
 const tls13 = @import("tls13.zig");
 const frame_mod = @import("frame.zig");
 const Frame = frame_mod.Frame;
@@ -644,7 +645,7 @@ pub const Connection = struct {
     remembered_params: ?tls13.SessionTicket = null,
 
     // NEW_TOKEN received from server (client stores for reuse in future connections)
-    new_token_buf: [packet.TOKEN_MAX_LEN]u8 = .{0} ** packet.TOKEN_MAX_LEN,
+    new_token_buf: [retry_token.TOKEN_MAX_LEN]u8 = .{0} ** retry_token.TOKEN_MAX_LEN,
     new_token_len: u8 = 0,
 
     // Token key for NEW_TOKEN generation (server, shared with retry_token_key)
@@ -2583,8 +2584,8 @@ pub const Connection = struct {
 
                     // Server: issue NEW_TOKEN for client address validation (RFC 9000 §8.1.3)
                     if (self.is_server) {
-                        var nt_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
-                        const nt_len = packet.generateNewToken(
+                        var nt_buf: [retry_token.TOKEN_MAX_LEN]u8 = undefined;
+                        const nt_len = retry_token.generateNewToken(
                             &nt_buf,
                             self.paths[self.active_path_idx].peer_addr,
                             self.token_key,

@@ -2,6 +2,7 @@
 test {
     _ = @import("quic/connection.zig");
     _ = @import("quic/packet.zig");
+    _ = @import("quic/retry_token.zig");
     _ = @import("quic/protocol.zig");
     _ = @import("quic/frame.zig");
     _ = @import("quic/ranges.zig");
@@ -20,6 +21,8 @@ test {
     _ = @import("quic/ecn.zig");
     _ = @import("quic/ecn_socket.zig");
     _ = @import("quic/quic_lb.zig");
+    _ = @import("quic/lb_adapter.zig");
+    _ = @import("quic/lb_envelope.zig");
     _ = @import("h3/frame.zig");
     _ = @import("h3/qpack.zig");
     _ = @import("h3/huffman.zig");

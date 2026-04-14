@@ -18,10 +18,13 @@ const posix = std.posix;
 const net = std.net;
 const quic = @import("quic");
 const quic_lb = quic.quic_lb;
+const lb_envelope = @import("quic").lb_envelope;
 
 const MAX_PACKET_SIZE: usize = 1500;
 const MAX_SERVERS: usize = 256;
 const MAX_CLIENTS: usize = 4096;
+
+const CidFormat = enum { draft20, netcode };
 
 /// Mapping: server_id (hex) → backend address
 const ServerMapping = struct {
@@ -44,13 +47,27 @@ const ClientMapping = struct {
 
 const LbConfig = struct {
     listen_addr: net.Address = net.Address.initIp4(.{ 0, 0, 0, 0 }, 443),
+    cid_format: CidFormat = .draft20,
+
     lb_config: quic_lb.Config = .{
         .config_id = 0,
         .server_id_len = 2,
         .nonce_len = 6,
     },
+    netcode_config: quic_lb.NetcodeConfig = .{ .config_id = 0, .key = .{0} ** 16 },
+
     servers: [MAX_SERVERS]ServerMapping = undefined,
     server_count: usize = 0,
+
+    // Retry offload (netcode mode): when true, the LB forces clients through
+    // a Retry and validates tokens before forwarding.
+    require_retry: bool = false,
+    retry_key: [16]u8 = .{0} ** 16,
+
+    // LB↔backend envelope framing. When `envelope_hmac_key` is non-null the
+    // envelope is HMAC-authenticated end-to-end.
+    envelope_enabled: bool = false,
+    envelope_hmac_key: ?[32]u8 = null,
 };
 
 fn parseConfigFile(path: []const u8, allocator: std.mem.Allocator) !LbConfig {
@@ -100,6 +117,57 @@ fn parseConfigFile(path: []const u8, allocator: std.mem.Allocator) !LbConfig {
                 return error.InvalidConfig;
             };
             config.lb_config.key = key;
+        } else if (std.mem.startsWith(u8, trimmed, "cid_format ")) {
+            const val = std.mem.trim(u8, trimmed["cid_format ".len..], &std.ascii.whitespace);
+            if (std.mem.eql(u8, val, "netcode")) {
+                config.cid_format = .netcode;
+                config.lb_config.server_id_len = quic_lb.NETCODE_SERVER_ID_LEN;
+                config.lb_config.nonce_len = quic_lb.NETCODE_NONCE_LEN + quic_lb.NETCODE_RESERVED_LEN;
+            } else if (std.mem.eql(u8, val, "draft20")) {
+                config.cid_format = .draft20;
+            } else {
+                std.log.err("invalid cid_format: {s}", .{val});
+                return error.InvalidConfig;
+            }
+        } else if (std.mem.startsWith(u8, trimmed, "netcode_key ")) {
+            const hex = std.mem.trim(u8, trimmed["netcode_key ".len..], &std.ascii.whitespace);
+            if (hex.len != 32) {
+                std.log.err("netcode_key must be 32 hex chars, got {d}", .{hex.len});
+                return error.InvalidConfig;
+            }
+            _ = std.fmt.hexToBytes(&config.netcode_config.key, hex) catch {
+                std.log.err("invalid hex netcode_key", .{});
+                return error.InvalidConfig;
+            };
+        } else if (std.mem.startsWith(u8, trimmed, "require_retry ")) {
+            const val = std.mem.trim(u8, trimmed["require_retry ".len..], &std.ascii.whitespace);
+            config.require_retry = std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1");
+        } else if (std.mem.startsWith(u8, trimmed, "retry_key ")) {
+            const hex = std.mem.trim(u8, trimmed["retry_key ".len..], &std.ascii.whitespace);
+            if (hex.len != 32) {
+                std.log.err("retry_key must be 32 hex chars", .{});
+                return error.InvalidConfig;
+            }
+            _ = std.fmt.hexToBytes(&config.retry_key, hex) catch {
+                std.log.err("invalid hex retry_key", .{});
+                return error.InvalidConfig;
+            };
+        } else if (std.mem.startsWith(u8, trimmed, "envelope_hmac_key ")) {
+            const hex = std.mem.trim(u8, trimmed["envelope_hmac_key ".len..], &std.ascii.whitespace);
+            if (hex.len != 64) {
+                std.log.err("envelope_hmac_key must be 64 hex chars (32 bytes)", .{});
+                return error.InvalidConfig;
+            }
+            var key: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&key, hex) catch {
+                std.log.err("invalid hex envelope_hmac_key", .{});
+                return error.InvalidConfig;
+            };
+            config.envelope_hmac_key = key;
+            config.envelope_enabled = true;
+        } else if (std.mem.startsWith(u8, trimmed, "envelope_enabled ")) {
+            const val = std.mem.trim(u8, trimmed["envelope_enabled ".len..], &std.ascii.whitespace);
+            config.envelope_enabled = std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1");
         } else if (std.mem.startsWith(u8, trimmed, "server ")) {
             const rest = std.mem.trim(u8, trimmed["server ".len..], &std.ascii.whitespace);
             // Parse: <server_id_hex> <backend_addr>
@@ -162,6 +230,138 @@ fn findBackend(config: *const LbConfig, server_id: []const u8) ?net.Address {
     return null;
 }
 
+fn findBackendIndex(config: *const LbConfig, server_id: [quic_lb.NETCODE_SERVER_ID_LEN]u8) ?u16 {
+    const sid_len: usize = quic_lb.NETCODE_SERVER_ID_LEN;
+    for (config.servers[0..config.server_count], 0..) |mapping, i| {
+        if (mapping.server_id_len >= sid_len and
+            std.mem.eql(u8, mapping.server_id[0..sid_len], &server_id))
+        {
+            return @intCast(i);
+        }
+    }
+    return null;
+}
+
+// --- Minimal QUIC Initial / Retry wire helpers for the LB ---
+
+const Initial = struct {
+    version: u32,
+    dcid: []const u8,
+    scid: []const u8,
+    token: []const u8,
+    // Offset at which "Length" varint begins (for decrypting pkt number).
+    // Unused for retry-offload.
+    length_off: usize = 0,
+};
+
+fn parseInitial(pkt: []const u8) ?Initial {
+    if (pkt.len < 7) return null;
+    // First byte: 0x80 form | 0x40 fixed | 0x00 type(Initial) | PN-len bits
+    if ((pkt[0] & 0xC0) != 0xC0) return null;
+    // Long packet type bits 5-4: 00=Initial. 01=0-RTT, 10=Handshake, 11=Retry.
+    if ((pkt[0] & 0x30) != 0x00) return null;
+
+    const version = std.mem.readInt(u32, pkt[1..5], .big);
+    if (version == 0) return null; // Version negotiation
+
+    var i: usize = 5;
+    if (i >= pkt.len) return null;
+    const dcid_len = pkt[i];
+    i += 1;
+    if (dcid_len > 20 or i + dcid_len > pkt.len) return null;
+    const dcid = pkt[i..][0..dcid_len];
+    i += dcid_len;
+
+    if (i >= pkt.len) return null;
+    const scid_len = pkt[i];
+    i += 1;
+    if (scid_len > 20 or i + scid_len > pkt.len) return null;
+    const scid = pkt[i..][0..scid_len];
+    i += scid_len;
+
+    // Token length varint
+    const tok_len = readVarInt(pkt, &i) orelse return null;
+    if (tok_len > 1024 or i + tok_len > pkt.len) return null;
+    const token = pkt[i..][0..@intCast(tok_len)];
+    i += @intCast(tok_len);
+
+    return .{ .version = version, .dcid = dcid, .scid = scid, .token = token, .length_off = i };
+}
+
+fn readVarInt(buf: []const u8, pos: *usize) ?u64 {
+    if (pos.* >= buf.len) return null;
+    const first = buf[pos.*];
+    const len_bits = first >> 6;
+    const len: usize = @as(usize, 1) << @intCast(len_bits);
+    if (pos.* + len > buf.len) return null;
+    var v: u64 = first & 0x3F;
+    var j: usize = 1;
+    while (j < len) : (j += 1) {
+        v = (v << 8) | buf[pos.* + j];
+    }
+    pos.* += len;
+    return v;
+}
+
+// --- Retry packet construction ---
+// Matches the existing quic.packet.retry builder; inlined here so the LB
+// binary doesn't need to depend on the QUIC packet module's mutable Header.
+
+const RETRY_INTEGRITY_KEY_V1: [16]u8 = .{ 0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e };
+const RETRY_INTEGRITY_NONCE_V1: [12]u8 = .{ 0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb };
+
+/// Build a Retry packet in `out` in response to `initial`. `retry_scid`
+/// becomes the client's next DCID; the token is opaque to the client.
+fn buildRetryPacket(
+    out: []u8,
+    initial: Initial,
+    retry_scid: []const u8,
+    token: []const u8,
+) !usize {
+    var i: usize = 0;
+    if (out.len < 1 + 4 + 1 + initial.scid.len + 1 + retry_scid.len + token.len + 16) return error.BufferTooSmall;
+
+    // First byte: long(0x80) | fixed(0x40) | retry type(0x30) | unused 4 bits (random)
+    out[i] = 0xC0 | 0x30;
+    i += 1;
+    std.mem.writeInt(u32, out[i..][0..4], initial.version, .big);
+    i += 4;
+    out[i] = @intCast(initial.scid.len);
+    i += 1;
+    @memcpy(out[i..][0..initial.scid.len], initial.scid);
+    i += initial.scid.len;
+    out[i] = @intCast(retry_scid.len);
+    i += 1;
+    @memcpy(out[i..][0..retry_scid.len], retry_scid);
+    i += retry_scid.len;
+    @memcpy(out[i..][0..token.len], token);
+    i += token.len;
+
+    // Retry integrity tag over pseudo-packet = ODCID-length(1) || ODCID || Retry packet body
+    var pseudo: [256]u8 = undefined;
+    var pp: usize = 0;
+    pseudo[pp] = @intCast(initial.dcid.len);
+    pp += 1;
+    @memcpy(pseudo[pp..][0..initial.dcid.len], initial.dcid);
+    pp += initial.dcid.len;
+    @memcpy(pseudo[pp..][0..i], out[0..i]);
+    pp += i;
+
+    var tag: [16]u8 = undefined;
+    const AesGcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    AesGcm.encrypt(
+        &[_]u8{}, // no ciphertext output
+        &tag,
+        &[_]u8{}, // empty plaintext
+        pseudo[0..pp],
+        RETRY_INTEGRITY_NONCE_V1,
+        RETRY_INTEGRITY_KEY_V1,
+    );
+    @memcpy(out[i..][0..16], &tag);
+    i += 16;
+    return i;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -180,13 +380,26 @@ pub fn main() !void {
         return;
     };
 
-    std.log.info("QUIC-LB: config_id={d}, server_id_len={d}, nonce_len={d}, encrypted={}", .{
+    std.log.info("QUIC-LB: cid_format={s}, config_id={d}, server_id_len={d}, nonce_len={d}, encrypted={}", .{
+        @tagName(config.cid_format),
         config.lb_config.config_id,
         config.lb_config.server_id_len,
         config.lb_config.nonce_len,
         config.lb_config.key != null,
     });
+    std.log.info("QUIC-LB: require_retry={}, envelope_enabled={}, hmac_auth={}", .{
+        config.require_retry,
+        config.envelope_enabled,
+        config.envelope_hmac_key != null,
+    });
     std.log.info("QUIC-LB: {d} backend server(s) configured", .{config.server_count});
+
+    // Optional retry service (netcode mode only)
+    var retry_svc: ?quic_lb.RetryService = null;
+    if (config.require_retry and config.cid_format == .netcode) {
+        retry_svc = try quic_lb.RetryService.init(allocator, config.retry_key, null, quic_lb.DEFAULT_NONCE_CACHE_CAPACITY);
+    }
+    defer if (retry_svc) |*svc| svc.deinit(allocator);
 
     // Create UDP socket
     const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
@@ -245,31 +458,173 @@ pub fn main() !void {
             continue;
         }
 
-        // This is from a client — extract server_id from CID
-        // QUIC long header: byte 0 has form bit (1), then DCID starts at offset 6 (after version+len)
-        // QUIC short header: byte 0 has form bit (0), DCID starts at offset 1
+        // From a client. Route based on CID format.
         const is_long_header = (recv_buf[0] & 0x80) != 0;
 
+        var backend_addr: ?net.Address = null;
+        var backend_id: u16 = 0;
+
+        if (config.cid_format == .netcode) {
+            // Netcode path: LB can perform retry offload. Try to extract a
+            // backend routing hint from the DCID first.
+            var dcid_offset: usize = undefined;
+            var dcid_len: usize = undefined;
+            if (is_long_header) {
+                if (n < 6) continue;
+                dcid_len = recv_buf[5];
+                dcid_offset = 6;
+                if (n < dcid_offset + dcid_len) continue;
+            } else {
+                dcid_len = quic_lb.NETCODE_CID_LEN;
+                dcid_offset = 1;
+                if (n < dcid_offset + dcid_len) continue;
+            }
+            const dcid = recv_buf[dcid_offset .. dcid_offset + dcid_len];
+
+            // If DCID is a netcode-format CID, decode it and route.
+            if (dcid.len >= quic_lb.NETCODE_CID_LEN) {
+                var sid: [quic_lb.NETCODE_SERVER_ID_LEN]u8 = undefined;
+                if (quic_lb.extractNetcodeServerId(&config.netcode_config, dcid, &sid)) {
+                    if (findBackendIndex(&config, sid)) |idx| {
+                        backend_addr = config.servers[idx].addr;
+                        backend_id = idx;
+                    }
+                }
+            }
+
+            // Retry-offload: intercept Initial packets.
+            if (is_long_header) {
+                const initial_opt = parseInitial(recv_buf[0..n]);
+                if (initial_opt) |initial| {
+                    if (retry_svc) |*svc| {
+                        if (initial.token.len == 0) {
+                            // No token → mint Retry.
+                            // Choose backend: CID-routed if we already have one,
+                            // else round-robin.
+                            if (backend_addr == null) {
+                                if (config.server_count == 0) continue;
+                                backend_id = @intCast(next_rr);
+                                next_rr = (next_rr + 1) % config.server_count;
+                                backend_addr = config.servers[backend_id].addr;
+                            }
+
+                            // Mint new retry SCID for chosen backend.
+                            var retry_scid: [quic_lb.NETCODE_CID_LEN]u8 = undefined;
+                            var sid_bytes: [quic_lb.NETCODE_SERVER_ID_LEN]u8 = undefined;
+                            @memcpy(&sid_bytes, config.servers[backend_id].server_id[0..quic_lb.NETCODE_SERVER_ID_LEN]);
+                            quic_lb.generateNetcodeCid(&config.netcode_config, sid_bytes, &retry_scid);
+
+                            // Mint retry token.
+                            var tok_buf: [quic_lb.RETRY_TOKEN_MAX_LEN]u8 = undefined;
+                            const tok_len = svc.mintToken(&tok_buf, initial.dcid, &retry_scid, backend_id, src_addr) catch {
+                                std.log.warn("retry mint failed", .{});
+                                continue;
+                            };
+
+                            // Build Retry packet.
+                            var retry_buf: [1500]u8 = undefined;
+                            const retry_len = buildRetryPacket(&retry_buf, initial, &retry_scid, tok_buf[0..tok_len]) catch {
+                                std.log.warn("buildRetryPacket failed", .{});
+                                continue;
+                            };
+
+                            const src_len: posix.socklen_t = if (src_addr.family == posix.AF.INET6)
+                                @sizeOf(posix.sockaddr.in6)
+                            else
+                                @sizeOf(posix.sockaddr.in);
+                            _ = posix.sendto(sock, retry_buf[0..retry_len], 0, @ptrCast(&src_addr), src_len) catch |err| {
+                                std.log.warn("sendto retry failed: {any}", .{err});
+                            };
+                            continue;
+                        }
+
+                        // Has token → validate.
+                        const validated = svc.consumeToken(initial.token, src_addr) catch |err| {
+                            std.log.warn("retry token invalid: {any}", .{err});
+                            continue;
+                        };
+
+                        if (validated.backend_id >= config.server_count) {
+                            std.log.warn("retry token backend_id={d} out of range", .{validated.backend_id});
+                            continue;
+                        }
+                        backend_id = validated.backend_id;
+                        backend_addr = config.servers[backend_id].addr;
+
+                        // Forward as enveloped datagram carrying ODCID + retry_scid.
+                        const dest_ok = backend_addr.?;
+                        var envelope_buf: [MAX_PACKET_SIZE + 128]u8 = undefined;
+                        const env_len = lb_envelope.encode(
+                            &envelope_buf,
+                            validated.odcid(),
+                            validated.retryScid(),
+                            true,
+                            config.envelope_hmac_key,
+                            recv_buf[0..n],
+                        ) catch {
+                            std.log.warn("envelope encode failed", .{});
+                            continue;
+                        };
+
+                        storeClientMapping(&client_mappings, initial.scid, &src_addr, &dest_ok.any, now);
+
+                        _ = posix.sendto(sock, envelope_buf[0..env_len], 0, &dest_ok.any, dest_ok.getOsSockLen()) catch |err| {
+                            std.log.warn("sendto backend (enveloped) failed: {any}", .{err});
+                        };
+                        continue;
+                    }
+                }
+            }
+
+            // Non-Initial netcode packet (or retry disabled): CID-routed.
+            if (backend_addr == null) {
+                if (findMappingForClient(&client_mappings, &src_addr)) |existing| {
+                    for (config.servers[0..config.server_count]) |mapping| {
+                        if (sockaddrEql(&existing.backend_addr, &addrToStorage(&mapping.addr.any))) {
+                            backend_addr = mapping.addr;
+                            break;
+                        }
+                    }
+                }
+                if (backend_addr == null and config.server_count > 0) {
+                    backend_addr = config.servers[next_rr].addr;
+                    next_rr = (next_rr + 1) % config.server_count;
+                }
+            }
+            const dest = backend_addr orelse continue;
+
+            if (is_long_header and n > dcid_offset + dcid_len + 1) {
+                const scid_len_pos = dcid_offset + dcid_len;
+                const scid_len_val = recv_buf[scid_len_pos];
+                if (n > scid_len_pos + 1 + scid_len_val) {
+                    const scid = recv_buf[scid_len_pos + 1 .. scid_len_pos + 1 + scid_len_val];
+                    storeClientMapping(&client_mappings, scid, &src_addr, &dest.any, now);
+                }
+            }
+
+            _ = posix.sendto(sock, recv_buf[0..n], 0, &dest.any, dest.getOsSockLen()) catch |err| {
+                std.log.err("sendto backend error: {any}", .{err});
+                continue;
+            };
+            continue;
+        }
+
+        // --- draft20 path (unchanged) ---
         var dcid_offset: usize = undefined;
         var dcid_len: usize = undefined;
 
         if (is_long_header) {
-            // Long header: byte 5 = DCID length, DCID starts at byte 6
             if (n < 6) continue;
             dcid_len = recv_buf[5];
             dcid_offset = 6;
             if (n < dcid_offset + dcid_len) continue;
         } else {
-            // Short header: DCID starts at byte 1, length from config
             dcid_len = quic_lb.cidLength(&config.lb_config);
             dcid_offset = 1;
             if (n < dcid_offset + dcid_len) continue;
         }
 
         const dcid = recv_buf[dcid_offset .. dcid_offset + dcid_len];
-
-        // Try to extract server_id from CID for routing
-        var backend_addr: ?net.Address = null;
 
         if (dcid.len >= quic_lb.cidLength(&config.lb_config)) {
             var server_id: [15]u8 = undefined;
@@ -278,12 +633,8 @@ pub fn main() !void {
             }
         }
 
-        // Fallback: Initial packets have random client-generated DCIDs.
-        // Route by round-robin, or reuse existing client mapping.
         if (backend_addr == null) {
-            // Check if we already have a mapping for this client
             if (findMappingForClient(&client_mappings, &src_addr)) |existing| {
-                // Find the server entry matching this backend address
                 for (config.servers[0..config.server_count]) |mapping| {
                     if (sockaddrEql(&existing.backend_addr, &addrToStorage(&mapping.addr.any))) {
                         backend_addr = mapping.addr;
@@ -292,7 +643,6 @@ pub fn main() !void {
                 }
             }
             if (backend_addr == null and config.server_count > 0) {
-                // Round-robin for new clients
                 backend_addr = config.servers[next_rr].addr;
                 next_rr = (next_rr + 1) % config.server_count;
             }
@@ -300,8 +650,6 @@ pub fn main() !void {
 
         const dest = backend_addr orelse continue;
 
-        // Store client → backend mapping for return traffic
-        // Extract client's SCID from long header (Initial/Handshake)
         if (is_long_header and n > dcid_offset + dcid_len + 1) {
             const scid_len_pos = dcid_offset + dcid_len;
             const scid_len_val = recv_buf[scid_len_pos];
@@ -311,7 +659,6 @@ pub fn main() !void {
             }
         }
 
-        // Forward to backend
         _ = posix.sendto(sock, recv_buf[0..n], 0, &dest.any, dest.getOsSockLen()) catch |err| {
             std.log.err("sendto backend error: {any}", .{err});
             continue;

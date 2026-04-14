@@ -12,4 +12,7 @@ pub const http1 = @import("http1/server.zig");
 pub const qpack = @import("h3/qpack.zig");
 pub const webtransport = @import("webtransport/session.zig");
 pub const quic_lb = @import("quic/quic_lb.zig");
+pub const lb_adapter = @import("quic/lb_adapter.zig");
+pub const lb_envelope = @import("quic/lb_envelope.zig");
+pub const packet = @import("quic/packet.zig");
 pub const event_loop = @import("event_loop.zig");

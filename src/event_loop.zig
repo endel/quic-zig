@@ -11,6 +11,7 @@ const xev = if (builtin.os.tag == .linux) xev_mod.Epoll else xev_mod;
 const connection = @import("quic/connection.zig");
 const connection_manager = @import("quic/connection_manager.zig");
 const ConnEntry = connection_manager.ConnEntry;
+const lb_adapter_mod = @import("quic/lb_adapter.zig");
 const tls13 = @import("quic/tls13.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
@@ -33,6 +34,13 @@ pub const Config = struct {
     max_datagram_frame_size: u64 = 65536,
     webtransport_max_sessions: u64 = 4,
     require_retry: bool = false,
+
+    /// Optional pluggable LB adapter. Each incoming datagram is first
+    /// passed to the adapter, which can strip deployment-specific framing
+    /// and inject ODCID / retry_scid for new connections. The core has no
+    /// opinion on wire format — see `src/quic/lb_adapter.zig` and
+    /// `src/quic/lb_envelope.zig` for the netcode implementation.
+    lb_adapter: ?lb_adapter_mod.LbAdapter = null,
 
     // Advanced: provide pre-built TLS and connection configs directly.
     // When tls_config is set, cert_path/key_path are ignored.
@@ -425,6 +433,7 @@ pub fn Server(comptime Handler: type) type {
                 static_reset_key,
             );
             conn_mgr.require_retry = config.require_retry;
+            conn_mgr.lb_adapter = config.lb_adapter;
 
             // Init libxev
             const loop = try xev.Loop.init(.{});

@@ -4,6 +4,7 @@ const event_loop = quic.event_loop;
 const connection = quic.connection;
 const quic_lb = quic.quic_lb;
 const qpack = quic.qpack;
+const lb_envelope = quic.lb_envelope;
 
 const H3Handler = struct {
     pub const protocol: event_loop.Protocol = .h3;
@@ -39,6 +40,8 @@ pub fn main() !void {
     var port: u16 = 4434;
     var server_id_hex: ?[]const u8 = null;
     var lb_key_hex: ?[]const u8 = null;
+    var lb_envelope_enabled = false;
+    var envelope_hmac_hex: ?[]const u8 = null;
     var args = std.process.args();
     _ = args.next();
     while (args.next()) |arg| {
@@ -48,7 +51,28 @@ pub fn main() !void {
             if (args.next()) |v| server_id_hex = v;
         } else if (std.mem.eql(u8, arg, "--lb-key")) {
             if (args.next()) |v| lb_key_hex = v;
+        } else if (std.mem.eql(u8, arg, "--lb-envelope")) {
+            lb_envelope_enabled = true;
+        } else if (std.mem.eql(u8, arg, "--envelope-hmac")) {
+            if (args.next()) |v| {
+                envelope_hmac_hex = v;
+                lb_envelope_enabled = true;
+            }
         }
+    }
+
+    var envelope_hmac_key: ?[32]u8 = null;
+    if (envelope_hmac_hex) |hex| {
+        if (hex.len != 64) {
+            std.log.err("--envelope-hmac must be 64 hex chars (32 bytes)", .{});
+            return;
+        }
+        var k: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&k, hex) catch {
+            std.log.err("invalid --envelope-hmac hex", .{});
+            return;
+        };
+        envelope_hmac_key = k;
     }
 
     var conn_config: ?connection.ConnectionConfig = null;
@@ -75,11 +99,18 @@ pub fn main() !void {
     }
 
     var handler = H3Handler{ .alloc = alloc };
+    // Wrap the netcode envelope in the generic LB-adapter interface. Other
+    // deployments can plug in their own adapter here (HAProxy PROXY v2,
+    // deployment-specific sidecars, etc.) without touching core QUIC.
+    var envelope_adapter = lb_envelope.Adapter{ .hmac_key = envelope_hmac_key };
+    const lb_adapter = if (lb_envelope_enabled) envelope_adapter.lbAdapter() else null;
+
     var server = try event_loop.Server(H3Handler).init(alloc, &handler, .{
         .port = port,
         .cert_path = "interop/certs/server.crt",
         .key_path = "interop/certs/server.key",
-        .require_retry = if (server_id_hex != null) false else true,
+        .require_retry = if (server_id_hex != null or lb_envelope_enabled) false else true,
+        .lb_adapter = lb_adapter,
         .conn_config = conn_config,
     });
     defer server.deinit();

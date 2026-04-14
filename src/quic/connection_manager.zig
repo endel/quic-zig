@@ -5,9 +5,11 @@ const io = std.io;
 
 const connection = @import("connection.zig");
 const packet = @import("packet.zig");
+const retry_token = @import("retry_token.zig");
 const protocol = @import("protocol.zig");
 const stateless_reset = @import("stateless_reset.zig");
 const quic_lb = @import("quic_lb.zig");
+const lb_adapter_mod = @import("lb_adapter.zig");
 const tls13 = @import("tls13.zig");
 const h3 = @import("../h3/connection.zig");
 const h0 = @import("../h0/connection.zig");
@@ -109,6 +111,13 @@ pub const ConnectionManager = struct {
 
     /// When true, Initial packets without a valid token get a Retry response.
     require_retry: bool = false,
+
+    /// Optional pluggable LB adapter. If set, every incoming datagram is
+    /// first passed to the adapter, which may strip LB-specific framing and
+    /// inject ODCID / retry_scid for newly accepted connections. The core
+    /// knows nothing about the adapter's wire format — implementations
+    /// (e.g. `lb_envelope.Adapter`) live outside this module.
+    lb_adapter: ?lb_adapter_mod.LbAdapter = null,
 
     // Deferred free queue: entries invalidated by removeConnection are held
     // here until freeDeadEntries() is called after all event processing.
@@ -292,12 +301,38 @@ pub const ConnectionManager = struct {
         ecn_val: u2,
         out_buf: []u8,
     ) RecvAction {
-        var fbs = io.fixedBufferStream(bytes);
+        // Delegate LB framing removal to the configured adapter (if any).
+        // After this block, `working` holds the inner QUIC payload and
+        // `injected_*` holds whatever the adapter surfaced for new
+        // connections. Packets the adapter rejects are dropped outright.
+        var working: []u8 = bytes;
+        var injected_odcid_buf: [20]u8 = .{0} ** 20;
+        var injected_odcid_len: u8 = 0;
+        var injected_retry_scid_buf: [20]u8 = .{0} ** 20;
+        var injected_retry_scid_len: u8 = 0;
+        var envelope_was_retried: bool = false;
+
+        if (self.lb_adapter) |adapter| {
+            switch (adapter.unwrap(bytes)) {
+                .passthrough => {},
+                .drop => return .{ .dropped = {} },
+                .injected => |ctx| {
+                    injected_odcid_len = ctx.odcid_len;
+                    @memcpy(injected_odcid_buf[0..ctx.odcid_len], ctx.odcid());
+                    injected_retry_scid_len = ctx.retry_scid_len;
+                    @memcpy(injected_retry_scid_buf[0..ctx.retry_scid_len], ctx.retryScid());
+                    envelope_was_retried = ctx.was_retried;
+                    working = bytes[ctx.payload_offset..];
+                },
+            }
+        }
+
+        var fbs = io.fixedBufferStream(working);
         var current_entry: ?*ConnEntry = null;
 
-        while (fbs.pos < bytes.len) {
+        while (fbs.pos < working.len) {
             // All valid QUIC packets have the fixed bit (0x40) set.
-            if (bytes[fbs.pos] & 0x40 == 0) break;
+            if (working[fbs.pos] & 0x40 == 0) break;
 
             const pkt_start = fbs.pos;
             var header = packet.Header.parse(&fbs, self.local_cid_len) catch break;
@@ -330,15 +365,24 @@ pub const ConnectionManager = struct {
                     return .{ .dropped = {} };
                 }
 
-                // Initial packet — check retry requirement
-                if (self.require_retry) {
+                // If the LB injected ODCID/retry_scid via envelope, skip
+                // the backend-side retry dance — the LB already validated.
+                if (injected_odcid_len > 0) {
+                    const inj_odcid: []const u8 = injected_odcid_buf[0..injected_odcid_len];
+                    const inj_retry_scid: ?[]const u8 = if (envelope_was_retried and injected_retry_scid_len > 0)
+                        injected_retry_scid_buf[0..injected_retry_scid_len]
+                    else
+                        null;
+                    entry = self.acceptConnection(header, local, from, inj_odcid, inj_retry_scid) catch
+                        return .{ .dropped = {} };
+                } else if (self.require_retry) {
                     if (header.token == null or header.token.?.len == 0) {
                         // No token: send Retry
                         var retry_scid: [8]u8 = undefined;
                         std.crypto.random.bytes(&retry_scid);
 
-                        var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
-                        const token_len = packet.generateRetryToken(
+                        var token_buf: [retry_token.TOKEN_MAX_LEN]u8 = undefined;
+                        const token_len = retry_token.generateRetryToken(
                             &token_buf,
                             header.dcid,
                             &retry_scid,
@@ -353,7 +397,7 @@ pub const ConnectionManager = struct {
                     }
 
                     // Has token: validate as Retry token
-                    const validated = packet.validateRetryToken(
+                    const validated = retry_token.validateRetryToken(
                         header.token.?,
                         from,
                         self.retry_token_key,
@@ -362,7 +406,7 @@ pub const ConnectionManager = struct {
                     if (validated) |vt| {
                         entry = self.acceptConnection(header, local, from, vt.getOdcid(), vt.getRetryScid()) catch
                             return .{ .dropped = {} };
-                    } else if (packet.validateNewToken(header.token.?, from, self.retry_token_key)) {
+                    } else if (retry_token.validateNewToken(header.token.?, from, self.retry_token_key)) {
                         // Valid NEW_TOKEN — accept without retry
                         entry = self.acceptConnection(header, local, from, header.dcid, null) catch
                             return .{ .dropped = {} };
@@ -379,7 +423,7 @@ pub const ConnectionManager = struct {
             const e = entry.?;
             // Only count datagram_size for the first packet in a coalesced datagram
             // to avoid double-counting in amplification limit calculations.
-            const dg_size: u64 = if (current_entry == null) bytes.len else 0;
+            const dg_size: u64 = if (current_entry == null) working.len else 0;
             current_entry = e;
             const recv_info: connection.RecvInfo = .{ .to = local, .from = from, .ecn = ecn_val, .datagram_size = dg_size };
             e.conn.recv(&header, &fbs, recv_info) catch break;
