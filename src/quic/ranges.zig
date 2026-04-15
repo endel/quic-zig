@@ -166,6 +166,209 @@ pub const RangeSet = struct {
     }
 };
 
+/// Sliding-window bitmap for O(1) packet number tracking.
+/// Replaces RangeSet for received packet number duplicate detection.
+///
+/// Design (inspired by lxin/quic kernel pnspace.c):
+/// - Fixed 4096-bit bitmap (512 bytes, no heap allocation)
+/// - O(1) contains() via bit test
+/// - O(1) mark() via bit set
+/// - getRanges() scans bitmap to produce descending Range array for ACK frames
+/// - removeBelow() shifts the window forward
+pub const PacketNumberBitmap = struct {
+    const BITMAP_BITS: usize = 4096;
+    const MaskInt = std.DynamicBitSet.MaskInt;
+    const MASK_BITS = @bitSizeOf(MaskInt);
+    const NUM_MASKS: usize = BITMAP_BITS / MASK_BITS;
+
+    /// The bitmap, stored inline (512 bytes for 4096 bits).
+    masks: [NUM_MASKS]MaskInt = [_]MaskInt{0} ** NUM_MASKS,
+
+    /// Base packet number: bitmap[0] corresponds to this PN.
+    base: u64 = 0,
+
+    /// Highest marked packet number (for fast largest() query).
+    highest: ?u64 = null,
+
+    /// Number of set bits.
+    count: u32 = 0,
+
+    /// Mark a packet number as received. Returns true if newly added (not duplicate).
+    pub fn mark(self: *PacketNumberBitmap, pn: u64) bool {
+        if (self.highest != null and pn < self.base) return false; // too old
+
+        // If pn is beyond current window, shift the window forward
+        if (pn >= self.base + BITMAP_BITS) {
+            self.shiftTo(pn);
+        }
+
+        const offset = pn - self.base;
+        const idx = @as(usize, @intCast(offset / MASK_BITS));
+        const bit: std.math.Log2Int(MaskInt) = @intCast(offset % MASK_BITS);
+
+        if (self.masks[idx] & (@as(MaskInt, 1) << bit) != 0) {
+            return false; // duplicate
+        }
+
+        self.masks[idx] |= @as(MaskInt, 1) << bit;
+        self.count += 1;
+
+        if (self.highest == null or pn > self.highest.?) {
+            self.highest = pn;
+        }
+        return true;
+    }
+
+    /// O(1) duplicate detection.
+    pub fn contains(self: *const PacketNumberBitmap, pn: u64) bool {
+        if (self.highest == null) return false;
+        if (pn < self.base or pn >= self.base + BITMAP_BITS) return false;
+
+        const offset = pn - self.base;
+        const idx = @as(usize, @intCast(offset / MASK_BITS));
+        const bit: std.math.Log2Int(MaskInt) = @intCast(offset % MASK_BITS);
+
+        return self.masks[idx] & (@as(MaskInt, 1) << bit) != 0;
+    }
+
+    pub fn largest(self: *const PacketNumberBitmap) ?u64 {
+        return self.highest;
+    }
+
+    /// Remove all entries below `val` by shifting the base forward.
+    pub fn removeBelow(self: *PacketNumberBitmap, val: u64) void {
+        if (val <= self.base) return;
+
+        const shift_by = val - self.base;
+        if (shift_by >= BITMAP_BITS) {
+            // Clear everything
+            @memset(&self.masks, 0);
+            self.base = val;
+            self.count = 0;
+            // highest stays — it may be above val
+            return;
+        }
+
+        const word_shift = @as(usize, @intCast(shift_by / MASK_BITS));
+        const bit_shift: std.math.Log2Int(MaskInt) = @intCast(shift_by % MASK_BITS);
+
+        // Count bits being removed (for accurate count tracking)
+        var removed: u32 = 0;
+        if (word_shift > 0) {
+            for (self.masks[0..word_shift]) |w| {
+                removed += @popCount(w);
+            }
+        }
+        // Count bits in the partial word that are being shifted out
+        if (bit_shift > 0 and word_shift < NUM_MASKS) {
+            const partial_mask = (@as(MaskInt, 1) << bit_shift) - 1;
+            removed += @popCount(self.masks[word_shift] & partial_mask);
+        }
+        self.count -|= removed;
+
+        // Shift words
+        if (word_shift > 0) {
+            var i: usize = 0;
+            while (i + word_shift < NUM_MASKS) : (i += 1) {
+                self.masks[i] = self.masks[i + word_shift];
+            }
+            // Zero the trailing words
+            @memset(self.masks[NUM_MASKS - word_shift ..], 0);
+        }
+
+        // Shift bits within words
+        if (bit_shift > 0) {
+            const anti_shift: std.math.Log2Int(MaskInt) = @intCast(MASK_BITS - @as(usize, bit_shift));
+            var i: usize = 0;
+            while (i < NUM_MASKS - 1) : (i += 1) {
+                self.masks[i] = (self.masks[i] >> bit_shift) | (self.masks[i + 1] << anti_shift);
+            }
+            self.masks[NUM_MASKS - 1] >>= bit_shift;
+        }
+
+        self.base = val;
+    }
+
+    /// Produce up to `max_ranges` ranges in descending order for ACK frame generation.
+    /// Scans the bitmap from highest to base, finding contiguous runs of 1s.
+    pub fn getRanges(self: *const PacketNumberBitmap, out: []Range) usize {
+        const hi = self.highest orelse return 0;
+        if (hi < self.base) return 0;
+
+        var range_count: usize = 0;
+        const max_offset = hi - self.base;
+
+        var pos: u64 = max_offset;
+        while (range_count < out.len) {
+            // Find next set bit at or below pos (scanning downward)
+            const end_off = self.findPrevSet(pos) orelse break;
+            // Find the start of this contiguous run
+            const start_off = self.findRunStart(end_off);
+
+            out[range_count] = .{
+                .start = self.base + start_off,
+                .end = self.base + end_off,
+            };
+            range_count += 1;
+
+            if (start_off == 0) break;
+            pos = start_off - 1;
+        }
+
+        return range_count;
+    }
+
+    /// Find the highest set bit at or below `offset` (scanning downward).
+    fn findPrevSet(self: *const PacketNumberBitmap, offset: u64) ?u64 {
+        var pos: i64 = @intCast(offset);
+        while (pos >= 0) {
+            const p: usize = @intCast(pos);
+            const idx = p / MASK_BITS;
+            const bit_in_word = p % MASK_BITS;
+
+            // Mask off bits above our position
+            const mask = self.masks[idx] & ((@as(MaskInt, 2) << @as(std.math.Log2Int(MaskInt), @intCast(bit_in_word))) -% 1);
+            if (mask != 0) {
+                const highest_bit = MASK_BITS - 1 - @as(usize, @clz(mask));
+                return @intCast(idx * MASK_BITS + highest_bit);
+            }
+            // Move to end of previous word
+            if (idx == 0) break;
+            pos = @as(i64, @intCast(idx * MASK_BITS)) - 1;
+        }
+        return null;
+    }
+
+    /// Find the lowest offset in a contiguous run of set bits ending at `end_offset`.
+    fn findRunStart(self: *const PacketNumberBitmap, end_offset: u64) u64 {
+        if (end_offset == 0) {
+            return if (self.masks[0] & 1 != 0) 0 else end_offset;
+        }
+
+        var pos: u64 = end_offset;
+        while (pos > 0) {
+            pos -= 1;
+            const idx = @as(usize, @intCast(pos / MASK_BITS));
+            const bit: std.math.Log2Int(MaskInt) = @intCast(pos % MASK_BITS);
+            if (self.masks[idx] & (@as(MaskInt, 1) << bit) == 0) {
+                return pos + 1;
+            }
+        }
+        // Bit 0 is also set — run starts at 0
+        return 0;
+    }
+
+    /// Shift the window so that `pn` fits. Preserves as much history as possible.
+    fn shiftTo(self: *PacketNumberBitmap, pn: u64) void {
+        // Shift base so pn fits within the window, leaving some room for reordering.
+        // Place pn at 3/4 of the window to leave room for future packets.
+        const new_base = if (pn >= BITMAP_BITS * 3 / 4) pn - BITMAP_BITS * 3 / 4 else 0;
+        if (new_base > self.base) {
+            self.removeBelow(new_base);
+        }
+    }
+};
+
 // Tests
 
 test "RangeSet: add single values" {
@@ -266,4 +469,172 @@ test "RangeSet: out-of-order with gaps" {
     // Fill gap at 3
     try rs.add(3);
     try testing.expectEqual(@as(usize, 1), rs.len());
+}
+
+// PacketNumberBitmap tests
+
+test "PacketNumberBitmap: mark and contains" {
+    var bm = PacketNumberBitmap{};
+
+    try testing.expect(bm.mark(0));
+    try testing.expect(bm.contains(0));
+    try testing.expect(!bm.contains(1));
+
+    // Duplicate returns false
+    try testing.expect(!bm.mark(0));
+
+    try testing.expect(bm.mark(5));
+    try testing.expect(bm.contains(5));
+    try testing.expect(!bm.contains(3));
+    try testing.expectEqual(@as(u64, 5), bm.largest().?);
+}
+
+test "PacketNumberBitmap: sequential packets" {
+    var bm = PacketNumberBitmap{};
+
+    var i: u64 = 0;
+    while (i < 100) : (i += 1) {
+        try testing.expect(bm.mark(i));
+    }
+    try testing.expectEqual(@as(u32, 100), bm.count);
+    try testing.expectEqual(@as(u64, 99), bm.largest().?);
+
+    // All should be present
+    i = 0;
+    while (i < 100) : (i += 1) {
+        try testing.expect(bm.contains(i));
+    }
+    try testing.expect(!bm.contains(100));
+}
+
+test "PacketNumberBitmap: getRanges descending" {
+    var bm = PacketNumberBitmap{};
+
+    // Create ranges: [0,2], gap, [5,7], gap, [10,12]
+    _ = bm.mark(0);
+    _ = bm.mark(1);
+    _ = bm.mark(2);
+    _ = bm.mark(5);
+    _ = bm.mark(6);
+    _ = bm.mark(7);
+    _ = bm.mark(10);
+    _ = bm.mark(11);
+    _ = bm.mark(12);
+
+    var out: [10]Range = undefined;
+    const n = bm.getRanges(&out);
+    try testing.expectEqual(@as(usize, 3), n);
+
+    // Descending order: highest first
+    try testing.expectEqual(@as(u64, 10), out[0].start);
+    try testing.expectEqual(@as(u64, 12), out[0].end);
+    try testing.expectEqual(@as(u64, 5), out[1].start);
+    try testing.expectEqual(@as(u64, 7), out[1].end);
+    try testing.expectEqual(@as(u64, 0), out[2].start);
+    try testing.expectEqual(@as(u64, 2), out[2].end);
+}
+
+test "PacketNumberBitmap: removeBelow" {
+    var bm = PacketNumberBitmap{};
+
+    var i: u64 = 0;
+    while (i < 20) : (i += 1) {
+        _ = bm.mark(i);
+    }
+
+    bm.removeBelow(10);
+    try testing.expectEqual(@as(u64, 10), bm.base);
+
+    // 0-9 should be gone
+    i = 0;
+    while (i < 10) : (i += 1) {
+        try testing.expect(!bm.contains(i));
+    }
+    // 10-19 should still be present
+    while (i < 20) : (i += 1) {
+        try testing.expect(bm.contains(i));
+    }
+    try testing.expectEqual(@as(u32, 10), bm.count);
+}
+
+test "PacketNumberBitmap: out-of-order with gaps" {
+    var bm = PacketNumberBitmap{};
+
+    _ = bm.mark(0);
+    _ = bm.mark(2);
+    _ = bm.mark(4);
+
+    try testing.expect(bm.contains(0));
+    try testing.expect(!bm.contains(1));
+    try testing.expect(bm.contains(2));
+    try testing.expect(!bm.contains(3));
+    try testing.expect(bm.contains(4));
+
+    var out: [10]Range = undefined;
+    const n = bm.getRanges(&out);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(@as(u64, 4), out[0].start);
+    try testing.expectEqual(@as(u64, 4), out[0].end);
+    try testing.expectEqual(@as(u64, 2), out[1].start);
+    try testing.expectEqual(@as(u64, 2), out[1].end);
+    try testing.expectEqual(@as(u64, 0), out[2].start);
+    try testing.expectEqual(@as(u64, 0), out[2].end);
+
+    // Fill gaps
+    _ = bm.mark(1);
+    _ = bm.mark(3);
+    const n2 = bm.getRanges(&out);
+    try testing.expectEqual(@as(usize, 1), n2);
+    try testing.expectEqual(@as(u64, 0), out[0].start);
+    try testing.expectEqual(@as(u64, 4), out[0].end);
+}
+
+test "PacketNumberBitmap: large packet numbers" {
+    var bm = PacketNumberBitmap{};
+
+    // Start at high PN
+    _ = bm.mark(1_000_000);
+    _ = bm.mark(1_000_001);
+    _ = bm.mark(1_000_002);
+
+    try testing.expect(bm.contains(1_000_000));
+    try testing.expect(bm.contains(1_000_001));
+    try testing.expect(bm.contains(1_000_002));
+    try testing.expect(!bm.contains(999_999));
+    try testing.expectEqual(@as(u64, 1_000_002), bm.largest().?);
+}
+
+test "PacketNumberBitmap: window shift on large jump" {
+    var bm = PacketNumberBitmap{};
+
+    // Mark some early packets
+    _ = bm.mark(0);
+    _ = bm.mark(1);
+    _ = bm.mark(2);
+
+    // Jump far ahead — forces window shift
+    _ = bm.mark(10000);
+    try testing.expect(bm.contains(10000));
+    // Early packets should be gone (shifted out)
+    try testing.expect(!bm.contains(0));
+    try testing.expect(!bm.contains(1));
+    try testing.expect(!bm.contains(2));
+}
+
+test "PacketNumberBitmap: getRanges limited output" {
+    var bm = PacketNumberBitmap{};
+
+    // Create many ranges
+    _ = bm.mark(0);
+    _ = bm.mark(2);
+    _ = bm.mark(4);
+    _ = bm.mark(6);
+    _ = bm.mark(8);
+
+    // Only ask for 2 ranges (should get the highest 2)
+    var out: [2]Range = undefined;
+    const n = bm.getRanges(&out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u64, 8), out[0].start);
+    try testing.expectEqual(@as(u64, 6), out[1].start);
 }
