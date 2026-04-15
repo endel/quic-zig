@@ -4,6 +4,15 @@ const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
 
+/// Linux sendmmsg batches multiple datagrams into one syscall.
+/// Compile-time gate; on other platforms the portable sendmsg loop is used.
+const use_sendmmsg = builtin.os.tag == .linux;
+const linux = std.os.linux;
+
+/// Runtime kill switch. Set QUIC_ZIG_NO_SENDMMSG=1 to force the sendmsg loop
+/// on Linux (useful for bisecting regressions without rebuilding).
+const sendmmsg_env_var = "QUIC_ZIG_NO_SENDMMSG";
+
 // Platform-specific constants for ECN socket options (IPv4).
 const IPPROTO_IP: u32 = 0;
 
@@ -200,12 +209,26 @@ pub fn mapV4ToV6(storage: *posix.sockaddr.storage) void {
 
 /// Batch sender that collects outgoing packets and flushes them together.
 /// Reduces syscall overhead by batching sendto calls and caching ECN marks.
+/// On Linux, flush uses sendmmsg to send many packets per syscall
+/// (grouped by ECN mark so the cached IP_TOS stays valid). On other platforms
+/// it falls back to a per-packet sendmsg loop.
 pub const SendBatch = struct {
     const MAX_BATCH: usize = 64;
+
+    /// Warn every N dropped packets so a stuck send path is visible without
+    /// flooding the log when ENOBUFS briefly spikes.
+    const DROP_WARN_INTERVAL: u64 = 1024;
 
     sockfd: posix.socket_t,
     count: usize = 0,
     current_ecn: u2 = 0,
+
+    /// Total packets the kernel refused to accept from this batcher.
+    /// UDP is lossy and QUIC loss detection recovers; we just surface a metric.
+    dropped_packets: u64 = 0,
+
+    /// Runtime kill switch — resolved once at init, so flush() never touches env.
+    use_mmsg: bool = false,
 
     // Per-packet data
     addrs: [MAX_BATCH]posix.sockaddr.storage = undefined,
@@ -219,7 +242,10 @@ pub const SendBatch = struct {
     data_len: usize = 0,
 
     pub fn init(sockfd: posix.socket_t) SendBatch {
-        return .{ .sockfd = sockfd };
+        return .{
+            .sockfd = sockfd,
+            .use_mmsg = use_sendmmsg and !envFlagSet(sendmmsg_env_var),
+        };
     }
 
     /// Add a packet to the batch. Flushes automatically when full.
@@ -238,17 +264,27 @@ pub const SendBatch = struct {
         self.count += 1;
     }
 
-    /// Send all queued packets via sendmsg (matches quic-go's approach).
-    /// Uses sendmsg instead of sendto for more reliable delivery on macOS loopback.
+    /// Send all queued packets. Dispatches to the fastest available path.
     pub fn flush(self: *SendBatch) void {
         if (self.count == 0) return;
+        defer {
+            self.count = 0;
+            self.data_len = 0;
+        }
 
-        for (0..self.count) |i| {
-            // Only call setsockopt when ECN mark changes (saves 2 syscalls per packet)
-            if (self.ecn_marks[i] != self.current_ecn) {
-                self.current_ecn = self.ecn_marks[i];
-                setEcnMark(self.sockfd, self.current_ecn) catch {};
+        if (comptime use_sendmmsg) {
+            if (self.use_mmsg) {
+                self.flushLinux();
+                return;
             }
+        }
+        self.flushPortable();
+    }
+
+    /// Per-packet sendmsg loop — used on macOS/Windows and as the kill-switch fallback.
+    fn flushPortable(self: *SendBatch) void {
+        for (0..self.count) |i| {
+            self.applyEcn(self.ecn_marks[i]);
             const data = self.data_buf[self.offsets[i]..][0..self.lengths[i]];
             var iov = [1]posix.iovec_const{.{
                 .base = data.ptr,
@@ -263,13 +299,98 @@ pub const SendBatch = struct {
                 .controllen = 0,
                 .flags = 0,
             };
-            _ = std.c.sendmsg(self.sockfd, &msg, 0);
+            if (std.c.sendmsg(self.sockfd, &msg, 0) < 0) {
+                self.recordDrop(1);
+            }
         }
+    }
 
-        self.count = 0;
-        self.data_len = 0;
+    /// Linux sendmmsg path: walks runs of same ECN mark, issues one syscall per run.
+    fn flushLinux(self: *SendBatch) void {
+        if (comptime !use_sendmmsg) unreachable;
+
+        // Scratch arrays live on the stack — sized for MAX_BATCH (~5 KB total).
+        var iovs: [MAX_BATCH]posix.iovec_const = undefined;
+        var msgvec: [MAX_BATCH]linux.mmsghdr_const = undefined;
+
+        var start: usize = 0;
+        while (start < self.count) {
+            // Extend the run while the ECN mark matches the one at `start`.
+            const run_ecn = self.ecn_marks[start];
+            var end = start + 1;
+            while (end < self.count and self.ecn_marks[end] == run_ecn) : (end += 1) {}
+
+            self.applyEcn(run_ecn);
+
+            // One mmsghdr per packet within the run.
+            for (start..end) |i| {
+                iovs[i] = .{
+                    .base = self.data_buf[self.offsets[i]..].ptr,
+                    .len = self.lengths[i],
+                };
+                msgvec[i] = .{
+                    .hdr = .{
+                        .name = @ptrCast(&self.addrs[i]),
+                        .namelen = self.addr_lens[i],
+                        .iov = @ptrCast(&iovs[i]),
+                        .iovlen = 1,
+                        .control = null,
+                        .controllen = 0,
+                        .flags = 0,
+                    },
+                    .len = 0,
+                };
+            }
+
+            const run_len: u32 = @intCast(end - start);
+            const sent = sendmmsgRun(self.sockfd, msgvec[start..end].ptr, run_len);
+            if (sent < run_len) {
+                self.recordDrop(run_len - sent);
+            }
+            start = end;
+        }
+    }
+
+    /// Issue one sendmmsg syscall for `n` packets starting at `msgvec`.
+    /// Retries once on EINTR when no packets have been sent yet.
+    /// Returns the number of packets the kernel accepted.
+    fn sendmmsgRun(sockfd: posix.socket_t, msgvec: [*]linux.mmsghdr_const, n: u32) u32 {
+        var attempts: u2 = 0;
+        while (true) : (attempts += 1) {
+            const rc = linux.sendmmsg(sockfd, msgvec, n, 0);
+            switch (linux.E.init(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => if (attempts == 0) continue else return 0,
+                else => return 0,
+            }
+        }
+    }
+
+    /// Update the socket ECN mark via setsockopt, skipping the syscall when
+    /// the mark hasn't changed since the last send.
+    fn applyEcn(self: *SendBatch, ecn: u2) void {
+        if (ecn == self.current_ecn) return;
+        self.current_ecn = ecn;
+        setEcnMark(self.sockfd, ecn) catch {};
+    }
+
+    fn recordDrop(self: *SendBatch, n: u32) void {
+        const before = self.dropped_packets;
+        self.dropped_packets += n;
+        // Log only when we cross a DROP_WARN_INTERVAL boundary.
+        const crossed = (before / DROP_WARN_INTERVAL) != (self.dropped_packets / DROP_WARN_INTERVAL);
+        if (crossed) {
+            std.log.warn("ecn_socket: {d} outgoing UDP packets dropped so far", .{self.dropped_packets});
+        }
     }
 };
+
+/// Treats an env var as a boolean flag: unset, empty, or "0" → false; anything else → true.
+fn envFlagSet(name: [:0]const u8) bool {
+    if (comptime is_windows) return false;
+    const value = std.posix.getenv(name) orelse return false;
+    return !(value.len == 0 or std.mem.eql(u8, value, "0"));
+}
 
 /// Send a single packet directly from the caller's buffer (zero-copy send path).
 /// Avoids the batch memcpy overhead for single-packet sends — the common case
@@ -319,6 +440,51 @@ test "setEcnMark on a real socket" {
     try setEcnMark(sockfd, 0b10);
     // Not-ECT = 0b00 = 0
     try setEcnMark(sockfd, 0b00);
+}
+
+test "SendBatch delivers mixed-ECN packets in order" {
+    if (comptime is_windows) return error.SkipZigTest;
+
+    const rx = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer posix.close(rx);
+    const tx = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer posix.close(tx);
+
+    const bind_addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    try posix.bind(rx, &bind_addr.any, bind_addr.getOsSockLen());
+    try enableEcnRecv(rx);
+
+    var peer: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    try posix.getsockname(rx, @ptrCast(&peer), &peer_len);
+
+    var batch = SendBatch.init(tx);
+    // Alternate ECN marks to exercise the run-segmentation logic.
+    const payloads = [_][]const u8{ "aa", "bb", "cc", "dd", "ee" };
+    const marks = [_]u2{ 0, 0b10, 0b10, 0, 0b01 };
+    for (payloads, marks) |p, m| {
+        batch.add(p, @ptrCast(&peer), peer_len, m);
+    }
+    batch.flush();
+    try std.testing.expectEqual(@as(u64, 0), batch.dropped_packets);
+
+    // Drain the receiver — order should match the send order on loopback.
+    var buf: [64]u8 = undefined;
+    // Give the kernel a moment to queue everything (loopback is fast but not sync).
+    var received: usize = 0;
+    const deadline = std.time.milliTimestamp() + 200;
+    while (received < payloads.len and std.time.milliTimestamp() < deadline) {
+        const r = recvmsgEcn(rx, &buf) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expectEqualSlices(u8, payloads[received], buf[0..r.bytes_read]);
+        received += 1;
+    }
+    try std.testing.expectEqual(payloads.len, received);
 }
 
 test "recvmsgEcn returns WouldBlock on empty socket" {

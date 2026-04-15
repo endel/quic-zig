@@ -4,6 +4,10 @@ set -e
 # Setup routing for the simulated network
 source /setup.sh
 
+# Optimization toggles — both on by default; set to 1 to disable for bisection.
+export QUIC_ZIG_NO_SENDMMSG="${QUIC_ZIG_NO_SENDMMSG:-0}"
+export QUIC_ZIG_NO_PACING="${QUIC_ZIG_NO_PACING:-0}"
+
 # Determine if this is a WebTransport test case
 is_wt_test() {
     case "$TESTCASE" in

@@ -421,6 +421,12 @@ fn icbrt(x: u64) u64 {
 /// Pacer for spacing out packet sends to avoid bursts.
 ///
 /// Uses a token bucket algorithm similar to quic-go's pacer.
+///
+/// All timestamp arguments (`now` in `onPacketSent`, `timeUntilSend`, and
+/// `replenish`) MUST be on `CLOCK_MONOTONIC` — callers obtain them via
+/// `clock.monoNanos()`. The monotonic clock makes budget replenishment
+/// immune to wall-clock jumps (NTP slews, manual time changes). Mixing
+/// clock sources across calls would silently corrupt budget math.
 pub const Pacer = struct {
     /// Available budget in bytes.
     budget: u64,
@@ -428,7 +434,7 @@ pub const Pacer = struct {
     /// Max burst size in bytes.
     max_burst: u64,
 
-    /// Last time a packet was sent (nanoseconds).
+    /// Last time a packet was sent (CLOCK_MONOTONIC nanoseconds).
     last_sent_time: i64 = 0,
 
     /// Bandwidth in bytes per nanosecond, left-shifted by BANDWIDTH_SHIFT for precision.

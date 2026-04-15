@@ -1,8 +1,36 @@
 # Interop Test Results
 
-Date: 2026-03-24
-Zig version: 0.15.2, quic-go interop image `martenseemann/quic-go-interop:latest`, webtransport-go interop image `martenseemann/webtransport-go-interop:latest`
+Date: 2026-04-15 (supersedes 2026-03-24 baseline below)
+Zig version: 0.15.2, quic-go interop image `martenseemann/quic-go-interop:latest`, neqo interop image `ghcr.io/mozilla/neqo-qns:latest`, webtransport-go interop image `martenseemann/webtransport-go-interop:latest`
 Build: Docker interop image from `interop/runner/Dockerfile`, `zig build -Doptimize=ReleaseSafe`
+
+## 2026-04-15: UDP send-path optimizations (`sendmmsg` + pacer hardening)
+
+Inspired by Cloudflare's "Accelerating UDP packet transmission for QUIC" post,
+narrowed to the techniques that fit a real-time WebTransport workload (small
+datagrams, latency-sensitive). Larger throughput-oriented optimizations (UDP
+GSO, SO_TXTIME kernel pacing) were prototyped, validated, and reverted —
+see "Cloudflare optimizations: what we kept and why" in `SPEC/STATUS.md` if
+revisiting in the future.
+
+### Send-path toggles
+| Feature | Default | Env var | Notes |
+|---------|---------|---------|-------|
+| `sendmmsg` batching | on (Linux) | `QUIC_ZIG_NO_SENDMMSG=1` disables | one syscall per ECN-mark run |
+| User-space pacer | on | `QUIC_ZIG_NO_PACING=1` disables | bisection escape hatch |
+| Pacer clock | always `CLOCK_MONOTONIC` | n/a | NTP-skew resilience |
+
+### Matrix (sequential run, `handshake,transfer,chacha20,multiplexing,longrtt,http3,keyupdate`)
+
+|                           | quic-go (server/client) | neqo (server/client) |
+|---------------------------|-------------------------|----------------------|
+| quic-zig server ← peer client | **7/7 PASS**        | **7/7 PASS**         |
+| quic-zig client → peer server | **7/7 PASS**        | **6-7/7 PASS**       |
+
+Zero regressions against the 2026-03-24 baseline recorded below. The
+zig-client → neqo-server flake on `keyupdate`/`chacha20` predates this work.
+
+## 2026-03-24 baseline (pre-optimization)
 
 ## Functional Interop Matrix
 
