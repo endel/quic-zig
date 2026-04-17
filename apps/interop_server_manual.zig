@@ -349,10 +349,10 @@ fn pollH3Server(h3c: *h3.H3Connection, alloc: std.mem.Allocator, www_dir: []cons
                 h3c.sendResponse(hdr.stream_id, &resp_headers, file_data) catch {};
             },
             .data => {
-                        // Drain body to clear pending state
-                        var sink: [4096]u8 = undefined;
-                        while (h3c.recvBody(&sink) > 0) {}
-                    },
+                // Drain body to clear pending state
+                var sink: [4096]u8 = undefined;
+                while (h3c.recvBody(&sink) > 0) {}
+            },
             .settings, .finished, .goaway, .connect_request, .shutdown_complete, .request_cancelled => {},
         }
     }
@@ -376,24 +376,11 @@ fn pollH0Server(h0c: *h0.H0Connection, www_dir: []const u8) void {
 }
 
 fn readFileFromWww(alloc: std.mem.Allocator, www_dir: []const u8, path: []const u8) ![]u8 {
-    var clean_path = path;
-    while (clean_path.len > 0 and clean_path[0] == '/') {
-        clean_path = clean_path[1..];
-    }
-    if (clean_path.len == 0) clean_path = "index.html";
-
+    var clean_path_buf: [4096]u8 = undefined;
     var full_path_buf: [4096]u8 = undefined;
-    var pos: usize = 0;
-    @memcpy(full_path_buf[pos..][0..www_dir.len], www_dir);
-    pos += www_dir.len;
-    if (www_dir.len > 0 and www_dir[www_dir.len - 1] != '/') {
-        full_path_buf[pos] = '/';
-        pos += 1;
-    }
-    @memcpy(full_path_buf[pos..][0..clean_path.len], clean_path);
-    pos += clean_path.len;
+    const full_path = try h0.buildSafeFilePath(www_dir, path, &clean_path_buf, &full_path_buf);
 
-    return std.fs.cwd().readFileAlloc(alloc, full_path_buf[0..pos], 10 * 1024 * 1024);
+    return std.fs.cwd().readFileAlloc(alloc, full_path, 10 * 1024 * 1024);
 }
 
 fn loadFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
