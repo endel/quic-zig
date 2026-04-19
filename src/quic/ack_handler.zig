@@ -10,6 +10,7 @@ const frame_mod = @import("frame.zig");
 const Frame = frame_mod.Frame;
 const AckRange = frame_mod.AckRange;
 const MAX_ACK_RANGES = frame_mod.MAX_ACK_RANGES;
+const delivery_rate = @import("delivery_rate.zig");
 
 /// Encryption level / packet number space.
 pub const EncLevel = enum(u2) {
@@ -76,6 +77,15 @@ pub const SentPacket = struct {
 
     /// Whether this packet contains DATAGRAM frames (for stats tracking on loss).
     has_datagram: bool = false,
+
+    // ── Delivery-rate sampler snapshots (RFC 9002 §B / draft-cardwell §3.2) ──
+    // Filled in by RateSampler.onPacketSent at the moment this packet is
+    // transmitted. Consumed by the sampler when the packet is acked to
+    // produce a RateSample.
+    delivered_at_send: u64 = 0,
+    delivered_time_at_send: i64 = 0,
+    first_sent_time_at_send: i64 = 0,
+    is_app_limited_at_send: bool = false,
 
     /// Record a stream frame carried by this packet.
     pub fn addStreamFrame(self: *SentPacket, info: StreamFrameInfo) void {
@@ -501,6 +511,18 @@ pub const PacketHandler = struct {
     bytes_in_flight: u64 = 0,
     pto_count: u32 = 0,
     next_pn: [3]u64 = .{ 0, 0, 0 },
+    /// Delivery-rate sampler (RFC 9002 §B). Stamps per-packet snapshots on
+    /// send and produces RateSamples on ACK. Consumed by BBR; ignored by
+    /// NewReno/Cubic.
+    rate_sampler: delivery_rate.RateSampler = .{},
+    /// Latest delivery-rate sample produced during the most recent
+    /// `onAckReceived` call (null if no acked packets / no usable sample,
+    /// or if rate sampling is disabled).
+    latest_rate_sample: ?delivery_rate.RateSample = null,
+    /// Whether the rate sampler should run on send/ack. Off by default —
+    /// enable only when the active CC needs delivery-rate samples (BBR).
+    /// Off, the per-send stamp and per-ack u128 divide are skipped entirely.
+    rate_sampling_enabled: bool = false,
 
     pub fn init(allocator: Allocator) PacketHandler {
         return .{
@@ -536,8 +558,15 @@ pub const PacketHandler = struct {
         return self.sent[idx].largest_acked;
     }
 
-    pub fn onPacketSent(self: *PacketHandler, pkt: SentPacket) !void {
+    pub fn onPacketSent(self: *PacketHandler, pkt_in: SentPacket) !void {
+        var pkt = pkt_in;
         const idx = @intFromEnum(pkt.enc_level);
+        // Stamp delivery-rate snapshot fields only when sampling is enabled.
+        // The branch is predictable (flag is constant for the connection's
+        // lifetime), and skipping saves 5 stores per send when CC ≠ BBR.
+        if (self.rate_sampling_enabled) {
+            self.rate_sampler.onPacketSent(&pkt, self.bytes_in_flight, pkt.time_sent);
+        }
         try self.sent[idx].onPacketSent(pkt);
         if (pkt.in_flight) {
             self.bytes_in_flight += pkt.size;
@@ -576,8 +605,16 @@ pub const PacketHandler = struct {
         );
 
         // ACK-of-ACK pruning (RFC 9000 §13.2.4): when an acked packet contained
-        // our ACK frame, prune received ranges below that ACK's largest_ack
+        // our ACK frame, prune received ranges below that ACK's largest_ack.
+        // Also feed the delivery-rate sampler (when enabled) and capture the
+        // latest sample from the highest-numbered acked packet (RFC 9002 §B
+        // uses the sample produced by the highest-acked packet as
+        // representative for the ACK).
         var max_ack_of_ack: ?u64 = null;
+        var highest_acked_pn: ?u64 = null;
+        self.latest_rate_sample = null;
+        const sampling_on = self.rate_sampling_enabled;
+        const rtt_for_sample = self.rtt_stats.latest_rtt;
         for (result.acked.constSlice()) |pkt| {
             if (pkt.in_flight) {
                 self.bytes_in_flight -|= pkt.size;
@@ -585,6 +622,13 @@ pub const PacketHandler = struct {
             if (pkt.largest_acked) |la| {
                 if (max_ack_of_ack == null or la > max_ack_of_ack.?) {
                     max_ack_of_ack = la;
+                }
+            }
+            if (sampling_on) {
+                const sample = self.rate_sampler.onPacketAcked(&pkt, rtt_for_sample, now);
+                if (highest_acked_pn == null or pkt.pn > highest_acked_pn.?) {
+                    highest_acked_pn = pkt.pn;
+                    self.latest_rate_sample = sample;
                 }
             }
         }

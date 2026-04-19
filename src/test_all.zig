@@ -8,6 +8,8 @@ test {
     _ = @import("quic/rtt.zig");
     _ = @import("quic/ack_handler.zig");
     _ = @import("quic/congestion.zig");
+    _ = @import("quic/delivery_rate.zig");
+    _ = @import("quic/bbr.zig");
     _ = @import("quic/flow_control.zig");
     _ = @import("quic/transport_params.zig");
     _ = @import("quic/stream.zig");

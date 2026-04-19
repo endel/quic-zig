@@ -276,6 +276,7 @@
 | 7.8 | Under-utilizing the Congestion Window | ✅ Done | app_limited flag suppresses cwnd growth in NewReno + CUBIC |
 | B | NewReno Pseudocode | ✅ Done | Matches appendix B |
 | - | CUBIC (RFC 8312) | ✅ Done | Default CC algorithm, fast convergence |
+| - | BBRv3 (draft-cardwell-iccrg-03) | ✅ Done | Selectable via `ConnectionConfig.congestion_control = .bbr`. See [9002_BBR.md](./9002_BBR.md) |
 
 ### Summary — RFC 9002
 

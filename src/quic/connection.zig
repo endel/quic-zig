@@ -524,6 +524,8 @@ pub const ConnectionConfig = struct {
     datagram_queue_capacity: usize = DatagramQueue.DEFAULT_MAX_ITEMS,
     // Auto-close connection when all data is sent and acknowledged.
     close_when_idle: bool = false,
+    // Congestion control algorithm. Defaults to Cubic.
+    congestion_control: congestion.Algorithm = .cubic,
 };
 
 /// A QUIC connection.
@@ -560,7 +562,10 @@ pub const Connection = struct {
 
     // New subsystems
     pkt_handler: ack_handler.PacketHandler = undefined,
-    cc: congestion.Cubic = congestion.Cubic.init(),
+    cc: congestion.CongestionControl = .{ .cubic = congestion.Cubic.init() },
+    /// Selected congestion-control algorithm. Preserved across path migration
+    /// resets so the user-chosen CC is honored after rebinding to a new IP.
+    cc_algorithm: congestion.Algorithm = .cubic,
     pacer: congestion.Pacer = congestion.Pacer.init(),
     conn_flow_ctrl: flow_control.ConnectionFlowController = undefined,
     streams: stream_mod.StreamsMap = undefined,
@@ -808,6 +813,9 @@ pub const Connection = struct {
             conn.keep_alive_interval_ns = @min(ka_ns, @divTrunc(conn.idle_timeout_ns, 2));
         }
         conn.close_when_idle = config.close_when_idle;
+        conn.cc_algorithm = config.congestion_control;
+        conn.cc = congestion.CongestionControl.init(config.congestion_control);
+        conn.pkt_handler.rate_sampling_enabled = (config.congestion_control == .bbr);
 
         // Initialize TLS 1.3 handshake if config provided
         if (tls_config) |tc| {
@@ -1397,7 +1405,8 @@ pub const Connection = struct {
                 // while bytes_in_flight still reflects the pre-ACK state.
                 // If checked after, bytes_in_flight is already decremented,
                 // making it appear app-limited even when the sender filled cwnd.
-                self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
+                const prior_bytes_in_flight = self.pkt_handler.bytes_in_flight;
+                self.cc.setAppLimited(prior_bytes_in_flight < self.cc.sendWindow());
 
                 var ack_result: ack_handler.AckResult = .{};
                 try self.pkt_handler.onAckReceived(
@@ -1415,6 +1424,8 @@ pub const Connection = struct {
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
                 var earliest_lost_sent_time: ?i64 = null;
+                var newly_acked_bytes: u64 = 0;
+                var newly_lost_bytes: u64 = 0;
                 for (result.acked.constSlice()) |pkt| {
                     // Check if this is an MTU probe ACK
                     if (self.mtu_discoverer.onProbeAcked(pkt.pn, now)) {
@@ -1424,6 +1435,8 @@ pub const Connection = struct {
                         self.cc.setMaxDatagramSize(new_mtu);
                         self.pacer.max_datagram_size = new_mtu;
                         std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
+                    } else {
+                        newly_acked_bytes += pkt.size;
                     }
 
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent);
@@ -1462,6 +1475,7 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
                         has_non_probe_loss = true;
+                        newly_lost_bytes += pkt.size;
                         if (earliest_lost_sent_time == null or pkt.time_sent < earliest_lost_sent_time.?) {
                             earliest_lost_sent_time = pkt.time_sent;
                         }
@@ -1491,20 +1505,24 @@ pub const Connection = struct {
                     }
                 }
 
-                if (has_non_probe_loss) {
-                    if (result.persistent_congestion) {
-                        // Only trigger persistent congestion if the lost packets
-                        // are from outside the current recovery epoch. This prevents
-                        // repeated resets when old packets are gradually declared lost
-                        // across multiple ACK events after a blackhole.
-                        if (earliest_lost_sent_time) |lost_time| {
-                            if (!self.cc.inCongestionRecovery(lost_time)) {
-                                self.cc.onPersistentCongestion(now);
-                                std.log.info("persistent congestion detected, window reduced to minimum", .{});
-                            }
-                        }
-                    } else if (earliest_lost_sent_time) |lost_time| {
-                        self.cc.onCongestionEvent(lost_time, now);
+                // Always call onAckBatch when there's any progress so BBR can update
+                // its model from the rate sample, even on no-loss/no-CE acks.
+                if (newly_acked_bytes > 0 or has_non_probe_loss) {
+                    const ack_ctx = congestion.AckContext{
+                        .now = now,
+                        .bytes_in_flight = self.pkt_handler.bytes_in_flight,
+                        .prior_bytes_in_flight = prior_bytes_in_flight,
+                        .newly_acked_bytes = newly_acked_bytes,
+                        .newly_lost_bytes = newly_lost_bytes,
+                        .persistent_congestion = result.persistent_congestion,
+                        .earliest_lost_sent_time = earliest_lost_sent_time,
+                        .largest_acked_pn = ack.largest_ack,
+                        .ce_byte_count = 0,
+                        .rate_sample = self.pkt_handler.latest_rate_sample,
+                    };
+                    self.cc.onAckBatch(&ack_ctx);
+                    if (result.persistent_congestion and earliest_lost_sent_time != null) {
+                        std.log.info("persistent congestion detected, window reduced to minimum", .{});
                     }
                 }
 
@@ -1517,7 +1535,7 @@ pub const Connection = struct {
                 self.maybeConfirmHandshake(enc_level, result.acked.len);
 
                 // Update pacer
-                self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
+                self.cc.updatePacer(&self.pacer, &self.pkt_handler.rtt_stats);
             },
 
             .ack_ecn => |ack| {
@@ -1526,7 +1544,8 @@ pub const Connection = struct {
                 const peer_tp = self.peer_params orelse transport_params.TransportParams{};
 
                 // RFC 9002 §7.8: snapshot app_limited BEFORE processing ACKs
-                self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
+                const prior_bytes_in_flight_ecn = self.pkt_handler.bytes_in_flight;
+                self.cc.setAppLimited(prior_bytes_in_flight_ecn < self.cc.sendWindow());
 
                 var ack_result: ack_handler.AckResult = .{};
                 try self.pkt_handler.onAckReceived(
@@ -1544,6 +1563,8 @@ pub const Connection = struct {
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
                 var earliest_lost_sent_time_ecn: ?i64 = null;
+                var newly_acked_bytes_ecn: u64 = 0;
+                var newly_lost_bytes_ecn: u64 = 0;
                 for (result.acked.constSlice()) |pkt| {
                     if (self.mtu_discoverer.onProbeAcked(pkt.pn, now)) {
                         const new_mtu = self.mtu_discoverer.current_mtu;
@@ -1551,6 +1572,8 @@ pub const Connection = struct {
                         self.cc.setMaxDatagramSize(new_mtu);
                         self.pacer.max_datagram_size = new_mtu;
                         std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
+                    } else {
+                        newly_acked_bytes_ecn += pkt.size;
                     }
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent);
 
@@ -1592,6 +1615,7 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
                         has_non_probe_loss = true;
+                        newly_lost_bytes_ecn += pkt.size;
                         if (earliest_lost_sent_time_ecn == null or pkt.time_sent < earliest_lost_sent_time_ecn.?) {
                             earliest_lost_sent_time_ecn = pkt.time_sent;
                         }
@@ -1621,30 +1645,15 @@ pub const Connection = struct {
                     }
                 }
 
-                if (has_non_probe_loss) {
-                    if (result.persistent_congestion) {
-                        if (earliest_lost_sent_time_ecn) |lost_time| {
-                            if (!self.cc.inCongestionRecovery(lost_time)) {
-                                self.cc.onPersistentCongestion(now);
-                                std.log.info("persistent congestion detected, window reduced to minimum", .{});
-                            }
-                        }
-                    } else if (earliest_lost_sent_time_ecn) |lost_time| {
-                        self.cc.onCongestionEvent(lost_time, now);
-                    }
-                }
-
-                // QLOG: metrics_updated after ACK_ECN processing
-                if (self.qlog_writer) |*ql| {
-                    const rs = &self.pkt_handler.rtt_stats;
-                    ql.metricsUpdated(now, rs.min_rtt, rs.smoothed_rtt, rs.latest_rtt, rs.rtt_var, self.cc.sendWindow(), self.pkt_handler.bytes_in_flight);
-                }
-
                 // ECN validation (RFC 9000 §13.4.2.1):
                 // Count how many newly-acked packets were ECN-marked
                 var newly_acked_ect0: u64 = 0;
+                var newly_acked_ect0_bytes: u64 = 0;
                 for (result.acked.constSlice()) |pkt| {
-                    if (pkt.ecn_marked) newly_acked_ect0 += 1;
+                    if (pkt.ecn_marked) {
+                        newly_acked_ect0 += 1;
+                        newly_acked_ect0_bytes += pkt.size;
+                    }
                 }
 
                 // Validate ECN counts from peer
@@ -1658,19 +1667,53 @@ pub const Connection = struct {
                     newly_acked_ect0,
                 );
 
-                // If valid and CE count increased, treat as congestion event
+                // Approximate CE-byte count for the CC. ACK_ECN counters are
+                // aggregate (no per-packet attribution), so distribute the
+                // CE-count delta across the ECT(0) bytes acked in this batch.
+                var ce_byte_count: u64 = 0;
                 if (ecn_valid and ack.ecn_ce > self.peer_ecn_ce[space_idx]) {
+                    const ce_delta = ack.ecn_ce - self.peer_ecn_ce[space_idx];
+                    if (newly_acked_ect0 > 0) {
+                        ce_byte_count = newly_acked_ect0_bytes * ce_delta / newly_acked_ect0;
+                    } else {
+                        // Fallback: assume MTU-sized packets
+                        ce_byte_count = ce_delta * self.packer.max_packet_size;
+                    }
                     std.log.info("ECN: CE count increased {d} -> {d}, congestion signal", .{ self.peer_ecn_ce[space_idx], ack.ecn_ce });
-                    self.cc.onCongestionEvent(now, now);
                 }
                 self.peer_ecn_ect0[space_idx] = ack.ecn_ect0;
                 self.peer_ecn_ect1[space_idx] = ack.ecn_ect1;
                 self.peer_ecn_ce[space_idx] = ack.ecn_ce;
 
+                if (newly_acked_bytes_ecn > 0 or has_non_probe_loss or ce_byte_count > 0) {
+                    const ack_ctx = congestion.AckContext{
+                        .now = now,
+                        .bytes_in_flight = self.pkt_handler.bytes_in_flight,
+                        .prior_bytes_in_flight = prior_bytes_in_flight_ecn,
+                        .newly_acked_bytes = newly_acked_bytes_ecn,
+                        .newly_lost_bytes = newly_lost_bytes_ecn,
+                        .persistent_congestion = result.persistent_congestion,
+                        .earliest_lost_sent_time = earliest_lost_sent_time_ecn,
+                        .largest_acked_pn = ack.largest_ack,
+                        .ce_byte_count = ce_byte_count,
+                        .rate_sample = self.pkt_handler.latest_rate_sample,
+                    };
+                    self.cc.onAckBatch(&ack_ctx);
+                    if (result.persistent_congestion and earliest_lost_sent_time_ecn != null) {
+                        std.log.info("persistent congestion detected, window reduced to minimum", .{});
+                    }
+                }
+
+                // QLOG: metrics_updated after ACK_ECN processing
+                if (self.qlog_writer) |*ql| {
+                    const rs = &self.pkt_handler.rtt_stats;
+                    ql.metricsUpdated(now, rs.min_rtt, rs.smoothed_rtt, rs.latest_rtt, rs.rtt_var, self.cc.sendWindow(), self.pkt_handler.bytes_in_flight);
+                }
+
                 self.maybeConfirmHandshake(enc_level, result.acked.len);
 
                 // Update pacer
-                self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
+                self.cc.updatePacer(&self.pacer, &self.pkt_handler.rtt_stats);
             },
 
             .reset_stream => |rs| {
@@ -2543,8 +2586,8 @@ pub const Connection = struct {
                                     const challenge = self.paths[candidate_idx].validator.startChallenge();
                                     self.pending_frames.push(.{ .path_challenge = challenge });
 
-                                    // Reset CC/RTT/MTU/ECN for new IP
-                                    self.cc = congestion.Cubic.init();
+                                    // Reset CC/RTT/MTU/ECN for new IP (preserve algorithm choice)
+                                    self.cc = congestion.CongestionControl.init(self.cc_algorithm);
                                     self.pacer = congestion.Pacer.init();
                                     self.pkt_handler.rtt_stats = rtt.RttStats{};
                                     self.mtu_discoverer.reset();
@@ -3105,7 +3148,7 @@ pub const Connection = struct {
         const old_path = &self.paths[1 - candidate_idx];
         const same_ip = sockaddrSameIp(&new_peer_addr, &old_path.peer_addr);
         if (!same_ip) {
-            self.cc = congestion.Cubic.init();
+            self.cc = congestion.CongestionControl.init(self.cc_algorithm);
             self.pacer = congestion.Pacer.init();
             self.pkt_handler.rtt_stats = rtt.RttStats{};
             self.mtu_discoverer.reset();
@@ -3204,16 +3247,19 @@ pub const Connection = struct {
         // Loss detection timer: check loss_time BEFORE PTO (RFC 9002 §6.2.1).
         // Loss timers don't increment pto_count — they run loss detection directly.
         if (self.pkt_handler.getExpiredLossTime(now)) |loss_level| {
+            const prior_bif_lt = self.pkt_handler.bytes_in_flight;
             var loss_result: ack_handler.AckResult = .{};
             self.pkt_handler.detectLossesForSpace(loss_level, now, &loss_result);
             var has_non_probe_loss_lt = false;
             var earliest_lost_sent_time_lt: ?i64 = null;
+            var newly_lost_bytes_lt: u64 = 0;
             for (loss_result.lost.constSlice()) |pkt| {
                 self.total_packets_lost += 1;
                 if (pkt.has_datagram) self.datagrams_lost_outgoing += 1;
 
                 if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {} else {
                     has_non_probe_loss_lt = true;
+                    newly_lost_bytes_lt += pkt.size;
                     if (earliest_lost_sent_time_lt == null or pkt.time_sent < earliest_lost_sent_time_lt.?) {
                         earliest_lost_sent_time_lt = pkt.time_sent;
                     }
@@ -3227,18 +3273,24 @@ pub const Connection = struct {
                 }
             }
             if (has_non_probe_loss_lt) {
-                if (loss_result.persistent_congestion) {
-                    if (earliest_lost_sent_time_lt) |lost_time| {
-                        if (!self.cc.inCongestionRecovery(lost_time)) {
-                            self.cc.onPersistentCongestion(now);
-                            std.log.info("persistent congestion detected (loss timer), window reduced to minimum", .{});
-                        }
-                    }
-                } else if (earliest_lost_sent_time_lt) |lost_time| {
-                    self.cc.onCongestionEvent(lost_time, now);
+                const ack_ctx = congestion.AckContext{
+                    .now = now,
+                    .bytes_in_flight = self.pkt_handler.bytes_in_flight,
+                    .prior_bytes_in_flight = prior_bif_lt,
+                    .newly_acked_bytes = 0,
+                    .newly_lost_bytes = newly_lost_bytes_lt,
+                    .persistent_congestion = loss_result.persistent_congestion,
+                    .earliest_lost_sent_time = earliest_lost_sent_time_lt,
+                    .largest_acked_pn = null,
+                    .ce_byte_count = 0,
+                    .rate_sample = null,
+                };
+                self.cc.onAckBatch(&ack_ctx);
+                if (loss_result.persistent_congestion and earliest_lost_sent_time_lt != null) {
+                    std.log.info("persistent congestion detected (loss timer), window reduced to minimum", .{});
                 }
             }
-            self.pacer.setBandwidth(self.cc.sendWindow(), &self.pkt_handler.rtt_stats);
+            self.cc.updatePacer(&self.pacer, &self.pkt_handler.rtt_stats);
         }
 
         // Check PTO — fire when any space has an expired deadline.
@@ -4170,6 +4222,9 @@ pub fn connect(
         conn.keep_alive_interval_ns = @min(ka_ns, @divTrunc(conn.idle_timeout_ns, 2));
     }
     conn.close_when_idle = config.close_when_idle;
+    conn.cc_algorithm = config.congestion_control;
+    conn.cc = congestion.CongestionControl.init(config.congestion_control);
+    conn.pkt_handler.rate_sampling_enabled = (config.congestion_control == .bbr);
 
     // Initialize QLOG if configured
     if (config.qlog_dir) |dir| {
@@ -4308,6 +4363,41 @@ test "Connection: init and basic state" {
     try std.testing.expectEqual(conn.state, .first_flight);
     try std.testing.expect(!conn.isClosed());
     try std.testing.expect(!conn.isDraining());
+}
+
+test "Connection: BBR algorithm selection via config" {
+    var conn = try connect(
+        std.testing.allocator,
+        "example.com",
+        .{ .congestion_control = .bbr },
+        null,
+        null,
+    );
+    defer conn.deinit();
+
+    try std.testing.expectEqual(congestion.Algorithm.bbr, conn.cc.algorithm());
+    try std.testing.expectEqual(congestion.Algorithm.bbr, conn.cc_algorithm);
+}
+
+test "Connection: NewReno algorithm selection via config" {
+    var conn = try connect(
+        std.testing.allocator,
+        "example.com",
+        .{ .congestion_control = .newreno },
+        null,
+        null,
+    );
+    defer conn.deinit();
+
+    try std.testing.expectEqual(congestion.Algorithm.newreno, conn.cc.algorithm());
+}
+
+test "Connection: default algorithm is Cubic" {
+    var conn = try connect(std.testing.allocator, "example.com", .{}, null, null);
+    defer conn.deinit();
+
+    try std.testing.expectEqual(congestion.Algorithm.cubic, conn.cc.algorithm());
+    try std.testing.expectEqual(congestion.Algorithm.cubic, conn.cc_algorithm);
 }
 
 // ConnectionIdPool tests

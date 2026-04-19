@@ -4,6 +4,9 @@ const testing = std.testing;
 
 const rtt_mod = @import("rtt.zig");
 const RttStats = rtt_mod.RttStats;
+const delivery_rate = @import("delivery_rate.zig");
+const bbr_mod = @import("bbr.zig");
+pub const Bbr = bbr_mod.Bbr;
 
 /// Default initial congestion window in packets.
 /// RFC 9002 §7.2: initial_window = min(10 * mds, max(14720, 2 * mds))
@@ -160,6 +163,23 @@ pub const NewReno = struct {
     /// Update the max datagram size (e.g., after PMTUD).
     pub fn setMaxDatagramSize(self: *NewReno, size: u64) void {
         self.max_datagram_size = size;
+    }
+
+    /// Apply batch-level signals from one ACK frame. `onPacketAcked` is still
+    /// fired per-packet by the caller; this method handles loss/ECN events.
+    pub fn onAckBatch(self: *NewReno, ctx: *const AckContext) void {
+        if (ctx.earliest_lost_sent_time) |lost_time| {
+            if (ctx.persistent_congestion) {
+                if (!self.inCongestionRecovery(lost_time)) {
+                    self.onPersistentCongestion(ctx.now);
+                }
+            } else {
+                self.onCongestionEvent(lost_time, ctx.now);
+            }
+        }
+        if (ctx.ce_byte_count > 0) {
+            self.onCongestionEvent(ctx.now, ctx.now);
+        }
     }
 };
 
@@ -385,6 +405,181 @@ pub const Cubic = struct {
     pub fn setMaxDatagramSize(self: *Cubic, size: u64) void {
         self.max_datagram_size = size;
     }
+
+    /// Apply batch-level signals from one ACK frame.
+    pub fn onAckBatch(self: *Cubic, ctx: *const AckContext) void {
+        if (ctx.earliest_lost_sent_time) |lost_time| {
+            if (ctx.persistent_congestion) {
+                if (!self.inCongestionRecovery(lost_time)) {
+                    self.onPersistentCongestion(ctx.now);
+                }
+            } else {
+                self.onCongestionEvent(lost_time, ctx.now);
+            }
+        }
+        if (ctx.ce_byte_count > 0) {
+            self.onCongestionEvent(ctx.now, ctx.now);
+        }
+    }
+};
+
+/// Batch-level summary for one ACK frame's worth of work.
+///
+/// `onPacketAcked` still fires per-packet inside the connection's existing
+/// loop (it's where per-packet bookkeeping lives anyway). This struct carries
+/// the *batch* signals consumed by `onAckBatch`. NewReno/Cubic use a small
+/// subset (loss + ECN); BBR uses the rest.
+pub const AckContext = struct {
+    /// Current time (nanoseconds).
+    now: i64,
+    /// Bytes in flight after this ACK has been processed (post-ack).
+    bytes_in_flight: u64,
+    /// Bytes in flight before this ACK was processed. Denominator for
+    /// BBR's `BBRLossThresh` check (loss-fraction-of-inflight gate).
+    prior_bytes_in_flight: u64 = 0,
+    /// Total bytes acknowledged in this batch (excluding MTU probes).
+    newly_acked_bytes: u64 = 0,
+    /// Total bytes lost in this batch (excluding MTU probes).
+    newly_lost_bytes: u64 = 0,
+    /// True iff loss-detection determined persistent congestion (RFC 9002 §7.6.2).
+    persistent_congestion: bool,
+    /// Earliest send time across the lost packets in this batch (null if no
+    /// non-probe loss).
+    earliest_lost_sent_time: ?i64,
+    /// Largest packet number acknowledged in this batch (for BBR recovery
+    /// exit detection: leave recovery once acks pass `recovery_start_pn`).
+    largest_acked_pn: ?u64 = null,
+    /// Approximate ECN-CE bytes acknowledged in this batch (0 for plain ACK).
+    /// NewReno/Cubic treat any non-zero value as a single congestion event,
+    /// matching the pre-batch behavior. BBR feeds this into a smoothed alpha
+    /// (`BBRExcessiveEcnCE`).
+    ce_byte_count: u64,
+    /// Most recent delivery-rate sample produced from the highest-acked packet
+    /// in this batch (null if no usable sample). Consumed by BBR.
+    rate_sample: ?delivery_rate.RateSample = null,
+};
+
+/// Selectable congestion control algorithm.
+pub const Algorithm = enum {
+    newreno,
+    cubic,
+    bbr, // placeholder; not implemented yet
+};
+
+/// Tagged union over the supported congestion controllers.
+pub const CongestionControl = union(Algorithm) {
+    newreno: NewReno,
+    cubic: Cubic,
+    bbr: Bbr,
+
+    pub fn init(algo: Algorithm) CongestionControl {
+        return switch (algo) {
+            .newreno => .{ .newreno = NewReno.init() },
+            .cubic => .{ .cubic = Cubic.init() },
+            .bbr => .{ .bbr = Bbr.init() },
+        };
+    }
+
+    pub fn initWithMds(algo: Algorithm, max_datagram_size: u64) CongestionControl {
+        return switch (algo) {
+            .newreno => .{ .newreno = NewReno.initWithMds(max_datagram_size) },
+            .cubic => .{ .cubic = Cubic.initWithMds(max_datagram_size) },
+            .bbr => .{ .bbr = Bbr.initWithMds(max_datagram_size) },
+        };
+    }
+
+    pub fn algorithm(self: *const CongestionControl) Algorithm {
+        return std.meta.activeTag(self.*);
+    }
+
+    pub fn inSlowStart(self: *const CongestionControl) bool {
+        return switch (self.*) {
+            inline else => |*cc| cc.inSlowStart(),
+        };
+    }
+
+    pub fn inCongestionRecovery(self: *const CongestionControl, sent_time: i64) bool {
+        return switch (self.*) {
+            inline else => |*cc| cc.inCongestionRecovery(sent_time),
+        };
+    }
+
+    pub fn onPacketAcked(self: *CongestionControl, acked_bytes: u64, sent_time: i64) void {
+        switch (self.*) {
+            inline else => |*cc| cc.onPacketAcked(acked_bytes, sent_time),
+        }
+    }
+
+    pub fn onCongestionEvent(self: *CongestionControl, sent_time: i64, now: i64) void {
+        switch (self.*) {
+            inline else => |*cc| cc.onCongestionEvent(sent_time, now),
+        }
+    }
+
+    pub fn onPersistentCongestion(self: *CongestionControl, now: i64) void {
+        switch (self.*) {
+            inline else => |*cc| cc.onPersistentCongestion(now),
+        }
+    }
+
+    pub fn onPtoExpired(self: *CongestionControl) void {
+        switch (self.*) {
+            inline else => |*cc| cc.onPtoExpired(),
+        }
+    }
+
+    pub fn sendWindow(self: *const CongestionControl) u64 {
+        return switch (self.*) {
+            inline else => |*cc| cc.sendWindow(),
+        };
+    }
+
+    pub fn setMaxDatagramSize(self: *CongestionControl, size: u64) void {
+        switch (self.*) {
+            inline else => |*cc| cc.setMaxDatagramSize(size),
+        }
+    }
+
+    /// "Don't trigger congestion for pre-migration losses" semantics:
+    /// NewReno/Cubic stamp the recovery start time; BBR resets its model.
+    pub fn enterRecoveryForMigration(self: *CongestionControl, now: i64) void {
+        switch (self.*) {
+            .newreno => |*cc| cc.congestion_recovery_start_time = now,
+            .cubic => |*cc| cc.enterRecoveryForMigration(now),
+            .bbr => |*cc| cc.onPathChange(),
+        }
+    }
+
+    pub fn setAppLimited(self: *CongestionControl, app_limited: bool) void {
+        switch (self.*) {
+            .newreno => |*cc| cc.app_limited = app_limited,
+            .cubic => |*cc| cc.app_limited = app_limited,
+            .bbr => {}, // BBR uses delivery-rate sampler's app-limited tracking instead
+        }
+    }
+
+    /// Apply the batch-level signals from one ACK frame.
+    pub fn onAckBatch(self: *CongestionControl, ctx: *const AckContext) void {
+        switch (self.*) {
+            inline else => |*cc| cc.onAckBatch(ctx),
+        }
+    }
+
+    /// Update the pacer using the CC-preferred input. NewReno/Cubic feed the
+    /// pacer the cwnd/RTT pair; BBR writes its computed pacing rate directly.
+    pub fn updatePacer(self: *const CongestionControl, p: *Pacer, rtt: *const RttStats) void {
+        switch (self.*) {
+            .newreno => |*cc| p.setBandwidth(cc.sendWindow(), rtt),
+            .cubic => |*cc| p.setBandwidth(cc.sendWindow(), rtt),
+            .bbr => |*cc| {
+                if (cc.pacingRateBps() > 0) {
+                    p.setPacingRate(cc.pacingRateBps());
+                } else {
+                    p.setBandwidth(cc.sendWindow(), rtt);
+                }
+            },
+        }
+    }
 };
 
 /// Integer cube root approximation (Newton's method).
@@ -460,6 +655,19 @@ pub const Pacer = struct {
         self.bandwidth_shifted = @intCast(@divTrunc(
             @as(u128, cwnd) * PACER_BANDWIDTH_NUM * (@as(u128, 1) << BANDWIDTH_SHIFT),
             @as(u128, @intCast(srtt)) * PACER_BANDWIDTH_DENOM,
+        ));
+    }
+
+    /// Set the pacing rate directly in bytes per second. Intended for
+    /// model-based controllers (BBR) that compute their own pacing rate
+    /// independent of cwnd/RTT.
+    pub fn setPacingRate(self: *Pacer, bytes_per_second: u64) void {
+        if (bytes_per_second == 0) return;
+        // bandwidth_shifted = (bytes_per_ns) << SHIFT
+        //                   = (bps / 1e9) << SHIFT
+        self.bandwidth_shifted = @intCast(@divTrunc(
+            @as(u128, bytes_per_second) << BANDWIDTH_SHIFT,
+            std.time.ns_per_s,
         ));
     }
 
@@ -705,6 +913,126 @@ test "icbrt: basic cube roots" {
     try testing.expectEqual(@as(u64, 10), icbrt(1000));
     try testing.expectEqual(@as(u64, 10), icbrt(1100));
     try testing.expectEqual(@as(u64, 100), icbrt(1000000));
+}
+
+// ── CongestionControl union dispatch tests ──
+
+test "CongestionControl: cubic dispatch is transparent" {
+    var cc = CongestionControl.init(.cubic);
+    const initial = cc.sendWindow();
+    try testing.expect(cc.inSlowStart());
+
+    cc.onPacketAcked(1200, 100);
+    try testing.expectEqual(initial + 1200, cc.sendWindow());
+
+    cc.onCongestionEvent(200, 300);
+    try testing.expect(cc.sendWindow() < initial + 1200);
+    try testing.expect(cc.inCongestionRecovery(150));
+}
+
+test "CongestionControl: newreno dispatch is transparent" {
+    var cc = CongestionControl.init(.newreno);
+    const initial = cc.sendWindow();
+    try testing.expect(cc.inSlowStart());
+
+    cc.onPacketAcked(1200, 100);
+    try testing.expectEqual(initial + 1200, cc.sendWindow());
+
+    cc.setAppLimited(true);
+    cc.onPacketAcked(1200, 110);
+    // app_limited suppresses growth
+    try testing.expectEqual(initial + 1200, cc.sendWindow());
+
+    cc.setAppLimited(false);
+    cc.onCongestionEvent(50, 200);
+    try testing.expect(cc.sendWindow() < initial + 1200);
+}
+
+test "CongestionControl: setMaxDatagramSize + enterRecoveryForMigration on newreno" {
+    var cc = CongestionControl.init(.newreno);
+    cc.setMaxDatagramSize(1400);
+    cc.enterRecoveryForMigration(500);
+    // Pre-migration packet (sent_time=400 <= 500) should be in recovery
+    try testing.expect(cc.inCongestionRecovery(400));
+    // Post-migration packet (sent_time=600 > 500) should not be
+    try testing.expect(!cc.inCongestionRecovery(600));
+}
+
+test "CongestionControl: persistent congestion drops to minimum" {
+    var cc = CongestionControl.init(.cubic);
+    cc.onPersistentCongestion(1_000_000_000);
+    try testing.expectEqual(MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE, cc.sendWindow());
+    try testing.expect(cc.inSlowStart());
+}
+
+test "CongestionControl: onAckBatch parity (loss path matches onCongestionEvent)" {
+    var via_batch = CongestionControl.init(.cubic);
+    var via_direct = Cubic.init();
+
+    // Same loss event applied via batch and direct API should yield same window.
+    via_batch.onAckBatch(&.{
+        .now = 200,
+        .bytes_in_flight = 0,
+        .persistent_congestion = false,
+        .earliest_lost_sent_time = 100,
+        .ce_byte_count = 0,
+    });
+    via_direct.onCongestionEvent(100, 200);
+    try testing.expectEqual(via_direct.sendWindow(), via_batch.sendWindow());
+}
+
+test "CongestionControl: onAckBatch persistent congestion path" {
+    var cc = CongestionControl.init(.newreno);
+    cc.onAckBatch(&.{
+        .now = 1_000_000_000,
+        .bytes_in_flight = 0,
+        .persistent_congestion = true,
+        .earliest_lost_sent_time = 500_000_000,
+        .ce_byte_count = 0,
+    });
+    try testing.expectEqual(MIN_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE, cc.sendWindow());
+}
+
+test "CongestionControl: onAckBatch ECN-CE triggers congestion" {
+    var cc = CongestionControl.init(.cubic);
+    const initial = cc.sendWindow();
+    cc.onAckBatch(&.{
+        .now = 200,
+        .bytes_in_flight = 0,
+        .persistent_congestion = false,
+        .earliest_lost_sent_time = null,
+        .ce_byte_count = 1200,
+    });
+    try testing.expect(cc.sendWindow() < initial);
+}
+
+test "Pacer: setPacingRate vs setBandwidth produce non-zero bandwidth" {
+    var p1 = Pacer.init();
+    p1.setPacingRate(1_000_000); // 1 MB/s
+    try testing.expect(p1.bandwidth_shifted > 0);
+
+    var p2 = Pacer.init();
+    var rtt = RttStats{};
+    rtt.updateRtt(50_000_000, 0, false);
+    p2.setBandwidth(60_000, &rtt);
+    try testing.expect(p2.bandwidth_shifted > 0);
+}
+
+test "CongestionControl: updatePacer dispatches correctly for cubic" {
+    var cc = CongestionControl.init(.cubic);
+    var pacer = Pacer.init();
+    var rtt = RttStats{};
+    rtt.updateRtt(50_000_000, 0, false);
+
+    cc.updatePacer(&pacer, &rtt);
+    try testing.expect(pacer.bandwidth_shifted > 0);
+}
+
+test "CongestionControl: algorithm tag" {
+    var cc = CongestionControl.init(.cubic);
+    try testing.expectEqual(Algorithm.cubic, cc.algorithm());
+    cc = CongestionControl.init(.newreno);
+    try testing.expectEqual(Algorithm.newreno, cc.algorithm());
 }
 
 // ── Pacer tests ──
