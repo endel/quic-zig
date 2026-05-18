@@ -314,11 +314,11 @@ pub const TransportParams = struct {
                     _ = try reader.readSliceShort(&pref.ipv4_addr);
                     var ipv4_port_bytes: [2]u8 = undefined;
                     _ = try reader.readSliceShort(&ipv4_port_bytes);
-                    pref.ipv4_port = std.mem.bigToNative(u16, @bitCast(ipv4_port_bytes));
+                    pref.ipv4_port = std.mem.readInt(u16, &ipv4_port_bytes, .big);
                     _ = try reader.readSliceShort(&pref.ipv6_addr);
                     var ipv6_port_bytes: [2]u8 = undefined;
                     _ = try reader.readSliceShort(&ipv6_port_bytes);
-                    pref.ipv6_port = std.mem.bigToNative(u16, @bitCast(ipv6_port_bytes));
+                    pref.ipv6_port = std.mem.readInt(u16, &ipv6_port_bytes, .big);
                     pref.cid_len = try reader.takeByte();
                     if (pref.cid_len > 20) return error.TransportParameterError;
                     _ = try reader.readSliceShort(pref.cid_buf[0..pref.cid_len]);

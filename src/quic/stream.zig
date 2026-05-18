@@ -1218,38 +1218,26 @@ pub const StreamsMap = struct {
     }
 };
 
-/// Sort bidi streams descending by send_order (higher first). Insertion sort for small N.
+/// Sort bidi streams descending by send_order (higher first).
+/// Stable: equal send_order preserves arrival order.
 fn sortStreamsBySendOrder(streams: []*Stream) void {
-    if (streams.len <= 1) return;
-    for (1..streams.len) |i| {
-        const key = streams[i];
-        const key_order = key.send.send_order orelse 0;
-        var j: usize = i;
-        while (j > 0) {
-            const prev_order = streams[j - 1].send.send_order orelse 0;
-            if (prev_order >= key_order) break;
-            streams[j] = streams[j - 1];
-            j -= 1;
+    const C = struct {
+        fn moreUrgent(_: void, a: *Stream, b: *Stream) bool {
+            return (a.send.send_order orelse 0) > (b.send.send_order orelse 0);
         }
-        streams[j] = key;
-    }
+    };
+    std.sort.insertion(*Stream, streams, {}, C.moreUrgent);
 }
 
-/// Sort uni send streams descending by send_order (higher first). Insertion sort for small N.
+/// Sort uni send streams descending by send_order (higher first).
+/// Stable: equal send_order preserves arrival order.
 fn sortSendStreamsBySendOrder(streams: []*SendStream) void {
-    if (streams.len <= 1) return;
-    for (1..streams.len) |i| {
-        const key = streams[i];
-        const key_order = key.send_order orelse 0;
-        var j: usize = i;
-        while (j > 0) {
-            const prev_order = streams[j - 1].send_order orelse 0;
-            if (prev_order >= key_order) break;
-            streams[j] = streams[j - 1];
-            j -= 1;
+    const C = struct {
+        fn moreUrgent(_: void, a: *SendStream, b: *SendStream) bool {
+            return (a.send_order orelse 0) > (b.send_order orelse 0);
         }
-        streams[j] = key;
-    }
+    };
+    std.sort.insertion(*SendStream, streams, {}, C.moreUrgent);
 }
 
 // Tests
