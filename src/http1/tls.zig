@@ -9,6 +9,7 @@
 const std = @import("std");
 const sys = @import("../sys.zig");
 const crypto = std.crypto;
+const tls = std.crypto.tls;
 const posix = std.posix;
 const net = std.net;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
@@ -23,37 +24,13 @@ const quic_crypto = @import("../quic/crypto.zig");
 const KeySchedule = tls13.KeySchedule;
 const TranscriptHash = tls13.TranscriptHash;
 
-// TLS record content types
-const CT_CHANGE_CIPHER_SPEC: u8 = 20;
-const CT_ALERT: u8 = 21;
-const CT_HANDSHAKE: u8 = 22;
-const CT_APPLICATION_DATA: u8 = 23;
+// Record content types, handshake types, extension types, named groups,
+// cipher suite and protocol version are referenced via std.crypto.tls enums
+// (ContentType, HandshakeType, ExtensionType, NamedGroup, CipherSuite,
+// ProtocolVersion) at their use sites.
 
-// TLS version for record layer (always 0x0303 for compat)
+// TLS 1.2 record-layer version bytes (always 0x0303 for TLS 1.3 compat).
 const TLS12_VERSION = [2]u8{ 0x03, 0x03 };
-const TLS10_VERSION = [2]u8{ 0x03, 0x01 };
-
-// Handshake message types
-const HS_CLIENT_HELLO: u8 = 1;
-const HS_SERVER_HELLO: u8 = 2;
-const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
-const HS_CERTIFICATE: u8 = 11;
-const HS_CERTIFICATE_VERIFY: u8 = 15;
-const HS_FINISHED: u8 = 20;
-
-// Extension types
-const EXT_SERVER_NAME: u16 = 0;
-const EXT_SUPPORTED_GROUPS: u16 = 10;
-const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
-const EXT_ALPN: u16 = 16;
-const EXT_SUPPORTED_VERSIONS: u16 = 43;
-const EXT_KEY_SHARE: u16 = 51;
-
-// Constants
-const GROUP_X25519: u16 = 0x001d;
-const GROUP_SECP256R1: u16 = 0x0017;
-const TLS13_VERSION: u16 = 0x0304;
-const CIPHER_AES128_GCM: u16 = 0x1301;
 const SIG_ECDSA_P256_SHA256: u16 = 0x0403;
 const TAG_LEN = Aes128Gcm.tag_length; // 16
 
@@ -85,9 +62,9 @@ pub const TlsStream = struct {
         // 1. Read ClientHello record
         var rec_buf: [16384]u8 = undefined;
         const ch_rec = try readRecord(fd, &rec_buf);
-        if (ch_rec.content_type != CT_HANDSHAKE) return error.UnexpectedMessage;
+        if (ch_rec.content_type != @intFromEnum(tls.ContentType.handshake)) return error.UnexpectedMessage;
         const ch_msg = ch_rec.payload;
-        if (ch_msg.len < 4 or ch_msg[0] != HS_CLIENT_HELLO) return error.UnexpectedMessage;
+        if (ch_msg.len < 4 or ch_msg[0] != @intFromEnum(tls.HandshakeType.client_hello)) return error.UnexpectedMessage;
 
         // Parse ClientHello
         const ch = try parseClientHello(ch_msg);
@@ -101,9 +78,9 @@ pub const TlsStream = struct {
         const x25519_public = try X25519.recoverPublicKey(x25519_secret);
 
         var shared_secret: [32]u8 = undefined;
-        if (ch.key_share_group == GROUP_X25519) {
+        if (ch.key_share_group == @intFromEnum(tls.NamedGroup.x25519)) {
             shared_secret = X25519.scalarmult(x25519_secret, ch.x25519_public) catch return error.KeyExchangeFailed;
-        } else if (ch.key_share_group == GROUP_SECP256R1) {
+        } else if (ch.key_share_group == @intFromEnum(tls.NamedGroup.secp256r1)) {
             const peer_point = P256.fromSec1(&ch.p256_public) catch return error.KeyExchangeFailed;
             var p256_secret: [32]u8 = undefined;
             sys.randomBytes(&p256_secret);
@@ -122,10 +99,10 @@ pub const TlsStream = struct {
         sys.randomBytes(&server_random);
         const sh_msg = buildServerHello(&sh_buf, &server_random, &x25519_public, ch.session_id[0..ch.session_id_len]);
         transcript.update(sh_msg);
-        try sendRecord(fd, CT_HANDSHAKE, sh_msg);
+        try sendRecord(fd, @intFromEnum(tls.ContentType.handshake), sh_msg);
 
         // 4. Send ChangeCipherSpec (middlebox compatibility, RFC 8446 §5.1)
-        try sendRecord(fd, CT_CHANGE_CIPHER_SPEC, &[_]u8{1});
+        try sendRecord(fd, @intFromEnum(tls.ContentType.change_cipher_spec), &[_]u8{1});
 
         // 5. Derive handshake keys
         var ks = KeySchedule.init();
@@ -144,19 +121,19 @@ pub const TlsStream = struct {
         var ee_buf: [512]u8 = undefined;
         const ee_msg = buildEncryptedExtensions(&ee_buf, config.alpn);
         transcript.update(ee_msg);
-        try sendEncryptedRecord(fd, CT_HANDSHAKE, ee_msg, server_hs_key, server_hs_iv, &server_hs_seq);
+        try sendEncryptedRecord(fd, @intFromEnum(tls.ContentType.handshake), ee_msg, server_hs_key, server_hs_iv, &server_hs_seq);
 
         // Certificate
         var cert_buf: [16384]u8 = undefined;
         const cert_msg = buildCertificate(&cert_buf, config.cert_chain_der);
         transcript.update(cert_msg);
-        try sendEncryptedRecord(fd, CT_HANDSHAKE, cert_msg, server_hs_key, server_hs_iv, &server_hs_seq);
+        try sendEncryptedRecord(fd, @intFromEnum(tls.ContentType.handshake), cert_msg, server_hs_key, server_hs_iv, &server_hs_seq);
 
         // CertificateVerify
         var cv_buf: [512]u8 = undefined;
         const cv_msg = try buildCertificateVerify(&cv_buf, transcript.current(), config.private_key_bytes);
         transcript.update(cv_msg);
-        try sendEncryptedRecord(fd, CT_HANDSHAKE, cv_msg, server_hs_key, server_hs_iv, &server_hs_seq);
+        try sendEncryptedRecord(fd, @intFromEnum(tls.ContentType.handshake), cv_msg, server_hs_key, server_hs_iv, &server_hs_seq);
 
         // Finished
         const server_finished_vd = KeySchedule.computeFinishedVerifyData(
@@ -164,7 +141,7 @@ pub const TlsStream = struct {
             transcript.current(),
         );
         var fin_msg: [36]u8 = undefined;
-        fin_msg[0] = HS_FINISHED;
+        fin_msg[0] = @intFromEnum(tls.HandshakeType.finished);
         fin_msg[1] = 0;
         fin_msg[2] = 0;
         fin_msg[3] = 32;
@@ -175,17 +152,17 @@ pub const TlsStream = struct {
         const transcript_after_sf = transcript.current();
         ks.deriveAppSecrets(transcript_after_sf);
 
-        try sendEncryptedRecord(fd, CT_HANDSHAKE, &fin_msg, server_hs_key, server_hs_iv, &server_hs_seq);
+        try sendEncryptedRecord(fd, @intFromEnum(tls.ContentType.handshake), &fin_msg, server_hs_key, server_hs_iv, &server_hs_seq);
 
         // 7. Read client messages (ChangeCipherSpec + Finished)
         var client_hs_seq: u64 = 0;
         var got_finished = false;
         while (!got_finished) {
             const crec = try readRecord(fd, &rec_buf);
-            if (crec.content_type == CT_CHANGE_CIPHER_SPEC) {
+            if (crec.content_type == @intFromEnum(tls.ContentType.change_cipher_spec)) {
                 continue; // Skip CCS
             }
-            if (crec.content_type != CT_APPLICATION_DATA) return error.UnexpectedMessage;
+            if (crec.content_type != @intFromEnum(tls.ContentType.application_data)) return error.UnexpectedMessage;
 
             // Decrypt
             var dec_buf2: [16384]u8 = undefined;
@@ -199,8 +176,8 @@ pub const TlsStream = struct {
             const inner_ct = plaintext[inner_len - 1];
             const inner_data = plaintext[0 .. inner_len - 1];
 
-            if (inner_ct == CT_HANDSHAKE) {
-                if (inner_data.len < 4 or inner_data[0] != HS_FINISHED) return error.UnexpectedMessage;
+            if (inner_ct == @intFromEnum(tls.ContentType.handshake)) {
+                if (inner_data.len < 4 or inner_data[0] != @intFromEnum(tls.HandshakeType.finished)) return error.UnexpectedMessage;
                 // Verify client Finished
                 const expected_vd = KeySchedule.computeFinishedVerifyData(
                     ks.client_handshake_traffic_secret,
@@ -243,8 +220,8 @@ pub const TlsStream = struct {
         var rec_buf: [16384 + 256]u8 = undefined;
         const rec = readRecord(self.fd, &rec_buf) catch return 0;
 
-        if (rec.content_type == CT_ALERT) return 0;
-        if (rec.content_type != CT_APPLICATION_DATA) return 0;
+        if (rec.content_type == @intFromEnum(tls.ContentType.alert)) return 0;
+        if (rec.content_type != @intFromEnum(tls.ContentType.application_data)) return 0;
 
         // Decrypt
         const plaintext = decryptRecord(rec.payload, &self.dec_buf, self.read_key, self.read_iv, &self.read_seq) catch return 0;
@@ -255,8 +232,8 @@ pub const TlsStream = struct {
         while (inner_len > 0 and self.dec_buf[inner_len - 1] == 0) inner_len -= 1;
         if (inner_len == 0) return 0;
         const inner_ct = self.dec_buf[inner_len - 1];
-        if (inner_ct == CT_ALERT) return 0;
-        if (inner_ct != CT_APPLICATION_DATA) return 0;
+        if (inner_ct == @intFromEnum(tls.ContentType.alert)) return 0;
+        if (inner_ct != @intFromEnum(tls.ContentType.application_data)) return 0;
         const data_len = inner_len - 1;
 
         // Copy to caller's buffer, buffer the rest
@@ -274,13 +251,16 @@ pub const TlsStream = struct {
 
     /// Write application data as encrypted TLS record(s).
     pub fn write(self: *TlsStream, data: []const u8) !void {
-        try sendEncryptedRecord(self.fd, CT_APPLICATION_DATA, data, self.write_key, self.write_iv, &self.write_seq);
+        try sendEncryptedRecord(self.fd, @intFromEnum(tls.ContentType.application_data), data, self.write_key, self.write_iv, &self.write_seq);
     }
 
     /// Send close_notify alert.
     pub fn close(self: *TlsStream) void {
-        const alert = [_]u8{ 1, 0 }; // warning, close_notify
-        sendEncryptedRecord(self.fd, CT_ALERT, &alert, self.write_key, self.write_iv, &self.write_seq) catch {};
+        const alert = [_]u8{
+            @intFromEnum(tls.Alert.Level.warning),
+            @intFromEnum(tls.Alert.Description.close_notify),
+        };
+        sendEncryptedRecord(self.fd, @intFromEnum(tls.ContentType.alert), &alert, self.write_key, self.write_iv, &self.write_seq) catch {};
     }
 };
 
@@ -321,7 +301,7 @@ fn sendRecord(fd: posix.fd_t, content_type: u8, payload: []const u8) !void {
     var hdr: [5]u8 = undefined;
     hdr[0] = content_type;
     // Use TLS 1.0 for ClientHello compat, TLS 1.2 for the rest
-    if (content_type == CT_HANDSHAKE) {
+    if (content_type == @intFromEnum(tls.ContentType.handshake)) {
         hdr[1] = TLS12_VERSION[0];
         hdr[2] = TLS12_VERSION[1];
     } else {
@@ -343,7 +323,7 @@ fn sendEncryptedRecord(
     seq: *u64,
 ) !void {
     // TLS 1.3 encrypted record: inner content = plaintext + content_type byte
-    // Outer record: CT_APPLICATION_DATA, encrypted payload + tag
+    // Outer record: application_data content type, encrypted payload + tag
     const inner_len = plaintext.len + 1; // +1 for inner content type
     const ciphertext_len = inner_len + TAG_LEN;
 
@@ -351,7 +331,7 @@ fn sendEncryptedRecord(
 
     // Build AAD (record header with ciphertext length)
     var aad: [5]u8 = undefined;
-    aad[0] = CT_APPLICATION_DATA;
+    aad[0] = @intFromEnum(tls.ContentType.application_data);
     aad[1] = TLS12_VERSION[0];
     aad[2] = TLS12_VERSION[1];
     aad[3] = @intCast(ciphertext_len >> 8);
@@ -395,7 +375,7 @@ fn decryptRecord(
 
     // Build AAD
     var aad: [5]u8 = undefined;
-    aad[0] = CT_APPLICATION_DATA;
+    aad[0] = @intFromEnum(tls.ContentType.application_data);
     aad[1] = TLS12_VERSION[0];
     aad[2] = TLS12_VERSION[1];
     aad[3] = @intCast(ciphertext_with_tag.len >> 8);
@@ -479,19 +459,19 @@ fn parseClientHello(msg: []const u8) !ClientHelloInfo {
         ext_pos += 2;
         if (ext_pos + elen > ext_data.len) break;
 
-        if (etype == EXT_KEY_SHARE and elen >= 2) {
+        if (etype == @intFromEnum(tls.ExtensionType.key_share) and elen >= 2) {
             var share_pos: usize = 2; // skip client_shares_len
             while (share_pos + 4 <= elen) {
                 const group = readU16(ext_data[ext_pos + share_pos ..]);
                 const kelen = readU16(ext_data[ext_pos + share_pos + 2 ..]);
                 share_pos += 4;
-                if (group == GROUP_X25519 and kelen == 32 and share_pos + 32 <= elen) {
+                if (group == @intFromEnum(tls.NamedGroup.x25519) and kelen == 32 and share_pos + 32 <= elen) {
                     @memcpy(&info.x25519_public, ext_data[ext_pos + share_pos ..][0..32]);
-                    info.key_share_group = GROUP_X25519;
+                    info.key_share_group = @intFromEnum(tls.NamedGroup.x25519);
                     break;
-                } else if (group == GROUP_SECP256R1 and kelen == 65 and share_pos + 65 <= elen) {
+                } else if (group == @intFromEnum(tls.NamedGroup.secp256r1) and kelen == 65 and share_pos + 65 <= elen) {
                     @memcpy(&info.p256_public, ext_data[ext_pos + share_pos ..][0..65]);
-                    if (info.key_share_group == 0) info.key_share_group = GROUP_SECP256R1;
+                    if (info.key_share_group == 0) info.key_share_group = @intFromEnum(tls.NamedGroup.secp256r1);
                 }
                 share_pos += kelen;
             }
@@ -524,7 +504,7 @@ fn buildServerHello(buf: []u8, server_random: *const [32]u8, x25519_pub: *const 
     }
 
     // cipher_suite
-    writeU16(buf[pos..], CIPHER_AES128_GCM);
+    writeU16(buf[pos..], @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256));
     pos += 2;
 
     // compression_method
@@ -536,18 +516,18 @@ fn buildServerHello(buf: []u8, server_random: *const [32]u8, x25519_pub: *const 
     pos += 2;
 
     // supported_versions
-    writeU16(buf[pos..], EXT_SUPPORTED_VERSIONS);
+    writeU16(buf[pos..], @intFromEnum(tls.ExtensionType.supported_versions));
     writeU16(buf[pos + 2 ..], 2);
     pos += 4;
-    writeU16(buf[pos..], TLS13_VERSION);
+    writeU16(buf[pos..], @intFromEnum(tls.ProtocolVersion.tls_1_3));
     pos += 2;
 
     // key_share (X25519)
     const ks_data_len: u16 = 2 + 2 + 32;
-    writeU16(buf[pos..], EXT_KEY_SHARE);
+    writeU16(buf[pos..], @intFromEnum(tls.ExtensionType.key_share));
     writeU16(buf[pos + 2 ..], ks_data_len);
     pos += 4;
-    writeU16(buf[pos..], GROUP_X25519);
+    writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.x25519));
     pos += 2;
     writeU16(buf[pos..], 32);
     pos += 2;
@@ -559,7 +539,7 @@ fn buildServerHello(buf: []u8, server_random: *const [32]u8, x25519_pub: *const 
 
     // Fill in message header
     const body_len: u24 = @intCast(pos - 4);
-    buf[0] = HS_SERVER_HELLO;
+    buf[0] = @intFromEnum(tls.HandshakeType.server_hello);
     buf[1] = @intCast(body_len >> 16);
     buf[2] = @intCast((body_len >> 8) & 0xff);
     buf[3] = @intCast(body_len & 0xff);
@@ -578,7 +558,7 @@ fn buildEncryptedExtensions(buf: []u8, alpn_list: []const []const u8) []const u8
         var alpn_total: usize = 0;
         for (alpn_list) |proto| alpn_total += 1 + proto.len;
 
-        writeU16(buf[pos..], EXT_ALPN);
+        writeU16(buf[pos..], @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation));
         writeU16(buf[pos + 2 ..], @intCast(2 + alpn_total));
         pos += 4;
         writeU16(buf[pos..], @intCast(alpn_total));
@@ -594,7 +574,7 @@ fn buildEncryptedExtensions(buf: []u8, alpn_list: []const []const u8) []const u8
     writeU16(buf[ext_list_start..], @intCast(pos - ext_list_start - 2));
 
     const body_len: u24 = @intCast(pos - 4);
-    buf[0] = HS_ENCRYPTED_EXTENSIONS;
+    buf[0] = @intFromEnum(tls.HandshakeType.encrypted_extensions);
     buf[1] = @intCast(body_len >> 16);
     buf[2] = @intCast((body_len >> 8) & 0xff);
     buf[3] = @intCast(body_len & 0xff);
@@ -633,7 +613,7 @@ fn buildCertificate(buf: []u8, cert_chain: []const []const u8) []const u8 {
     buf[cert_list_start + 2] = @intCast(cert_list_len & 0xff);
 
     const body_len: u24 = @intCast(pos - 4);
-    buf[0] = HS_CERTIFICATE;
+    buf[0] = @intFromEnum(tls.HandshakeType.certificate);
     buf[1] = @intCast(body_len >> 16);
     buf[2] = @intCast((body_len >> 8) & 0xff);
     buf[3] = @intCast(body_len & 0xff);
@@ -671,7 +651,7 @@ fn buildCertificateVerify(buf: []u8, transcript_hash: [32]u8, private_key_bytes:
     pos += sig_bytes.len;
 
     const body_len: u24 = @intCast(pos - 4);
-    buf[0] = HS_CERTIFICATE_VERIFY;
+    buf[0] = @intFromEnum(tls.HandshakeType.certificate_verify);
     buf[1] = @intCast(body_len >> 16);
     buf[2] = @intCast((body_len >> 8) & 0xff);
     buf[3] = @intCast(body_len & 0xff);
@@ -682,10 +662,9 @@ fn buildCertificateVerify(buf: []u8, transcript_hash: [32]u8, private_key_bytes:
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 fn readU16(data: []const u8) u16 {
-    return (@as(u16, data[0]) << 8) | @as(u16, data[1]);
+    return std.mem.readInt(u16, data[0..2], .big);
 }
 
 fn writeU16(buf: []u8, val: u16) void {
-    buf[0] = @intCast(val >> 8);
-    buf[1] = @intCast(val & 0xff);
+    std.mem.writeInt(u16, buf[0..2], val, .big);
 }

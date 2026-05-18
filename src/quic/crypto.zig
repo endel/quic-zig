@@ -4,6 +4,7 @@ const packet = @import("packet.zig");
 const assert = std.debug.assert;
 
 const crypto = std.crypto;
+const tls = std.crypto.tls;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
@@ -375,9 +376,9 @@ pub fn deriveInitialKeyMaterial(
 
     // Client (Initial keys are always AES-128-GCM)
     secret = hkdfExpandLabel(initial_secret, "client in", "", Hmac.key_length);
-    const client_key_16 = hkdfExpandLabelRuntime(secret, label_key, "", key_len);
-    const client_iv = hkdfExpandLabelRuntime(secret, label_iv, "", nonce_len);
-    const client_hp_16 = hkdfExpandLabelRuntime(secret, label_hp, "", key_len);
+    const client_key_16 = hkdfExpandLabel(secret, label_key, "", key_len);
+    const client_iv = hkdfExpandLabel(secret, label_iv, "", nonce_len);
+    const client_hp_16 = hkdfExpandLabel(secret, label_hp, "", key_len);
     var client_key: [max_key_len]u8 = .{0} ** max_key_len;
     @memcpy(client_key[0..key_len], &client_key_16);
     var client_hp_key: [max_key_len]u8 = .{0} ** max_key_len;
@@ -385,9 +386,9 @@ pub fn deriveInitialKeyMaterial(
 
     // Server
     secret = hkdfExpandLabel(initial_secret, "server in", "", Hmac.key_length);
-    const server_key_16 = hkdfExpandLabelRuntime(secret, label_key, "", key_len);
-    const server_iv = hkdfExpandLabelRuntime(secret, label_iv, "", nonce_len);
-    const server_hp_16 = hkdfExpandLabelRuntime(secret, label_hp, "", key_len);
+    const server_key_16 = hkdfExpandLabel(secret, label_key, "", key_len);
+    const server_iv = hkdfExpandLabel(secret, label_iv, "", nonce_len);
+    const server_hp_16 = hkdfExpandLabel(secret, label_hp, "", key_len);
     var server_key: [max_key_len]u8 = .{0} ** max_key_len;
     @memcpy(server_key[0..key_len], &server_key_16);
     var server_hp_key: [max_key_len]u8 = .{0} ** max_key_len;
@@ -546,62 +547,14 @@ test "header protection key" {
     }
 }
 
-/// Uses hkdf's expand to generate a derived key.
-/// Constructs a hkdf context by generating a hkdf-label
-/// which consists of `length`, the label "tls13 " ++ `label` and the given
-/// `context`.
+/// RFC 8446 §7.1 HKDF-Expand-Label.
 pub fn hkdfExpandLabel(
-    secret: [32]u8,
-    comptime label: []const u8,
-    context: []const u8,
-    comptime length: u16,
-) [length]u8 {
-    // return tls.hkdfExpandLabel(HkdfSha256, secret, label, context, length);
-
-    std.debug.assert(label.len <= 255 and label.len > 0);
-    std.debug.assert(context.len <= 255);
-    const full_label = "tls13 " ++ label;
-
-    // length, label, context
-    var buf: [2 + 255 + 255]u8 = undefined;
-    std.mem.writeInt(u16, buf[0..2], length, .big);
-    buf[2] = full_label.len;
-    @memcpy(buf[3..][0..full_label.len], full_label);
-    buf[3 + full_label.len] = @intCast(context.len);
-    @memcpy(buf[4 + full_label.len ..][0..context.len], context);
-    const actual_context = buf[0 .. 4 + full_label.len + context.len];
-
-    var out: [32]u8 = undefined;
-    HkdfSha256.expand(&out, actual_context, secret);
-    return out[0..length].*;
-}
-
-/// Runtime version of hkdfExpandLabel for version-dependent labels.
-pub fn hkdfExpandLabelRuntime(
     secret: [32]u8,
     label: []const u8,
     context: []const u8,
     comptime length: u16,
 ) [length]u8 {
-    std.debug.assert(label.len <= 249 and label.len > 0);
-    std.debug.assert(context.len <= 255);
-
-    var buf: [2 + 1 + 6 + 249 + 1 + 255]u8 = undefined;
-    std.mem.writeInt(u16, buf[0..2], length, .big);
-    // "tls13 " prefix (6 bytes) + label
-    const prefix = "tls13 ";
-    const full_len: u8 = @intCast(prefix.len + label.len);
-    buf[2] = full_len;
-    @memcpy(buf[3..][0..prefix.len], prefix);
-    @memcpy(buf[3 + prefix.len ..][0..label.len], label);
-    const label_end = 3 + prefix.len + label.len;
-    buf[label_end] = @intCast(context.len);
-    @memcpy(buf[label_end + 1 ..][0..context.len], context);
-    const actual_context = buf[0 .. label_end + 1 + context.len];
-
-    var out: [32]u8 = undefined;
-    HkdfSha256.expand(&out, actual_context, secret);
-    return out[0..length].*;
+    return tls.hkdfExpandLabel(HkdfSha256, secret, label, context, length);
 }
 
 /// Derive a QUIC key and pad to max_key_len.
@@ -614,24 +567,16 @@ pub fn deriveKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_ke
 fn deriveKeyPaddedL(secret: [32]u8, actual_len: usize, label: []const u8) [max_key_len]u8 {
     var result: [max_key_len]u8 = .{0} ** max_key_len;
     if (actual_len == 32) {
-        result = hkdfExpandLabelRuntime(secret, label, "", 32);
+        result = hkdfExpandLabel(secret, label, "", 32);
     } else {
-        const k16 = hkdfExpandLabelRuntime(secret, label, "", 16);
+        const k16 = hkdfExpandLabel(secret, label, "", 16);
         @memcpy(result[0..16], &k16);
     }
     return result;
 }
 
 pub fn deriveHpKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_key_len]u8 {
-    const label = protocol.quicLabel(version, .hp);
-    var result: [max_key_len]u8 = .{0} ** max_key_len;
-    if (actual_len == 32) {
-        result = hkdfExpandLabelRuntime(secret, label, "", 32);
-    } else {
-        const k16 = hkdfExpandLabelRuntime(secret, label, "", 16);
-        @memcpy(result[0..16], &k16);
-    }
-    return result;
+    return deriveKeyPaddedL(secret, actual_len, protocol.quicLabel(version, .hp));
 }
 
 /// AES-128-GCM confidentiality limit: 2^23 packets (~8M).
@@ -646,7 +591,7 @@ pub fn deriveNextTrafficSecret(current: [32]u8) [32]u8 {
 }
 
 pub fn deriveNextTrafficSecretV(current: [32]u8, version: u32) [32]u8 {
-    return hkdfExpandLabelRuntime(current, protocol.quicLabel(version, .ku), "", 32);
+    return hkdfExpandLabel(current, protocol.quicLabel(version, .ku), "", 32);
 }
 
 /// Manages QUIC key update (RFC 9001 Section 6).
@@ -718,17 +663,17 @@ pub const KeyUpdateManager = struct {
 
         // Derive current Open/Seal from the initial secrets
         const recv_key = deriveKeyPaddedL(recv_secret, kl, label_key);
-        const recv_iv = hkdfExpandLabelRuntime(recv_secret, label_iv, "", nonce_len);
+        const recv_iv = hkdfExpandLabel(recv_secret, label_iv, "", nonce_len);
         const send_key = deriveKeyPaddedL(send_secret, kl, label_key);
-        const send_iv = hkdfExpandLabelRuntime(send_secret, label_iv, "", nonce_len);
+        const send_iv = hkdfExpandLabel(send_secret, label_iv, "", nonce_len);
 
         // Pre-compute next generation secrets and keys
         const next_recv_secret = deriveNextTrafficSecretV(recv_secret, version);
         const next_send_secret = deriveNextTrafficSecretV(send_secret, version);
         const next_recv_key = deriveKeyPaddedL(next_recv_secret, kl, label_key);
-        const next_recv_iv = hkdfExpandLabelRuntime(next_recv_secret, label_iv, "", nonce_len);
+        const next_recv_iv = hkdfExpandLabel(next_recv_secret, label_iv, "", nonce_len);
         const next_send_key = deriveKeyPaddedL(next_send_secret, kl, label_key);
-        const next_send_iv = hkdfExpandLabelRuntime(next_send_secret, label_iv, "", nonce_len);
+        const next_send_iv = hkdfExpandLabel(next_send_secret, label_iv, "", nonce_len);
 
         var ku: KeyUpdateManager = .{
             .current_open = .{ .key = recv_key, .hp_key = recv_hp, .nonce = recv_iv, .cipher_suite = cipher_suite },
@@ -779,14 +724,14 @@ pub const KeyUpdateManager = struct {
         self.next_open = .{
             .key = deriveKeyPaddedL(next_recv_secret, kl, label_key),
             .hp_key = self.hp_open,
-            .nonce = hkdfExpandLabelRuntime(next_recv_secret, label_iv, "", nonce_len),
+            .nonce = hkdfExpandLabel(next_recv_secret, label_iv, "", nonce_len),
             .cipher_suite = self.cipher_suite,
             .hp_aes_ctx = self.hp_open_ctx,
         };
         self.next_seal = .{
             .key = deriveKeyPaddedL(next_send_secret, kl, label_key),
             .hp_key = self.hp_seal,
-            .nonce = hkdfExpandLabelRuntime(next_send_secret, label_iv, "", nonce_len),
+            .nonce = hkdfExpandLabel(next_send_secret, label_iv, "", nonce_len),
             .cipher_suite = self.cipher_suite,
             .hp_aes_ctx = self.hp_seal_ctx,
         };

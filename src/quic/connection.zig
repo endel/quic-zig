@@ -4,6 +4,7 @@ const sys = @import("../sys.zig");
 const net = std.net;
 const posix = std.posix;
 const crypto = std.crypto;
+const tls = std.crypto.tls;
 
 const protocol = @import("protocol.zig");
 const packet = @import("packet.zig");
@@ -2244,10 +2245,10 @@ pub const Connection = struct {
                 while (nst_iters < 10) : (nst_iters += 1) {
                     const action = hs.step() catch |err| {
                         // RFC 9001 §4.8: post-handshake TLS errors
-                        const tls_alert: u64 = switch (err) {
-                            error.UnexpectedMessage => 10,
-                            else => 80,
-                        };
+                        const tls_alert: u64 = @intFromEnum(switch (err) {
+                            error.UnexpectedMessage => tls.Alert.Description.unexpected_message,
+                            else => tls.Alert.Description.internal_error,
+                        });
                         self.closeWithTransportError(TransportError.cryptoError(tls_alert), @intFromEnum(FrameType.crypto), "post-handshake TLS error");
                         return;
                     };
@@ -2296,18 +2297,18 @@ pub const Connection = struct {
                     return;
                 }
                 // RFC 9001 §4.8: map TLS errors to CRYPTO_ERROR (0x100 + TLS alert code)
-                const tls_alert: u64 = switch (err) {
-                    error.BadCertificate => 42, // bad_certificate
-                    error.BadCertificateVerify => 51, // decrypt_error
-                    error.UnexpectedMessage => 10, // unexpected_message
-                    error.DecodeError => 50, // decode_error
-                    error.BadFinished => 51, // decrypt_error
-                    error.NoKeyShare => 40, // handshake_failure
-                    error.UnsupportedVersion => 70, // protocol_version
-                    error.NoApplicationProtocol => 120, // no_application_protocol
-                    error.MissingExtension => 109, // missing_extension
-                    else => 80, // internal_error
-                };
+                const tls_alert: u64 = @intFromEnum(switch (err) {
+                    error.BadCertificate => tls.Alert.Description.bad_certificate,
+                    error.BadCertificateVerify => tls.Alert.Description.decrypt_error,
+                    error.UnexpectedMessage => tls.Alert.Description.unexpected_message,
+                    error.DecodeError => tls.Alert.Description.decode_error,
+                    error.BadFinished => tls.Alert.Description.decrypt_error,
+                    error.NoKeyShare => tls.Alert.Description.handshake_failure,
+                    error.UnsupportedVersion => tls.Alert.Description.protocol_version,
+                    error.NoApplicationProtocol => tls.Alert.Description.no_application_protocol,
+                    error.MissingExtension => tls.Alert.Description.missing_extension,
+                    else => tls.Alert.Description.internal_error,
+                });
                 self.closeWithTransportError(TransportError.cryptoError(tls_alert), @intFromEnum(FrameType.crypto), "TLS handshake failure");
                 return;
             };

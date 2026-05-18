@@ -8,6 +8,7 @@ const std = @import("std");
 const sys = @import("../sys.zig");
 const io = @import("../io_compat.zig");
 const crypto = std.crypto;
+const tls = std.crypto.tls;
 const quic_crypto = @import("crypto.zig");
 const protocol = @import("protocol.zig");
 const transport_params = @import("transport_params.zig");
@@ -50,25 +51,11 @@ const ExtType = enum(u16) {
     _,
 };
 
-// Signature algorithms
-const SIG_ECDSA_P256_SHA256: u16 = 0x0403;
-const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
-const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
-const SIG_RSA_PSS_RSAE_SHA512: u16 = 0x0806;
-const SIG_ED25519: u16 = 0x0807;
-
-// Named groups
-const GROUP_SECP256R1: u16 = 0x0017;
-const GROUP_X25519: u16 = 0x001d;
+// Signature schemes, named groups, cipher suites and protocol version are
+// referenced directly via std.crypto.tls enums (SignatureScheme, NamedGroup,
+// CipherSuite, ProtocolVersion) at their use sites.
 
 const P256 = crypto.ecc.P256;
-
-// TLS 1.3 version
-const TLS13_VERSION: u16 = 0x0304;
-
-// Cipher suites
-const CIPHER_SUITE_AES128_GCM_SHA256: u16 = 0x1301;
-const CIPHER_SUITE_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
 pub const EncryptionLevel = quic_crypto.EncryptionLevel;
 
@@ -86,14 +73,15 @@ fn verifyCertificateVerifySignature(
     sig_bytes: []const u8,
     signed_content: []const u8,
 ) HandshakeError!void {
-    switch (sig_algo) {
-        SIG_ECDSA_P256_SHA256 => {
+    const scheme: tls.SignatureScheme = @enumFromInt(sig_algo);
+    switch (scheme) {
+        .ecdsa_secp256r1_sha256 => {
             if (pub_key_algo != .X9_62_id_ecPublicKey) return error.BadCertificateVerify;
             const pub_key = EcdsaP256Sha256.PublicKey.fromSec1(pub_key_bytes) catch return error.BadCertificateVerify;
             const sig = EcdsaP256Sha256.Signature.fromDer(sig_bytes) catch return error.BadCertificateVerify;
             sig.verify(signed_content, pub_key) catch return error.BadCertificateVerify;
         },
-        SIG_ED25519 => {
+        .ed25519 => {
             if (pub_key_algo != .curveEd25519) return error.BadCertificateVerify;
             if (pub_key_bytes.len != Ed25519.PublicKey.encoded_length) return error.BadCertificateVerify;
             if (sig_bytes.len != Ed25519.Signature.encoded_length) return error.BadCertificateVerify;
@@ -101,9 +89,9 @@ fn verifyCertificateVerifySignature(
             const sig = Ed25519.Signature.fromBytes(sig_bytes[0..Ed25519.Signature.encoded_length].*);
             sig.verify(signed_content, pub_key) catch return error.BadCertificateVerify;
         },
-        SIG_RSA_PSS_RSAE_SHA256 => verifyRsaPss(pub_key_bytes, pub_key_algo, sig_bytes, signed_content, Sha256) catch return error.BadCertificateVerify,
-        SIG_RSA_PSS_RSAE_SHA384 => verifyRsaPss(pub_key_bytes, pub_key_algo, sig_bytes, signed_content, Sha384) catch return error.BadCertificateVerify,
-        SIG_RSA_PSS_RSAE_SHA512 => verifyRsaPss(pub_key_bytes, pub_key_algo, sig_bytes, signed_content, Sha512) catch return error.BadCertificateVerify,
+        .rsa_pss_rsae_sha256 => verifyRsaPss(pub_key_bytes, pub_key_algo, sig_bytes, signed_content, Sha256) catch return error.BadCertificateVerify,
+        .rsa_pss_rsae_sha384 => verifyRsaPss(pub_key_bytes, pub_key_algo, sig_bytes, signed_content, Sha384) catch return error.BadCertificateVerify,
+        .rsa_pss_rsae_sha512 => verifyRsaPss(pub_key_bytes, pub_key_algo, sig_bytes, signed_content, Sha512) catch return error.BadCertificateVerify,
         else => return error.BadCertificateVerify,
     }
 }
@@ -378,8 +366,7 @@ pub const KeySchedule = struct {
     // Derive handshake secrets from the shared secret and transcript hash.
     pub fn deriveHandshakeSecrets(self: *KeySchedule, shared_secret: []const u8, transcript_hash: [32]u8) void {
         // derived1 = Derive-Secret(early_secret, "derived", Hash(""))
-        var empty_hash: [32]u8 = undefined;
-        Sha256.hash("", &empty_hash, .{});
+        const empty_hash = tls.emptyHash(Sha256);
         const derived1 = deriveSecret(self.early_secret, "derived", empty_hash);
 
         // handshake_secret = HKDF-Extract(derived1, shared_secret)
@@ -397,8 +384,7 @@ pub const KeySchedule = struct {
     // Derive application secrets from the transcript hash after server Finished.
     pub fn deriveAppSecrets(self: *KeySchedule, transcript_hash: [32]u8) void {
         // derived2 = Derive-Secret(handshake_secret, "derived", Hash(""))
-        var empty_hash: [32]u8 = undefined;
-        Sha256.hash("", &empty_hash, .{});
+        const empty_hash = tls.emptyHash(Sha256);
         const derived2 = deriveSecret(self.handshake_secret, "derived", empty_hash);
 
         // master_secret = HKDF-Extract(derived2, 0)
@@ -444,7 +430,7 @@ pub const KeySchedule = struct {
         const label_iv = protocol.quicLabel(version, .iv);
         var open: quic_crypto.Open = .{
             .key = quic_crypto.deriveKeyPaddedV(traffic_secret, kl, version),
-            .nonce = quic_crypto.hkdfExpandLabelRuntime(traffic_secret, label_iv, "", 12),
+            .nonce = quic_crypto.hkdfExpandLabel(traffic_secret, label_iv, "", 12),
             .hp_key = quic_crypto.deriveHpKeyPaddedV(traffic_secret, cipher.hpKeyLen(), version),
             .cipher_suite = cipher,
         };
@@ -457,7 +443,7 @@ pub const KeySchedule = struct {
         const label_iv = protocol.quicLabel(version, .iv);
         var seal: quic_crypto.Seal = .{
             .key = quic_crypto.deriveKeyPaddedV(traffic_secret, kl, version),
-            .nonce = quic_crypto.hkdfExpandLabelRuntime(traffic_secret, label_iv, "", 12),
+            .nonce = quic_crypto.hkdfExpandLabel(traffic_secret, label_iv, "", 12),
             .hp_key = quic_crypto.deriveHpKeyPaddedV(traffic_secret, cipher.hpKeyLen(), version),
             .cipher_suite = cipher,
         };
@@ -468,11 +454,7 @@ pub const KeySchedule = struct {
     // Compute the Finished verify_data.
     pub fn computeFinishedVerifyData(base_key: [32]u8, transcript_hash: [32]u8) [32]u8 {
         const finished_key = quic_crypto.hkdfExpandLabel(base_key, "finished", "", 32);
-        var hmac: [32]u8 = undefined;
-        var h = HmacSha256.init(&finished_key);
-        h.update(&transcript_hash);
-        h.final(&hmac);
-        return hmac;
+        return tls.hmac(HmacSha256, &transcript_hash, finished_key);
     }
 
     fn deriveSecret(secret: [32]u8, comptime label: []const u8, transcript_hash: [32]u8) [32]u8 {
@@ -650,7 +632,7 @@ pub const Tls13Handshake = struct {
     p256_secret: [32]u8 = undefined,
     p256_public: [65]u8 = undefined, // our uncompressed public point
     peer_p256_public: [65]u8 = undefined, // peer's uncompressed public point
-    negotiated_group: u16 = GROUP_X25519,
+    negotiated_group: tls.NamedGroup = .x25519,
 
     // Output buffer for built messages (32KB for large cert chains, e.g. 9-cert amplificationlimit test)
     out_buf: [32768]u8 = undefined,
@@ -750,7 +732,7 @@ pub const Tls13Handshake = struct {
             sys.randomBytes(&self.p256_secret);
             break :blk P256.basePoint.mulPublic(self.p256_secret, .big) catch unreachable;
         }).toUncompressedSec1();
-        self.negotiated_group = GROUP_X25519;
+        self.negotiated_group = .x25519;
 
         return self;
     }
@@ -795,7 +777,7 @@ pub const Tls13Handshake = struct {
             sys.randomBytes(&self.x25519_secret);
             break :blk X25519.recoverPublicKey(self.x25519_secret) catch unreachable;
         };
-        self.negotiated_group = GROUP_X25519;
+        self.negotiated_group = .x25519;
 
         return self;
     }
@@ -986,9 +968,9 @@ pub const Tls13Handshake = struct {
         if (pos + 3 > body.len) return error.DecodeError;
         const cipher_suite_raw = readU16(body[pos..]);
         pos += 2;
-        if (cipher_suite_raw == CIPHER_SUITE_AES128_GCM_SHA256) {
+        if (cipher_suite_raw == @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256)) {
             self.negotiated_cipher_suite = .aes_128_gcm_sha256;
-        } else if (cipher_suite_raw == CIPHER_SUITE_CHACHA20_POLY1305_SHA256) {
+        } else if (cipher_suite_raw == @intFromEnum(tls.CipherSuite.CHACHA20_POLY1305_SHA256)) {
             self.negotiated_cipher_suite = .chacha20_poly1305_sha256;
         } else {
             return error.UnsupportedVersion;
@@ -1015,13 +997,13 @@ pub const Tls13Handshake = struct {
                 if (elen < 4) return error.DecodeError;
                 const group = readU16(ext_data[ext_pos..]);
                 const kelen = readU16(ext_data[ext_pos + 2 ..]);
-                if (group == GROUP_X25519 and kelen == 32 and ext_pos + 4 + 32 <= ext_data.len) {
+                if (group == @intFromEnum(tls.NamedGroup.x25519) and kelen == 32 and ext_pos + 4 + 32 <= ext_data.len) {
                     @memcpy(&self.peer_x25519_public, ext_data[ext_pos + 4 ..][0..32]);
-                    self.negotiated_group = GROUP_X25519;
+                    self.negotiated_group = .x25519;
                     found_key_share = true;
-                } else if (group == GROUP_SECP256R1 and kelen == 65 and ext_pos + 4 + 65 <= ext_data.len) {
+                } else if (group == @intFromEnum(tls.NamedGroup.secp256r1) and kelen == 65 and ext_pos + 4 + 65 <= ext_data.len) {
                     @memcpy(&self.peer_p256_public, ext_data[ext_pos + 4 ..][0..65]);
-                    self.negotiated_group = GROUP_SECP256R1;
+                    self.negotiated_group = .secp256r1;
                     found_key_share = true;
                 } else {
                     return error.NoKeyShare;
@@ -1045,7 +1027,7 @@ pub const Tls13Handshake = struct {
 
         // Compute shared secret based on negotiated group
         var shared_secret: [32]u8 = undefined;
-        if (self.negotiated_group == GROUP_SECP256R1) {
+        if (self.negotiated_group == .secp256r1) {
             const peer_point = P256.fromSec1(self.peer_p256_public[0..65]) catch return error.KeyScheduleError;
             const shared_point = peer_point.mulPublic(self.p256_secret, .big) catch return error.KeyScheduleError;
             const shared_uncompressed = shared_point.toUncompressedSec1();
@@ -1329,10 +1311,10 @@ pub const Tls13Handshake = struct {
                         break;
                     }
                 } else {
-                    if (cs_id == CIPHER_SUITE_AES128_GCM_SHA256 and !cs_found) {
+                    if (cs_id == @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256) and !cs_found) {
                         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
                         cs_found = true;
-                    } else if (cs_id == CIPHER_SUITE_CHACHA20_POLY1305_SHA256 and !cs_found) {
+                    } else if (cs_id == @intFromEnum(tls.CipherSuite.CHACHA20_POLY1305_SHA256) and !cs_found) {
                         self.negotiated_cipher_suite = .chacha20_poly1305_sha256;
                         cs_found = true;
                     }
@@ -1376,12 +1358,12 @@ pub const Tls13Handshake = struct {
                         const group = readU16(ext_data[ext_pos + share_pos ..]);
                         const kelen = readU16(ext_data[ext_pos + share_pos + 2 ..]);
                         share_pos += 4;
-                        if (group == GROUP_X25519 and kelen == 32 and share_pos + 32 <= elen) {
+                        if (group == @intFromEnum(tls.NamedGroup.x25519) and kelen == 32 and share_pos + 32 <= elen) {
                             @memcpy(&self.peer_x25519_public, ext_data[ext_pos + share_pos ..][0..32]);
-                            self.negotiated_group = GROUP_X25519;
+                            self.negotiated_group = .x25519;
                             found_key_share = true;
                             break;
-                        } else if (group == GROUP_SECP256R1 and kelen == 65 and share_pos + 65 <= elen) {
+                        } else if (group == @intFromEnum(tls.NamedGroup.secp256r1) and kelen == 65 and share_pos + 65 <= elen) {
                             @memcpy(&self.peer_p256_public, ext_data[ext_pos + share_pos ..][0..65]);
                             found_p256 = true;
                         }
@@ -1389,7 +1371,7 @@ pub const Tls13Handshake = struct {
                     }
                     // Use P-256 if X25519 not found
                     if (!found_key_share and found_p256) {
-                        self.negotiated_group = GROUP_SECP256R1;
+                        self.negotiated_group = .secp256r1;
                         found_key_share = true;
                     }
                 }
@@ -1493,7 +1475,7 @@ pub const Tls13Handshake = struct {
 
         // Prepare key share based on negotiated group
         var ks_data_buf: [65]u8 = undefined;
-        const ks_data: []const u8 = if (self.negotiated_group == GROUP_SECP256R1) blk: {
+        const ks_data: []const u8 = if (self.negotiated_group == .secp256r1) blk: {
             // Generate P-256 ephemeral key pair
             sys.randomBytes(&self.p256_secret);
             self.p256_public = (P256.basePoint.mulPublic(self.p256_secret, .big) catch return error.KeyScheduleError).toUncompressedSec1();
@@ -1520,7 +1502,7 @@ pub const Tls13Handshake = struct {
 
         // Compute shared secret based on negotiated group
         var shared_secret: [32]u8 = undefined;
-        if (self.negotiated_group == GROUP_SECP256R1) {
+        if (self.negotiated_group == .secp256r1) {
             // P-256 ECDH: multiply peer's public key by our secret
             const peer_point = P256.fromSec1(self.peer_p256_public[0..65]) catch return error.KeyScheduleError;
             const shared_point = peer_point.mulPublic(self.p256_secret, .big) catch return error.KeyScheduleError;
@@ -1886,8 +1868,7 @@ pub const Tls13Handshake = struct {
 
         // Verify binder
         // binder_key = Derive-Secret(early_secret, "res binder", Hash(""))
-        var empty_hash: [32]u8 = undefined;
-        Sha256.hash("", &empty_hash, .{});
+        const empty_hash = tls.emptyHash(Sha256);
         const binder_key = quic_crypto.hkdfExpandLabel(temp_ks.early_secret, "res binder", &empty_hash, 32);
 
         // Partial ClientHello = up to and including identities field (RFC 8446 §4.2.11.2)
@@ -2096,9 +2077,9 @@ fn buildClientHello(
         // Offer both AES-128-GCM and ChaCha20-Poly1305
         writeU16(buf[pos..], 4);
         pos += 2;
-        writeU16(buf[pos..], CIPHER_SUITE_AES128_GCM_SHA256);
+        writeU16(buf[pos..], @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256));
         pos += 2;
-        writeU16(buf[pos..], CIPHER_SUITE_CHACHA20_POLY1305_SHA256);
+        writeU16(buf[pos..], @intFromEnum(tls.CipherSuite.CHACHA20_POLY1305_SHA256));
         pos += 2;
     }
 
@@ -2116,7 +2097,7 @@ fn buildClientHello(
     pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.supported_versions), 3);
     buf[pos] = 2; // list length
     pos += 1;
-    writeU16(buf[pos..], TLS13_VERSION);
+    writeU16(buf[pos..], @intFromEnum(tls.ProtocolVersion.tls_1_3));
     pos += 2;
 
     // key_share extension (X25519 + P-256)
@@ -2127,14 +2108,14 @@ fn buildClientHello(
     writeU16(buf[pos..], shares_total); // client_shares length
     pos += 2;
     // X25519 share (preferred)
-    writeU16(buf[pos..], GROUP_X25519);
+    writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.x25519));
     pos += 2;
     writeU16(buf[pos..], 32);
     pos += 2;
     @memcpy(buf[pos..][0..32], x25519_pub);
     pos += 32;
     // P-256 share (fallback)
-    writeU16(buf[pos..], GROUP_SECP256R1);
+    writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.secp256r1));
     pos += 2;
     writeU16(buf[pos..], 65);
     pos += 2;
@@ -2145,24 +2126,24 @@ fn buildClientHello(
     pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.signature_algorithms), 2 + 10);
     writeU16(buf[pos..], 10); // list length (5 algorithms x 2 bytes)
     pos += 2;
-    writeU16(buf[pos..], SIG_ED25519);
+    writeU16(buf[pos..], @intFromEnum(tls.SignatureScheme.ed25519));
     pos += 2;
-    writeU16(buf[pos..], SIG_ECDSA_P256_SHA256);
+    writeU16(buf[pos..], @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256));
     pos += 2;
-    writeU16(buf[pos..], SIG_RSA_PSS_RSAE_SHA256);
+    writeU16(buf[pos..], @intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha256));
     pos += 2;
-    writeU16(buf[pos..], SIG_RSA_PSS_RSAE_SHA384);
+    writeU16(buf[pos..], @intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha384));
     pos += 2;
-    writeU16(buf[pos..], SIG_RSA_PSS_RSAE_SHA512);
+    writeU16(buf[pos..], @intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha512));
     pos += 2;
 
     // supported_groups extension
     pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.supported_groups), 2 + 4);
     writeU16(buf[pos..], 4); // list length (2 groups x 2 bytes)
     pos += 2;
-    writeU16(buf[pos..], GROUP_X25519);
+    writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.x25519));
     pos += 2;
-    writeU16(buf[pos..], GROUP_SECP256R1);
+    writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.secp256r1));
     pos += 2;
 
     // SNI extension
@@ -2264,8 +2245,7 @@ fn buildClientHello(
 
         // Now compute the real binder
         // binder_key = Derive-Secret(early_secret, "res binder", Hash(""))
-        var empty_hash: [32]u8 = undefined;
-        Sha256.hash("", &empty_hash, .{});
+        const empty_hash = tls.emptyHash(Sha256);
         const binder_key = quic_crypto.hkdfExpandLabel(key_schedule.early_secret, "res binder", &empty_hash, 32);
 
         // partial_ch = everything up to and including identities (RFC 8446 §4.2.11.2)
@@ -2298,7 +2278,7 @@ fn buildClientHello(
 fn buildServerHello(
     buf: []u8,
     server_random: *const [32]u8,
-    key_share_group: u16,
+    key_share_group: tls.NamedGroup,
     key_share_data: []const u8,
     session_id_echo: []const u8,
     using_psk: bool,
@@ -2337,13 +2317,13 @@ fn buildServerHello(
 
     // supported_versions
     pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.supported_versions), 2);
-    writeU16(buf[pos..], TLS13_VERSION);
+    writeU16(buf[pos..], @intFromEnum(tls.ProtocolVersion.tls_1_3));
     pos += 2;
 
     // key_share (server's key)
     const ks_len: u16 = @intCast(2 + 2 + key_share_data.len);
     pos = writeExtHeader(buf, pos, @intFromEnum(ExtType.key_share), ks_len);
-    writeU16(buf[pos..], key_share_group);
+    writeU16(buf[pos..], @intFromEnum(key_share_group));
     pos += 2;
     writeU16(buf[pos..], @intCast(key_share_data.len));
     pos += 2;
@@ -2495,7 +2475,7 @@ fn buildCertificateVerify(
             const sig = key_pair.sign(&sign_content, null) catch return error.InternalError;
             const sig_bytes = sig.toDer(&sig_storage);
             sig_len = sig_bytes.len;
-            break :sig_algo SIG_ECDSA_P256_SHA256;
+            break :sig_algo @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256);
         },
         .ed25519 => sig_algo: {
             const key_pair = Ed25519.KeyPair.generateDeterministic(private_key_bytes[0..32].*) catch return error.InternalError;
@@ -2503,7 +2483,7 @@ fn buildCertificateVerify(
             const sig_bytes = sig.toBytes();
             @memcpy(sig_storage[0..sig_bytes.len], &sig_bytes);
             sig_len = sig_bytes.len;
-            break :sig_algo SIG_ED25519;
+            break :sig_algo @intFromEnum(tls.SignatureScheme.ed25519);
         },
     };
 
@@ -2539,12 +2519,11 @@ fn writeExtHeader(buf: []u8, pos: usize, ext_type: u16, ext_len: usize) usize {
 }
 
 fn readU16(data: []const u8) u16 {
-    return (@as(u16, data[0]) << 8) | @as(u16, data[1]);
+    return std.mem.readInt(u16, data[0..2], .big);
 }
 
 fn writeU16(buf: []u8, val: u16) void {
-    buf[0] = @intCast(val >> 8);
-    buf[1] = @intCast(val & 0xff);
+    std.mem.writeInt(u16, buf[0..2], val, .big);
 }
 
 // ─── Minimal PEM parser ──────────────────────────────────────────────
@@ -2875,7 +2854,7 @@ test "buildServerHello: produces valid message" {
     @memset(&client_random, 0xAA);
 
     var buf: [512]u8 = undefined;
-    const msg = try buildServerHello(&buf, &random, GROUP_X25519, &pub_key, &client_random, false, .aes_128_gcm_sha256);
+    const msg = try buildServerHello(&buf, &random, .x25519, &pub_key, &client_random, false, .aes_128_gcm_sha256);
 
     try std.testing.expectEqual(@as(u8, @intFromEnum(MsgType.server_hello)), msg[0]);
     const body_len = (@as(usize, msg[1]) << 16) | (@as(usize, msg[2]) << 8) | @as(usize, msg[3]);
@@ -2990,8 +2969,7 @@ test "PSK binder computation: deterministic and correct" {
     _ = &ks_zero;
 
     // binder_key = Derive-Secret(early_secret, "res binder", Hash(""))
-    var empty_hash: [32]u8 = undefined;
-    Sha256.hash("", &empty_hash, .{});
+    const empty_hash = tls.emptyHash(Sha256);
     const binder_key = quic_crypto.hkdfExpandLabel(ks.early_secret, "res binder", &empty_hash, 32);
 
     // Compute binder for a fake partial transcript
