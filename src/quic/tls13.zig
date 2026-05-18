@@ -1237,7 +1237,10 @@ pub const Tls13Handshake = struct {
             transcript_hash,
         );
 
-        if (!std.mem.eql(u8, body, &expected)) return error.BadFinished;
+        // Constant-time MAC compare (RFC 8446 §4.4.4). Length is public
+        // (fixed by the cipher suite hash), the verify_data is secret.
+        if (body.len != expected.len or
+            !crypto.timing_safe.eql([expected.len]u8, body[0..expected.len].*, expected)) return error.BadFinished;
 
         // Update transcript with server Finished
         self.transcript.update(msg);
@@ -1681,7 +1684,10 @@ pub const Tls13Handshake = struct {
             transcript_hash,
         );
 
-        if (!std.mem.eql(u8, body, &expected)) return error.BadFinished;
+        // Constant-time MAC compare (RFC 8446 §4.4.4). Length is public
+        // (fixed by the cipher suite hash), the verify_data is secret.
+        if (body.len != expected.len or
+            !crypto.timing_safe.eql([expected.len]u8, body[0..expected.len].*, expected)) return error.BadFinished;
 
         self.transcript.update(msg);
 
@@ -1903,7 +1909,8 @@ pub const Tls13Handshake = struct {
         const expected_binder = KeySchedule.computeFinishedVerifyData(binder_key, partial_transcript);
         _ = &partial_transcript;
 
-        if (!std.mem.eql(u8, received_binder, &expected_binder)) {
+        // Constant-time compare of the PSK binder HMAC (RFC 8446 §4.2.11.2).
+        if (!crypto.timing_safe.eql([expected_binder.len]u8, received_binder.*, expected_binder)) {
             std.log.warn("PSK binder verification failed, falling back to full handshake", .{});
             return;
         }

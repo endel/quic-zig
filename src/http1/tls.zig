@@ -207,7 +207,8 @@ pub const TlsStream = struct {
                     transcript.current(),
                 );
                 if (inner_data.len < 36) return error.BadFinished;
-                if (!std.mem.eql(u8, inner_data[4..36], &expected_vd)) return error.BadFinished;
+                // Constant-time MAC compare (RFC 8446 §4.4.4).
+                if (!crypto.timing_safe.eql([32]u8, inner_data[4..36].*, expected_vd)) return error.BadFinished;
                 transcript.update(inner_data);
                 got_finished = true;
             }

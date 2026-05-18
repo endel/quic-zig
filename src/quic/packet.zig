@@ -701,7 +701,9 @@ pub fn verifyRetryIntegrity(
     const packet_without_tag = raw_packet[0 .. raw_packet.len - RETRY_INTEGRITY_TAG_SIZE];
     const received_tag = raw_packet[raw_packet.len - RETRY_INTEGRITY_TAG_SIZE ..];
     const expected_tag = try computeRetryIntegrityTag(packet_without_tag, odcid, version);
-    return std.mem.eql(u8, received_tag, &expected_tag);
+    // Constant-time compare of the Retry integrity AEAD tag (RFC 9001 §5.8):
+    // a non-constant-time check is an authentication-tag oracle.
+    return std.crypto.timing_safe.eql([RETRY_INTEGRITY_TAG_SIZE]u8, received_tag[0..RETRY_INTEGRITY_TAG_SIZE].*, expected_tag);
 }
 
 // Encrypted Retry token format:

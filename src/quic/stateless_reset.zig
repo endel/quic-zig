@@ -46,7 +46,9 @@ pub fn isStatelessReset(data: []const u8, tokens: []const [TOKEN_LEN]u8) bool {
 
     const packet_token = data[data.len - TOKEN_LEN ..][0..TOKEN_LEN];
     for (tokens) |known_token| {
-        if (std.mem.eql(u8, packet_token, &known_token)) return true;
+        // Constant-time compare: the reset token is a secret; a timing
+        // oracle here would leak it (RFC 9000 §10.3).
+        if (crypto.timing_safe.eql([TOKEN_LEN]u8, packet_token.*, known_token)) return true;
     }
     return false;
 }
