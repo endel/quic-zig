@@ -105,10 +105,11 @@ async function runBenchmark() {
     log(`=== Datagram (${iterations} iterations) ===`, 'info');
     const dgTimes = [];
     const dgReader = transport.datagrams.readable.getReader();
+    const dgWritable = transport.datagrams.writable ?? transport.datagrams.createWritable();
 
     for (let i = 0; i < iterations; i++) {
       const start = performance.now();
-      const dgWriter = transport.datagrams.writable.getWriter();
+      const dgWriter = dgWritable.getWriter();
       await dgWriter.write(new TextEncoder().encode('ping'));
       dgWriter.releaseLock();
       const { value } = await dgReader.read();

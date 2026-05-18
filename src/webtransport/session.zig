@@ -230,6 +230,9 @@ pub const WebTransportConnection = struct {
         const stream = try self.quic.openStream();
         const stream_id = stream.stream_id;
         stream.send.send_order = send_order;
+        // WT streams have no defined inter-stream ordering; round-robin
+        // interleaving is the correct scheduling (also the quicperf path).
+        stream.send.incremental = true;
 
         // Write WT bidi stream type prefix
         var prefix_buf: [16]u8 = undefined;
@@ -248,6 +251,9 @@ pub const WebTransportConnection = struct {
         const send_stream = try self.quic.openUniStream();
         const stream_id = send_stream.stream_id;
         send_stream.send_order = send_order;
+        // WT streams have no defined inter-stream ordering; round-robin
+        // interleaving is the correct scheduling (also the quicperf path).
+        send_stream.incremental = true;
 
         // Write WT uni stream type prefix
         var prefix_buf: [16]u8 = undefined;

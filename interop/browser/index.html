@@ -65,8 +65,8 @@
   <h2>Connection <span id="status" class="status status-disconnected">Disconnected</span></h2>
   <label for="url">Server URL</label>
   <input type="text" id="url" value="https://127.0.0.1:4433">
-  <label for="hash">Certificate SHA-256 (hex)</label>
-  <input type="text" id="hash" placeholder="paste hex hash from server output">
+  <label for="hash">Certificate SHA-256 (hex) — leave empty for CA-trusted cert</label>
+  <input type="text" id="hash" placeholder="(optional) paste hex hash from server output">
   <div style="display:flex;gap:10px;margin-top:4px;">
     <button id="btnConnect" class="btn-primary" onclick="doConnect()">Connect</button>
     <button id="btnDisconnect" class="btn-danger" onclick="doDisconnect()" disabled>Disconnect</button>
@@ -136,27 +136,33 @@ async function doConnect() {
   const url = document.getElementById('url').value.trim();
   const hashHex = document.getElementById('hash').value.trim();
 
-  if (!hashHex || hashHex.length !== 64) {
-    log('Certificate hash must be 64 hex characters (SHA-256)', 'error');
+  // Empty hash = rely on CA trust (useful when hitting a server with a
+  // Let's Encrypt cert). Any non-empty value must be a 64-char SHA-256 hex.
+  let wtOptions;
+  if (hashHex === '') {
+    wtOptions = undefined;
+  } else if (hashHex.length === 64) {
+    wtOptions = {
+      serverCertificateHashes: [{
+        algorithm: 'sha-256',
+        value: hexToBytes(hashHex).buffer,
+      }],
+    };
+  } else {
+    log('Certificate hash, when provided, must be 64 hex characters (SHA-256). Leave empty to rely on CA trust.', 'error');
     return;
   }
 
-  const hashBytes = hexToBytes(hashHex);
   setStatus('connecting');
   connectCount++;
   const thisConnect = connectCount;
   const label = thisConnect === 1 ? 'Initial' : `Reconnect #${thisConnect - 1}`;
-  log(`${label}: connecting to ${url}...`);
+  log(`${label}: connecting to ${url} (${wtOptions ? 'pinned cert hash' : 'CA trust'})...`);
 
   const t0 = performance.now();
 
   try {
-    transport = new WebTransport(url, {
-      serverCertificateHashes: [{
-        algorithm: 'sha-256',
-        value: hashBytes.buffer
-      }]
-    });
+    transport = wtOptions ? new WebTransport(url, wtOptions) : new WebTransport(url);
 
     transport.closed.then(() => {
       log('Connection closed', 'warn');
@@ -227,10 +233,10 @@ async function sendBidi() {
   try {
     const stream = await transport.createBidirectionalStream();
     const writer = stream.writable.getWriter();
-    await writer.write(new TextEncoder().encode(msg));
-    await writer.close();
-
     const reader = stream.readable.getReader();
+    await writer.write(new TextEncoder().encode(msg));
+    writer.close().catch(() => {});
+
     let response = '';
     while (true) {
       const { value, done } = await reader.read();
@@ -252,7 +258,8 @@ async function sendDatagram() {
   log(`→ Datagram: "${msg}"`, 'send');
 
   try {
-    const writer = transport.datagrams.writable.getWriter();
+    const writable = transport.datagrams.writable ?? transport.datagrams.createWritable();
+    const writer = writable.getWriter();
     await writer.write(new TextEncoder().encode(msg));
     writer.releaseLock();
     log('→ Datagram sent', 'send');

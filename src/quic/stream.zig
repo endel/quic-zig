@@ -373,7 +373,10 @@ pub const SendStream = struct {
     urgency: u3 = 3,
 
     /// RFC 9218 priority: incremental streams are interleaved round-robin.
-    incremental: bool = true,
+    /// RFC 9218 §4.2: the default is non-incremental (sequential). Protocol
+    /// adapters that want round-robin multiplexing (WebTransport, HTTP/0.9)
+    /// opt in explicitly at their stream-open boundary.
+    incremental: bool = false,
 
     /// WebTransport sendOrder: higher values transmitted first. When set,
     /// takes precedence over RFC 9218 urgency for scheduling.
