@@ -15,6 +15,12 @@ pub const QlogWriter = struct {
 
     const Self = @This();
 
+    /// No-op where there is no filesystem (ESP-IDF): call sites keep their
+    /// `if (conn.qlog_writer) |*ql|` shape, the writer just never exists.
+    fn emit(self: *Self, bytes: []const u8) void {
+        self.file.writeAll(bytes) catch {};
+    }
+
     pub fn init(dir_path: []const u8, odcid: []const u8, is_server: bool) ?Self {
         // Ensure directory exists (ignore "already exists")
         sys.makeDir(dir_path) catch |err| switch (err) {
@@ -88,7 +94,7 @@ pub const QlogWriter = struct {
         @memcpy(buf[pos..][0..tail.len], tail);
         pos += tail.len;
 
-        self.file.writeAll(buf[0..pos]) catch {};
+        self.emit(buf[0..pos]);
     }
 
     // ── Time helper ──────────────────────────────────────────────────────
@@ -104,42 +110,42 @@ pub const QlogWriter = struct {
         var buf: [256]u8 = undefined;
         const time_ms = self.relativeTimeMs(now);
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"transport:connection_started\",\"data\":{{}}}}\n", .{time_ms}) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     pub fn connectionClosed(self: *Self, now: i64, trigger: []const u8, error_code: u64) void {
         var buf: [512]u8 = undefined;
         const time_ms = self.relativeTimeMs(now);
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"transport:connection_closed\",\"data\":{{\"trigger\":\"{s}\",\"connection_code\":{d}}}}}\n", .{ time_ms, trigger, error_code }) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     pub fn parametersSet(self: *Self, now: i64, owner: []const u8, params_json: []const u8) void {
         var buf: [1024]u8 = undefined;
         const time_ms = self.relativeTimeMs(now);
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"transport:parameters_set\",\"data\":{{\"owner\":\"{s}\",{s}}}}}\n", .{ time_ms, owner, params_json }) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     pub fn packetSent(self: *Self, now: i64, pkt_type: []const u8, pn: u64, length: usize, frames_json: []const u8) void {
         var buf: [4096]u8 = undefined;
         const time_ms = self.relativeTimeMs(now);
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"transport:packet_sent\",\"data\":{{\"header\":{{\"packet_type\":\"{s}\",\"packet_number\":{d}}},\"raw\":{{\"length\":{d}}},\"frames\":[{s}]}}}}\n", .{ time_ms, pkt_type, pn, length, frames_json }) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     pub fn packetReceived(self: *Self, now: i64, pkt_type: []const u8, pn: u64, length: usize, frames_json: []const u8) void {
         var buf: [4096]u8 = undefined;
         const time_ms = self.relativeTimeMs(now);
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"transport:packet_received\",\"data\":{{\"header\":{{\"packet_type\":\"{s}\",\"packet_number\":{d}}},\"raw\":{{\"length\":{d}}},\"frames\":[{s}]}}}}\n", .{ time_ms, pkt_type, pn, length, frames_json }) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     pub fn packetDropped(self: *Self, now: i64, pkt_type: []const u8, trigger: []const u8) void {
         var buf: [512]u8 = undefined;
         const time_ms = self.relativeTimeMs(now);
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"transport:packet_dropped\",\"data\":{{\"header\":{{\"packet_type\":\"{s}\"}},\"trigger\":\"{s}\"}}}}\n", .{ time_ms, pkt_type, trigger }) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     pub fn metricsUpdated(self: *Self, now: i64, min_rtt_ns: i64, smoothed_rtt_ns: i64, latest_rtt_ns: i64, rttvar_ns: i64, cwnd: u64, bytes_in_flight: u64) void {
@@ -150,35 +156,35 @@ pub const QlogWriter = struct {
         const latest = @as(f64, @floatFromInt(latest_rtt_ns)) / 1_000_000.0;
         const rttvar = @as(f64, @floatFromInt(rttvar_ns)) / 1_000_000.0;
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"recovery:metrics_updated\",\"data\":{{\"min_rtt\":{d:.3},\"smoothed_rtt\":{d:.3},\"latest_rtt\":{d:.3},\"rtt_variance\":{d:.3},\"congestion_window\":{d},\"bytes_in_flight\":{d}}}}}\n", .{ time_ms, min_rtt, srtt, latest, rttvar, cwnd, bytes_in_flight }) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     pub fn congestionStateUpdated(self: *Self, now: i64, new_state: []const u8) void {
         var buf: [256]u8 = undefined;
         const time_ms = self.relativeTimeMs(now);
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"recovery:congestion_state_updated\",\"data\":{{\"new\":\"{s}\"}}}}\n", .{ time_ms, new_state }) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     pub fn packetLost(self: *Self, now: i64, pkt_type: []const u8, pn: u64, trigger: []const u8) void {
         var buf: [256]u8 = undefined;
         const time_ms = self.relativeTimeMs(now);
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"recovery:packet_lost\",\"data\":{{\"header\":{{\"packet_type\":\"{s}\",\"packet_number\":{d}}},\"trigger\":\"{s}\"}}}}\n", .{ time_ms, pkt_type, pn, trigger }) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     pub fn keyUpdated(self: *Self, now: i64, trigger: []const u8, key_type: []const u8) void {
         var buf: [256]u8 = undefined;
         const time_ms = self.relativeTimeMs(now);
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"security:key_updated\",\"data\":{{\"trigger\":\"{s}\",\"key_type\":\"{s}\"}}}}\n", .{ time_ms, trigger, key_type }) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     pub fn keyDiscarded(self: *Self, now: i64, key_type: []const u8) void {
         var buf: [256]u8 = undefined;
         const time_ms = self.relativeTimeMs(now);
         const len = std.fmt.bufPrint(&buf, "{{\"time\":{d:.3},\"name\":\"security:key_discarded\",\"data\":{{\"key_type\":\"{s}\"}}}}\n", .{ time_ms, key_type }) catch return;
-        self.file.writeAll(len) catch {};
+        self.emit(len);
     }
 
     // ── Frame serialization helpers ──────────────────────────────────────

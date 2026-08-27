@@ -169,9 +169,12 @@ pub const ConnectionManager = struct {
             return error.TooManyConnections;
         }
 
-        // Heap-allocate Connection
+        // Heap-allocate Connection, then build it in place: the by-value
+        // accept() would stage all ~185 KB on the stack first.
         const conn = try self.allocator.create(connection.Connection);
-        conn.* = try connection.Connection.accept(
+        errdefer self.allocator.destroy(conn);
+        try connection.Connection.acceptInto(
+            conn,
             self.allocator,
             header,
             local,
@@ -185,7 +188,7 @@ pub const ConnectionManager = struct {
 
         // Create entry
         const entry = try self.allocator.create(ConnEntry);
-        entry.* = ConnEntry{ .conn = conn };
+        entry.* = .{ .conn = conn };
 
         // Register server's SCID in the routing map
         const scid_key = CidKey.fromSlice(conn.scid[0..conn.scid_len]);
@@ -376,7 +379,10 @@ pub const ConnectionManager = struct {
                 }
             }
 
-            const e = entry.?;
+            // ReleaseSmall has no safety checks, so `entry.?` on a null
+            // optional is a wild dereference rather than a panic. Every branch
+            // above assigns or returns; drop the datagram if that ever changes.
+            const e = entry orelse return .{ .dropped = {} };
             // Only count datagram_size for the first packet in a coalesced datagram
             // to avoid double-counting in amplification limit calculations.
             const dg_size: u64 = if (current_entry == null) bytes.len else 0;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const limits = @import("../quic/limits.zig");
 const testing = std.testing;
 const huffman = @import("huffman.zig");
 
@@ -198,7 +199,8 @@ fn decodeString(data: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usiz
     const is_huffman = (data[pos.*] & 0x80) != 0;
 
     const len = try decodeInteger(data, pos, 7);
-    if (pos.* + len > data.len) return error.BufferTooShort;
+    // Subtract rather than add: `len` is an unchecked wire varint.
+    if (len > data.len - pos.*) return error.BufferTooShort;
 
     const raw = data[pos.*..][0..len];
     pos.* += len;
@@ -228,23 +230,22 @@ fn decodeString(data: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usiz
 /// Entry overhead per RFC 9204 §3.2.1: name.len + value.len + 32.
 const ENTRY_OVERHEAD: usize = 32;
 
-/// A single dynamic table entry with inline storage.
+/// A view of one dynamic table entry. The slices point into the table's
+/// arena and stay valid until that entry is evicted.
 pub const DynEntry = struct {
-    name_buf: [128]u8 = undefined,
-    name_len: u8 = 0,
-    value_buf: [512]u8 = undefined,
-    value_len: u16 = 0,
+    name: []const u8,
+    value: []const u8,
 
-    pub fn getName(self: *const DynEntry) []const u8 {
-        return self.name_buf[0..self.name_len];
+    pub fn getName(self: DynEntry) []const u8 {
+        return self.name;
     }
 
-    pub fn getValue(self: *const DynEntry) []const u8 {
-        return self.value_buf[0..self.value_len];
+    pub fn getValue(self: DynEntry) []const u8 {
+        return self.value;
     }
 
-    pub fn entrySize(self: *const DynEntry) usize {
-        return @as(usize, self.name_len) + @as(usize, self.value_len) + ENTRY_OVERHEAD;
+    pub fn entrySize(self: DynEntry) usize {
+        return self.name.len + self.value.len + ENTRY_OVERHEAD;
     }
 };
 
@@ -253,91 +254,135 @@ fn computeEntrySize(name: []const u8, value: []const u8) usize {
     return name.len + value.len + ENTRY_OVERHEAD;
 }
 
-/// FIFO dynamic table with ring buffer storage.
+/// FIFO dynamic table (RFC 9204 §3.2).
+///
+/// Names and values live in one arena sized to the capacity we are willing
+/// to advertise, indexed by a ring of small descriptors. The protocol bounds
+/// total content by the negotiated capacity — `insert` enforces it — so the
+/// arena cannot overflow, and there is no per-entry size limit beyond what
+/// the capacity itself implies.
 pub const DynamicTable = struct {
-    const MAX_ENTRIES = 128;
+    /// Also the arena size: content can never exceed the capacity.
+    pub const MAX_CAPACITY: usize = limits.qpack_table_capacity;
+    /// An entry costs at least ENTRY_OVERHEAD, so this many is the most the
+    /// capacity can ever hold.
+    const MAX_ENTRIES: usize = MAX_CAPACITY / ENTRY_OVERHEAD;
 
-    entries: [MAX_ENTRIES]DynEntry = undefined,
-    head: usize = 0, // next write position (newest)
+    const Desc = struct {
+        off: u32 = 0,
+        name_len: u16 = 0,
+        value_len: u16 = 0,
+    };
+
+    arena: [MAX_CAPACITY]u8 = undefined,
+    descs: [MAX_ENTRIES]Desc = undefined,
+    /// Bytes of arena consumed. Live content is always [tail.off, used).
+    used: usize = 0,
+    head: usize = 0, // next descriptor slot (newest)
     count: usize = 0, // current entry count
-    size: usize = 0, // current size in bytes
+    size: usize = 0, // current size in bytes, per RFC accounting
     capacity: usize = 0, // max size in bytes (from SETTINGS)
     insert_count: u64 = 0, // total insertions ever (absolute index base)
 
-    /// Set the capacity, evicting entries if needed.
+    fn tailIndex(self: *const DynamicTable) usize {
+        return (self.head + MAX_ENTRIES - self.count) % MAX_ENTRIES;
+    }
+
+    fn entryAt(self: *const DynamicTable, ring_idx: usize) DynEntry {
+        const d = self.descs[ring_idx];
+        return .{
+            .name = self.arena[d.off..][0..d.name_len],
+            .value = self.arena[d.off + d.name_len ..][0..d.value_len],
+        };
+    }
+
+    /// Set the capacity, evicting entries if needed. A peer asking for more
+    /// than we sized the arena for is clamped, not trusted.
     pub fn setCapacity(self: *DynamicTable, cap: usize) void {
-        self.capacity = cap;
+        self.capacity = @min(cap, MAX_CAPACITY);
         while (self.size > self.capacity and self.count > 0) {
             self.evict();
         }
     }
 
-    /// Insert a new entry. Returns error if name/value too large for inline storage.
-    pub fn insert(self: *DynamicTable, name: []const u8, value: []const u8) !void {
-        if (name.len > 128) return error.NameTooLong;
-        if (value.len > 512) return error.ValueTooLong;
+    /// Slide the live entries back to the start of the arena. They are always
+    /// contiguous — insertion only ever appends, eviction only ever drops the
+    /// oldest — so this is one move plus an offset fixup.
+    fn compact(self: *DynamicTable) void {
+        const tail = self.tailIndex();
+        const base = self.descs[tail].off;
+        if (base == 0) return;
+        const live = self.used - base;
+        std.mem.copyForwards(u8, self.arena[0..live], self.arena[base..][0..live]);
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            const idx = (tail + i) % MAX_ENTRIES;
+            self.descs[idx].off -= base;
+        }
+        self.used = live;
+    }
 
+    /// Insert a new entry, evicting oldest-first to make room.
+    pub fn insert(self: *DynamicTable, name: []const u8, value: []const u8) !void {
         const entry_size = computeEntrySize(name, value);
         if (entry_size > self.capacity) return error.EntryTooLarge;
 
-        // Evict until there's room
         while (self.size + entry_size > self.capacity and self.count > 0) {
             self.evict();
         }
 
-        // Write at head
-        var entry = &self.entries[self.head];
-        @memcpy(entry.name_buf[0..name.len], name);
-        entry.name_len = @intCast(name.len);
-        @memcpy(entry.value_buf[0..value.len], value);
-        entry.value_len = @intCast(value.len);
+        const content = name.len + value.len;
+        if (self.used + content > MAX_CAPACITY) self.compact();
 
+        const off: u32 = @intCast(self.used);
+        @memcpy(self.arena[off..][0..name.len], name);
+        @memcpy(self.arena[off + name.len ..][0..value.len], value);
+
+        self.descs[self.head] = .{
+            .off = off,
+            .name_len = @intCast(name.len),
+            .value_len = @intCast(value.len),
+        };
         self.head = (self.head + 1) % MAX_ENTRIES;
+        self.used += content;
         self.count += 1;
         self.size += entry_size;
         self.insert_count += 1;
     }
 
-    /// Evict the oldest entry (tail of the FIFO).
+    /// Evict the oldest entry (tail of the FIFO). Arena space is reclaimed
+    /// lazily by `compact`.
     fn evict(self: *DynamicTable) void {
         if (self.count == 0) return;
-        // tail index: head points one past newest, so oldest is at head - count
-        const tail = (self.head + MAX_ENTRIES - self.count) % MAX_ENTRIES;
-        self.size -= self.entries[tail].entrySize();
+        const tail = self.tailIndex();
+        self.size -= self.entryAt(tail).entrySize();
         self.count -= 1;
+        if (self.count == 0) self.used = 0;
     }
 
     /// Get entry by absolute index (0 = first ever inserted).
     /// Returns null if the entry has been evicted or not yet inserted.
-    pub fn get(self: *const DynamicTable, abs_idx: u64) ?*const DynEntry {
-        // Absolute index range of entries currently in the table:
-        // oldest = insert_count - count, newest = insert_count - 1
+    pub fn get(self: *const DynamicTable, abs_idx: u64) ?DynEntry {
         if (self.count == 0) return null;
         const oldest = self.insert_count - self.count;
         if (abs_idx < oldest or abs_idx >= self.insert_count) return null;
 
-        // Map to ring buffer position
-        // The newest entry is at (head - 1), abs_idx = insert_count - 1
-        // offset from newest = (insert_count - 1) - abs_idx
         const offset_from_newest = self.insert_count - 1 - abs_idx;
-        const ring_idx = (self.head + MAX_ENTRIES - 1 - offset_from_newest) % MAX_ENTRIES;
-        return &self.entries[ring_idx];
+        const ring_idx = (self.head + MAX_ENTRIES - 1 - @as(usize, @intCast(offset_from_newest))) % MAX_ENTRIES;
+        return self.entryAt(ring_idx);
     }
 
     /// Get entry by relative index from a given base.
     /// RFC 9204 §3.2.3: relative index = base - absolute_index - 1
-    /// So absolute_index = base - relative_index - 1
-    pub fn getRelative(self: *const DynamicTable, base: u64, rel_idx: u64) ?*const DynEntry {
+    pub fn getRelative(self: *const DynamicTable, base: u64, rel_idx: u64) ?DynEntry {
         if (rel_idx >= base) return null;
-        const abs_idx = base - rel_idx - 1;
-        return self.get(abs_idx);
+        return self.get(base - rel_idx - 1);
     }
 
     /// Get entry by post-base index.
     /// RFC 9204 §3.2.3: absolute_index = base + post_base_index
-    pub fn getPostBase(self: *const DynamicTable, base: u64, post_base_idx: u64) ?*const DynEntry {
-        const abs_idx = base + post_base_idx;
-        return self.get(abs_idx);
+    pub fn getPostBase(self: *const DynamicTable, base: u64, post_base_idx: u64) ?DynEntry {
+        return self.get(base + post_base_idx);
     }
 
     /// Result of a dynamic table search.
@@ -353,7 +398,6 @@ pub const DynamicTable = struct {
         var name_match: ?u64 = null;
         const oldest = self.insert_count - self.count;
 
-        // Search from newest to oldest for best match
         var i: u64 = self.insert_count;
         while (i > oldest) {
             i -= 1;
@@ -362,15 +406,11 @@ pub const DynamicTable = struct {
                 if (std.mem.eql(u8, entry.getValue(), value)) {
                     return .{ .abs_index = i, .full_match = true };
                 }
-                if (name_match == null) {
-                    name_match = i;
-                }
+                if (name_match == null) name_match = i;
             }
         }
 
-        if (name_match) |idx| {
-            return .{ .abs_index = idx, .full_match = false };
-        }
+        if (name_match) |idx| return .{ .abs_index = idx, .full_match = false };
         return null;
     }
 
@@ -411,18 +451,18 @@ fn decodeRequiredInsertCount(encoded: u64, max_entries: u64, total_insert_count:
 
 pub const QpackEncoder = struct {
     dynamic: DynamicTable = .{},
-    max_capacity: usize = 0,
     instruction_buf: [4096]u8 = undefined,
     instruction_len: usize = 0,
 
     /// Set capacity from peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY.
     pub fn setCapacity(self: *QpackEncoder, cap: usize) void {
-        self.max_capacity = cap;
         self.dynamic.setCapacity(cap);
-        // Emit Set Dynamic Table Capacity instruction: 001XXXXX (5-bit prefix)
-        if (cap > 0) {
+        // Announce what we will actually hold, not what was asked for:
+        // setCapacity clamps to the arena size.
+        const effective = self.dynamic.capacity;
+        if (effective > 0) {
             var pos = self.instruction_len;
-            encodeInteger(&self.instruction_buf, &pos, cap, 5, 0x20);
+            encodeInteger(&self.instruction_buf, &pos, effective, 5, 0x20);
             self.instruction_len = pos;
         }
     }
@@ -430,7 +470,7 @@ pub const QpackEncoder = struct {
     /// Encode headers into a QPACK header block, using dynamic table when possible.
     /// Returns the number of bytes written to buf.
     pub fn encode(self: *QpackEncoder, headers: []const Header, buf: []u8) !usize {
-        if (self.max_capacity == 0) {
+        if (self.dynamic.capacity == 0) {
             // No dynamic table — use static-only encoding
             return encodeHeaders(headers, buf);
         }
@@ -543,9 +583,6 @@ pub const QpackEncoder = struct {
     /// Try to insert an entry with a static name reference.
     /// Emits "Insert with Name Reference" encoder instruction.
     fn tryInsertWithStaticNameRef(self: *QpackEncoder, static_idx: u8, value: []const u8) void {
-        if (value.len > 512) return; // too large for inline storage
-        if (computeEntrySize(static_table[static_idx].name, value) > self.dynamic.capacity) return;
-
         self.dynamic.insert(static_table[static_idx].name, value) catch return;
 
         // Encoder instruction: 1TNNNNNN — T=1 for static, 6-bit index
@@ -559,9 +596,6 @@ pub const QpackEncoder = struct {
     /// Try to insert an entry with a literal name.
     /// Emits "Insert with Literal Name" encoder instruction.
     fn tryInsertWithLiteralName(self: *QpackEncoder, name: []const u8, value: []const u8) void {
-        if (name.len > 128 or value.len > 512) return;
-        if (computeEntrySize(name, value) > self.dynamic.capacity) return;
-
         self.dynamic.insert(name, value) catch return;
 
         // Encoder instruction: 01NNNNNN — 5-bit name length prefix with H=0
@@ -1522,15 +1556,64 @@ test "DynamicTable: insert entry larger than capacity fails" {
     );
 }
 
-test "DynamicTable: insert rejects over-long name/value" {
+test "DynamicTable: capacity is the only size limit" {
     var dt = DynamicTable{};
-    dt.setCapacity(100000);
+    dt.setCapacity(DynamicTable.MAX_CAPACITY);
 
-    // name > 128 bytes
-    const huge_name = "x" ** 200;
-    try testing.expectError(error.NameTooLong, dt.insert(huge_name, "v"));
+    // Names and values used to be capped at 128 and 512 bytes by their inline
+    // buffers, so a long-but-legal header could not be indexed at all.
+    const long_name = "x" ** 200;
+    const long_value = "v" ** 600;
+    try dt.insert(long_name, long_value);
+    const e = dt.get(0).?;
+    try testing.expectEqualStrings(long_name, e.getName());
+    try testing.expectEqualStrings(long_value, e.getValue());
 
-    // value > 512 bytes
-    const huge_value = "v" ** 600;
-    try testing.expectError(error.ValueTooLong, dt.insert("name", huge_value));
+    // What does not fit in the capacity is still rejected.
+    try testing.expectError(error.EntryTooLarge, dt.insert("n", "v" ** (DynamicTable.MAX_CAPACITY)));
+}
+
+test "DynamicTable: arena is reused as entries are evicted" {
+    var dt = DynamicTable{};
+    dt.setCapacity(DynamicTable.MAX_CAPACITY);
+
+    // Churn far more content than the arena holds, forcing repeated eviction
+    // and compaction, and check the survivors stay intact throughout.
+    var buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const name = try std.fmt.bufPrint(&buf, "header-{d}", .{i});
+        var vbuf: [200]u8 = undefined;
+        const value = try std.fmt.bufPrint(&vbuf, "value-{d}-{s}", .{ i, "p" ** 100 });
+        try dt.insert(name, value);
+
+        // The newest entry must always read back exactly.
+        const newest = dt.get(dt.insert_count - 1).?;
+        try testing.expectEqualStrings(name, newest.getName());
+        try testing.expectEqualStrings(value, newest.getValue());
+        try testing.expect(dt.size <= dt.capacity);
+        try testing.expect(dt.used <= DynamicTable.MAX_CAPACITY);
+    }
+
+    // Every entry still counted must decode to something well-formed.
+    const oldest = dt.insert_count - dt.count;
+    var k = oldest;
+    while (k < dt.insert_count) : (k += 1) {
+        const e = dt.get(k).?;
+        try testing.expect(std.mem.startsWith(u8, e.getName(), "header-"));
+        try testing.expect(std.mem.startsWith(u8, e.getValue(), "value-"));
+    }
+}
+
+test "DynamicTable: capacity beyond the arena is clamped, not trusted" {
+    var dt = DynamicTable{};
+    dt.setCapacity(1 << 30);
+    try testing.expectEqual(DynamicTable.MAX_CAPACITY, dt.capacity);
+
+    // Filling a clamped table must not run past the descriptor ring.
+    var i: usize = 0;
+    while (i < DynamicTable.MAX_CAPACITY / 32 + 50) : (i += 1) {
+        dt.insert("n", "v") catch break;
+        try testing.expect(dt.count <= DynamicTable.MAX_CAPACITY / 32);
+    }
 }

@@ -146,9 +146,9 @@ pub const H3Connection = struct {
             .headers_received_streams = std.AutoHashMap(u64, void).init(allocator),
         };
         // Advertise dynamic table capacity in local settings
-        conn.local_settings.qpack_max_table_capacity = 4096;
+        conn.local_settings.qpack_max_table_capacity = qpack.DynamicTable.MAX_CAPACITY;
         // Set decoder's local max capacity
-        conn.qpack_decoder.setCapacity(4096);
+        conn.qpack_decoder.setCapacity(qpack.DynamicTable.MAX_CAPACITY);
         return conn;
     }
 

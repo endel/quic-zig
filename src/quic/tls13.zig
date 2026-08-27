@@ -681,11 +681,15 @@ pub const Tls13Handshake = struct {
     received_ticket: ?SessionTicket = null,
     ticket_nonce_counter: u32 = 0,
 
-    pub fn initClient(
+    /// Builds the client handshake in place. Tls13Handshake is ~52 KB, and
+    /// returning it by value is the single largest contributor to the stack
+    /// frame of anything that opens a connection — see quic/limits.zig.
+    pub fn initClientInto(
+        out: *Tls13Handshake,
         config: TlsConfig,
         local_tp: transport_params.TransportParams,
-    ) Tls13Handshake {
-        var self: Tls13Handshake = undefined;
+    ) void {
+        const self = out;
         self.state = .client_start;
         self.is_server = false;
         self.transcript = TranscriptHash.init();
@@ -734,14 +738,28 @@ pub const Tls13Handshake = struct {
         }).toUncompressedSec1();
         self.negotiated_group = .x25519;
 
+        return;
+    }
+
+    pub fn initClient(config: TlsConfig, local_tp: transport_params.TransportParams) Tls13Handshake {
+        var self: Tls13Handshake = undefined;
+        initClientInto(&self, config, local_tp);
         return self;
     }
 
-    pub fn initServer(
+    pub fn initServer(config: TlsConfig, local_tp: transport_params.TransportParams) Tls13Handshake {
+        var self: Tls13Handshake = undefined;
+        initServerInto(&self, config, local_tp);
+        return self;
+    }
+
+    /// Builds the server handshake in place — see initClientInto.
+    pub fn initServerInto(
+        out: *Tls13Handshake,
         config: TlsConfig,
         local_tp: transport_params.TransportParams,
-    ) Tls13Handshake {
-        var self: Tls13Handshake = undefined;
+    ) void {
+        const self = out;
         self.state = .server_wait_client_hello;
         self.is_server = true;
         self.transcript = TranscriptHash.init();
@@ -779,7 +797,7 @@ pub const Tls13Handshake = struct {
         };
         self.negotiated_group = .x25519;
 
-        return self;
+        return;
     }
 
     // Provide incoming crypto stream data to the handshake.

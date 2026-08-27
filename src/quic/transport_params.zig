@@ -237,7 +237,7 @@ pub const TransportParams = struct {
             const grease_val_len: u64 = @as(u64, grease_entropy[1] & 0x03) + 1;
             try packet.writeVarInt(writer, grease_id);
             try packet.writeVarInt(writer, grease_val_len);
-            try writer.writeAll(grease_entropy[2..][0..grease_val_len]);
+            try writer.writeAll(grease_entropy[2..][0..@intCast(grease_val_len)]);
         }
 
         // RFC 9368: version_information
@@ -261,7 +261,11 @@ pub const TransportParams = struct {
 
         while (fbs.seek < data.len) {
             const param_id = try packet.readVarInt(reader);
-            const param_len = try packet.readVarInt(reader);
+            // A parameter cannot extend past the buffer it was decoded from,
+            // and its varint length has to survive a 32-bit usize.
+            const param_len = packet.readVarIntUsize(reader) catch
+                return error.TransportParameterError;
+            if (param_len > data.len - fbs.seek) return error.TransportParameterError;
             const param_start = fbs.seek;
 
             switch (param_id) {
@@ -555,4 +559,10 @@ test "TransportParams: greasing roundtrip" {
     try original.encode(&fbs2);
     const decoded2 = try TransportParams.decode(fbs2.buffered());
     try std.testing.expectEqual(@as(u64, 30000), decoded2.max_idle_timeout);
+}
+
+test "transport parameter longer than the buffer is rejected" {
+    // id=0x00 (original_destination_connection_id), len=16383, 2 bytes present.
+    const params = [_]u8{ 0x00, 0x7f, 0xff, 0xaa, 0xbb };
+    try std.testing.expectError(error.TransportParameterError, TransportParams.decode(&params));
 }
