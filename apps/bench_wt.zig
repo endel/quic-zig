@@ -134,7 +134,7 @@ fn establishSession(
     remote.* = connection.sockaddrToStorage(&server_addr.any);
     asz.* = server_addr.getOsSockLen();
 
-    conn.* = try connection.connect(alloc, "localhost", .{
+    try connection.connectInto(conn, alloc, "localhost", .{
         .max_datagram_frame_size = 65536,
     }, tls_config, null);
 

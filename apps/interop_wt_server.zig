@@ -300,12 +300,17 @@ pub fn main(_: std.process.Init.Minimal) !void {
 
             // Initialize H3 + WT when connection is established
             if (conn.isEstablished() and !entry.h3_initialized) {
-                entry.h3_conn = h3.H3Connection.init(alloc, conn, true);
-                entry.h3_conn.?.local_settings.enable_connect_protocol = true;
-                entry.h3_conn.?.local_settings.h3_datagram = true;
-                entry.h3_conn.?.local_settings.enable_webtransport = true;
-                entry.h3_conn.?.local_settings.webtransport_max_sessions = 1;
-                entry.h3_conn.?.initConnection() catch |err| {
+                const h3c = alloc.create(h3.H3Connection) catch {
+                    i += 1;
+                    continue;
+                };
+                h3c.* = h3.H3Connection.init(alloc, conn, true);
+                h3c.local_settings.enable_connect_protocol = true;
+                h3c.local_settings.h3_datagram = true;
+                h3c.local_settings.enable_webtransport = true;
+                h3c.local_settings.webtransport_max_sessions = 1;
+                entry.h3_conn = h3c;
+                h3c.initConnection() catch |err| {
                     std.log.err("H3 init error: {any}", .{err});
                     i += 1;
                     continue;
@@ -317,7 +322,7 @@ pub fn main(_: std.process.Init.Minimal) !void {
                     continue;
                 };
                 state.* = ConnState.init(alloc);
-                state.wt_conn = webtransport.WebTransportConnection.init(alloc, &entry.h3_conn.?, conn, true);
+                state.wt_conn = webtransport.WebTransportConnection.init(alloc, h3c, conn, true);
                 conn_states.put(conn_key, state) catch {};
 
                 entry.h3_initialized = true;

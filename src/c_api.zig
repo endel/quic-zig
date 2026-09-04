@@ -178,7 +178,7 @@ pub const CApiHandler = struct {
 
         // Look up session_id from the WebTransport connection's stream maps
         const session_id: u64 = blk: {
-            if (session.entry.wt_conn) |*wtc| {
+            if (session.entry.wt_conn) |wtc| {
                 if (wtc.wt_bidi_streams.get(stream_id)) |sid| break :blk sid;
                 if (wtc.wt_uni_streams.get(stream_id)) |sid| break :blk sid;
             }

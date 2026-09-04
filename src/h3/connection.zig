@@ -119,6 +119,14 @@ pub const H3Connection = struct {
     qpack_encoder: qpack.QpackEncoder = .{},
     qpack_decoder: qpack.QpackDecoder = .{},
 
+    /// Scratch the decoder copies header names/values into; `headers_buf`
+    /// slices point in here and survive only until the next decode on this
+    /// connection. Point every connection on an event loop at one shared
+    /// buffer to pay 16 KB per loop instead of per connection; left empty,
+    /// the first decode allocates a private one.
+    qpack_scratch: []u8 = &.{},
+    qpack_scratch_owned: bool = false,
+
     // Pending DATA frame body: set by poll() when a DATA frame is found,
     // consumed by recvBody().  poll() won't advance past this stream
     // until the body is fully read.
@@ -153,6 +161,7 @@ pub const H3Connection = struct {
     }
 
     pub fn deinit(self: *H3Connection) void {
+        if (self.qpack_scratch_owned) self.allocator.free(self.qpack_scratch);
         var it = self.stream_bufs.valueIterator();
         while (it.next()) |buf| {
             buf.deinit(self.allocator);
@@ -161,6 +170,14 @@ pub const H3Connection = struct {
         self.finished_streams.deinit();
         self.excluded_bidi_streams.deinit();
         self.headers_received_streams.deinit();
+    }
+
+    fn qpackScratch(self: *H3Connection) ![]u8 {
+        if (self.qpack_scratch.len == 0) {
+            self.qpack_scratch = try self.allocator.alloc(u8, qpack.SCRATCH_SIZE);
+            self.qpack_scratch_owned = true;
+        }
+        return self.qpack_scratch;
     }
 
     /// Initialize the HTTP/3 connection: open control + QPACK streams, send SETTINGS.
@@ -971,11 +988,12 @@ pub const H3Connection = struct {
                     },
                     .headers => |qpack_data| {
                         var hdr_count: usize = 0;
-                        if (self.qpack_decoder.decode(qpack_data, &self.headers_buf, stream_id)) |c| {
+                        const scratch = try self.qpackScratch();
+                        if (self.qpack_decoder.decode(qpack_data, &self.headers_buf, scratch, stream_id)) |c| {
                             hdr_count = c;
                         } else |_| {
                             // Fallback to static-only decoder for compatibility
-                            hdr_count = qpack.decodeHeaders(qpack_data, &self.headers_buf) catch {
+                            hdr_count = qpack.decodeHeaders(qpack_data, &self.headers_buf, scratch) catch {
                                 // RFC 9204 §4.5.5: QPACK decompression failure
                                 self.consumeFrameFromBuf(buf, result.consumed);
                                 self.closeWithError(.qpack_decompression_failed, "QPACK decode failure");
