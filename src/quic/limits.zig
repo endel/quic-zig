@@ -23,3 +23,12 @@ pub const pending_frames: usize = 128;
 /// total content by the negotiated capacity, so this is the whole storage
 /// cost. A peer advertising more is clamped, not trusted.
 pub const qpack_table_capacity: usize = 4096;
+
+/// TLS 1.3 handshake staging, heap-allocated per connection alongside
+/// `Connection` (`tls13_hs`) and the largest single allocation unit left.
+/// The out buffer holds one outgoing flight, dominated by the Certificate
+/// message, so it scales with the local cert chain — 32 KB covers the
+/// 9-cert amplificationlimit interop case. The in buffer reassembles one
+/// peer flight.
+pub const tls_handshake_out: usize = 32 * 1024;
+pub const tls_handshake_in: usize = 16 * 1024;
