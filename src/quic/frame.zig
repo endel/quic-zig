@@ -348,7 +348,7 @@ pub const Frame = union(FrameType) {
                     .offset = offset,
                     .length = data_length,
                     .fin = has_fin,
-                    .data = bytes[stream.seek..@min(stream.seek + data_length, bytes.len)],
+                    .data = try body(bytes, stream.seek, data_length),
                 } };
             },
 
@@ -478,7 +478,7 @@ pub const Frame = union(FrameType) {
             0x31 => blk: {
                 const length = try packet.readVarInt(reader);
                 break :blk .{ .datagram_with_length = .{
-                    .data = bytes[stream.seek..@min(stream.seek + length, bytes.len)],
+                    .data = try body(bytes, stream.seek, length),
                 } };
             },
 
