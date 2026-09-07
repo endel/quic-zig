@@ -19,3 +19,26 @@
 - HTTP Datagrams and the Capsule Protocol (https://www.rfc-editor.org/rfc/rfc9297.txt)
 - Final step: The WebTransport Protocol Framework (https://www.ietf.org/archive/id/draft-ietf-webtrans-overview-11.txt)
 
+
+## Checking the Zig stdlib
+
+This repo targets Zig 0.16 (`minimum_zig_version` in `build.zig.zon`). Never
+answer a stdlib question from memory or from a 0.15-era habit — 0.16 moved most
+of `std.posix`, `std.fs` and `std.time` onto the `Io` interface, so a stale
+answer still looks plausible instead of failing.
+
+Use the pinned wrapper, which resolves `std` from the version this repo builds
+against:
+
+```bash
+./tools/zigdoc std.Io.net.Socket
+./tools/zigdoc std.crypto.tls
+```
+
+Install once with `gh release download --repo rockorager/zigdoc` (or
+`zig build install --prefix $HOME/.local` from source) so `zigdoc` is on PATH.
+The wrapper exists because zigdoc resolves `std` from the first `zig` on PATH:
+if that is not 0.16 it answers from the wrong stdlib rather than erroring.
+
+`src/sys.zig` is the library's syscall seam and documents which 0.16 homes each
+helper corresponds to.

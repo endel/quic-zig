@@ -1,0 +1,24 @@
+#!/bin/bash
+# zigdoc pinned to this repo's Zig toolchain.
+#
+# zigdoc resolves `std` from whichever `zig` is first on PATH. zvm's default
+# is often not the version in build.zig.zon's minimum_zig_version, and the
+# 0.15 -> 0.16 stdlib reshuffle (std.posix -> std.Io) makes a wrong-version
+# answer look plausible rather than failing. So pin it.
+#
+# Usage: ./tools/zigdoc std.Io.net.Socket
+set -e
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WANT=$(sed -n 's/.*\.minimum_zig_version *= *"\([^"]*\)".*/\1/p' "$REPO_ROOT/build.zig.zon")
+
+if [ -n "$WANT" ] && [ -x "$HOME/.zvm/$WANT/zig" ]; then
+  export PATH="$HOME/.zvm/$WANT:$PATH"
+elif [ -n "$WANT" ]; then
+  HAVE=$(zig version 2>/dev/null || echo "none")
+  if [ "$HAVE" != "$WANT" ]; then
+    echo "warning: build.zig.zon wants zig $WANT, PATH has $HAVE — docs may be for the wrong stdlib" >&2
+  fi
+fi
+
+exec zigdoc "$@"
