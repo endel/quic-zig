@@ -1,11 +1,21 @@
-//! Thin POSIX syscall wrappers replacing the 0.15 `std.posix.*` helpers
-//! that Zig 0.16 removed. Structured for cross-platform with `@compileError`
-//! branches for unimplemented platforms — we only claim to work where we
-//! actually test. Currently: Linux, macOS, FreeBSD.
+//! Thin POSIX syscall wrappers over `std.c`, kept as the library's single
+//! syscall seam. Structured for cross-platform with `@compileError` branches
+//! for unimplemented platforms — we only claim to work where we actually
+//! test. Currently: Linux, macOS, FreeBSD.
 //!
-//! Naming mirrors the old `std.posix.X` so migration at call sites is
-//! a one-word swap (`posix.socket` → `sys.socket`). Constants
-//! (`AF`, `SOCK`, `IPPROTO`, `SOL`, `SO`) still live on `std.posix`.
+//! These helpers did not disappear in Zig 0.16, they moved onto the `Io`
+//! interface: sockets to `std.Io.net`, files to `std.Io.Dir`, randomness to
+//! `std.Io.random`, time to `std.Io.Clock`, sleep to `std.Io.sleep`. What
+//! `std.posix` still exposes is `setsockopt`, `poll` and `read`.
+//!
+//! We keep this seam because `Io` is viral: adopting it means threading an
+//! `io: Io` argument through ~170 call sites across the library, and `Io`
+//! is new enough in 0.16 that its shape will still move. The seam lets the
+//! internals here migrate to `std.Io.net` later — worth doing for
+//! `Socket.sendMany` (`sendmmsg` on Linux) — without touching callers.
+//!
+//! Naming mirrors the pre-0.16 `std.posix.X`. Constants (`AF`, `SOCK`,
+//! `IPPROTO`, `SOL`, `SO`) still live on `std.posix`.
 
 const std = @import("std");
 const builtin = @import("builtin");
