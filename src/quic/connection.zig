@@ -3526,12 +3526,12 @@ pub const Connection = struct {
                         // stream can already have pending data while another has an
                         // unacked hole and no queued retransmission. A connection-level
                         // has_data guard would leave that second stream stalled.
-                        {
-                            // RFC 9002 §6.2.1: the Application space has no PTO
-                            // timer until the handshake is confirmed. Resending
-                            // 0-RTT data at 1-RTT before the peer has had any
-                            // chance to acknowledge it throws away the round trip.
-                            if (self.handshake_confirmed) {
+                        // RFC 9002 §6.2.1: the Application space has no PTO timer
+                        // until the handshake is confirmed. Resending 0-RTT data at
+                        // 1-RTT before the peer has had any chance to acknowledge it
+                        // throws away the round trip 0-RTT is for.
+                        if (self.handshake_confirmed) {
+                            {
                                 var resend_it = self.streams.streams.valueIterator();
                                 while (resend_it.next()) |s_ptr| {
                                     const s = s_ptr.*;
