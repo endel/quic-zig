@@ -719,8 +719,6 @@ pub const Tls13Handshake = struct {
             break :blk P256.basePoint.mulPublic(self.p256_secret, .big) catch unreachable;
         }).toUncompressedSec1();
         self.negotiated_group = .x25519;
-
-        return;
     }
 
     pub fn initClient(config: TlsConfig, local_tp: transport_params.TransportParams) Tls13Handshake {
@@ -779,8 +777,6 @@ pub const Tls13Handshake = struct {
             break :blk X25519.recoverPublicKey(self.x25519_secret) catch unreachable;
         };
         self.negotiated_group = .x25519;
-
-        return;
     }
 
     // Provide incoming crypto stream data to the handshake.

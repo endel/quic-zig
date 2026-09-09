@@ -19,9 +19,14 @@ const connection_manager = lib.connection_manager;
 const tls13 = lib.tls13;
 const ecn_socket = lib.ecn_socket;
 const h3 = lib.h3;
+const qpack = lib.qpack;
 const wt = lib.webtransport;
 
 const MAX_DATAGRAM_SIZE: usize = 1500;
+
+// One QPACK decode buffer for every connection this process serves: the
+// header slices it hands back live only until the next decode.
+var qpack_scratch: [qpack.SCRATCH_SIZE]u8 = undefined;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     // A server outlives its streams, so it needs an allocator that reuses what
@@ -187,6 +192,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     continue;
                 };
                 h3c.* = h3.H3Connection.init(alloc, conn, true);
+                h3c.qpack_scratch = &qpack_scratch;
                 h3c.local_settings = .{
                     .enable_connect_protocol = true,
                     .h3_datagram = true,

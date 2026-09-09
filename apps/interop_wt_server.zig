@@ -112,6 +112,10 @@ const ConnState = struct {
     }
 };
 
+// One QPACK decode buffer for every connection this process serves: the
+// header slices it hands back live only until the next decode.
+var qpack_scratch: [qpack.SCRATCH_SIZE]u8 = undefined;
+
 pub fn main(_: std.process.Init.Minimal) !void {
     // A server outlives its streams, so it needs an allocator that reuses what
     // they give back — an arena would grow for as long as the process runs.
@@ -305,6 +309,7 @@ pub fn main(_: std.process.Init.Minimal) !void {
                     continue;
                 };
                 h3c.* = h3.H3Connection.init(alloc, conn, true);
+                h3c.qpack_scratch = &qpack_scratch;
                 h3c.local_settings.enable_connect_protocol = true;
                 h3c.local_settings.h3_datagram = true;
                 h3c.local_settings.enable_webtransport = true;

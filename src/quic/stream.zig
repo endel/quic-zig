@@ -635,7 +635,7 @@ pub const SendStream = struct {
             self.send_window - range.offset
         else
             0;
-        const data_len = @min(@min(available, max_len), window_remaining);
+        const data_len = @min(available, max_len, window_remaining);
 
         if (data_len == 0 and !range.fin) {
             // Nothing useful to retransmit - remove this range
@@ -845,14 +845,16 @@ pub const StreamsMap = struct {
     disposal_queue: [64]u64 = undefined,
     disposal_count: usize = 0,
 
-    /// The last few reclaimed stream IDs, newest overwriting oldest. A stream
-    /// ID is not enough on its own to tell "reclaimed" from "not yet opened":
-    /// peers may use IDs out of order, so an ID below the highest we have seen
-    /// can still be a stream we have never been told about. Retransmissions of
-    /// acked data arrive within a PTO or two, so a short window catches them;
-    /// missing one only costs what happened before this check existed.
-    recent_disposed: [32]u64 = @splat(std.math.maxInt(u64)),
-    recent_disposed_idx: usize = 0,
+    /// Set when the queue was full and a settled stream could not be enqueued.
+    /// The next drain re-arms the scan to pick it up; without that the scan
+    /// would either stop and strand it, or never stop and cost O(n) per send.
+    disposal_overflow: bool = false,
+
+    /// Every peer-initiated bidi ID below this has been opened. RFC 9000 §3.2:
+    /// using a stream ID implicitly opens every lower one of the same type, so
+    /// an ID under the watermark that is absent from the map was opened and
+    /// reclaimed — not one we have yet to hear about.
+    next_peer_bidi_to_open: u64,
 
     /// Highest peer-initiated bidi stream ID that has been opened.
     /// Upper layers (WT/H3) compare this with their own "next to examine"
@@ -870,6 +872,8 @@ pub const StreamsMap = struct {
         // Client uni = 2, 6, 10, ...; server uni = 3, 7, 11, ...
         const bidi_base: u64 = if (is_server) 1 else 0;
         const uni_base: u64 = if (is_server) 3 else 2;
+        // Peer-initiated bidi IDs are the other parity from our own.
+        const peer_bidi_base: u64 = if (is_server) 0 else 1;
 
         return .{
             .allocator = allocator,
@@ -878,6 +882,7 @@ pub const StreamsMap = struct {
             .send_streams = std.AutoHashMap(u64, *SendStream).init(allocator),
             .recv_streams = std.AutoHashMap(u64, *ReceiveStream).init(allocator),
             .next_bidi_stream_id = bidi_base,
+            .next_peer_bidi_to_open = peer_bidi_base,
             .next_uni_stream_id = uni_base,
         };
     }
@@ -990,11 +995,24 @@ pub const StreamsMap = struct {
             return error.StreamStateError; // Uni streams should use recv_streams
         }
 
-        // Under loss the peer retransmits data we acked before reclaiming the
-        // stream. Recreating it here would leave a stream nothing will ever
-        // close and double-count the close against MAX_STREAMS.
-        if (self.wasRecentlyDisposed(stream_id)) return error.StreamAlreadyClosed;
+        // Below the watermark it was opened once and has since been reclaimed —
+        // the peer is retransmitting data we acked just before it went away.
+        // Building it again would leave a stream nothing will ever close and
+        // count its close a second time against MAX_STREAMS.
+        if (stream_id < self.next_peer_bidi_to_open) return error.StreamAlreadyClosed;
 
+        // RFC 9000 §3.2: using a stream ID opens every lower one of the same
+        // type. Materialising them is what makes the watermark above exact.
+        // Bounded by the MAX_STREAMS credit we granted, which the caller checks
+        // before we get here.
+        var id = self.next_peer_bidi_to_open;
+        while (id < stream_id) : (id += 4) _ = try self.openPeerBidiStream(id);
+        self.next_peer_bidi_to_open = stream_id + 4;
+        return try self.openPeerBidiStream(stream_id);
+    }
+
+    /// Build one peer-initiated bidi stream and add it to the map.
+    fn openPeerBidiStream(self: *StreamsMap, stream_id: u64) !*Stream {
         const s = try self.allocator.create(Stream);
         s.* = Stream.init(self.allocator, stream_id);
         // Peer initiated this stream → peer's "bidi_local" limit applies to our sends
@@ -1002,6 +1020,10 @@ pub const StreamsMap = struct {
         // Our local receive window for peer-initiated streams
         s.recv.receive_window = self.local_max_stream_data_bidi_remote;
         s.recv.receive_window_size = self.local_max_stream_data_bidi_remote;
+        errdefer {
+            s.deinit();
+            self.allocator.destroy(s);
+        }
         try self.streams.put(stream_id, s);
         self.open_bidi_streams += 1;
         self.needs_gc_scan = true; // New stream will eventually need GC
@@ -1177,10 +1199,14 @@ pub const StreamsMap = struct {
             // drops entries once the queue is full, and a stream can settle
             // without any further ACK arriving to trigger the check.
             self.disposeIfSettled(s);
-            if (!s.disposal_queued) found_pending = true;
+            // Keep scanning only for streams a future scan could still act on.
+            // One that is settled but could not be enqueued is covered by
+            // `disposal_overflow` instead, so a caller that never drains does
+            // not leave us scanning the whole map on every send.
+            if (!s.disposal_queued and !s.isDisposable()) found_pending = true;
         }
         // Stop scanning once every remaining stream is on its way out.
-        if (!found_pending) self.needs_gc_scan = false;
+        self.needs_gc_scan = found_pending;
     }
 
     pub fn closeStream(self: *StreamsMap, stream_id: u64) void {
@@ -1205,20 +1231,13 @@ pub const StreamsMap = struct {
     /// fully closed (closed_for_gc set, no pending retransmissions).
     /// Returns false when the queue is full; the caller must try again later.
     pub fn queueDisposal(self: *StreamsMap, stream_id: u64) bool {
-        if (self.disposal_count >= self.disposal_queue.len) return false;
+        if (self.disposal_count >= self.disposal_queue.len) {
+            self.disposal_overflow = true;
+            return false;
+        }
         self.disposal_queue[self.disposal_count] = stream_id;
         self.disposal_count += 1;
         return true;
-    }
-
-    /// Whether this ID names a stream we opened and have already reclaimed.
-    fn wasRecentlyDisposed(self: *const StreamsMap, stream_id: u64) bool {
-        return std.mem.indexOfScalar(u64, &self.recent_disposed, stream_id) != null;
-    }
-
-    fn rememberDisposed(self: *StreamsMap, stream_id: u64) void {
-        self.recent_disposed[self.recent_disposed_idx] = stream_id;
-        self.recent_disposed_idx = (self.recent_disposed_idx + 1) % self.recent_disposed.len;
     }
 
     /// Drain the disposal queue: remove queued streams from the maps. O(k)
@@ -1226,7 +1245,6 @@ pub const StreamsMap = struct {
     pub fn drainDisposalQueue(self: *StreamsMap) void {
         if (self.disposal_count == 0) return;
         for (self.disposal_queue[0..self.disposal_count]) |id| {
-            self.rememberDisposed(id);
             if (self.streams.fetchRemove(id)) |kv| {
                 var s = kv.value;
                 s.deinit();
@@ -1239,6 +1257,10 @@ pub const StreamsMap = struct {
             }
         }
         self.disposal_count = 0;
+        if (self.disposal_overflow) {
+            self.disposal_overflow = false;
+            self.needs_gc_scan = true; // there was more than the queue could hold
+        }
     }
 
     /// Check if MAX_STREAMS updates should be sent (sliding window pattern).
@@ -2353,6 +2375,27 @@ test "collectClosedStreams: picks up streams the disposal queue could not hold" 
     sm.collectClosedStreams();
     sm.drainDisposalQueue();
     try testing.expectEqual(@as(usize, 0), sm.streams.count());
+    try testing.expect(!sm.needs_gc_scan); // and the scan stands down again
+}
+
+test "StreamsMap: a caller that never drains does not keep the GC scan armed" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(1000, 1000);
+
+    for (0..sm.disposal_queue.len + 1) |_| {
+        const s = try sm.openBidiStream();
+        s.send.fin_sent = true;
+        s.recv.fin_received = true;
+    }
+
+    // Two scans with no drain in between: everything settled, the queue is
+    // full, and nothing further can be achieved until someone drains.
+    sm.needs_gc_scan = true;
+    sm.collectClosedStreams();
+    sm.collectClosedStreams();
+    try testing.expect(!sm.needs_gc_scan);
+    try testing.expect(sm.disposal_overflow);
 }
 
 test "getOrCreateStream: a reclaimed stream is not resurrected by a retransmit" {
@@ -2370,9 +2413,12 @@ test "getOrCreateStream: a reclaimed stream is not resurrected by a retransmit" 
 
     try testing.expectError(error.StreamAlreadyClosed, sm.getOrCreateStream(0));
 
-    // An ID we have never seen is still a new stream, even out of order.
+    // RFC 9000 §3.2: reaching for 8 opens 4 as well, so an out-of-order frame
+    // for 4 finds the stream already there rather than being turned away.
     _ = try sm.getOrCreateStream(8);
+    try testing.expect(sm.streams.get(4) != null);
     _ = try sm.getOrCreateStream(4);
+    try testing.expectEqual(@as(u64, 12), sm.next_peer_bidi_to_open);
 }
 
 test "SendStream: a closed stream stays unacked until the FIN itself is acked" {

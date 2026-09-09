@@ -727,8 +727,8 @@ pub fn Server(comptime Handler: type) type {
                 // Remove streams that were queued for disposal during this cycle.
                 // WT layer reads the queue first (to clean its own maps), then
                 // QUIC layer drains it (actually removing stream objects).
-                if (Handler.protocol == .webtransport) {
-                    if (entry.wt_conn) |wtc| wtc.drainDisposalQueue();
+                if (entry.wt_conn) |wtc| {
+                    wtc.drainDisposalQueue(); // chains to its H3 layer
                 } else if (entry.h3_conn) |h3c| {
                     h3c.drainDisposalQueue();
                 }
@@ -1556,17 +1556,9 @@ pub fn Client(comptime Handler: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            // WT borrows the H3 connection, so it goes first.
-            if (self.wt_conn) |wtc| {
-                wtc.deinit();
-                self.allocator.destroy(wtc);
-                self.wt_conn = null;
-            }
-            if (self.h3_conn) |h3c| {
-                h3c.deinit();
-                self.allocator.destroy(h3c);
-                self.h3_conn = null;
-            }
+            connection_manager.destroyProtocols(self.allocator, self.wt_conn, self.h3_conn, null);
+            self.wt_conn = null;
+            self.h3_conn = null;
             self.finished_streams.deinit();
             self.timer.deinit();
             self.loop.deinit();
@@ -1724,8 +1716,8 @@ pub fn Client(comptime Handler: type) type {
             }
 
             // Drain disposal queues
-            if (Handler.protocol == .webtransport) {
-                if (self.wt_conn) |wtc| wtc.drainDisposalQueue();
+            if (self.wt_conn) |wtc| {
+                wtc.drainDisposalQueue(); // chains to its H3 layer
             } else if (self.h3_conn) |h3c| {
                 h3c.drainDisposalQueue();
             }

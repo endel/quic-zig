@@ -59,6 +59,10 @@ fn parseTestCase(name: []const u8) TestCase {
     return .unsupported;
 }
 
+// One QPACK decode buffer for every connection this process serves: the
+// header slices it hands back live only until the next decode.
+var qpack_scratch: [qpack.SCRATCH_SIZE]u8 = undefined;
+
 pub fn main() !void {
     // A server outlives its streams, so it needs an allocator that reuses what
     // they give back — an arena would grow for as long as the process runs.
@@ -273,6 +277,7 @@ pub fn main() !void {
                         continue;
                     };
                     h3c.* = h3.H3Connection.init(alloc, conn, true);
+                    h3c.qpack_scratch = &qpack_scratch;
                     entry.h3_conn = h3c;
                     h3c.initConnection() catch |err| {
                         std.log.err("H3 init error: {any}", .{err});

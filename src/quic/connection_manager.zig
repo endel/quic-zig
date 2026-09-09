@@ -108,7 +108,7 @@ const DeadEntry = struct {
 };
 
 /// WebTransport borrows the H3 connection, so it is torn down first.
-fn destroyProtocols(
+pub fn destroyProtocols(
     allocator: Allocator,
     wt_conn: ?*wt.WebTransportConnection,
     h3_conn: ?*h3.H3Connection,

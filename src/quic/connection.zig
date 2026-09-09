@@ -937,8 +937,6 @@ pub const Connection = struct {
             try conn.datagram_recv_queue.resize(allocator, config.datagram_queue_capacity);
             try conn.datagram_send_queue.resize(allocator, config.datagram_queue_capacity);
         }
-
-        return;
     }
 
     /// Convenience wrapper for callers with stack to spare.
@@ -2842,6 +2840,37 @@ pub const Connection = struct {
     }
 
     /// Install 1-RTT (Application) encryption keys.
+    /// Queue every stream's unacknowledged bytes as retransmit ranges for a PTO
+    /// probe. Returns whether anything was queued.
+    ///
+    /// RFC 9002 §6.2.1 gives the Application space no PTO timer until the
+    /// handshake is confirmed: 0-RTT data cannot have been acknowledged yet, and
+    /// resending it at 1-RTT spends the round trip 0-RTT exists to save.
+    ///
+    /// The range stops at `send_offset`, not `write_offset`. What the
+    /// application has written can run past the peer's MAX_STREAM_DATA, and this
+    /// is the one send path with no window check of its own. `send_offset` is
+    /// not rewound either: already-sent bytes must not be recounted against
+    /// connection flow control when MAX_DATA credit is zero.
+    fn queueStreamPtoRetransmissions(self: *Connection) bool {
+        if (!self.handshake_confirmed) return false;
+        var queued = false;
+        var it = self.streams.streams.valueIterator();
+        while (it.next()) |s_ptr| {
+            const s = s_ptr.*;
+            if (!s.send.hasUnackedData()) continue;
+            const start = s.send.ack_offset;
+            const end = s.send.send_offset;
+            if (end > start) {
+                s.send.queueRetransmit(start, end - start, s.send.fin_sent);
+            } else if (s.send.fin_sent) {
+                s.send.queueRetransmit(end, 0, true);
+            }
+            queued = true;
+        }
+        return queued;
+    }
+
     /// Called when the TLS handshake produces application-level secrets.
     pub fn installAppKeys(self: *Connection, open: quic_crypto.Open, seal: quic_crypto.Seal) void {
         // Packet number space index 2 = Application (1-RTT)
@@ -3134,29 +3163,7 @@ pub const Connection = struct {
                 if (self.pkt_num_spaces[1].crypto_seal != null) {
                     self.queueCryptoRetransmission(.handshake);
                 }
-                // Queue unacked stream bytes as retransmission ranges. Do not
-                // rewind send_offset: already-sent bytes must not be recounted
-                // against connection flow control when MAX_DATA credit is zero.
-                // RFC 9002 §6.2.1: no Application-space timer before the
-                // handshake is confirmed — 0-RTT data has not had a chance to
-                // be acknowledged yet, and resending it at 1-RTT wastes the
-                // round trip 0-RTT was for.
-                if (self.handshake_confirmed) {
-                    var resend_it = self.streams.streams.valueIterator();
-                    while (resend_it.next()) |s_ptr| {
-                        const s = s_ptr.*;
-                        if (s.send.hasUnackedData()) {
-                            const start = s.send.ack_offset;
-                            // See the other PTO site: retransmit only what was sent.
-                            const end = s.send.send_offset;
-                            if (end > start) {
-                                s.send.queueRetransmit(start, end - start, s.send.fin_sent);
-                            } else if (s.send.fin_sent) {
-                                s.send.queueRetransmit(end, 0, true);
-                            }
-                        }
-                    }
-                }
+                _ = self.queueStreamPtoRetransmissions();
             }
 
             // Client: auto-clear Handshake keys once Finished has been sent AND acknowledged
@@ -3521,38 +3528,7 @@ pub const Connection = struct {
                                 }
                             }
                         }
-                        // PTO must rescue every stream with outstanding data, not only
-                        // the connection as a whole. In multi-stream transfers, one
-                        // stream can already have pending data while another has an
-                        // unacked hole and no queued retransmission. A connection-level
-                        // has_data guard would leave that second stream stalled.
-                        // RFC 9002 §6.2.1: the Application space has no PTO timer
-                        // until the handshake is confirmed. Resending 0-RTT data at
-                        // 1-RTT before the peer has had any chance to acknowledge it
-                        // throws away the round trip 0-RTT is for.
-                        if (self.handshake_confirmed) {
-                            {
-                                var resend_it = self.streams.streams.valueIterator();
-                                while (resend_it.next()) |s_ptr| {
-                                    const s = s_ptr.*;
-                                    if (s.send.hasUnackedData()) {
-                                        const start = s.send.ack_offset;
-                                        // Only what we actually put on the wire.
-                                        // write_offset is what the application has
-                                        // written, which can run past the peer's
-                                        // MAX_STREAM_DATA — and the retransmit path
-                                        // does not re-check the window.
-                                        const end = s.send.send_offset;
-                                        if (end > start) {
-                                            s.send.queueRetransmit(start, end - start, s.send.fin_sent);
-                                        } else if (s.send.fin_sent) {
-                                            s.send.queueRetransmit(end, 0, true);
-                                        }
-                                        has_data = true;
-                                    }
-                                }
-                            }
-                        }
+                        if (self.queueStreamPtoRetransmissions()) has_data = true;
                     }
                 }
 

@@ -70,11 +70,11 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - `Connection` and the TLS 1.3 handshake are no longer returned by value, so
   constructing one no longer costs 185 KB and 52 KB of the caller's stack.
 
-Measured on an interleaved A/B over loopback against the pre-merge tree: an 8 MB
-single-stream download goes 52.7 → 51.6 MB/s, about 2% slower, which is the price
-of the layout change — `Connection` shrank by the 52 KB of TLS staging that moved
-out of it. On the workload the reclamation is about, 8000 sequential HTTP/3
-requests on one connection, the same comparison is 3192 → 3652 requests/s.
+Measured on an interleaved A/B over loopback against the pre-merge tree: on the
+workload the reclamation is about — 8000 sequential HTTP/3 requests on one
+connection — 3192 → 3652 requests/s. Single-stream bulk download is unchanged;
+48 order-balanced runs a side put the two within 1% of each other, which is well
+inside this benchmark's ±5% per-run spread.
 
 ### Added
 
