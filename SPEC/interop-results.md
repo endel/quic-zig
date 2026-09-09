@@ -51,6 +51,20 @@ a bug the run exposed: `blackhole` in both directions (PTO retransmitting past
 EncryptedExtensions), `zerortt` against quic-go (the Application PTO firing
 before handshake confirmation), and `rebind-addr` against quic-go.
 
+## None of the remaining failures are regressions
+
+The pre-merge tree (`b6f9eb6`) was built as its own interop image and run against
+quiche's client for the cases that still fail. It fails all of them the same way:
+
+    quic-zig-base<-quiche multiplexing          FAIL
+    quic-zig-base<-quiche handshakeloss         FAIL
+    quic-zig-base<-quiche handshakecorruption   FAIL
+    quic-zig-base<-quiche rebind-port           FAIL
+    quic-zig-base<-quiche chacha20              UNSUPPORTED
+
+quiche had never been run against us before this matrix, which is why they are
+only surfacing now.
+
 ## What the remaining failures are
 
 ### chacha20 — open, ours to explain
