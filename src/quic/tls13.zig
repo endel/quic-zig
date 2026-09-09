@@ -652,6 +652,11 @@ pub const Tls13Handshake = struct {
 
     // PSK / 0-RTT fields
     using_psk: bool = false,
+
+    /// Server: the ClientHello carried the early_data extension. RFC 8446
+    /// 4.2.10 only lets EncryptedExtensions answer an extension the client
+    /// offered, so accepting a PSK is not on its own a licence to send it.
+    early_data_offered: bool = false,
     zero_rtt_accepted: bool = false,
     pending_install_early: bool = false,
     received_ticket: ?SessionTicket = null,
@@ -687,6 +692,7 @@ pub const Tls13Handshake = struct {
         self.leaf_pub_key_len = 0;
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
+        self.early_data_offered = false;
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
@@ -754,6 +760,7 @@ pub const Tls13Handshake = struct {
         self.leaf_pub_key_len = 0;
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
+        self.early_data_offered = false;
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
@@ -1405,6 +1412,8 @@ pub const Tls13Handshake = struct {
                 // PSK extension must be the last one (RFC 8446 §4.2.11)
                 psk_ext_offset = ext_pos;
                 psk_ext_len = elen;
+            } else if (etype == @intFromEnum(tls.ExtensionType.early_data)) {
+                self.early_data_offered = true;
             }
             ext_pos += elen;
         }
@@ -1538,7 +1547,7 @@ pub const Tls13Handshake = struct {
             &buf,
             self.config.alpn,
             self.tp_encoded[0..self.tp_encoded_len],
-            self.using_psk, // include early_data extension if PSK accepted
+            self.zero_rtt_accepted, // early_data only answers a client that asked
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
@@ -1892,8 +1901,10 @@ pub const Tls13Handshake = struct {
         // Binder verified — now safe to install PSK key schedule
         self.key_schedule = temp_ks;
         self.using_psk = true;
-        self.zero_rtt_accepted = true;
-        std.log.info("PSK resumption accepted — 0-RTT enabled", .{});
+        self.zero_rtt_accepted = self.early_data_offered;
+        std.log.info("PSK resumption accepted (0-RTT {s})", .{
+            if (self.zero_rtt_accepted) @as([]const u8, "enabled") else "not offered",
+        });
     }
 
     // ─── Client: Parse NewSessionTicket ──────────────────────────────
@@ -3260,4 +3271,18 @@ test "X509Extensions: hasKeyCertSign with keyCertSign bit set" {
     // keyCertSign alone: 0x0400
     exts.key_usage = 0x0400;
     try std.testing.expect(exts.hasKeyCertSign());
+}
+
+test "server: early_data in EncryptedExtensions only answers a client that offered it" {
+    var buf: [512]u8 = undefined;
+    const alpn = [_][]const u8{"h3"};
+
+    const without = try buildEncryptedExtensionsFromEncoded(&buf, &alpn, &.{}, false);
+    const len_without = without.len;
+
+    var buf2: [512]u8 = undefined;
+    const with = try buildEncryptedExtensionsFromEncoded(&buf2, &alpn, &.{}, true);
+
+    // The extension is 4 bytes of header and no payload (RFC 8446 §4.2.10).
+    try std.testing.expectEqual(len_without + 4, with.len);
 }
