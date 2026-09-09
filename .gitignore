@@ -5,3 +5,5 @@ zig-out
 .vscode
 interop/quiche/target
 fuzz/corpus
+interop/runner/matrix-logs
+interop/runner/matrix-results.txt
