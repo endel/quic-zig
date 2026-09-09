@@ -1,136 +1,105 @@
 # Interop Test Results
 
-Date: 2026-03-24
-Zig version: 0.15.2, quic-go interop image `martenseemann/quic-go-interop:latest`, webtransport-go interop image `martenseemann/webtransport-go-interop:latest`
-Build: Docker interop image from `interop/runner/Dockerfile`, `zig build -Doptimize=ReleaseSafe`
+Date: 2026-09-09  ·  quic-zig `03380f7`, Zig 0.16.0, `zig build -Doptimize=ReleaseSafe`
+Peers: `martenseemann/quic-go-interop:latest`, `cloudflare/quiche-qns:latest`
+Harness: `interop/runner/matrix.sh` (quic-interop-runner + quic-network-simulator)
 
-## Functional Interop Matrix
+## QUIC / HTTP/3 matrix
 
-### QUIC / HTTP/3 (`quic-go`)
+Read `A<-B` as "A is the server, B is the client".
 
-#### Zig server ← quic-go client (9/14 pass)
+| Test | quic-go<-quic-zig | quic-zig<-quic-go | quic-zig<-quiche | quiche<-quic-zig |
+|---|---|---|---|---|
+| handshake | ✅ | ✅ | ✅ | ✅ |
+| transfer | ✅ | ✅ | ✅ | ✅ |
+| http3 | ✅ | ✅ | ✅ | ✅ |
+| retry | ✅ | ✅ | ✅ | ✅ |
+| resumption | ✅ | ✅ | ✅ | ✅ |
+| zerortt | ✅ | ✅ | ✅ | ✅ |
+| multiplexing | ✅ | ✅ | ❌ | ✅ |
+| longrtt | ✅ | ✅ | ✅ | ✅ |
+| keyupdate | ✅ | ✅ | — | ✅ |
+| chacha20 | ❌ | ❌ | — | ❌ |
+| v2 | — | — | — | — |
+| ipv6 | ✅ | ✅ | ✅ | ✅ |
+| ecn | — | — | — | — |
+| amplificationlimit | ✅ | ✅ | ✅ | ✅ |
+| rebind-port | ✅ | ✅ | ❌ | ❌ |
+| rebind-addr | ✅ | ✅ | ❌ | ❌ |
+| connectionmigration | — | ❌ | ❌ | — |
+| blackhole | ✅ | ✅ | ✅ | ✅ |
+| handshakeloss | ✅ | ✅ | ❌ | ✅ |
+| transferloss | ✅ | ✅ | ✅ | ✅ |
+| handshakecorruption | ✅ | ✅ | ❌ | ✅ |
+| transfercorruption | ✅ | ✅ | ✅ | ✅ |
 
-| Test | Result | Notes |
-|------|--------|-------|
-| handshake | PASS | |
-| transfer | PASS | |
-| retry | PASS | |
-| http3 | PASS | |
-| longrtt | PASS | |
-| multiplexing | PASS | |
-| keyupdate | PASS | |
-| amplificationlimit | PASS | |
-| transferloss | PASS | |
-| blackhole | FAIL | Quick failure — PTO recovery stalls |
-| handshakeloss | FAIL | 30% loss, handshake timeout |
-| handshakecorruption | FAIL | Corruption, handshake timeout |
-| transfercorruption | FAIL | Corruption during transfer, timeout |
-| connectionmigration | FAIL | Go client didn't migrate to preferred address |
+Totals:
+- `quic-go<-quic-zig` — 18 pass, 1 fail, 3 unsupported, of 22
+- `quic-zig<-quic-go` — 18 pass, 2 fail, 2 unsupported, of 22
+- `quic-zig<-quiche` — 12 pass, 6 fail, 4 unsupported, of 22
+- `quiche<-quic-zig` — 16 pass, 3 fail, 3 unsupported, of 22
 
-#### quic-go server ← Zig client (12/15 pass)
+Legend: ✅ pass · ❌ fail · — the peer does not implement the case.
 
-| Test | Result | Notes |
-|------|--------|-------|
-| handshake | PASS | |
-| transfer | PASS | |
-| retry | PASS | |
-| http3 | PASS | |
-| longrtt | PASS | |
-| multiplexing | PASS | |
-| blackhole | PASS | |
-| keyupdate | PASS | |
-| handshakeloss | PASS | |
-| transferloss | PASS | |
-| handshakecorruption | PASS | |
-| transfercorruption | PASS | |
-| ecn | UNSUPPORTED | Go server does not support ECN test case |
-| amplificationlimit | FAIL | Timeout during amplification-limited transfer |
-| connectionmigration | UNSUPPORTED | Go server does not support connectionmigration test case |
+Against quic-go both directions are clean apart from `chacha20` and the two
+migration cases the peer's client does not drive. Everything under loss and
+corruption passes, in both roles.
 
-### WebTransport (`webtransport-go`)
+Five cases were red when this matrix was first run and are green here, each from
+a bug the run exposed: `blackhole` in both directions (PTO retransmitting past
+`MAX_STREAM_DATA`), `resumption` against quiche (`early_data` sent unsolicited in
+EncryptedExtensions), `zerortt` against quic-go (the Application PTO firing
+before handshake confirmation), and `rebind-addr` against quic-go.
 
-#### Zig server ← webtransport-go client (5/7 pass)
+## What the remaining failures are
 
-| Test | Result |
-|------|--------|
-| handshake | PASS |
-| transfer-unidirectional-receive | PASS |
-| transfer-unidirectional-send | PASS |
-| transfer-bidirectional-receive | FAIL |
-| transfer-bidirectional-send | PASS |
-| transfer-datagram-receive | PASS |
-| transfer-datagram-send | FAIL |
+### chacha20 — open, ours to explain
+Fails in every direction it is tested. The peer never acknowledges our
+Handshake packets, so we PTO in the Handshake space until the test times out.
+It is not the key schedule and, as far as three independent checks can tell, not
+our packet protection either:
 
-#### webtransport-go server ← Zig client (5/7 pass)
+- The pcap shows the ClientHello offering only `0x1303` and our ServerHello
+  selecting it.
+- Both endpoints' `keys.log` files carry byte-identical handshake traffic
+  secrets.
+- Re-implementing RFC 9001 §5.4.4 header protection and the AEAD in Python and
+  running it over a whole capture decrypts 305 of 307 of our Handshake packets,
+  and the plaintext parses cleanly: `ACK largest=1 first_range=0`, `CRYPTO
+  off=0 len=36` (the Finished), then zero padding. Reserved bits are zero.
 
-| Test | Result |
-|------|--------|
-| handshake | PASS |
-| transfer-unidirectional-receive | PASS |
-| transfer-unidirectional-send | PASS |
-| transfer-bidirectional-receive | PASS |
-| transfer-bidirectional-send | FAIL |
-| transfer-datagram-receive | FAIL |
-| transfer-datagram-send | PASS |
+quiche's server logs `rx pkt Handshake ... pn=0` — so it removed our header
+protection and decoded the packet number — and then "dropped invalid packet".
+quic-go's qlog gives `payload_decrypt_error` and records the dropped packet's
+header as `dcil: 0, scil: 0` where the wire carries 20 and 8. That last detail is
+the only lead: it would put the packet-number offset nine bytes early and sample
+the wrong sixteen bytes. Worth checking against a peer build with header parsing
+traced before touching our own crypto.
 
-### Legend
-- `H` handshake, `DC` transfer, `S` retry, `3` HTTP/3, `LR` longrtt, `M` multiplexing
-- `B` blackhole, `U` keyupdate, `E` ecn, `A` amplificationlimit
-- `L1` handshakeloss, `L2` transferloss, `C1` handshakecorruption, `C2` transfercorruption, `CM` connectionmigration
-- `UR` unidi-receive, `US` unidi-send, `BR` bidi-receive, `BS` bidi-send, `DR` datagram-receive, `DS` datagram-send
+### connectionmigration and rebind-addr / rebind-port — environmental
+The runner's `connectionmigration` needs the *client* to migrate. quic-go's
+client does not, so "Server saw only a single path in use" is what the check
+reports regardless of what we do; quiche declares the case unsupported outright.
 
-**Latest findings (2026-03-24):**
-- **CRYPTO_ERROR 0x133 resolved** — the earlier "ECDSA verification failure" was caused by Docker container race conditions (stale sim container), not a real TLS bug. With clean Docker state, all handshakes succeed in both directions.
-- Zig-as-server now passes 9/14 QUIC tests (up from 0). Remaining failures are loss/corruption recovery and connection migration.
-- Zig-as-client passes 12/15 QUIC tests (up from 4). Only `amplificationlimit` fails.
-- WebTransport passes 5/7 in both directions. The bidi/datagram failures are directionally swapped.
-- Linux interop containers use `epoll` backend (not `io_uring` due to kernel version).
+The rebind cases fail the same way in three of the four pairings: the simulator
+starts rewriting the client's source address within ~200 ms of our client's
+first packet, so the rebind lands during the handshake, and the peer keeps
+addressing its replies to the pre-rebind address for many seconds. In the
+rebind-addr pairing that does pass, quic-go's client's very first packet already
+carries the post-rebind address. Our client answers PATH_CHALLENGE correctly and
+quiche logs "Connection migrated"; the transfer simply never resumes because
+nothing reaches us at the address the peer is using.
 
-**Remaining work:**
-- Loss/corruption recovery: blackhole, handshakeloss, handshakecorruption, transfercorruption (Zig server PTO recovery under adverse conditions)
-- Connection migration: preferred address migration not triggering path change in Go client
-- Amplification limit: Zig client timeout during amplification-limited handshake
-- WebTransport bidi-send/receive and datagram-send/receive directional failures
+### multiplexing against quiche — open
+quiche's client completes 1986 of 1999 requests and times out. Granting the last
+partial MAX_STREAMS batch (which was a real bug, and is fixed) did not move the
+number, so the stall is something else. Not reproduced against quic-go, whose
+client passes the same case.
 
-## Latency Benchmarks
-
-### Go WT Client -> Server (localhost, 2000 iterations)
-
-| Metric | Go server | Zig server | Ratio |
-|--------|-----------|------------|-------|
-| Bidi median | 96µs | 101µs | 1.05x |
-| Bidi p95 | 181µs | 240µs | 1.33x |
-| Bidi p99 | 307µs | 357µs | 1.16x |
-| Bidi max | 1.214ms | 674µs | **0.56x** |
-| DG median | 62µs | 79µs | 1.27x |
-| DG p95 | 96µs | 123µs | 1.28x |
-| DG p99 | 111µs | 198µs | 1.78x |
-| DG max | 285µs | 595µs | 2.09x |
-
-### Chrome WebTransport (puppeteer, `page.evaluate`, 1000 iterations)
-
-| Metric | Go server | Zig server | Ratio |
-|--------|-----------|------------|-------|
-| Bidi median | 0.20ms | 0.20ms | 1.0x |
-| Bidi p99 | 0.40ms | 0.60ms | 1.5x |
-| DG median | 0.10ms | 0.20ms | 2.0x |
-| DG p99 | 0.20ms | 0.30ms | 1.5x |
-| Spikes >5ms | 0 | 0 | -- |
-
-### Chrome WebTransport (latency.html with DOM updates, 1000 iterations)
-
-| Metric | Go server | Zig server | Ratio |
-|--------|-----------|------------|-------|
-| Bidi median | 0.40ms | 0.40ms | 1.0x |
-| Bidi p95 | 1.30ms | 1.30ms | 1.0x |
-| Bidi p99 | 2.20ms | 2.10ms | 0.95x |
-| DG median | 0.60ms | 0.60ms | 1.0x |
-| DG p95 | 2.00ms | 2.00ms | 1.0x |
-| Spikes >5ms | 8 | 8 | 1.0x |
-
-## Optimizations Applied
-
-1. **ReleaseFast build** — Debug mode added ~400µs/packet from safety checks and unoptimized codegen.
-2. **Log level `.err`** — `std.log.info` (67 calls in connection.zig) was flushing to stderr on every packet in ReleaseFast (default level is `.info`).
-3. **Targeted stream disposal** — Closed streams accumulated in HashMaps, causing O(n) scans in `pollWtStreamData`, `identifyWtBidiStreams`, `getScheduledStreams`. Fixed with a disposal queue: `queueDisposal()` at close time, `drainDisposalQueue()` once per cycle. O(k) where k = streams just closed.
-4. **FIN-aware echo handler** — `onStreamData` was called twice per bidi stream (data + empty FIN). The handler echoed both, sending "Echo: ping" + "Echo: " (double response). This doubled packets, created congestion backpressure, and caused cascading 5-26ms spikes in Chrome. Fixed by using the `onStreamData(session, stream_id, data, fin)` signature and only echoing non-empty data while using `fin` to decide when to close.
+### handshakeloss / handshakecorruption against quiche — slow, not broken
+The 50 sequential handshakes under 30 % loss do complete, but at roughly 2.7 s
+each: quiche's client finishes 11 of them and then hits its own overall timeout.
+The connection it is on when time runs out is healthy — it has exchanged
+Finished and is sending 1-RTT. quic-go's client passes the same case, so this
+reads as our Initial/Handshake retransmission being slower off the mark than
+quiche is willing to wait for, rather than a stall.
