@@ -1255,7 +1255,17 @@ pub const StreamsMap = struct {
         // This prevents the threshold from outgrowing batch sizes and stalling.
         if (self.max_incoming_bidi_streams > 0) {
             const threshold = @max(self.initial_max_incoming_bidi / 4, 1);
-            if (self.consumed_bidi_streams >= threshold) {
+            // Batching by threshold leaves the last partial batch ungranted: a
+            // peer that stops short of it waits forever for credit it will
+            // never be offered. Flush early once it has opened everything we
+            // allowed. IDs go 0,4,8..., so id/4 counts them for either role.
+            const peer_at_limit = if (self.highest_peer_bidi_stream_id) |id|
+                (id / 4) + 1 >= self.max_incoming_bidi_streams
+            else
+                false;
+            if (self.consumed_bidi_streams >= threshold or
+                (peer_at_limit and self.consumed_bidi_streams > 0))
+            {
                 const new_max = self.last_sent_max_bidi + self.consumed_bidi_streams;
                 if (new_max > self.last_sent_max_bidi) {
                     result.bidi = new_max;
@@ -2414,4 +2424,23 @@ test "SendStream: a retransmit range never walks past MAX_STREAM_DATA" {
     const rt = ss.popStreamFrame(1000).?;
     try testing.expectEqual(@as(u64, 0), rt.stream.offset);
     try testing.expectEqual(@as(u64, 100), rt.stream.length);
+}
+
+test "StreamsMap: MAX_STREAMS grants a remainder below the batch threshold" {
+    var sm = StreamsMap.init(testing.allocator, true); // server: peer bidi = 0,4,8...
+    defer sm.deinit();
+    sm.setMaxIncomingStreams(8, 8);
+
+    // The peer opens every stream we allowed.
+    var id: u64 = 0;
+    while (id < 8 * 4) : (id += 4) _ = try sm.getOrCreateStream(id);
+
+    // One of them finishes — a remainder far below the 8/4 = 2 threshold.
+    sm.consumed_bidi_streams = 1;
+    const upd = sm.getMaxStreamsUpdates();
+    try testing.expect(upd.bidi != null);
+    try testing.expectEqual(@as(u64, 9), upd.bidi.?);
+
+    // And it does not keep firing once the peer has room again.
+    try testing.expect(sm.getMaxStreamsUpdates().bidi == null);
 }
