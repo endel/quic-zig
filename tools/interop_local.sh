@@ -5,7 +5,10 @@
 #   tools/interop_local.sh              # every case known to pass
 #   tools/interop_local.sh retry v2     # only these
 #
-# connectionmigration is excluded: it panics in the client on clean master too.
+# connectionmigration is excluded: interop-server-manual advertises a preferred
+# address on its own port and listens on one socket, so the client migrates to
+# an address nothing is reading and both ends PTO. interop-server (the docker
+# image) uses a second socket on a different port and does exercise it.
 set -u
 
 cd "$(dirname "$0")/.."
