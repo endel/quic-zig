@@ -1825,6 +1825,29 @@ pub const Connection = struct {
                     self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM on send-only stream");
                     return error.ProtocolViolation;
                 }
+                // RFC 9000 §3.2: RESET_STREAM opens a receive stream just as a
+                // STREAM frame does, so the same MAX_STREAMS bound applies.
+                if (!stream_mod.isLocal(rs.stream_id, self.is_server)) {
+                    const limit = if (stream_mod.isBidi(rs.stream_id))
+                        self.streams.max_incoming_bidi_streams
+                    else
+                        self.streams.max_incoming_uni_streams;
+                    if (rs.stream_id / 4 >= limit) {
+                        self.closeWithTransportError(@intFromEnum(TransportError.stream_limit_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM stream ID exceeds MAX_STREAMS limit");
+                        return error.ProtocolViolation;
+                    }
+                    // An unheard-of uni stream is opened by the reset itself;
+                    // without this its final size never reaches connection flow
+                    // control and the window is short by that much for good.
+                    if (!stream_mod.isBidi(rs.stream_id) and
+                        self.streams.recv_streams.get(rs.stream_id) == null)
+                    {
+                        _ = self.streams.getOrCreateRecvStream(rs.stream_id) catch |err| switch (err) {
+                            error.StreamAlreadyClosed => return, // already reclaimed
+                            else => return,
+                        };
+                    }
+                }
                 if (self.streams.getStream(rs.stream_id)) |s| {
                     s.recv.handleResetStream(rs.error_code, rs.final_size) catch {
                         // RFC 9000 §4.5: FINAL_SIZE_ERROR
@@ -5469,4 +5492,33 @@ test "STREAMS_BLOCKED on uni streams grants uni credit" {
 
     try conn.processFrame(&.{ .streams_blocked_uni = 4 }, .application, 0);
     try std.testing.expectEqual(@as(u64, 6), conn.pending_frames.pop().?.max_streams_uni);
+}
+
+test "RESET_STREAM opens a uni stream we had not heard of" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    // The peer's STREAM frames were all lost; the reset is the first we see it.
+    try conn.processFrame(&.{ .reset_stream = .{
+        .stream_id = 2,
+        .error_code = 3,
+        .final_size = 500,
+    } }, .application, 0);
+
+    try std.testing.expect(conn.streams.recv_streams.get(2) != null);
+    try std.testing.expectEqual(@as(u64, 500), conn.conn_flow_ctrl.base.bytes_read);
+    try std.testing.expectEqual(@as(u64, 1), conn.streams.consumed_uni_streams);
+}
+
+test "RESET_STREAM beyond MAX_STREAMS is a protocol violation" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(2, 2);
+
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .reset_stream = .{
+        .stream_id = 2 + 5 * 4,
+        .error_code = 3,
+        .final_size = 10,
+    } }, .application, 0));
 }
