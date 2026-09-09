@@ -63,6 +63,9 @@ Throughput and request rate are unchanged: on an interleaved A/B over loopback,
   against our own client and server, with no Docker.
 - `tools/bench_local.sh` reports single-stream download throughput and
   handshake/request rate over loopback.
+- `interop/runner/matrix.sh` runs the quic-interop-runner matrix against a peer
+  in both directions, one case at a time, recording each verdict so an
+  interrupted run resumes where it stopped.
 - `interop/run_local_tests.sh` covers quic-zig against quiche directly, in both
   directions and over HTTP/3; previously quiche was only ever run against
   quic-go. Every client now runs under a watchdog, so a client that does not exit
