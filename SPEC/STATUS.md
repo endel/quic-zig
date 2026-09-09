@@ -21,7 +21,7 @@
 | 4.3 | Flow Control Performance | ✅ Done | Auto-tuning prevents stalls |
 | 4.4 | Handling Stream Cancellation | ✅ Done | RESET_STREAM/STOP_SENDING, final_size validation, conn flow ctrl accounting |
 | 4.5 | Stream Final Size | ✅ Done | FIN/RESET_STREAM final_size validation, FINAL_SIZE_ERROR on mismatch |
-| 4.6 | Controlling Concurrency | ✅ Done | MAX_STREAMS + STREAMS_BLOCKED |
+| 4.6 | Controlling Concurrency | ✅ Done | MAX_STREAMS + STREAMS_BLOCKED; the last partial batch is granted once the peer is at the limit |
 | **5** | **Connections** | | |
 | 5.1 | Connection ID | ✅ Done | LocalCidPool + ConnectionIdPool |
 | 5.1.1 | Issuing Connection IDs | ✅ Done | NEW_CONNECTION_ID with stateless reset tokens |
@@ -197,7 +197,7 @@
 | 4.3 | ClientHello Size | ✅ Done | Initial packet padded to 1200 bytes (RFC 9001 requires packet padding, not CH padding) |
 | 4.4 | Peer Authentication | ✅ Done | Chain validation, hostname verify |
 | 4.5 | Session Resumption | ✅ Done | PSK/tickets, binder, NewSessionTicket |
-| 4.6 | 0-RTT | ✅ Done | Early key install, 0-RTT packing |
+| 4.6 | 0-RTT | ✅ Done | Early key install, 0-RTT packing; `early_data` answered in EncryptedExtensions only when the ClientHello offered it (RFC 8446 §4.2.10) |
 | 4.7 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager |
 | 4.8 | TLS Errors | ✅ Done | Maps HandshakeError to CRYPTO_ERROR (0x100 + TLS alert) with CONNECTION_CLOSE |
 | 4.9 | Discarding Unused Keys | ✅ Done | Initial/Handshake keys cleared post-handshake |
@@ -257,7 +257,7 @@
 | 6.1.1 | Packet Threshold | ✅ Done | kPacketThreshold = 3 |
 | 6.1.2 | Time Threshold | ✅ Done | 9/8 × max(srtt, latest_rtt) |
 | 6.2 | Probe Timeout | | |
-| 6.2.1 | Computing PTO | ✅ Done | srtt + max(4×rttvar, 1ms) + ack_delay |
+| 6.2.1 | Computing PTO | ✅ Done | srtt + max(4×rttvar, 1ms) + ack_delay; no Application-space timer before handshake confirmation |
 | 6.2.2 | Handshakes and New Paths | ✅ Done | No ack_delay for Initial/Handshake |
 | 6.2.3 | Speeding Up Handshake Completion | ✅ Done | |
 | 6.2.4 | Sending Probe Packets | ✅ Done | PTO probes prefer data retransmit |
