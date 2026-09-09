@@ -29,6 +29,10 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   including bytes never sent, and the retransmit path is the one send path with
   no window check of its own. quic-go closed our transfer with FLOW_CONTROL_ERROR
   under the blackhole test.
+- The Application-space PTO ran before the handshake was confirmed, concluded
+  that 0-RTT data the peer had not yet had a chance to acknowledge was lost, and
+  re-sent every early request at 1-RTT — spending the round trip 0-RTT exists to
+  save. RFC 9002 §6.2.1 gives that space no timer until confirmation.
 - A server that accepted a resumption ticket sent the `early_data` extension in
   EncryptedExtensions whether or not the client had offered early data.
   BoringSSL calls that an unexpected extension, so every quiche client resuming
