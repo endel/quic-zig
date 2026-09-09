@@ -33,4 +33,5 @@ test {
     _ = @import("moq/track.zig");
     _ = @import("moq/object.zig");
     _ = @import("moq/message.zig");
+    _ = @import("event_loop.zig");
 }

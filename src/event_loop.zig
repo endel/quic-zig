@@ -320,6 +320,10 @@ pub fn Server(comptime Handler: type) type {
         /// Optional second socket for preferred_address (connectionmigration).
         /// When the server advertises a preferred_address on a different port,
         /// clients migrate there. This socket receives and responds on that port.
+        /// The TLS material read off disk in init(), when we loaded it rather
+        /// than the caller supplying an in-memory config. Freed in deinit().
+        owned_tls: ?OwnedTlsMaterial,
+
         preferred: ?PreferredSocket,
 
         /// Optional HTTP/1.1 static file server (runs on a separate thread).
@@ -336,6 +340,7 @@ pub fn Server(comptime Handler: type) type {
 
         pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: Config) !Self {
             // Determine TLS config: use advanced or build from cert/key paths
+            var owned_tls: ?OwnedTlsMaterial = null;
             const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
                 // Read cert files
                 const server_cert_pem = try sys.readFileAlloc(alloc, config.cert_path, 8192);
@@ -355,6 +360,14 @@ pub fn Server(comptime Handler: type) type {
                 var ticket_key: [16]u8 = undefined;
                 sys.randomBytes(&ticket_key);
 
+                owned_tls = .{
+                    .cert_pem = server_cert_pem,
+                    .key_pem = server_key_pem,
+                    .cert_chain = cert_chain,
+                    .private_key = ec_private_key,
+                    .alpn = alpn,
+                };
+
                 break :blk .{
                     .cert_chain_der = cert_chain,
                     .private_key_bytes = ec_private_key,
@@ -362,6 +375,7 @@ pub fn Server(comptime Handler: type) type {
                     .ticket_key = ticket_key,
                 };
             };
+            errdefer if (owned_tls) |*o| o.deinit(alloc);
 
             var retry_token_key: [16]u8 = if (config.retry_token_key) |k| k else undefined;
             if (config.retry_token_key == null) sys.randomBytes(&retry_token_key);
@@ -475,6 +489,7 @@ pub fn Server(comptime Handler: type) type {
                 .recv_buf = undefined,
                 .qpack_scratch = undefined,
                 .out_buf = undefined,
+                .owned_tls = owned_tls,
                 .preferred = preferred,
                 .http1_server = http1_server,
             };
@@ -489,6 +504,8 @@ pub fn Server(comptime Handler: type) type {
             sys.close(self.sockfd);
             if (self.preferred) |p| sys.close(p.sockfd);
             self.conn_mgr.deinit();
+            // Last: live connections hold slices into this material.
+            if (self.owned_tls) |*o| o.deinit(self.allocator);
         }
 
         /// Register watchers and start the event loop. Call once before tick().
@@ -1153,10 +1170,35 @@ pub const ClientConfig = struct {
 
 /// ClientSession wraps a single client-side connection and provides the same
 /// convenience methods as the server-side Session.
+/// TLS material a Server allocated for itself in init(), so deinit() can give
+/// it back. Absent when the caller supplied an in-memory `tls_config`.
+const OwnedTlsMaterial = struct {
+    cert_pem: []u8,
+    key_pem: []u8,
+    cert_chain: [][]const u8,
+    private_key: []u8,
+    alpn: [][]const u8,
+
+    fn deinit(self: *OwnedTlsMaterial, alloc: std.mem.Allocator) void {
+        alloc.free(self.cert_pem);
+        alloc.free(self.key_pem);
+        for (self.cert_chain) |der| alloc.free(der); // each DER is its own alloc
+        alloc.free(self.cert_chain);
+        alloc.free(self.private_key);
+        alloc.free(self.alpn);
+    }
+};
+
 pub const ClientSession = struct {
     conn: *connection.Connection,
     h3_conn: ?*h3.H3Connection = null,
     wt_conn: ?*wt.WebTransportConnection = null,
+
+    /// The owning Client's `stopping` flag. A client has exactly one
+    /// connection, so closing it from a handler is a request to shut down —
+    /// the run loop only leaves once this is set and the connection has
+    /// finished draining.
+    stopping: ?*bool = null,
 
     // --- H3 methods ---
 
@@ -1292,6 +1334,7 @@ pub const ClientSession = struct {
 
     pub fn closeConnection(self: *ClientSession) void {
         self.conn.close(0, "");
+        if (self.stopping) |flag| flag.* = true;
     }
 
     pub fn getStats(self: *const ClientSession) connection.Connection.Stats {
@@ -1443,10 +1486,15 @@ pub fn Client(comptime Handler: type) type {
         server_name: []const u8,
         path: []const u8,
 
+        /// The default ALPN list, when we built it rather than the caller.
+        owned_alpn: ?[][]const u8,
+
         pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: ClientConfig) !Self {
             // Build TLS config
+            var owned_alpn: ?[][]const u8 = null;
             const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
                 const alpn = try alloc.alloc([]const u8, 1);
+                owned_alpn = alpn;
                 alpn[0] = if (config.alpn) |a| a else switch (Handler.protocol) {
                     .h3, .webtransport => "h3",
                     .quic, .h0 => "h3", // default; override via config.alpn for custom protocols
@@ -1483,6 +1531,8 @@ pub fn Client(comptime Handler: type) type {
 
             // Heap-allocate for pointer stability, then build in place: the
             // by-value connect() would stage all ~137 KB on the stack first.
+            errdefer if (owned_alpn) |a| alloc.free(a);
+
             const conn_ptr = try alloc.create(connection.Connection);
             errdefer alloc.destroy(conn_ptr);
             try connection.connectInto(
@@ -1556,6 +1606,7 @@ pub fn Client(comptime Handler: type) type {
                 .finished_streams = std.AutoHashMap(u64, void).init(alloc),
                 .server_name = config.server_name,
                 .path = config.path,
+                .owned_alpn = owned_alpn,
             };
         }
 
@@ -1563,6 +1614,7 @@ pub fn Client(comptime Handler: type) type {
             connection_manager.destroyProtocols(self.allocator, self.wt_conn, self.h3_conn, null);
             self.wt_conn = null;
             self.h3_conn = null;
+            if (self.owned_alpn) |a| self.allocator.free(a);
             self.finished_streams.deinit();
             self.timer.deinit();
             self.loop.deinit();
@@ -2015,6 +2067,7 @@ pub fn Client(comptime Handler: type) type {
                 .conn = self.conn,
                 .h3_conn = self.h3_conn,
                 .wt_conn = self.wt_conn,
+                .stopping = &self.stopping,
             };
         }
     };
@@ -2027,7 +2080,7 @@ const crypto = std.crypto;
 const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 
 fn makeTestTlsConfig() tls13.TlsConfig {
-    const server_key_pair = EcdsaP256Sha256.KeyPair.generate();
+    const server_key_pair = EcdsaP256Sha256.KeyPair.generate(std.testing.io);
     const S = struct {
         var secret_key_bytes: [32]u8 = undefined;
         var pub_key_bytes: [65]u8 = undefined;
@@ -2039,7 +2092,7 @@ fn makeTestTlsConfig() tls13.TlsConfig {
     S.pub_key_bytes = server_key_pair.public_key.toUncompressedSec1();
     S.cert_chain = .{&S.pub_key_bytes};
     S.alpn = .{"h3"};
-    crypto.random.bytes(&S.ticket_key);
+    sys.randomBytes(&S.ticket_key);
     return .{
         .cert_chain_der = &S.cert_chain,
         .private_key_bytes = &S.secret_key_bytes,
@@ -2248,5 +2301,27 @@ test "Client QUIC: start, tick, stop lifecycle" {
     try testing.expect(client.started);
 
     client.stop();
+    try testing.expect(client.stopping);
+}
+
+test "Client: closeConnection from a handler arms the run loop's exit" {
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19881,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try client.tick();
+    try testing.expect(!client.stopping);
+
+    // run() only leaves once `stopping` is set, so a handler that closes the
+    // connection without it leaves the client spinning after the exchange.
+    var session = client.makeSession();
+    session.closeConnection();
     try testing.expect(client.stopping);
 }
