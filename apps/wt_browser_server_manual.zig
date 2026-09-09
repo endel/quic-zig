@@ -182,30 +182,34 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             // Initialize H3 + WT layers once handshake completes
             if (conn.isEstablished() and !entry.h3_initialized) {
-                entry.h3_conn = h3.H3Connection.init(alloc, conn, true);
-                entry.h3_conn.?.local_settings = .{
+                const h3c = alloc.create(h3.H3Connection) catch {
+                    i += 1;
+                    continue;
+                };
+                h3c.* = h3.H3Connection.init(alloc, conn, true);
+                h3c.local_settings = .{
                     .enable_connect_protocol = true,
                     .h3_datagram = true,
                     .enable_webtransport = true,
                     .webtransport_max_sessions = 4,
                 };
-                entry.h3_conn.?.initConnection() catch {
+                entry.h3_conn = h3c;
+                h3c.initConnection() catch {
                     i += 1;
                     continue;
                 };
-                entry.wt_conn = wt.WebTransportConnection.init(
-                    alloc,
-                    &entry.h3_conn.?,
-                    conn,
-                    true,
-                );
+                const wtc_new = alloc.create(wt.WebTransportConnection) catch {
+                    i += 1;
+                    continue;
+                };
+                wtc_new.* = wt.WebTransportConnection.init(alloc, h3c, conn, true);
+                entry.wt_conn = wtc_new;
                 entry.h3_initialized = true;
                 std.debug.print("connection established (total: {d})\n", .{conn_mgr.connectionCount()});
             }
 
             // Poll WebTransport events
-            if (entry.wt_conn != null) {
-                var wtc = &entry.wt_conn.?;
+            if (entry.wt_conn) |wtc| {
 
                 // Drain datagrams
                 while (wtc.pollDatagrams()) |dg_event| {

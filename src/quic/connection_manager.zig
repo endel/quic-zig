@@ -44,12 +44,16 @@ pub const CidKeyContext = struct {
 };
 
 /// Per-connection wrapper holding the heap-allocated Connection and H3 state.
+///
+/// Every protocol layer is a pointer, not a value: a raw-QUIC connection
+/// would otherwise pay for the H3 and WebTransport state it never touches,
+/// and the table is sized for MAX_CONNECTIONS of them.
 pub const ConnEntry = struct {
     conn: *connection.Connection,
-    h3_conn: ?h3.H3Connection = null,
+    h3_conn: ?*h3.H3Connection = null,
     h3_initialized: bool = false,
     h0_conn: ?*h0.H0Connection = null,
-    wt_conn: ?wt.WebTransportConnection = null,
+    wt_conn: ?*wt.WebTransportConnection = null,
 
     /// Type-erased handler pointer for zero-copy datagram callback.
     datagram_handler_ctx: ?*anyopaque = null,
@@ -93,6 +97,37 @@ pub const ConnEntry = struct {
     }
 };
 
+/// An entry taken out of service, plus the protocol layers detached from it.
+/// The layers are unhooked from the entry immediately so stale `Session`
+/// handles see null, but stay allocated until `freeDeadEntries`.
+const DeadEntry = struct {
+    entry: *ConnEntry,
+    h3_conn: ?*h3.H3Connection,
+    h0_conn: ?*h0.H0Connection,
+    wt_conn: ?*wt.WebTransportConnection,
+};
+
+/// WebTransport borrows the H3 connection, so it is torn down first.
+fn destroyProtocols(
+    allocator: Allocator,
+    wt_conn: ?*wt.WebTransportConnection,
+    h3_conn: ?*h3.H3Connection,
+    h0_conn: ?*h0.H0Connection,
+) void {
+    if (wt_conn) |p| {
+        p.deinit();
+        allocator.destroy(p);
+    }
+    if (h3_conn) |p| {
+        p.deinit();
+        allocator.destroy(p);
+    }
+    if (h0_conn) |p| {
+        p.deinit();
+        allocator.destroy(p);
+    }
+}
+
 /// Manages multiple QUIC connections, routing packets by DCID.
 pub const ConnectionManager = struct {
     const MAX_CONNECTIONS = 256;
@@ -113,7 +148,7 @@ pub const ConnectionManager = struct {
 
     // Deferred free queue: entries invalidated by removeConnection are held
     // here until freeDeadEntries() is called after all event processing.
-    dead_entries_buf: [MAX_CONNECTIONS]*ConnEntry = undefined,
+    dead_entries_buf: [MAX_CONNECTIONS]DeadEntry = undefined,
     dead_entry_count: usize = 0,
 
     pub fn init(
@@ -140,6 +175,7 @@ pub const ConnectionManager = struct {
         self.freeDeadEntries();
         // Clean up all live connections
         for (self.entries.items) |entry| {
+            destroyProtocols(self.allocator, entry.wt_conn, entry.h3_conn, entry.h0_conn);
             entry.finished_streams.deinit(self.allocator);
             entry.conn.deinit();
             self.allocator.destroy(entry.conn);
@@ -169,9 +205,12 @@ pub const ConnectionManager = struct {
             return error.TooManyConnections;
         }
 
-        // Heap-allocate Connection
+        // Heap-allocate Connection, then build it in place: the by-value
+        // accept() would stage all ~185 KB on the stack first.
         const conn = try self.allocator.create(connection.Connection);
-        conn.* = try connection.Connection.accept(
+        errdefer self.allocator.destroy(conn);
+        try connection.Connection.acceptInto(
+            conn,
             self.allocator,
             header,
             local,
@@ -185,7 +224,7 @@ pub const ConnectionManager = struct {
 
         // Create entry
         const entry = try self.allocator.create(ConnEntry);
-        entry.* = ConnEntry{ .conn = conn };
+        entry.* = .{ .conn = conn };
 
         // Register server's SCID in the routing map
         const scid_key = CidKey.fromSlice(conn.scid[0..conn.scid_len]);
@@ -237,11 +276,19 @@ pub const ConnectionManager = struct {
             _ = self.cid_map.remove(key);
         }
 
-        // Invalidate transport layers so stale Session pointers are safe.
-        // Session.sendDatagram/sendStreamData check `if (entry.wt_conn)`
-        // and will skip the send instead of dereferencing freed sub-objects.
+        // Detach the transport layers so stale Session pointers are safe:
+        // Session.sendDatagram/sendStreamData check `if (entry.wt_conn)` and
+        // skip the send rather than dereference. The objects themselves are
+        // freed with the entry, not here.
+        const dead: DeadEntry = .{
+            .entry = entry,
+            .h3_conn = entry.h3_conn,
+            .h0_conn = entry.h0_conn,
+            .wt_conn = entry.wt_conn,
+        };
         entry.wt_conn = null;
         entry.h3_conn = null;
+        entry.h0_conn = null;
 
         // Swap-remove from entries list
         var idx: usize = 0;
@@ -253,14 +300,16 @@ pub const ConnectionManager = struct {
         }
 
         // Queue for deferred free (entry memory stays valid until freeDeadEntries)
-        self.dead_entries_buf[self.dead_entry_count] = entry;
+        self.dead_entries_buf[self.dead_entry_count] = dead;
         self.dead_entry_count = @min(self.dead_entry_count + 1, self.dead_entries_buf.len);
     }
 
     /// Free entries that were invalidated by removeConnection.
     /// Call after all event processing is complete for the current cycle.
     pub fn freeDeadEntries(self: *ConnectionManager) void {
-        for (self.dead_entries_buf[0..self.dead_entry_count]) |entry| {
+        for (self.dead_entries_buf[0..self.dead_entry_count]) |dead| {
+            destroyProtocols(self.allocator, dead.wt_conn, dead.h3_conn, dead.h0_conn);
+            const entry = dead.entry;
             entry.finished_streams.deinit(self.allocator);
             entry.conn.deinit();
             self.allocator.destroy(entry.conn);
@@ -376,7 +425,10 @@ pub const ConnectionManager = struct {
                 }
             }
 
-            const e = entry.?;
+            // ReleaseSmall has no safety checks, so `entry.?` on a null
+            // optional is a wild dereference rather than a panic. Every branch
+            // above assigns or returns; drop the datagram if that ever changes.
+            const e = entry orelse return .{ .dropped = {} };
             // Only count datagram_size for the first packet in a coalesced datagram
             // to avoid double-counting in amplification limit calculations.
             const dg_size: u64 = if (current_entry == null) bytes.len else 0;
@@ -456,4 +508,43 @@ test "ConnEntry registered CIDs" {
     try std.testing.expectEqual(@as(u8, 1), entry.registered_cid_count);
     try std.testing.expect(!entry.hasRegisteredCid(key1));
     try std.testing.expect(entry.hasRegisteredCid(key2));
+}
+
+test "removeConnection detaches the protocol layers, freeDeadEntries frees them" {
+    const alloc = std.testing.allocator;
+
+    const tls_config: tls13.TlsConfig = .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &.{},
+    };
+    var mgr = ConnectionManager.init(alloc, tls_config, .{}, .{0} ** 16, .{0} ** 16);
+    defer mgr.deinit();
+
+    const conn = try alloc.create(connection.Connection);
+    try connection.connectInto(conn, alloc, "example.com", .{}, null, null);
+
+    const entry = try alloc.create(ConnEntry);
+    entry.* = .{ .conn = conn };
+    try mgr.entries.append(alloc, entry);
+
+    const h3c = try alloc.create(h3.H3Connection);
+    h3c.* = h3.H3Connection.init(alloc, conn, true);
+    entry.h3_conn = h3c;
+
+    const wtc = try alloc.create(wt.WebTransportConnection);
+    wtc.* = wt.WebTransportConnection.init(alloc, h3c, conn, true);
+    entry.wt_conn = wtc;
+
+    mgr.removeConnection(entry);
+
+    // Detached at once, so a Session still holding this entry sees null
+    // rather than dereferencing a layer that is about to go away.
+    try std.testing.expect(entry.h3_conn == null);
+    try std.testing.expect(entry.wt_conn == null);
+    try std.testing.expectEqual(@as(usize, 0), mgr.entries.items.len);
+
+    // Freed only here — testing.allocator fails the test if either layer,
+    // or the hash maps they own, is left behind.
+    mgr.freeDeadEntries();
 }

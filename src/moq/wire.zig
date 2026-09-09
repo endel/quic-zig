@@ -174,10 +174,11 @@ pub fn readVarBytesInto(reader: anytype, buf: []u8) ![]u8 {
 
 // For zero-copy decoding off a FixedBufferStream.
 pub fn readVarBytesZc(fbs: *io.FixedBufferStream([]const u8)) ![]const u8 {
-    const len_u64 = try readVarInt(fbs);
-    const len = @as(usize, @intCast(len_u64));
-    if (fbs.seek + len > fbs.buffer.len) return Error.BufferTooShort;
-    const slice = fbs.buffer[fbs.seek .. fbs.seek + len];
+    // Compare by subtraction, never `seek + len`: a hostile 64-bit length
+    // wraps the addition and passes the check. Same rule as frame.body().
+    const len = std.math.cast(usize, try readVarInt(fbs)) orelse return Error.BufferTooShort;
+    if (len > fbs.buffer.len - fbs.seek) return Error.BufferTooShort;
+    const slice = fbs.buffer[fbs.seek..][0..len];
     fbs.seek += len;
     return slice;
 }

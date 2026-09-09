@@ -192,6 +192,14 @@ pub const Frame = union(FrameType) {
         reordering_threshold: u64,
     },
 
+    /// A frame body cannot extend past the datagram it was decoded from.
+    /// Wire lengths are u64 varints, so this is also where they narrow to
+    /// usize (RFC 9000 12.4: a violation is FRAME_ENCODING_ERROR).
+    fn body(bytes: []u8, seek: usize, len: u64) ![]u8 {
+        if (len > bytes.len - seek) return error.FrameEncodingError;
+        return bytes[seek..][0..@intCast(len)];
+    }
+
     /// Parse a single frame from a byte buffer. Returns the frame and advances
     /// the stream position.
     pub fn parse(bytes: []u8) !Frame {
@@ -308,7 +316,7 @@ pub const Frame = union(FrameType) {
                 return .{
                     .crypto = .{
                         .offset = offset,
-                        .data = bytes[stream.seek..(stream.seek + length)],
+                        .data = try body(bytes, stream.seek, length),
                     },
                 };
             },
@@ -317,7 +325,7 @@ pub const Frame = union(FrameType) {
             0x07 => {
                 const len = try packet.readVarInt(reader);
                 return .{
-                    .new_token = bytes[stream.seek..(stream.seek + len)],
+                    .new_token = try body(bytes, stream.seek, len),
                 };
             },
 
@@ -340,7 +348,7 @@ pub const Frame = union(FrameType) {
                     .offset = offset,
                     .length = data_length,
                     .fin = has_fin,
-                    .data = bytes[stream.seek..@min(stream.seek + data_length, bytes.len)],
+                    .data = try body(bytes, stream.seek, data_length),
                 } };
             },
 
@@ -405,7 +413,7 @@ pub const Frame = union(FrameType) {
                                 return error.FrameEncodingError;
                             }
 
-                            const conn_id = bytes[stream.seek..(stream.seek + conn_id_len)];
+                            const conn_id = try body(bytes, stream.seek, conn_id_len);
                             try stream.seekBy(conn_id_len);
 
                             break :blk conn_id;
@@ -439,7 +447,7 @@ pub const Frame = union(FrameType) {
                     .frame_type = try packet.readVarInt(reader),
                     .reason = blk: {
                         const len = try packet.readVarInt(reader);
-                        break :blk bytes[stream.seek..(stream.seek + len)];
+                        break :blk try body(bytes, stream.seek, len);
                     },
                 },
             },
@@ -450,7 +458,7 @@ pub const Frame = union(FrameType) {
                     .error_code = try packet.readVarInt(reader),
                     .reason = blk: {
                         const len = try packet.readVarInt(reader);
-                        break :blk bytes[stream.seek..(stream.seek + len)];
+                        break :blk try body(bytes, stream.seek, len);
                     },
                 },
             },
@@ -470,7 +478,7 @@ pub const Frame = union(FrameType) {
             0x31 => blk: {
                 const length = try packet.readVarInt(reader);
                 break :blk .{ .datagram_with_length = .{
-                    .data = bytes[stream.seek..@min(stream.seek + length, bytes.len)],
+                    .data = try body(bytes, stream.seek, length),
                 } };
             },
 
@@ -717,14 +725,30 @@ pub const Frame = union(FrameType) {
             .connection_close => pkt_type != .zero_rtt,
             // NEW_TOKEN, NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, HANDSHAKE_DONE: 1-RTT only
             // ACK_FREQUENCY, IMMEDIATE_ACK: 1-RTT only (draft-ietf-quic-ack-frequency)
-            .new_token, .new_connection_id, .retire_connection_id, .handshake_done,
-            .ack_frequency, .immediate_ack,
+            .new_token,
+            .new_connection_id,
+            .retire_connection_id,
+            .handshake_done,
+            .ack_frequency,
+            .immediate_ack,
             => pkt_type == .one_rtt,
             // All others: 0-RTT and 1-RTT only
-            .reset_stream, .stop_sending, .stream, .max_data, .max_stream_data,
-            .max_streams_bidi, .max_streams_uni, .data_blocked, .stream_data_blocked,
-            .streams_blocked_bidi, .streams_blocked_uni, .path_challenge, .path_response,
-            .application_close, .datagram, .datagram_with_length,
+            .reset_stream,
+            .stop_sending,
+            .stream,
+            .max_data,
+            .max_stream_data,
+            .max_streams_bidi,
+            .max_streams_uni,
+            .data_blocked,
+            .stream_data_blocked,
+            .streams_blocked_bidi,
+            .streams_blocked_uni,
+            .path_challenge,
+            .path_response,
+            .application_close,
+            .datagram,
+            .datagram_with_length,
             => pkt_type == .one_rtt or pkt_type == .zero_rtt,
         };
     }
@@ -844,7 +868,7 @@ pub const PendingControlFrame = union(enum) {
 
 /// Fixed-capacity queue for pending control frames.
 pub const PendingFrameQueue = struct {
-    const capacity = 128;
+    const capacity = @import("limits.zig").pending_frames;
 
     items: [capacity]PendingControlFrame = undefined,
     len: u8 = 0,
@@ -1435,4 +1459,18 @@ test "PendingFrameQueue: push and pop max_streams variants" {
     }
 
     try std.testing.expect(queue.pop() == null);
+}
+
+test "frame body longer than the datagram is rejected, not sliced" {
+    // 0x06 CRYPTO, offset 0, length 16383 — but only 4 bytes follow.
+    var crypto_frame = [_]u8{ 0x06, 0x00, 0x7f, 0xff, 0xde, 0xad, 0xbe, 0xef };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&crypto_frame));
+
+    // Same shape via CONNECTION_CLOSE's reason phrase.
+    var close_frame = [_]u8{ 0x1c, 0x00, 0x00, 0x7f, 0xff, 0x41 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&close_frame));
+
+    // 0x07 NEW_TOKEN with a length past the end.
+    var token_frame = [_]u8{ 0x07, 0x7f, 0xff, 0x01, 0x02 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&token_frame));
 }

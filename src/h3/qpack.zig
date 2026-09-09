@@ -1,4 +1,5 @@
 const std = @import("std");
+const limits = @import("../quic/limits.zig");
 const testing = std.testing;
 const huffman = @import("huffman.zig");
 
@@ -198,7 +199,8 @@ fn decodeString(data: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usiz
     const is_huffman = (data[pos.*] & 0x80) != 0;
 
     const len = try decodeInteger(data, pos, 7);
-    if (pos.* + len > data.len) return error.BufferTooShort;
+    // Subtract rather than add: `len` is an unchecked wire varint.
+    if (len > data.len - pos.*) return error.BufferTooShort;
 
     const raw = data[pos.*..][0..len];
     pos.* += len;
@@ -228,23 +230,14 @@ fn decodeString(data: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usiz
 /// Entry overhead per RFC 9204 §3.2.1: name.len + value.len + 32.
 const ENTRY_OVERHEAD: usize = 32;
 
-/// A single dynamic table entry with inline storage.
+/// A view of one dynamic table entry. The slices point into the table's
+/// arena and stay valid until that entry is evicted.
 pub const DynEntry = struct {
-    name_buf: [128]u8 = undefined,
-    name_len: u8 = 0,
-    value_buf: [512]u8 = undefined,
-    value_len: u16 = 0,
+    name: []const u8,
+    value: []const u8,
 
-    pub fn getName(self: *const DynEntry) []const u8 {
-        return self.name_buf[0..self.name_len];
-    }
-
-    pub fn getValue(self: *const DynEntry) []const u8 {
-        return self.value_buf[0..self.value_len];
-    }
-
-    pub fn entrySize(self: *const DynEntry) usize {
-        return @as(usize, self.name_len) + @as(usize, self.value_len) + ENTRY_OVERHEAD;
+    pub fn entrySize(self: DynEntry) usize {
+        return self.name.len + self.value.len + ENTRY_OVERHEAD;
     }
 };
 
@@ -253,91 +246,140 @@ fn computeEntrySize(name: []const u8, value: []const u8) usize {
     return name.len + value.len + ENTRY_OVERHEAD;
 }
 
-/// FIFO dynamic table with ring buffer storage.
+/// FIFO dynamic table (RFC 9204 §3.2).
+///
+/// Names and values live in one arena sized to the capacity we are willing
+/// to advertise, indexed by a ring of small descriptors. The protocol bounds
+/// total content by the negotiated capacity — `insert` enforces it — so the
+/// arena cannot overflow, and there is no per-entry size limit beyond what
+/// the capacity itself implies.
 pub const DynamicTable = struct {
-    const MAX_ENTRIES = 128;
+    /// Also the arena size: content can never exceed the capacity.
+    pub const MAX_CAPACITY: usize = limits.qpack_table_capacity;
+    /// An entry costs at least ENTRY_OVERHEAD, so this many is the most the
+    /// capacity can ever hold.
+    const MAX_ENTRIES: usize = MAX_CAPACITY / ENTRY_OVERHEAD;
 
-    entries: [MAX_ENTRIES]DynEntry = undefined,
-    head: usize = 0, // next write position (newest)
+    const Desc = struct {
+        off: u32 = 0,
+        name_len: u16 = 0,
+        value_len: u16 = 0,
+    };
+
+    arena: [MAX_CAPACITY]u8 = undefined,
+    descs: [MAX_ENTRIES]Desc = undefined,
+    /// Bytes of arena consumed. Live content is always [tail.off, used).
+    used: usize = 0,
     count: usize = 0, // current entry count
-    size: usize = 0, // current size in bytes
+    size: usize = 0, // current size in bytes, per RFC accounting
     capacity: usize = 0, // max size in bytes (from SETTINGS)
     insert_count: u64 = 0, // total insertions ever (absolute index base)
 
-    /// Set the capacity, evicting entries if needed.
+    /// Descriptor slot the next insert takes. Derived rather than tracked:
+    /// only insert advances it, in lockstep with insert_count.
+    fn headIndex(self: *const DynamicTable) usize {
+        return @intCast(self.insert_count % MAX_ENTRIES);
+    }
+
+    fn tailIndex(self: *const DynamicTable) usize {
+        return (self.headIndex() + MAX_ENTRIES - self.count) % MAX_ENTRIES;
+    }
+
+    fn entryAt(self: *const DynamicTable, ring_idx: usize) DynEntry {
+        const d = self.descs[ring_idx];
+        return .{
+            .name = self.arena[d.off..][0..d.name_len],
+            .value = self.arena[d.off + d.name_len ..][0..d.value_len],
+        };
+    }
+
+    /// Set the capacity, evicting entries if needed. A peer asking for more
+    /// than we sized the arena for is clamped, not trusted.
     pub fn setCapacity(self: *DynamicTable, cap: usize) void {
-        self.capacity = cap;
+        self.capacity = @min(cap, MAX_CAPACITY);
         while (self.size > self.capacity and self.count > 0) {
             self.evict();
         }
     }
 
-    /// Insert a new entry. Returns error if name/value too large for inline storage.
-    pub fn insert(self: *DynamicTable, name: []const u8, value: []const u8) !void {
-        if (name.len > 128) return error.NameTooLong;
-        if (value.len > 512) return error.ValueTooLong;
+    /// Slide the live entries back to the start of the arena. They are always
+    /// contiguous — insertion only ever appends, eviction only ever drops the
+    /// oldest — so this is one move plus an offset fixup.
+    fn compact(self: *DynamicTable) void {
+        const tail = self.tailIndex();
+        const base = self.descs[tail].off;
+        if (base == 0) return;
+        const live = self.used - base;
+        std.mem.copyForwards(u8, self.arena[0..live], self.arena[base..][0..live]);
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            const idx = (tail + i) % MAX_ENTRIES;
+            self.descs[idx].off -= base;
+        }
+        self.used = live;
+    }
 
+    /// Insert a new entry, evicting oldest-first to make room.
+    pub fn insert(self: *DynamicTable, name: []const u8, value: []const u8) !void {
         const entry_size = computeEntrySize(name, value);
         if (entry_size > self.capacity) return error.EntryTooLarge;
 
-        // Evict until there's room
         while (self.size + entry_size > self.capacity and self.count > 0) {
             self.evict();
         }
 
-        // Write at head
-        var entry = &self.entries[self.head];
-        @memcpy(entry.name_buf[0..name.len], name);
-        entry.name_len = @intCast(name.len);
-        @memcpy(entry.value_buf[0..value.len], value);
-        entry.value_len = @intCast(value.len);
+        const content = name.len + value.len;
+        if (self.used + content > MAX_CAPACITY) self.compact();
 
-        self.head = (self.head + 1) % MAX_ENTRIES;
+        const off: u32 = @intCast(self.used);
+        @memcpy(self.arena[off..][0..name.len], name);
+        @memcpy(self.arena[off + name.len ..][0..value.len], value);
+
+        // Before insert_count moves — headIndex() is derived from it.
+        self.descs[self.headIndex()] = .{
+            .off = off,
+            .name_len = @intCast(name.len),
+            .value_len = @intCast(value.len),
+        };
+        self.used += content;
         self.count += 1;
         self.size += entry_size;
         self.insert_count += 1;
     }
 
-    /// Evict the oldest entry (tail of the FIFO).
+    /// Evict the oldest entry (tail of the FIFO). Arena space is reclaimed
+    /// lazily by `compact`.
     fn evict(self: *DynamicTable) void {
         if (self.count == 0) return;
-        // tail index: head points one past newest, so oldest is at head - count
-        const tail = (self.head + MAX_ENTRIES - self.count) % MAX_ENTRIES;
-        self.size -= self.entries[tail].entrySize();
+        const tail = self.tailIndex();
+        self.size -= self.entryAt(tail).entrySize();
         self.count -= 1;
+        if (self.count == 0) self.used = 0;
     }
 
     /// Get entry by absolute index (0 = first ever inserted).
     /// Returns null if the entry has been evicted or not yet inserted.
-    pub fn get(self: *const DynamicTable, abs_idx: u64) ?*const DynEntry {
-        // Absolute index range of entries currently in the table:
-        // oldest = insert_count - count, newest = insert_count - 1
+    pub fn get(self: *const DynamicTable, abs_idx: u64) ?DynEntry {
         if (self.count == 0) return null;
         const oldest = self.insert_count - self.count;
         if (abs_idx < oldest or abs_idx >= self.insert_count) return null;
 
-        // Map to ring buffer position
-        // The newest entry is at (head - 1), abs_idx = insert_count - 1
-        // offset from newest = (insert_count - 1) - abs_idx
         const offset_from_newest = self.insert_count - 1 - abs_idx;
-        const ring_idx = (self.head + MAX_ENTRIES - 1 - offset_from_newest) % MAX_ENTRIES;
-        return &self.entries[ring_idx];
+        const ring_idx = (self.headIndex() + MAX_ENTRIES - 1 - @as(usize, @intCast(offset_from_newest))) % MAX_ENTRIES;
+        return self.entryAt(ring_idx);
     }
 
     /// Get entry by relative index from a given base.
     /// RFC 9204 §3.2.3: relative index = base - absolute_index - 1
-    /// So absolute_index = base - relative_index - 1
-    pub fn getRelative(self: *const DynamicTable, base: u64, rel_idx: u64) ?*const DynEntry {
+    pub fn getRelative(self: *const DynamicTable, base: u64, rel_idx: u64) ?DynEntry {
         if (rel_idx >= base) return null;
-        const abs_idx = base - rel_idx - 1;
-        return self.get(abs_idx);
+        return self.get(base - rel_idx - 1);
     }
 
     /// Get entry by post-base index.
     /// RFC 9204 §3.2.3: absolute_index = base + post_base_index
-    pub fn getPostBase(self: *const DynamicTable, base: u64, post_base_idx: u64) ?*const DynEntry {
-        const abs_idx = base + post_base_idx;
-        return self.get(abs_idx);
+    pub fn getPostBase(self: *const DynamicTable, base: u64, post_base_idx: u64) ?DynEntry {
+        return self.get(base + post_base_idx);
     }
 
     /// Result of a dynamic table search.
@@ -353,24 +395,19 @@ pub const DynamicTable = struct {
         var name_match: ?u64 = null;
         const oldest = self.insert_count - self.count;
 
-        // Search from newest to oldest for best match
         var i: u64 = self.insert_count;
         while (i > oldest) {
             i -= 1;
             const entry = self.get(i) orelse continue;
-            if (std.mem.eql(u8, entry.getName(), name)) {
-                if (std.mem.eql(u8, entry.getValue(), value)) {
+            if (std.mem.eql(u8, entry.name, name)) {
+                if (std.mem.eql(u8, entry.value, value)) {
                     return .{ .abs_index = i, .full_match = true };
                 }
-                if (name_match == null) {
-                    name_match = i;
-                }
+                if (name_match == null) name_match = i;
             }
         }
 
-        if (name_match) |idx| {
-            return .{ .abs_index = idx, .full_match = false };
-        }
+        if (name_match) |idx| return .{ .abs_index = idx, .full_match = false };
         return null;
     }
 
@@ -411,18 +448,18 @@ fn decodeRequiredInsertCount(encoded: u64, max_entries: u64, total_insert_count:
 
 pub const QpackEncoder = struct {
     dynamic: DynamicTable = .{},
-    max_capacity: usize = 0,
     instruction_buf: [4096]u8 = undefined,
     instruction_len: usize = 0,
 
     /// Set capacity from peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY.
     pub fn setCapacity(self: *QpackEncoder, cap: usize) void {
-        self.max_capacity = cap;
         self.dynamic.setCapacity(cap);
-        // Emit Set Dynamic Table Capacity instruction: 001XXXXX (5-bit prefix)
-        if (cap > 0) {
+        // Announce what we will actually hold, not what was asked for:
+        // setCapacity clamps to the arena size.
+        const effective = self.dynamic.capacity;
+        if (effective > 0) {
             var pos = self.instruction_len;
-            encodeInteger(&self.instruction_buf, &pos, cap, 5, 0x20);
+            encodeInteger(&self.instruction_buf, &pos, effective, 5, 0x20);
             self.instruction_len = pos;
         }
     }
@@ -430,7 +467,7 @@ pub const QpackEncoder = struct {
     /// Encode headers into a QPACK header block, using dynamic table when possible.
     /// Returns the number of bytes written to buf.
     pub fn encode(self: *QpackEncoder, headers: []const Header, buf: []u8) !usize {
-        if (self.max_capacity == 0) {
+        if (self.dynamic.capacity == 0) {
             // No dynamic table — use static-only encoding
             return encodeHeaders(headers, buf);
         }
@@ -543,9 +580,6 @@ pub const QpackEncoder = struct {
     /// Try to insert an entry with a static name reference.
     /// Emits "Insert with Name Reference" encoder instruction.
     fn tryInsertWithStaticNameRef(self: *QpackEncoder, static_idx: u8, value: []const u8) void {
-        if (value.len > 512) return; // too large for inline storage
-        if (computeEntrySize(static_table[static_idx].name, value) > self.dynamic.capacity) return;
-
         self.dynamic.insert(static_table[static_idx].name, value) catch return;
 
         // Encoder instruction: 1TNNNNNN — T=1 for static, 6-bit index
@@ -559,9 +593,6 @@ pub const QpackEncoder = struct {
     /// Try to insert an entry with a literal name.
     /// Emits "Insert with Literal Name" encoder instruction.
     fn tryInsertWithLiteralName(self: *QpackEncoder, name: []const u8, value: []const u8) void {
-        if (name.len > 128 or value.len > 512) return;
-        if (computeEntrySize(name, value) > self.dynamic.capacity) return;
-
         self.dynamic.insert(name, value) catch return;
 
         // Encoder instruction: 01NNNNNN — 5-bit name length prefix with H=0
@@ -607,6 +638,9 @@ pub const QpackEncoder = struct {
 
 // ── QPACK Decoder (RFC 9204 §4.2) ─────────────────────────────────────
 
+/// Enough scratch for one header block's decoded names and values.
+pub const SCRATCH_SIZE = 16384;
+
 pub const QpackDecoder = struct {
     dynamic: DynamicTable = .{},
     max_capacity: usize = 0,
@@ -621,7 +655,15 @@ pub const QpackDecoder = struct {
 
     /// Decode a QPACK header block, resolving dynamic table references.
     /// Returns the number of headers decoded.
-    pub fn decode(self: *QpackDecoder, data: []const u8, headers_buf: []Header, stream_id: u64) !usize {
+    /// Decoded `Header` names/values are copied into `scratch` and point there;
+    /// they stay valid only until the next decode using the same buffer.
+    pub fn decode(
+        self: *QpackDecoder,
+        data: []const u8,
+        headers_buf: []Header,
+        scratch: []u8,
+        stream_id: u64,
+    ) !usize {
         if (data.len < 2) return error.BufferTooShort;
 
         var pos: usize = 0;
@@ -668,14 +710,14 @@ pub const QpackDecoder = struct {
                 const rel_idx = try decodeInteger(data, &pos, 6);
                 const entry = self.dynamic.getRelative(base, rel_idx) orelse return error.InvalidIndex;
                 // Copy name/value from dynamic entry into scratch
-                const n = entry.getName();
-                const v = entry.getValue();
-                if (scratch_pos + n.len + v.len > huffman_scratch.len) return error.BufferTooSmall;
-                @memcpy(huffman_scratch[scratch_pos..][0..n.len], n);
-                const name_slice = huffman_scratch[scratch_pos..][0..n.len];
+                const n = entry.name;
+                const v = entry.value;
+                if (scratch_pos + n.len + v.len > scratch.len) return error.BufferTooSmall;
+                @memcpy(scratch[scratch_pos..][0..n.len], n);
+                const name_slice = scratch[scratch_pos..][0..n.len];
                 scratch_pos += n.len;
-                @memcpy(huffman_scratch[scratch_pos..][0..v.len], v);
-                const value_slice = huffman_scratch[scratch_pos..][0..v.len];
+                @memcpy(scratch[scratch_pos..][0..v.len], v);
+                const value_slice = scratch[scratch_pos..][0..v.len];
                 scratch_pos += v.len;
                 headers_buf[count] = .{ .name = name_slice, .value = value_slice };
                 count += 1;
@@ -686,7 +728,7 @@ pub const QpackDecoder = struct {
                 if (is_static) {
                     const index = try decodeInteger(data, &pos, 4);
                     if (index >= static_table.len) return error.InvalidIndex;
-                    const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+                    const value = try decodeString(data, &pos, scratch, &scratch_pos);
                     headers_buf[count] = .{
                         .name = static_table[index].name,
                         .value = value,
@@ -695,12 +737,12 @@ pub const QpackDecoder = struct {
                 } else {
                     const rel_idx = try decodeInteger(data, &pos, 4);
                     const entry = self.dynamic.getRelative(base, rel_idx) orelse return error.InvalidIndex;
-                    const n = entry.getName();
-                    if (scratch_pos + n.len > huffman_scratch.len) return error.BufferTooSmall;
-                    @memcpy(huffman_scratch[scratch_pos..][0..n.len], n);
-                    const name_slice = huffman_scratch[scratch_pos..][0..n.len];
+                    const n = entry.name;
+                    if (scratch_pos + n.len > scratch.len) return error.BufferTooSmall;
+                    @memcpy(scratch[scratch_pos..][0..n.len], n);
+                    const name_slice = scratch[scratch_pos..][0..n.len];
                     scratch_pos += n.len;
-                    const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+                    const value = try decodeString(data, &pos, scratch, &scratch_pos);
                     headers_buf[count] = .{ .name = name_slice, .value = value };
                     count += 1;
                 }
@@ -713,33 +755,33 @@ pub const QpackDecoder = struct {
                 if (is_name_huffman) {
                     var temp_buf: [4096]u8 = undefined;
                     const decoded_len = huffman.decode(data[pos..][0..name_len], &temp_buf) catch return error.InvalidEncoding;
-                    if (scratch_pos + decoded_len > huffman_scratch.len) return error.BufferTooSmall;
-                    @memcpy(huffman_scratch[scratch_pos..][0..decoded_len], temp_buf[0..decoded_len]);
-                    name = huffman_scratch[scratch_pos..][0..decoded_len];
+                    if (scratch_pos + decoded_len > scratch.len) return error.BufferTooSmall;
+                    @memcpy(scratch[scratch_pos..][0..decoded_len], temp_buf[0..decoded_len]);
+                    name = scratch[scratch_pos..][0..decoded_len];
                     scratch_pos += decoded_len;
                 } else {
                     // Copy raw name to scratch for lifetime safety
-                    if (scratch_pos + name_len > huffman_scratch.len) return error.BufferTooSmall;
-                    @memcpy(huffman_scratch[scratch_pos..][0..name_len], data[pos..][0..name_len]);
-                    name = huffman_scratch[scratch_pos..][0..name_len];
+                    if (scratch_pos + name_len > scratch.len) return error.BufferTooSmall;
+                    @memcpy(scratch[scratch_pos..][0..name_len], data[pos..][0..name_len]);
+                    name = scratch[scratch_pos..][0..name_len];
                     scratch_pos += name_len;
                 }
                 pos += name_len;
-                const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+                const value = try decodeString(data, &pos, scratch, &scratch_pos);
                 headers_buf[count] = .{ .name = name, .value = value };
                 count += 1;
             } else if (first & 0xf0 == 0x10) {
                 // Post-base indexed: 0001NNNN
                 const post_idx = try decodeInteger(data, &pos, 4);
                 const entry = self.dynamic.getPostBase(base, post_idx) orelse return error.InvalidIndex;
-                const n = entry.getName();
-                const v = entry.getValue();
-                if (scratch_pos + n.len + v.len > huffman_scratch.len) return error.BufferTooSmall;
-                @memcpy(huffman_scratch[scratch_pos..][0..n.len], n);
-                const name_slice = huffman_scratch[scratch_pos..][0..n.len];
+                const n = entry.name;
+                const v = entry.value;
+                if (scratch_pos + n.len + v.len > scratch.len) return error.BufferTooSmall;
+                @memcpy(scratch[scratch_pos..][0..n.len], n);
+                const name_slice = scratch[scratch_pos..][0..n.len];
                 scratch_pos += n.len;
-                @memcpy(huffman_scratch[scratch_pos..][0..v.len], v);
-                const value_slice = huffman_scratch[scratch_pos..][0..v.len];
+                @memcpy(scratch[scratch_pos..][0..v.len], v);
+                const value_slice = scratch[scratch_pos..][0..v.len];
                 scratch_pos += v.len;
                 headers_buf[count] = .{ .name = name_slice, .value = value_slice };
                 count += 1;
@@ -747,12 +789,12 @@ pub const QpackDecoder = struct {
                 // Literal with post-base name ref: 0000NNNN
                 const post_idx = try decodeInteger(data, &pos, 3);
                 const entry = self.dynamic.getPostBase(base, post_idx) orelse return error.InvalidIndex;
-                const n = entry.getName();
-                if (scratch_pos + n.len > huffman_scratch.len) return error.BufferTooSmall;
-                @memcpy(huffman_scratch[scratch_pos..][0..n.len], n);
-                const name_slice = huffman_scratch[scratch_pos..][0..n.len];
+                const n = entry.name;
+                if (scratch_pos + n.len > scratch.len) return error.BufferTooSmall;
+                @memcpy(scratch[scratch_pos..][0..n.len], n);
+                const name_slice = scratch[scratch_pos..][0..n.len];
                 scratch_pos += n.len;
-                const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+                const value = try decodeString(data, &pos, scratch, &scratch_pos);
                 headers_buf[count] = .{ .name = name_slice, .value = value };
                 count += 1;
             } else {
@@ -771,16 +813,22 @@ pub const QpackDecoder = struct {
     /// Process encoder instructions from the encoder stream.
     pub fn processEncoderInstruction(self: *QpackDecoder, data: []const u8) !void {
         var pos: usize = 0;
+        // Staging for one instruction's name/value: both are copied into the
+        // dynamic table before the iteration ends, so nothing outlives it and
+        // the position rewinds each time. An entry too large to stage here is
+        // also too large for the table (insert would return EntryTooLarge).
+        var scratch: [limits.qpack_table_capacity]u8 = undefined;
         var scratch_pos: usize = 0;
 
         while (pos < data.len) {
+            scratch_pos = 0;
             const first = data[pos];
 
             if (first & 0x80 != 0) {
                 // Insert with Name Reference: 1TNNNNNN
                 const is_static = (first & 0x40) != 0;
                 const name_idx = try decodeInteger(data, &pos, 6);
-                const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+                const value = try decodeString(data, &pos, &scratch, &scratch_pos);
 
                 var name: []const u8 = undefined;
                 if (is_static) {
@@ -789,7 +837,7 @@ pub const QpackDecoder = struct {
                 } else {
                     // Dynamic table name ref — absolute index
                     const entry = self.dynamic.get(name_idx) orelse return error.InvalidIndex;
-                    name = entry.getName();
+                    name = entry.name;
                 }
                 try self.dynamic.insert(name, value);
             } else if (first & 0xc0 == 0x40) {
@@ -802,23 +850,23 @@ pub const QpackDecoder = struct {
                 if (is_name_huffman) {
                     var temp_buf: [4096]u8 = undefined;
                     const decoded_len = huffman.decode(data[pos..][0..name_len], &temp_buf) catch return error.InvalidEncoding;
-                    if (scratch_pos + decoded_len > huffman_scratch.len) return error.BufferTooSmall;
-                    @memcpy(huffman_scratch[scratch_pos..][0..decoded_len], temp_buf[0..decoded_len]);
-                    name = huffman_scratch[scratch_pos..][0..decoded_len];
+                    if (scratch_pos + decoded_len > scratch.len) return error.BufferTooSmall;
+                    @memcpy(scratch[scratch_pos..][0..decoded_len], temp_buf[0..decoded_len]);
+                    name = scratch[scratch_pos..][0..decoded_len];
                     scratch_pos += decoded_len;
                 } else {
                     name = data[pos..][0..name_len];
                 }
                 pos += name_len;
 
-                const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+                const value = try decodeString(data, &pos, &scratch, &scratch_pos);
                 try self.dynamic.insert(name, value);
             } else if (first & 0xe0 == 0x00) {
                 // Duplicate: 000XXXXX — 5-bit index
                 const idx = try decodeInteger(data, &pos, 5);
                 const entry = self.dynamic.get(idx) orelse return error.InvalidIndex;
-                const n = entry.getName();
-                const v = entry.getValue();
+                const n = entry.name;
+                const v = entry.value;
                 try self.dynamic.insert(n, v);
             } else if (first & 0xe0 == 0x20) {
                 // Set Dynamic Table Capacity: 001XXXXX — 5-bit capacity
@@ -889,13 +937,12 @@ pub fn encodeHeaders(headers: []const Header, buf: []u8) !usize {
     return pos;
 }
 
-/// Scratch buffer for Huffman-decoded strings within a single decodeHeaders call.
-/// Each decoded string gets its own slice, so they don't overwrite each other.
-var huffman_scratch: [16384]u8 = undefined;
-
-/// Decode a QPACK header block into headers.
-/// Returns the number of headers decoded.
-pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
+/// Decode a QPACK header block into headers, resolving static-table
+/// references only. Returns the number of headers decoded.
+///
+/// Names/values are copied into `scratch` and point there; they stay valid
+/// only until the next decode using the same buffer. Size it `SCRATCH_SIZE`.
+pub fn decodeHeaders(data: []const u8, headers_buf: []Header, scratch: []u8) !usize {
     if (data.len < 2) return error.BufferTooShort;
 
     var pos: usize = 0;
@@ -928,7 +975,7 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
             // N = never-indexed (bit 5), T = table type (bit 4): 1=static, 0=dynamic
             const is_static = (first & 0x10) != 0;
             const index = try decodeInteger(data, &pos, 4);
-            const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+            const value = try decodeString(data, &pos, scratch, &scratch_pos);
             if (is_static) {
                 if (index >= static_table.len) return error.InvalidIndex;
                 headers_buf[count] = .{
@@ -948,19 +995,19 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
             if (is_name_huffman) {
                 var temp_buf: [4096]u8 = undefined;
                 const decoded_len = huffman.decode(data[pos..][0..name_len], &temp_buf) catch return error.InvalidEncoding;
-                if (scratch_pos + decoded_len > huffman_scratch.len) return error.BufferTooSmall;
-                @memcpy(huffman_scratch[scratch_pos..][0..decoded_len], temp_buf[0..decoded_len]);
-                name = huffman_scratch[scratch_pos..][0..decoded_len];
+                if (scratch_pos + decoded_len > scratch.len) return error.BufferTooSmall;
+                @memcpy(scratch[scratch_pos..][0..decoded_len], temp_buf[0..decoded_len]);
+                name = scratch[scratch_pos..][0..decoded_len];
                 scratch_pos += decoded_len;
             } else {
                 // Copy raw name to scratch for lifetime safety
-                if (scratch_pos + name_len > huffman_scratch.len) return error.BufferTooSmall;
-                @memcpy(huffman_scratch[scratch_pos..][0..name_len], data[pos..][0..name_len]);
-                name = huffman_scratch[scratch_pos..][0..name_len];
+                if (scratch_pos + name_len > scratch.len) return error.BufferTooSmall;
+                @memcpy(scratch[scratch_pos..][0..name_len], data[pos..][0..name_len]);
+                name = scratch[scratch_pos..][0..name_len];
                 scratch_pos += name_len;
             }
             pos += name_len;
-            const value = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+            const value = try decodeString(data, &pos, scratch, &scratch_pos);
             headers_buf[count] = .{
                 .name = name,
                 .value = value,
@@ -981,7 +1028,7 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
         } else if (first & 0xf0 == 0x00) {
             // Literal with post-base name ref (dynamic): 0000NNNN — skip
             _ = try decodeInteger(data, &pos, 3);
-            _ = try decodeString(data, &pos, &huffman_scratch, &scratch_pos);
+            _ = try decodeString(data, &pos, scratch, &scratch_pos);
         } else {
             // Unknown encoding pattern — skip byte
             pos += 1;
@@ -992,6 +1039,9 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header) !usize {
 }
 
 // Tests
+
+// Tests run sequentially and never hold header slices across calls.
+var test_scratch: [SCRATCH_SIZE]u8 = undefined;
 
 test "QPACK: encode and decode indexed header" {
     var buf: [256]u8 = undefined;
@@ -1005,7 +1055,7 @@ test "QPACK: encode and decode indexed header" {
     try testing.expect(encoded_len > 2);
 
     var decoded: [16]Header = undefined;
-    const count = try decodeHeaders(buf[0..encoded_len], &decoded);
+    const count = try decodeHeaders(buf[0..encoded_len], &decoded, &test_scratch);
     try testing.expectEqual(@as(usize, 3), count);
     try testing.expectEqualStrings(":method", decoded[0].name);
     try testing.expectEqualStrings("GET", decoded[0].value);
@@ -1024,7 +1074,7 @@ test "QPACK: encode name reference with literal value" {
     const encoded_len = try encodeHeaders(&headers, &buf);
 
     var decoded: [8]Header = undefined;
-    const count = try decodeHeaders(buf[0..encoded_len], &decoded);
+    const count = try decodeHeaders(buf[0..encoded_len], &decoded, &test_scratch);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqualStrings(":authority", decoded[0].name);
     try testing.expectEqualStrings("example.com", decoded[0].value);
@@ -1039,7 +1089,7 @@ test "QPACK: encode literal name and value" {
     const encoded_len = try encodeHeaders(&headers, &buf);
 
     var decoded: [8]Header = undefined;
-    const count = try decodeHeaders(buf[0..encoded_len], &decoded);
+    const count = try decodeHeaders(buf[0..encoded_len], &decoded, &test_scratch);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqualStrings("x-custom", decoded[0].name);
     try testing.expectEqualStrings("foobar", decoded[0].value);
@@ -1058,7 +1108,7 @@ test "QPACK: full GET request" {
     const encoded_len = try encodeHeaders(&headers, &buf);
 
     var decoded: [16]Header = undefined;
-    const count = try decodeHeaders(buf[0..encoded_len], &decoded);
+    const count = try decodeHeaders(buf[0..encoded_len], &decoded, &test_scratch);
     try testing.expectEqual(@as(usize, 5), count);
 
     try testing.expectEqualStrings(":method", decoded[0].name);
@@ -1084,7 +1134,7 @@ test "QPACK: full 200 response" {
     const encoded_len = try encodeHeaders(&headers, &buf);
 
     var decoded: [16]Header = undefined;
-    const count = try decodeHeaders(buf[0..encoded_len], &decoded);
+    const count = try decodeHeaders(buf[0..encoded_len], &decoded, &test_scratch);
     try testing.expectEqual(@as(usize, 3), count);
     try testing.expectEqualStrings(":status", decoded[0].name);
     try testing.expectEqualStrings("200", decoded[0].value);
@@ -1125,8 +1175,8 @@ test "DynamicTable: insert and lookup" {
 
     // Absolute index 0
     const entry = dt.get(0).?;
-    try testing.expectEqualStrings(":authority", entry.getName());
-    try testing.expectEqualStrings("example.com", entry.getValue());
+    try testing.expectEqualStrings(":authority", entry.name);
+    try testing.expectEqualStrings("example.com", entry.value);
 }
 
 test "DynamicTable: multiple inserts and relative indexing" {
@@ -1141,13 +1191,13 @@ test "DynamicTable: multiple inserts and relative indexing" {
 
     // Relative from base=3: rel 0 = abs 2, rel 1 = abs 1, rel 2 = abs 0
     const e0 = dt.getRelative(3, 0).?;
-    try testing.expectEqualStrings("content-type", e0.getName());
+    try testing.expectEqualStrings("content-type", e0.name);
 
     const e1 = dt.getRelative(3, 1).?;
-    try testing.expectEqualStrings("user-agent", e1.getName());
+    try testing.expectEqualStrings("user-agent", e1.name);
 
     const e2 = dt.getRelative(3, 2).?;
-    try testing.expectEqualStrings(":authority", e2.getName());
+    try testing.expectEqualStrings(":authority", e2.name);
 }
 
 test "DynamicTable: eviction on capacity" {
@@ -1232,7 +1282,7 @@ test "QpackEncoder: static-only fallback when capacity=0" {
 
     // Should decode fine with static decoder
     var decoded: [16]Header = undefined;
-    const count = try decodeHeaders(buf[0..len], &decoded);
+    const count = try decodeHeaders(buf[0..len], &decoded, &test_scratch);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqualStrings(":method", decoded[0].name);
     try testing.expectEqualStrings("GET", decoded[0].value);
@@ -1285,8 +1335,8 @@ test "QpackEncoder + QpackDecoder: instruction roundtrip" {
 
     // Verify decoder has the right entries
     const e0 = decoder.dynamic.get(0).?;
-    try testing.expectEqualStrings(":authority", e0.getName());
-    try testing.expectEqualStrings("example.com", e0.getValue());
+    try testing.expectEqualStrings(":authority", e0.name);
+    try testing.expectEqualStrings("example.com", e0.value);
 }
 
 test "QpackDecoder: decode with dynamic refs" {
@@ -1313,7 +1363,7 @@ test "QpackDecoder: decode with dynamic refs" {
 
     // First decode — static refs only, no header ack expected
     var decoded: [16]Header = undefined;
-    const count1 = try decoder.decode(buf[0..len1], &decoded, 0);
+    const count1 = try decoder.decode(buf[0..len1], &decoded, &test_scratch, 0);
     try testing.expectEqual(@as(usize, 3), count1);
     try testing.expectEqualStrings(":authority", decoded[1].name);
     try testing.expectEqualStrings("test.example.com", decoded[1].value);
@@ -1331,7 +1381,7 @@ test "QpackDecoder: decode with dynamic refs" {
 
     // Second decode — should resolve dynamic refs
     var decoded2: [16]Header = undefined;
-    const count2 = try decoder.decode(buf2[0..len2], &decoded2, 4);
+    const count2 = try decoder.decode(buf2[0..len2], &decoded2, &test_scratch, 4);
     try testing.expectEqual(@as(usize, 3), count2);
     try testing.expectEqualStrings(":method", decoded2[0].name);
     try testing.expectEqualStrings("GET", decoded2[0].value);
@@ -1391,10 +1441,10 @@ test "QpackEncoder: second encode reuses dynamic table" {
 test "decodeHeaders: truncated prefix" {
     // Only 1 byte — prefix requires ≥2 bytes (RIC + Delta Base)
     var decoded: [4]Header = undefined;
-    const r0 = decodeHeaders(&[_]u8{}, &decoded);
+    const r0 = decodeHeaders(&[_]u8{}, &decoded, &test_scratch);
     try testing.expectError(error.BufferTooShort, r0);
 
-    const r1 = decodeHeaders(&[_]u8{0x00}, &decoded);
+    const r1 = decodeHeaders(&[_]u8{0x00}, &decoded, &test_scratch);
     try testing.expectError(error.BufferTooShort, r1);
 }
 
@@ -1407,7 +1457,7 @@ test "decodeHeaders: invalid static index" {
 
     // index = 100: 11 prefix + 6-bit 0x3f=63 + continuation byte 100-63=37
     const bad = [_]u8{ 0x00, 0x00, 0xff, 37 };
-    try testing.expectError(error.InvalidIndex, decodeHeaders(&bad, &decoded));
+    try testing.expectError(error.InvalidIndex, decodeHeaders(&bad, &decoded, &test_scratch));
 }
 
 test "decodeHeaders: truncated literal value length" {
@@ -1416,7 +1466,7 @@ test "decodeHeaders: truncated literal value length" {
     var decoded: [4]Header = undefined;
     // 7-bit length prefix continuation marker with no following byte:
     const bad = [_]u8{ 0x00, 0x00, 0x21, 'x', 0xff };
-    const r = decodeHeaders(&bad, &decoded);
+    const r = decodeHeaders(&bad, &decoded, &test_scratch);
     try testing.expect(std.meta.isError(r));
 }
 
@@ -1433,7 +1483,7 @@ test "decodeHeaders: TooManyHeaders when buffer too small" {
     const enc_len = try encodeHeaders(&headers, &encode_buf);
 
     var decoded: [3]Header = undefined;
-    try testing.expectError(error.TooManyHeaders, decodeHeaders(encode_buf[0..enc_len], &decoded));
+    try testing.expectError(error.TooManyHeaders, decodeHeaders(encode_buf[0..enc_len], &decoded, &test_scratch));
 }
 
 test "QpackDecoder: Insert Count Increment of 0 is a stream error" {
@@ -1477,13 +1527,13 @@ test "QpackDecoder: invalid dynamic name reference" {
     // then value string: 0x01 'x'
     const bad = [_]u8{ 0x00, 0x00, 0x40, 0x01, 'x' };
     var out: [4]Header = undefined;
-    try testing.expectError(error.InvalidIndex, decoder.decode(&bad, &out, 0));
+    try testing.expectError(error.InvalidIndex, decoder.decode(&bad, &out, &test_scratch, 0));
 }
 
 test "decodeHeaders: empty block (prefix only)" {
     // Valid: RIC=0, Delta Base=0, no fields → 0 headers.
     var decoded: [4]Header = undefined;
-    const count = try decodeHeaders(&[_]u8{ 0x00, 0x00 }, &decoded);
+    const count = try decodeHeaders(&[_]u8{ 0x00, 0x00 }, &decoded, &test_scratch);
     try testing.expectEqual(@as(usize, 0), count);
 }
 
@@ -1492,7 +1542,7 @@ test "decodeHeaders: literal with zero-length name and value" {
     // Encoded: prefix (00,00) + 0x20 (literal name, len=0) + 0x00 (value len=0).
     var decoded: [4]Header = undefined;
     const input = [_]u8{ 0x00, 0x00, 0x20, 0x00 };
-    const count = try decodeHeaders(&input, &decoded);
+    const count = try decodeHeaders(&input, &decoded, &test_scratch);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqualStrings("", decoded[0].name);
     try testing.expectEqualStrings("", decoded[0].value);
@@ -1522,15 +1572,64 @@ test "DynamicTable: insert entry larger than capacity fails" {
     );
 }
 
-test "DynamicTable: insert rejects over-long name/value" {
+test "DynamicTable: capacity is the only size limit" {
     var dt = DynamicTable{};
-    dt.setCapacity(100000);
+    dt.setCapacity(DynamicTable.MAX_CAPACITY);
 
-    // name > 128 bytes
-    const huge_name = "x" ** 200;
-    try testing.expectError(error.NameTooLong, dt.insert(huge_name, "v"));
+    // Names and values used to be capped at 128 and 512 bytes by their inline
+    // buffers, so a long-but-legal header could not be indexed at all.
+    const long_name = "x" ** 200;
+    const long_value = "v" ** 600;
+    try dt.insert(long_name, long_value);
+    const e = dt.get(0).?;
+    try testing.expectEqualStrings(long_name, e.name);
+    try testing.expectEqualStrings(long_value, e.value);
 
-    // value > 512 bytes
-    const huge_value = "v" ** 600;
-    try testing.expectError(error.ValueTooLong, dt.insert("name", huge_value));
+    // What does not fit in the capacity is still rejected.
+    try testing.expectError(error.EntryTooLarge, dt.insert("n", "v" ** (DynamicTable.MAX_CAPACITY)));
+}
+
+test "DynamicTable: arena is reused as entries are evicted" {
+    var dt = DynamicTable{};
+    dt.setCapacity(DynamicTable.MAX_CAPACITY);
+
+    // Churn far more content than the arena holds, forcing repeated eviction
+    // and compaction, and check the survivors stay intact throughout.
+    var buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const name = try std.fmt.bufPrint(&buf, "header-{d}", .{i});
+        var vbuf: [200]u8 = undefined;
+        const value = try std.fmt.bufPrint(&vbuf, "value-{d}-{s}", .{ i, "p" ** 100 });
+        try dt.insert(name, value);
+
+        // The newest entry must always read back exactly.
+        const newest = dt.get(dt.insert_count - 1).?;
+        try testing.expectEqualStrings(name, newest.name);
+        try testing.expectEqualStrings(value, newest.value);
+        try testing.expect(dt.size <= dt.capacity);
+        try testing.expect(dt.used <= DynamicTable.MAX_CAPACITY);
+    }
+
+    // Every entry still counted must decode to something well-formed.
+    const oldest = dt.insert_count - dt.count;
+    var k = oldest;
+    while (k < dt.insert_count) : (k += 1) {
+        const e = dt.get(k).?;
+        try testing.expect(std.mem.startsWith(u8, e.name, "header-"));
+        try testing.expect(std.mem.startsWith(u8, e.value, "value-"));
+    }
+}
+
+test "DynamicTable: capacity beyond the arena is clamped, not trusted" {
+    var dt = DynamicTable{};
+    dt.setCapacity(1 << 30);
+    try testing.expectEqual(DynamicTable.MAX_CAPACITY, dt.capacity);
+
+    // Filling a clamped table must not run past the descriptor ring.
+    var i: usize = 0;
+    while (i < DynamicTable.MAX_CAPACITY / 32 + 50) : (i += 1) {
+        dt.insert("n", "v") catch break;
+        try testing.expect(dt.count <= DynamicTable.MAX_CAPACITY / 32);
+    }
 }

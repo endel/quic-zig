@@ -12,6 +12,7 @@ const tls = std.crypto.tls;
 const quic_crypto = @import("crypto.zig");
 const protocol = @import("protocol.zig");
 const transport_params = @import("transport_params.zig");
+const limits = @import("limits.zig");
 
 const Certificate = std.crypto.Certificate;
 
@@ -609,8 +610,8 @@ pub const Tls13Handshake = struct {
     peer_p256_public: [65]u8 = undefined, // peer's uncompressed public point
     negotiated_group: tls.NamedGroup = .x25519,
 
-    // Output buffer for built messages (32KB for large cert chains, e.g. 9-cert amplificationlimit test)
-    out_buf: [32768]u8 = undefined,
+    // Outgoing flight, built in place; see limits.tls_handshake_out.
+    out_buf: [limits.tls_handshake_out]u8 = undefined,
     out_len: usize = 0,
 
     // Pending actions returned by step()
@@ -623,8 +624,8 @@ pub const Tls13Handshake = struct {
     tp_encoded: [256]u8 = undefined,
     tp_encoded_len: usize = 0,
 
-    // Buffered incoming data (16KB for large cert chains, e.g. 9-cert amplificationlimit test)
-    in_buf: [16384]u8 = undefined,
+    // Peer flight being reassembled; see limits.tls_handshake_in.
+    in_buf: [limits.tls_handshake_in]u8 = undefined,
     in_len: usize = 0,
     in_offset: usize = 0,
 
@@ -656,11 +657,15 @@ pub const Tls13Handshake = struct {
     received_ticket: ?SessionTicket = null,
     ticket_nonce_counter: u32 = 0,
 
-    pub fn initClient(
+    /// Builds the client handshake in place. Tls13Handshake is ~52 KB, and
+    /// returning it by value is the single largest contributor to the stack
+    /// frame of anything that opens a connection — see quic/limits.zig.
+    pub fn initClientInto(
+        out: *Tls13Handshake,
         config: TlsConfig,
         local_tp: transport_params.TransportParams,
-    ) Tls13Handshake {
-        var self: Tls13Handshake = undefined;
+    ) void {
+        const self = out;
         self.state = .client_start;
         self.is_server = false;
         self.transcript = TranscriptHash.init();
@@ -709,14 +714,28 @@ pub const Tls13Handshake = struct {
         }).toUncompressedSec1();
         self.negotiated_group = .x25519;
 
+        return;
+    }
+
+    pub fn initClient(config: TlsConfig, local_tp: transport_params.TransportParams) Tls13Handshake {
+        var self: Tls13Handshake = undefined;
+        initClientInto(&self, config, local_tp);
         return self;
     }
 
-    pub fn initServer(
+    pub fn initServer(config: TlsConfig, local_tp: transport_params.TransportParams) Tls13Handshake {
+        var self: Tls13Handshake = undefined;
+        initServerInto(&self, config, local_tp);
+        return self;
+    }
+
+    /// Builds the server handshake in place — see initClientInto.
+    pub fn initServerInto(
+        out: *Tls13Handshake,
         config: TlsConfig,
         local_tp: transport_params.TransportParams,
-    ) Tls13Handshake {
-        var self: Tls13Handshake = undefined;
+    ) void {
+        const self = out;
         self.state = .server_wait_client_hello;
         self.is_server = true;
         self.transcript = TranscriptHash.init();
@@ -754,7 +773,7 @@ pub const Tls13Handshake = struct {
         };
         self.negotiated_group = .x25519;
 
-        return self;
+        return;
     }
 
     // Provide incoming crypto stream data to the handshake.
@@ -1545,8 +1564,10 @@ pub const Tls13Handshake = struct {
     }
 
     fn serverBuildCertificate(self: *Tls13Handshake) !Action {
-        var buf: [32768]u8 = undefined;
-        const msg = buildCertificate(&buf, self.config.cert_chain_der) catch return error.InternalError;
+        // Built straight into out_buf: a local of the same size would be a
+        // 32 KB stack duplicate of a field we already own.
+        const msg = buildCertificate(&self.out_buf, self.config.cert_chain_der) catch return error.InternalError;
+        self.out_len = msg.len;
 
         self.transcript.update(msg);
         {
@@ -1554,9 +1575,6 @@ pub const Tls13Handshake = struct {
             crypto.hash.sha2.Sha256.hash(msg, &cert_sha, .{});
             std.log.info("transcript after Cert ({d} bytes): {x}, msg_sha256={x}", .{ msg.len, self.transcript.current(), cert_sha });
         }
-
-        @memcpy(self.out_buf[0..msg.len], msg);
-        self.out_len = msg.len;
 
         self.state = .server_send_certificate_verify;
         return Action{ .send_data = .{
@@ -2398,6 +2416,9 @@ fn buildCertificate(buf: []u8, cert_chain: []const []const u8) ![]const u8 {
     pos += 3; // 3-byte length
 
     for (cert_chain) |cert_der| {
+        // 5 = 3-byte length + 2-byte empty extensions
+        if (cert_der.len + 5 > buf.len - pos) return error.CertChainTooLarge;
+
         // cert_data length (3 bytes)
         const cert_len: u24 = @intCast(cert_der.len);
         buf[pos] = @intCast(cert_len >> 16);

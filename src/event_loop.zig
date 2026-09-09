@@ -65,82 +65,82 @@ pub const Session = struct {
     // --- H3 methods ---
 
     pub fn sendResponse(self: *Session, stream_id: u64, headers: []const qpack.Header, body: []const u8) !void {
-        var h3c = &self.entry.h3_conn.?;
+        const h3c = self.entry.h3_conn.?;
         try h3c.sendResponse(stream_id, headers, body);
     }
 
     // --- WebTransport methods ---
 
     pub fn sendStreamData(self: *Session, stream_id: u64, data: []const u8) !void {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             try wtc.sendStreamData(stream_id, data);
         }
     }
 
     pub fn sendDatagram(self: *Session, session_id: u64, data: []const u8) !void {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             try wtc.sendDatagram(session_id, data);
         }
     }
 
     pub fn acceptSession(self: *Session, session_id: u64) !void {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             try wtc.acceptSession(session_id);
         }
     }
 
     pub fn closeStream(self: *Session, stream_id: u64) void {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             wtc.closeStream(stream_id);
         }
     }
 
     pub fn openBidiStream(self: *Session, session_id: u64, send_order: ?i64) !u64 {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             return try wtc.openBidiStream(session_id, send_order);
         }
         return error.NoWtConnection;
     }
 
     pub fn openUniStream(self: *Session, session_id: u64, send_order: ?i64) !u64 {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             return try wtc.openUniStream(session_id, send_order);
         }
         return error.NoWtConnection;
     }
 
     pub fn setSendOrder(self: *Session, stream_id: u64, send_order: ?i64) void {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             wtc.setSendOrder(stream_id, send_order);
         }
     }
 
     pub fn closeSession(self: *Session, session_id: u64) void {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             wtc.closeSession(session_id);
         }
     }
 
     pub fn closeSessionWithError(self: *Session, session_id: u64, error_code: u32, reason: []const u8) !void {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             try wtc.closeSessionWithError(session_id, error_code, reason);
         }
     }
 
     pub fn resetStream(self: *Session, stream_id: u64, error_code: u32) void {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             wtc.resetStream(stream_id, error_code);
         }
     }
 
     pub fn stopSending(self: *Session, stream_id: u64, error_code: u32) void {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             wtc.stopSending(stream_id, error_code);
         }
     }
 
     pub fn acceptSessionWithHeaders(self: *Session, session_id: u64, extra_headers: []const qpack.Header) !void {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             try wtc.acceptSessionWithHeaders(session_id, extra_headers);
         }
     }
@@ -150,12 +150,12 @@ pub const Session = struct {
     }
 
     pub fn getSendStreamStats(self: *const Session, stream_id: u64) ?wt.SendStreamStats {
-        if (self.entry.wt_conn) |*wtc| return wtc.getSendStreamStats(stream_id);
+        if (self.entry.wt_conn) |wtc| return wtc.getSendStreamStats(stream_id);
         return null;
     }
 
     pub fn getRecvStreamStats(self: *const Session, stream_id: u64) ?wt.RecvStreamStats {
-        if (self.entry.wt_conn) |*wtc| return wtc.getRecvStreamStats(stream_id);
+        if (self.entry.wt_conn) |wtc| return wtc.getRecvStreamStats(stream_id);
         return null;
     }
 
@@ -180,14 +180,14 @@ pub const Session = struct {
     }
 
     pub fn isDatagramSendQueueFull(self: *const Session) bool {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             return wtc.isDatagramSendQueueFull();
         }
         return true;
     }
 
     pub fn maxDatagramPayloadSize(self: *const Session, session_id: u64) ?usize {
-        if (self.entry.wt_conn) |*wtc| {
+        if (self.entry.wt_conn) |wtc| {
             return wtc.maxDatagramPayloadSize(session_id);
         }
         return null;
@@ -310,6 +310,12 @@ pub fn Server(comptime Handler: type) type {
         batch: ecn_socket.SendBatch,
         recv_buf: [8192]u8,
         out_buf: [1500]u8,
+
+        /// Shared by every H3Connection on this loop — one 16 KB buffer for
+        /// the whole server rather than one per connection. Safe because a
+        /// loop decodes one header block at a time and never holds the
+        /// resulting slices past the poll that produced them.
+        qpack_scratch: [qpack.SCRATCH_SIZE]u8,
 
         /// Optional second socket for preferred_address (connectionmigration).
         /// When the server advertises a preferred_address on a different port,
@@ -467,6 +473,7 @@ pub fn Server(comptime Handler: type) type {
                 .local_addr = connection.sockaddrToStorage(&local_addr.any),
                 .batch = ecn_socket.SendBatch.init(sockfd),
                 .recv_buf = undefined,
+                .qpack_scratch = undefined,
                 .out_buf = undefined,
                 .preferred = preferred,
                 .http1_server = http1_server,
@@ -477,14 +484,6 @@ pub fn Server(comptime Handler: type) type {
             // Stop HTTP/1.1 server
             if (self.http1_server) |*h1| h1.deinit();
 
-            // Clean up H0 connections (heap-allocated pointers)
-            for (self.conn_mgr.entries.items) |entry| {
-                if (entry.h0_conn) |h0c| {
-                    h0c.deinit();
-                    self.allocator.destroy(h0c);
-                    entry.h0_conn = null;
-                }
-            }
             self.timer.deinit();
             self.loop.deinit();
             sys.close(self.sockfd);
@@ -729,7 +728,7 @@ pub fn Server(comptime Handler: type) type {
                 // WT layer reads the queue first (to clean its own maps), then
                 // QUIC layer drains it (actually removing stream objects).
                 if (Handler.protocol == .webtransport) {
-                    if (entry.wt_conn) |*wtc| wtc.drainDisposalQueue();
+                    if (entry.wt_conn) |wtc| wtc.drainDisposalQueue();
                 }
                 conn.streams.drainDisposalQueue();
             }
@@ -740,7 +739,7 @@ pub fn Server(comptime Handler: type) type {
         /// the decrypted packet and is only valid for the duration of this call.
         fn datagramRecvCallback(data: []const u8, ctx: ?*anyopaque) void {
             const entry: *ConnEntry = @ptrCast(@alignCast(ctx orelse return));
-            var wtc = &(entry.wt_conn orelse return);
+            const wtc = entry.wt_conn orelse return;
 
             // Parse WT quarter_stream_id prefix inline
             var reader: std.Io.Reader = .fixed(data);
@@ -759,20 +758,21 @@ pub fn Server(comptime Handler: type) type {
         fn initProtocol(self: *Self, entry: *ConnEntry) void {
             switch (Handler.protocol) {
                 .webtransport => {
-                    entry.h3_conn = h3.H3Connection.init(self.allocator, entry.conn, true);
-                    entry.h3_conn.?.local_settings = .{
+                    const h3c = self.allocator.create(h3.H3Connection) catch return;
+                    h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.local_settings = .{
                         .enable_connect_protocol = true,
                         .h3_datagram = true,
                         .enable_webtransport = true,
                         .webtransport_max_sessions = 4,
                     };
-                    entry.h3_conn.?.initConnection() catch return;
-                    entry.wt_conn = wt.WebTransportConnection.init(
-                        self.allocator,
-                        &entry.h3_conn.?,
-                        entry.conn,
-                        true,
-                    );
+                    entry.h3_conn = h3c;
+                    h3c.initConnection() catch return;
+
+                    const wtc = self.allocator.create(wt.WebTransportConnection) catch return;
+                    wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, entry.conn, true);
+                    entry.wt_conn = wtc;
 
                     // Install zero-copy datagram callback on the QUIC connection.
                     // Datagrams will be delivered directly during packet processing,
@@ -784,8 +784,11 @@ pub fn Server(comptime Handler: type) type {
                     }
                 },
                 .h3 => {
-                    entry.h3_conn = h3.H3Connection.init(self.allocator, entry.conn, true);
-                    entry.h3_conn.?.initConnection() catch return;
+                    const h3c = self.allocator.create(h3.H3Connection) catch return;
+                    h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    entry.h3_conn = h3c;
+                    h3c.initConnection() catch return;
                 },
                 .h0 => {
                     const h0c = self.allocator.create(h0.H0Connection) catch return;
@@ -800,7 +803,7 @@ pub fn Server(comptime Handler: type) type {
 
         fn pollWtEvents(self: *Self, entry: *ConnEntry) void {
             if (entry.wt_conn == null) return;
-            var wtc = &entry.wt_conn.?;
+            const wtc = entry.wt_conn.?;
             var session = Session{ .entry = entry };
 
             // Allow handler to run deferred work each poll cycle
@@ -881,7 +884,7 @@ pub fn Server(comptime Handler: type) type {
 
         fn pollH3Events(self: *Self, entry: *ConnEntry) void {
             if (entry.h3_conn == null) return;
-            var h3c = &entry.h3_conn.?;
+            const h3c = entry.h3_conn.?;
             var session = Session{ .entry = entry };
 
             while (true) {
@@ -1409,13 +1412,21 @@ pub fn Client(comptime Handler: type) type {
         recv_buf: [8192]u8,
         out_buf: [1500]u8,
 
+        /// Shared by every H3Connection on this loop — one 16 KB buffer for
+        /// the whole server rather than one per connection. Safe because a
+        /// loop decodes one header block at a time and never holds the
+        /// resulting slices past the poll that produced them.
+        qpack_scratch: [qpack.SCRATCH_SIZE]u8,
+
         // Single QUIC connection
         conn: *connection.Connection,
         remote_addr: posix.sockaddr.storage,
 
-        // Protocol layers (initialized after handshake)
-        h3_conn: ?h3.H3Connection,
-        wt_conn: ?wt.WebTransportConnection,
+        // Protocol layers (initialized after handshake). Pointers, so a raw-QUIC
+        // client does not carry ~27 KB of H3/WT state it never touches — Client
+        // is returned by value from init().
+        h3_conn: ?*h3.H3Connection,
+        wt_conn: ?*wt.WebTransportConnection,
         protocol_initialized: bool,
         session_id: ?u64,
 
@@ -1464,21 +1475,19 @@ pub fn Client(comptime Handler: type) type {
                 break :cc_blk cc;
             };
 
-            // Create QUIC client connection
-            const conn = try connection.connect(
+            // Heap-allocate for pointer stability, then build in place: the
+            // by-value connect() would stage all ~137 KB on the stack first.
+            const conn_ptr = try alloc.create(connection.Connection);
+            errdefer alloc.destroy(conn_ptr);
+            try connection.connectInto(
+                conn_ptr,
                 alloc,
                 config.server_name,
                 conn_config,
                 tls_config,
                 null,
             );
-            // Heap-allocate so pointers remain stable
-            const conn_ptr = try alloc.create(connection.Connection);
-            errdefer {
-                conn_ptr.deinit();
-                alloc.destroy(conn_ptr);
-            }
-            conn_ptr.* = conn;
+            errdefer conn_ptr.deinit();
 
             // Resolve remote address
             const remote_addr = if (config.ipv6) blk: {
@@ -1530,6 +1539,7 @@ pub fn Client(comptime Handler: type) type {
                 .local_addr = connection.sockaddrToStorage(&local_addr.any),
                 .batch = ecn_socket.SendBatch.init(sockfd),
                 .recv_buf = undefined,
+                .qpack_scratch = undefined,
                 .out_buf = undefined,
                 .conn = conn_ptr,
                 .remote_addr = remote_addr,
@@ -1544,8 +1554,17 @@ pub fn Client(comptime Handler: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.wt_conn) |*wtc| wtc.deinit();
-            if (self.h3_conn) |*h3c| h3c.deinit();
+            // WT borrows the H3 connection, so it goes first.
+            if (self.wt_conn) |wtc| {
+                wtc.deinit();
+                self.allocator.destroy(wtc);
+                self.wt_conn = null;
+            }
+            if (self.h3_conn) |h3c| {
+                h3c.deinit();
+                self.allocator.destroy(h3c);
+                self.h3_conn = null;
+            }
             self.finished_streams.deinit();
             self.timer.deinit();
             self.loop.deinit();
@@ -1704,7 +1723,7 @@ pub fn Client(comptime Handler: type) type {
 
             // Drain disposal queues
             if (Handler.protocol == .webtransport) {
-                if (self.wt_conn) |*wtc| wtc.drainDisposalQueue();
+                if (self.wt_conn) |wtc| wtc.drainDisposalQueue();
             }
             conn.streams.drainDisposalQueue();
         }
@@ -1712,32 +1731,35 @@ pub fn Client(comptime Handler: type) type {
         fn initProtocol(self: *Self) void {
             switch (Handler.protocol) {
                 .webtransport => {
-                    self.h3_conn = h3.H3Connection.init(self.allocator, self.conn, false);
-                    self.h3_conn.?.local_settings = .{
+                    const h3c = self.allocator.create(h3.H3Connection) catch return;
+                    h3c.* = h3.H3Connection.init(self.allocator, self.conn, false);
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.local_settings = .{
                         .enable_connect_protocol = true,
                         .h3_datagram = true,
                         .enable_webtransport = true,
                         .webtransport_max_sessions = 1,
                     };
-                    self.h3_conn.?.initConnection() catch return;
+                    self.h3_conn = h3c;
+                    h3c.initConnection() catch return;
 
-                    self.wt_conn = wt.WebTransportConnection.init(
-                        self.allocator,
-                        &self.h3_conn.?,
-                        self.conn,
-                        false,
-                    );
+                    const wtc = self.allocator.create(wt.WebTransportConnection) catch return;
+                    wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, self.conn, false);
+                    self.wt_conn = wtc;
 
                     // Send Extended CONNECT to establish WebTransport session
-                    const session_id = self.wt_conn.?.connect(
+                    const session_id = wtc.connect(
                         self.server_name,
                         self.path,
                     ) catch return;
                     self.session_id = session_id;
                 },
                 .h3 => {
-                    self.h3_conn = h3.H3Connection.init(self.allocator, self.conn, false);
-                    self.h3_conn.?.initConnection() catch return;
+                    const h3c = self.allocator.create(h3.H3Connection) catch return;
+                    h3c.* = h3.H3Connection.init(self.allocator, self.conn, false);
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    self.h3_conn = h3c;
+                    h3c.initConnection() catch return;
                 },
                 .quic, .h0 => {},
             }
@@ -1746,7 +1768,7 @@ pub fn Client(comptime Handler: type) type {
 
         fn pollWtEvents(self: *Self) void {
             if (self.wt_conn == null) return;
-            var wtc = &self.wt_conn.?;
+            const wtc = self.wt_conn.?;
             var session = self.makeSession();
 
             if (@hasDecl(Handler, "onPollComplete")) {
@@ -1814,7 +1836,7 @@ pub fn Client(comptime Handler: type) type {
 
         fn pollH3Events(self: *Self) void {
             if (self.h3_conn == null) return;
-            var h3c = &self.h3_conn.?;
+            const h3c = self.h3_conn.?;
             var session = self.makeSession();
 
             if (@hasDecl(Handler, "onPollComplete")) {
@@ -1987,8 +2009,8 @@ pub fn Client(comptime Handler: type) type {
         fn makeSession(self: *Self) ClientSession {
             return .{
                 .conn = self.conn,
-                .h3_conn = if (self.h3_conn != null) &self.h3_conn.? else null,
-                .wt_conn = if (self.wt_conn != null) &self.wt_conn.? else null,
+                .h3_conn = self.h3_conn,
+                .wt_conn = self.wt_conn,
             };
         }
     };

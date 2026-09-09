@@ -80,7 +80,7 @@ pub const CryptoStream = struct {
 
         const data_len = @min(unsent_len, max_len);
         const offset = self.send_offset;
-        const data = self.send_buffer.items[offset..][0..data_len];
+        const data = self.send_buffer.items[@intCast(offset)..][0..@intCast(data_len)];
 
         self.send_offset += data_len;
 

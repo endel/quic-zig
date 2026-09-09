@@ -369,7 +369,7 @@ const RelayHandler = struct {
     fn replayCachedGroups(self: *RelayHandler, sub_ci: usize, t: *const Track, sub_alias: u64) void {
         if (!self.clients[sub_ci].active) return;
         const sub_entry = self.clients[sub_ci].entry orelse return;
-        var sub_wtc = if (sub_entry.wt_conn) |*w| w else return;
+        const sub_wtc = sub_entry.wt_conn orelse return;
         const sub_sid = self.clients[sub_ci].wt_session_id;
 
         var slots: [N_CACHED_GROUPS]*const CachedGroup = undefined;
@@ -464,7 +464,7 @@ const RelayHandler = struct {
                 const sub_ci = t.sub_client_idx[si];
                 if (!self.clients[sub_ci].active) continue;
                 const sub_entry = self.clients[sub_ci].entry orelse continue;
-                var sub_wtc = if (sub_entry.wt_conn) |*w| w else continue;
+                const sub_wtc = sub_entry.wt_conn orelse continue;
                 const sub_sid = self.clients[sub_ci].wt_session_id;
 
                 const out = sub_wtc.openUniStream(sub_sid, null) catch |e| {
@@ -512,7 +512,7 @@ const RelayHandler = struct {
                 const sub_ci = fs.out_sub_idx[i];
                 if (!self.clients[sub_ci].active) continue;
                 const sub_entry = self.clients[sub_ci].entry orelse continue;
-                var sub_wtc = if (sub_entry.wt_conn) |*w| w else continue;
+                const sub_wtc = sub_entry.wt_conn orelse continue;
                 sub_wtc.sendStreamData(fs.out_stream_ids[i], chunk) catch |e| {
                     std.debug.print("[relay] fwd chunk to sub {d}: {}\n", .{ sub_ci, e });
                 };
@@ -526,7 +526,7 @@ const RelayHandler = struct {
                 const sub_ci = fs.out_sub_idx[i];
                 if (!self.clients[sub_ci].active) continue;
                 const sub_entry = self.clients[sub_ci].entry orelse continue;
-                var sub_wtc = if (sub_entry.wt_conn) |*w| w else continue;
+                const sub_wtc = sub_entry.wt_conn orelse continue;
                 sub_wtc.closeStream(fs.out_stream_ids[i]);
             }
             if (fs.track_idx) |ti_cap| {

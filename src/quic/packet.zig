@@ -548,12 +548,14 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
 
                 const token_length = try readVarInt(fbs);
                 if (token_length > 0) {
-                    if (fbs.seek + token_length > fbs.buffer.len) return error.BufferTooShort;
-                    header.token = fbs.buffer[fbs.seek..(fbs.seek + token_length)];
-                    fbs.seek += @intCast(token_length);
+                    // compare in u64: seek + token_length would overflow a 32-bit usize
+                    if (token_length > fbs.buffer.len - fbs.seek) return error.BufferTooShort;
+                    const n: usize = @intCast(token_length);
+                    header.token = fbs.buffer[fbs.seek..][0..n];
+                    fbs.seek += n;
                 }
 
-                header.remainder_len = try readVarInt(fbs);
+                header.remainder_len = try readVarIntUsize(fbs);
             },
 
             PacketType.retry => {
@@ -570,7 +572,7 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
 
             PacketType.handshake, PacketType.zero_rtt => {
                 // Long header packets (like Initial but without Token field)
-                header.remainder_len = try readVarInt(fbs);
+                header.remainder_len = try readVarIntUsize(fbs);
             },
 
             PacketType.one_rtt => {
@@ -585,7 +587,7 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
 
             else => {
                 std.log.err("Packet type not recognized: {any}", .{header.packet_type});
-                header.remainder_len = try readVarInt(fbs);
+                header.remainder_len = try readVarIntUsize(fbs);
             },
         }
     } else {
@@ -944,6 +946,12 @@ pub fn readVarInt(reader: anytype) !u64 {
 }
 
 /// Returns the number of bytes needed to encode a value as a QUIC variable-length integer.
+/// Read a varint that will be used as a length or index. Wire varints are
+/// u64; anything that cannot be a usize cannot describe a real buffer.
+pub fn readVarIntUsize(reader: anytype) !usize {
+    return std.math.cast(usize, try readVarInt(reader)) orelse error.VarIntTooLarge;
+}
+
 pub fn varIntLength(value: u64) usize {
     if (value <= 63) return 1;
     if (value <= 16383) return 2;

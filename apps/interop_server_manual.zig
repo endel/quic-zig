@@ -268,8 +268,13 @@ pub fn main() !void {
             if (conn.isEstablished() and !entry.h3_initialized) {
                 if (use_h3) {
                     // HTTP/3 mode
-                    entry.h3_conn = h3.H3Connection.init(alloc, conn, true);
-                    entry.h3_conn.?.initConnection() catch |err| {
+                    const h3c = alloc.create(h3.H3Connection) catch {
+                        i += 1;
+                        continue;
+                    };
+                    h3c.* = h3.H3Connection.init(alloc, conn, true);
+                    entry.h3_conn = h3c;
+                    h3c.initConnection() catch |err| {
                         std.log.err("H3 init error: {any}", .{err});
                         i += 1;
                         continue;
@@ -290,7 +295,7 @@ pub fn main() !void {
             // Poll for protocol events
             if (use_h3) {
                 if (entry.h3_conn != null) {
-                    pollH3Server(&entry.h3_conn.?, alloc, www_dir);
+                    pollH3Server(entry.h3_conn.?, alloc, www_dir);
                 }
             } else {
                 if (h0_conns.get(conn_key)) |h0c| {

@@ -165,7 +165,8 @@ test "fuzz: qpack decode" {
             const input = smith.in orelse return;
             if (input.len < 2) return;
             var headers: [64]qpack.Header = undefined;
-            _ = qpack.decodeHeaders(input, &headers) catch return;
+            var scratch: [qpack.SCRATCH_SIZE]u8 = undefined;
+            _ = qpack.decodeHeaders(input, &headers, &scratch) catch return;
         }
     }.f, .{});
 }
@@ -501,7 +502,8 @@ test "fuzz: qpack encode-decode round-trip" {
 
             // Decode
             var decoded: [16]qpack.Header = undefined;
-            const decoded_count = qpack.decodeHeaders(encoded[0..encoded_len], &decoded) catch return;
+            var scratch: [qpack.SCRATCH_SIZE]u8 = undefined;
+            const decoded_count = qpack.decodeHeaders(encoded[0..encoded_len], &decoded, &scratch) catch return;
 
             // Verify count matches
             try testing.expectEqual(count, decoded_count);

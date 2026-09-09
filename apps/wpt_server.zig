@@ -147,7 +147,7 @@ const WptHandler = struct {
     }
 
     fn executeDeferredActions(self: *WptHandler, session: *event_loop.Session) void {
-        const wtc = if (session.entry.wt_conn) |*w| w else return;
+        const wtc = session.entry.wt_conn orelse return;
 
         // Check each active WT session for deferred actions
         for (&wtc.sessions) |*wts| {
@@ -361,7 +361,7 @@ const WptHandler = struct {
         // Log CONNECT stream state for debugging
         var recv_finished: bool = false;
         var send_fin_sent: bool = false;
-        if (session.entry.wt_conn) |*wtc| {
+        if (session.entry.wt_conn) |wtc| {
             if (wtc.quic.streams.getStream(session_id)) |stream| {
                 recv_finished = stream.recv.finished;
                 send_fin_sent = stream.send.fin_sent;
@@ -409,7 +409,7 @@ const WptHandler = struct {
     // -- Helpers --
 
     fn findSessionForStream(_: *WptHandler, session: *event_loop.Session) ?u64 {
-        if (session.entry.wt_conn) |*wtc| {
+        if (session.entry.wt_conn) |wtc| {
             // Check bidi streams
             var bidi_it = wtc.wt_bidi_streams.iterator();
             while (bidi_it.next()) |entry| {

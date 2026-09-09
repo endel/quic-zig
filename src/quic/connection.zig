@@ -1,6 +1,7 @@
 const std = @import("std");
 const io = @import("../io_compat.zig");
 const sys = @import("../sys.zig");
+const limits = @import("limits.zig");
 const net = std.net;
 const posix = std.posix;
 const crypto = std.crypto;
@@ -326,13 +327,13 @@ pub const LocalCidPool = struct {
 /// Fixed-capacity queue for QUIC DATAGRAM frames (RFC 9221).
 /// Supports optional max-age expiry and configurable high water mark.
 pub const DatagramQueue = struct {
-    pub const DEFAULT_MAX_ITEMS: usize = 32;
+    pub const DEFAULT_MAX_ITEMS: usize = limits.datagram_static_items;
     pub const MAX_DATAGRAM_SIZE: usize = 1200;
 
     allocator: ?std.mem.Allocator = null,
     bufs_static: [DEFAULT_MAX_ITEMS][MAX_DATAGRAM_SIZE]u8 = undefined,
-    lens_static: [DEFAULT_MAX_ITEMS]usize = .{0} ** DEFAULT_MAX_ITEMS,
-    times_static: [DEFAULT_MAX_ITEMS]i64 = .{0} ** DEFAULT_MAX_ITEMS,
+    lens_static: [DEFAULT_MAX_ITEMS]usize = @splat(0),
+    times_static: [DEFAULT_MAX_ITEMS]i64 = @splat(0),
     bufs_dynamic: ?[][MAX_DATAGRAM_SIZE]u8 = null,
     lens_dynamic: ?[]usize = null,
     times_dynamic: ?[]i64 = null,
@@ -535,8 +536,8 @@ pub const ConnectionConfig = struct {
 // or reordering). Mirrors quic-go's single `undecryptablePackets` queue
 // (RFC 9001 §4.1.4); replayed when any read key is installed. Bounded for
 // anti-amplification — cap matches quic-go's protocol.MaxUndecryptablePackets.
-const UNDECRYPTABLE_MAX_PKTS = 32;
-const UNDECRYPTABLE_BUF_LEN = 32 * 1024;
+const UNDECRYPTABLE_MAX_PKTS = limits.undecryptable_max_pkts;
+const UNDECRYPTABLE_BUF_LEN = limits.undecryptable_buf_len;
 
 const UndecryptablePackets = struct {
     buf: [UNDECRYPTABLE_BUF_LEN]u8 = undefined,
@@ -581,7 +582,11 @@ pub const Connection = struct {
     scid_len: u8 = 0,
 
     // TLS 1.3 handshake (null if not configured with TlsConfig)
-    tls13_hs: ?tls13.Tls13Handshake = null,
+    /// Heap-allocated: the handshake state is ~52 KB, which by value made it
+    /// the single largest member of Connection. It cannot be released early —
+    /// advanceHandshake still reads it after handshake_confirmed to process
+    /// NewSessionTicket — so this buys size, not lifetime.
+    tls13_hs: ?*tls13.Tls13Handshake = null,
 
     // Network paths (active + candidate for migration)
     paths: [2]NetworkPath = .{ std.mem.zeroes(NetworkPath), std.mem.zeroes(NetworkPath) },
@@ -743,7 +748,9 @@ pub const Connection = struct {
     creation_time: i64 = 0,
     idle_timeout_ns: i64 = 30_000_000_000, // 30s default
 
-    pub fn accept(
+    /// Builds the connection in place — see connectInto for why.
+    pub fn acceptInto(
+        conn: *Connection,
         allocator: std.mem.Allocator,
         header: packet.Header,
         local: posix.sockaddr.storage,
@@ -753,7 +760,7 @@ pub const Connection = struct {
         tls_config: ?tls13.TlsConfig,
         odcid: ?[]const u8,
         retry_scid: ?[]const u8,
-    ) !Connection {
+    ) !void {
         var initial_path = NetworkPath.init(local, remote, true);
         // If Retry was used, the path is already validated
         if (odcid != null) {
@@ -761,7 +768,7 @@ pub const Connection = struct {
         }
         const now: i64 = @intCast(sys.nanoTimestamp());
 
-        var conn = Connection{
+        conn.* = Connection{
             .allocator = allocator,
             .version = header.version,
             .is_server = is_server,
@@ -857,10 +864,12 @@ pub const Connection = struct {
         if (tls_config) |tc| {
             var tc_versioned = tc;
             tc_versioned.quic_version = conn.version;
-            conn.tls13_hs = if (is_server)
-                tls13.Tls13Handshake.initServer(tc_versioned, local_params)
+            const hs = try allocator.create(tls13.Tls13Handshake);
+            if (is_server)
+                tls13.Tls13Handshake.initServerInto(hs, tc_versioned, local_params)
             else
-                tls13.Tls13Handshake.initClient(tc_versioned, local_params);
+                tls13.Tls13Handshake.initClientInto(hs, tc_versioned, local_params);
+            conn.tls13_hs = hs;
         }
 
         // Store the DCID used for initial key derivation (needed for v2 re-derivation)
@@ -929,10 +938,31 @@ pub const Connection = struct {
             try conn.datagram_send_queue.resize(allocator, config.datagram_queue_capacity);
         }
 
+        return;
+    }
+
+    /// Convenience wrapper for callers with stack to spare.
+    pub fn accept(
+        allocator: std.mem.Allocator,
+        header: packet.Header,
+        local: posix.sockaddr.storage,
+        remote: posix.sockaddr.storage,
+        comptime is_server: bool,
+        config: ConnectionConfig,
+        tls_config: ?tls13.TlsConfig,
+        odcid: ?[]const u8,
+        retry_scid: ?[]const u8,
+    ) !Connection {
+        var conn: Connection = undefined;
+        try acceptInto(&conn, allocator, header, local, remote, is_server, config, tls_config, odcid, retry_scid);
         return conn;
     }
 
     pub fn deinit(self: *Connection) void {
+        if (self.tls13_hs) |hs| {
+            self.allocator.destroy(hs);
+            self.tls13_hs = null;
+        }
         if (self.qlog_writer) |*ql| {
             const now: i64 = @intCast(sys.nanoTimestamp());
             ql.connectionClosed(now, "application", 0);
@@ -2338,7 +2368,7 @@ pub const Connection = struct {
     /// Advance the TLS 1.3 handshake by reading contiguous crypto data.
     fn advanceHandshake(self: *Connection) !void {
         // Allow post-handshake messages (NST) even after handshake_confirmed
-        var hs = &(self.tls13_hs orelse return);
+        const hs = self.tls13_hs orelse return;
 
         // If handshake is confirmed, only feed application-level crypto data for NST
         if (self.handshake_confirmed) {
@@ -2792,7 +2822,7 @@ pub const Connection = struct {
         self.packer.version = new_version;
 
         // Update TLS config version so handshake/app key derivation uses v2 HKDF labels
-        if (self.tls13_hs) |*hs| {
+        if (self.tls13_hs) |hs| {
             hs.config.quic_version = new_version;
         }
 
@@ -3009,7 +3039,7 @@ pub const Connection = struct {
                 if (active_path.bytes_sent >= budget) return 0;
                 const remaining = budget - active_path.bytes_sent;
                 if (remaining < out_buf.len) {
-                    send_buf = out_buf[0..remaining];
+                    send_buf = out_buf[0..@intCast(remaining)];
                 }
             }
         }
@@ -3039,7 +3069,6 @@ pub const Connection = struct {
 
         self.packer.conn_flow_ctrl = &self.conn_flow_ctrl;
         self.packer.ecn_mark = self.ecn_validator.shouldMark();
-
 
         const bytes_written = try self.packer.packCoalesced(
             send_buf,
@@ -3190,7 +3219,7 @@ pub const Connection = struct {
                 if (active_path.bytes_sent >= budget) return 0;
                 const remaining = budget - active_path.bytes_sent;
                 if (remaining < out_buf.len) {
-                    send_buf = out_buf[0..remaining];
+                    send_buf = out_buf[0..@intCast(remaining)];
                 }
             }
         }
@@ -3458,49 +3487,49 @@ pub const Connection = struct {
                         if (!self.is_server and !self.handshake_confirmed) {
                             self.queueCryptoRetransmission(.handshake);
                             if (self.crypto_streams.getStream(2).hasData()) {
+                                has_data = true;
+                            }
+                        }
+                        // Check application-level crypto stream (e.g. NewSessionTicket)
+                        if (self.crypto_streams.getStream(3).hasData()) {
+                            has_data = true;
+                        }
+                        // HANDSHAKE_DONE: re-arm for retransmission on PTO
+                        if (self.handshake_done_pending) {
+                            self.packer.send_handshake_done = true;
+                            has_data = true;
+                        }
+                        // Check if any stream has data to send
+                        {
+                            var stream_it = self.streams.streams.valueIterator();
+                            while (stream_it.next()) |s_ptr| {
+                                if (s_ptr.*.send.hasData()) {
+                                    has_data = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // PTO must rescue every stream with outstanding data, not only
+                        // the connection as a whole. In multi-stream transfers, one
+                        // stream can already have pending data while another has an
+                        // unacked hole and no queued retransmission. A connection-level
+                        // has_data guard would leave that second stream stalled.
+                        {
+                            var resend_it = self.streams.streams.valueIterator();
+                            while (resend_it.next()) |s_ptr| {
+                                const s = s_ptr.*;
+                                if (s.send.hasUnackedData()) {
+                                    const start = s.send.ack_offset;
+                                    const end = s.send.write_offset;
+                                    if (end > start) {
+                                        s.send.queueRetransmit(start, end - start, s.send.fin_queued);
+                                    } else if (s.send.fin_queued) {
+                                        s.send.queueRetransmit(end, 0, true);
+                                    }
                                     has_data = true;
                                 }
                             }
-                            // Check application-level crypto stream (e.g. NewSessionTicket)
-                            if (self.crypto_streams.getStream(3).hasData()) {
-                                has_data = true;
-                            }
-                            // HANDSHAKE_DONE: re-arm for retransmission on PTO
-                            if (self.handshake_done_pending) {
-                                self.packer.send_handshake_done = true;
-                                has_data = true;
-                            }
-                            // Check if any stream has data to send
-                            {
-                                var stream_it = self.streams.streams.valueIterator();
-                                while (stream_it.next()) |s_ptr| {
-                                    if (s_ptr.*.send.hasData()) {
-                                        has_data = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            // PTO must rescue every stream with outstanding data, not only
-                            // the connection as a whole. In multi-stream transfers, one
-                            // stream can already have pending data while another has an
-                            // unacked hole and no queued retransmission. A connection-level
-                            // has_data guard would leave that second stream stalled.
-                            {
-                                var resend_it = self.streams.streams.valueIterator();
-                                while (resend_it.next()) |s_ptr| {
-                                    const s = s_ptr.*;
-                                    if (s.send.hasUnackedData()) {
-                                        const start = s.send.ack_offset;
-                                        const end = s.send.write_offset;
-                                        if (end > start) {
-                                            s.send.queueRetransmit(start, end - start, s.send.fin_queued);
-                                        } else if (s.send.fin_queued) {
-                                            s.send.queueRetransmit(end, 0, true);
-                                        }
-                                        has_data = true;
-                                    }
-                                }
-                            }
+                        }
                     }
                 }
 
@@ -4247,13 +4276,17 @@ pub fn generateConnectionId(buf: []u8) void {
 ///
 /// If `tls_config` is provided, a real TLS 1.3 ClientHello is generated.
 /// Otherwise, transport parameters are queued as a placeholder.
-pub fn connect(
+/// Builds the connection in place. Connection is ~185 KB; returning it by
+/// value puts that on the caller's stack, which is more than a FreeRTOS task
+/// gets — and GCC will not finish optimising the copy on a 32-bit target.
+pub fn connectInto(
+    conn: *Connection,
     allocator: std.mem.Allocator,
     server_name: []const u8,
     config: ConnectionConfig,
     tls_config: ?tls13.TlsConfig,
     initial_token: ?[]const u8,
-) !Connection {
+) !void {
     const now: i64 = @intCast(sys.nanoTimestamp());
     var scid: [8]u8 = undefined;
     var dcid: [8]u8 = undefined;
@@ -4280,7 +4313,7 @@ pub fn connect(
         local_params.version_info_available_count = 2;
     }
 
-    var conn = Connection{
+    conn.* = Connection{
         .allocator = allocator,
         .version = protocol.SUPPORTED_VERSIONS[0],
         .is_server = false,
@@ -4387,7 +4420,9 @@ pub fn connect(
             conn.remembered_params = ticket.*;
         }
 
-        conn.tls13_hs = tls13.Tls13Handshake.initClient(tc_with_sni, local_params);
+        const hs = try allocator.create(tls13.Tls13Handshake);
+        tls13.Tls13Handshake.initClientInto(hs, tc_with_sni, local_params);
+        conn.tls13_hs = hs;
 
         // Step the handshake to generate the ClientHello
         try conn.advanceHandshake();
@@ -4407,6 +4442,20 @@ pub fn connect(
         try conn.datagram_send_queue.resize(allocator, config.datagram_queue_capacity);
     }
 
+    return;
+}
+
+/// Convenience wrapper for callers with stack to spare. Prefer connectInto
+/// anywhere the 185 KB temporary matters.
+pub fn connect(
+    allocator: std.mem.Allocator,
+    server_name: []const u8,
+    config: ConnectionConfig,
+    tls_config: ?tls13.TlsConfig,
+    initial_token: ?[]const u8,
+) !Connection {
+    var conn: Connection = undefined;
+    try connectInto(&conn, allocator, server_name, config, tls_config, initial_token);
     return conn;
 }
 
