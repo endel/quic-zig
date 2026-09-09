@@ -2166,3 +2166,104 @@ test "StreamsMap: setSendOrder dynamically changes scheduling" {
     try testing.expectEqual(@as(u64, 0), out[0].stream_id);
     try testing.expectEqual(@as(u64, 4), out[1].stream_id);
 }
+
+// ── Stream lifecycle / disposal tests ──────────────────────────────────
+
+test "collectClosedStreams marks fully-closed bidi streams" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.openBidiStream();
+    try testing.expectEqual(@as(u64, 1), sm.open_bidi_streams);
+
+    // Simulate both directions done: our FIN sent, peer FIN received
+    s.send.fin_sent = true;
+    s.recv.fin_received = true;
+
+    // openBidiStream doesn't set needs_gc_scan (only getOrCreateStream does), so set it manually
+    sm.needs_gc_scan = true;
+    sm.collectClosedStreams();
+
+    try testing.expect(s.closed_for_gc);
+    // closeStream decremented open counter (locally-initiated, consumed not incremented)
+    try testing.expectEqual(@as(u64, 0), sm.open_bidi_streams);
+    try testing.expectEqual(@as(u64, 0), sm.consumed_bidi_streams);
+}
+
+test "queueDisposal + drainDisposalQueue lifecycle" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.openBidiStream();
+    const sid = s.stream_id;
+    try testing.expect(sm.streams.get(sid) != null);
+
+    // Queue — stream still in hashmap before drain
+    sm.queueDisposal(sid);
+    try testing.expect(sm.streams.get(sid) != null);
+
+    // Drain — stream removed, memory freed
+    sm.drainDisposalQueue();
+    try testing.expect(sm.streams.get(sid) == null);
+}
+
+test "collectClosedStreams defers disposal when hasUnackedData" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.openBidiStream();
+    try s.send.writeData("x" ** 1000);
+    s.send.send_offset = 1000; // all data "sent"
+    s.send.fin_sent = true;
+    s.recv.fin_received = true;
+
+    // ack_offset is 0, so hasUnackedData returns true
+    try testing.expect(s.send.hasUnackedData());
+
+    // collectClosedStreams marks closed_for_gc but keeps stream in map (no disposal)
+    sm.needs_gc_scan = true;
+    sm.collectClosedStreams();
+    try testing.expect(s.closed_for_gc);
+    try testing.expect(sm.streams.get(s.stream_id) != null);
+
+    // Simulate ACK for all data — advances ack_offset to 1000
+    try s.send.onAck(0, 1000);
+    try testing.expect(!s.send.hasUnackedData());
+}
+
+test "disposal guard: closed_for_gc + fully-acked -> disposed" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.openBidiStream();
+    try s.send.writeData("x" ** 100);
+    s.send.send_offset = 100;
+    s.send.fin_sent = true;
+    s.recv.fin_received = true;
+
+    // Mark closed_for_gc via collectClosedStreams
+    sm.needs_gc_scan = true;
+    sm.collectClosedStreams();
+    try testing.expect(s.closed_for_gc);
+
+    // Fully ACK all sent data (fin_queued not set, so hasUnackedData becomes false)
+    try s.send.onAck(0, 100);
+    try testing.expect(!s.send.hasUnackedData());
+    try testing.expectEqual(@as(u8, 0), s.send.retransmit_count);
+
+    // Same guard used by the onAck disposal check and the STREAM+FIN path
+    // closed_for_gc && retransmit_count == 0 && !hasUnackedData()
+    try testing.expect(s.closed_for_gc);
+    try testing.expectEqual(@as(u8, 0), s.send.retransmit_count);
+    try testing.expect(!s.send.hasUnackedData());
+
+    // Queue disposal and drain — stream fully removed, no leaks
+    const sid = s.stream_id;
+    sm.queueDisposal(sid);
+    sm.drainDisposalQueue();
+    try testing.expect(sm.streams.get(sid) == null);
+}

@@ -1544,6 +1544,9 @@ pub const Connection = struct {
                         if (stream_mod.isBidi(sf.stream_id)) {
                             if (self.streams.getStream(sf.stream_id)) |s| {
                                 try s.send.onAck(sf.offset, sf.length);
+                                if (s.closed_for_gc and s.send.retransmit_count == 0 and !s.send.hasUnackedData()) {
+                                    self.streams.queueDisposal(s.stream_id);
+                                }
                             }
                         } else {
                             if (self.streams.send_streams.get(sf.stream_id)) |s| {
@@ -1677,6 +1680,9 @@ pub const Connection = struct {
                         if (stream_mod.isBidi(sf.stream_id)) {
                             if (self.streams.getStream(sf.stream_id)) |s| {
                                 try s.send.onAck(sf.offset, sf.length);
+                                if (s.closed_for_gc and s.send.retransmit_count == 0 and !s.send.hasUnackedData()) {
+                                    self.streams.queueDisposal(s.stream_id);
+                                }
                             }
                         } else {
                             if (self.streams.send_streams.get(sf.stream_id)) |s| {
