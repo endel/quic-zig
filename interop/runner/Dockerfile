@@ -24,9 +24,10 @@ RUN --mount=type=cache,target=/root/.cache/zig,sharing=locked \
 COPY src ./src
 COPY apps ./apps
 
-# Build interop binaries. `-j1` keeps peak RAM usage low (builds roll
-# through exe targets sequentially) so this works in tight CI/Docker
-# VMs — full parallel build of 25+ executables peaks around 12 GB.
+# Build interop binaries. The `interop` step builds only the four this image
+# ships; the default step builds all 24 apps and most of that is waste here.
+# `-j1` keeps peak RAM usage low (builds roll through exe targets sequentially)
+# so this works in tight CI/Docker VMs — a full parallel build peaks near 12 GB.
 #
 # Both Zig caches are BuildKit cache mounts, so a source change recompiles only
 # what it touched instead of paying the full ~25 min ReleaseSafe build. They
@@ -34,7 +35,7 @@ COPY apps ./apps
 # `docker builder prune` to force a cold compile.
 RUN --mount=type=cache,target=/root/.cache/zig,sharing=locked \
     --mount=type=cache,target=/src/.zig-cache,sharing=locked \
-    zig build -Doptimize=ReleaseSafe --global-cache-dir /root/.cache/zig -j1
+    zig build interop -Doptimize=ReleaseSafe --global-cache-dir /root/.cache/zig -j1
 
 # Stage 2: Runtime image based on quic-network-simulator endpoint
 FROM martenseemann/quic-network-simulator-endpoint:latest

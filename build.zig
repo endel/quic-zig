@@ -228,6 +228,19 @@ pub fn build(b: *std.Build) void {
     run_interop_wt_client.step.dependOn(b.getInstallStep());
     b.step("run-interop-wt-client", "Run interop runner WebTransport client").dependOn(&run_interop_wt_client.step);
 
+    // The interop docker image needs these four and nothing else. Building the
+    // default step there compiles all 24 apps, which is most of the image's
+    // ~18 minute ReleaseSafe build.
+    {
+        const step = b.step("interop", "Build only the binaries the interop image ships");
+        for ([_]*std.Build.Step.Compile{
+            exe_interop_server,
+            exe_interop_client,
+            exe_interop_wt_server,
+            exe_interop_wt_client,
+        }) |exe| step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
     const exe_lb = App.add(b, "quic-lb", "apps/quic_lb.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_lb);
     const run_lb = b.addRunArtifact(exe_lb);
