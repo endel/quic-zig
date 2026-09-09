@@ -191,9 +191,9 @@ const MoqServerHandler = struct {
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    // A server outlives its streams, so it needs an allocator that reuses what
+    // they give back — an arena would grow for as long as the process runs.
+    const alloc = std.heap.smp_allocator;
 
     var port: u16 = 4443;
     var cert_path: []const u8 = "interop/certs/server.crt";

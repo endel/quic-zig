@@ -132,9 +132,9 @@ const H0InteropHandler = struct {
 };
 
 pub fn main(_: std.process.Init.Minimal) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    // A server outlives its streams, so it needs an allocator that reuses what
+    // they give back — an arena would grow for as long as the process runs.
+    const alloc = std.heap.smp_allocator;
 
     // Read environment variables
     const testcase_str = sys.getenv("TESTCASE") orelse "handshake";
