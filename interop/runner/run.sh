@@ -44,7 +44,7 @@ PEER="${2:-quic-zig}"
 IMAGE_TAG="quic-zig-interop:latest"
 
 echo "=== Building quic-zig interop Docker image ==="
-docker build --network=host -t "$IMAGE_TAG" -f "$SCRIPT_DIR/Dockerfile" "$ROOT_DIR"
+"$SCRIPT_DIR/build_image.sh" "$IMAGE_TAG"
 
 echo ""
 echo "=== Injecting quic-zig into implementations_quic.json ==="
