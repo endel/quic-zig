@@ -1573,14 +1573,14 @@ pub const Connection = struct {
                     for (pkt.getStreamFrames()) |sf| {
                         if (stream_mod.isBidi(sf.stream_id)) {
                             if (self.streams.getStream(sf.stream_id)) |s| {
-                                try s.send.onAck(sf.offset, sf.length);
+                                try s.send.onAck(sf.offset, sf.length, sf.fin);
                                 // The last ACK of a closed stream is the moment
                                 // it stops being needed for retransmission.
                                 self.streams.disposeIfSettled(s);
                             }
                         } else {
                             if (self.streams.send_streams.get(sf.stream_id)) |s| {
-                                try s.onAck(sf.offset, sf.length);
+                                try s.onAck(sf.offset, sf.length, sf.fin);
                             }
                         }
                     }
@@ -1709,14 +1709,14 @@ pub const Connection = struct {
                     for (pkt.getStreamFrames()) |sf| {
                         if (stream_mod.isBidi(sf.stream_id)) {
                             if (self.streams.getStream(sf.stream_id)) |s| {
-                                try s.send.onAck(sf.offset, sf.length);
+                                try s.send.onAck(sf.offset, sf.length, sf.fin);
                                 // The last ACK of a closed stream is the moment
                                 // it stops being needed for retransmission.
                                 self.streams.disposeIfSettled(s);
                             }
                         } else {
                             if (self.streams.send_streams.get(sf.stream_id)) |s| {
-                                try s.onAck(sf.offset, sf.length);
+                                try s.onAck(sf.offset, sf.length, sf.fin);
                             }
                         }
                     }

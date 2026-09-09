@@ -729,6 +729,8 @@ pub fn Server(comptime Handler: type) type {
                 // QUIC layer drains it (actually removing stream objects).
                 if (Handler.protocol == .webtransport) {
                     if (entry.wt_conn) |wtc| wtc.drainDisposalQueue();
+                } else if (entry.h3_conn) |h3c| {
+                    h3c.drainDisposalQueue();
                 }
                 conn.streams.drainDisposalQueue();
             }
@@ -1724,6 +1726,8 @@ pub fn Client(comptime Handler: type) type {
             // Drain disposal queues
             if (Handler.protocol == .webtransport) {
                 if (self.wt_conn) |wtc| wtc.drainDisposalQueue();
+            } else if (self.h3_conn) |h3c| {
+                h3c.drainDisposalQueue();
             }
             conn.streams.drainDisposalQueue();
         }

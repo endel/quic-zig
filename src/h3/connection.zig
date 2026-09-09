@@ -545,6 +545,25 @@ pub const H3Connection = struct {
 
     /// Poll for the next HTTP/3 event.
     /// Processes incoming QUIC stream data and returns H3 events.
+    /// Drop per-stream bookkeeping for the streams QUIC is about to reclaim.
+    /// Called before `StreamsMap.drainDisposalQueue`, while the IDs are still
+    /// on the queue. O(k) in the number of streams reclaimed this cycle.
+    pub fn drainDisposalQueue(self: *H3Connection) void {
+        const disposed = self.quic_conn.streams.disposal_queue[0..self.quic_conn.streams.disposal_count];
+        for (disposed) |id| {
+            _ = self.finished_streams.remove(id);
+            _ = self.excluded_bidi_streams.remove(id);
+            _ = self.headers_received_streams.remove(id);
+            if (self.stream_bufs.fetchRemove(id)) |kv| {
+                var buf = kv.value;
+                buf.deinit(self.allocator);
+            }
+            if (self.pending_body) |pb| {
+                if (pb.stream_id == id) self.pending_body = null;
+            }
+        }
+    }
+
     pub fn poll(self: *H3Connection) !?H3Event {
         // Check for critical stream closure (RFC 9114 §6.2.1, RFC 9204 §4.2)
         if (self.checkCriticalStreams()) |err| return err;

@@ -385,6 +385,10 @@ pub const SendStream = struct {
     /// Whether FIN has been queued.
     fin_queued: bool = false,
 
+    /// Set when an ACK covered the frame that carried our FIN. The FIN is not a
+    /// byte, so `ack_offset` never reaches past the last one and cannot say this.
+    fin_acked: bool = false,
+
     /// Whether FIN has been sent.
     fin_sent: bool = false,
 
@@ -437,8 +441,10 @@ pub const SendStream = struct {
         self.fin_queued = true;
     }
 
-    /// Update the acknowledged offset when a packet carrying stream frames is ACKed.
-    pub fn onAck(self: *SendStream, offset: u64, length: u64) !void {
+    /// Update the acknowledged offset when a packet carrying stream frames is
+    /// ACKed. `fin` is the flag the acked frame was sent with.
+    pub fn onAck(self: *SendStream, offset: u64, length: u64, fin: bool) !void {
+        if (fin) self.fin_acked = true;
         if (length == 0) {
             return;
         }
@@ -572,8 +578,11 @@ pub const SendStream = struct {
     /// Check if there's data that has been sent but not yet acknowledged.
     /// Used by PTO to determine if retransmission is needed.
     pub fn hasUnackedData(self: *const SendStream) bool {
+        // RESET_STREAM supersedes the data: RFC 9000 3.1 forbids sending STREAM
+        // frames after it, so unacked bytes are never coming back.
+        if (self.reset_err != null) return false;
         return self.ack_offset < self.write_offset or
-            (self.fin_queued and self.ack_offset < self.write_offset + 1);
+            (self.fin_queued and !self.fin_acked);
     }
 
     /// Pop a STREAM frame with at most max_len bytes of payload.
@@ -1940,7 +1949,7 @@ test "SendStream: contiguous ACK advances send offset after retransmit" {
     try testing.expectEqual(@as(u64, 80), retransmit.stream.length);
     try testing.expectEqual(@as(u64, 20), ss.send_offset);
 
-    try ss.onAck(0, 100);
+    try ss.onAck(0, 100, false);
 
     try testing.expectEqual(@as(u64, 100), ss.ack_offset);
     try testing.expectEqual(@as(u64, 100), ss.send_offset);
@@ -1957,13 +1966,13 @@ test "SendStream: ACK progress trims stale retransmit ranges" {
     ss.send_offset = 100;
     ss.queueRetransmit(0, 80, false);
 
-    try ss.onAck(0, 32);
+    try ss.onAck(0, 32, false);
 
     try testing.expectEqual(@as(u8, 1), ss.retransmit_count);
     try testing.expectEqual(@as(u64, 32), ss.retransmit_ranges[0].offset);
     try testing.expectEqual(@as(u64, 48), ss.retransmit_ranges[0].length);
 
-    try ss.onAck(32, 48);
+    try ss.onAck(32, 48, false);
     try testing.expectEqual(@as(u8, 0), ss.retransmit_count);
 }
 
@@ -2279,7 +2288,7 @@ test "disposeIfSettled: reclaims a closed stream once the last byte is acked" {
     sm.drainDisposalQueue();
     try testing.expect(sm.streams.get(sid) != null);
 
-    try s.send.onAck(0, 100);
+    try s.send.onAck(0, 100, true);
     sm.disposeIfSettled(s);
     sm.drainDisposalQueue();
     try testing.expect(sm.streams.get(sid) == null);
@@ -2346,4 +2355,35 @@ test "getOrCreateStream: a reclaimed stream is not resurrected by a retransmit" 
     // An ID we have never seen is still a new stream, even out of order.
     _ = try sm.getOrCreateStream(8);
     _ = try sm.getOrCreateStream(4);
+}
+
+test "SendStream: a closed stream stays unacked until the FIN itself is acked" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("x" ** 100);
+    ss.send_offset = 100;
+    ss.close();
+
+    // Every byte acknowledged, but the peer has not confirmed the FIN.
+    try ss.onAck(0, 100, false);
+    try testing.expectEqual(@as(u64, 100), ss.ack_offset);
+    try testing.expect(ss.hasUnackedData());
+
+    // The FIN rode a frame of its own, so its ACK carries no bytes.
+    try ss.onAck(100, 0, true);
+    try testing.expect(!ss.hasUnackedData());
+}
+
+test "SendStream: a reset stream has nothing left to retransmit" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("x" ** 100);
+    ss.send_offset = 100;
+    ss.close();
+    try testing.expect(ss.hasUnackedData());
+
+    ss.reset(7);
+    try testing.expect(!ss.hasUnackedData());
 }
