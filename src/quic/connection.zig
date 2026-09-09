@@ -1836,13 +1836,37 @@ pub const Connection = struct {
                         self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM exceeds flow control");
                         return error.FlowControlError;
                     };
-                    // Mark bytes as "read" so connection flow control window advances
-                    const already_read = s.recv.bytes_read;
-                    if (rs.final_size > already_read) {
-                        self.conn_flow_ctrl.addBytesRead(rs.final_size - already_read);
+                    // Credit the bytes between what arrived and the final size,
+                    // so the connection window advances past a stream whose tail
+                    // will never be delivered. The bytes that did arrive were
+                    // already credited by the STREAM handler.
+                    const credited = s.recv.sorter.highestReceived();
+                    if (rs.final_size > credited) {
+                        self.conn_flow_ctrl.addBytesRead(rs.final_size - credited);
                     }
                     // If send side is also done, stream is fully closed
                     if (s.send.fin_sent or s.send.reset_err != null) {
+                        self.streams.closeStream(rs.stream_id);
+                    }
+                } else if (self.streams.recv_streams.get(rs.stream_id)) |s| {
+                    // Peer-initiated uni stream. The peer counted final_size
+                    // against connection flow control when it sent the data, so
+                    // we have to release that credit here or the connection
+                    // stalls at the window even though the bytes never arrived.
+                    s.handleResetStream(rs.error_code, rs.final_size) catch {
+                        self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM final_size mismatch");
+                        return error.ProtocolViolation;
+                    };
+                    self.conn_flow_ctrl.base.addBytesReceived(rs.final_size) catch {
+                        self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM exceeds flow control");
+                        return error.FlowControlError;
+                    };
+                    const credited = s.sorter.highestReceived();
+                    if (rs.final_size > credited) {
+                        self.conn_flow_ctrl.addBytesRead(rs.final_size - credited);
+                    }
+                    if (!s.closed_counted) {
+                        s.closed_counted = true;
                         self.streams.closeStream(rs.stream_id);
                     }
                 }
@@ -1940,9 +1964,14 @@ pub const Connection = struct {
                     }
                 } else {
                     // Unidirectional stream — route to recv_streams
-                    const recv_strm = self.streams.getOrCreateRecvStream(s.stream_id) catch |err| {
-                        std.log.err("Failed to get/create recv stream {}: {}", .{ s.stream_id, err });
-                        return;
+                    const recv_strm = self.streams.getOrCreateRecvStream(s.stream_id) catch |err| switch (err) {
+                        // Retransmission of data the consumer took before the
+                        // stream was reclaimed. Nothing to deliver.
+                        error.StreamAlreadyClosed => return,
+                        else => {
+                            std.log.err("Failed to get/create recv stream {}: {}", .{ s.stream_id, err });
+                            return;
+                        },
                     };
                     recv_strm.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
                         error.FinalSizeError => {
@@ -1952,8 +1981,10 @@ pub const Connection = struct {
                         else => return err,
                     };
 
-                    // For incoming uni streams, FIN means the stream is done
-                    if (s.fin) {
+                    // For incoming uni streams, FIN means the stream is done.
+                    // A retransmitted FIN must not count against MAX_STREAMS twice.
+                    if (s.fin and !recv_strm.closed_counted) {
+                        recv_strm.closed_counted = true;
                         self.streams.closeStream(s.stream_id);
                     }
                 }
@@ -5305,4 +5336,86 @@ test "keep_alive_ping_sent resets on packet receipt simulation" {
     conn.last_packet_received_time = @intCast(sys.nanoTimestamp());
     conn.keep_alive_ping_sent = false;
     try std.testing.expect(!conn.keep_alive_ping_sent);
+}
+
+test "RESET_STREAM on a peer uni stream releases connection flow control" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    // Peer opens uni stream 2, sends 10 bytes, then resets at final size 100.
+    var payload = "0123456789".*;
+    try conn.processFrame(&.{ .stream = .{
+        .stream_id = 2,
+        .offset = 0,
+        .length = payload.len,
+        .data = &payload,
+        .fin = false,
+    } }, .application, 0);
+
+    const before = conn.conn_flow_ctrl.base.receive_window;
+    try conn.processFrame(&.{ .reset_stream = .{
+        .stream_id = 2,
+        .error_code = 7,
+        .final_size = 100,
+    } }, .application, 0);
+
+    // The peer counted all 100 bytes against the connection window when it
+    // sent them; without crediting the 90 that never arrived we stall short.
+    try std.testing.expectEqual(@as(u64, 100), conn.conn_flow_ctrl.base.highest_received);
+    try std.testing.expectEqual(@as(u64, 100), conn.conn_flow_ctrl.base.bytes_read);
+    try std.testing.expect(conn.conn_flow_ctrl.base.receive_window >= before);
+    try std.testing.expectEqual(@as(u64, 1), conn.streams.consumed_uni_streams);
+
+    const rs = conn.streams.recv_streams.get(2).?;
+    try std.testing.expectEqual(@as(?u64, 7), rs.reset_err);
+}
+
+test "a retransmitted uni FIN is counted against MAX_STREAMS only once" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    var payload = "hi".*;
+    const fin_frame: Frame = .{ .stream = .{
+        .stream_id = 2,
+        .offset = 0,
+        .length = payload.len,
+        .data = &payload,
+        .fin = true,
+    } };
+    try conn.processFrame(&fin_frame, .application, 0);
+    try conn.processFrame(&fin_frame, .application, 0);
+
+    try std.testing.expectEqual(@as(u64, 1), conn.streams.consumed_uni_streams);
+    try std.testing.expectEqual(@as(u64, 0), conn.streams.open_uni_streams);
+}
+
+test "a uni STREAM retransmit after reclamation is dropped, not resurrected" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    var payload = "hi".*;
+    const fin_frame: Frame = .{ .stream = .{
+        .stream_id = 2,
+        .offset = 0,
+        .length = payload.len,
+        .data = &payload,
+        .fin = true,
+    } };
+    try conn.processFrame(&fin_frame, .application, 0);
+
+    const rs = conn.streams.recv_streams.get(2).?;
+    const data = rs.read().?;
+    std.testing.allocator.free(data);
+    _ = rs.read();
+    conn.streams.releaseRecvStream(2);
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(conn.streams.recv_streams.get(2) == null);
+
+    // Retransmit: silently ignored, and it must not open a second stream.
+    try conn.processFrame(&fin_frame, .application, 0);
+    try std.testing.expect(conn.streams.recv_streams.get(2) == null);
+    try std.testing.expectEqual(@as(u64, 1), conn.streams.consumed_uni_streams);
 }

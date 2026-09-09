@@ -732,6 +732,9 @@ pub fn Server(comptime Handler: type) type {
                 } else if (entry.h3_conn) |h3c| {
                     h3c.drainDisposalQueue();
                 }
+                for (conn.streams.disposal_queue[0..conn.streams.disposal_count]) |id| {
+                    _ = entry.finished_streams.remove(id);
+                }
                 conn.streams.drainDisposalQueue();
             }
         }
@@ -988,6 +991,7 @@ pub fn Server(comptime Handler: type) type {
                     entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
                 }
+                if (rs.finished) conn.streams.releaseRecvStream(stream_id);
             }
         }
 
@@ -1721,6 +1725,9 @@ pub fn Client(comptime Handler: type) type {
             } else if (self.h3_conn) |h3c| {
                 h3c.drainDisposalQueue();
             }
+            for (conn.streams.disposal_queue[0..conn.streams.disposal_count]) |id| {
+                _ = self.finished_streams.remove(id);
+            }
             conn.streams.drainDisposalQueue();
         }
 
@@ -1920,6 +1927,7 @@ pub fn Client(comptime Handler: type) type {
                     self.finished_streams.put(stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
                 }
+                if (rs.finished) conn.streams.releaseRecvStream(stream_id);
             }
         }
 

@@ -661,7 +661,11 @@ pub const H3Connection = struct {
             if (self.peer_qpack_dec_stream_id != null and self.peer_qpack_dec_stream_id.? == stream_id) continue;
 
             // Try to read type byte (read() transfers ownership of heap-allocated data)
-            const data = recv_stream.read() orelse continue;
+            const data = recv_stream.read() orelse {
+                // FIN with nothing to identify it by — no layer will claim it.
+                if (recv_stream.finished) self.quic_conn.streams.releaseRecvStream(stream_id);
+                continue;
+            };
             defer self.allocator.free(data);
             if (data.len == 0) continue;
 

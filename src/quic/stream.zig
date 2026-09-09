@@ -245,6 +245,19 @@ pub const ReceiveStream = struct {
     /// Whether all data has been read.
     finished: bool = false,
 
+    /// Set once the consumer has been handed the FIN and will not read again.
+    /// Reclamation waits on this rather than on `finished`: the protocol layers
+    /// keep per-stream state keyed by ID (H3 critical streams, WT buffers) and
+    /// `finished` flips inside their own read, before they have delivered it.
+    released: bool = false,
+
+    /// Already on the disposal queue — keeps releaseRecvStream() idempotent.
+    disposal_queued: bool = false,
+
+    /// FIN has been counted against the MAX_STREAMS window. A retransmitted
+    /// FIN must not count a second time.
+    closed_counted: bool = false,
+
     // Receive-side flow control (for generating MAX_STREAM_DATA)
     bytes_read: u64 = 0,
     receive_window: u64 = 0,
@@ -326,6 +339,16 @@ pub const ReceiveStream = struct {
     /// Request that the peer stop sending on this stream (sends STOP_SENDING).
     pub fn stopSending(self: *ReceiveStream, error_code: u64) void {
         self.stop_sending_err = error_code;
+    }
+
+    /// Nothing more will ever be delivered from this stream: the FIN has been
+    /// read out or the peer reset it. There is no send side to wait for an ACK
+    /// on, so this is the whole condition for reclaiming it.
+    pub fn isDisposable(self: *const ReceiveStream) bool {
+        // `finished` only flips inside read(); a consumer that noticed the FIN
+        // via the sorter is just as done, so check the sorter too.
+        return self.released and
+            (self.finished or self.reset_err != null or self.sorter.isComplete());
     }
 };
 
@@ -850,6 +873,11 @@ pub const StreamsMap = struct {
     /// would either stop and strand it, or never stop and cost O(n) per send.
     disposal_overflow: bool = false,
 
+    /// Same, for receive streams. They need their own flag because nothing
+    /// re-offers them: `collectClosedStreams` scans only bidi streams, and a
+    /// released receive stream is released exactly once.
+    recv_disposal_overflow: bool = false,
+
     /// Every peer-initiated bidi ID below this has been opened. RFC 9000 §3.2:
     /// using a stream ID implicitly opens every lower one of the same type, so
     /// an ID under the watermark that is absent from the map was opened and
@@ -862,6 +890,12 @@ pub const StreamsMap = struct {
     /// nextStreamToAccept / nextStreamToOpen.
     highest_peer_bidi_stream_id: ?u64 = null,
 
+    /// The uni counterparts of the two fields above. Reclaimed receive streams
+    /// make the same watermark necessary: without it a retransmitted STREAM
+    /// frame would rebuild a stream nothing will ever read.
+    next_peer_uni_to_open: u64,
+    highest_peer_uni_stream_id: ?u64 = null,
+
     /// Flag: set when a stream's FIN is received or sent, indicating that
     /// collectClosedStreams() needs to scan. Cleared after scan completes.
     /// Avoids O(n) scan on every send() when no streams are closing.
@@ -872,8 +906,9 @@ pub const StreamsMap = struct {
         // Client uni = 2, 6, 10, ...; server uni = 3, 7, 11, ...
         const bidi_base: u64 = if (is_server) 1 else 0;
         const uni_base: u64 = if (is_server) 3 else 2;
-        // Peer-initiated bidi IDs are the other parity from our own.
+        // Peer-initiated IDs are the other parity from our own.
         const peer_bidi_base: u64 = if (is_server) 0 else 1;
+        const peer_uni_base: u64 = if (is_server) 2 else 3;
 
         return .{
             .allocator = allocator,
@@ -884,6 +919,7 @@ pub const StreamsMap = struct {
             .next_bidi_stream_id = bidi_base,
             .next_peer_bidi_to_open = peer_bidi_base,
             .next_uni_stream_id = uni_base,
+            .next_peer_uni_to_open = peer_uni_base,
         };
     }
 
@@ -1040,11 +1076,45 @@ pub const StreamsMap = struct {
             return existing;
         }
 
+        // Below the watermark it was opened once and has since been reclaimed —
+        // the peer is retransmitting data the consumer already took. Rebuilding
+        // it would leave a stream nothing reads and count its FIN twice.
+        if (stream_id < self.next_peer_uni_to_open) return error.StreamAlreadyClosed;
+
+        // RFC 9000 §3.2: using a stream ID opens every lower one of the same
+        // type. Materialising them is what makes the watermark above exact.
+        var id = self.next_peer_uni_to_open;
+        while (id < stream_id) : (id += 4) _ = try self.openPeerUniStream(id);
+        self.next_peer_uni_to_open = stream_id + 4;
+        return try self.openPeerUniStream(stream_id);
+    }
+
+    /// Build one peer-initiated receive stream and add it to the map.
+    fn openPeerUniStream(self: *StreamsMap, stream_id: u64) !*ReceiveStream {
         const s = try self.allocator.create(ReceiveStream);
         s.* = ReceiveStream.initWithWindow(self.allocator, stream_id, self.local_max_stream_data_uni);
+        errdefer {
+            s.deinit();
+            self.allocator.destroy(s);
+        }
         try self.recv_streams.put(stream_id, s);
         self.open_uni_streams += 1;
+        if (self.highest_peer_uni_stream_id == null or stream_id > self.highest_peer_uni_stream_id.?) {
+            self.highest_peer_uni_stream_id = stream_id;
+        }
         return s;
+    }
+
+    /// The consumer has taken this receive stream's FIN and will not read it
+    /// again. Queues it for reclamation once it is settled. O(1) and idempotent.
+    pub fn releaseRecvStream(self: *StreamsMap, stream_id: u64) void {
+        const rs = self.recv_streams.get(stream_id) orelse return;
+        rs.released = true;
+        if (rs.disposal_queued or !rs.isDisposable()) return;
+        rs.disposal_queued = self.queueDisposal(stream_id);
+        // Nothing will call release again for this stream, so a dropped enqueue
+        // would strand it. The next drain re-scans instead.
+        if (!rs.disposal_queued) self.recv_disposal_overflow = true;
     }
 
     /// Get a stream by ID.
@@ -1260,6 +1330,19 @@ pub const StreamsMap = struct {
         if (self.disposal_overflow) {
             self.disposal_overflow = false;
             self.needs_gc_scan = true; // there was more than the queue could hold
+        }
+        if (self.recv_disposal_overflow) {
+            self.recv_disposal_overflow = false;
+            var it = self.recv_streams.valueIterator();
+            while (it.next()) |rp| {
+                const rs = rp.*;
+                if (rs.disposal_queued or !rs.isDisposable()) continue;
+                rs.disposal_queued = self.queueDisposal(rs.stream_id);
+                if (!rs.disposal_queued) {
+                    self.recv_disposal_overflow = true; // still more than fits
+                    break;
+                }
+            }
         }
     }
 
@@ -2489,4 +2572,93 @@ test "StreamsMap: MAX_STREAMS grants a remainder below the batch threshold" {
 
     // And it does not keep firing once the peer has room again.
     try testing.expect(sm.getMaxStreamsUpdates().bidi == null);
+}
+
+// ── Receive-stream disposal ────────────────────────────────────────────
+
+test "releaseRecvStream: reclaims a uni stream once the consumer took the FIN" {
+    var sm = StreamsMap.init(testing.allocator, true); // server: peer uni = 2,6,10...
+    defer sm.deinit();
+
+    const rs = try sm.getOrCreateRecvStream(2);
+    try rs.handleStreamFrame(0, "hi", true);
+    try testing.expectEqual(@as(u64, 1), sm.open_uni_streams);
+
+    // Consumer reads the payload, then reads again to see the FIN.
+    const data = rs.read().?;
+    testing.allocator.free(data);
+    try testing.expect(rs.read() == null);
+    try testing.expect(rs.finished);
+
+    // Finished is not enough on its own: the protocol layer may still need it.
+    sm.drainDisposalQueue();
+    try testing.expect(sm.recv_streams.get(2) != null);
+
+    sm.releaseRecvStream(2);
+    sm.drainDisposalQueue();
+    try testing.expect(sm.recv_streams.get(2) == null);
+}
+
+test "releaseRecvStream: leaves an unfinished stream alone" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    const rs = try sm.getOrCreateRecvStream(2);
+    try rs.handleStreamFrame(0, "hi", false);
+
+    sm.releaseRecvStream(2);
+    sm.drainDisposalQueue();
+    try testing.expect(sm.recv_streams.get(2) != null);
+    try testing.expect(rs.released);
+}
+
+test "getOrCreateRecvStream: a reclaimed uni stream is not rebuilt" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    const rs = try sm.getOrCreateRecvStream(2);
+    try rs.handleStreamFrame(0, "hi", true);
+    const data = rs.read().?;
+    testing.allocator.free(data);
+    _ = rs.read();
+    sm.releaseRecvStream(2);
+    sm.drainDisposalQueue();
+
+    // A retransmit of the same frame must not resurrect it.
+    try testing.expectError(error.StreamAlreadyClosed, sm.getOrCreateRecvStream(2));
+}
+
+test "getOrCreateRecvStream: opens the uni IDs skipped over" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    // RFC 9000 §3.2: using ID 10 opens 2 and 6 as well.
+    _ = try sm.getOrCreateRecvStream(10);
+    try testing.expect(sm.recv_streams.get(2) != null);
+    try testing.expect(sm.recv_streams.get(6) != null);
+    try testing.expectEqual(@as(u64, 3), sm.open_uni_streams);
+    try testing.expectEqual(@as(?u64, 10), sm.highest_peer_uni_stream_id);
+    try testing.expectEqual(@as(u64, 14), sm.next_peer_uni_to_open);
+}
+
+test "drainDisposalQueue: an overflowed release is picked up on the next drain" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+
+    const total = sm.disposal_queue.len + 4;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        const id: u64 = 2 + @as(u64, i) * 4;
+        const rs = try sm.getOrCreateRecvStream(id);
+        try rs.handleStreamFrame(0, "x", true);
+        const d = rs.read().?;
+        testing.allocator.free(d);
+        _ = rs.read();
+        sm.releaseRecvStream(id);
+    }
+    try testing.expect(sm.recv_disposal_overflow);
+
+    sm.drainDisposalQueue(); // clears the queue, re-queues the overflow
+    sm.drainDisposalQueue();
+    try testing.expectEqual(@as(usize, 0), sm.recv_streams.count());
 }

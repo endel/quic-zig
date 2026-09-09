@@ -729,7 +729,11 @@ pub const WebTransportConnection = struct {
             if (self.pending_uni_streams.contains(stream_id)) continue;
 
             // Try to read data (read() transfers ownership)
-            const data = recv_stream.read() orelse continue;
+            const data = recv_stream.read() orelse {
+                // FIN with nothing to identify it by — no layer will claim it.
+                if (recv_stream.finished) self.quic.streams.releaseRecvStream(stream_id);
+                continue;
+            };
             defer self.allocator.free(data);
             if (data.len == 0) continue;
 
@@ -915,7 +919,10 @@ pub const WebTransportConnection = struct {
                         recv_stream.finished or recv_stream.sorter.isComplete()
                     else
                         false;
-                    if (fin) self.fin_delivered.put(stream_id, {}) catch {};
+                    if (fin) {
+                        self.fin_delivered.put(stream_id, {}) catch {};
+                        self.quic.streams.releaseRecvStream(stream_id);
+                    }
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = data_slice,
@@ -927,7 +934,10 @@ pub const WebTransportConnection = struct {
             if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
                 if (recv_stream.read()) |data| {
                     const fin = recv_stream.finished or recv_stream.sorter.isComplete();
-                    if (fin) self.fin_delivered.put(stream_id, {}) catch {};
+                    if (fin) {
+                        self.fin_delivered.put(stream_id, {}) catch {};
+                        self.quic.streams.releaseRecvStream(stream_id);
+                    }
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = data,
@@ -935,6 +945,7 @@ pub const WebTransportConnection = struct {
                     } };
                 } else if (recv_stream.finished and !self.fin_delivered.contains(stream_id)) {
                     self.fin_delivered.put(stream_id, {}) catch {};
+                    self.quic.streams.releaseRecvStream(stream_id);
                     return .{ .stream_data = .{
                         .stream_id = stream_id,
                         .data = &[_]u8{},
@@ -2141,4 +2152,40 @@ test "H3Frame: write and parse DRAIN_WEBTRANSPORT_SESSION" {
 
     const result = try h3_frame.parse(written);
     try testing.expectEqual(h3_frame.H3FrameType.drain_webtransport_session, std.meta.activeTag(result.frame));
+}
+
+test "WT integration: finished uni streams are reclaimed, not retained for the connection" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // The H3 control stream is the one uni stream that must survive.
+    const baseline = setup.quic_conn.streams.recv_streams.count();
+    try testing.expectEqual(@as(u32, 1), baseline);
+
+    // 40 short-lived uni streams, the shape MoQ puts objects on.
+    var i: u64 = 0;
+    while (i < 40) : (i += 1) {
+        const stream_id = 6 + i * 4; // client uni: 2, 6, 10, ... (2 is control)
+        var prefix_buf: [16]u8 = undefined;
+        const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+        const rs = try setup.quic_conn.streams.getOrCreateRecvStream(stream_id);
+        try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+        try rs.handleStreamFrame(prefix_len, "object", true);
+
+        // Drain every event this stream produces, then reclaim as the loop does.
+        while (try setup.wt.poll()) |ev| {
+            switch (ev) {
+                .stream_data => |sd| testing.allocator.free(sd.data),
+                else => {},
+            }
+        }
+        setup.wt.drainDisposalQueue();
+        setup.quic_conn.streams.drainDisposalQueue();
+    }
+
+    try testing.expectEqual(baseline, setup.quic_conn.streams.recv_streams.count());
+    // The per-stream bookkeeping the WT layer keeps alongside them goes too.
+    try testing.expectEqual(@as(u32, 0), setup.wt.wt_uni_streams.count());
+    try testing.expectEqual(@as(u32, 0), setup.wt.fin_delivered.count());
 }
