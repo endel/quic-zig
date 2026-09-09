@@ -3137,17 +3137,23 @@ pub const Connection = struct {
                 // Queue unacked stream bytes as retransmission ranges. Do not
                 // rewind send_offset: already-sent bytes must not be recounted
                 // against connection flow control when MAX_DATA credit is zero.
-                var resend_it = self.streams.streams.valueIterator();
-                while (resend_it.next()) |s_ptr| {
-                    const s = s_ptr.*;
-                    if (s.send.hasUnackedData()) {
-                        const start = s.send.ack_offset;
-                        // See the other PTO site: retransmit only what was sent.
-                        const end = s.send.send_offset;
-                        if (end > start) {
-                            s.send.queueRetransmit(start, end - start, s.send.fin_sent);
-                        } else if (s.send.fin_sent) {
-                            s.send.queueRetransmit(end, 0, true);
+                // RFC 9002 §6.2.1: no Application-space timer before the
+                // handshake is confirmed — 0-RTT data has not had a chance to
+                // be acknowledged yet, and resending it at 1-RTT wastes the
+                // round trip 0-RTT was for.
+                if (self.handshake_confirmed) {
+                    var resend_it = self.streams.streams.valueIterator();
+                    while (resend_it.next()) |s_ptr| {
+                        const s = s_ptr.*;
+                        if (s.send.hasUnackedData()) {
+                            const start = s.send.ack_offset;
+                            // See the other PTO site: retransmit only what was sent.
+                            const end = s.send.send_offset;
+                            if (end > start) {
+                                s.send.queueRetransmit(start, end - start, s.send.fin_sent);
+                            } else if (s.send.fin_sent) {
+                                s.send.queueRetransmit(end, 0, true);
+                            }
                         }
                     }
                 }
@@ -3521,22 +3527,29 @@ pub const Connection = struct {
                         // unacked hole and no queued retransmission. A connection-level
                         // has_data guard would leave that second stream stalled.
                         {
-                            var resend_it = self.streams.streams.valueIterator();
-                            while (resend_it.next()) |s_ptr| {
-                                const s = s_ptr.*;
-                                if (s.send.hasUnackedData()) {
-                                    const start = s.send.ack_offset;
-                                    // Only what we actually put on the wire. write_offset
-                                    // is what the application has written, which can run
-                                    // past the peer's MAX_STREAM_DATA — and the
-                                    // retransmit path does not re-check the window.
-                                    const end = s.send.send_offset;
-                                    if (end > start) {
-                                        s.send.queueRetransmit(start, end - start, s.send.fin_sent);
-                                    } else if (s.send.fin_sent) {
-                                        s.send.queueRetransmit(end, 0, true);
+                            // RFC 9002 §6.2.1: the Application space has no PTO
+                            // timer until the handshake is confirmed. Resending
+                            // 0-RTT data at 1-RTT before the peer has had any
+                            // chance to acknowledge it throws away the round trip.
+                            if (self.handshake_confirmed) {
+                                var resend_it = self.streams.streams.valueIterator();
+                                while (resend_it.next()) |s_ptr| {
+                                    const s = s_ptr.*;
+                                    if (s.send.hasUnackedData()) {
+                                        const start = s.send.ack_offset;
+                                        // Only what we actually put on the wire.
+                                        // write_offset is what the application has
+                                        // written, which can run past the peer's
+                                        // MAX_STREAM_DATA — and the retransmit path
+                                        // does not re-check the window.
+                                        const end = s.send.send_offset;
+                                        if (end > start) {
+                                            s.send.queueRetransmit(start, end - start, s.send.fin_sent);
+                                        } else if (s.send.fin_sent) {
+                                            s.send.queueRetransmit(end, 0, true);
+                                        }
+                                        has_data = true;
                                     }
-                                    has_data = true;
                                 }
                             }
                         }
