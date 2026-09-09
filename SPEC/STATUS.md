@@ -13,7 +13,7 @@
 | 3.1 | Sending Stream States | ✅ Done | Ready→Send→DataSent→DataRecvd/ResetSent |
 | 3.2 | Receiving Stream States | ✅ Done | Recv→SizeKnown→DataRecvd→DataRead |
 | 3.3 | Permitted Frame Types | ✅ Done | Frame-in-wrong-state enforcement |
-| 3.4 | Bidirectional Stream States | ✅ Done | Composite of send + recv states |
+| 3.4 | Bidirectional Stream States | ✅ Done | Composite of send + recv states; reclaimed once fully acked — see [RFC9000_3.md](RFC9000_3.md) |
 | 3.5 | Solicited State Transitions | ✅ Done | STOP_SENDING triggers RESET_STREAM |
 | **4** | **Flow Control** | | |
 | 4.1 | Data Flow Control | ✅ Done | Connection + stream level |
