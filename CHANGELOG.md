@@ -7,12 +7,23 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
-- A connection no longer holds the send buffers of streams it has finished with.
-  Streams were marked closed but never removed, so a long-lived connection
-  serving many short-lived streams — a relay, a WebTransport session pulling byte
-  ranges — grew for its whole lifetime. They are now reclaimed as soon as the
-  peer acknowledges the last byte. Based on
-  [#29](https://github.com/endel/quic-zig/pull/29). Thanks @MKS2508!
+- A connection no longer holds on to the streams it has finished with. They were
+  marked closed but never removed, so a long-lived connection serving many
+  short-lived streams — a relay, a WebTransport session pulling byte ranges —
+  grew for its whole lifetime, and every PTO walked every stream it had ever
+  opened. Underneath, a stream that sent a FIN counted as unacknowledged forever,
+  because the FIN is not a byte and the check compared byte offsets; it is now
+  tracked from the flag on the acknowledged frame. HTTP/3's own per-stream
+  bookkeeping is pruned alongside. Reported in
+  [#29](https://github.com/endel/quic-zig/pull/29) — thanks @MKS2508!
+
+  8000 sequential HTTP/3 requests on one connection: 6364 live streams at the
+  end, now 6; peak server memory 18.3 MB above idle, now 2.8 MB; 3183 → 3623
+  requests/s.
+- Every server in `apps/` allocated from an arena, where freeing does nothing, so
+  a server's memory grew for as long as the process ran no matter what the
+  library released. They now use an allocator that reuses it. Clients keep the
+  arena; they exit.
 - A `CRYPTO`, `NEW_TOKEN` or `CONNECTION_CLOSE` frame whose declared length ran
   past the end of the datagram read out of bounds — an 8-byte datagram claiming
   16383 bytes of crypto data panicked. `NEW_CONNECTION_ID` never checked its
