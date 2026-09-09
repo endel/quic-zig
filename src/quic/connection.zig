@@ -3142,10 +3142,11 @@ pub const Connection = struct {
                     const s = s_ptr.*;
                     if (s.send.hasUnackedData()) {
                         const start = s.send.ack_offset;
-                        const end = s.send.write_offset;
+                        // See the other PTO site: retransmit only what was sent.
+                        const end = s.send.send_offset;
                         if (end > start) {
-                            s.send.queueRetransmit(start, end - start, s.send.fin_queued);
-                        } else if (s.send.fin_queued) {
+                            s.send.queueRetransmit(start, end - start, s.send.fin_sent);
+                        } else if (s.send.fin_sent) {
                             s.send.queueRetransmit(end, 0, true);
                         }
                     }
@@ -3525,10 +3526,14 @@ pub const Connection = struct {
                                 const s = s_ptr.*;
                                 if (s.send.hasUnackedData()) {
                                     const start = s.send.ack_offset;
-                                    const end = s.send.write_offset;
+                                    // Only what we actually put on the wire. write_offset
+                                    // is what the application has written, which can run
+                                    // past the peer's MAX_STREAM_DATA — and the
+                                    // retransmit path does not re-check the window.
+                                    const end = s.send.send_offset;
                                     if (end > start) {
-                                        s.send.queueRetransmit(start, end - start, s.send.fin_queued);
-                                    } else if (s.send.fin_queued) {
+                                        s.send.queueRetransmit(start, end - start, s.send.fin_sent);
+                                    } else if (s.send.fin_sent) {
                                         s.send.queueRetransmit(end, 0, true);
                                     }
                                     has_data = true;

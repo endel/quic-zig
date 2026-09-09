@@ -627,7 +627,15 @@ pub const SendStream = struct {
             @min(range.length, buffered.len - range.offset)
         else
             0;
-        const data_len = @min(available, max_len);
+        // A retransmit range can only cover bytes already sent, which were
+        // inside the window when they went out. Clamp anyway: a caller that
+        // queues past send_offset would otherwise walk past MAX_STREAM_DATA,
+        // since this path has no other window check.
+        const window_remaining = if (self.send_window > range.offset)
+            self.send_window - range.offset
+        else
+            0;
+        const data_len = @min(@min(available, max_len), window_remaining);
 
         if (data_len == 0 and !range.fin) {
             // Nothing useful to retransmit - remove this range
@@ -2386,4 +2394,24 @@ test "SendStream: a reset stream has nothing left to retransmit" {
 
     ss.reset(7);
     try testing.expect(!ss.hasUnackedData());
+}
+
+test "SendStream: a retransmit range never walks past MAX_STREAM_DATA" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("x" ** 200);
+    ss.send_window = 100;
+
+    // Everything the window allows goes out.
+    const first = ss.popStreamFrame(1000).?;
+    try testing.expectEqual(@as(u64, 100), first.stream.length);
+    try testing.expect(ss.popStreamFrame(1000) == null);
+
+    // A caller that queues the whole buffer — PTO used to pass write_offset —
+    // must still not push the 100 bytes the peer has not granted.
+    ss.queueRetransmit(0, 200, false);
+    const rt = ss.popStreamFrame(1000).?;
+    try testing.expectEqual(@as(u64, 0), rt.stream.offset);
+    try testing.expectEqual(@as(u64, 100), rt.stream.length);
 }
