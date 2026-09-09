@@ -1,8 +1,10 @@
 # quic-zig — handover
 
-State at `8192e79`, unpushed. 572/572 unit tests, 448/448 fuzz smoke,
-11/11 `tools/interop_local.sh`, 9/9 `interop/run_local_tests.sh`.
-Docker matrix: see [`SPEC/interop-results.md`](SPEC/interop-results.md).
+State at `4ca8f01`, unpushed. 573/573 unit tests, 448/448 fuzz smoke,
+11/11 `tools/interop_local.sh`, 9/9 `interop/run_local_tests.sh`, and 64/88 on
+the docker matrix — 12 fail, 12 the peer does not implement, every failure
+matching the previous session's verdict, so no regressions. Full matrix in
+[`SPEC/interop-results.md`](SPEC/interop-results.md).
 What changed and why: [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Running things
@@ -82,6 +84,11 @@ parts worth knowing:
 - `event_loop.zig` was never in `test_all.zig`. Its eleven tests stopped
   compiling during the 0.16 migration and nothing noticed for months. They pass
   now and immediately found six leaks.
+- A PTO in a handshake space now always sends a probe. It used to send nothing
+  when it had nothing to resend, and since the deadline is measured from the
+  last ack-eliciting packet it stayed expired and re-fired on every tick —
+  22365 Initial PTOs in ten seconds, no probe ever sent. The matrix caught it;
+  no local suite exercises loss or corruption, so nothing else could have.
 - RFC 9001 Appendix A.5 runs as a unit test. It passes byte-exact, so the open
   `chacha20` interop failure is **not** our ChaCha20 crypto or header
   protection. Worth keeping in mind that A.2 (AES) was the only vector tested
@@ -111,9 +118,11 @@ only one non-incremental stream per call at the minimum urgency (which is
 RFC 9218 behaviour), picked in hash-iteration order — worth ruling out before
 looking further.
 
-### 3. Handshake retransmission under loss
+### 3. Handshake retransmission under loss vs quiche
 `quic-zig<-quiche handshakeloss` and `handshakecorruption`: quiche's client
-finishes 11 of 50 handshakes and hits its own overall timeout. A local harness
+finishes 11 of 50 handshakes and hits its own overall timeout. Note the PTO
+probe fix above did not move these, and the quic-go equivalents all pass in
+both directions. A local harness
 now exists to poke at this without docker — a UDP relay that drops a fraction
 of datagrams in both directions. Under it our server averaged 1.50 s per
 handshake at 30 % loss against quiche's client, where quiche's *own* server
@@ -139,6 +148,13 @@ already drifted once; deriving `DynamicTable.size` from `used`/`count`.
 
 ## Environment notes
 
+- **This machine OOMs during a matrix run.** The harness kills the background
+  task, but `matrix.sh` resumes from `matrix-results.txt`, so just run it
+  again; a small wrapper loop that re-invokes it until the file has 88 lines
+  gets through unattended. Dropping the Docker builder stage also freed 16.5 GB
+  of now-dead BuildKit cache, which is worth pruning if it comes back.
+- A `tshark` crash in the runner shows up as `ERROR` rather than `FAIL`. It is
+  a harness casualty, not a result — delete the line and re-run that case.
 - Peer images: `martenseemann/quic-go-interop:latest`,
   `cloudflare/quiche-qns:latest`, `martenseemann/quic-network-simulator`.
   Pull with `--platform linux/amd64` on Apple silicon.

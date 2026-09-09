@@ -1,6 +1,6 @@
 # Interop Test Results
 
-Date: 2026-09-09  ·  quic-zig `03380f7`, Zig 0.16.0, `zig build -Doptimize=ReleaseSafe`
+Date: 2026-09-09  ·  quic-zig `4ca8f01`, Zig 0.16.0, `zig build -Doptimize=ReleaseSafe`
 Peers: `martenseemann/quic-go-interop:latest`, `cloudflare/quiche-qns:latest`
 Harness: `interop/runner/matrix.sh` (quic-interop-runner + quic-network-simulator)
 
@@ -41,20 +41,12 @@ Totals:
 
 Legend: ✅ pass · ❌ fail · — the peer does not implement the case.
 
-Against quic-go both directions are clean apart from `chacha20` and the two
-migration cases the peer's client does not drive. Everything under loss and
-corruption passes, in both roles.
-
-Five cases were red when this matrix was first run and are green here, each from
-a bug the run exposed: `blackhole` in both directions (PTO retransmitting past
-`MAX_STREAM_DATA`), `resumption` against quiche (`early_data` sent unsolicited in
-EncryptedExtensions), `zerortt` against quic-go (the Application PTO firing
-before handshake confirmation), and `rebind-addr` against quic-go.
-
 ## None of the remaining failures are regressions
 
-The pre-merge tree (`b6f9eb6`) was built as its own interop image and run against
-quiche's client for the cases that still fail. It fails all of them the same way:
+Every failure above matches the previous session's matrix verdict for verdict.
+The pre-merge tree (`b6f9eb6`) was separately built as its own interop image and
+run against quiche's client for the cases that still fail; it fails all of them
+the same way:
 
     quic-zig-base<-quiche multiplexing          FAIL
     quic-zig-base<-quiche handshakeloss         FAIL
@@ -62,8 +54,25 @@ quiche's client for the cases that still fail. It fails all of them the same way
     quic-zig-base<-quiche rebind-port           FAIL
     quic-zig-base<-quiche chacha20              UNSUPPORTED
 
-quiche had never been run against us before this matrix, which is why they are
-only surfacing now.
+quiche had never been run against us before that matrix, which is why they only
+surfaced then.
+
+One case moved the other way in this run: `quic-go<-quic-zig
+handshakecorruption` regressed to FAIL and was fixed. Our client fired 22365
+Initial-space PTOs in ten seconds without sending anything, because a PTO with
+nothing to resend sent no probe at all — and the PTO deadline is measured from
+the last ack-eliciting packet, so it stayed expired and re-fired on every tick.
+Both directions pass now.
+
+## A caution about this table
+
+The binaries under test must be cross-compiled by
+`interop/runner/build_image.sh`, not built inside the image. Building them in
+the `linux/amd64` builder stage on an Apple-silicon host runs the x86_64 Zig
+compiler under emulation, and its ReleaseSafe output has a broken ECDSA signing
+path: every peer rejects the server's CertificateVerify and every case in the
+matrix fails at the handshake. It reads exactly like a protocol regression. See
+`HANDOFF.md` for the ten-second way to tell the two apart.
 
 ## What the remaining failures are
 
