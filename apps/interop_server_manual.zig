@@ -303,6 +303,11 @@ pub fn main() !void {
                 }
             }
 
+            // Reclaim the streams that finished during this poll, in the same
+            // order the event loop does: protocol layer first, QUIC last.
+            if (entry.h3_conn) |h3c| h3c.drainDisposalQueue();
+            conn.streams.drainDisposalQueue();
+
             // Timeouts + close check
             if (!conn_mgr.tickEntry(entry)) {
                 _ = h0_conns.remove(conn_key);
