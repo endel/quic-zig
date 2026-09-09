@@ -24,6 +24,20 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   a server's memory grew for as long as the process ran no matter what the
   library released. They now use an allocator that reuses it. Clients keep the
   arena; they exit.
+- PTO could push data past the peer's `MAX_STREAM_DATA`. It queued everything
+  from the last acknowledged byte to the last byte the *application* had written,
+  including bytes never sent, and the retransmit path is the one send path with
+  no window check of its own. quic-go closed our transfer with FLOW_CONTROL_ERROR
+  under the blackhole test.
+- A server that accepted a resumption ticket sent the `early_data` extension in
+  EncryptedExtensions whether or not the client had offered early data.
+  BoringSSL calls that an unexpected extension, so every quiche client resuming
+  against us was closed with alert 110.
+- Stream credit was only extended once a quarter of the initial limit had been
+  consumed, so a peer whose remaining work was smaller than that batch waited
+  forever for credit it would never be offered — quiche's client stalled at 1988
+  of 1999 requests. The remainder is now granted once the peer has opened
+  everything it was allowed.
 - A `CRYPTO`, `NEW_TOKEN` or `CONNECTION_CLOSE` frame whose declared length ran
   past the end of the datagram read out of bounds — an 8-byte datagram claiming
   16383 bytes of crypto data panicked. `NEW_CONNECTION_ID` never checked its
