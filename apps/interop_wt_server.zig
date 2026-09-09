@@ -336,6 +336,13 @@ pub fn main(_: std.process.Init.Minimal) !void {
                 }
             }
 
+            // Reclaim streams that finished during this poll, in the same order
+            // the event loop does: WebTransport first, then QUIC.
+            if (conn_states.get(conn_key)) |state| {
+                if (state.wt_conn != null) state.wt_conn.?.drainDisposalQueue();
+            }
+            entry.conn.streams.drainDisposalQueue();
+
             // Timeouts + close check
             if (!conn_mgr.tickEntry(entry)) {
                 if (conn_states.get(conn_key)) |state| {
