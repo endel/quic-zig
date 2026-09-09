@@ -367,8 +367,13 @@ pub const SendStream = struct {
     stream_id: u64,
     allocator: Allocator,
 
-    /// Data buffered for sending.
+    /// Data buffered for sending. Indexed relative to `buf_base`, not by
+    /// absolute stream offset — use bufferedAt().
     write_buffer: std.ArrayList(u8),
+
+    /// Stream offset of `write_buffer.items[0]`. Bytes below it were
+    /// acknowledged and dropped; no send path can ask for them again.
+    buf_base: u64 = 0,
 
     /// Current write offset (total bytes written).
     write_offset: u64 = 0,
@@ -459,6 +464,42 @@ pub const SendStream = struct {
         self.write_offset += data.len;
     }
 
+    /// Drop the acknowledged prefix once it is worth the memmove. Without this
+    /// a stream holds every byte it ever sent until it closes, so one long
+    /// transfer holds the whole transfer.
+    const COMPACT_THRESHOLD: usize = 64 * 1024;
+
+    fn compactAcked(self: *SendStream) void {
+        const prefix = self.ack_offset - self.buf_base;
+        if (prefix < COMPACT_THRESHOLD) return;
+        // Move no more than we discard, so the copying is amortised O(1) per
+        // byte. A flat threshold alone is quadratic against an application that
+        // writes ahead: an 8 MB write acked in 64 KB steps memmoves ~512 MB and
+        // costs two thirds of bulk throughput.
+        if (prefix < self.write_buffer.items.len - prefix) return;
+
+        const n: usize = @intCast(prefix);
+        const items = self.write_buffer.items;
+        if (n >= items.len) {
+            self.write_buffer.clearRetainingCapacity();
+        } else {
+            std.mem.copyForwards(u8, items[0 .. items.len - n], items[n..]);
+            self.write_buffer.items.len = items.len - n;
+        }
+        self.buf_base = self.ack_offset;
+    }
+
+    /// The buffered bytes at `offset`, at most `max_len` of them. Empty when
+    /// the offset names data that has been acknowledged and dropped, or data
+    /// the application has not written yet.
+    fn bufferedAt(self: *const SendStream, offset: u64, max_len: u64) []const u8 {
+        if (offset < self.buf_base) return &.{};
+        const rel: usize = @intCast(offset - self.buf_base);
+        const items = self.write_buffer.items;
+        if (rel >= items.len) return &.{};
+        return items[rel..][0..@intCast(@min(max_len, items.len - rel))];
+    }
+
     /// Close the stream (queue FIN).
     pub fn close(self: *SendStream) void {
         self.fin_queued = true;
@@ -493,6 +534,7 @@ pub const SendStream = struct {
         }
         self.trimRetransmitRangesBelow(self.ack_offset);
         self.send_offset = @max(self.send_offset, self.ack_offset);
+        self.compactAcked();
     }
 
     /// Cancel the stream with an error code (sends RESET_STREAM).
@@ -520,7 +562,7 @@ pub const SendStream = struct {
     }
 
     /// Queue a range of stream data for retransmission (called when a packet is declared lost).
-    pub fn queueRetransmit(self: *SendStream, offset: u64, length: u64, fin: bool) void {
+    pub fn queueRetransmit(self: *SendStream, offset_in: u64, length_in: u64, fin: bool) void {
         if (self.reset_err != null) return;
 
         // If FIN was in the lost packet, mark it for retransmission
@@ -530,7 +572,19 @@ pub const SendStream = struct {
         }
 
         // Don't queue zero-length ranges (unless it was a FIN-only frame, handled above)
-        if (length == 0) return;
+        if (length_in == 0) return;
+
+        // A lost packet can carry bytes a later ACK already covered, and those
+        // bytes are gone from the buffer. Resending them would be waste even if
+        // they were still there.
+        var offset = offset_in;
+        var length = length_in;
+        if (offset < self.ack_offset) {
+            const skip = self.ack_offset - offset;
+            if (skip >= length) return;
+            offset += skip;
+            length -= skip;
+        }
 
         // Check if this range overlaps with or is adjacent to an existing retransmit range
         // and merge if possible
@@ -643,13 +697,9 @@ pub const SendStream = struct {
         if (self.retransmit_count == 0) return null;
 
         const range = &self.retransmit_ranges[0];
-        const buffered = self.write_buffer.items;
 
         // Clamp to available buffer and max_len
-        const available = if (range.offset < buffered.len)
-            @min(range.length, buffered.len - range.offset)
-        else
-            0;
+        const available = self.bufferedAt(range.offset, range.length).len;
         // A retransmit range can only cover bytes already sent, which were
         // inside the window when they went out. Clamp anyway: a caller that
         // queues past send_offset would otherwise walk past MAX_STREAM_DATA,
@@ -668,7 +718,7 @@ pub const SendStream = struct {
 
         // Save the original offset before modifying the range
         const frame_offset = range.offset;
-        const data = if (data_len > 0) buffered[@intCast(frame_offset)..][0..@intCast(data_len)] else &[_]u8{};
+        const data = self.bufferedAt(frame_offset, data_len);
         // FIN should be set if this range had FIN and we're sending all of its data
         const fin = range.fin and (frame_offset + data_len == self.write_offset);
 
@@ -700,7 +750,6 @@ pub const SendStream = struct {
 
     /// Pop a new data frame (original send path).
     fn popNewDataFrame(self: *SendStream, max_len: u64) ?Frame {
-        const buffered = self.write_buffer.items;
         const unsent_start = self.send_offset;
         const unsent_len = self.write_offset - self.send_offset;
 
@@ -720,7 +769,7 @@ pub const SendStream = struct {
         // and would cause the receiver to interpret following frame bytes as stream data
         if (data_len == 0 and !fin) return null;
 
-        const data = if (data_len > 0) buffered[@intCast(unsent_start)..][0..@intCast(data_len)] else &[_]u8{};
+        const data = self.bufferedAt(unsent_start, data_len);
 
         self.send_offset += data_len;
         if (fin) self.fin_sent = true;
@@ -2672,4 +2721,82 @@ test "StreamsMap: the uni window also grants its remainder at the limit" {
     const upd = sm.getMaxStreamsUpdates();
     try testing.expectEqual(@as(?u64, 9), upd.uni);
     try testing.expect(sm.getMaxStreamsUpdates().uni == null);
+}
+
+// ── Send-buffer compaction ─────────────────────────────────────────────
+
+test "SendStream: acked bytes are dropped and later offsets stay correct" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    const chunk = "x" ** 32768;
+    try ss.writeData(chunk);
+    try ss.writeData(chunk);
+    try ss.writeData("TAIL");
+
+    // Send and acknowledge the first 64 KiB.
+    ss.send_offset = 65536;
+    try ss.onAck(0, 65536, false);
+
+    try testing.expectEqual(@as(u64, 65536), ss.buf_base);
+    try testing.expectEqual(@as(usize, 4), ss.write_buffer.items.len);
+
+    // The tail still goes out at its true stream offset, with its true bytes.
+    const f = ss.popStreamFrame(1000).?;
+    try testing.expectEqual(@as(u64, 65536), f.stream.offset);
+    try testing.expectEqualStrings("TAIL", f.stream.data);
+}
+
+test "SendStream: a long transfer does not grow without bound" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    // 4 MB streamed in 8 KB chunks, acknowledged as it goes.
+    const chunk = "y" ** 8192;
+    var sent: u64 = 0;
+    while (sent < 4 * 1024 * 1024) : (sent += chunk.len) {
+        try ss.writeData(chunk);
+        ss.send_offset = ss.write_offset;
+        try ss.onAck(sent, chunk.len, false);
+    }
+
+    try testing.expectEqual(@as(u64, 4 * 1024 * 1024), ss.write_offset);
+    // Bounded by the compaction threshold, not by the size of the transfer.
+    try testing.expect(ss.write_buffer.items.len <= 2 * SendStream.COMPACT_THRESHOLD);
+    try testing.expect(ss.write_buffer.capacity <= 4 * SendStream.COMPACT_THRESHOLD);
+}
+
+test "SendStream: a lost packet whose bytes were since acked is not requeued" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("x" ** 200);
+    ss.send_offset = 200;
+    try ss.onAck(0, 100, false);
+
+    // Loss detection reports the packet that first carried [0,100).
+    ss.queueRetransmit(0, 100, false);
+    try testing.expectEqual(@as(u8, 0), ss.retransmit_count);
+
+    // A range straddling the ack boundary keeps only its unacked half.
+    ss.queueRetransmit(50, 100, false);
+    try testing.expectEqual(@as(u8, 1), ss.retransmit_count);
+    try testing.expectEqual(@as(u64, 100), ss.retransmit_ranges[0].offset);
+    try testing.expectEqual(@as(u64, 50), ss.retransmit_ranges[0].length);
+}
+
+test "SendStream: retransmission after compaction sends the right bytes" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("a" ** 65536);
+    try ss.writeData("bbbbbbbbbb");
+    ss.send_offset = ss.write_offset;
+    try ss.onAck(0, 65536, false);
+    try testing.expectEqual(@as(u64, 65536), ss.buf_base);
+
+    ss.queueRetransmit(65536, 10, false);
+    const f = ss.popStreamFrame(1000).?;
+    try testing.expectEqual(@as(u64, 65536), f.stream.offset);
+    try testing.expectEqualStrings("bbbbbbbbbb", f.stream.data);
 }
