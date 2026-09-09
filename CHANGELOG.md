@@ -29,16 +29,21 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Changed
 
-- Per-connection memory drops from 181 KB to 27 KB. A full 256-connection table
-  goes from 44 MB to 6 MB. Most of it was QPACK: every dynamic table entry
-  reserved a 128-byte name and a 512-byte value, twice per connection, whether or
-  not the peer used the table. Entries now share one capacity-sized arena, and
-  HTTP/3 and WebTransport state is allocated only for connections that speak
-  those protocols.
+- Per-connection memory. A connection speaking raw QUIC used to carry HTTP/3 and
+  WebTransport state it never touched; those layers are now allocated only when a
+  protocol needs them, and the connection table entry goes from 181,640 bytes to
+  256. The HTTP/3 layer itself goes from 175,776 to 21,160 bytes, almost all of it
+  QPACK: every dynamic table entry reserved a 128-byte name and a 512-byte value,
+  twice per connection, so a table advertising 4 KB of capacity reserved 82 KB to
+  hold it. Entries now share one capacity-sized arena.
 - Entries larger than 128/512 bytes are now indexable in the QPACK dynamic
   table, which they were not before.
 - `Connection` and the TLS 1.3 handshake are no longer returned by value, so
   constructing one no longer costs 185 KB and 52 KB of the caller's stack.
+
+Throughput and request rate are unchanged: on an interleaved A/B over loopback,
+8 MB single-stream download 52.2 → 52.5 MB/s and 20×50 HTTP/3 requests 5892 →
+5963 req/s, both inside run-to-run noise.
 
 ### Added
 
