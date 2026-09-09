@@ -7,6 +7,25 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- Unidirectional receive streams were never freed. A connection kept a receive
+  buffer and its reassembly state for every uni stream it had ever accepted, so
+  anything that puts messages on uni streams — MoQ objects, WebTransport uni
+  streams — grew for the life of the connection. They are released once the
+  application has been handed the stream's FIN.
+- `RESET_STREAM` on a peer-initiated unidirectional stream was ignored
+  completely. The sender counts the whole final size against connection flow
+  control when it sends, so a reset stream permanently consumed that much of the
+  connection window; enough of them stall the connection. A retransmitted FIN on
+  a uni stream also counted twice against the stream limit.
+- A `STREAMS_BLOCKED` frame was answered with the limit the peer had just said
+  it was stuck at, which unblocks nothing. The peer is now granted the credit
+  its closed streams have earned, and the current limit is resent only when the
+  peer's view of it is behind ours.
+- A send stream held every byte it had ever sent until it closed, so a long
+  transfer held the whole transfer in memory. Acknowledged data is released as
+  it goes.
+- `closeConnection()` on a client session closed the connection but left the
+  run loop spinning forever, so a client that finished its work never exited.
 - A connection no longer holds on to the streams it has finished with. They were
   marked closed but never removed, so a long-lived connection serving many
   short-lived streams — a relay, a WebTransport session pulling byte ranges —
@@ -69,6 +88,11 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   table, which they were not before.
 - `Connection` and the TLS 1.3 handshake are no longer returned by value, so
   constructing one no longer costs 185 KB and 52 KB of the caller's stack.
+- The interop image's binaries are cross-compiled on the host rather than built
+  inside the linux/amd64 image. On an Apple-silicon host that stage ran the
+  x86_64 Zig compiler under emulation and produced a server whose ECDSA
+  CertificateVerify no peer would accept. Building the image is now 7 seconds
+  rather than 25-30 minutes.
 
 Measured on an interleaved A/B over loopback against the pre-merge tree: on the
 workload the reclamation is about — 8000 sequential HTTP/3 requests on one
