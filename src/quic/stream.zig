@@ -470,23 +470,26 @@ pub const SendStream = struct {
     const COMPACT_THRESHOLD: usize = 64 * 1024;
 
     fn compactAcked(self: *SendStream) void {
-        const prefix = self.ack_offset - self.buf_base;
+        const buffered = self.write_buffer.items.len;
+        // Clamped: ack_offset should never pass write_offset, but the value
+        // comes from a peer's ACK ranges and the subtraction below would
+        // underflow rather than fail politely.
+        const prefix: usize = @intCast(@min(self.ack_offset - self.buf_base, buffered));
         if (prefix < COMPACT_THRESHOLD) return;
         // Move no more than we discard, so the copying is amortised O(1) per
         // byte. A flat threshold alone is quadratic against an application that
         // writes ahead: an 8 MB write acked in 64 KB steps memmoves ~512 MB and
         // costs two thirds of bulk throughput.
-        if (prefix < self.write_buffer.items.len - prefix) return;
+        if (prefix < buffered - prefix) return;
 
-        const n: usize = @intCast(prefix);
         const items = self.write_buffer.items;
-        if (n >= items.len) {
+        if (prefix >= buffered) {
             self.write_buffer.clearRetainingCapacity();
         } else {
-            std.mem.copyForwards(u8, items[0 .. items.len - n], items[n..]);
-            self.write_buffer.items.len = items.len - n;
+            std.mem.copyForwards(u8, items[0 .. buffered - prefix], items[prefix..]);
+            self.write_buffer.items.len = buffered - prefix;
         }
-        self.buf_base = self.ack_offset;
+        self.buf_base += prefix;
     }
 
     /// The buffered bytes at `offset`, at most `max_len` of them. Empty when
@@ -2799,4 +2802,19 @@ test "SendStream: retransmission after compaction sends the right bytes" {
     const f = ss.popStreamFrame(1000).?;
     try testing.expectEqual(@as(u64, 65536), f.stream.offset);
     try testing.expectEqualStrings("bbbbbbbbbb", f.stream.data);
+}
+
+test "SendStream: compaction survives an ack past what was written" {
+    var ss = SendStream.init(testing.allocator, 0);
+    defer ss.deinit();
+
+    try ss.writeData("z" ** 70000);
+    ss.send_offset = ss.write_offset;
+    // A peer that acknowledges more than we sent must not underflow the
+    // buffered-length arithmetic.
+    ss.ack_offset = ss.write_offset + 5000;
+    ss.compactAcked();
+
+    try testing.expectEqual(@as(usize, 0), ss.write_buffer.items.len);
+    try testing.expectEqual(@as(u64, 70000), ss.buf_base);
 }
