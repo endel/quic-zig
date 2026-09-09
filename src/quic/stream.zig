@@ -734,6 +734,10 @@ pub const Stream = struct {
     /// Prevents double-counting while keeping the stream in the map for retransmission.
     closed_for_gc: bool = false,
 
+    /// Set once the stream is on the disposal queue, so the ACK path and the
+    /// collectClosedStreams backstop cannot enqueue it twice.
+    disposal_queued: bool = false,
+
     pub fn init(allocator: Allocator, stream_id: u64) Stream {
         return .{
             .stream_id = stream_id,
@@ -745,6 +749,18 @@ pub const Stream = struct {
     pub fn deinit(self: *Stream) void {
         self.send.deinit();
         self.recv.deinit();
+    }
+
+    /// Whether the stream can be removed from the map and freed.
+    ///
+    /// `closed_for_gc` only means both FINs have crossed. The FIN we sent may
+    /// still be lost, and PTO recovers it by resetting `send_offset` — which it
+    /// cannot do once the stream is gone. Nothing is left to recover only when
+    /// every byte is acknowledged and no retransmit range is outstanding.
+    pub fn isDisposable(self: *const Stream) bool {
+        return self.closed_for_gc and
+            self.send.retransmit_count == 0 and
+            !self.send.hasUnackedData();
     }
 };
 
@@ -811,6 +827,15 @@ pub const StreamsMap = struct {
     /// drained by drainDisposalQueue() once per event loop cycle. O(k) not O(n).
     disposal_queue: [64]u64 = undefined,
     disposal_count: usize = 0,
+
+    /// The last few reclaimed stream IDs, newest overwriting oldest. A stream
+    /// ID is not enough on its own to tell "reclaimed" from "not yet opened":
+    /// peers may use IDs out of order, so an ID below the highest we have seen
+    /// can still be a stream we have never been told about. Retransmissions of
+    /// acked data arrive within a PTO or two, so a short window catches them;
+    /// missing one only costs what happened before this check existed.
+    recent_disposed: [32]u64 = @splat(std.math.maxInt(u64)),
+    recent_disposed_idx: usize = 0,
 
     /// Highest peer-initiated bidi stream ID that has been opened.
     /// Upper layers (WT/H3) compare this with their own "next to examine"
@@ -947,6 +972,11 @@ pub const StreamsMap = struct {
         if (!isBidi(stream_id)) {
             return error.StreamStateError; // Uni streams should use recv_streams
         }
+
+        // Under loss the peer retransmits data we acked before reclaiming the
+        // stream. Recreating it here would leave a stream nothing will ever
+        // close and double-count the close against MAX_STREAMS.
+        if (self.wasRecentlyDisposed(stream_id)) return error.StreamAlreadyClosed;
 
         const s = try self.allocator.create(Stream);
         s.* = Stream.init(self.allocator, stream_id);
@@ -1116,7 +1146,8 @@ pub const StreamsMap = struct {
     pub fn collectClosedStreams(self: *StreamsMap) void {
         if (!self.needs_gc_scan) return; // No FIN events since last scan
 
-        // Mark fully-closed streams for consumed counting and queue for disposal.
+        // Mark fully-closed streams for consumed counting, and reclaim any whose
+        // send side has settled since the last scan.
         var found_pending = false;
         var it = self.streams.iterator();
         while (it.next()) |kv| {
@@ -1124,15 +1155,14 @@ pub const StreamsMap = struct {
             if (!s.closed_for_gc and (s.recv.finished or s.recv.fin_received) and s.send.fin_sent) {
                 s.closed_for_gc = true;
                 self.closeStream(s.stream_id);
-                // Delay disposal: keep the stream in the map so PTO can
-                // reset send_offset for retransmission under loss.
-                // Stream will be cleaned up when the connection closes.
-            } else if (!s.closed_for_gc) {
-                // At least one stream is still pending close
-                found_pending = true;
             }
+            // Backstop for the ACK-time path: that one reclaims in O(1) but
+            // drops entries once the queue is full, and a stream can settle
+            // without any further ACK arriving to trigger the check.
+            self.disposeIfSettled(s);
+            if (!s.disposal_queued) found_pending = true;
         }
-        // Clear flag only if no unclosed streams remain
+        // Stop scanning once every remaining stream is on its way out.
         if (!found_pending) self.needs_gc_scan = false;
     }
 
@@ -1147,13 +1177,31 @@ pub const StreamsMap = struct {
         }
     }
 
+    /// Queue a stream for removal if it is closed and fully acknowledged.
+    /// O(1) and idempotent, so the ACK path can call it per acked STREAM frame.
+    pub fn disposeIfSettled(self: *StreamsMap, s: *Stream) void {
+        if (s.disposal_queued or !s.isDisposable()) return;
+        s.disposal_queued = self.queueDisposal(s.stream_id);
+    }
+
     /// Queue a stream for removal. O(1) — called when a stream is known to be
     /// fully closed (closed_for_gc set, no pending retransmissions).
-    pub fn queueDisposal(self: *StreamsMap, stream_id: u64) void {
-        if (self.disposal_count < self.disposal_queue.len) {
-            self.disposal_queue[self.disposal_count] = stream_id;
-            self.disposal_count += 1;
-        }
+    /// Returns false when the queue is full; the caller must try again later.
+    pub fn queueDisposal(self: *StreamsMap, stream_id: u64) bool {
+        if (self.disposal_count >= self.disposal_queue.len) return false;
+        self.disposal_queue[self.disposal_count] = stream_id;
+        self.disposal_count += 1;
+        return true;
+    }
+
+    /// Whether this ID names a stream we opened and have already reclaimed.
+    fn wasRecentlyDisposed(self: *const StreamsMap, stream_id: u64) bool {
+        return std.mem.indexOfScalar(u64, &self.recent_disposed, stream_id) != null;
+    }
+
+    fn rememberDisposed(self: *StreamsMap, stream_id: u64) void {
+        self.recent_disposed[self.recent_disposed_idx] = stream_id;
+        self.recent_disposed_idx = (self.recent_disposed_idx + 1) % self.recent_disposed.len;
     }
 
     /// Drain the disposal queue: remove queued streams from the maps. O(k)
@@ -1161,6 +1209,7 @@ pub const StreamsMap = struct {
     pub fn drainDisposalQueue(self: *StreamsMap) void {
         if (self.disposal_count == 0) return;
         for (self.disposal_queue[0..self.disposal_count]) |id| {
+            self.rememberDisposed(id);
             if (self.streams.fetchRemove(id)) |kv| {
                 var s = kv.value;
                 s.deinit();
@@ -2165,4 +2214,136 @@ test "StreamsMap: setSendOrder dynamically changes scheduling" {
     count = sm.getScheduledStreams(&out);
     try testing.expectEqual(@as(u64, 0), out[0].stream_id);
     try testing.expectEqual(@as(u64, 4), out[1].stream_id);
+}
+
+// ── Stream disposal ────────────────────────────────────────────────────
+
+test "collectClosedStreams: marks a stream once both FINs have crossed" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.openBidiStream();
+    try testing.expectEqual(@as(u64, 1), sm.open_bidi_streams);
+
+    s.send.fin_sent = true;
+    s.recv.fin_received = true;
+
+    sm.needs_gc_scan = true;
+    sm.collectClosedStreams();
+
+    try testing.expect(s.closed_for_gc);
+    // Locally initiated, so the open count drops but nothing is consumed.
+    try testing.expectEqual(@as(u64, 0), sm.open_bidi_streams);
+    try testing.expectEqual(@as(u64, 0), sm.consumed_bidi_streams);
+}
+
+test "collectClosedStreams: keeps an unacked stream for PTO" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.openBidiStream();
+    try s.send.writeData("x" ** 1000);
+    s.send.send_offset = 1000;
+    s.send.fin_sent = true;
+    s.recv.fin_received = true;
+
+    sm.needs_gc_scan = true;
+    sm.collectClosedStreams();
+    sm.drainDisposalQueue();
+
+    try testing.expect(s.closed_for_gc);
+    try testing.expect(!s.isDisposable());
+    try testing.expect(sm.streams.get(s.stream_id) != null);
+}
+
+test "disposeIfSettled: reclaims a closed stream once the last byte is acked" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.openBidiStream();
+    const sid = s.stream_id;
+    try s.send.writeData("x" ** 100);
+    s.send.send_offset = 100;
+    s.send.fin_sent = true;
+    s.recv.fin_received = true;
+
+    sm.needs_gc_scan = true;
+    sm.collectClosedStreams();
+    try testing.expect(s.closed_for_gc);
+
+    // Before the ACK there is still data PTO could have to resend.
+    sm.disposeIfSettled(s);
+    sm.drainDisposalQueue();
+    try testing.expect(sm.streams.get(sid) != null);
+
+    try s.send.onAck(0, 100);
+    sm.disposeIfSettled(s);
+    sm.drainDisposalQueue();
+    try testing.expect(sm.streams.get(sid) == null);
+}
+
+test "disposeIfSettled: queues each stream once" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.openBidiStream();
+    s.send.fin_sent = true;
+    s.recv.fin_received = true;
+    s.closed_for_gc = true;
+
+    sm.disposeIfSettled(s);
+    sm.disposeIfSettled(s);
+    sm.disposeIfSettled(s);
+    try testing.expectEqual(@as(usize, 1), sm.disposal_count);
+}
+
+test "collectClosedStreams: picks up streams the disposal queue could not hold" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(1000, 1000);
+
+    // One more settled stream than the queue has room for.
+    const overflow = sm.disposal_queue.len + 1;
+    for (0..overflow) |_| {
+        const s = try sm.openBidiStream();
+        s.send.fin_sent = true;
+        s.recv.fin_received = true;
+    }
+
+    sm.needs_gc_scan = true;
+    sm.collectClosedStreams();
+    try testing.expectEqual(sm.disposal_queue.len, sm.disposal_count);
+
+    sm.drainDisposalQueue();
+    try testing.expectEqual(@as(usize, 1), sm.streams.count());
+    try testing.expect(sm.needs_gc_scan); // still work to do
+
+    // The straggler is reclaimed on the next scan rather than leaking.
+    sm.collectClosedStreams();
+    sm.drainDisposalQueue();
+    try testing.expectEqual(@as(usize, 0), sm.streams.count());
+}
+
+test "getOrCreateStream: a reclaimed stream is not resurrected by a retransmit" {
+    var sm = StreamsMap.init(testing.allocator, true); // server: peer bidi = 0, 4, 8
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.getOrCreateStream(0);
+    s.send.fin_sent = true;
+    s.recv.fin_received = true;
+    s.closed_for_gc = true;
+    sm.disposeIfSettled(s);
+    sm.drainDisposalQueue();
+    try testing.expect(sm.streams.get(0) == null);
+
+    try testing.expectError(error.StreamAlreadyClosed, sm.getOrCreateStream(0));
+
+    // An ID we have never seen is still a new stream, even out of order.
+    _ = try sm.getOrCreateStream(8);
+    _ = try sm.getOrCreateStream(4);
 }

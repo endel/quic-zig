@@ -1574,6 +1574,9 @@ pub const Connection = struct {
                         if (stream_mod.isBidi(sf.stream_id)) {
                             if (self.streams.getStream(sf.stream_id)) |s| {
                                 try s.send.onAck(sf.offset, sf.length);
+                                // The last ACK of a closed stream is the moment
+                                // it stops being needed for retransmission.
+                                self.streams.disposeIfSettled(s);
                             }
                         } else {
                             if (self.streams.send_streams.get(sf.stream_id)) |s| {
@@ -1707,6 +1710,9 @@ pub const Connection = struct {
                         if (stream_mod.isBidi(sf.stream_id)) {
                             if (self.streams.getStream(sf.stream_id)) |s| {
                                 try s.send.onAck(sf.offset, sf.length);
+                                // The last ACK of a closed stream is the moment
+                                // it stops being needed for retransmission.
+                                self.streams.disposeIfSettled(s);
                             }
                         } else {
                             if (self.streams.send_streams.get(sf.stream_id)) |s| {
@@ -1910,9 +1916,14 @@ pub const Connection = struct {
                 }
                 if (stream_mod.isBidi(s.stream_id)) {
                     // Bidirectional stream
-                    const strm = self.streams.getOrCreateStream(s.stream_id) catch |err| {
-                        std.log.err("Failed to get/create stream {}: {}", .{ s.stream_id, err });
-                        return;
+                    const strm = self.streams.getOrCreateStream(s.stream_id) catch |err| switch (err) {
+                        // Retransmission of data we acked before reclaiming the
+                        // stream. Nothing to deliver, and no error to raise.
+                        error.StreamAlreadyClosed => return,
+                        else => {
+                            std.log.err("Failed to get/create stream {}: {}", .{ s.stream_id, err });
+                            return;
+                        },
                     };
                     strm.recv.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
                         error.FinalSizeError => {
@@ -1927,13 +1938,7 @@ pub const Connection = struct {
                     if (s.fin and (strm.send.fin_sent or strm.send.reset_err != null) and !strm.closed_for_gc) {
                         strm.closed_for_gc = true;
                         self.streams.closeStream(s.stream_id);
-                        // Only dispose once all our send data has been ACKed. fin_sent
-                        // means we wrote the FIN once, not that the peer received it —
-                        // PTO may need to retransmit everything under loss, and can't
-                        // if the stream is removed from the map.
-                        if (strm.send.retransmit_count == 0 and !strm.send.hasUnackedData()) {
-                            self.streams.queueDisposal(s.stream_id);
-                        }
+                        self.streams.disposeIfSettled(strm);
                     }
                 } else {
                     // Unidirectional stream — route to recv_streams
