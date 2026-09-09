@@ -77,6 +77,10 @@ our packet protection either:
   selecting it.
 - Both endpoints' `keys.log` files carry byte-identical handshake traffic
   secrets.
+- The RFC 9001 Appendix A.5 known-answer vector now runs as a unit test
+  (`crypto.zig`) and passes byte-exact: key, IV, hp key, ku, nonce, AEAD
+  ciphertext, HP sample, HP mask and the final protected packet. Our ChaCha20
+  primitives and header protection are not the cause.
 - Re-implementing RFC 9001 §5.4.4 header protection and the AEAD in Python and
   running it over a whole capture decrypts 305 of 307 of our Handshake packets,
   and the plaintext parses cleanly: `ACK largest=1 first_range=0`, `CRYPTO

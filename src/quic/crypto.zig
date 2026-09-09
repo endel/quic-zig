@@ -1219,3 +1219,71 @@ test "RFC 9001 A.2: Client Initial packet protection" {
     // And contains the ClientHello
     try std.testing.expectEqualSlices(u8, client_hello[0..16], decrypted[4..20]);
 }
+
+// RFC 9001 Appendix A.5: ChaCha20-Poly1305 short header packet.
+// The only end-to-end known-answer vector for the ChaCha20 suite. Without it,
+// a self-consistent error in our ChaCha20 path passes every Zig↔Zig test and
+// only shows up as a peer silently dropping packets.
+test "RFC 9001 A.5: ChaCha20-Poly1305 short header packet" {
+    const secret = [_]u8{
+        0x9a, 0xc3, 0x12, 0xa7, 0xf8, 0x77, 0x46, 0x8e, 0xbe, 0x69, 0x42, 0x27, 0x48, 0xad, 0x00, 0xa1,
+        0x54, 0x43, 0xf1, 0x82, 0x03, 0xa0, 0x7d, 0x60, 0x60, 0xf6, 0x88, 0xf3, 0x0f, 0x21, 0x63, 0x2b,
+    };
+
+    // Keys, IV and header-protection key.
+    const key = deriveKeyPaddedV(secret, 32, protocol.QUIC_V1);
+    const hp = deriveHpKeyPaddedV(secret, 32, protocol.QUIC_V1);
+    const iv = hkdfExpandLabel(secret, "quic iv", "", nonce_len);
+
+    var expected_key: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_key, "c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8");
+    try std.testing.expectEqualSlices(u8, &expected_key, key[0..32]);
+
+    var expected_iv: [12]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_iv, "e0459b3474bdd0e44a41c144");
+    try std.testing.expectEqualSlices(u8, &expected_iv, &iv);
+
+    var expected_hp: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_hp, "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4");
+    try std.testing.expectEqualSlices(u8, &expected_hp, hp[0..32]);
+
+    var expected_ku: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_ku, "1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9");
+    try std.testing.expectEqualSlices(u8, &expected_ku, &deriveNextTrafficSecret(secret));
+
+    // Nonce for pn 654360564, unprotected header 4200bff4, payload 0x01.
+    const pn: u64 = 654360564;
+    var expected_nonce: [12]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_nonce, "e0459b3474bdd0e46d417eb0");
+    try std.testing.expectEqualSlices(u8, &expected_nonce, &makeNonce(iv, pn));
+
+    var seal = Seal{ .key = key, .hp_key = hp, .nonce = iv, .cipher_suite = .chacha20_poly1305_sha256 };
+    seal.prepareHpCtx();
+
+    var header: [4]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&header, "4200bff4");
+
+    var pkt: [21]u8 = undefined;
+    @memcpy(pkt[0..4], &header);
+    const written = seal.encryptPayload(pn, &header, &[_]u8{0x01}, pkt[4..]);
+    try std.testing.expectEqual(@as(usize, 17), written);
+
+    var expected_ct: [17]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_ct, "655e5cd55c41f69080575d7999c25a5bfb");
+    try std.testing.expectEqualSlices(u8, &expected_ct, pkt[4..]);
+
+    // Header protection: the sample starts one byte past the 3-byte pn.
+    var expected_sample: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_sample, "5e5cd55c41f69080575d7999c25a5bfb");
+    try std.testing.expectEqualSlices(u8, &expected_sample, pkt[5..21]);
+
+    var expected_mask: [5]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_mask, "aefefe7d03");
+    try std.testing.expectEqualSlices(u8, &expected_mask, &seal.newMask(pkt[5..21]));
+
+    seal.applyHeaderProtection(&pkt, 1, 3);
+
+    var expected_packet: [21]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_packet, "4cfe4189655e5cd55c41f69080575d7999c25a5bfb");
+    try std.testing.expectEqualSlices(u8, &expected_packet, &pkt);
+}

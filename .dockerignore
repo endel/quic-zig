@@ -8,3 +8,12 @@ interop/quiche
 interop/browser
 test_crypto.o
 SESSION.md
+interop/moq-rs
+interop/certs
+bench
+examples
+zig-pkg
+node_modules
+*.log
+*.o
+*.psd

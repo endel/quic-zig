@@ -11,18 +11,30 @@ RUN ZIG_ARCH=$(case "$TARGETARCH" in arm64) echo "aarch64";; *) echo "x86_64";; 
     ln -s /opt/zig-${ZIG_ARCH}-linux-0.16.0/zig /usr/local/bin/zig
 
 WORKDIR /src
-COPY . .
+
+# Manifest before sources, so editing a .zig file does not re-fetch the world.
+COPY build.zig build.zig.zon ./
 
 # Pre-fetch libxev dependency (curl works with Docker DNS; zig fetch sometimes doesn't)
-RUN mkdir -p /root/.cache/zig && \
+RUN --mount=type=cache,target=/root/.cache/zig,sharing=locked \
     curl -L -o /tmp/libxev.tar.gz https://github.com/mitchellh/libxev/archive/a82a04eabb46.tar.gz && \
     zig fetch --global-cache-dir /root/.cache/zig /tmp/libxev.tar.gz && \
     rm /tmp/libxev.tar.gz
 
+COPY src ./src
+COPY apps ./apps
+
 # Build interop binaries. `-j1` keeps peak RAM usage low (builds roll
 # through exe targets sequentially) so this works in tight CI/Docker
 # VMs — full parallel build of 25+ executables peaks around 12 GB.
-RUN zig build -Doptimize=ReleaseSafe --global-cache-dir /root/.cache/zig -j1
+#
+# Both Zig caches are BuildKit cache mounts, so a source change recompiles only
+# what it touched instead of paying the full ~25 min ReleaseSafe build. They
+# outlive the image, so `docker build --no-cache` still reuses them; add
+# `docker builder prune` to force a cold compile.
+RUN --mount=type=cache,target=/root/.cache/zig,sharing=locked \
+    --mount=type=cache,target=/src/.zig-cache,sharing=locked \
+    zig build -Doptimize=ReleaseSafe --global-cache-dir /root/.cache/zig -j1
 
 # Stage 2: Runtime image based on quic-network-simulator endpoint
 FROM martenseemann/quic-network-simulator-endpoint:latest
