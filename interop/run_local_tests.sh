@@ -1,6 +1,7 @@
 #!/bin/bash
 # Local interop test suite — tests event-loop-based Zig servers against Go/quiche
 set -e
+set +m  # no job-control chatter when the watchdog is killed
 
 cd "$(dirname "$0")/.."
 
@@ -29,11 +30,16 @@ GO_SERVER=./interop/quic-go/server_bin
 
 QUICHE_CLIENT=./interop/quiche/target/release/client
 QUICHE_SERVER=./interop/quiche/target/release/server
+QUICHE_H3_SERVER=./interop/quiche/target/release/h3server
+
+ZIG_QUIC_CLIENT=./zig-out/bin/quic-client
+ZIG_QUIC_SERVER=./zig-out/bin/quic-server
 
 CERT=interop/certs/server.crt
 KEY=interop/certs/server.key
 
 SERVER_PID=""
+CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-20}
 
 cleanup() {
     if [ -n "$SERVER_PID" ]; then
@@ -76,9 +82,19 @@ run_test() {
         return
     fi
 
-    # Run client
+    # Run client under a watchdog: some clients (wt-client) drain and then sit
+    # in the event loop forever, which would stall the whole suite.
+    local out_file
+    out_file=$(mktemp)
+    eval "$client_cmd" >"$out_file" 2>&1 &
+    local CLI_PID=$!
+    ( sleep "$CLIENT_TIMEOUT"; kill -9 $CLI_PID 2>/dev/null ) >/dev/null 2>&1 &
+    local WD_PID=$!
+    wait $CLI_PID 2>/dev/null || true
+    { kill $WD_PID; wait $WD_PID; } >/dev/null 2>&1 || true
     local output
-    output=$(eval "$client_cmd" 2>&1) || true
+    output=$(cat "$out_file")
+    rm -f "$out_file"
 
     # Stop server
     kill -9 $SERVER_PID 2>/dev/null || true
@@ -138,10 +154,25 @@ run_test "Go QUIC client → Go QUIC server (baseline)" \
 
 # --- quiche (Rust) raw QUIC echo tests ---
 
-run_test "quiche client → Go QUIC server" \
+run_test "quiche client → Go QUIC server (baseline)" \
     "$GO_SERVER --addr localhost:__PORT__ --cert $CERT --key $KEY --alpn hq-interop" \
     "$QUICHE_CLIENT --addr 127.0.0.1:__PORT__ --alpn hq-interop" \
     "received"
+
+run_test "quiche client → Zig QUIC server" \
+    "$ZIG_QUIC_SERVER --port __PORT__" \
+    "$QUICHE_CLIENT --addr 127.0.0.1:__PORT__ --alpn h3" \
+    "received 24 bytes"
+
+run_test "Zig QUIC client → quiche server" \
+    "$QUICHE_SERVER --addr 127.0.0.1:__PORT__ --cert $CERT --key $KEY --alpn h3" \
+    "$ZIG_QUIC_CLIENT --port __PORT__" \
+    "Echo:"
+
+run_test "Zig H3 client → quiche H3 server" \
+    "$QUICHE_H3_SERVER --addr 127.0.0.1:__PORT__ --cert $CERT --key $KEY" \
+    "$ZIG_CLIENT --port __PORT__" \
+    ":status: 200"
 
 # NOTE: Go client → quiche server has a known version negotiation issue
 # (quiche reports UnknownVersion). Skipped.
