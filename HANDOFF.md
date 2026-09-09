@@ -1,136 +1,141 @@
 # quic-zig — handover
 
-State at `1a0473e`, 30 commits ahead of `origin/main` (`b6f9eb6`), unpushed.
-540/540 unit tests, 431/431 fuzz smoke, 11/11 `tools/interop_local.sh`,
-9/9 `interop/run_local_tests.sh`, 64/88 on the docker matrix (12 fail,
-12 the peer does not implement). Full matrix in
-[`SPEC/interop-results.md`](SPEC/interop-results.md); what changed and why in
-[`CHANGELOG.md`](CHANGELOG.md).
+State at `8192e79`, unpushed. 572/572 unit tests, 448/448 fuzz smoke,
+11/11 `tools/interop_local.sh`, 9/9 `interop/run_local_tests.sh`.
+Docker matrix: see [`SPEC/interop-results.md`](SPEC/interop-results.md).
+What changed and why: [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Running things
 
     zig build test                 # repo needs Zig 0.16; zvm's default may be 0.15.2
     zig build                      # apps/ into zig-out/bin
+    zig build interop              # only the four binaries the interop image ships
     zig build fuzz
 
     tools/interop_local.sh         # 11 cases, quic-zig against itself, no docker
-    tools/interop_local.sh retry v2
     interop/run_local_tests.sh     # 9 cases against quic-go and quiche binaries
     tools/bench_local.sh           # single-stream throughput + handshake rate
 
-    interop/runner/matrix.sh                    # full docker matrix, both peers
-    interop/runner/matrix.sh quic-go handshake,transfer
-    interop/runner/report.py                    # renders the SPEC table
+    interop/runner/build_image.sh  # cross-compile + package, ~7 s
+    interop/runner/matrix.sh       # full docker matrix, both peers
+    interop/runner/report.py       # renders the SPEC table
 
 `matrix.sh` appends a verdict per case to `interop/runner/matrix-results.txt`
 and skips what is already there, so an interrupted run resumes. To re-run only
-the failures: `grep -v FAIL matrix-results.txt > tmp && mv tmp matrix-results.txt`
-and run it again. It needs `PYTHON=/opt/homebrew/bin/python3.12` (3.10+) and a
+the failures: `grep -v FAIL matrix-results.txt > tmp && mv tmp matrix-results.txt`.
+It needs `PYTHON=/opt/homebrew/bin/python3.12` (3.10+) and a
 `quic-zig-interop:latest` image.
 
-**The image rebuild is the bottleneck** — see task 6.
+## Read this before trusting a matrix result
+
+**Never build the interop image with a plain `docker build`.** The old
+Dockerfile compiled inside the `linux/amd64` builder stage, which on an
+Apple-silicon host runs the x86_64 Zig compiler under emulation — and the
+ReleaseSafe binaries it produced were wrong. The server's ECDSA
+CertificateVerify failed to verify in every peer (`tls: invalid signature by
+the server certificate`), so every case failed at the handshake and it looked
+exactly like a protocol regression. `interop/runner/build_image.sh`
+cross-compiles on the host instead; it is also 7 seconds rather than 25-30
+minutes, which is why interop fixes no longer have to be batched.
+
+Isolating that took a while, so here is the ten-second version for next time.
+Generate runner certs, then point a peer client at the image's binary directly:
+
+    cd interop/quic-interop-runner && ./certs.sh /tmp/rc 1
+    docker run --rm --platform linux/amd64 -d --name s -p 15730:443/udp \
+      -v /tmp/rc:/certs:ro -v /tmp/www:/www:ro \
+      -e CERTS=/certs -e WWW=/www -e TESTCASE=http3 -e PORT=443 \
+      --entrypoint /usr/local/bin/interop-server quic-zig-interop:latest
+    (cd interop/quic-go && ./h3client_bin --addr 127.0.0.1:15730)
+
+The matrix takes hours; that takes ten seconds and separates "our protocol is
+broken" from "our toolchain is broken". The same trick — swap in a binary built
+a different way with `-v` and `--entrypoint` — is what narrowed it: macOS
+Debug and ReleaseSafe both fine, container Debug fine, container ReleaseSafe
+broken, host-cross-compiled ReleaseSafe fine.
+
+**Anything measured on this machine before that fix is suspect**, including the
+"12 pre-existing failures, no regressions" line in the previous handover.
 
 ## What landed
 
-Merged `memory-and-bounds`; reworked and merged [#29](https://github.com/endel/quic-zig/pull/29).
-The headline is that no bidi stream was ever reclaimable: `hasUnackedData()`
-compared byte offsets against a FIN, which is not a byte, so any stream that had
-sent one counted as unacknowledged forever. Every PTO also walked every stream
-the connection had ever opened. Six further bugs came out of running the matrix
-— they are listed in the changelog; four of them flipped an interop case green.
+Eight of the nine items on the previous list. Details in the changelog; the
+parts worth knowing:
 
-Measured against the pre-merge tree: 8000 sequential H3 requests on one
-connection went 3192 → 3652 req/s with peak RSS growth 18.3 → 2.8 MB and live
-streams at the end 6364 → 6. Single-stream bulk throughput is unchanged (48
-order-balanced runs a side land within 1%, inside a ±5% per-run spread — an
-earlier two-run reading claiming −2% did not hold up).
-
-Not done, deliberately: **nothing is pushed, and PR #29 has no comment on it.**
+- Unidirectional receive streams are reclaimed now. The predicate could not be
+  `recv.finished`: that flips inside `read()`, which the protocol layer calls
+  itself, so at that instant WebTransport has the bytes but has not delivered
+  the FIN event and H3 has not yet noticed a peer closing a critical stream.
+  The consumer calls `StreamsMap.releaseRecvStream()` when it is genuinely
+  done. H3's control and QPACK streams are never released, which is the right
+  answer by construction rather than by special case. See
+  [`SPEC/RFC9000_3.md`](SPEC/RFC9000_3.md).
+- Two RESET_STREAM bugs came out of that. On a peer-initiated uni stream the
+  frame was ignored completely, so the final size never reached connection flow
+  control and the window stayed short by that much permanently. And a peer
+  whose STREAM frames were all lost announces the stream with the reset itself
+  (RFC 9000 §3.2) — we dropped the frame instead of opening the stream.
+- Send buffers release acknowledged data. Note the second condition in
+  `compactAcked`: discarding on a flat size threshold alone is quadratic
+  against an application that writes ahead, and cost two thirds of bulk
+  throughput (20.0 → 7.2 MB/s) before the amortised rule went in.
+- `event_loop.zig` was never in `test_all.zig`. Its eleven tests stopped
+  compiling during the 0.16 migration and nothing noticed for months. They pass
+  now and immediately found six leaks.
+- RFC 9001 Appendix A.5 runs as a unit test. It passes byte-exact, so the open
+  `chacha20` interop failure is **not** our ChaCha20 crypto or header
+  protection. Worth keeping in mind that A.2 (AES) was the only vector tested
+  before, and the RFC 7541 Huffman table bug got in exactly this way.
 
 ## Open, roughly in the order I would take them
 
-### 1. Uni receive streams are never reclaimed
-`StreamsMap.recv_streams` is only inserted into (`stream.zig:1045`) and removed
-in `drainDisposalQueue` and `deinit`; every `disposeIfSettled` call site works on
-a bidi `*Stream`, so nothing ever queues a uni ID. Same shape as the bug just
-fixed for bidi, still open. Credit accounting is fine — `closeStream` does run on
-uni FIN (`connection.zig:1957`) — it is the `ReceiveStream` and its `FrameSorter`
-that are retained for the connection's life. Matters most for MoQ, which puts
-objects on uni streams.
+### 1. `chacha20` — fails against both peers, unexplained
+Ruled out with evidence: cipher negotiation, the key schedule, our packet
+protection (a from-scratch RFC 9001 implementation decrypts 305 of 307 of our
+Handshake packets from a capture), and now the A.5 known-answer vector. The
+peer removes our header protection correctly — quiche logs the right packet
+number — and then fails the AEAD.
 
-The predicate has to differ: there is no send side to wait on, so the signal is
-`recv.finished` (the application has read past the FIN), not an ACK.
+The one lead left: quic-go records the dropped packet's header as
+`dcil: 0, scil: 0` where the wire carries 20 and 8. That is what you would see
+if it parsed at the wrong offset in a coalesced datagram, which would point at
+our long-header Length field rather than at crypto — and the chacha20 case
+changes the ClientHello size, so a size-dependent coalescing bug would show up
+here and nowhere else. Worth writing a parser that walks one of our datagrams
+by its Length fields, the way a peer does, before touching crypto again.
 
-### 2. `wt-client` never exits
-Completes the exchange, drains, logs "connection terminated after draining
-period", then sits in the event loop forever. Predates all of this work; it is
-why `interop/run_local_tests.sh` now runs every client under a 20 s watchdog.
-Worked around, never diagnosed. User-visible for anyone using the client API.
+### 2. `quic-zig<-quiche multiplexing` — stalls at 1986/1999
+Not stream credit: quiche logged MAX_STREAMS up to 2777 against the 1999 needed
+and never sent STREAMS_BLOCKED. Unexplained. `getScheduledStreams` schedules
+only one non-incremental stream per call at the minimum urgency (which is
+RFC 9218 behaviour), picked in hash-iteration order — worth ruling out before
+looking further.
 
-### 3. STREAMS_BLOCKED is answered with a limit that unblocks nothing
-`connection.zig:2046` replies with `max_incoming_bidi_streams` — the limit the
-peer is already sitting at. Granting the accumulated `consumed` credit instead
-would make the handler work, and would let the eager per-send MAX_STREAMS flush
-added in `getMaxStreamsUpdates` go back to batching. That flush currently emits
-one frame per closed stream at saturation instead of one per 25; harmless
-(~0.4 ms over a 2.2 s run) but it exists only because the blocked path is dead.
+### 3. Handshake retransmission under loss
+`quic-zig<-quiche handshakeloss` and `handshakecorruption`: quiche's client
+finishes 11 of 50 handshakes and hits its own overall timeout. A local harness
+now exists to poke at this without docker — a UDP relay that drops a fraction
+of datagrams in both directions. Under it our server averaged 1.50 s per
+handshake at 30 % loss against quiche's client, where quiche's *own* server
+averaged 4.43 s, so the local model does not reproduce whatever the simulator
+does. The scripts are in the session scratchpad, not committed; they were
+30 lines of Python and bash.
 
-### 4. Send buffers never reclaim acked bytes (TODO C4)
-`SendStream.write_buffer` holds an entire transfer for its duration, so one
-multi-GB stream holds multi-GB. With streams now reclaimed this is the last
-unbounded-memory path. `buf_base` + compaction.
+### 4. Review findings left on the table
+From an earlier `/simplify` pass, all sound: `createH3`/`createWt` constructor
+helpers (seven hand-rolled copies across the event loop and apps);
+`qpack_scratch` as a `poll()` parameter rather than a shared-or-owned field;
+a `dispose_observer` on `StreamsMap` so the "protocol layer drains before QUIC"
+ordering cannot be got wrong at five call sites; `initCommonInto` for
+`initClientInto`/`initServerInto`, which share ~30 identical lines and have
+already drifted once; deriving `DynamicTable.size` from `used`/`count`.
 
-### 5. Handshake retransmission is slow under loss
-50 handshakes at 30% loss run ~2.7 s each; quiche's client finishes 11 and hits
-its own timeout, which is what `quic-zig<-quiche handshakeloss` and
-`handshakecorruption` fail on. The connection it is on when time runs out is
-healthy. quic-go's client passes the same case, so we are simply slower off the
-mark than quiche waits for. Pre-existing — the pre-merge image fails identically.
-
-### 6. The interop image has no build cache
-`interop/runner/Dockerfile` does `COPY . .` before `zig build`, so any source
-change invalidates everything after it and you pay the full `-j1` ReleaseSafe
-compile: 25–30 minutes, four times in one session. A BuildKit cache mount on the
-Zig cache directories would make it incremental. Do this before the next round of
-interop fixes. Note `-j1` is deliberate — a parallel build peaks around 12 GB and
-the machine OOM'd during this session even at `-j1` with other work alongside.
-
-### 7. `chacha20` — fails against both peers, unexplained
-The one open failure I could not close. Ruled out, with evidence in
-`SPEC/interop-results.md`: cipher negotiation (pcap shows only `0x1303` offered
-and selected), the key schedule (both endpoints' keylogs are byte-identical), and
-our packet protection — a from-scratch RFC 9001 §5.4.4 implementation decrypts
-305 of 307 of our Handshake packets from the capture, and the plaintext parses
-cleanly.
-
-quiche removes our header protection (it logs the right packet numbers) and then
-drops the packet; quic-go reports `payload_decrypt_error` and records the dropped
-header as `dcil: 0, scil: 0` where the wire carries 20 and 8. That last detail is
-the only lead — it would put the packet-number offset nine bytes early. Next step
-is a peer build with header parsing traced, not more changes to our crypto.
-
-### 8. `quic-zig<-quiche multiplexing` — stalls at 1986/1999
-Not stream credit: quiche logged MAX_STREAMS up to 2777 against the 1999 needed,
-and never sent STREAMS_BLOCKED. Pre-existing. Unexplained.
-
-### 9. `MEMORY.md` is over its size limit
-312 lines against a 200-line cap, so only part of it loads each session. The Zig
-0.15.2 API notes and the test counts are stale. Worth pruning to the index it is
-meant to be.
-
-## Review findings left on the table
-
-From a `/simplify` pass, all sound, all bigger than that pass warranted:
-`createH3`/`createWt` constructor helpers (seven hand-rolled copies across the
-event loop and apps); `qpack_scratch` as a `poll()` parameter rather than a
-shared-or-owned field with a lazy fallback; a `dispose_observer` on `StreamsMap`
-so the "protocol layer drains before QUIC" ordering cannot be got wrong at five
-call sites; `initCommonInto` for `initClientInto`/`initServerInto`, which share
-~30 identical lines and already drifted once; deriving `DynamicTable.size` from
-`used`/`count` instead of maintaining both.
-
-Also: the uni half of `getMaxStreamsUpdates` has no early flush, because there is
-no `highest_peer_uni_stream_id` to write the condition against.
+### 5. Smaller things
+- The plain-QUIC uni loop in `event_loop.zig` reads `rs.finished` right after
+  `rs.read()` returned data, where it is always false; the following branch
+  delivers the FIN. Harmless, but the first branch reads as if it does something.
+- `Server.init` reads the cert with an 8192-byte cap. A longer chain fails to
+  load rather than truncating, but the limit is arbitrary.
 
 ## Environment notes
 
@@ -141,13 +146,13 @@ no `highest_peer_uni_stream_id` to write the condition against.
   docker-compose, testcase.py). `matrix.sh` registers `quic-zig` idempotently.
 - `tools/interop_local.sh` excludes `connectionmigration`: the manual server
   advertises a preferred address on its own port and listens on one socket, so
-  the client migrates to an address nothing is reading. `interop-server`, used by
-  the docker image, uses a second socket and does exercise it.
+  the client migrates to an address nothing is reading. `interop-server`, used
+  by the docker image, uses a second socket and does exercise it.
 
 ## The ESP32 branch
 
 `esp32-s3` is abandoned. If it is revisited, the thing worth knowing is that
-Zig's C backend produced three separate silent miscompiles on Xtensa (u128 struct
-alignment vs. ZIG_TARGET_MAX_INT_ALIGNMENT, uintptr_t vs uint32_t in helper
-signatures, and an Ed25519 keypair corruption reproduced in
+Zig's C backend produced three separate silent miscompiles on Xtensa (u128
+struct alignment vs. ZIG_TARGET_MAX_INT_ALIGNMENT, uintptr_t vs uint32_t in
+helper signatures, and an Ed25519 keypair corruption reproduced in
 `qz_diag_ed25519_minimal`). Everything else there was ordinary porting.
