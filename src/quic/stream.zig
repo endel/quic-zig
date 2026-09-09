@@ -1353,49 +1353,44 @@ pub const StreamsMap = struct {
         uni: ?u64 = null,
     };
 
+    /// Hand the peer the credit that closed streams have earned, ignoring the
+    /// batching threshold. Returns the new limit, or null when there is none
+    /// to give. This is what answers STREAMS_BLOCKED.
+    pub fn flushMaxStreams(self: *StreamsMap, comptime bidi: bool) ?u64 {
+        const max_incoming = if (bidi) &self.max_incoming_bidi_streams else &self.max_incoming_uni_streams;
+        const consumed = if (bidi) &self.consumed_bidi_streams else &self.consumed_uni_streams;
+        const last_sent = if (bidi) &self.last_sent_max_bidi else &self.last_sent_max_uni;
+
+        if (max_incoming.* == 0 or consumed.* == 0) return null;
+        const new_max = last_sent.* + consumed.*;
+        if (new_max <= last_sent.*) return null;
+        last_sent.* = new_max;
+        max_incoming.* = new_max;
+        consumed.* = 0;
+        return new_max;
+    }
+
+    /// Whether the sliding window is due for a grant on its own initiative.
+    /// Batching by a fixed fraction of the initial limit leaves the last
+    /// partial batch ungranted, so a peer sitting at the limit gets it early.
+    /// IDs go 0,4,8..., so id/4 counts them for either role.
+    fn maxStreamsDue(self: *const StreamsMap, comptime bidi: bool) bool {
+        const consumed = if (bidi) self.consumed_bidi_streams else self.consumed_uni_streams;
+        if (consumed == 0) return false;
+
+        const initial = if (bidi) self.initial_max_incoming_bidi else self.initial_max_incoming_uni;
+        if (consumed >= @max(initial / 4, 1)) return true;
+
+        const highest = if (bidi) self.highest_peer_bidi_stream_id else self.highest_peer_uni_stream_id;
+        const max_incoming = if (bidi) self.max_incoming_bidi_streams else self.max_incoming_uni_streams;
+        return if (highest) |id| (id / 4) + 1 >= max_incoming else false;
+    }
+
     pub fn getMaxStreamsUpdates(self: *StreamsMap) MaxStreamsUpdate {
-        var result = MaxStreamsUpdate{};
-
-        // Use fixed threshold based on initial limit (not growing max_incoming).
-        // This prevents the threshold from outgrowing batch sizes and stalling.
-        if (self.max_incoming_bidi_streams > 0) {
-            const threshold = @max(self.initial_max_incoming_bidi / 4, 1);
-            // Batching by threshold leaves the last partial batch ungranted: a
-            // peer that stops short of it waits forever for credit it will
-            // never be offered. Flush early once it has opened everything we
-            // allowed. IDs go 0,4,8..., so id/4 counts them for either role.
-            const peer_at_limit = if (self.highest_peer_bidi_stream_id) |id|
-                (id / 4) + 1 >= self.max_incoming_bidi_streams
-            else
-                false;
-            if (self.consumed_bidi_streams >= threshold or
-                (peer_at_limit and self.consumed_bidi_streams > 0))
-            {
-                const new_max = self.last_sent_max_bidi + self.consumed_bidi_streams;
-                if (new_max > self.last_sent_max_bidi) {
-                    result.bidi = new_max;
-                    self.last_sent_max_bidi = new_max;
-                    self.max_incoming_bidi_streams = new_max;
-                    self.consumed_bidi_streams = 0;
-                }
-            }
-        }
-
-        // Uni: same fixed-threshold sliding window
-        if (self.max_incoming_uni_streams > 0) {
-            const threshold = @max(self.initial_max_incoming_uni / 4, 1);
-            if (self.consumed_uni_streams >= threshold) {
-                const new_max = self.last_sent_max_uni + self.consumed_uni_streams;
-                if (new_max > self.last_sent_max_uni) {
-                    result.uni = new_max;
-                    self.last_sent_max_uni = new_max;
-                    self.max_incoming_uni_streams = new_max;
-                    self.consumed_uni_streams = 0;
-                }
-            }
-        }
-
-        return result;
+        return .{
+            .bidi = if (self.maxStreamsDue(true)) self.flushMaxStreams(true) else null,
+            .uni = if (self.maxStreamsDue(false)) self.flushMaxStreams(false) else null,
+        };
     }
 };
 
@@ -2661,4 +2656,20 @@ test "drainDisposalQueue: an overflowed release is picked up on the next drain" 
     sm.drainDisposalQueue(); // clears the queue, re-queues the overflow
     sm.drainDisposalQueue();
     try testing.expectEqual(@as(usize, 0), sm.recv_streams.count());
+}
+
+test "StreamsMap: the uni window also grants its remainder at the limit" {
+    var sm = StreamsMap.init(testing.allocator, true); // server: peer uni = 2,6,10...
+    defer sm.deinit();
+    sm.setMaxIncomingStreams(8, 8);
+
+    // The peer opens every uni stream we allowed.
+    _ = try sm.getOrCreateRecvStream(2 + 7 * 4);
+    try testing.expectEqual(@as(?u64, 30), sm.highest_peer_uni_stream_id);
+
+    // One finishes — far below the 8/4 = 2 threshold, but the peer is stuck.
+    sm.consumed_uni_streams = 1;
+    const upd = sm.getMaxStreamsUpdates();
+    try testing.expectEqual(@as(?u64, 9), upd.uni);
+    try testing.expect(sm.getMaxStreamsUpdates().uni == null);
 }

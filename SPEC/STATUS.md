@@ -21,7 +21,7 @@
 | 4.3 | Flow Control Performance | ✅ Done | Auto-tuning prevents stalls |
 | 4.4 | Handling Stream Cancellation | ✅ Done | RESET_STREAM/STOP_SENDING, final_size validation, conn flow ctrl accounting |
 | 4.5 | Stream Final Size | ✅ Done | FIN/RESET_STREAM final_size validation, FINAL_SIZE_ERROR on mismatch |
-| 4.6 | Controlling Concurrency | ✅ Done | MAX_STREAMS + STREAMS_BLOCKED; the last partial batch is granted once the peer is at the limit |
+| 4.6 | Controlling Concurrency | ✅ Done | MAX_STREAMS + STREAMS_BLOCKED; blocked peers are granted accumulated credit, and the last partial batch is granted once the peer is at the limit (bidi and uni) |
 | **5** | **Connections** | | |
 | 5.1 | Connection ID | ✅ Done | LocalCidPool + ConnectionIdPool |
 | 5.1.1 | Issuing Connection IDs | ✅ Done | NEW_CONNECTION_ID with stateless reset tokens |

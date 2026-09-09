@@ -2078,8 +2078,13 @@ pub const Connection = struct {
                     self.closeWithTransportError(@intFromEnum(TransportError.stream_limit_error), @intFromEnum(FrameType.streams_blocked_bidi), "STREAMS_BLOCKED_BIDI exceeds 2^60");
                     return error.ProtocolViolation;
                 }
-                // Peer is blocked — respond with our current MAX_STREAMS limit
-                if (self.streams.max_incoming_bidi_streams > 0) {
+                // RFC 9000 §4.6: the peer wants streams it has no credit for.
+                // Echoing the limit it is already sitting at unblocks nothing —
+                // grant what its closed streams have earned. With nothing to
+                // grant, our last MAX_STREAMS was probably lost, so resend it.
+                if (self.streams.flushMaxStreams(true)) |new_max| {
+                    self.pending_frames.push(.{ .max_streams_bidi = new_max });
+                } else if (val < self.streams.max_incoming_bidi_streams) {
                     self.pending_frames.push(.{ .max_streams_bidi = self.streams.max_incoming_bidi_streams });
                 }
             },
@@ -2089,8 +2094,10 @@ pub const Connection = struct {
                     self.closeWithTransportError(@intFromEnum(TransportError.stream_limit_error), @intFromEnum(FrameType.streams_blocked_uni), "STREAMS_BLOCKED_UNI exceeds 2^60");
                     return error.ProtocolViolation;
                 }
-                // Peer is blocked — respond with our current MAX_STREAMS limit
-                if (self.streams.max_incoming_uni_streams > 0) {
+                // Same as the bidi case above.
+                if (self.streams.flushMaxStreams(false)) |new_max| {
+                    self.pending_frames.push(.{ .max_streams_uni = new_max });
+                } else if (val < self.streams.max_incoming_uni_streams) {
                     self.pending_frames.push(.{ .max_streams_uni = self.streams.max_incoming_uni_streams });
                 }
             },
@@ -5418,4 +5425,48 @@ test "a uni STREAM retransmit after reclamation is dropped, not resurrected" {
     try conn.processFrame(&fin_frame, .application, 0);
     try std.testing.expect(conn.streams.recv_streams.get(2) == null);
     try std.testing.expectEqual(@as(u64, 1), conn.streams.consumed_uni_streams);
+}
+
+test "STREAMS_BLOCKED is answered with credit the peer does not already have" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(4, 4);
+
+    // The peer opens all four streams we allowed and closes three of them.
+    var id: u64 = 0;
+    while (id < 16) : (id += 4) _ = try conn.streams.getOrCreateStream(id);
+    conn.streams.consumed_bidi_streams = 3;
+
+    try conn.processFrame(&.{ .streams_blocked_bidi = 4 }, .application, 0);
+
+    const frame = conn.pending_frames.pop().?;
+    // Echoing 4 — the limit it is already at — would leave it blocked.
+    try std.testing.expectEqual(@as(u64, 7), frame.max_streams_bidi);
+    try std.testing.expectEqual(@as(u64, 7), conn.streams.max_incoming_bidi_streams);
+    try std.testing.expectEqual(@as(u64, 0), conn.streams.consumed_bidi_streams);
+}
+
+test "STREAMS_BLOCKED below our limit resends it, and grants nothing twice" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(4, 4);
+
+    // A stale view of the limit: our MAX_STREAMS was lost in flight.
+    conn.streams.max_incoming_bidi_streams = 9;
+    try conn.processFrame(&.{ .streams_blocked_bidi = 4 }, .application, 0);
+    try std.testing.expectEqual(@as(u64, 9), conn.pending_frames.pop().?.max_streams_bidi);
+
+    // At the real limit with no closed streams there is nothing to give.
+    try conn.processFrame(&.{ .streams_blocked_bidi = 9 }, .application, 0);
+    try std.testing.expect(conn.pending_frames.pop() == null);
+}
+
+test "STREAMS_BLOCKED on uni streams grants uni credit" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(4, 4);
+    conn.streams.consumed_uni_streams = 2;
+
+    try conn.processFrame(&.{ .streams_blocked_uni = 4 }, .application, 0);
+    try std.testing.expectEqual(@as(u64, 6), conn.pending_frames.pop().?.max_streams_uni);
 }
