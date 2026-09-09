@@ -3613,7 +3613,19 @@ pub const Connection = struct {
                             break;
                         }
                     }
-                    if (has_stream_in_flight) {
+                    // A PTO in a handshake space must produce an ack-eliciting
+                    // probe even with nothing to resend (RFC 9002 §6.2.4).
+                    // Sending nothing leaves last_ack_eliciting_sent_time — what
+                    // the deadline is measured from — where it was, so the
+                    // deadline stays expired and the PTO re-fires on every tick
+                    // without ever probing: 22365 fires in 10 s of
+                    // handshakecorruption. Letting the app space stay quiet is
+                    // deliberate, so that a delivered connection can idle out.
+                    const in_handshake_space = if (self.pkt_handler.getPtoSpace()) |sp|
+                        sp != .application
+                    else
+                        false;
+                    if (in_handshake_space or has_stream_in_flight) {
                         self.pending_frames.push(.{ .ping = {} });
                     }
                     self.idle_pto_count += 1;
@@ -5521,4 +5533,28 @@ test "RESET_STREAM beyond MAX_STREAMS is a protocol violation" {
         .error_code = 3,
         .final_size = 10,
     } }, .application, 0));
+}
+
+test "a handshake-space PTO with nothing to resend still probes" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    const now: i64 = @intCast(sys.nanoTimestamp());
+    conn.state = .connected;
+    conn.handshake_confirmed = false;
+    conn.last_packet_received_time = now;
+    conn.last_packet_sent_time = now;
+
+    // Initial space: an ack-eliciting packet went out long ago and was acked,
+    // so nothing is in flight and there is nothing queued to resend.
+    const initial = &conn.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.initial)];
+    initial.last_ack_eliciting_sent_time = now - 10 * std.time.ns_per_s;
+
+    try conn.onTimeout();
+
+    // Without a probe, last_ack_eliciting_sent_time never moves, the deadline
+    // stays expired, and this fires again on every tick forever.
+    const f = conn.pending_frames.pop();
+    try std.testing.expect(f != null);
+    try std.testing.expect(f.? == .ping);
 }
