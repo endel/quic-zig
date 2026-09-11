@@ -9,3 +9,8 @@ interop/runner/matrix-logs
 interop/runner/matrix-results.txt
 node_modules
 interop/browser/certs
+
+# Session handover notes: rewritten wholesale every session, so tracking it
+# put a large diff in history for something no build or test reads. The
+# durable record lives in SPEC/, CHANGELOG.md and TODO.md.
+HANDOFF.md

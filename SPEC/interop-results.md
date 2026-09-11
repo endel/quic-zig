@@ -71,8 +71,19 @@ The binaries under test must be cross-compiled by
 the `linux/amd64` builder stage on an Apple-silicon host runs the x86_64 Zig
 compiler under emulation, and its ReleaseSafe output has a broken ECDSA signing
 path: every peer rejects the server's CertificateVerify and every case in the
-matrix fails at the handshake. It reads exactly like a protocol regression. See
-`HANDOFF.md` for the ten-second way to tell the two apart.
+matrix fails at the handshake. It reads exactly like a protocol regression.
+
+Ten seconds separates the two, where the matrix takes hours — run the image's
+own binary against a peer client directly:
+
+    cd interop/quic-interop-runner && ./certs.sh /tmp/rc 1
+    docker run --rm --platform linux/amd64 -d --name s -p 15730:443/udp \
+      -v /tmp/rc:/certs:ro -v /tmp/www:/www:ro \
+      -e CERTS=/certs -e WWW=/www -e TESTCASE=http3 -e PORT=443 \
+      --entrypoint /usr/local/bin/interop-server quic-zig-interop:latest
+    (cd interop/quic-go && ./h3client_bin --addr 127.0.0.1:15730)
+
+If that handshake fails, the toolchain is the suspect, not the protocol.
 
 ## What the remaining failures are
 
