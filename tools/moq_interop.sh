@@ -114,11 +114,9 @@ mkdir -p "$(dirname "$OUT")"
 # by hand — the runner-harness results and what they mean — so carry it over
 # rather than overwriting the analysis with a fresh table.
 KEEP_MARK='<!-- Everything below is written by hand; the generator keeps it. -->'
-if [ -f "$OUT" ] && grep -qF "$KEEP_MARK" "$OUT"; then
-  sed -n "/$(printf '%s' "$KEEP_MARK" | sed 's/[][\/.*^$]/\\&/g')/,\$p" "$OUT" > "$TMP/keep.md"
-else
-  printf '%s\n' "$KEEP_MARK" > "$TMP/keep.md"
-fi
+# awk compares the whole line literally, so the marker needs no escaping.
+awk -v mark="$KEEP_MARK" '$0 == mark { keep = 1 } keep' "$OUT" 2>/dev/null > "$TMP/keep.md"
+[ -s "$TMP/keep.md" ] || printf '%s\n' "$KEEP_MARK" > "$TMP/keep.md"
 { echo; cat "$TMP/keep.md"; } >> "$TMP/out.md"
 cp "$TMP/out.md" "$OUT"
 echo "wrote $OUT" >&2

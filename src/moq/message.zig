@@ -170,6 +170,9 @@ pub const ParamType = struct {
 
 pub const ParamShape = enum { varint, uint8, location, length_prefixed };
 
+/// Normative, not a convenience: §10.2 makes an unknown parameter type a
+/// session-fatal error, so a type listed in ParamType without a shape here
+/// ends every session that sends it. Add both or neither.
 pub fn paramShape(t: u64) ?ParamShape {
     return switch (t) {
         ParamType.DELIVERY_TIMEOUT,
@@ -794,7 +797,7 @@ pub fn decodeFetch(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Dr
     const parsed = try readParams(&fbs, &params);
     if (findParam(parsed, ParamType.SUBSCRIBER_PRIORITY)) |v| f.subscriber_priority = v.uint8;
     if (findParam(parsed, ParamType.GROUP_ORDER)) |v| {
-        f.group_order = track.GroupOrder.fromInt(v.uint8) orelse return Error.MalformedMessage;
+        f.group_order = track.GroupOrder.fromInt(v.uint8) orelse return Error.ProtocolViolation;
     }
     return f;
 }

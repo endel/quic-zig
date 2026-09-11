@@ -20,7 +20,10 @@ pub const MSG_PUBLISH_NAMESPACE: u64 = 0x06;
 pub const MSG_NAMESPACE: u64 = 0x08;
 pub const MSG_NAMESPACE_DONE: u64 = 0x0E;
 /// draft-17 only. draft-18 moved it to 0x50 and split off SUBSCRIBE_TRACKS,
-/// so use `subscribeNamespaceCode(draft)` rather than this constant.
+/// so a writer takes the code from `version.Rules.of(draft)
+/// .subscribe_namespace_code` rather than from this constant. A reader that
+/// serves both drafts accepts either, and the negotiated draft decides how
+/// the body is laid out.
 pub const MSG_SUBSCRIBE_NAMESPACE: u64 = 0x11;
 pub const MSG_SUBSCRIBE_NAMESPACE_18: u64 = 0x50;
 /// draft-18 (§10.19): SUBSCRIBE_NAMESPACE yields NAMESPACE/NAMESPACE_DONE,

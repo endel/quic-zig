@@ -281,6 +281,63 @@ pub fn tupleEncodedLen(parts: []const []const u8) usize {
     return n;
 }
 
+// A namespace tuple flattened to one comparable key, "a/b/c/". The trailing
+// separator is what makes a prefix test a tuple-boundary test: "moq/" matches
+// "moq/demo/" and not "moqtail/". Relays key their tables on this, so the
+// convention and its inverse live here rather than in each of them.
+pub fn flattenNamespace(parts: []const []const u8, buf: []u8) usize {
+    var off: usize = 0;
+    for (parts) |part| {
+        if (off + part.len + 1 > buf.len) break;
+        @memcpy(buf[off .. off + part.len], part);
+        off += part.len;
+        buf[off] = '/';
+        off += 1;
+    }
+    return off;
+}
+
+// The inverse: parts alias `flat`, so it must outlive the result. Empty
+// segments are dropped, which makes a flattened key and a re-flattened one
+// compare equal.
+pub fn splitNamespace(flat: []const u8, out: [][]const u8) [][]const u8 {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, flat, '/');
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        if (n == out.len) break;
+        out[n] = part;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "a namespace flattens to a key and splits back" {
+    const parts = [_][]const u8{ "moq-test", "interop" };
+    var buf: [64]u8 = undefined;
+    const flat = buf[0..flattenNamespace(&parts, &buf)];
+    try testing.expectEqualStrings("moq-test/interop/", flat);
+
+    var out: [MAX_TUPLE_PARTS][]const u8 = undefined;
+    const back = splitNamespace(flat, &out);
+    try testing.expectEqual(@as(usize, 2), back.len);
+    try testing.expectEqualStrings("moq-test", back[0]);
+    try testing.expectEqualStrings("interop", back[1]);
+
+    // The trailing separator keeps a prefix test on tuple boundaries.
+    var pbuf: [64]u8 = undefined;
+    const prefix = pbuf[0..flattenNamespace(&[_][]const u8{"moq-test"}, &pbuf)];
+    try testing.expect(std.mem.startsWith(u8, flat, prefix));
+    var obuf: [64]u8 = undefined;
+    const other = obuf[0..flattenNamespace(&[_][]const u8{"moq-tested"}, &obuf)];
+    try testing.expect(!std.mem.startsWith(u8, other, prefix));
+
+    // A suffix cut from the key splits into the tuple parts past the prefix.
+    const suffix = splitNamespace(flat[prefix.len..], &out);
+    try testing.expectEqual(@as(usize, 1), suffix.len);
+    try testing.expectEqualStrings("interop", suffix[0]);
+}
+
 // Round-trip tests.
 test "varint round-trip at each length boundary" {
     const cases = [_]u64{
