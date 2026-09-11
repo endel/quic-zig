@@ -25,6 +25,12 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   Initial carrying a token of ~500 bytes or more overflowed the buffer the
   associated data is built in; and a QPACK integer with a long enough
   continuation run overflowed its accumulator, which any HTTP/3 peer can send.
+- A peer's QPACK encoder stream could corrupt our dynamic table. `Duplicate`
+  and `Insert With Name Reference` both name an entry the table already holds,
+  and inserting the copy can evict the original first — so the insert read
+  from the bytes it was overwriting. The visible effect is one header's value
+  filed under another header's name, which for a proxy means attributing a
+  request field it was never sent.
 - QPACK header encoding wrote past the end of its output buffer when the
   headers did not fit. The size check only covered the first byte of each one.
 - Rejecting a peer's packet no longer logs at error level. An unsupported QUIC

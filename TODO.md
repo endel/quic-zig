@@ -171,14 +171,22 @@ spec, so the consequence is recorded alongside the fix.
 
   Fixed: the same shape now covers the QUIC packet headers, frames, transport
   parameters, HTTP/3 frames, QPACK, Huffman and capsules, plus a connection
-  fed a stream of datagrams — `handleDatagram` being the whole pipeline. Four
-  remote aborts fell out in the first hour, three of them pre-handshake: a
-  QPACK integer whose continuation run overflows its accumulator, a packet
-  Length below the packet number length (reads gigabytes past the datagram),
-  one below the 16-byte AEAD tag, and an Initial token past the 512-byte
-  buffer the associated data is built in. `SWEEP_ITERATIONS` is what
+  fed a stream of datagrams — `handleDatagram` being the whole pipeline. Five
+  bugs a peer can reach fell out, four of them aborts and three of those
+  pre-handshake: a QPACK integer whose continuation run overflows its
+  accumulator, a packet Length below the packet number length (reads gigabytes
+  past the datagram), one below the 16-byte AEAD tag, an Initial token past
+  the 512-byte buffer the associated data is built in, and a QPACK `Duplicate`
+  reading the arena it was writing to. `SWEEP_ITERATIONS` is what
   `zig build fuzz` can afford; raise it locally when touching a parser, the
   seeds are fixed so a longer run is a superset.
+
+  Worth knowing if you extend these: a sweep is only as good as its reach.
+  The transport-parameter and QPACK sweeps looked fine and were decoding
+  nothing — 53 and 244 successes per 50k — because a seeded message was handed
+  over with the rest of the random buffer trailing it, and neither format is
+  self-delimiting. Count what gets past the first length check before trusting
+  a sweep.
 
   Still open underneath: `-ffuzz` itself, which would replace all of this
   with coverage-guided input. Recheck on the next Zig release.

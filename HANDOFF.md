@@ -8,9 +8,9 @@ sessions, both unpushed:
   to the draft-17 control messages, and a moq-lite implementation.
 - `core-followups` — the core problems that work turned up (Tier 5 in
   [`TODO.md`](TODO.md), all four closed), and the certificate handling they
-  led to. Eight bugs a peer could reach: four remote aborts found by the new
-  randomized sweeps, a QPACK out-of-bounds write, and the three that together
-  meant no TLS certificate could ever be verified.
+  led to. Nine bugs a peer could reach: five found by the new randomized
+  sweeps, a QPACK out-of-bounds write, and the three that together meant no
+  TLS certificate could ever be verified.
 
     zig build test                    # green
     zig build fuzz                    # green
@@ -323,10 +323,12 @@ later. All four are fixed, and the second one found four more bugs on its own:
 - 23 of 26 fuzz targets never saw a random byte, because `-ffuzz` does not
   compile on Zig 0.16.0. The fixed-seed sweep pattern now covers the QUIC and
   HTTP/3 parsers too, and a connection fed a stream of datagrams. It found
-  four remote aborts, three of them reachable before the handshake completes:
-  a QPACK integer that overflows its accumulator, a packet Length below the
-  packet number length, one below the AEAD tag, and an Initial token past the
-  buffer the associated data is built in.
+  five bugs a peer can reach — four aborts, three of those before the
+  handshake completes: a QPACK integer that overflows its accumulator, a
+  packet Length below the packet number length, one below the AEAD tag, an
+  Initial token past the buffer the associated data is built in, and a QPACK
+  `Duplicate` that read the arena it was writing to, which in a release build
+  is silent table corruption rather than a crash.
 - `Client` was one connection per loop. `ClientConfig.loop` joins an existing
   one; the socket stays per-connection, which is the right shape for a client.
 - A TLS server advertising several ALPN protocols echoed its own first choice
