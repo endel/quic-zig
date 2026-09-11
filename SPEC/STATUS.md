@@ -571,7 +571,7 @@ details, and [moq-interop.md](moq-interop.md) for the interop runner.
 | Datagram objects, relayed with alias remapping | ✅ Done |
 | FETCH request/response runtime | ⚠ Codec only |
 | draft-18, alongside draft-17 | ✅ Done — chosen by ALPN, per peer |
-| Interop: our relay, both drafts | ✅ 7/7 each |
+| Interop: both relays, both drafts | ✅ 7/7 each |
 | Interop: moq-relay v0.14.16 (both transports, both drafts) | ⚠ 6/7 — their non-standard error code |
 | Interop: cdn.moq.dev | ❌ Blocked at TLS (no HelloRetryRequest) |
 

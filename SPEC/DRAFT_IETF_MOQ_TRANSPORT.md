@@ -188,8 +188,9 @@ Invalid datagram types: `0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F` (STATUS
 | Object framing (`src/moq/object.zig`) | subgroup headers (all id-modes and priority variants), datagram objects, fetch stream headers |
 | Session (`src/moq/session.zig`) | SETUP + request-stream state machine, generic over the transport; reassembles split messages and drains coalesced ones |
 | Publisher / Subscriber | `moq-client` subscribes or `--mode publish`; `moq-server` publishes |
-| Relay (`moq-relay`) | pub/sub fanout with alias remapping, namespace registry, rendezvous timeouts, PUBLISH_DONE on publisher loss |
-| Browser (WebTransport) | `moq-browser-server` + `interop/browser/moq.html`, with WT application-protocol negotiation |
+| Relay (`moq-relay`, raw QUIC) | pub/sub fanout with alias remapping, namespace registry, rendezvous timeouts, PUBLISH_DONE on publisher loss |
+| Relay (`moq-browser-server`, WebTransport) | the same, plus a per-track group cache and WT application-protocol negotiation |
+| Browser | `interop/browser/moq.html` and `moq_video.html`, driven end to end by `tools/moq_browser_test.mjs` |
 | Interop test client | `moq-test-client`, 7 cases, TAP 14, containerised |
 | Datagram objects | done — `moq-client --mode publish --datagrams`, relayed with alias remapping |
 | FETCH | codec done; no runtime request/response flow |
@@ -206,13 +207,14 @@ table at all. Older builds held the subscription open and never answered.
 
 | Scenario | Result |
 | --- | --- |
-| `moq-test-client` → our relay, draft-17 and draft-18 | 7/7 each |
+| `moq-test-client` → our raw-QUIC relay, both drafts | 7/7 each |
+| `moq-test-client` → our WebTransport relay, both drafts | 7/7 each |
 | `moq-test-client` → moq-relay v0.14.16, raw QUIC, both drafts | 6/7 each |
 | `moq-test-client` → moq-relay v0.14.16, WebTransport, both drafts | 6/7 each |
 | `moq-test-client` → `cdn.moq.dev` | blocked at TLS: no HelloRetryRequest |
 | Zig pub → Zig relay → Zig sub (raw QUIC) | ✅ |
 | Datagram objects, pub → relay → sub (raw QUIC) | ✅ both drafts |
-| Browser ↔ Zig WT relay (clock, live video) | ✅ |
+| Browser → Zig WT relay → browser (live video) | ✅ 81 frames published, 51 decoded |
 
 ## Where draft-18 differs
 

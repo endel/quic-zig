@@ -10,7 +10,8 @@ implementation.
     tools/interop_local.sh      # 11/11
     interop/run_local_tests.sh  # 9/9
     interop/runner/matrix.sh    # 64/88, identical to the previous run
-    tools/moq_local.sh          # 9/9, MoQ end-to-end against our own binaries
+    tools/moq_local.sh          # 11/11, MoQ end-to-end against our own binaries
+    node tools/moq_browser_test.mjs   # the video demo, through Chrome
     tools/moq_interop.sh        # MoQ, both drafts: 7/7 ours, 6/7 moq-relay
     node tools/moq_lite_browser_test.mjs          # moq-lite in Chrome
     RELAY=1 node tools/moq_lite_browser_test.mjs  # ... through our relay
@@ -214,6 +215,27 @@ reason. With that wired, MoQ datagram objects (§10.3.1) work end to end:
 `moq-client --mode publish --datagrams`, relayed to each subscriber with
 the alias rewritten as for subgroup streams.
 
+### Both relays, and a close that never left
+
+The WebTransport relay had none of the namespace work the raw-QUIC one
+got, and never negotiated a MoQ version, so it read the draft-17 demo
+pages as draft-18. Both now pass all seven interop cases at both drafts,
+which is what a relay entry in the runner would need — its compose file
+defaults to `https://relay:4443`.
+
+The browser pages carried the same encoder drift the Zig side did:
+`buildPublish` was missing its request id, delta and parameter count.
+They are a second implementation of the draft and drifted the same way,
+which is the argument for `tools/moq_browser_test.mjs` — it drives the
+video demo end to end through Chrome's fake camera.
+
+Underneath that: a client queued its CONNECTION_CLOSE and never flushed
+it, so it left with the process and every peer held the session for its
+full idle timeout — half a minute of a relay's capacity per test. A suite
+exhausted the relay's client table long before that expired, and the
+symptom was "no SETUP from peer" three tests later on an unrelated
+connection. `Client.stop()` queues; `Client.flush()` sends.
+
 ### Smaller, but worth knowing
 
 - **Offer only the version you implement.** The WebTransport CONNECT
@@ -261,10 +283,10 @@ fail identically at TLS with `error.UnexpectedMessage`, before any MoQ.
 Cloudflare's edge asks for HRR and `src/quic/tls13.zig` has no notion of
 it. This blocks every public MoQ relay, and probably more than MoQ.
 
-**e. A relay image for the runner.** `apps/moq_relay.zig` is raw-QUIC only
-and the runner's compose defaults to `https://relay:4443`. The relay's 7/7
-is over QUIC; the WebTransport relay (`moq_browser_server.zig`) has had
-none of the conformance work.
+**e. A relay image for the runner.** Both relays pass 7/7 at both drafts
+now, so this is packaging rather than protocol: a Dockerfile following
+`interop/moq-runner/`, honouring `MOQT_ROLE`/`MOQT_PORT`/`/certs`/`/mlog`,
+and a `roles.relay` entry alongside the client one.
 
 ### Carried over
 
