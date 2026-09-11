@@ -5,10 +5,17 @@ test client for <https://github.com/englishm/moq-interop-runner>, a
 substantial correction to the draft-17 control messages, and a moq-lite
 implementation.
 
-    zig build test      # all green
-    zig build fuzz      # all green
-    tools/moq_interop.sh
-    interop/runner/matrix.sh    # the QUIC regression gate; see below
+    zig build test      # green
+    zig build fuzz      # green
+    tools/interop_local.sh      # 11/11
+    interop/run_local_tests.sh  # 9/9
+    interop/runner/matrix.sh    # 64/88, identical to the previous run
+    tools/moq_interop.sh        # MoQ: 7/7 against ours, 6/7 against moq-relay
+
+The docker matrix landed one case away from the baseline on the first
+pass — `quiche<-quic-zig handshakecorruption` — and passed on a re-run, so
+64/88 with the same verdicts case for case. That case is flaky under this
+peer, which the corruption notes below already say.
 
 What changed and why: [`CHANGELOG.md`](CHANGELOG.md). MoQ specifics:
 [`SPEC/moq-interop.md`](SPEC/moq-interop.md),
@@ -168,8 +175,23 @@ Only lite-05 is implemented and the ALPN offer says so; lite-04 has no
 Setup or Track stream, no ANNOUNCE_OK and a different SUBSCRIBE_OK body.
 There is no moq-lite relay yet.
 
+### Datagrams
+
+A `.quic` handler could not receive a QUIC datagram at all — the zero-copy
+callback was installed only on the WebTransport path and `pollQuicEvents`
+never drained the queue; `sendDatagram` was WebTransport-only for the same
+reason. With that wired, MoQ datagram objects (§10.3.1) work end to end:
+`moq-client --mode publish --datagrams`, relayed to each subscriber with
+the alias rewritten as for subgroup streams.
+
 ### Smaller, but worth knowing
 
+- **Offer only the version you implement.** The WebTransport CONNECT
+  advertised `moqt-18` next to `moqt-17`; the current moq-relay speaks up
+  to draft-21, picks 18, and then every message is the wrong shape. The
+  connection succeeds and only the MoQ on top of it goes quiet, which
+  looks like anything but a version mismatch. Raw QUIC was fine because
+  its ALPN carried one token. moq-lite had the same bug.
 - `decodeSubscribe`/`decodePublish` returned a slice-of-slices into their
   own stack frame. Every relay SUBSCRIBE took that path.
 - A peer's GroupOrder byte outside 0x00-0x02 reached `@enumFromInt` in four
