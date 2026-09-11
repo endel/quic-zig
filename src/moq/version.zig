@@ -57,8 +57,11 @@ pub const Rules = struct {
     subscribe_namespace_code: u64,
     /// draft-18 answers PUBLISH with REQUEST_OK instead.
     publish_ok_is_own_message: bool,
-    /// draft-17 only: SUBSCRIBE_NAMESPACE carries a Subscribe Options varint.
+    /// draft-17 only: SUBSCRIBE_NAMESPACE carries a Subscribe Options
+    /// varint, because one message covered both roles.
     subscribe_namespace_options: bool,
+    /// draft-18 split the other role out into its own message.
+    has_subscribe_tracks: bool,
     /// draft-18 only: SUBGROUP_HEADER bit 0x40.
     subgroup_first_object_bit: bool,
 
@@ -69,6 +72,7 @@ pub const Rules = struct {
                 .subscribe_namespace_code = 0x11,
                 .publish_ok_is_own_message = true,
                 .subscribe_namespace_options = true,
+                .has_subscribe_tracks = false,
                 .subgroup_first_object_bit = false,
             },
             .draft_18 => .{
@@ -76,6 +80,7 @@ pub const Rules = struct {
                 .subscribe_namespace_code = 0x50,
                 .publish_ok_is_own_message = false,
                 .subscribe_namespace_options = false,
+                .has_subscribe_tracks = true,
                 .subgroup_first_object_bit = true,
             },
         };
@@ -110,6 +115,8 @@ test "the rules table says where the drafts differ" {
     try testing.expect(!r18.publish_ok_is_own_message);
     try testing.expect(!r17.subgroup_first_object_bit);
     try testing.expect(r18.subgroup_first_object_bit);
+    try testing.expect(!r17.has_subscribe_tracks);
+    try testing.expect(r18.has_subscribe_tracks);
 }
 
 test "alpn round-trips through the draft table" {

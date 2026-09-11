@@ -936,7 +936,7 @@ pub fn writeSubscribeNamespace(writer: anytype, s: SubscribeNamespace, draft: ve
 /// draft-18 §10.19 only. SUBSCRIBE_NAMESPACE yields NAMESPACE/NAMESPACE_DONE
 /// there; this is the half that yields PUBLISH.
 pub fn writeSubscribeTracks(writer: anytype, s: SubscribeNamespace, draft: version.Draft) !void {
-    if (version.Rules.of(draft).subscribe_namespace_options) return Error.UnknownMessageType;
+    if (!version.Rules.of(draft).has_subscribe_tracks) return Error.UnknownMessageType;
     return writeSubscribeNamespaceLike(writer, codes.MSG_SUBSCRIBE_TRACKS, s, draft);
 }
 
