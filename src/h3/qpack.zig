@@ -335,20 +335,33 @@ pub const DynamicTable = struct {
     }
 
     /// Insert a new entry, evicting oldest-first to make room.
+    ///
+    /// `name` and `value` may point into this table's own arena: the encoder
+    /// stream's Duplicate and Insert With Name Reference both name an entry
+    /// already in it (RFC 9204 4.3.4, 4.3.2). So they are staged out before
+    /// anything moves — otherwise the copy below either overlaps its source,
+    /// or reads from where `compact()` has just moved the entry away from,
+    /// which puts one peer-chosen entry's bytes under another's name.
     pub fn insert(self: *DynamicTable, name: []const u8, value: []const u8) !void {
         const entry_size = computeEntrySize(name, value);
         if (entry_size > self.capacity) return error.EntryTooLarge;
+
+        const content = name.len + value.len;
+        if (content > MAX_CAPACITY) return error.EntryTooLarge;
+
+        var staged: [MAX_CAPACITY]u8 = undefined;
+        @memcpy(staged[0..name.len], name);
+        @memcpy(staged[name.len..][0..value.len], value);
 
         while (self.size + entry_size > self.capacity and self.count > 0) {
             self.evict();
         }
 
-        const content = name.len + value.len;
         if (self.used + content > MAX_CAPACITY) self.compact();
 
         const off: u32 = @intCast(self.used);
-        @memcpy(self.arena[off..][0..name.len], name);
-        @memcpy(self.arena[off + name.len ..][0..value.len], value);
+        if (off + content > self.arena.len) return error.EntryTooLarge;
+        @memcpy(self.arena[off..][0..content], staged[0..content]);
 
         // Before insert_count moves — headIndex() is derived from it.
         self.descs[self.headIndex()] = .{
@@ -1661,4 +1674,40 @@ test "DynamicTable: capacity beyond the arena is clamped, not trusted" {
         dt.insert("n", "v") catch break;
         try testing.expect(dt.count <= DynamicTable.MAX_CAPACITY / 32);
     }
+}
+
+test "an encoder-stream Duplicate copies an entry out of the arena it writes to" {
+    // RFC 9204 4.3.4: Duplicate names an entry the table already holds, so
+    // insert() is handed a slice of the arena it is about to write into. Here
+    // the duplicate does not fit alongside the original, so inserting it
+    // evicts the original first — and the arena offset resets to where the
+    // bytes being read from live. Source and destination are then the same
+    // address, which is an aliasing @memcpy and, once compaction is in play,
+    // one entry's bytes filed under another's name.
+    var dec = QpackDecoder{};
+    dec.setCapacity(4096);
+
+    // Set Dynamic Table Capacity (001XXXXX, 5-bit prefix) to 41 — exactly one
+    // "name"/"value" entry, 9 bytes of content plus the RFC's 32 of overhead.
+    try dec.processEncoderInstruction(&[_]u8{ 0x20 | 31, 10 });
+    try testing.expectEqual(@as(usize, 41), dec.dynamic.capacity);
+
+    // Insert With Literal Name: 01H0NNNN, 5-bit name length, then a string.
+    try dec.processEncoderInstruction(&[_]u8{
+        0x40 | 4, 'n', 'a', 'm', 'e',
+        5,        'v', 'a', 'l', 'u', 'e',
+    });
+    try testing.expectEqual(@as(usize, 1), dec.dynamic.count);
+
+    // Duplicate the entry, repeatedly — each one evicts the one it copies.
+    for (0..4) |i| {
+        const idx: u8 = @intCast(i);
+        try dec.processEncoderInstruction(&[_]u8{idx});
+
+        const newest = dec.dynamic.get(dec.dynamic.insert_count - 1) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("name", newest.name);
+        try testing.expectEqualStrings("value", newest.value);
+    }
+    try testing.expectEqual(@as(u64, 5), dec.dynamic.insert_count);
 }
