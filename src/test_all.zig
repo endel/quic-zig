@@ -36,5 +36,6 @@ test {
     _ = @import("moq/message.zig");
     _ = @import("moq/version.zig");
     _ = @import("moq/url.zig");
+    _ = @import("moq/session.zig");
     _ = @import("event_loop.zig");
 }

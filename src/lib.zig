@@ -27,4 +27,5 @@ pub const moq = struct {
     pub const track = @import("moq/track.zig");
     pub const version = @import("moq/version.zig");
     pub const url = @import("moq/url.zig");
+    pub const session = @import("moq/session.zig");
 };
