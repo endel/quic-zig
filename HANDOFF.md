@@ -1,7 +1,6 @@
 # quic-zig — handover
 
-Branch `core-followups`, unpushed, on top of `moq-interop-and-lite`. Two
-sessions, both unpushed:
+Merged to `main` and pushed. Two sessions' work:
 
 - `moq-interop-and-lite` — MoQ: an interop test client for
   <https://github.com/englishm/moq-interop-runner>, a substantial correction
@@ -135,9 +134,8 @@ the way the runner expects — `RELAY_URL`/`TESTCASE`/`TLS_DISABLE_VERIFY`/
 inside the container. `tools/moq_interop.sh` runs a relay list and writes
 [`SPEC/moq-interop-results.md`](SPEC/moq-interop-results.md).
 
-Registering it is not done and is your call: it means publishing an image
-to GHCR and a PR against someone else's repo. The entry is written out in
-`SPEC/moq-interop.md`.
+Registering it is your call: the images publish themselves, so what is left
+is a PR against someone else's repo. See `SPEC/moq-interop.md`.
 
 ### draft-17 control messages were wrong, and the client is how we found out
 
@@ -278,13 +276,18 @@ connection. `Client.stop()` queues; `Client.flush()` sends.
 
 ### MoQ, from this session
 
-**a. Register with the interop runner.** Needs your go-ahead: `docker
-push` to GHCR under your account, and a PR against
-`englishm/moq-interop-runner`. Everything else is done — client and relay
-images both build from `interop/moq-runner/build_image.sh` and pass 7/7
-against each other on a compose-style network, and the registration entry
-is written out in `interop/moq-runner/implementations-entry.json` with
-`OWNER` left to fill in.
+**a. Register with the interop runner.** All that is left is the PR against
+`englishm/moq-interop-runner`, which is yours to open. The client and relay
+images publish to GHCR on every push to `main`
+(`.github/workflows/docker.yml`), both are public, and the pair pulled from
+GHCR passes 7/7 against each other on a compose-style network with
+certificates generated the way the runner's own `generate-certs.sh` does.
+The entry to send is `interop/moq-runner/implementations-entry.json`.
+
+Note the relay needs an **ECDSA P-256** key: we sign with P-256 or Ed25519
+and have no RSA path, so an RSA `priv.key` fails at startup with
+`error.DecodeError`. The runner generates P-256, so this only bites on
+certificates of your own.
 
 **b. The draft-18 corners that were skipped.** The relaxed varint,
 `REQUEST_ERROR`'s `Redirect`, `REQUEST_OK`'s Track Properties,
