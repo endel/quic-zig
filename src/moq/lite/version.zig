@@ -41,8 +41,13 @@ pub const Version = enum(u8) {
 /// ALPN itself. Offered by peers we do not negotiate with.
 pub const ALPN_LEGACY: []const u8 = "moql";
 
-/// Newest first, so a peer that speaks several picks the newest we share.
-pub const PREFERRED: []const Version = &.{ .lite_05, .lite_04, .lite_03 };
+/// What we offer. Only lite-05 is implemented — lite-04 has no Setup or
+/// Track stream, no ANNOUNCE_OK and a different SUBSCRIBE_OK body — so
+/// offering the older ALPNs would negotiate a version we cannot speak.
+pub const PREFERRED: []const Version = &.{.lite_05};
+
+/// Every version this module can name, implemented or not.
+pub const ALL: []const Version = &.{ .lite_05, .lite_04, .lite_03 };
 
 pub const DEFAULT: Version = .lite_05;
 
@@ -66,10 +71,20 @@ test "legacy codes match the reference implementation" {
     try testing.expectEqual(@as(u64, 0xff0dad05), Version.lite_05.code());
 }
 
-test "alpn offer is newest first" {
+test "the offer names only what is implemented" {
     var buf: [4][]const u8 = undefined;
     const offer = alpnOffer(PREFERRED, &buf);
+    try testing.expectEqual(@as(usize, 1), offer.len);
+    try testing.expectEqualStrings("moq-lite-05", offer[0]);
+}
+
+test "alpn offer is newest first and clamps to the buffer" {
+    var buf: [4][]const u8 = undefined;
+    const offer = alpnOffer(ALL, &buf);
     try testing.expectEqual(@as(usize, 3), offer.len);
     try testing.expectEqualStrings("moq-lite-05", offer[0]);
     try testing.expectEqualStrings("moq-lite-03", offer[2]);
+
+    var small: [1][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), alpnOffer(ALL, &small).len);
 }
