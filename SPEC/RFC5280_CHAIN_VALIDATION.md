@@ -7,7 +7,11 @@
 #### Chain Validation (via `std.crypto.Certificate`)
 - **Signature verification**: Each certificate's signature is verified against its issuer's public key
 - **Issuer/subject name matching**: Verified automatically by `Parsed.verify()`
-- **Time validity**: Not-before/not-after checked against current time
+- **Time validity**: Not-before/not-after checked against `sys.realtimeSeconds()`.
+  Until Sept 2026 this read `sys.nanoTimestamp()`, which is `CLOCK_MONOTONIC`
+  — its zero is the last boot, so every real certificate came back
+  `CertificateNotYetValid` and nothing here could ever succeed. See
+  [`../TODO.md`](../TODO.md) I2b.
 - **Hostname verification**: Leaf cert checked against SNI via `verifyHostName()` (supports wildcards, SAN)
 - **Trust anchor verification**: Last cert in chain verified against `Certificate.Bundle` (CA trust store)
 
@@ -17,8 +21,16 @@
 - **Key Usage (§4.2.1.3)**: If keyUsage extension is present on an issuer cert, `keyCertSign` bit must be set
 
 #### System Root CAs
-- `loadSystemCaBundle()` helper wraps `Certificate.Bundle.rescan()` for OS-native roots
-- Supports macOS (Keychain), Linux (`/etc/ssl/certs/`), Windows (CertStore), FreeBSD, OpenBSD, etc.
+- `src/quic/ca_bundle.zig`: `loadSystem()` for the OS store, `loadFile()` for a
+  PEM bundle of your own. Zig 0.16 moved certificate loading behind `Io`, and
+  this module is where that `Io` is built and torn down so it stays out of the
+  library's signatures (the same call `src/sys.zig` documents).
+- Supports macOS (Keychain), Linux (`/etc/ssl/certs/`), FreeBSD, OpenBSD, etc.
+- Event-loop clients ask for it with `ClientConfig.ca` = `.system` or
+  `.{ .file = path }`; either turns `skip_cert_verify` off. Each client loads
+  its own copy — about 13 ms for the 163 certificates in the macOS store — so
+  a process making many short-lived clients should build one bundle and pass
+  it through `tls_config`.
 
 ### Configuration
 
@@ -41,8 +53,23 @@ const tls_config = TlsConfig{
 - **Policy Constraints** — RFC 5280 §4.2.1.11
 - **Mandatory ca_bundle enforcement** — When `skip_cert_verify=false` and no `ca_bundle` is provided, the chain's self-signed root is accepted without trust anchor verification
 
+#### Client certificates
+- A server's `CertificateRequest` (RFC 8446 §4.3.2) is answered with an empty
+  `Certificate` and no `CertificateVerify` (§4.4.2). We never offer one.
+  Refusing to answer used to end the handshake, which is what made every
+  Cloudflare edge — `cdn.moq.dev` among them — unreachable.
+- We never send a `CertificateRequest` of our own.
+
 ### Caveats
 
 - `skip_cert_verify` defaults to `true` for backward compatibility
 - V1 certificates (no extensions) are accepted as CAs when no basicConstraints is present — this matches common practice but is less strict than RFC 5280's recommendation
-- The interop client always uses `skip_cert_verify=true` since interop test peers use various self-signed certs
+- The interop client always uses `skip_cert_verify=true` since interop test
+  peers use various self-signed certs. The MoQ interop image's
+  `TLS_DISABLE_VERIFY` defaults to `1` for the same reason.
+
+### Verified against
+
+`cdn.moq.dev` (Cloudflare, ECDSA chain) over both raw QUIC and WebTransport
+with `ClientConfig.ca = .system`, and our own `interop/certs/ca.crt` with
+`.file`. Sept 2026.
