@@ -11,6 +11,10 @@ Merged to `main` and pushed. Two sessions' work:
   sweeps, a QPACK out-of-bounds write, and the three that together meant no
   TLS certificate could ever be verified.
 
+**If you are here for the interop PR, read "a. Register with the interop
+runner" below first.** It is blocked on two open relay bugs, not on the
+paperwork, and the reproduction has three traps in it.
+
     zig build test                    # green
     zig build fuzz                    # green
     tools/interop_local.sh            # 11/11
@@ -276,18 +280,114 @@ connection. `Client.stop()` queues; `Client.flush()` sends.
 
 ### MoQ, from this session
 
-**a. Register with the interop runner.** All that is left is the PR against
-`englishm/moq-interop-runner`, which is yours to open. The client and relay
-images publish to GHCR on every push to `main`
-(`.github/workflows/docker.yml`), both are public, and the pair pulled from
-GHCR passes 7/7 against each other on a compose-style network with
-certificates generated the way the runner's own `generate-certs.sh` does.
-The entry to send is `interop/moq-runner/implementations-entry.json`.
+**a. Register with the interop runner — blocked on three things.** The
+registration itself is ready; what is not ready is the implementation behind
+it. Full numbers and reproductions in
+[`SPEC/moq-interop-results.md`](SPEC/moq-interop-results.md).
 
-Note the relay needs an **ECDSA P-256** key: we sign with P-256 or Ed25519
-and have no RSA path, so an RSA `priv.key` fails at startup with
-`error.DecodeError`. The runner generates P-256, so this only bites on
-certificates of your own.
+Done, do not redo:
+
+- The entry validates. `./validate-registration.sh --impl quic-zig` in their
+  repo reports all checks passed — schema, test plan, both images resolve.
+- Both images publish to GHCR on every push to `main`
+  (`.github/workflows/docker.yml`), are public, and pull anonymously.
+- Client against the eight public relays: 6/15 pairings, three of them 7/7 on
+  both transports (moq-rs-draft-18, moqt-nr, moxygen).
+- Relay against third-party clients: moq-rs 8/9, moxygen 5/6 — but see B3,
+  one of those moxygen passes is not real.
+
+**The blockers.** All three relay-side bugs share one property: *our own
+client cannot see any of them*, because it agrees with whatever we emit. This
+is the same trap [`draft-17 control messages were wrong`](#draft-17-control-messages-were-wrong-and-the-client-is-how-we-found-out)
+describes, hit a second time. Do not treat `tools/moq_local.sh` being green as
+evidence about any of this.
+
+- **B1. A subscriber cannot read what we forward.** `publish-track-subscribe`
+  times out. The relay forwards (`stream from client 2 -> 1 subs`) and caches
+  the right bytes, but moq-rs's WebTransport layer says `failed to read
+  capsule: UnexpectedEnd` and the subscriber never gets a payload. Something
+  in what we write on a forwarded uni stream is wrong in a way only a peer
+  that is not us can tell. Start with a capture of the stream we open to the
+  subscriber versus what moq-rs's own relay writes for the same case.
+
+- **B2. We cannot decode moxygen's SUBSCRIBE.** `REQUEST_ERROR -> client:
+  code=18 malformed subscribe`, so `announce-subscribe` fails. We reach Meta's
+  *relay* 7/7 on both transports, so it is specific to what their client puts
+  on the wire — likely an optional field or parameter ours never sends. The
+  tractable one: capture their SUBSCRIBE and diff it against
+  `writeSubscribe` in `src/moq/message.zig`.
+
+- **B3. That bug also inflates our score.** moxygen's `subscribe-error`
+  passes because we answer with an error — but for the wrong reason. Their
+  log says it: *"Subscribe correctly returned error: malformed subscribe"*.
+  Fixing B2 will turn a green into a red before it turns it green again.
+  moxygen is 4/6 honestly, not 5/6.
+
+**Not a bug, but a decision.** `rendezvous-timeout` accounts for eight of our
+nine client-side failures. The spec
+([TEST-CASES.md](https://github.com/englishm/moq-interop-runner/blob/main/docs/tests/TEST-CASES.md))
+says `REQUEST_ERROR` with code `TIMEOUT`; five of the eight relays answer
+`DOES_NOT_EXIST` (0x10) or `404`. We are right and most of the ecosystem is
+not. Our own relay answers `TIMEOUT` and moq-rs's client agrees with us. Do
+not quietly relax our check to reach 14/15 — raise it with the maintainers;
+no issue is open about it as of 2026-09-11.
+
+**Also worth doing before submitting.** The MoQ image defaults
+`TLS_DISABLE_VERIFY=1` (`interop/moq-runner/Dockerfile`). That was a
+misjudgement: the harness sets the value explicitly on both paths (`1` for
+its compose relay, `false` for remotes), so the default only affects manual
+runs, where skipping verification silently is the wrong way round. Revert it
+to `0` to match their Makefile.
+
+### Reproducing any of it
+
+Not obvious, and three things will waste your afternoon if you miss them.
+
+```bash
+git clone --depth 1 https://github.com/englishm/moq-interop-runner.git
+cd moq-interop-runner
+
+# 1. Add our entry under .implementations
+python3 - <<'EOF'
+import json, collections
+entry = json.load(open('/path/to/quic-zig/interop/moq-runner/implementations-entry.json'))
+entry.pop('_comment', None)
+d = json.load(open('implementations.json'), object_pairs_hook=collections.OrderedDict)
+d['implementations']['quic-zig'] = entry['quic-zig']
+json.dump(d, open('implementations.json', 'w'), indent=2)
+EOF
+
+# 2. Certificates. NOT ./generate-certs.sh on macOS — LibreSSL 3.3.6 emits
+#    explicit EC parameters for their invocation and rustls rejects those, so
+#    every pairing fails with "invalid peer certificate" and it looks like our
+#    bug. OpenSSL 3 (their CI) emits a named curve. Force it:
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -pkeyopt ec_param_enc:named_curve -keyout certs/priv.key \
+    -out certs/cert.pem -days 10 -nodes -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,DNS:relay,DNS:moq-relay,IP:127.0.0.1"
+chmod 644 certs/*
+
+# 3. Pull the client images first. The harness checks for images that are
+#    already local, not ones that are pullable, and silently skips 13 pairs.
+docker pull ghcr.io/englishm/moq-interop-runner-moq-test-client-draft-18:latest
+docker pull ghcr.io/facebookexperimental/moxygen-interop-client:latest-amd64
+
+./run-interop-tests.sh --relay quic-zig --docker-only   # them -> our relay
+./run-interop-tests.sh --client quic-zig --remote-only  # our client -> public relays
+```
+
+To test a relay change, rebuild with `interop/moq-runner/build_image.sh` and
+point the entry's `roles.relay.docker.image` at `quic-zig-moq-relay:latest`
+so the harness uses the local tag instead of pulling. Per-case TAP and the
+relay's own stderr land in `results/<timestamp>/*.log` — the relay lines are
+what tell you whether it forwarded, cached or replayed.
+
+The relay needs an **ECDSA P-256** key. We sign with P-256 or Ed25519 and
+have no RSA path, so an RSA `priv.key` fails at startup with
+`error.DecodeError`.
+
+Worth sending upstream separately: their `generate-certs.sh` is not portable
+to macOS for the reason in step 2.
 
 **b. The draft-18 corners that were skipped.** The relaxed varint,
 `REQUEST_ERROR`'s `Redirect`, `REQUEST_OK`'s Track Properties,
