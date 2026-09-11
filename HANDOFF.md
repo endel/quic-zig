@@ -24,11 +24,14 @@ sessions, both unpushed:
     node tools/moq_lite_browser_test.mjs          # moq-lite in Chrome
     RELAY=1 node tools/moq_lite_browser_test.mjs  # ... through our relay
 
-The docker matrix ran twice over this work and came back 64/88 both times,
-with no case differing from the baseline. (One case,
-`quiche<-quic-zig handshakecorruption`, failed on one pass and passed on a
-re-run; it is flaky under that peer, which the corruption notes below
-already say.)
+The docker matrix has run four times over these two branches and come back
+64/88 every time, with no case differing from the baseline — including a full
+pass on the `core-followups` work, which touched packet decryption, QPACK and
+the TLS client. (One case, `quiche<-quic-zig handshakecorruption`, failed on
+one pass and passed on a re-run; it is flaky under that peer, which the
+corruption notes below already say. A `longrtt` run once came back ERROR
+rather than a verdict, which is the harness losing its result under CPU
+contention, not a protocol failure.)
 
 MoQ interop, both drafts: 7/7 against our raw-QUIC relay, 7/7 against our
 WebTransport relay, 5/7 against `moq-relay` v0.14.16 — the two it misses
