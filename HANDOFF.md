@@ -5,21 +5,26 @@ test client for <https://github.com/englishm/moq-interop-runner>, a
 substantial correction to the draft-17 control messages, and a moq-lite
 implementation.
 
-    zig build test      # green
-    zig build fuzz      # green
-    tools/interop_local.sh      # 11/11
-    interop/run_local_tests.sh  # 9/9
-    interop/runner/matrix.sh    # 64/88, identical to the previous run
-    tools/moq_local.sh          # 11/11, MoQ end-to-end against our own binaries
+    zig build test                    # green
+    zig build fuzz                    # green
+    tools/interop_local.sh            # 11/11
+    interop/run_local_tests.sh        # 9/9
+    interop/runner/matrix.sh          # 64/88, verdict for verdict as before
+    tools/moq_local.sh                # 11/11, MoQ end to end, our binaries
+    tools/moq_interop.sh              # MoQ vs peers, both drafts
     node tools/moq_browser_test.mjs   # the video demo, through Chrome
-    tools/moq_interop.sh        # MoQ, both drafts: 7/7 ours, 6/7 moq-relay
     node tools/moq_lite_browser_test.mjs          # moq-lite in Chrome
     RELAY=1 node tools/moq_lite_browser_test.mjs  # ... through our relay
 
-The docker matrix landed one case away from the baseline on the first
-pass — `quiche<-quic-zig handshakecorruption` — and passed on a re-run, so
-64/88 with the same verdicts case for case. That case is flaky under this
-peer, which the corruption notes below already say.
+The docker matrix ran twice over this work and came back 64/88 both times,
+with no case differing from the baseline. (One case,
+`quiche<-quic-zig handshakecorruption`, failed on one pass and passed on a
+re-run; it is flaky under that peer, which the corruption notes below
+already say.)
+
+MoQ interop, both drafts: 7/7 against our raw-QUIC relay, 7/7 against our
+WebTransport relay, 5/7 against `moq-relay` v0.14.16 — the two it misses
+are its own, written up in `SPEC/moq-interop.md`.
 
 What changed and why: [`CHANGELOG.md`](CHANGELOG.md). MoQ specifics:
 [`SPEC/moq-interop.md`](SPEC/moq-interop.md),
