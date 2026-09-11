@@ -28,10 +28,12 @@ const wire = @import("wire.zig");
 const msg = @import("message.zig");
 const version = @import("version.zig");
 
-pub const MAX_STREAMS: usize = 64;
-/// Enough for any control message we exchange. Group payloads do not pass
-/// through it.
-pub const CONTROL_BUF_SIZE: usize = 8 * 1024;
+pub const MAX_STREAMS: usize = 32;
+/// Enough for any control message we exchange — they carry paths and track
+/// names, not media. Group payloads never pass through it, so this bounds
+/// a session at MAX_STREAMS * CONTROL_BUF_SIZE, which a server multiplies
+/// by its client count. Keep it small enough to sit in one allocation.
+pub const CONTROL_BUF_SIZE: usize = 2 * 1024;
 
 const NO_STREAM: u64 = std.math.maxInt(u64);
 
@@ -398,6 +400,19 @@ pub fn Session(comptime Transport: type) type {
                         }
                         s.consume(fbs.seek);
                     },
+                    // Once a group stream's header is read the rest is
+                    // payload, not messages: hand over whatever is still
+                    // buffered and let onStreamData forward the rest.
+                    .group_in => {
+                        if (s.len == 0) break;
+                        out[n] = .{ .group_data = .{ .stream_id = stream_id, .data = s.slice() } };
+                        n += 1;
+                        // The slice aliases the buffer, so it has to be
+                        // consumed by the caller before the next read; that
+                        // is the same contract every event here has.
+                        s.len = 0;
+                        break;
+                    },
                     else => {
                         const ev = (try self.next(stream_id, s)) orelse break;
                         if (ev) |e| {
@@ -495,7 +510,7 @@ pub fn Session(comptime Transport: type) type {
                 } },
                 // A fetch response is bare frames, surfaced like group data.
                 .fetch_out => Event{ .group_data = .{ .stream_id = stream_id, .data = body } },
-                // subscribe_out returns above; the rest never reach here.
+                // These are handled before next() is reached.
                 .subscribe_out, .group_in, .unknown_uni, .unknown_bidi => null,
             };
             s.consume(f.consumed);
@@ -714,6 +729,34 @@ test "an announce stream gives ANNOUNCE_OK once, then broadcasts" {
     try testing.expectEqual(@as(u64, 2), events[0].announce_ok.ok.hop_id);
     try testing.expectEqualStrings("alice", events[1].announce_broadcast.broadcast.suffix);
     try testing.expectEqual(msg.AnnounceStatus.ended, events[2].announce_broadcast.broadcast.status);
+}
+
+test "frames arriving with the group header are not swallowed" {
+    // Regression: the bytes left in the buffer after the GROUP header were
+    // framed as if they were another control message, and dropped.
+    var t = FakeTransport{};
+    var s = TestSession.init(&t);
+
+    var buf: [128]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try msg.writeStreamType(&fbs, @intFromEnum(msg.DataType.group));
+    try msg.writeGroup(&fbs, .{ .subscribe_id = 1, .sequence = 0 });
+    const header_len = fbs.seek;
+    try msg.writeFrame(&fbs, .{ .timestamp_delta = 0, .payload = "first" });
+
+    try s.onPeerStream(7, false);
+    var events: [8]Event = undefined;
+    const n = try s.onStreamData(7, buf[0..fbs.seek], false, &events);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u64, 0), events[0].group_start.group.sequence);
+
+    var rbuf: [128]u8 = undefined;
+    var reader = FrameReader.init(&rbuf);
+    try reader.push(events[1].group_data.data);
+    const item = (try reader.next()).?;
+    try testing.expectEqualStrings("first", item.payload);
+    try testing.expectEqual(@as(i64, 0), item.timestamp);
+    try testing.expectEqual(fbs.seek - header_len, events[1].group_data.data.len);
 }
 
 test "a group stream names its subscription, then forwards bytes" {

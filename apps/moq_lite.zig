@@ -3,6 +3,11 @@
 //   moq-lite publish   --url <URL> --broadcast <path> [--track <name>]
 //   moq-lite subscribe --url <URL> --broadcast <path> [--track <name>]
 //   moq-lite announce  --url <URL> [--prefix <path>]
+//   moq-lite serve     --port <N>  --broadcast <path> [--track <name>]
+//
+// `serve` is an origin, not a relay: it publishes one synthetic track to
+// whoever subscribes. It exists so a subscriber has something to talk to
+// without a relay in the middle, ours or moq-rs's.
 //
 // The URL scheme picks the transport: https:// is WebTransport, moqt:// is
 // native QUIC. Shaped to cross directly with moq-rs's `moq-clock`, which
@@ -25,7 +30,7 @@ const moq_url = quic.moq.url;
 
 pub const std_options: std.Options = .{ .log_level = .err };
 
-const Mode = enum { publish, subscribe, announce };
+const Mode = enum { publish, subscribe, announce, serve };
 
 fn nowMs() i64 {
     return @intCast(@divFloor(sys.nanoTimestamp(), 1_000_000));
@@ -173,6 +178,7 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                     // announce stream, then serves the subscribe it brings.
                     print("publishing {s}/{s}\n", .{ self.broadcast, self.track });
                 },
+                .serve => unreachable, // serve runs the Server handler, not this
             }
         }
 
@@ -313,6 +319,279 @@ fn Peer(comptime proto: event_loop.Protocol) type {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// serve — a moq-lite origin
+//
+// One synthetic track, published to whoever subscribes. The handler is
+// also the transport for every client's session; `cur` is the connection
+// whose callback is running, which is the only one a callback ever writes
+// to, so no cross-connection plumbing is needed.
+// ─────────────────────────────────────────────────────────────────────
+
+const MAX_CLIENTS: usize = 8;
+
+const TICK_MS: i64 = 200;
+const FRAMES_PER_GROUP: u64 = 5;
+
+fn Server(comptime proto: event_loop.Protocol) type {
+    return struct {
+        const Self = @This();
+        pub const protocol: event_loop.Protocol = proto;
+        pub const poll_interval_ms: u64 = 50;
+        const is_wt = proto == .webtransport;
+        const Sess = lite_session.Session(*Ref);
+
+        /// What a session writes through. Every write happens inside a
+        /// callback for one connection, which `owner.cur` names.
+        const Ref = struct {
+            owner: *Self,
+            idx: usize,
+
+            pub fn openUni(self: *Ref) !u64 {
+                const s = self.owner.cur orelse return error.NotConnected;
+                return if (is_wt) s.openUniStream(self.owner.clients[self.idx].wt_session_id, null) else s.openStream();
+            }
+            pub fn openBidi(self: *Ref) !u64 {
+                const s = self.owner.cur orelse return error.NotConnected;
+                return if (is_wt) s.openBidiStream(self.owner.clients[self.idx].wt_session_id, null) else s.openStream();
+            }
+            pub fn write(self: *Ref, stream_id: u64, data: []const u8) !void {
+                const s = self.owner.cur orelse return error.NotConnected;
+                return if (is_wt) s.sendStreamData(stream_id, data) else s.writeStream(stream_id, data);
+            }
+            pub fn finish(self: *Ref, stream_id: u64) void {
+                const s = self.owner.cur orelse return;
+                if (is_wt) s.closeStream(stream_id) else s.closeQuicStream(stream_id);
+            }
+            pub fn reset(self: *Ref, stream_id: u64, code: u64) void {
+                const s = self.owner.cur orelse return;
+                s.resetStream(stream_id, @truncate(code));
+            }
+        };
+
+        const ClientState = struct {
+            active: bool = false,
+            conn: ?*anyopaque = null,
+            wt_session_id: u64 = 0,
+            ref: Ref = undefined,
+            sess: Sess = undefined,
+            setup_sent: bool = false,
+            // The subscription we are serving, if any.
+            sub_stream: ?u64 = null,
+            sub_id: u64 = 0,
+            group_stream: ?u64 = null,
+            group_seq: u64 = 0,
+            frame_in_group: u64 = 0,
+            last_tick_ms: i64 = 0,
+        };
+
+        broadcast: []const u8 = "clock",
+        track: []const u8 = "clock",
+        clients: [MAX_CLIENTS]ClientState = [_]ClientState{.{}} ** MAX_CLIENTS,
+        cur: ?*event_loop.Session = null,
+        cur_idx: usize = 0,
+
+        fn key(session: *event_loop.Session) *anyopaque {
+            return @ptrCast(session.entry.conn);
+        }
+
+        fn find(self: *Self, session: *event_loop.Session) ?usize {
+            const k = key(session);
+            for (&self.clients, 0..) |*c, i| if (c.active and c.conn == k) return i;
+            return null;
+        }
+
+        fn admit(self: *Self, session: *event_loop.Session) ?usize {
+            if (self.find(session)) |i| return i;
+            for (&self.clients, 0..) |*c, i| {
+                if (c.active) continue;
+                c.* = .{ .active = true, .conn = key(session) };
+                c.ref = .{ .owner = self, .idx = i };
+                c.sess = Sess.init(&self.clients[i].ref);
+                return i;
+            }
+            return null;
+        }
+
+        fn enter(self: *Self, session: *event_loop.Session) ?usize {
+            const i = self.admit(session) orelse return null;
+            self.cur = session;
+            self.cur_idx = i;
+            return i;
+        }
+
+        fn greet(self: *Self, i: usize) void {
+            const c = &self.clients[i];
+            if (c.setup_sent) return;
+            c.sess.sendSetup() catch |e| {
+                print("client {d}: SETUP failed: {t}\n", .{ i, e });
+                return;
+            };
+            c.setup_sent = true;
+        }
+
+        pub fn onConnectRequest(
+            _: *Self,
+            session: *event_loop.Session,
+            session_id: u64,
+            _: []const u8,
+            headers: []const qpack.Header,
+        ) void {
+            if (!is_wt) return;
+            var alpn_buf: [4][]const u8 = undefined;
+            const supported = lite_version.alpnOffer(lite_version.PREFERRED, &alpn_buf);
+
+            var scratch: [256]u8 = undefined;
+            var value_buf: [64]u8 = undefined;
+            if (wt_protocol.findHeader(headers, wt_protocol.HEADER_AVAILABLE)) |offer| {
+                if (wt_protocol.selectFromOffer(offer, supported, &scratch)) |name| {
+                    print("negotiated {s}\n", .{name});
+                    if (wt_protocol.encodeItem(name, &value_buf)) |encoded| {
+                        const extra = [_]qpack.Header{
+                            .{ .name = wt_protocol.HEADER_SELECTED, .value = encoded },
+                        };
+                        session.acceptSessionWithHeaders(session_id, &extra) catch {};
+                        return;
+                    } else |_| {}
+                }
+                // §3.1: the version rides the ALPN, so no overlap means no
+                // shared protocol. Better to refuse than to guess.
+                print("no shared moq-lite version; rejecting\n", .{});
+                session.closeSession(session_id);
+                return;
+            }
+            session.acceptSession(session_id) catch {};
+        }
+
+        pub fn onSessionReady(self: *Self, session: *event_loop.Session, session_id: u64) void {
+            const i = self.enter(session) orelse return;
+            defer self.cur = null;
+            self.clients[i].wt_session_id = session_id;
+            self.greet(i);
+        }
+
+        pub fn onBidiStream(self: *Self, session: *event_loop.Session, _: u64, stream_id: u64) void {
+            const i = self.enter(session) orelse return;
+            defer self.cur = null;
+            self.clients[i].sess.onPeerStream(stream_id, true) catch {};
+        }
+
+        pub fn onUniStream(self: *Self, session: *event_loop.Session, _: u64, stream_id: u64) void {
+            const i = self.enter(session) orelse return;
+            defer self.cur = null;
+            self.clients[i].sess.onPeerStream(stream_id, false) catch {};
+        }
+
+        pub fn onStreamData(
+            self: *Self,
+            session: *event_loop.Session,
+            stream_id: u64,
+            data: []const u8,
+            fin: bool,
+        ) void {
+            const i = self.enter(session) orelse return;
+            defer self.cur = null;
+            // Raw QUIC has no session-ready callback, so this is where a
+            // connection first announces itself.
+            if (!is_wt) self.greet(i);
+
+            var events: [16]lite_session.Event = undefined;
+            const n = self.clients[i].sess.onStreamData(stream_id, data, fin, &events) catch |e| {
+                print("client {d} stream {d}: {t}\n", .{ i, stream_id, e });
+                return;
+            };
+            for (events[0..n]) |ev| self.handle(i, ev);
+        }
+
+        pub fn onSessionClosed(self: *Self, session: *event_loop.Session, _: u64, _: u32, _: []const u8) void {
+            const i = self.find(session) orelse return;
+            print("client {d} gone\n", .{i});
+            self.clients[i] = .{};
+        }
+
+        fn handle(self: *Self, i: usize, ev: lite_session.Event) void {
+            const c = &self.clients[i];
+            switch (ev) {
+                .peer_setup => print("client {d}: SETUP\n", .{i}),
+                .announce_request => |a| {
+                    c.sess.sendAnnounceOk(a.stream_id, .{ .hop_id = 1, .active_count = 1 }) catch return;
+                    if (lite.wire.stripPathPrefix(self.broadcast, a.request.prefix)) |suffix| {
+                        c.sess.sendAnnounceBroadcast(a.stream_id, .{
+                            .status = .active,
+                            .suffix = suffix,
+                        }) catch {};
+                        print("client {d}: announced \"{s}\"\n", .{ i, self.broadcast });
+                    }
+                },
+                .track_request => |t| {
+                    c.sess.sendTrackInfo(t.stream_id, .{ .timescale = 1000 }) catch {};
+                },
+                .subscribe_request => |sr| {
+                    const sub = sr.subscribe;
+                    if (!std.mem.eql(u8, sub.broadcast, self.broadcast) or
+                        !std.mem.eql(u8, sub.track, self.track))
+                    {
+                        c.sess.resetStream(sr.stream_id, lite_session.ResetCode.NOT_FOUND);
+                        print("client {d}: no such track {s}/{s}\n", .{ i, sub.broadcast, sub.track });
+                        return;
+                    }
+                    c.sub_stream = sr.stream_id;
+                    c.sub_id = sub.id;
+                    c.sess.sendSubscribeResponse(sr.stream_id, .{ .ok = .{ .group = c.group_seq } }) catch {};
+                    print("client {d}: serving {s}/{s} as subscription {d}\n", .{
+                        i, sub.broadcast, sub.track, sub.id,
+                    });
+                },
+                .fetch_request => |f| {
+                    // §5.1.3 has no error message: refusing is a reset.
+                    c.sess.resetStream(f.stream_id, lite_session.ResetCode.NOT_FOUND);
+                },
+                .stream_finished => |f| {
+                    if (c.sub_stream == f.stream_id) {
+                        print("client {d}: unsubscribed\n", .{i});
+                        c.sub_stream = null;
+                        if (c.group_stream) |g| c.sess.finishGroup(g);
+                        c.group_stream = null;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        pub fn onPollComplete(self: *Self, session: *event_loop.Session) void {
+            const i = self.find(session) orelse return;
+            const c = &self.clients[i];
+            if (c.sub_stream == null) return;
+
+            const now = nowMs();
+            if (now - c.last_tick_ms < TICK_MS) return;
+            c.last_tick_ms = now;
+
+            self.cur = session;
+            self.cur_idx = i;
+            defer self.cur = null;
+
+            if (c.group_stream == null or c.frame_in_group >= FRAMES_PER_GROUP) {
+                if (c.group_stream) |g| c.sess.finishGroup(g);
+                c.group_stream = c.sess.openGroup(.{
+                    .subscribe_id = c.sub_id,
+                    .sequence = c.group_seq,
+                }) catch return;
+                c.group_seq += 1;
+                c.frame_in_group = 0;
+            }
+
+            var buf: [64]u8 = undefined;
+            const payload = std.fmt.bufPrint(&buf, "{d}", .{now}) catch return;
+            c.sess.sendFrame(c.group_stream.?, .{
+                .timestamp_delta = if (c.frame_in_group == 0) 0 else TICK_MS,
+                .payload = payload,
+            }) catch return;
+            c.frame_in_group += 1;
+        }
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────
 
@@ -403,6 +682,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var prefix: []const u8 = "";
     var seconds: u64 = 10;
     var skip_verify = false;
+    var port: u16 = 4447;
+    var cert_path: []const u8 = "interop/certs/server.crt";
+    var key_path: []const u8 = "interop/certs/server.key";
 
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
@@ -413,6 +695,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             mode = .subscribe;
         } else if (std.mem.eql(u8, arg, "announce")) {
             mode = .announce;
+        } else if (std.mem.eql(u8, arg, "serve")) {
+            mode = .serve;
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            if (args.next()) |v| port = std.fmt.parseInt(u16, v, 10) catch 4447;
+        } else if (std.mem.eql(u8, arg, "--cert")) {
+            if (args.next()) |v| cert_path = v;
+        } else if (std.mem.eql(u8, arg, "--key")) {
+            if (args.next()) |v| key_path = v;
         } else if (std.mem.eql(u8, arg, "--url")) {
             if (args.next()) |v| url = v;
         } else if (std.mem.eql(u8, arg, "--broadcast")) {
@@ -435,6 +725,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 \\  --seconds N               how long to run (default 10)
                 \\  --tls-disable-verify
                 \\
+                \\serve options:
+                \\  --port N                  listen port (default 4447)
+                \\  --cert PATH --key PATH    TLS material
+                \\
             , .{});
             return 0;
         }
@@ -444,6 +738,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         print("usage: moq-lite <publish|subscribe|announce> --url URL [...]\n", .{});
         return 2;
     };
+
+    if (m == .serve) return serveMain(alloc, port, cert_path, key_path, broadcast, track);
 
     const loc = moq_url.parse(url) catch |e| {
         print("bad --url {s}: {t}\n", .{ url, e });
@@ -471,5 +767,39 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             print("\n{d} groups, {d} frames\n", .{ handler.groups_seen, handler.frames_seen });
         },
     }
+    return 0;
+}
+
+/// Runs the origin. WebTransport, because that is what a browser and
+/// moq-rs both reach for; raw-QUIC moq-lite servers can follow when
+/// something needs one.
+fn serveMain(
+    alloc: std.mem.Allocator,
+    port: u16,
+    cert_path: []const u8,
+    key_path: []const u8,
+    broadcast: []const u8,
+    track: []const u8,
+) !u8 {
+    const H = Server(.webtransport);
+    // On the heap: one session per client is MAX_STREAMS control buffers,
+    // which overflows the stack well before the client limit.
+    const handler = try alloc.create(H);
+    handler.* = .{ .broadcast = broadcast, .track = track };
+
+    var server = event_loop.Server(H).init(alloc, handler, .{
+        .port = port,
+        .cert_path = cert_path,
+        .key_path = key_path,
+    }) catch |e| {
+        print("cannot listen on {d}: {t}\n", .{ port, e });
+        return 1;
+    };
+    defer server.deinit();
+
+    print("=== moq-lite origin ({s}) ===\n", .{lite_version.DEFAULT.alpn()});
+    print("https://0.0.0.0:{d}  serving {s}/{s}\n\n", .{ port, broadcast, track });
+
+    try server.run();
     return 0;
 }
