@@ -10,6 +10,7 @@ implementation.
     tools/interop_local.sh      # 11/11
     interop/run_local_tests.sh  # 9/9
     interop/runner/matrix.sh    # 64/88, identical to the previous run
+    tools/moq_local.sh          # 9/9, MoQ end-to-end against our own binaries
     tools/moq_interop.sh        # MoQ, both drafts: 7/7 ours, 6/7 moq-relay
     node tools/moq_lite_browser_test.mjs          # moq-lite in Chrome
     RELAY=1 node tools/moq_lite_browser_test.mjs  # ... through our relay
@@ -34,6 +35,7 @@ What changed and why: [`CHANGELOG.md`](CHANGELOG.md). MoQ specifics:
 
     tools/interop_local.sh         # 11 cases, quic-zig against itself, no docker
     interop/run_local_tests.sh     # 9 cases against quic-go and quiche binaries
+    tools/moq_local.sh             # MoQ end-to-end, our binaries only, no docker
     tools/moq_interop.sh           # MoQ interop matrix -> SPEC/moq-interop-results.md
     tools/wt_protocol_test.mjs     # WebTransport protocol negotiation, via Chrome
     tools/bench_local.sh           # single-stream throughput + handshake rate

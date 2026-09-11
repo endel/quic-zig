@@ -107,6 +107,9 @@ offer and the https URI derived for the CONNECT; the runner still accepts
 ```sh
 zig build
 
+# Our own binaries end to end: both drafts, streams, datagrams, moq-lite.
+tools/moq_local.sh
+
 # One relay, one case, verbose.
 zig-out/bin/moq-test-client --relay moqt://127.0.0.1:4455/ \
     --test setup-only --verbose --tls-disable-verify
