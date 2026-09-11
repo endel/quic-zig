@@ -5,7 +5,47 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ## Unreleased
 
+### Added
+
+- **moq-lite** (draft-lcurley-moq-lite-05), the dialect `moq-relay`,
+  `cdn.moq.dev` and the `@moq/net` browser client actually speak. Wire and
+  message codecs, a session layer, and a `moq-lite` binary that publishes,
+  subscribes, discovers broadcasts, or serves as an origin. Verified in both
+  directions against `moq-relay` v0.14.16 and `moq-clock`, and from a browser.
+- **`moq-test-client`**, the interop client for
+  [moq-interop-runner](https://github.com/englishm/moq-interop-runner): seven
+  control-plane test cases over either transport, TAP 14 output, packaged as a
+  container. `tools/moq_interop.sh` runs it against a relay list.
+- **WebTransport application-protocol negotiation** (`WT-Available-Protocols` /
+  `WT-Protocol`). Both moq-lite and moq-transport from draft-15 on choose their
+  wire version this way over WebTransport, so nothing browser-facing could
+  negotiate one before.
+- MoQ relays hold a `SUBSCRIBE` open when the subscriber asks them to, and
+  answer `DOES_NOT_EXIST` when it does not.
+- An event-loop handler can declare `poll_interval_ms` to be woken on a
+  cadence rather than only when the peer sends something.
+
 ### Fixed
+
+- **MoQ draft-17 control messages did not match the draft.** Most were
+  encode-only, so their round-trip tests agreed with a shape no peer spoke.
+  PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, PUBLISH, REQUEST_UPDATE and FETCH
+  were missing their Request ID and Required Request ID Delta; GOAWAY its
+  Timeout, REQUEST_ERROR its Retry Interval, PUBLISH_DONE its Stream Count;
+  FETCH had no Fetch Type and so no joining form; FETCH_OK, PUBLISH_OK and
+  PUBLISH_BLOCKED had invented bodies; NAMESPACE_DONE carried nothing. The
+  error codes were a pre-draft-17 list that mixed the session and request
+  number spaces.
+- A MoQ peer could abort the process with one byte: a `GroupOrder` outside
+  `0x00`-`0x02` reached `@enumFromInt` in four decoders.
+- `decodeSubscribe` and `decodePublish` returned a track namespace that
+  pointed into their own stack frame.
+- The MoQ relay tracked stream roles in a 256-entry array indexed by stream
+  id, so a long-lived connection stopped being able to tell a control stream
+  from a subgroup header. It also read a connection pointer the event loop
+  had already freed.
+- `interop/runner/matrix.sh` removed every container on the machine between
+  test cases, not just its own.
 
 - Unidirectional receive streams were never freed. A connection kept a receive
   buffer and its reassembly state for every uni stream it had ever accepted, so
