@@ -295,10 +295,12 @@ missing HelloRetryRequest. It was two other things:
 2. Certificate validity compared against `CLOCK_MONOTONIC`, whose zero is the
    last boot, so every real certificate read as not-yet-valid.
 
-Both transports now run a full moq-lite session against it with the chain
-verified. What is still missing is the trust anchor — `ca_cert_path` is
-ignored pending the Zig 0.16 `Io` threading, so the chain is checked but
-never rooted.
+3. No trust store: `ca_cert_path` had done nothing but log a warning since
+   the Zig 0.16 migration, so a chain could not be rooted even in principle.
+   `ClientConfig.ca` replaces it (`.system` or `.file`).
+
+Both transports now run a full moq-lite session against it, verified against
+the system trust store.
 
 ### Core quic-zig, for a session that is not about MoQ
 

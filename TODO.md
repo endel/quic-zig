@@ -121,8 +121,15 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
   Still open is the trust anchor: `ca_cert_path` is ignored pending the 0.16
   `Io` threading (`event_loop.zig`), so the chain is checked link by link and
   against the hostname, but never rooted. That is I3.
-- [ ] **I3. Client cert verification defaults off (S)** — flip `skip_cert_verify`
-  (`tls13.zig:509`) when server_name+ca_bundle present.
+- [x] **I3. Client cert verification defaults off (S)** — `ClientConfig.ca`
+  now takes `.none`, `.system` (the platform trust store) or
+  `.file` (a PEM bundle), and anything but `.none` turns `skip_cert_verify`
+  off. `src/quic/ca_bundle.zig` holds the `Io` that 0.16 requires for the
+  load, so it stays out of the library's signatures. The `ca_cert_path` field
+  it replaces had done nothing but log a warning since the 0.16 migration.
+  `moq-lite` and `moq-test-client` default to the trust store unless
+  `--tls-disable-verify` is passed. Verified against `cdn.moq.dev` (system
+  store) and our own interop CA (file).
 - [ ] **I4. Cipher/curve breadth (S/M/L)** — AES-256-GCM-SHA384, P-384, X25519MLKEM768.
 - [ ] **I5. RESET_STREAM_AT reliable reset (M/L)** — needed by WebTransport draft-13.
 - [ ] **I6. Proactive key-update cadence (S)** — rotate every ~100k pkts (`crypto.zig:788`).

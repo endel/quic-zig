@@ -18,8 +18,7 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   could not be reached at all, over either transport. The request is now
   answered the way RFC 8446 says to when there is nothing to offer: with an
   empty certificate. With both fixed, `cdn.moq.dev` runs a full session over
-  either transport with its chain verified — though not yet rooted in a trust
-  store, which still needs `ca_cert_path`.
+  either transport, verified against the system trust store.
 - A peer could abort the process before the handshake completed. A QUIC packet
   whose Length field was below its packet number length read gigabytes past
   the datagram, and one below the 16-byte AEAD tag tripped an assertion; an
@@ -34,6 +33,12 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Added
 
+- `ClientConfig.ca` loads trust anchors — `.system` for the platform store,
+  `.file` for a PEM bundle of your own — and turns certificate verification
+  on when set. The `ca_cert_path` it replaces had done nothing but log a
+  warning since the Zig 0.16 migration, so a client could not verify a server
+  against anything. `moq-lite` and `moq-test-client` now use the trust store
+  unless `--tls-disable-verify` is passed.
 - `ClientConfig.loop` joins an event loop instead of creating one, so several
   clients share it and one `run()` drives them all. A client needing two
   connections at once no longer means two loops and a caller spinning `tick()`

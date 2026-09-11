@@ -170,10 +170,9 @@ pairs with most of its eighteen relays; draft-17 with four.
 ## Known blockers
 
 - **(Cleared) `cdn.moq.dev` is reachable.** A full moq-lite session runs over
-  both transports, with Cloudflare's certificate chain verified — hostname,
-  each link's signature, CA:TRUE/keyCertSign, validity dates. What is still
-  missing is the trust anchor: `ca_cert_path` is ignored pending the Zig 0.16
-  `Io` threading, so the chain is checked but never rooted (TODO I3).
+  both transports, with Cloudflare's certificate verified against the system
+  trust store — hostname, every link's signature, CA:TRUE/keyCertSign,
+  validity dates, and a trusted root.
 
   It used to fail outright, with `error.UnexpectedMessage` on both transports,
   and that was recorded here as a missing HelloRetryRequest. Two unrelated
@@ -184,5 +183,7 @@ pairs with most of its eighteen relays; draft-17 with four.
      handshake.
   2. Certificate validity was compared against `CLOCK_MONOTONIC`, so every
      real certificate read as not-yet-valid and no chain could ever verify.
+  3. There was no trust store to root a chain in: `ca_cert_path` had done
+     nothing but log a warning since the Zig 0.16 migration.
 
   We still implement no HelloRetryRequest — it would fail as `DecodeError`.
