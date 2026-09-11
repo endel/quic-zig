@@ -32,7 +32,9 @@ const moq_version = quic.moq.version;
 
 pub const std_options: std.Options = .{ .log_level = .err };
 
-const VERSION = "0.1.0";
+/// Reported to the runner as `implementation_version`. Tracks the version
+/// in build.zig.zon, which is what a reader would go looking for.
+const VERSION = "0.3.0";
 
 // Fixed by the test spec, not passed in.
 const TEST_NAMESPACE = [_][]const u8{ "moq-test", "interop" };

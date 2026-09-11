@@ -3,7 +3,11 @@
 Notable changes to quic-zig. Versions follow [semantic versioning](https://semver.org);
 `Unreleased` collects what has landed on `main` since the last tag.
 
-## Unreleased
+## 0.3.0
+
+Media over QUIC, in both dialects the ecosystem uses, and an interop client
+for the runner that tests them. Closes
+[#21](https://github.com/endel/quic-zig/issues/21).
 
 ### Added
 
@@ -18,7 +22,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - **`moq-test-client`**, the interop client for
   [moq-interop-runner](https://github.com/englishm/moq-interop-runner): seven
   control-plane test cases over either transport, TAP 14 output, packaged as a
-  container. `tools/moq_interop.sh` runs it against a relay list.
+  container. `tools/moq_interop.sh` runs it against a relay list. Registering
+  with the runner is prepared but not submitted — see `SPEC/moq-interop.md`.
+  [#21](https://github.com/endel/quic-zig/issues/21)
 - **WebTransport application-protocol negotiation** (`WT-Available-Protocols` /
   `WT-Protocol`). Both moq-lite and moq-transport from draft-15 on choose their
   wire version this way over WebTransport, so nothing browser-facing could
