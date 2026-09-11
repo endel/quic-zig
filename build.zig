@@ -248,6 +248,12 @@ pub fn build(b: *std.Build) void {
         }) |exe| step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
+    // Same idea for the MoQ interop image, which ships only the test client.
+    {
+        const step = b.step("moq-interop", "Build only the binaries the MoQ interop image ships");
+        step.dependOn(&b.addInstallArtifact(exe_moq_test_client, .{}).step);
+    }
+
     const exe_lb = App.add(b, "quic-lb", "apps/quic_lb.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_lb);
     const run_lb = b.addRunArtifact(exe_lb);
