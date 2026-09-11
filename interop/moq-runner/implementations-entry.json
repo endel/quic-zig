@@ -1,12 +1,12 @@
 {
   "_comment": [
     "The entry to add to englishm/moq-interop-runner's implementations.json.",
-    "Not submitted: registering means publishing images to GHCR under the",
-    "owner's account and opening a PR against someone else's repository.",
+    "Not submitted: that means opening a PR against someone else's repository.",
     "Validate with their implementations.schema.json before sending.",
     "",
-    "Both images are built by interop/moq-runner/build_image.sh and pass",
-    "7/7 against each other over a compose-style network."
+    "Both images are published by .github/workflows/docker.yml on every push",
+    "to main, and built locally by interop/moq-runner/build_image.sh. They",
+    "pass 7/7 against each other over a compose-style network."
   ],
   "quic-zig": {
     "name": "quic-zig",
@@ -17,12 +17,12 @@
     "roles": {
       "client": {
         "docker": {
-          "image": "ghcr.io/OWNER/quic-zig-moq-client:latest"
+          "image": "ghcr.io/endel/quic-zig-moq-client:latest"
         }
       },
       "relay": {
         "docker": {
-          "image": "ghcr.io/OWNER/quic-zig-moq-relay:latest"
+          "image": "ghcr.io/endel/quic-zig-moq-relay:latest"
         }
       }
     }

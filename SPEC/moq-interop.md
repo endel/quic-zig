@@ -153,15 +153,26 @@ Peers to test against:
 
 ## Registering with the runner
 
-Prepared but not submitted: it means publishing images to GHCR under your
-account and opening a PR against `englishm/moq-interop-runner`, neither of
-which is ours to do. The entry is written out in
-[`interop/moq-runner/implementations-entry.json`](../interop/moq-runner/implementations-entry.json)
-with `OWNER` left to fill in; validate it against their
-`implementations.schema.json` before sending.
+Both images publish to GHCR on every push to `main`
+([`.github/workflows/docker.yml`](../.github/workflows/docker.yml)), as
+`ghcr.io/endel/quic-zig-moq-client` and `…-moq-relay`. The entry to send is
+[`interop/moq-runner/implementations-entry.json`](../interop/moq-runner/implementations-entry.json);
+validate it against their `implementations.schema.json` first. Opening the PR
+is what remains, and that is not ours to do.
 
-Both images pass 7/7 against each other over a compose-style network, so
-what remains is `docker push` and the PR.
+A new GHCR package is private on first publish even when the repository is
+public. The runner cannot pull a private image, so both packages have to be
+switched to public once before any of this works.
+
+The images pass 7/7 against each other over a compose-style network, with
+certificates generated exactly the way the runner's `generate-certs.sh` does.
+
+**The relay needs an ECDSA P-256 key.** Our TLS signs with ECDSA P-256 or
+Ed25519 and has no RSA signing path, so an RSA `priv.key` fails at startup
+with `error: DecodeError` and nothing pairs. Both the SEC1 and PKCS#8
+encodings are read. The runner generates P-256 — deliberately, so browsers
+can pin the certificate by hash — so this costs nothing there; it is a trap
+only when mounting certificates of your own.
 
 Both drafts are implemented, so `draft_versions` would be
 `["draft-17", "draft-18"]`. draft-18 is the runner's `current_target` and
