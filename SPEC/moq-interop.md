@@ -160,9 +160,10 @@ Both images publish to GHCR on every push to `main`
 validate it against their `implementations.schema.json` first. Opening the PR
 is what remains, and that is not ours to do.
 
-A new GHCR package is private on first publish even when the repository is
-public. The runner cannot pull a private image, so both packages have to be
-switched to public once before any of this works.
+Both packages came out public on first publish, inheriting the repository's
+visibility — `docker manifest inspect` and `docker pull` both succeed with no
+credentials. Worth re-checking if that ever changes: the runner cannot pull a
+private image.
 
 The images pass 7/7 against each other over a compose-style network, with
 certificates generated exactly the way the runner's `generate-certs.sh` does.
