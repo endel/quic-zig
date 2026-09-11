@@ -1,8 +1,10 @@
 # quic-zig — improvement backlog
 
-Derived from the full gap review against quic-go HEAD `89690bf` (2026-06-08, post-v0.60.0).
-Detailed findings with file:line citations on both sides live in
+Tiers 1-4 derive from the full gap review against quic-go HEAD `89690bf`
+(2026-06-08, post-v0.60.0). Detailed findings with file:line citations on both
+sides live in
 [`SPEC/REVIEW_quic_go_comparison_2026-06.md`](SPEC/REVIEW_quic_go_comparison_2026-06.md).
+Tier 5 is separate: core problems hit while building MoQ on top of this stack.
 
 Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `(S/M/L)` effort.
 
@@ -93,7 +95,13 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
 
 - [ ] **I1. Server-level 0-RTT queue + undecryptable-queue expiry (M)** —
   `connection_manager.zig:317`. (Relevant to `debug/zerortt-quic-go-interop`.)
-- [ ] **I2. HelloRetryRequest unsupported (M)** — `tls13.zig`.
+- [ ] **I2. HelloRetryRequest unsupported (M)** — `tls13.zig`. Now known to
+  block real servers, not just theoretically: `cdn.moq.dev` (Cloudflare)
+  fails at `error.UnexpectedMessage` over both raw QUIC and WebTransport,
+  before any application protocol. Likely the same cause as I4's missing
+  X25519MLKEM768 — the edge asks for a group we did not offer. The
+  fingerprint to look for is both transports failing identically at the
+  handshake.
 - [ ] **I3. Client cert verification defaults off (S)** — flip `skip_cert_verify`
   (`tls13.zig:509`) when server_name+ca_bundle present.
 - [ ] **I4. Cipher/curve breadth (S/M/L)** — AES-256-GCM-SHA384, P-384, X25519MLKEM768.
@@ -106,6 +114,52 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
 - [ ] **I10. Stats: latest_rtt/bytes_lost + server counters (S)** — `connection.zig:4009`.
 - [ ] **I11. Misc (S)** — always advertise v2 in version_information; embed PSK ticket nonce
   (`tls13.zig:1845`).
+
+## Tier 5 — Found while building MoQ (2026-09)
+
+Core issues, not MoQ ones. Each was hit in practice rather than read off a
+spec, so the consequence is recorded alongside the fix.
+
+- [ ] **F1. `Client.stop()` queues CONNECTION_CLOSE but never sends it (S)** —
+  `event_loop.zig:1710`. `stop()` calls `conn.close()`, which only queues the
+  frame; it reaches the wire on the next flush. An app driving the loop with
+  `run()` is fine, because the armed timer fires and drains before the loop
+  exits. An app driving it with `tick()` and then exiting is not: `tick()` is
+  `loop.run(.no_wait)` and returns without firing a timer that is not yet due,
+  so the close never leaves and the peer holds the session for its whole idle
+  timeout — 30 s of a server's per-client capacity for a client that ran for
+  two. It surfaces far from the cause: a relay's client table fills and some
+  *later*, unrelated connection fails with "no SETUP from peer". Either make
+  `stop()` flush, or say in its doc comment that it does not and that callers
+  driving `tick()` must. `apps/moq_test_client.zig` and `apps/moq_lite.zig`
+  call `flush()` explicitly as a workaround; no other app calls `stop()`.
+
+- [ ] **F2. 23 of 26 fuzz targets never see a random byte (M)** — `fuzz.zig`.
+  `-ffuzz` does not compile on Zig 0.16.0: 27 errors inside the toolchain's
+  own `lib/compiler/test_runner.zig` (`*builtin.StackTrace` vs
+  `*debug.StackTrace`), so `std.testing.fuzz` runs each body once on its seed
+  and the whole file is a smoke test. The three MoQ parsers have a fixed-seed
+  sweep instead — random bytes, plus real encoded messages with a few bytes
+  flipped — and it found a one-byte remote abort within seconds of being
+  written (`@enumFromInt` on an attacker-controlled `GroupOrder`). The same
+  shape applied to the QUIC packet/frame, transport-parameter, QPACK, HPACK
+  and capsule parsers is the cheapest coverage available until the toolchain
+  is fixed. See `moq decoders survive a randomized sweep` for the pattern.
+
+- [ ] **F3. `Client` is one connection per loop (M)** — `event_loop.zig:1432`.
+  Any client needing two concurrent connections — the MoQ interop runner's
+  two-connection cases, a relay dialling upstream, a migration test — has to
+  instantiate two `Client`s and alternate `tick()` on them, which works but
+  means two sockets, two libxev loops and hand-rolled scheduling. The server
+  side already multiplexes connections over one loop via `ConnectionManager`;
+  the client could use the same seam.
+
+- [x] **F4. TLS server echoed `config.alpn[0]` regardless of the match (S)** —
+  a server advertising more than one protocol told every client its own first
+  choice, so the two could disagree about what they were speaking. Fixed with
+  `Tls13Handshake.negotiatedAlpn()` and `Connection.negotiatedAlpn()`; it had
+  gone unnoticed because nothing advertised more than one ALPN until MoQ
+  needed to serve two drafts at once.
 
 ## Where we already lead quic-go (keep)
 

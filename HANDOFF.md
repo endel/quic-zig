@@ -292,6 +292,29 @@ fail identically at TLS with `error.UnexpectedMessage`, before any MoQ.
 Cloudflare's edge asks for HRR and `src/quic/tls13.zig` has no notion of
 it. This blocks every public MoQ relay, and probably more than MoQ.
 
+### Core quic-zig, for a session that is not about MoQ
+
+Building MoQ on this stack turned up four core problems, none of them MoQ's.
+They are written up as **Tier 5** in [`TODO.md`](TODO.md) with the
+consequence each one had, which is the part that is hard to reconstruct
+later:
+
+- `Client.stop()` queues the CONNECTION_CLOSE and never sends it, so a
+  `tick()`-driven client that exits leaves the peer holding the session for
+  its full idle timeout. It surfaces as an unrelated connection failing
+  much later.
+- 23 of 26 fuzz targets never see a random byte, because `-ffuzz` does not
+  compile on Zig 0.16.0. The fixed-seed sweep written for the MoQ parsers
+  found a one-byte remote abort immediately; the QUIC and H3 parsers have
+  nothing equivalent.
+- `Client` is one connection per loop, so anything needing two concurrent
+  connections instantiates two of everything.
+- (Fixed) a TLS server advertising several ALPN protocols echoed its own
+  first choice rather than the one that matched.
+
+`TODO.md` also now records what `I2. HelloRetryRequest unsupported` actually
+costs: it is what blocks `cdn.moq.dev`, and probably any Cloudflare edge.
+
 ### Carried over
 
 
