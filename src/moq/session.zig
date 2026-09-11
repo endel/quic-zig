@@ -391,7 +391,7 @@ test "a request opens a bidi stream and FIN releases it" {
     var buf: [256]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
     const ns = [_][]const u8{ "moq-test", "interop" };
-    try msg.writePublishNamespace(&fbs, .{ .track_namespace_prefix = &ns });
+    try msg.writePublishNamespace(&fbs, .{ .track_namespace = &ns });
 
     const sid = try s.sendRequest(buf[0..fbs.seek]);
     try testing.expectEqual(@as(u64, 0), sid);
@@ -437,11 +437,11 @@ test "namespaces decoded from an event outlive the call" {
     var buf: [256]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
     const ns = [_][]const u8{ "moq-test", "interop" };
-    try msg.writeNamespace(&fbs, .{ .track_namespace = &ns });
+    try msg.writeNamespace(&fbs, .{ .track_namespace_suffix = &ns });
 
     var events: [4]Event = undefined;
     _ = try s.onStreamData(0, buf[0..fbs.seek], false, &events);
-    const got = events[0].namespace.namespace.track_namespace;
+    const got = events[0].namespace.namespace.track_namespace_suffix;
     try testing.expectEqual(@as(usize, 2), got.len);
     try testing.expectEqualStrings("moq-test", got[0]);
     try testing.expectEqualStrings("interop", got[1]);

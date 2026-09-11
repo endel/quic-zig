@@ -340,7 +340,7 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             var fbs = io_compat.fixedBufferStream(&buf);
             switch (self.role) {
                 .publisher => moq_msg.writePublishNamespace(&fbs, .{
-                    .track_namespace_prefix = &TEST_NAMESPACE,
+                    .track_namespace = &TEST_NAMESPACE,
                 }) catch return,
                 .subscriber => moq_msg.writeSubscribe(&fbs, .{
                     .track_namespace = self.subscribe_namespace,

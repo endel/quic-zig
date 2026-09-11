@@ -354,7 +354,7 @@ const RelayHandler = struct {
 
         var buf: [512]u8 = undefined;
         var ns_fbs = io_compat.fixedBufferStream(&buf);
-        try moq_msg.writeNamespace(&ns_fbs, .{ .track_namespace = parts_buf[0..n_parts] });
+        try moq_msg.writeNamespace(&ns_fbs, .{ .track_namespace_suffix = parts_buf[0..n_parts] });
         try stream.send.writeData(buf[0..ns_fbs.seek]);
     }
 

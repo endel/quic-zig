@@ -733,7 +733,7 @@ test "fuzz: moq control message decode" {
             // Every decoder sees every payload: a peer can put any message
             // type on the wire, and a mis-typed body must not be a crash.
             var ns: moq_msg.NamespaceBuf = undefined;
-            var kvs: [16]moq_wire.KvEntry = undefined;
+            var kvs: [moq_msg.MAX_PARAMS]moq_msg.Param = undefined;
             _ = moq_msg.decodeSetupPayload(body) catch {};
             _ = moq_msg.decodeGoaway(body) catch {};
             _ = moq_msg.decodeRequestOk(body, &kvs) catch {};
@@ -750,7 +750,7 @@ test "fuzz: moq control message decode" {
             _ = moq_msg.decodeFetch(body, &ns) catch {};
             _ = moq_msg.decodeFetchOk(body) catch {};
             _ = moq_msg.decodeTrackStatus(body, &ns) catch {};
-            _ = moq_msg.decodePublishBlocked(body) catch {};
+            _ = moq_msg.decodePublishBlocked(body, &ns) catch {};
         }
     }.f, .{});
 }
@@ -782,7 +782,7 @@ test "moq decoders survive a randomized sweep" {
 
     var buf: [512]u8 = undefined;
     var ns: moq_msg.NamespaceBuf = undefined;
-    var kvs: [16]moq_wire.KvEntry = undefined;
+    var kvs: [moq_msg.MAX_PARAMS]moq_msg.Param = undefined;
 
     for (0..20_000) |i| {
         const len = rand.uintLessThan(usize, buf.len);
@@ -816,7 +816,7 @@ test "moq decoders survive a randomized sweep" {
     }
 }
 
-fn sweepMoqDecoders(input: []const u8, ns: *moq_msg.NamespaceBuf, kvs: []moq_wire.KvEntry) !void {
+fn sweepMoqDecoders(input: []const u8, ns: *moq_msg.NamespaceBuf, kvs: []moq_msg.Param) !void {
     var f1 = io_compat.fixedBufferStream(input);
     _ = moq_wire.readVarInt(&f1) catch {};
     var f2 = io_compat.fixedBufferStream(input);
@@ -846,10 +846,11 @@ fn sweepMoqDecoders(input: []const u8, ns: *moq_msg.NamespaceBuf, kvs: []moq_wir
     _ = moq_msg.decodePublishNamespace(body, ns) catch {};
     _ = moq_msg.decodeSubscribeNamespace(body, ns) catch {};
     _ = moq_msg.decodeNamespace(body, ns) catch {};
+    _ = moq_msg.decodeNamespaceDone(body, ns) catch {};
     _ = moq_msg.decodeFetch(body, ns) catch {};
     _ = moq_msg.decodeFetchOk(body) catch {};
     _ = moq_msg.decodeTrackStatus(body, ns) catch {};
-    _ = moq_msg.decodePublishBlocked(body) catch {};
+    _ = moq_msg.decodePublishBlocked(body, ns) catch {};
 }
 
 // Writes one valid encoded control message into `buf`, chosen at random.
@@ -863,34 +864,34 @@ fn seedMoqMessage(buf: []u8, rand: std.Random) ?usize {
         1 => moq_msg.writeGoaway(w, .{ .new_uri = "https://x/moq" }) catch return null,
         2 => moq_msg.writeRequestError(w, .{ .error_code = 3, .reason = "no" }) catch return null,
         3 => moq_msg.writeSubscribe(w, .{ .track_namespace = &ns, .track_name = "video" }) catch return null,
-        4 => moq_msg.writeSubscribeOk(w, .{ .track_alias = 9, .group_order = .descending }) catch return null,
+        4 => moq_msg.writeSubscribeOk(w, .{ .track_alias = 9, .largest = .{ .group = 1, .object = 2 } }) catch return null,
         5 => moq_msg.writePublish(w, .{
             .track_namespace = &ns,
             .track_name = "video",
             .track_alias = 2,
-            .publisher_priority = 128,
+            .forward = true,
         }) catch return null,
-        6 => moq_msg.writePublishOk(w, .{ .largest = .{ .group = 4, .object = 5 } }) catch return null,
-        7 => moq_msg.writePublishDone(w, .{ .status_code = 1, .reason = "bye", .final_group = 3 }) catch return null,
+        6 => moq_msg.writePublishOk(w, .{ .subscriber_priority = 4 }) catch return null,
+        7 => moq_msg.writePublishDone(w, .{ .status_code = 1, .stream_count = 3, .reason = "bye" }) catch return null,
         8 => moq_msg.writeFetch(w, .{
-            .track_namespace = &ns,
-            .track_name = "video",
+            .body = .{ .standalone = .{
+                .track_namespace = &ns,
+                .track_name = "video",
+                .start = .{ .group = 0, .object = 0 },
+                .end = .{ .group = 1, .object = 1 },
+            } },
             .subscriber_priority = 1,
             .group_order = .ascending,
-            .start = .{ .group = 0, .object = 0 },
-            .end = .{ .group = 1, .object = 1 },
         }) catch return null,
         9 => moq_msg.writeTrackStatus(w, .{
             .track_namespace = &ns,
             .track_name = "audio",
-            .status_code = 0,
-            .largest = .{ .group = 1, .object = 1 },
         }) catch return null,
         10 => moq_msg.writeSubscribeNamespace(w, .{ .track_namespace_prefix = &ns }) catch return null,
         else => moq_msg.writeRequestUpdate(w, .{
+            .request_id = 1,
             .subscriber_priority = 3,
-            .group_order = .ascending,
-            .end = .{ .group = 2, .object = 2 },
+            .forward = true,
         }) catch return null,
     }
     return fbs.seek;

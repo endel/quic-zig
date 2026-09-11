@@ -209,7 +209,7 @@ const MoqClientHandler = struct {
                 .track_name = ts.name,
                 .subscriber_priority = 128,
                 .group_order = .ascending,
-                .filter_type = .latest_object,
+                .filter = .{ .type = .latest_object },
             }) catch return;
             session.writeStream(bidi, buf[0..fbs.seek]) catch return;
             std.debug.print("[MoQ] Sent SUBSCRIBE on bidi {d} for track \"{s}\"\n", .{ bidi, ts.name });
@@ -244,7 +244,7 @@ const MoqClientHandler = struct {
             .track_namespace = self.ns_parts,
             .track_name = self.track_name,
             .track_alias = 1,
-            .publisher_priority = 128,
+            .forward = true,
         }) catch return;
         session.writeStream(bidi, buf[0..fbs.seek]) catch return;
         std.debug.print("[MoQ] Sent PUBLISH on bidi stream {d}\n", .{bidi});
