@@ -22,7 +22,7 @@ can be a Docker image or just a public URL.
 |---|---|
 | `RELAY_URL` | Relay locator; the scheme selects the transport |
 | `TESTCASE` | One test name, or unset/empty for all |
-| `TLS_DISABLE_VERIFY` | `1` to skip certificate verification |
+| `TLS_DISABLE_VERIFY` | `1` to skip certificate verification (the image defaults to `1`: every relay in the matrix is self-signed) |
 | `VERBOSE` | `1` for diagnostics on stderr |
 
 CLI: `--relay URL`, `--test NAME`, `--list`, `--verbose`,
