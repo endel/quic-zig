@@ -21,6 +21,10 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Added
 
+- `ClientConfig.loop` joins an event loop instead of creating one, so several
+  clients share it and one `run()` drives them all. A client needing two
+  connections at once no longer means two loops and a caller spinning `tick()`
+  over both.
 - Randomized sweeps over the QUIC packet, frame, transport-parameter, HTTP/3
   frame, QPACK, Huffman and capsule parsers, and over a connection fed a
   stream of datagrams. They are what found the above; `zig build fuzz` runs

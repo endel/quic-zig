@@ -157,13 +157,26 @@ spec, so the consequence is recorded alongside the fix.
   Still open underneath: `-ffuzz` itself, which would replace all of this
   with coverage-guided input. Recheck on the next Zig release.
 
-- [ ] **F3. `Client` is one connection per loop (M)** — `event_loop.zig:1432`.
+- [x] **F3. `Client` is one connection per loop (M)** — `event_loop.zig:1432`.
   Any client needing two concurrent connections — the MoQ interop runner's
-  two-connection cases, a relay dialling upstream, a migration test — has to
+  two-connection cases, a relay dialling upstream, a migration test — had to
   instantiate two `Client`s and alternate `tick()` on them, which works but
-  means two sockets, two libxev loops and hand-rolled scheduling. The server
-  side already multiplexes connections over one loop via `ConnectionManager`;
-  the client could use the same seam.
+  means two sockets, two libxev loops and hand-rolled scheduling.
+
+  Fixed the loop half: `ClientConfig.loop` joins an existing loop instead of
+  making one, so several clients share it and one `run()` drives them all. A
+  client that joined a loop never stops it. `event_loop.Xev` exports the
+  backend the build selected, because on Linux a bare `@import("xev")` is a
+  different type. See `two clients share one loop`.
+
+  Left as is: one socket per connection. Separate 4-tuples are the right
+  shape for a client — independent congestion control, and migration tests
+  need them — so `ConnectionManager`'s demultiplexing has nothing to do here.
+  The measured case for going further is weak: rewiring `moq_test_client` onto
+  a shared loop was tried and reverted, because it came out identical on both
+  the healthy path (1.13 s vs 1.18 s) and against an unreachable relay
+  (6.5 s user vs 6.4 s) — the CPU there is handshake retransmission, not the
+  spin.
 
 - [x] **F4. TLS server echoed `config.alpn[0]` regardless of the match (S)** —
   a server advertising more than one protocol told every client its own first
