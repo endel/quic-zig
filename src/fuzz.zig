@@ -973,12 +973,20 @@ test "transport parameters survive a randomized sweep" {
 
     for (0..SWEEP_ITERATIONS) |i| {
         const len = rand.uintLessThan(usize, buf.len);
-        const input = buf[0..len];
+        var input = buf[0..len];
         rand.bytes(input);
 
-        if (i % 2 == 0) {
-            const n = seedTransportParams(input, rand) orelse continue;
-            corrupt(input[0..n], rand);
+        // A parameter block is the whole extension, not a framed message, so
+        // trailing noise after a seeded one just fails the parse. The seeded
+        // cases hand over only what they wrote: one intact, to exercise the
+        // round trip, one corrupted, to exercise the rejection.
+        switch (i % 3) {
+            1, 2 => {
+                const n = seedTransportParams(input, rand) orelse continue;
+                input = input[0..n];
+                if (i % 3 == 2) corrupt(input, rand);
+            },
+            else => {},
         }
 
         const p = transport_params.TransportParams.decode(input) catch continue;
@@ -1044,17 +1052,22 @@ test "HTTP/3 frame, QPACK and Huffman decoders survive a randomized sweep" {
 
     for (0..SWEEP_ITERATIONS) |i| {
         const len = rand.uintLessThan(usize, buf.len);
-        const input = buf[0..len];
+        var input = buf[0..len];
         rand.bytes(input);
 
-        switch (i % 3) {
+        switch (i % 4) {
             0 => {
+                // An HTTP/3 frame carries its own length, so what follows it
+                // is another frame's worth of noise — which is realistic.
                 const n = seedH3Frame(input, rand) orelse continue;
                 corrupt(input[0..n], rand);
             },
-            1 => {
+            // A field section is the whole block: handing over more than was
+            // written just fails the parse before reaching any of it.
+            1, 2 => {
                 const n = seedQpackHeaders(input, rand) orelse continue;
-                corrupt(input[0..n], rand);
+                input = input[0..n];
+                if (i % 4 == 2) corrupt(input, rand);
             },
             else => {},
         }
