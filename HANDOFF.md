@@ -288,12 +288,17 @@ would let `moq-clock` and the rest of the moq-dev tooling use our relay,
 which is the widest external validation available for it.
 
 **d. (Fixed) `cdn.moq.dev` is reachable.** It was written up here as a
-missing HelloRetryRequest; it was not. The message our client refused was a
-**CertificateRequest** — Cloudflare's edge asks for a client certificate, and
-RFC 8446 4.4.2 wants an empty Certificate back rather than silence. Both
-transports now run a full moq-lite session against it. What still needs
-`--tls-disable-verify` is the server chain: `ca_cert_path` is ignored pending
-the Zig 0.16 `Io` threading.
+missing HelloRetryRequest. It was two other things:
+
+1. A **CertificateRequest** — Cloudflare's edge asks for a client certificate,
+   and RFC 8446 4.4.2 wants an empty Certificate back rather than silence.
+2. Certificate validity compared against `CLOCK_MONOTONIC`, whose zero is the
+   last boot, so every real certificate read as not-yet-valid.
+
+Both transports now run a full moq-lite session against it with the chain
+verified. What is still missing is the trust anchor — `ca_cert_path` is
+ignored pending the Zig 0.16 `Io` threading, so the chain is checked but
+never rooted.
 
 ### Core quic-zig, for a session that is not about MoQ
 

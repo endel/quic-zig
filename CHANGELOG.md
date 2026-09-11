@@ -7,12 +7,19 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- Certificate validity was checked against the monotonic clock, whose zero is
+  the last boot, so every real certificate looked not-yet-valid and no chain
+  could verify — which is why `skip_cert_verify` was the only way to connect
+  anywhere. Session tickets carried the same timestamp, making a ticket
+  issued by one host meaningless to another, and one older than 49 days
+  aborted the process instead of wrapping.
 - A server asking for a client certificate ended the handshake. Cloudflare's
   edge does, so `cdn.moq.dev` — and presumably any relay behind Cloudflare —
   could not be reached at all, over either transport. The request is now
   answered the way RFC 8446 says to when there is nothing to offer: with an
-  empty certificate. Verifying the server's own chain is still a separate
-  gap; `cdn.moq.dev` needs `--tls-disable-verify` until `ca_cert_path` works.
+  empty certificate. With both fixed, `cdn.moq.dev` runs a full session over
+  either transport with its chain verified — though not yet rooted in a trust
+  store, which still needs `ca_cert_path`.
 - A peer could abort the process before the handshake completed. A QUIC packet
   whose Length field was below its packet number length read gigabytes past
   the datagram, and one below the 16-byte AEAD tag tripped an assertion; an

@@ -108,10 +108,19 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
   carries a bare selected_group, which our 4-byte minimum rejects. That is the
   fingerprint to look for next time.
 
-- [ ] **I2b. Server certificate chains do not verify (S/M)** — `cdn.moq.dev`
-  needs `--tls-disable-verify`; with verification on it is `BadCertificate`.
-  Same root as I3: `ca_cert_path` is ignored pending the 0.16 `Io` threading
-  (`event_loop.zig`), so there is no trust store to verify against.
+- [x] **I2b. Certificate validity was checked against the monotonic clock
+  (S)** — `sys.nanoTimestamp()` is `CLOCK_MONOTONIC`, whose zero is the last
+  boot, and `tls13.zig` compared X.509 notBefore/notAfter against it. Every
+  real certificate read as `CertificateNotYetValid`, so a chain could never
+  verify and everything ran with `skip_cert_verify`. Session tickets embedded
+  the same clock, so a ticket issued by one host and presented to another
+  computed a meaningless age — and one older than ~49 days aborted the
+  process on a `u32` overflow rather than wrapping as RFC 8446 4.2.11 says.
+  Fixed with `sys.realtimeSeconds()`. `cdn.moq.dev` now verifies.
+
+  Still open is the trust anchor: `ca_cert_path` is ignored pending the 0.16
+  `Io` threading (`event_loop.zig`), so the chain is checked link by link and
+  against the hostname, but never rooted. That is I3.
 - [ ] **I3. Client cert verification defaults off (S)** — flip `skip_cert_verify`
   (`tls13.zig:509`) when server_name+ca_bundle present.
 - [ ] **I4. Cipher/curve breadth (S/M/L)** — AES-256-GCM-SHA384, P-384, X25519MLKEM768.

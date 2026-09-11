@@ -149,7 +149,7 @@ Peers to test against:
 |---|---|
 | our relay | `zig build run-moq-relay -- --port 4455` |
 | moq-rs (draft-17) | `cargo install moq-relay`, then `moq-relay <config.toml>` |
-| `cdn.moq.dev` | public; reachable, needs `--tls-disable-verify` |
+| `cdn.moq.dev` | public; reachable, certificate verifies |
 
 ## Registering with the runner
 
@@ -169,13 +169,20 @@ pairs with most of its eighteen relays; draft-17 with four.
 
 ## Known blockers
 
-- **`cdn.moq.dev` needs `--tls-disable-verify`.** The handshake completes and
-  a full moq-lite session runs over both transports; what fails is verifying
-  Cloudflare's certificate chain, because `ca_cert_path` is still ignored
-  pending the Zig 0.16 `Io` threading. A QUIC-layer gap, not a MoQ one.
+- **(Cleared) `cdn.moq.dev` is reachable.** A full moq-lite session runs over
+  both transports, with Cloudflare's certificate chain verified — hostname,
+  each link's signature, CA:TRUE/keyCertSign, validity dates. What is still
+  missing is the trust anchor: `ca_cert_path` is ignored pending the Zig 0.16
+  `Io` threading, so the chain is checked but never rooted (TODO I3).
 
   It used to fail outright, with `error.UnexpectedMessage` on both transports,
-  and that was recorded here as a missing HelloRetryRequest. It was not: the
-  message was a **CertificateRequest** (handshake type 13). Cloudflare's edge
-  asks for a client certificate, and refusing to answer ended the handshake.
+  and that was recorded here as a missing HelloRetryRequest. Two unrelated
+  bugs, neither of them HRR:
+
+  1. The message was a **CertificateRequest** (handshake type 13). Cloudflare's
+     edge asks for a client certificate, and refusing to answer ended the
+     handshake.
+  2. Certificate validity was compared against `CLOCK_MONOTONIC`, so every
+     real certificate read as not-yet-valid and no chain could ever verify.
+
   We still implement no HelloRetryRequest — it would fail as `DecodeError`.
