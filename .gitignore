@@ -8,3 +8,4 @@ fuzz/corpus
 interop/runner/matrix-logs
 interop/runner/matrix-results.txt
 node_modules
+interop/browser/certs
