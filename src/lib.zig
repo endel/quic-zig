@@ -28,4 +28,12 @@ pub const moq = struct {
     pub const version = @import("moq/version.zig");
     pub const url = @import("moq/url.zig");
     pub const session = @import("moq/session.zig");
+
+    /// moq-lite (draft-lcurley-moq-lite-05) — a separate wire format from
+    /// the IETF draft above, sharing only the transport underneath.
+    pub const lite = struct {
+        pub const wire = @import("moq/lite/wire.zig");
+        pub const message = @import("moq/lite/message.zig");
+        pub const version = @import("moq/lite/version.zig");
+    };
 };
