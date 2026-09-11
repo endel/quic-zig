@@ -213,7 +213,7 @@ not once the earlier cases have run. See
 | `moq-test-client` → our WebTransport relay, both drafts | 7/7 each |
 | `moq-test-client` → moq-relay v0.14.16, raw QUIC, both drafts | 5/7 each |
 | `moq-test-client` → moq-relay v0.14.16, WebTransport, both drafts | 5/7 each |
-| `moq-test-client` → `cdn.moq.dev` | blocked at TLS: no HelloRetryRequest |
+| `moq-test-client` → `cdn.moq.dev` | reachable; it speaks moq-lite, not this dialect |
 | Zig pub → Zig relay → Zig sub (raw QUIC) | ✅ |
 | Datagram objects, pub → relay → sub (raw QUIC) | ✅ both drafts |
 | Browser → Zig WT relay → browser (live video) | ✅ 81 frames published, 51 decoded |

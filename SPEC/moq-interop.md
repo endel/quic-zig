@@ -149,7 +149,7 @@ Peers to test against:
 |---|---|
 | our relay | `zig build run-moq-relay -- --port 4455` |
 | moq-rs (draft-17) | `cargo install moq-relay`, then `moq-relay <config.toml>` |
-| `cdn.moq.dev` | public; currently unreachable — see below |
+| `cdn.moq.dev` | public; reachable, needs `--tls-disable-verify` |
 
 ## Registering with the runner
 
@@ -169,7 +169,13 @@ pairs with most of its eighteen relays; draft-17 with four.
 
 ## Known blockers
 
-- **`cdn.moq.dev` does not complete a TLS handshake.** Both transports fail
-  identically with `error.UnexpectedMessage`, before any MoQ is exchanged.
-  Our TLS 1.3 implements no HelloRetryRequest, which Cloudflare's edge asks
-  for. This is a QUIC-layer gap, not a MoQ one.
+- **`cdn.moq.dev` needs `--tls-disable-verify`.** The handshake completes and
+  a full moq-lite session runs over both transports; what fails is verifying
+  Cloudflare's certificate chain, because `ca_cert_path` is still ignored
+  pending the Zig 0.16 `Io` threading. A QUIC-layer gap, not a MoQ one.
+
+  It used to fail outright, with `error.UnexpectedMessage` on both transports,
+  and that was recorded here as a missing HelloRetryRequest. It was not: the
+  message was a **CertificateRequest** (handshake type 13). Cloudflare's edge
+  asks for a client certificate, and refusing to answer ended the handshake.
+  We still implement no HelloRetryRequest — it would fail as `DecodeError`.

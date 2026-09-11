@@ -7,6 +7,12 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A server asking for a client certificate ended the handshake. Cloudflare's
+  edge does, so `cdn.moq.dev` — and presumably any relay behind Cloudflare —
+  could not be reached at all, over either transport. The request is now
+  answered the way RFC 8446 says to when there is nothing to offer: with an
+  empty certificate. Verifying the server's own chain is still a separate
+  gap; `cdn.moq.dev` needs `--tls-disable-verify` until `ca_cert_path` works.
 - A peer could abort the process before the handshake completed. A QUIC packet
   whose Length field was below its packet number length read gigabytes past
   the datagram, and one below the 16-byte AEAD tag tripped an assertion; an

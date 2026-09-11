@@ -573,7 +573,7 @@ details, and [moq-interop.md](moq-interop.md) for the interop runner.
 | draft-18, alongside draft-17 | ✅ Done — chosen by ALPN, per peer |
 | Interop: both relays, both drafts | ✅ 7/7 each |
 | Interop: moq-relay v0.14.16 (both transports, both drafts) | ⚠ 6/7 — their non-standard error code |
-| Interop: cdn.moq.dev | ❌ Blocked at TLS (no HelloRetryRequest) |
+| Interop: cdn.moq.dev | ✅ moq-lite over both transports, with `--tls-disable-verify` |
 
 ### moq-lite (draft-lcurley-moq-lite-05)
 

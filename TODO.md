@@ -95,13 +95,23 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
 
 - [ ] **I1. Server-level 0-RTT queue + undecryptable-queue expiry (M)** —
   `connection_manager.zig:317`. (Relevant to `debug/zerortt-quic-go-interop`.)
-- [ ] **I2. HelloRetryRequest unsupported (M)** — `tls13.zig`. Now known to
-  block real servers, not just theoretically: `cdn.moq.dev` (Cloudflare)
-  fails at `error.UnexpectedMessage` over both raw QUIC and WebTransport,
-  before any application protocol. Likely the same cause as I4's missing
-  X25519MLKEM768 — the edge asks for a group we did not offer. The
-  fingerprint to look for is both transports failing identically at the
-  handshake.
+- [ ] **I2. HelloRetryRequest unsupported (M)** — `tls13.zig`. Still missing,
+  but no longer known to block anything. The `cdn.moq.dev` failure attributed
+  to it here was a misdiagnosis: instrumenting the `UnexpectedMessage` showed
+  handshake type 13, a **CertificateRequest**, arriving where the server's own
+  Certificate was expected. X25519 had been accepted and there was no HRR in
+  sight. Handling it (RFC 8446 4.3.2/4.4.2 — accept the request, answer with an
+  empty Certificate) makes `cdn.moq.dev` work over both raw QUIC and
+  WebTransport: full moq-lite session, 8 broadcasts listed.
+
+  An HRR would fail as `DecodeError`, not `UnexpectedMessage` — its key_share
+  carries a bare selected_group, which our 4-byte minimum rejects. That is the
+  fingerprint to look for next time.
+
+- [ ] **I2b. Server certificate chains do not verify (S/M)** — `cdn.moq.dev`
+  needs `--tls-disable-verify`; with verification on it is `BadCertificate`.
+  Same root as I3: `ca_cert_path` is ignored pending the 0.16 `Io` threading
+  (`event_loop.zig`), so there is no trust store to verify against.
 - [ ] **I3. Client cert verification defaults off (S)** — flip `skip_cert_verify`
   (`tls13.zig:509`) when server_name+ca_bundle present.
 - [ ] **I4. Cipher/curve breadth (S/M/L)** — AES-256-GCM-SHA384, P-384, X25519MLKEM768.

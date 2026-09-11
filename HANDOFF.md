@@ -287,10 +287,13 @@ WebTransport-only; `moq-lite` the client does both. Supporting lite-04
 would let `moq-clock` and the rest of the moq-dev tooling use our relay,
 which is the widest external validation available for it.
 
-**d. `cdn.moq.dev` is unreachable — no HelloRetryRequest.** Both transports
-fail identically at TLS with `error.UnexpectedMessage`, before any MoQ.
-Cloudflare's edge asks for HRR and `src/quic/tls13.zig` has no notion of
-it. This blocks every public MoQ relay, and probably more than MoQ.
+**d. (Fixed) `cdn.moq.dev` is reachable.** It was written up here as a
+missing HelloRetryRequest; it was not. The message our client refused was a
+**CertificateRequest** — Cloudflare's edge asks for a client certificate, and
+RFC 8446 4.4.2 wants an empty Certificate back rather than silence. Both
+transports now run a full moq-lite session against it. What still needs
+`--tls-disable-verify` is the server chain: `ca_cert_path` is ignored pending
+the Zig 0.16 `Io` threading.
 
 ### Core quic-zig, for a session that is not about MoQ
 
@@ -299,21 +302,23 @@ They are written up as **Tier 5** in [`TODO.md`](TODO.md) with the
 consequence each one had, which is the part that is hard to reconstruct
 later:
 
-- `Client.stop()` queues the CONNECTION_CLOSE and never sends it, so a
-  `tick()`-driven client that exits leaves the peer holding the session for
-  its full idle timeout. It surfaces as an unrelated connection failing
-  much later.
-- 23 of 26 fuzz targets never see a random byte, because `-ffuzz` does not
-  compile on Zig 0.16.0. The fixed-seed sweep written for the MoQ parsers
-  found a one-byte remote abort immediately; the QUIC and H3 parsers have
-  nothing equivalent.
-- `Client` is one connection per loop, so anything needing two concurrent
-  connections instantiates two of everything.
-- (Fixed) a TLS server advertising several ALPN protocols echoed its own
-  first choice rather than the one that matched.
+All four are now fixed, and the sweeps turned up four more:
 
-`TODO.md` also now records what `I2. HelloRetryRequest unsupported` actually
-costs: it is what blocks `cdn.moq.dev`, and probably any Cloudflare edge.
+- `Client.stop()` queued the CONNECTION_CLOSE and never sent it, so a
+  `tick()`-driven client that exited left the peer holding the session for
+  its full idle timeout. It surfaced as an unrelated connection failing
+  much later.
+- 23 of 26 fuzz targets never saw a random byte, because `-ffuzz` does not
+  compile on Zig 0.16.0. The fixed-seed sweep pattern now covers the QUIC and
+  HTTP/3 parsers too, and a connection fed a stream of datagrams. It found
+  four remote aborts, three of them reachable before the handshake completes:
+  a QPACK integer that overflows its accumulator, a packet Length below the
+  packet number length, one below the AEAD tag, and an Initial token past the
+  buffer the associated data is built in.
+- `Client` was one connection per loop. `ClientConfig.loop` joins an existing
+  one; the socket stays per-connection, which is the right shape for a client.
+- A TLS server advertising several ALPN protocols echoed its own first choice
+  rather than the one that matched.
 
 ### Carried over
 
