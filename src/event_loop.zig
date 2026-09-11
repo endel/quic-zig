@@ -11,6 +11,11 @@ const io_compat = @import("io_compat.zig");
 // io_uring init fails in some containers used by the interop runner.
 const xev = if (builtin.os.tag == .linux) xev_mod.Epoll else xev_mod;
 
+/// The libxev backend this build selected. A caller sharing one loop across
+/// several clients has to create it from here: on Linux this is `Epoll`, not
+/// what a bare `@import("xev")` gives you, and the two are different types.
+pub const Xev = xev;
+
 const connection = @import("quic/connection.zig");
 const connection_manager = @import("quic/connection_manager.zig");
 const ConnEntry = connection_manager.ConnEntry;
@@ -23,6 +28,7 @@ const qpack = @import("h3/qpack.zig");
 const wt = @import("webtransport/session.zig");
 const packet = @import("quic/packet.zig");
 const Certificate = std.crypto.Certificate;
+const ca_bundle = @import("quic/ca_bundle.zig");
 
 pub const Protocol = enum { quic, h3, h0, webtransport };
 
@@ -77,10 +83,13 @@ pub const Session = struct {
         }
     }
 
+    /// `session_id` names the WebTransport session; on raw QUIC there is
+    /// none and it is ignored.
     pub fn sendDatagram(self: *Session, session_id: u64, data: []const u8) !void {
         if (self.entry.wt_conn) |wtc| {
-            try wtc.sendDatagram(session_id, data);
+            return wtc.sendDatagram(session_id, data);
         }
+        return self.entry.conn.sendDatagram(data);
     }
 
     pub fn acceptSession(self: *Session, session_id: u64) !void {
@@ -600,6 +609,11 @@ pub fn Server(comptime Handler: type) type {
                     conn.close(0, "server shutdown");
                 }
             }
+            // close() only queues the frame. Waiting for the loop to send it
+            // is fine when the caller goes on to run(), and silently wrong
+            // when it exits instead — the peer then holds the connection
+            // until its idle timeout rather than learning we are gone.
+            self.flush();
         }
 
         // ---- Internal callbacks ----
@@ -851,14 +865,10 @@ pub fn Server(comptime Handler: type) type {
 
                 switch (event.?) {
                     .connect_request => |req| {
-                        if (@hasDecl(Handler, "onConnectRequest")) {
-                            self.handler.onConnectRequest(&session, req.session_id, req.path);
-                        }
+                        self.dispatchConnectRequest(&session, req.session_id, req.path, req.headers);
                     },
                     .session_ready => |sr| {
-                        if (@hasDecl(Handler, "onSessionReady")) {
-                            self.handler.onSessionReady(&session, sr.session_id);
-                        }
+                        self.dispatchSessionReady(&session, sr.session_id, sr.headers);
                     },
                     .stream_data => |sd| {
                         self.dispatchStreamData(&session, sd.stream_id, sd.data, sd.fin);
@@ -901,6 +911,28 @@ pub fn Server(comptime Handler: type) type {
                 self.handler.onStreamData(session, stream_id, data, fin);
             } else if (data.len > 0) {
                 self.handler.onStreamData(session, stream_id, data);
+            }
+        }
+
+        // The 5-arity form also receives the CONNECT request headers, which
+        // is where WebTransport carries the application-protocol offer.
+        fn dispatchConnectRequest(self: *Self, session: *Session, session_id: u64, path: []const u8, headers: []const qpack.Header) void {
+            if (!@hasDecl(Handler, "onConnectRequest")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onConnectRequest)).@"fn".params.len == 5) {
+                self.handler.onConnectRequest(session, session_id, path, headers);
+            } else {
+                self.handler.onConnectRequest(session, session_id, path);
+            }
+        }
+
+        fn dispatchSessionReady(self: *Self, session: *Session, session_id: u64, headers: []const qpack.Header) void {
+            if (!@hasDecl(Handler, "onSessionReady")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".params.len == 4) {
+                self.handler.onSessionReady(session, session_id, headers);
+            } else {
+                self.handler.onSessionReady(session, session_id);
             }
         }
 
@@ -972,6 +1004,16 @@ pub fn Server(comptime Handler: type) type {
 
             if (@hasDecl(Handler, "onPollComplete")) {
                 self.handler.onPollComplete(&session);
+            }
+
+            // Raw QUIC has no session id to report, so 0 stands in.
+            // WebTransport installs a zero-copy callback instead and does
+            // not reach here.
+            if (@hasDecl(Handler, "onDatagram")) {
+                while (conn.peekDatagram()) |dg| {
+                    self.handler.onDatagram(&session, 0, dg);
+                    conn.consumeDatagram();
+                }
             }
 
             // Poll bidirectional streams.
@@ -1128,11 +1170,16 @@ pub fn Server(comptime Handler: type) type {
                 }
             }
 
-            const deadline = earliest orelse return null;
+            // A handler with its own deadlines — a publisher on a tick, a
+            // relay holding a subscription open — cannot rely on QUIC having
+            // a timer pending, so let it name a cadence to be woken on.
+            const floor: ?u64 = if (@hasDecl(Handler, "poll_interval_ms")) Handler.poll_interval_ms else null;
+
+            const deadline = earliest orelse return floor;
             const delta_ns = deadline - now;
             if (delta_ns <= 0) return 1; // overdue — fire on next tick
             const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
-            return ms;
+            return if (floor) |f| @min(ms, f) else ms;
         }
     };
 }
@@ -1150,11 +1197,31 @@ pub const ClientConfig = struct {
     // WebTransport session path (auto-CONNECT on handshake complete)
     path: []const u8 = "/.well-known/webtransport",
 
+    // Extra headers on the extended CONNECT — this is where
+    // WT-Available-Protocols goes. The slices must outlive the client.
+    connect_headers: []const qpack.Header = &.{},
+
     // TLS ALPN override (when null, derived from handler protocol: "h3" for h3/webtransport)
     alpn: ?[]const u8 = null,
 
     // TLS verification
-    ca_cert_path: ?[]const u8 = null,
+    /// Where the trust anchors come from. `.none` leaves the chain unrooted:
+    /// the hostname, each link's signature, CA:TRUE/keyCertSign and the
+    /// validity dates are still checked, but nothing says the chain ends
+    /// anywhere you trust. `.system` reads the platform's store, `.file` a
+    /// PEM bundle of your own — a private CA, an interop peer's.
+    ///
+    /// Anything but `.none` also turns `skip_cert_verify` off.
+    ///
+    /// Each client loads its own copy — about 13 ms for the 163 certificates
+    /// in the macOS store. For many short-lived clients in one process, build
+    /// one `ca_bundle.loadSystem()` yourself and hand it to every connection
+    /// through `tls_config`.
+    ca: union(enum) {
+        none,
+        system,
+        file: []const u8,
+    } = .none,
     skip_cert_verify: bool = false,
 
     // QUIC transport
@@ -1166,6 +1233,18 @@ pub const ClientConfig = struct {
 
     // IPv6
     ipv6: bool = false,
+
+    /// An event loop to join rather than create. Several clients sharing one
+    /// loop is how you drive more than one connection at a time without
+    /// spinning `tick()` over each of them in turn: the caller owns the loop,
+    /// calls `start()` on each client, and then runs it. A client that joined
+    /// a loop never stops it, so one shutting down leaves the others running.
+    ///
+    /// The loop outlives the client, so the client's completions have to be
+    /// off it before `deinit()`: `stop()`, then `tick()` until
+    /// `conn.isClosed()`. Deinitialising every client before the loop and not
+    /// running it again does just as well.
+    loop: ?*xev.Loop = null,
 };
 
 /// ClientSession wraps a single client-side connection and provides the same
@@ -1270,10 +1349,13 @@ pub const ClientSession = struct {
         } else return error.NoWtConnection;
     }
 
+    /// `session_id` names the WebTransport session; on raw QUIC there is
+    /// none and it is ignored.
     pub fn sendDatagram(self: *ClientSession, session_id: u64, data: []const u8) !void {
         if (self.wt_conn) |wtc| {
-            try wtc.sendDatagram(session_id, data);
-        } else return error.NoWtConnection;
+            return wtc.sendDatagram(session_id, data);
+        }
+        return self.conn.sendDatagram(data);
     }
 
     pub fn closeStream(self: *ClientSession, stream_id: u64) void {
@@ -1443,8 +1525,11 @@ pub fn Client(comptime Handler: type) type {
         allocator: std.mem.Allocator,
         handler: *Handler,
 
-        // libxev
-        loop: xev.Loop,
+        // libxev. `own_loop` is unused when the caller supplied one, and the
+        // active loop comes from eventLoop() rather than a stored pointer:
+        // init() returns by value, so a pointer into self would dangle.
+        own_loop: xev.Loop,
+        shared_loop: ?*xev.Loop,
         file: xev.File,
         timer: xev.Timer,
         poll_completion: xev.Completion,
@@ -1485,13 +1570,18 @@ pub fn Client(comptime Handler: type) type {
         // Config retained for protocol init
         server_name: []const u8,
         path: []const u8,
+        connect_headers: []const qpack.Header,
 
         /// The default ALPN list, when we built it rather than the caller.
         owned_alpn: ?[][]const u8,
 
+        /// The trust anchors, when `ClientConfig.ca` asked us to load them.
+        owned_ca: ?*Certificate.Bundle,
+
         pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: ClientConfig) !Self {
             // Build TLS config
             var owned_alpn: ?[][]const u8 = null;
+            var owned_ca: ?*Certificate.Bundle = null;
             const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
                 const alpn = try alloc.alloc([]const u8, 1);
                 owned_alpn = alpn;
@@ -1500,14 +1590,17 @@ pub fn Client(comptime Handler: type) type {
                     .quic, .h0 => "h3", // default; override via config.alpn for custom protocols
                 };
 
-                const ca_bundle: ?*Certificate.Bundle = null;
-                if (config.ca_cert_path) |ca_path| {
-                    _ = ca_path;
-                    // TODO(zig-0.16): Certificate.Bundle.addCertsFromFilePath now
-                    // requires an Io instance and Io.Dir — needs an Io threaded
-                    // through the event_loop Config. Skipped for Phase 2 since
-                    // skip_cert_verify covers the interop test paths.
-                    log.warn("ca_cert_path ignored: pending 0.16 Io threading", .{});
+                // On the heap: init() returns by value, so a bundle stored
+                // in the client would move out from under this pointer.
+                if (config.ca != .none) {
+                    const b = try alloc.create(Certificate.Bundle);
+                    errdefer alloc.destroy(b);
+                    b.* = switch (config.ca) {
+                        .none => unreachable,
+                        .system => try ca_bundle.loadSystem(alloc),
+                        .file => |path| try ca_bundle.loadFile(alloc, path),
+                    };
+                    owned_ca = b;
                 }
 
                 break :blk .{
@@ -1515,8 +1608,8 @@ pub fn Client(comptime Handler: type) type {
                     .private_key_bytes = &.{},
                     .alpn = alpn,
                     .server_name = config.server_name,
-                    .skip_cert_verify = config.skip_cert_verify,
-                    .ca_bundle = ca_bundle,
+                    .skip_cert_verify = if (owned_ca != null) false else config.skip_cert_verify,
+                    .ca_bundle = owned_ca,
                 };
             };
 
@@ -1532,6 +1625,10 @@ pub fn Client(comptime Handler: type) type {
             // Heap-allocate for pointer stability, then build in place: the
             // by-value connect() would stage all ~137 KB on the stack first.
             errdefer if (owned_alpn) |a| alloc.free(a);
+            errdefer if (owned_ca) |b| {
+                b.deinit(alloc);
+                alloc.destroy(b);
+            };
 
             const conn_ptr = try alloc.create(connection.Connection);
             errdefer alloc.destroy(conn_ptr);
@@ -1575,14 +1672,15 @@ pub fn Client(comptime Handler: type) type {
             ecn_socket.enableEcnRecv(sockfd) catch {};
 
             // Init libxev
-            const loop = try xev.Loop.init(.{});
+            const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
             const file_handle = xev.File.initFd(sockfd);
             const timer_handle = try xev.Timer.init();
 
             return .{
                 .allocator = alloc,
                 .handler = handler,
-                .loop = loop,
+                .own_loop = loop,
+                .shared_loop = config.loop,
                 .file = file_handle,
                 .timer = timer_handle,
                 .poll_completion = .{},
@@ -1606,7 +1704,9 @@ pub fn Client(comptime Handler: type) type {
                 .finished_streams = std.AutoHashMap(u64, void).init(alloc),
                 .server_name = config.server_name,
                 .path = config.path,
+                .connect_headers = config.connect_headers,
                 .owned_alpn = owned_alpn,
+                .owned_ca = owned_ca,
             };
         }
 
@@ -1615,29 +1715,49 @@ pub fn Client(comptime Handler: type) type {
             self.wt_conn = null;
             self.h3_conn = null;
             if (self.owned_alpn) |a| self.allocator.free(a);
+            if (self.owned_ca) |b| {
+                b.deinit(self.allocator);
+                self.allocator.destroy(b);
+            }
             self.finished_streams.deinit();
             self.timer.deinit();
-            self.loop.deinit();
+            if (self.shared_loop == null) self.own_loop.deinit();
             sys.close(self.sockfd);
             self.conn.deinit();
             self.allocator.destroy(self.conn);
         }
 
+        /// The loop this client runs on, ours or the caller's.
+        pub fn eventLoop(self: *Self) *xev.Loop {
+            return self.shared_loop orelse &self.own_loop;
+        }
+
         pub fn start(self: *Self) void {
-            self.file.poll(&self.loop, &self.poll_completion, .read, Self, self, onReadable);
-            self.timer.run(&self.loop, &self.timer_completion, 1, Self, self, onTimer);
+            const loop = self.eventLoop();
+            self.file.poll(loop, &self.poll_completion, .read, Self, self, onReadable);
+            self.timer.run(loop, &self.timer_completion, 1, Self, self, onTimer);
             self.timer_armed = true;
             self.started = true;
         }
 
+        /// Runs until this client's connection closes. Only for a client that
+        /// owns its loop: on a shared one this would drive the other clients
+        /// too and return when the last of them finished.
         pub fn run(self: *Self) !void {
+            std.debug.assert(self.shared_loop == null);
             self.start();
-            try self.loop.run(.until_done);
+            try self.own_loop.run(.until_done);
         }
 
         pub fn tick(self: *Self) !void {
             if (!self.started) self.start();
-            try self.loop.run(.no_wait);
+            try self.eventLoop().run(.no_wait);
+        }
+
+        /// A shared loop belongs to the caller and outlives us, so leaving it
+        /// running is the whole point of sharing it.
+        fn stopOwnLoop(self: *Self) void {
+            if (self.shared_loop == null) self.own_loop.stop();
         }
 
         pub fn flush(self: *Self) void {
@@ -1662,12 +1782,15 @@ pub fn Client(comptime Handler: type) type {
             self.rescheduleTimer();
         }
 
+        /// Closes the connection and puts the CONNECTION_CLOSE on the wire.
+        /// See the note on the server's stop() for why it flushes here.
         pub fn stop(self: *Self) void {
             self.stopping = true;
             const conn = self.conn;
             if (!conn.isClosed() and conn.state != .closing and conn.state != .draining) {
                 conn.close(0, "client shutdown");
             }
+            self.flush();
         }
 
         // ---- Internal callbacks ----
@@ -1693,7 +1816,7 @@ pub fn Client(comptime Handler: type) type {
             }
 
             if (self.stopping and self.conn.isClosed()) {
-                self.loop.stop();
+                self.stopOwnLoop();
                 return .disarm;
             }
 
@@ -1716,7 +1839,7 @@ pub fn Client(comptime Handler: type) type {
             self.tickAndSend();
 
             if (self.stopping and self.conn.isClosed()) {
-                self.loop.stop();
+                self.stopOwnLoop();
                 return .disarm;
             }
 
@@ -1803,9 +1926,10 @@ pub fn Client(comptime Handler: type) type {
                     self.wt_conn = wtc;
 
                     // Send Extended CONNECT to establish WebTransport session
-                    const session_id = wtc.connect(
+                    const session_id = wtc.connectWithHeaders(
                         self.server_name,
                         self.path,
+                        self.connect_headers,
                     ) catch return;
                     self.session_id = session_id;
                 },
@@ -1836,9 +1960,7 @@ pub fn Client(comptime Handler: type) type {
 
                 switch (event.?) {
                     .session_ready => |sr| {
-                        if (@hasDecl(Handler, "onSessionReady")) {
-                            self.handler.onSessionReady(&session, sr.session_id);
-                        }
+                        self.dispatchSessionReady(&session, sr.session_id, sr.headers);
                     },
                     .session_rejected => |rej| {
                         if (@hasDecl(Handler, "onSessionRejected")) {
@@ -1876,6 +1998,18 @@ pub fn Client(comptime Handler: type) type {
                     },
                     .connect_request => {},
                 }
+            }
+        }
+
+        // The 4-arity form also receives the CONNECT response headers, which
+        // is where WebTransport names the negotiated application protocol.
+        fn dispatchSessionReady(self: *Self, session: *ClientSession, session_id: u64, headers: []const qpack.Header) void {
+            if (!@hasDecl(Handler, "onSessionReady")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".params.len == 4) {
+                self.handler.onSessionReady(session, session_id, headers);
+            } else {
+                self.handler.onSessionReady(session, session_id);
             }
         }
 
@@ -1945,6 +2079,14 @@ pub fn Client(comptime Handler: type) type {
                 self.handler.onPollComplete(&session);
             }
 
+            // Raw QUIC has no session id to report, so 0 stands in.
+            if (@hasDecl(Handler, "onDatagram")) {
+                while (conn.peekDatagram()) |dg| {
+                    self.handler.onDatagram(&session, 0, dg);
+                    conn.consumeDatagram();
+                }
+            }
+
             // Poll bidi streams for incoming data
             var stream_it = conn.streams.streams.iterator();
             while (stream_it.next()) |entry| {
@@ -2002,7 +2144,7 @@ pub fn Client(comptime Handler: type) type {
             }
 
             if (conn.isClosed()) {
-                if (self.stopping) self.loop.stop();
+                if (self.stopping) self.stopOwnLoop();
                 return;
             }
 
@@ -2030,9 +2172,10 @@ pub fn Client(comptime Handler: type) type {
         fn rescheduleTimer(self: *Self) void {
             const next_ms = self.computeNextTimeoutMs() orelse return;
 
+            const loop = self.eventLoop();
             if (self.timer_armed) {
                 self.timer.reset(
-                    &self.loop,
+                    loop,
                     &self.timer_completion,
                     &self.timer_cancel_completion,
                     next_ms,
@@ -2042,7 +2185,7 @@ pub fn Client(comptime Handler: type) type {
                 );
             } else {
                 self.timer.run(
-                    &self.loop,
+                    loop,
                     &self.timer_completion,
                     next_ms,
                     Self,
@@ -2054,12 +2197,14 @@ pub fn Client(comptime Handler: type) type {
         }
 
         fn computeNextTimeoutMs(self: *Self) ?u64 {
-            const deadline = self.conn.nextTimeoutNs() orelse return null;
+            const floor: ?u64 = if (@hasDecl(Handler, "poll_interval_ms")) Handler.poll_interval_ms else null;
+            const deadline = self.conn.nextTimeoutNs() orelse return floor;
             const now: i64 = sys.nanoTimestamp();
             const delta_ns = deadline - now;
             if (delta_ns <= 0) return 1;
             const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
-            return if (ms == 0) 1 else ms;
+            const clamped = if (floor) |f| @min(ms, f) else ms;
+            return if (clamped == 0) 1 else clamped;
         }
 
         fn makeSession(self: *Self) ClientSession {
@@ -2146,6 +2291,27 @@ test "Server: handler validation compiles for valid handlers" {
     // These should compile without error
     _ = Server(TestWtHandler);
     _ = Server(TestH3Handler);
+}
+
+test "Server: handlers may take the CONNECT headers" {
+    // The extra parameter is how a WebTransport handler sees
+    // WT-Available-Protocols; both arities have to keep compiling.
+    const WithHeaders = struct {
+        pub const protocol: Protocol = .webtransport;
+        pub fn onConnectRequest(_: *@This(), _: *Session, _: u64, _: []const u8, _: []const qpack.Header) void {}
+        pub fn onSessionReady(_: *@This(), _: *Session, _: u64, _: []const qpack.Header) void {}
+        pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    };
+    _ = Server(WithHeaders);
+}
+
+test "Client: handlers may take the CONNECT response headers" {
+    const WithHeaders = struct {
+        pub const protocol: Protocol = .webtransport;
+        pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    };
+    _ = Client(WithHeaders);
 }
 
 test "Client: handler validation compiles for valid handlers" {
@@ -2304,6 +2470,32 @@ test "Client QUIC: start, tick, stop lifecycle" {
     try testing.expect(client.stopping);
 }
 
+test "stop() leaves nothing queued for the peer" {
+    // The CONNECTION_CLOSE has to be on the wire when stop() returns. If it
+    // is merely queued, a caller that exits instead of running the loop
+    // leaves the peer holding the connection until its idle timeout, and
+    // the symptom shows up on some unrelated connection much later.
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19881,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try client.tick();
+    client.stop();
+
+    try testing.expect(client.conn.state == .closing or client.conn.isClosed());
+
+    // Nothing left to send means the close was drained, not just queued.
+    var buf: [2048]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), client.conn.send(&buf) catch 0);
+}
+
 test "Client: closeConnection from a handler arms the run loop's exit" {
     var handler = struct {
         pub const protocol: Protocol = .quic;
@@ -2324,4 +2516,52 @@ test "Client: closeConnection from a handler arms the run loop's exit" {
     var session = client.makeSession();
     session.closeConnection();
     try testing.expect(client.stopping);
+}
+
+test "two clients share one loop" {
+    // Driving two connections used to mean two loops and a caller spinning
+    // tick() over both. On a shared loop one run() drives them, and one
+    // stopping must not take the other down with it.
+    const H = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    };
+    var handler = H{};
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var a = try Client(H).init(testing.allocator, &handler, .{
+        .port = 19882,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    defer a.deinit();
+
+    var b = try Client(H).init(testing.allocator, &handler, .{
+        .port = 19883,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    defer b.deinit();
+
+    try testing.expectEqual(a.eventLoop(), b.eventLoop());
+
+    a.start();
+    b.start();
+    try loop.run(.no_wait);
+
+    a.stop();
+    try testing.expect(a.conn.state == .closing or a.conn.isClosed());
+
+    // b still has work on a loop a did not stop.
+    try loop.run(.no_wait);
+    try testing.expect(!b.conn.isClosed());
+
+    // The teardown order the config documents: drain each client off the
+    // loop before the loop goes away.
+    for (0..8) |_| {
+        a.tick() catch break;
+        if (a.conn.isClosed()) break;
+    }
 }

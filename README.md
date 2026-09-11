@@ -301,10 +301,13 @@ Produces binaries in `zig-out/bin/`:
 | `wt-server` | WebTransport echo server |
 | `wt-client` | WebTransport client |
 | `wt-browser-server` | WebTransport server for browser clients (0.0.0.0:4433) |
-| `moq-server` | MoQ Transport publisher over raw QUIC (ALPN `moqt-17`) |
+| `moq-server` | MoQ Transport publisher over raw QUIC (ALPN `moqt-18`/`moqt-17`) |
 | `moq-client` | MoQ Transport client over raw QUIC — subscribe or `--mode publish` |
 | `moq-relay` | MoQ Transport relay over raw QUIC (pub/sub fanout, synthetic origin) |
 | `moq-browser-server` | MoQ Transport relay over WebTransport for browser clients |
+| `moq-test-client` | MoQ interop-runner test client (TAP 14) |
+| `moq-lite` | moq-lite client: `publish`, `subscribe`, `announce`, `serve` |
+| `moq-lite-relay` | moq-lite relay over WebTransport |
 | `interop-server` | QUIC Interop Runner server endpoint |
 | `interop-client` | QUIC Interop Runner client endpoint |
 | `interop-wt-server` | QUIC Interop Runner WebTransport server |
@@ -394,10 +397,40 @@ docker build --platform linux/amd64 \
 
 ## Media over QUIC
 
-MoQ Transport (`draft-ietf-moq-transport-17`) is implemented as a set of modules
-under `src/moq/` and re-exported via `quic.moq`. See
-[`SPEC/DRAFT_IETF_MOQ_TRANSPORT_17.md`](./SPEC/DRAFT_IETF_MOQ_TRANSPORT_17.md)
-for the wire format details and verified interop matrix.
+Two dialects, because the standards track and the deployed ecosystem have not
+converged yet. They share the transport underneath and nothing above it — most
+of all, moq-lite uses the QUIC varint where draft-17 uses a leading-ones one.
+
+| | Module | Spec |
+|---|---|---|
+| IETF MoQ Transport draft-17 and draft-18 | `src/moq/`, `quic.moq` | [DRAFT_IETF_MOQ_TRANSPORT.md](./SPEC/DRAFT_IETF_MOQ_TRANSPORT.md) |
+| moq-lite draft-05 | `src/moq/lite/`, `quic.moq.lite` | [DRAFT_LCURLEY_MOQ_LITE_05.md](./SPEC/DRAFT_LCURLEY_MOQ_LITE_05.md) |
+
+Interop with the [MoQ interop runner](https://github.com/englishm/moq-interop-runner):
+[SPEC/moq-interop.md](./SPEC/moq-interop.md), results in
+[SPEC/moq-interop-results.md](./SPEC/moq-interop-results.md).
+
+### moq-lite
+
+```bash
+zig build run-moq-lite-relay -- --port 4450
+zig build run-moq-lite -- publish   --url https://127.0.0.1:4450/ \
+    --broadcast clock --track seconds --tls-disable-verify
+zig build run-moq-lite -- subscribe --url https://127.0.0.1:4450/ \
+    --broadcast clock --track seconds --tls-disable-verify
+```
+
+Against the reference implementation (`cargo install moq-relay moq-clock`), in
+both directions and across a relay that speaks lite-05 to us and lite-04 to
+them. `interop/browser/moq_lite.html` is a standalone JS subscriber;
+`tools/moq_lite_browser_test.mjs` drives it through Chrome.
+
+### MoQ interop test client
+
+```bash
+zig build run-moq-test-client -- --relay moqt://127.0.0.1:4455/ --tls-disable-verify
+tools/moq_interop.sh          # matrix -> SPEC/moq-interop-results.md
+```
 
 ### Live browser video demo
 
@@ -429,10 +462,14 @@ zig build run-moq-client -- --addr 127.0.0.1:4443 --ns live --track camera      
 
 ```zig
 const quic = @import("quic");
-const wire = quic.moq.wire;         // MoQ leading-ones varint, KV codec, tuples
-const msg = quic.moq.message;       // 18 control message codecs (SETUP, SUBSCRIBE, …)
+const wire = quic.moq.wire;         // draft-17 leading-ones varint, KV codec, tuples
+const msg = quic.moq.message;       // all 18 control messages, encode and decode
 const obj = quic.moq.object;        // subgroup/datagram/fetch stream headers
 const track = quic.moq.track;       // TrackNamespace, FilterType, GroupOrder, …
+const session = quic.moq.session;   // SETUP + request-stream state machine
+const url = quic.moq.url;           // moqt:// and https:// relay locators
+
+const lite = quic.moq.lite;         // moq-lite: QUIC varints, its own messages
 ```
 
 Apps that don't reference `quic.moq` don't link any MoQ code — Zig's lazy

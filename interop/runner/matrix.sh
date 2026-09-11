@@ -55,7 +55,11 @@ run_one() {
         echo "  skip  $key ($(grep -F "$key " "$OUT" | tail -1 | awk '{print $NF}'))"
         return
     fi
-    docker rm -f $(docker ps -aq) >/dev/null 2>&1
+    # Clear the previous case's containers. Scoped by name to the three
+    # the runner creates — `docker ps -aq` would take out whatever else the
+    # machine happens to be running, which is a nasty surprise when a peer
+    # relay is up in another terminal.
+    docker rm -f sim server client >/dev/null 2>&1
     docker network prune -f >/dev/null 2>&1
     log="$LOGS/${server}-${client}-${test}.txt"
     json="$LOGS/${server}-${client}-${test}.json"

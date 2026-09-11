@@ -1,32 +1,79 @@
 # quic-zig — handover
 
-State at `4ca8f01`, unpushed. 573/573 unit tests, 448/448 fuzz smoke,
-11/11 `tools/interop_local.sh`, 9/9 `interop/run_local_tests.sh`, and 64/88 on
-the docker matrix — 12 fail, 12 the peer does not implement, every failure
-matching the previous session's verdict, so no regressions. Full matrix in
-[`SPEC/interop-results.md`](SPEC/interop-results.md).
-What changed and why: [`CHANGELOG.md`](CHANGELOG.md).
+Branch `core-followups`, unpushed, on top of `moq-interop-and-lite`. Two
+sessions, both unpushed:
+
+- `moq-interop-and-lite` — MoQ: an interop test client for
+  <https://github.com/englishm/moq-interop-runner>, a substantial correction
+  to the draft-17 control messages, and a moq-lite implementation.
+- `core-followups` — the core problems that work turned up (Tier 5 in
+  [`TODO.md`](TODO.md), all four closed), and the certificate handling they
+  led to. Nine bugs a peer could reach: five found by the new randomized
+  sweeps, a QPACK out-of-bounds write, and the three that together meant no
+  TLS certificate could ever be verified.
+
+    zig build test                    # green
+    zig build fuzz                    # green
+    tools/interop_local.sh            # 11/11
+    interop/run_local_tests.sh        # 9/9
+    interop/runner/matrix.sh          # 64/88, verdict for verdict as before
+    docker run -e RELAY_URL=... quic-zig-moq-client   # 7/7 containerised
+    tools/moq_local.sh                # 11/11, MoQ end to end, our binaries
+    tools/moq_interop.sh              # MoQ vs peers, both drafts
+    node tools/moq_browser_test.mjs   # the video demo, through Chrome
+    node tools/moq_lite_browser_test.mjs          # moq-lite in Chrome
+    RELAY=1 node tools/moq_lite_browser_test.mjs  # ... through our relay
+
+The docker matrix has run four times over these two branches and come back
+64/88 every time, with no case differing from the baseline — including a full
+pass on the `core-followups` work, which touched packet decryption, QPACK and
+the TLS client. (One case, `quiche<-quic-zig handshakecorruption`, failed on
+one pass and passed on a re-run; it is flaky under that peer, which the
+corruption notes below already say. A `longrtt` run once came back ERROR
+rather than a verdict, which is the harness losing its result under CPU
+contention, not a protocol failure.)
+
+MoQ interop, both drafts: 7/7 against our raw-QUIC relay, 7/7 against our
+WebTransport relay, 5/7 against `moq-relay` v0.14.16 — the two it misses
+are its own, written up in `SPEC/moq-interop.md`.
+
+What changed and why: [`CHANGELOG.md`](CHANGELOG.md). MoQ specifics:
+[`SPEC/moq-interop.md`](SPEC/moq-interop.md),
+[`SPEC/DRAFT_IETF_MOQ_TRANSPORT.md`](SPEC/DRAFT_IETF_MOQ_TRANSPORT.md),
+[`SPEC/DRAFT_LCURLEY_MOQ_LITE_05.md`](SPEC/DRAFT_LCURLEY_MOQ_LITE_05.md).
 
 ## Running things
 
     zig build test                 # repo needs Zig 0.16; zvm's default may be 0.15.2
     zig build                      # apps/ into zig-out/bin
-    zig build interop              # only the four binaries the interop image ships
+    zig build interop              # only the four binaries the QUIC interop image ships
+    zig build moq-interop          # only the MoQ interop client
     zig build fuzz
 
     tools/interop_local.sh         # 11 cases, quic-zig against itself, no docker
     interop/run_local_tests.sh     # 9 cases against quic-go and quiche binaries
+    tools/moq_local.sh             # MoQ end-to-end, our binaries only, no docker
+    tools/moq_interop.sh           # MoQ interop matrix -> SPEC/moq-interop-results.md
+    tools/wt_protocol_test.mjs     # WebTransport protocol negotiation, via Chrome
     tools/bench_local.sh           # single-stream throughput + handshake rate
 
-    interop/runner/build_image.sh  # cross-compile + package, ~7 s
-    interop/runner/matrix.sh       # full docker matrix, both peers
-    interop/runner/report.py       # renders the SPEC table
+    interop/runner/build_image.sh      # QUIC interop image, cross-compile + package
+    interop/moq-runner/build_image.sh  # MoQ interop client image
+    interop/runner/matrix.sh           # full docker matrix, both peers
+    interop/runner/report.py           # renders the SPEC table
 
 `matrix.sh` appends a verdict per case to `interop/runner/matrix-results.txt`
 and skips what is already there, so an interrupted run resumes. To re-run only
 the failures: `grep -v FAIL matrix-results.txt > tmp && mv tmp matrix-results.txt`.
 It needs `PYTHON=/opt/homebrew/bin/python3.12` (3.10+) and a
 `quic-zig-interop:latest` image.
+
+Peers for MoQ work: `cargo install moq-relay` gives a native lite-05 and
+draft-17 relay (`moq-relay <config.toml>`, config shape in
+`interop/moq-rs/demo/relay/localhost.toml` with `auth.public = ""`). The
+`moqdev/moq-relay` Docker image is the same thing, but `matrix.sh` used to
+`docker rm -f` every container on the machine and took it out twice; that
+is now scoped to the runner's own three.
 
 ## Read this before trusting a matrix result
 
@@ -61,40 +108,237 @@ broken, host-cross-compiled ReleaseSafe fine.
 
 ## What landed
 
-Eight of the nine items on the previous list. Details in the changelog; the
-parts worth knowing:
+### draft-18, alongside draft-17
 
-- Unidirectional receive streams are reclaimed now. The predicate could not be
-  `recv.finished`: that flips inside `read()`, which the protocol layer calls
-  itself, so at that instant WebTransport has the bytes but has not delivered
-  the FIN event and H3 has not yet noticed a peer closing a critical stream.
-  The consumer calls `StreamsMap.releaseRecvStream()` when it is genuinely
-  done. H3's control and QPACK streams are never released, which is the right
-  answer by construction rather than by special case. See
-  [`SPEC/RFC9000_3.md`](SPEC/RFC9000_3.md).
-- Two RESET_STREAM bugs came out of that. On a peer-initiated uni stream the
-  frame was ignored completely, so the final size never reached connection flow
-  control and the window stayed short by that much permanently. And a peer
-  whose STREAM frames were all lost announces the stream with the reset itself
-  (RFC 9000 §3.2) — we dropped the frame instead of opening the stream.
-- Send buffers release acknowledged data. Note the second condition in
-  `compactAcked`: discarding on a flat size threshold alone is quadratic
-  against an application that writes ahead, and cost two thirds of bulk
-  throughput (20.0 → 7.2 MB/s) before the amortised rule went in.
-- `event_loop.zig` was never in `test_all.zig`. Its eleven tests stopped
-  compiling during the 0.16 migration and nothing noticed for months. They pass
-  now and immediately found six leaks.
-- A PTO in a handshake space now always sends a probe. It used to send nothing
-  when it had nothing to resend, and since the deadline is measured from the
-  last ack-eliciting packet it stayed expired and re-fired on every tick —
-  22365 Initial PTOs in ten seconds, no probe ever sent. The matrix caught it;
-  no local suite exercises loss or corruption, so nothing else could have.
-- RFC 9001 Appendix A.5 runs as a unit test. It passes byte-exact, so the open
-  `chacha20` interop failure is **not** our ChaCha20 crypto or header
-  protection. Worth keeping in mind that A.2 (AES) was the only vector tested
-  before, and the RFC 7541 Huffman table bug got in exactly this way.
+The runner targets draft-18 and draft-17 pairs with only four of its
+eighteen relays, so both are implemented. Where they differ is one table,
+`version.Rules` in `src/moq/version.zig`, rather than a condition per call
+site; the draft travels with each message because a relay serves peers at
+different ones, read off the ALPN each negotiated.
+
+That meant fixing something underneath: a server matching a client's ALPN
+never recorded *which* entry matched and echoed `config.alpn[0]`
+regardless, so advertising two protocols told every client the first one.
+`Connection.negotiatedAlpn()` is the accessor.
+
+What of draft-18 is deliberately skipped is written down in
+`SPEC/DRAFT_IETF_MOQ_TRANSPORT.md` — chiefly the relaxed varint, which
+would need the draft threaded through every length and tuple read for one
+byte on values almost nothing emits.
+
+### The interop test client
+
+`apps/moq_test_client.zig` drives the runner's seven control-plane cases
+over either transport and reports TAP 14. `interop/moq-runner/` packages it
+the way the runner expects — `RELAY_URL`/`TESTCASE`/`TLS_DISABLE_VERIFY`/
+`VERBOSE`, uid 1000, `/mlog` — and it passes 7/7 against our own relay from
+inside the container. `tools/moq_interop.sh` runs a relay list and writes
+[`SPEC/moq-interop-results.md`](SPEC/moq-interop-results.md).
+
+Registering it is not done and is your call: it means publishing an image
+to GHCR and a PR against someone else's repo. The entry is written out in
+`SPEC/moq-interop.md`.
+
+### draft-17 control messages were wrong, and the client is how we found out
+
+Most of them were encode-only. Their round-trip tests agreed with a shape
+nobody else spoke, so they passed while being wrong. moq-rs rejected our
+PUBLISH_NAMESPACE with "bounds exceeded"; that turned out to be the
+smallest of it.
+
+Against the draft's §9 figures: PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE,
+PUBLISH, REQUEST_UPDATE and FETCH were all missing Request ID and Required
+Request ID Delta; GOAWAY was missing Timeout, REQUEST_ERROR its Retry
+Interval, PUBLISH_DONE its Stream Count; FETCH had no Fetch Type and so no
+joining form; FETCH_OK, PUBLISH_OK and PUBLISH_BLOCKED had invented bodies;
+NAMESPACE_DONE carried nothing at all. The error code table was a
+pre-draft-17 list, and mixed the session and request number spaces.
+
+Message parameters now go through one codec with the §9.3 type table, so a
+parameter's value shape comes from its type rather than from each call site.
+The interop client went from 1/7 to 5/7 against moq-rs; the two it does not
+pass are theirs — they hold a SUBSCRIBE for an unknown namespace open
+instead of answering.
+
+**If you take one thing from this: a round-trip test against your own
+encoder proves self-consistency and nothing else.** The new tests assert
+bytes against the draft figures where the shape is load-bearing.
+
+### Our relay had the mirror-image bug
+
+It answered SUBSCRIBE_OK to any namespace at all, because it created a
+track on demand. §9.3.4 says a subscriber that sent no RENDEZVOUS_TIMEOUT —
+the default is 0 — wants DOES_NOT_EXIST straight away, and one that sent a
+non-zero timeout wants the subscription held until it expires and then
+TIMEOUT. Both work now, and PUBLISH_NAMESPACE registers the prefix that
+makes a later SUBSCRIBE legitimate. 7/7.
+
+Two things fell out of making that work:
+
+- The relay read each client's connection pointer on every poll to notice
+  disconnects, but the loop frees the connection immediately after firing
+  `onSessionClosed`, which the relay did not implement. Nothing crashed
+  while clients only ever left voluntarily; a REQUEST_ERROR makes them
+  leave promptly. Teardown moved into the callback.
+- The loop armed no timer when QUIC had no deadline pending, so a handler
+  with its own deadline was not woken until the peer sent something. A
+  handler can now declare `poll_interval_ms`. This is also the cause of the
+  sparse clock tick that was noted as a MoQ caveat.
+
+### WebTransport application-protocol negotiation
+
+`WT-Available-Protocols` / `WT-Protocol` on the extended CONNECT
+(draft-ietf-webtrans-http3-13 §3.3). Both moq-lite and moq-transport ≥
+draft-15 choose their wire version this way over WebTransport, so nothing
+browser-facing worked without it. The headers were already on the
+`WtEvent`; the event loop dropped them before the handler.
+
+Checked against Chrome 146 rather than only against ourselves
+(`tools/wt_protocol_test.mjs`): our own client agreeing with our own server
+would have proved only that both share one reading of the grammar.
+
+### moq-lite
+
+`src/moq/lite/` — wire, messages, versions, session — plus `apps/moq_lite.zig`
+with `publish`, `subscribe`, `announce` and `serve`. It is a different wire
+format from the IETF draft, not a profile of it; most of all it uses the
+QUIC varint where draft-17 uses a leading-ones one, so the two share no
+primitives.
+
+Verified against `moq-relay` v0.14.16: `moq-lite-05` negotiated on the
+CONNECT, SETUP both ways, announce plane round-tripping, and the data plane
+end to end — our publisher, their relay, our subscriber, ten frames with
+the timestamps they were sent with.
+
+`moq-lite-relay` is a relay: it learns what each session carries by being
+a subscriber to it, routes a subscription upstream to the broadcast's
+origin, and forwards the origin's group streams with the subscribe id
+rewritten. Verified with a Zig publisher and the browser client as the
+subscriber, so three implementations sit in the path.
+
+Only lite-05 is implemented and the ALPN offer says so; lite-04 has no
+Setup or Track stream, no ANNOUNCE_OK and a different SUBSCRIBE_OK body.
+That is also why `moq-clock` cannot use our relay — it offers up to
+lite-04 — and the cheapest way to widen that is lite-04 support rather
+than anything structural.
+
+### Datagrams
+
+A `.quic` handler could not receive a QUIC datagram at all — the zero-copy
+callback was installed only on the WebTransport path and `pollQuicEvents`
+never drained the queue; `sendDatagram` was WebTransport-only for the same
+reason. With that wired, MoQ datagram objects (§10.3.1) work end to end:
+`moq-client --mode publish --datagrams`, relayed to each subscriber with
+the alias rewritten as for subgroup streams.
+
+### Both relays, and a close that never left
+
+The WebTransport relay had none of the namespace work the raw-QUIC one
+got, and never negotiated a MoQ version, so it read the draft-17 demo
+pages as draft-18. Both now pass all seven interop cases at both drafts,
+which is what a relay entry in the runner would need — its compose file
+defaults to `https://relay:4443`.
+
+The browser pages carried the same encoder drift the Zig side did:
+`buildPublish` was missing its request id, delta and parameter count.
+They are a second implementation of the draft and drifted the same way,
+which is the argument for `tools/moq_browser_test.mjs` — it drives the
+video demo end to end through Chrome's fake camera.
+
+Underneath that: a client queued its CONNECTION_CLOSE and never flushed
+it, so it left with the process and every peer held the session for its
+full idle timeout — half a minute of a relay's capacity per test. A suite
+exhausted the relay's client table long before that expired, and the
+symptom was "no SETUP from peer" three tests later on an unrelated
+connection. `Client.stop()` queues; `Client.flush()` sends.
+
+### Smaller, but worth knowing
+
+- **Offer only the version you implement.** The WebTransport CONNECT
+  advertised `moqt-18` next to `moqt-17`; the current moq-relay speaks up
+  to draft-21, picks 18, and then every message is the wrong shape. The
+  connection succeeds and only the MoQ on top of it goes quiet, which
+  looks like anything but a version mismatch. Raw QUIC was fine because
+  its ALPN carried one token. moq-lite had the same bug.
+- `decodeSubscribe`/`decodePublish` returned a slice-of-slices into their
+  own stack frame. Every relay SUBSCRIBE took that path.
+- A peer's GroupOrder byte outside 0x00-0x02 reached `@enumFromInt` in four
+  decoders — one byte, remote abort. Found by the randomized decoder sweep
+  added to `src/fuzz.zig`; `-ffuzz` does not compile on Zig 0.16.0 (the
+  errors are in `lib/compiler/test_runner.zig`), so the existing
+  `testing.fuzz` targets only ever see their seed.
+- `moq_relay.zig` indexed stream roles into a 256-entry array, so a
+  long-lived connection stopped being able to tell a control stream from a
+  subgroup header.
+- `interop/browser/certs/server.crt` had expired, which fails every browser
+  WebTransport test identically and looks like a protocol regression. Run
+  `interop/browser/generate-cert.sh`; Chrome caps these at 14 days.
 
 ## Open, roughly in the order I would take them
+
+### MoQ, from this session
+
+**a. Register with the interop runner.** Needs your go-ahead: `docker
+push` to GHCR under your account, and a PR against
+`englishm/moq-interop-runner`. Everything else is done — client and relay
+images both build from `interop/moq-runner/build_image.sh` and pass 7/7
+against each other on a compose-style network, and the registration entry
+is written out in `interop/moq-runner/implementations-entry.json` with
+`OWNER` left to fill in.
+
+**b. The draft-18 corners that were skipped.** The relaxed varint,
+`REQUEST_ERROR`'s `Redirect`, `REQUEST_OK`'s Track Properties,
+delta-encoded FETCH object ids, the renamed timeout parameters. None are
+exercised by the runner's cases, and each is listed in
+`SPEC/DRAFT_IETF_MOQ_TRANSPORT.md`. draft-19 and -20 are another row in
+`version.Rules` each.
+
+**c. moq-lite over raw QUIC, and lite-04.** The relay and origin are
+WebTransport-only; `moq-lite` the client does both. Supporting lite-04
+would let `moq-clock` and the rest of the moq-dev tooling use our relay,
+which is the widest external validation available for it.
+
+**d. (Fixed) `cdn.moq.dev` is reachable.** It was written up here as a
+missing HelloRetryRequest. It was two other things:
+
+1. A **CertificateRequest** — Cloudflare's edge asks for a client certificate,
+   and RFC 8446 4.4.2 wants an empty Certificate back rather than silence.
+2. Certificate validity compared against `CLOCK_MONOTONIC`, whose zero is the
+   last boot, so every real certificate read as not-yet-valid.
+3. No trust store: `ca_cert_path` had done nothing but log a warning since
+   the Zig 0.16 migration, so a chain could not be rooted even in principle.
+   `ClientConfig.ca` replaces it (`.system` or `.file`).
+
+Both transports now run a full moq-lite session against it, verified against
+the system trust store.
+
+### Core quic-zig — Tier 5, all four closed
+
+Building MoQ on this stack turned up four core problems, none of them MoQ's.
+They are written up as **Tier 5** in [`TODO.md`](TODO.md) with the
+consequence each one had, which is the part that is hard to reconstruct
+later. All four are fixed, and the second one found four more bugs on its own:
+
+- `Client.stop()` queued the CONNECTION_CLOSE and never sent it, so a
+  `tick()`-driven client that exited left the peer holding the session for
+  its full idle timeout. It surfaced as an unrelated connection failing
+  much later.
+- 23 of 26 fuzz targets never saw a random byte, because `-ffuzz` does not
+  compile on Zig 0.16.0. The fixed-seed sweep pattern now covers the QUIC and
+  HTTP/3 parsers too, and a connection fed a stream of datagrams. It found
+  five bugs a peer can reach — four aborts, three of those before the
+  handshake completes: a QPACK integer that overflows its accumulator, a
+  packet Length below the packet number length, one below the AEAD tag, an
+  Initial token past the buffer the associated data is built in, and a QPACK
+  `Duplicate` that read the arena it was writing to, which in a release build
+  is silent table corruption rather than a crash.
+- `Client` was one connection per loop. `ClientConfig.loop` joins an existing
+  one; the socket stays per-connection, which is the right shape for a client.
+- A TLS server advertising several ALPN protocols echoed its own first choice
+  rather than the one that matched.
+
+### Carried over
+
 
 ### 1. `chacha20` — fails against both peers, unexplained
 Ruled out with evidence: cipher negotiation, the key schedule, our packet

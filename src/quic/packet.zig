@@ -301,10 +301,41 @@ pub const PacketNumSpace = struct {
     }
 };
 
+/// Splits a protected packet into the Associated Data and the ciphertext
+/// (RFC 9001 5.3: the AD is the header with its first byte unprotected).
+///
+/// Both lengths are the peer's to choose — the Length varint for the payload,
+/// the token for the header — so neither is trusted here. A Length below the
+/// packet number length underflows the subtraction, and one above the
+/// datagram reads past it.
+fn splitProtected(header: *const Header, fbs: anytype, first_byte: u8, ad_buf: []u8) !struct {
+    ad: []const u8,
+    payload: []u8,
+} {
+    if (fbs.seek > fbs.buffer.len) return error.InvalidPacket;
+    if (header.remainder_len < header.packet_number_len) return error.InvalidPacket;
+
+    const payload_len = header.remainder_len - header.packet_number_len;
+    if (payload_len > fbs.buffer.len - fbs.seek) return error.InvalidPacket;
+
+    const pkt_start = header.packet_start;
+    if (pkt_start >= fbs.seek) return error.InvalidPacket;
+    const header_len = fbs.seek - pkt_start;
+    if (header_len > ad_buf.len) return error.InvalidPacket;
+
+    ad_buf[0] = first_byte;
+    @memcpy(ad_buf[1..][0 .. header_len - 1], fbs.buffer[pkt_start + 1 .. fbs.seek]);
+
+    return .{
+        .ad = ad_buf[0..header_len],
+        .payload = fbs.buffer[fbs.seek..][0..payload_len],
+    };
+}
+
 pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     // We need at least 4 bytes for packet number + 16 for sample
     if (fbs.seek + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
-        std.log.err("Not enough data for packet number + sample: pos={d}, buffer.len={d}", .{ fbs.seek, fbs.buffer.len });
+        std.log.debug("Not enough data for packet number + sample: pos={d}, buffer.len={d}", .{ fbs.seek, fbs.buffer.len });
         return error.InvalidPacket;
     }
 
@@ -316,7 +347,7 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     // RFC 9001 Section 5.4.2: Sample is taken 4 bytes after START of packet number field
     const sample_offset = fbs.seek + 4;
     if (sample_offset + crypto.SAMPLE_LEN > fbs.buffer.len) {
-        std.log.err("Not enough data for sample: offset={d}, buffer.len={d}", .{ sample_offset, fbs.buffer.len });
+        std.log.debug("Not enough data for sample: offset={d}, buffer.len={d}", .{ sample_offset, fbs.buffer.len });
         return error.InvalidPacket;
     }
 
@@ -368,19 +399,11 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     // Skip the packet number bytes in the buffer
     try fbs.seekBy(@intCast(header.packet_number_len));
 
-    const payload_len = header.remainder_len - header.packet_number_len;
-
-    // RFC 9001 Section 5.2: AD includes the unprotected first byte and everything up to and including packet number
-    // For coalesced packets, use packet_start to get the correct offset within the buffer
-    const pkt_start = header.packet_start;
-    const header_len = fbs.seek - pkt_start; // total header length including packet number
-    var header_bytes_buf: [512]u8 = undefined;
-    // Copy first byte as unprotected
-    header_bytes_buf[0] = first_byte;
-    // Copy the rest of the header and packet number (from byte after first to current position)
-    @memcpy(header_bytes_buf[1..][0..(header_len - 1)], fbs.buffer[(pkt_start + 1)..fbs.seek]);
-    const header_bytes = header_bytes_buf[0..header_len];
-    const encrypted_payload = fbs.buffer[(fbs.seek)..(fbs.seek + payload_len)];
+    // A header runs to the whole datagram when the peer sends a long token.
+    var header_bytes_buf: [MAX_PACKET_LEN]u8 = undefined;
+    const split = try splitProtected(header, fbs, first_byte, &header_bytes_buf);
+    const header_bytes = split.ad;
+    const encrypted_payload = split.payload;
 
     // Decode packet number
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
@@ -458,16 +481,10 @@ pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *PacketNumSpac
 
     try fbs.seekBy(@intCast(header.packet_number_len));
 
-    const payload_len = header.remainder_len - header.packet_number_len;
-
-    // Build associated data
-    const pkt_start = header.packet_start;
-    const header_len = fbs.seek - pkt_start;
-    var header_bytes_buf: [512]u8 = undefined;
-    header_bytes_buf[0] = first_byte;
-    @memcpy(header_bytes_buf[1..][0..(header_len - 1)], fbs.buffer[(pkt_start + 1)..fbs.seek]);
-    const header_bytes = header_bytes_buf[0..header_len];
-    const encrypted_payload = fbs.buffer[(fbs.seek)..(fbs.seek + payload_len)];
+    var header_bytes_buf: [MAX_PACKET_LEN]u8 = undefined;
+    const split = try splitProtected(header, fbs, first_byte, &header_bytes_buf);
+    const header_bytes = split.ad;
+    const encrypted_payload = split.payload;
 
     // Decode packet number
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
@@ -506,7 +523,7 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
 
         const dcid_length = try fbs.takeByte();
         if (dcid_length > CONNECTION_ID_MAX_SIZE) {
-            std.log.err("Destination CID is too long ({any} bytes)", .{dcid_length});
+            std.log.debug("Destination CID is too long ({any} bytes)", .{dcid_length});
             return error.PacketError;
         }
         if (fbs.seek + dcid_length > fbs.buffer.len) return error.BufferTooShort;
@@ -518,7 +535,7 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
 
         const scid_length = try fbs.takeByte();
         if (scid_length > CONNECTION_ID_MAX_SIZE) {
-            std.log.err("Source CID is too long ({any} bytes)", .{scid_length});
+            std.log.debug("Source CID is too long ({any} bytes)", .{scid_length});
             return error.InvalidPacket;
         }
         if (fbs.seek + scid_length > fbs.buffer.len) return error.BufferTooShort;
@@ -529,7 +546,7 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
         fbs.seek += scid_length;
 
         if ((first_byte & FIXED_BIT) == 0) {
-            std.log.err("Packet fixed bit is zero", .{});
+            std.log.debug("Packet fixed bit is zero", .{});
             return error.InvalidPacket;
         }
 
@@ -586,7 +603,7 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
             },
 
             else => {
-                std.log.err("Packet type not recognized: {any}", .{header.packet_type});
+                std.log.debug("Packet type not recognized: {any}", .{header.packet_type});
                 header.remainder_len = try readVarIntUsize(fbs);
             },
         }
@@ -1238,9 +1255,40 @@ test "Header.parse: Short header (1-RTT)" {
     try std.testing.expectEqual(@as(usize, 8), header.dcid.len);
 }
 
-// Header.parse with missing fixed bit: tested implicitly via connection.handleDatagram
-// which silently discards packets with bad fixed bit. Direct parse test omitted
-// because the error path uses std.log.err which fails the test runner.
+test "Header.parse rejects a long header with the fixed bit clear" {
+    // 0x80: long header form, fixed bit clear (RFC 9000 17.2).
+    var buf = [_]u8{ 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 };
+    var fbs = io.fixedBufferStream(&buf);
+    try std.testing.expectError(error.InvalidPacket, Header.parse(&fbs, 8));
+}
+
+test "splitProtected rejects lengths the datagram cannot back" {
+    var buf = [_]u8{0} ** 64;
+    var fbs = io.fixedBufferStream(&buf);
+    fbs.seek = 10;
+
+    var header = Header{ .packet_start = 0, .packet_number_len = 4, .remainder_len = 14 };
+    var ad: [MAX_PACKET_LEN]u8 = undefined;
+
+    const ok = try splitProtected(&header, &fbs, 0xc0, &ad);
+    try std.testing.expectEqual(@as(usize, 10), ok.ad.len);
+    try std.testing.expectEqual(@as(usize, 10), ok.payload.len);
+    try std.testing.expectEqual(@as(u8, 0xc0), ok.ad[0]);
+
+    // Below the packet number length the subtraction underflows.
+    header.remainder_len = 2;
+    try std.testing.expectError(error.InvalidPacket, splitProtected(&header, &fbs, 0xc0, &ad));
+
+    // Above what is left of the datagram it reads past the end.
+    header.remainder_len = 4 + 100;
+    try std.testing.expectError(error.InvalidPacket, splitProtected(&header, &fbs, 0xc0, &ad));
+
+    // A header longer than the buffer the associated data is built in — an
+    // Initial's token is the peer's to size.
+    header.remainder_len = 14;
+    var small: [4]u8 = undefined;
+    try std.testing.expectError(error.InvalidPacket, splitProtected(&header, &fbs, 0xc0, &small));
+}
 
 test "decodePacketNumber: RFC 9000 Appendix A examples" {
     // Example from RFC 9000 Appendix A:

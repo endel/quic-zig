@@ -451,6 +451,22 @@ pub fn sleepNs(ns: u64) void {
     }
 }
 
+/// Seconds since the Unix epoch, off the realtime clock (replaces
+/// `std.time.timestamp`). Use this and not `nanoTimestamp` for anything an
+/// absolute date is compared against — certificate validity, a timestamp
+/// written into something another host will read back. `nanoTimestamp` is
+/// monotonic, so its zero is the last boot.
+pub fn realtimeSeconds() i64 {
+    switch (builtin.os.tag) {
+        .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
+        .windows => @compileError("sys.realtimeSeconds: Windows support pending"),
+        else => @compileError("sys.realtimeSeconds: unsupported OS"),
+    }
+    var ts: timespec = undefined;
+    if (c.clock_gettime(posix.CLOCK.REALTIME, &ts) != 0) return 0;
+    return @intCast(ts.sec);
+}
+
 /// Monotonic clock timestamp in nanoseconds (replaces `std.time.nanoTimestamp`).
 pub fn nanoTimestamp() i64 {
     switch (builtin.os.tag) {
@@ -795,4 +811,15 @@ pub fn readFileAlloc(
         if (len > max_bytes) return error.StreamTooLong;
     }
     return gpa.realloc(buf, len);
+}
+
+test "realtimeSeconds is wall clock, not uptime" {
+    // Certificate validity is compared against this. nanoTimestamp() is
+    // monotonic — its zero is the last boot — and checking a notBefore
+    // against that made every real certificate "not yet valid", which is why
+    // nothing could verify a chain until this existed.
+    const now = realtimeSeconds();
+    try std.testing.expect(now > 1_767_225_600); // 2026-01-01
+    try std.testing.expect(now < 4_102_444_800); // 2100-01-01
+    try std.testing.expect(now > @divTrunc(nanoTimestamp(), std.time.ns_per_s));
 }

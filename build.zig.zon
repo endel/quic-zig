@@ -1,6 +1,6 @@
 .{
     .name = .quic,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .dependencies = .{
         .libxev = .{
             .url = "https://github.com/mitchellh/libxev/archive/a82a04eabb46.tar.gz",

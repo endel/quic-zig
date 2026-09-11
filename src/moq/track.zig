@@ -34,6 +34,15 @@ pub const GroupOrder = enum(u8) {
     publisher_default = 0x00,
     ascending = 0x01,
     descending = 0x02,
+
+    pub fn fromInt(v: u8) ?GroupOrder {
+        return switch (v) {
+            0x00 => .publisher_default,
+            0x01 => .ascending,
+            0x02 => .descending,
+            else => null,
+        };
+    }
 };
 
 // §9.8 "Filter Type" parameter value.

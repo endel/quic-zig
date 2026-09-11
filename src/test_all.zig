@@ -28,10 +28,18 @@ test {
     _ = @import("h3/capsule.zig");
     _ = @import("http1/server.zig");
     _ = @import("http1/tls.zig");
+    _ = @import("webtransport/protocol.zig");
     _ = @import("moq/wire.zig");
     _ = @import("moq/message_codes.zig");
     _ = @import("moq/track.zig");
     _ = @import("moq/object.zig");
     _ = @import("moq/message.zig");
+    _ = @import("moq/version.zig");
+    _ = @import("moq/url.zig");
+    _ = @import("moq/session.zig");
+    _ = @import("moq/lite/wire.zig");
+    _ = @import("moq/lite/message.zig");
+    _ = @import("moq/lite/version.zig");
+    _ = @import("moq/lite/session.zig");
     _ = @import("event_loop.zig");
 }

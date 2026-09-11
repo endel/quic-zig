@@ -38,8 +38,16 @@ const TrackSub = struct {
 
 const MoqClientHandler = struct {
     pub const protocol: event_loop.Protocol = .quic;
+    /// The publish tick is ours, not QUIC's, so the loop has to be woken
+    /// on a cadence rather than only when the peer sends something.
+    pub const poll_interval_ms: u64 = 100;
 
     mode: Mode = .subscribe,
+    /// Fixed by the ALPN this client offered, not negotiated per peer.
+    draft: moq_version.Draft = moq_version.DEFAULT,
+    /// §10.3.1: publish objects as datagrams instead of on subgroup
+    /// streams. Unreliable, unordered, and one object per datagram.
+    use_datagrams: bool = false,
     // Legacy single-track fields (kept for publish mode + backward compat).
     ns_parts: []const []const u8,
     track_name: []const u8,
@@ -85,6 +93,22 @@ const MoqClientHandler = struct {
         session.writeStream(ctrl, buf[0..fbs.seek]) catch return;
         self.setup_sent = true;
         std.debug.print("[MoQ] Sent SETUP on stream {d}\n", .{ctrl});
+    }
+
+    pub fn onDatagram(self: *MoqClientHandler, _: *event_loop.ClientSession, _: u64, data: []const u8) void {
+        const obj = moq_obj.readDatagramObject(data) catch |e| {
+            std.debug.print("[MoQ] bad datagram object: {t}\n", .{e});
+            return;
+        };
+        const name = if (self.trackByAlias(obj.track_alias)) |ts| ts.name else "?";
+        switch (obj.body) {
+            .payload => |pl| std.debug.print("[MoQ] Datagram track=\"{s}\" group={d} payload=\"{s}\"\n", .{
+                name, obj.group, pl,
+            }),
+            .status => |st| std.debug.print("[MoQ] Datagram track=\"{s}\" group={d} status={t}\n", .{
+                name, obj.group, st,
+            }),
+        }
     }
 
     pub fn onStreamData(self: *MoqClientHandler, session: *event_loop.ClientSession, stream_id: u64, data: []const u8, _: bool) void {
@@ -163,7 +187,7 @@ const MoqClientHandler = struct {
 
     fn handleDataStream(self: *MoqClientHandler, stream_id: u64, data: []const u8) void {
         var fbs = io_compat.fixedBufferStream(data);
-        const parsed = moq_obj.readSubgroupHeader(&fbs) catch {
+        const parsed = moq_obj.readSubgroupHeader(&fbs, self.draft) catch {
             std.debug.print("[MoQ] Data stream {d}: {d} bytes (parse deferred)\n", .{ stream_id, data.len });
             return;
         };
@@ -209,8 +233,8 @@ const MoqClientHandler = struct {
                 .track_name = ts.name,
                 .subscriber_priority = 128,
                 .group_order = .ascending,
-                .filter_type = .latest_object,
-            }) catch return;
+                .filter = .{ .type = .latest_object },
+            }, self.draft) catch return;
             session.writeStream(bidi, buf[0..fbs.seek]) catch return;
             std.debug.print("[MoQ] Sent SUBSCRIBE on bidi {d} for track \"{s}\"\n", .{ bidi, ts.name });
         }
@@ -244,8 +268,8 @@ const MoqClientHandler = struct {
             .track_namespace = self.ns_parts,
             .track_name = self.track_name,
             .track_alias = 1,
-            .publisher_priority = 128,
-        }) catch return;
+            .forward = true,
+        }, self.draft) catch return;
         session.writeStream(bidi, buf[0..fbs.seek]) catch return;
         std.debug.print("[MoQ] Sent PUBLISH on bidi stream {d}\n", .{bidi});
     }
@@ -258,10 +282,31 @@ const MoqClientHandler = struct {
         if (now - self.last_tick_ns < 1_000_000_000) return;
         self.last_tick_ns = now;
 
-        // Publish a tick object on a new uni stream.
-        const out_id = session.openQuicUniStream() catch return;
         var payload_buf: [128]u8 = undefined;
         const payload = std.fmt.bufPrint(&payload_buf, "pub tick {d}", .{self.group_id}) catch return;
+
+        if (self.use_datagrams) {
+            var dbuf: [256]u8 = undefined;
+            var dfbs = io_compat.fixedBufferStream(&dbuf);
+            moq_obj.writeDatagramObject(&dfbs, .{
+                .track_alias = 1,
+                .group = self.group_id,
+                .object = null,
+                .publisher_priority = 128,
+                .end_of_group = true,
+                .body = .{ .payload = payload },
+            }) catch return;
+            session.sendDatagram(0, dbuf[0..dfbs.seek]) catch |e| {
+                std.debug.print("[MoQ] datagram send failed: {t}\n", .{e});
+                return;
+            };
+            std.debug.print("[MoQ] Published tick {d} as a datagram\n", .{self.group_id});
+            self.group_id += 1;
+            return;
+        }
+
+        // Publish a tick object on a new uni stream.
+        const out_id = session.openQuicUniStream() catch return;
 
         var buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
@@ -296,6 +341,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var ns_str: []const u8 = "moq-clock";
     var track_name: []const u8 = "seconds";
     var mode: Mode = .subscribe;
+    var use_datagrams = false;
+    var draft: moq_version.Draft = moq_version.DEFAULT;
 
     // For multi-track subscribe: repeated --track flags accumulate here.
     var track_names = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
@@ -322,6 +369,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         } else if (std.mem.eql(u8, arg, "--server-name")) {
             if (args.next()) |v| server_name = v;
+        } else if (std.mem.eql(u8, arg, "--draft")) {
+            if (args.next()) |v| {
+                draft = switch (std.fmt.parseInt(u8, v, 10) catch 0) {
+                    17 => .draft_17,
+                    18 => .draft_18,
+                    else => moq_version.DEFAULT,
+                };
+            }
+        } else if (std.mem.eql(u8, arg, "--datagrams")) {
+            use_datagrams = true;
         } else if (std.mem.eql(u8, arg, "--mode")) {
             if (args.next()) |v| {
                 if (std.mem.eql(u8, v, "publish")) mode = .publish;
@@ -341,8 +398,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (part.len > 0) try ns_list.append(alloc, part);
     }
 
-    std.debug.print("\n=== MoQ Client (draft-17, raw QUIC) ===\n", .{});
-    std.debug.print("Target: {s}:{d}  ALPN: {s}\n", .{ address, port, moq_version.ALPN });
+    std.debug.print("\n=== MoQ Client (raw QUIC) ===\n", .{});
+    std.debug.print("Target: {s}:{d}  ALPN: {s}\n", .{ address, port, draft.alpn() });
     std.debug.print("Namespace: [", .{});
     for (ns_list.items, 0..) |p, i| {
         if (i > 0) std.debug.print(",", .{});
@@ -358,6 +415,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var handler = MoqClientHandler{
         .mode = mode,
+        .draft = draft,
+        .use_datagrams = use_datagrams,
         .ns_parts = ns_list.items,
         .track_name = track_name,
     };
@@ -374,7 +433,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .address = address,
         .port = port,
         .server_name = server_name,
-        .alpn = moq_version.ALPN,
+        .alpn = draft.alpn(),
         .skip_cert_verify = true,
     });
     defer client.deinit();

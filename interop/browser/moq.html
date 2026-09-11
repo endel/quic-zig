@@ -223,13 +223,29 @@ function buildSetup() {
 }
 
 function buildSubscribe(nsParts, trackName) {
+  // draft-17 §9.8. Parameters are count-prefixed with delta-encoded types
+  // in ascending order, and each type fixes its own value encoding — this
+  // is not the key/value list SETUP options use.
+  const reqId = moqVarintEncode(0);
+  const reqDelta = moqVarintEncode(0);
   const ns = encodeTuple(nsParts);
   const name = encodeVarBytes(trackName);
-  const priority = new Uint8Array([128]);
-  const groupOrder = new Uint8Array([0x01]); // ascending
-  const filterType = moqVarintEncode(0x02); // latest_object
-  const payload = concat(ns, name, priority, groupOrder, filterType);
-  return buildEnvelope(MSG_SUBSCRIBE, payload);
+
+  const paramCount = moqVarintEncode(5);
+  // 0x04 RENDEZVOUS_TIMEOUT (varint ms). Without it the default is 0, and
+  // a relay answers DOES_NOT_EXIST rather than waiting for the publisher.
+  const p0 = concat(moqVarintEncode(0x04), moqVarintEncode(30000));
+  // 0x10 FORWARD (uint8)
+  const p1 = concat(moqVarintEncode(0x10 - 0x04), new Uint8Array([1]));
+  // 0x20 SUBSCRIBER_PRIORITY (uint8)
+  const p2 = concat(moqVarintEncode(0x20 - 0x10), new Uint8Array([128]));
+  // 0x21 SUBSCRIPTION_FILTER (length-prefixed; latest object)
+  const ft = moqVarintEncode(0x02);
+  const p3 = concat(moqVarintEncode(1), moqVarintEncode(ft.length), ft);
+  // 0x22 GROUP_ORDER (uint8, 1 = ascending)
+  const p4 = concat(moqVarintEncode(1), new Uint8Array([1]));
+
+  return buildEnvelope(MSG_SUBSCRIBE, concat(reqId, reqDelta, ns, name, paramCount, p0, p1, p2, p3, p4));
 }
 
 // ── Connection state ─────────────────────────────────────────────────
@@ -275,6 +291,8 @@ async function doConnect() {
 
   try {
     wt = new WebTransport(url, {
+      // The MoQ version rides the CONNECT, not the QUIC ALPN.
+      protocols: ['moqt-17'],
       serverCertificateHashes: [{ algorithm: 'sha-256', value: hashBytes.buffer }]
     });
     await wt.ready;

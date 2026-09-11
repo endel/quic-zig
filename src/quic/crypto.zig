@@ -109,7 +109,9 @@ pub const Open = struct {
         const tag_len = 16; // Same for both AES-128-GCM and ChaCha20-Poly1305
         const payload_len = payload.len;
 
-        assert(payload_len >= tag_len);
+        // The payload length is the peer's Length varint minus the packet
+        // number: it can be shorter than the tag it is supposed to carry.
+        if (payload_len < tag_len) return error.AuthenticationFailed;
 
         const tag: [tag_len]u8 = tag: {
             var t: [tag_len]u8 = undefined;
@@ -123,13 +125,13 @@ pub const Open = struct {
         switch (self.cipher_suite) {
             .aes_128_gcm_sha256 => {
                 Aes128Gcm.decrypt(bytes, bytes, tag, associated_data, aead_nonce, self.key[0..16].*) catch |err| {
-                    std.log.err("AES-128-GCM decryption failed: {any}", .{err});
+                    std.log.debug("AES-128-GCM decryption failed: {any}", .{err});
                     return err;
                 };
             },
             .chacha20_poly1305_sha256 => {
                 ChaCha20Poly1305.decrypt(bytes, bytes, tag, associated_data, aead_nonce, self.key) catch |err| {
-                    std.log.err("ChaCha20-Poly1305 decryption failed: {any}", .{err});
+                    std.log.debug("ChaCha20-Poly1305 decryption failed: {any}", .{err});
                     return err;
                 };
             },
@@ -361,7 +363,7 @@ pub fn deriveInitialKeyMaterial(
     comptime is_server: bool,
 ) !std.meta.Tuple(&.{ Open, Seal }) {
     if (!protocol.isSupportedVersion(version)) {
-        std.log.err("unsupported QUIC version: 0x{x:0>8}", .{version});
+        std.log.debug("unsupported QUIC version: 0x{x:0>8}", .{version});
         return error.InvalidVersion;
     }
 
@@ -409,6 +411,15 @@ pub fn deriveInitialKeyMaterial(
 }
 
 // https://www.rfc-editor.org/rfc/rfc9001#section-a.1
+test "decryptPayload rejects a payload shorter than its tag" {
+    const keys = try deriveInitialKeyMaterial(&[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, protocol.QUIC_V1, false);
+    var open = keys[0];
+
+    // The payload length is the peer's Length varint minus the packet number.
+    var short = [_]u8{0} ** 8;
+    try std.testing.expectError(error.AuthenticationFailed, open.decryptPayload(0, &.{}, &short));
+}
+
 test "a.1: keys - initial secret" {
     {
         const expected = [_]u8{ 0x7d, 0xb5, 0xdf, 0x06, 0xe7, 0xa6, 0x9e, 0x43, 0x24, 0x96, 0xad, 0xed, 0xb0, 0x08, 0x51, 0x92, 0x35, 0x95, 0x22, 0x15, 0x96, 0xae, 0x2a, 0xe9, 0xfb, 0x81, 0x15, 0xc1, 0xe9, 0xed, 0x0a, 0x44 };

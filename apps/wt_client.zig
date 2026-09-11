@@ -1,15 +1,38 @@
 const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
+const qpack = quic.qpack;
+const wt_protocol = quic.webtransport_protocol;
+
+const OFFERED_PROTOCOLS = [_][]const u8{ "moqt-18", "moqt-17", "echo" };
 
 const EchoClient = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
 
     got_response: bool = false,
+    negotiated: [32]u8 = undefined,
+    negotiated_len: usize = 0,
 
-    pub fn onSessionReady(self: *EchoClient, session: *event_loop.ClientSession, session_id: u64) void {
-        _ = self;
+    pub fn onSessionReady(
+        self: *EchoClient,
+        session: *event_loop.ClientSession,
+        session_id: u64,
+        headers: []const qpack.Header,
+    ) void {
         std.debug.print("WebTransport session ready (session_id={d})\n", .{session_id});
+
+        if (wt_protocol.findHeader(headers, wt_protocol.HEADER_SELECTED)) |raw| {
+            var scratch: [64]u8 = undefined;
+            if (wt_protocol.decodeItem(raw, &scratch)) |name| {
+                self.negotiated_len = @min(name.len, self.negotiated.len);
+                @memcpy(self.negotiated[0..self.negotiated_len], name[0..self.negotiated_len]);
+                std.debug.print("Negotiated WT protocol: {s}\n", .{name});
+            } else |err| {
+                std.debug.print("Malformed WT-Protocol header: {any}\n", .{err});
+            }
+        } else {
+            std.debug.print("Server named no WT protocol\n", .{});
+        }
 
         // Open a bidi stream and send data
         const stream_id = session.openBidiStream(session_id, null) catch |err| {
@@ -74,10 +97,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("WebTransport client connecting to 127.0.0.1:{d}\n", .{port});
 
+    var offer_buf: [128]u8 = undefined;
+    const offer = try wt_protocol.encodeList(&OFFERED_PROTOCOLS, &offer_buf);
+    const connect_headers = [_]qpack.Header{
+        .{ .name = wt_protocol.HEADER_AVAILABLE, .value = offer },
+    };
+
     var handler = EchoClient{};
     var client = try event_loop.Client(EchoClient).init(alloc, &handler, .{
         .port = port,
-        .ca_cert_path = "interop/certs/ca.crt",
+        .ca = .{ .file = "interop/certs/ca.crt" },
+        .connect_headers = &connect_headers,
     });
     defer client.deinit();
 

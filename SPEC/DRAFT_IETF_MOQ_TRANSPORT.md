@@ -1,4 +1,11 @@
-# Media-over-QUIC Transport — draft-ietf-moq-transport-17
+# Media-over-QUIC Transport — draft-ietf-moq-transport
+
+Both **draft-17** and **draft-18** are implemented. The version is chosen
+by ALPN (`moqt-17` / `moqt-18`) on native QUIC, and by
+`WT-Available-Protocols` / `WT-Protocol` over WebTransport; a server
+advertises both and serves each peer at the one it picked. Everything
+below is draft-17 unless it says otherwise; where the two differ,
+`src/moq/version.zig`'s `Rules` table is the single place that says so.
 
 Status: **working end-to-end**. Wire layer complete. Raw-QUIC + WebTransport relays operational. Live browser video demo verified with multiple simultaneous subscribers.
 
@@ -12,6 +19,7 @@ Reference: `draft-ietf-moq-transport-17` (expires 2026-09). Cross-checked agains
 | `moq-client` | Raw-QUIC MoQ subscriber + `--mode publish` |
 | `moq-relay` | Raw-QUIC MoQ relay with pub/sub fanout and synthetic origin |
 | `moq-browser-server` | WebTransport MoQ relay for browsers, shared TLS cert with HTTP/1.1 static file server |
+| `moq-test-client` | moq-interop-runner test client; TAP 14 output. See [moq-interop.md](moq-interop.md) |
 
 Browser pages (served by `moq-browser-server`):
 - `interop/browser/moq.html` — clock-tick subscribe demo
@@ -174,32 +182,78 @@ Invalid datagram types: `0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F` (STATUS
 
 | Component | State |
 | --- | --- |
-| Wire primitives (`src/moq/wire.zig`, `message_codes.zig`) | done; 15 tests |
-| Control message codec (`src/moq/message.zig`) | done for SETUP, GOAWAY, REQUEST_OK/ERROR, SUBSCRIBE(+parameters), SUBSCRIBE_OK, PUBLISH, PUBLISH_OK/DONE, PUBLISH_NAMESPACE/BLOCKED, NAMESPACE/DONE, SUBSCRIBE_NAMESPACE, FETCH/FETCH_OK, TRACK_STATUS, REQUEST_UPDATE |
-| Object framing (`src/moq/object.zig`) | subgroup headers (all id-mode + priority variants), datagram objects, fetch stream headers — done with round-trip tests |
-| Transport abstraction | skipped — built directly on event_loop's `.quic` and `.webtransport` protocols |
-| Session / SETUP | done in-app (not as library abstraction); verified Zig↔Zig and Zig↔moq-rs |
-| Publisher / Subscriber | `moq_client.zig` has `--mode publish` / subscribe; `moq_server.zig` is a publisher |
-| Relay | done in `apps/moq_relay.zig`: pub/sub fanout with alias remapping + synthetic origin |
-| Browser (WebTransport) demo | done in `apps/moq_browser_server.zig` + `interop/browser/moq.html` |
-| Interop vs moq-rs | SETUP + SUBSCRIBE + SUBSCRIBE_NAMESPACE all validated; moq-rs reaches "broadcast is online, subscribing to track" against our relay; intermittent session close still under investigation |
-| Datagram objects | codec done + tested; runtime path deferred (needs `.quic` datagram dispatch in event_loop) |
-| FETCH stream | header codec done; runtime request/response flow deferred |
-| Namespace discovery | **done in raw-QUIC relay**: SUBSCRIBE_NAMESPACE handler + NAMESPACE/REQUEST_OK response + pre-registered synthetic origin tracks |
-| Group cache (relay) | **done**: per-track ring of N completed groups (default 2, 256 KB each). New subscribers replay cached groups on SUBSCRIBE_OK for immediate playback instead of waiting for next keyframe |
-| Multi-track per session | **done**: `moq-client` accepts repeated `--track` flags, tracks aliases, routes incoming data by track_alias |
-| Publisher liveness | **done**: relay detects closed publisher connections each poll cycle, clears publisher slot, logs gone-tracks (PUBLISH_DONE emission hooks in place) |
+| Wire primitives (`src/moq/wire.zig`, `message_codes.zig`) | done; leading-ones varint, KV list, tuples |
+| Control messages (`src/moq/message.zig`) | all 18 types encode **and** decode, matched to the §9 figures |
+| Message parameters (§9.3) | one codec with the type→shape table; unknown types are a protocol violation, as the draft requires |
+| Object framing (`src/moq/object.zig`) | subgroup headers (all id-modes and priority variants), datagram objects, fetch stream headers |
+| Session (`src/moq/session.zig`) | SETUP + request-stream state machine, generic over the transport; reassembles split messages and drains coalesced ones |
+| Publisher / Subscriber | `moq-client` subscribes or `--mode publish`; `moq-server` publishes |
+| Relay (`moq-relay`, raw QUIC) | pub/sub fanout with alias remapping, namespace registry, rendezvous timeouts, PUBLISH_DONE on publisher loss |
+| Relay (`moq-browser-server`, WebTransport) | the same, plus a per-track group cache and WT application-protocol negotiation |
+| Browser | `interop/browser/moq.html` and `moq_video.html`, driven end to end by `tools/moq_browser_test.mjs` |
+| Interop test client | `moq-test-client`, 7 cases, TAP 14, containerised |
+| Datagram objects | done — `moq-client --mode publish --datagrams`, relayed with alias remapping |
+| FETCH | codec done; no runtime request/response flow |
+| AUTHORIZATION_TOKEN | decoded at the KV level and discarded; no policy engine |
+| draft-18 | done — see below for what it changes, and what of it is skipped |
 
-## Verified interop matrix
+## Verified interop
 
-| Scenario | SETUP | SUBSCRIBE | Objects |
-| --- | --- | --- | --- |
-| Zig ↔ Zig (raw QUIC, loopback) | ✅ | ✅ | ✅ |
-| Zig client → moq-rs relay | ✅ | ✅ (`subscribe started` logged) | ⚠ blocked by moq-rs publisher auth config |
-| moq-rs client → Zig server | ✅ | n/a (subscriber idle) | n/a |
-| Browser (Chrome/Brave) ↔ Zig WT server (clock tick) | ✅ | ✅ | ✅ |
-| Zig pub → Zig relay → Zig sub (raw QUIC) | ✅ | ✅ | ✅ (built-in origin) |
-| **Browser pub → Zig WT relay → N browser subs (live video)** | ✅ | ✅ | ✅ (6 simultaneous subscribers verified) |
+`tools/moq_interop.sh` regenerates [moq-interop-results.md](moq-interop-results.md).
+
+The two cases moq-relay does not pass are its side: `rendezvous-timeout`
+answers `REQUEST_ERROR` with code `404`, which is in neither draft's error
+table, and `announce-subscribe` passes against a freshly started relay but
+not once the earlier cases have run. See
+[moq-interop.md](moq-interop.md).
+
+| Scenario | Result |
+| --- | --- |
+| `moq-test-client` → our raw-QUIC relay, both drafts | 7/7 each |
+| `moq-test-client` → our WebTransport relay, both drafts | 7/7 each |
+| `moq-test-client` → moq-relay v0.14.16, raw QUIC, both drafts | 5/7 each |
+| `moq-test-client` → moq-relay v0.14.16, WebTransport, both drafts | 5/7 each |
+| `moq-test-client` → `cdn.moq.dev` | reachable; it speaks moq-lite, not this dialect |
+| Zig pub → Zig relay → Zig sub (raw QUIC) | ✅ |
+| Datagram objects, pub → relay → sub (raw QUIC) | ✅ both drafts |
+| Browser → Zig WT relay → browser (live video) | ✅ 81 frames published, 51 decoded |
+
+## Where draft-18 differs
+
+`version.Rules` is the table; this is what it encodes, from the draft's
+Appendix A.1 and its §10/§11 tables.
+
+- **`Required Request ID Delta` is removed from every request message**
+  (#1615): SUBSCRIBE, REQUEST_UPDATE, PUBLISH, FETCH, PUBLISH_NAMESPACE,
+  SUBSCRIBE_NAMESPACE. A draft-17 reader on a draft-18 message therefore
+  reads every following field one varint late, which is why the two must
+  never be guessed at.
+- `SUBSCRIBE_NAMESPACE` moves **0x11 → 0x50** and loses `Subscribe
+  Options`; the new **`SUBSCRIBE_TRACKS` (0x51)** takes over yielding
+  PUBLISH while 0x50 yields only NAMESPACE/NAMESPACE_DONE.
+- **`PUBLISH_OK` (0x1E) is no longer sent** — respond to PUBLISH with
+  `REQUEST_OK` (0x07). Table 5 still lists a 0x1E row pointing at §10.5;
+  that is a spec bug, PR #1611 is explicit that the code point changed.
+- `SUBGROUP_HEADER` gains a **FIRST_OBJECT bit (0x40)**, widening the type
+  pattern to `0b0XX1XXXX`. Datagram headers are unchanged.
+- Sections renumber: control messages §9 → §10, data streams §10 → §11.
+
+Known and deliberately not implemented:
+
+- The varint stays leading-ones, but draft-18 makes the **7-byte form
+  valid** and allows non-minimal encodings. We still reject the 7-byte
+  form on both drafts. It saves one byte over eight for values in
+  2^42..2^49 and nothing observed emits it; accepting it needs the draft
+  threaded into the varint reader, which every length and tuple read goes
+  through.
+- `REQUEST_ERROR`'s optional `Redirect`, `REQUEST_OK`'s Track Properties,
+  delta-encoded FETCH object ids, the renamed and new timeout parameters,
+  GOAWAY on request streams, and mandatory-to-understand track
+  properties. None are exercised by the interop runner's cases.
+
+draft-19 and draft-20 also exist, and -19 reverted some of the above
+(Request ID removed from GOAWAY again, `PUBLISH_BLOCKED` renamed
+`PUBLISH_SKIPPED`). Adding one is another row in `Rules`.
 
 ## Video demo architecture
 
@@ -217,8 +271,6 @@ The one-stream-per-group design is what allowed scaling past ~1000 frames per su
 
 - No AUTHORIZATION_TOKEN policy engine — wire-level decode only.
 - VP8 video is in the demo app only; MoQ core treats object payloads as opaque bytes (as the spec intends: the media codec is not part of MoQ).
-- No moq-lite / warp dialect.
-- Relay has no explicit group cache — fresh subscribers see video starting from the next keyframe after they join. A "last N groups LRU" cache would shorten join latency.
-- FETCH request/response runtime flow and namespace-discovery streams are codec-only — no runtime handlers yet.
-- Raw QUIC datagram objects (for low-latency frame delivery) require wiring `.quic` protocol datagram dispatch in the event loop — the codec itself is done.
-- moq-rs data-plane interop blocked by their `--auth-public` config rejecting their own `moq-clock` publisher; their relay repeatedly closes the publisher's session with error 0. SETUP + SUBSCRIBE wire compatibility is validated.
+- moq-lite is implemented separately — see [DRAFT_LCURLEY_MOQ_LITE_05.md](DRAFT_LCURLEY_MOQ_LITE_05.md). It is a different wire format, not a profile of this one.
+- FETCH request/response flow is codec-only. Namespace discovery is wired up in the raw-QUIC relay.
+- The earlier note that moq-rs interop was blocked by their auth config is stale: `demo/relay/localhost.toml` sets `auth.public = ""`, and with it the interop client reaches 5/7 against them.

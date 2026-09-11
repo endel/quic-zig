@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WebTransport Latency Comparison</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: monospace; background: #0f1117; color: #e1e4e8; padding: 24px; max-width: 1400px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin-bottom: 16px; color: #58a6ff; }
+  h2 { font-size: 1rem; margin-bottom: 10px; color: #58a6ff; }
+  h3 { font-size: 0.9rem; margin-bottom: 8px; color: #8b949e; }
+
+  .row { display: flex; gap: 12px; }
+  .row > * { flex: 1; min-width: 0; }
+
+  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+  .panel-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+  .badge-zig { background: #f7a41d22; color: #f7a41d; border: 1px solid #f7a41d55; }
+  .badge-go { background: #00add822; color: #00add8; border: 1px solid #00add855; }
+
+  label { font-size: 0.8rem; color: #8b949e; display: block; }
+  input { width: 100%; padding: 6px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e1e4e8; font-family: monospace; font-size: 0.85rem; margin: 4px 0 8px; }
+
+  .controls { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 12px; display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
+  .controls .field { display: flex; flex-direction: column; }
+  .controls input { width: 80px; margin-bottom: 0; }
+
+  button { padding: 8px 16px; border: none; border-radius: 6px; font-size: 0.85rem; cursor: pointer; font-weight: 600; font-family: monospace; }
+  .btn-go { background: #238636; color: #fff; }
+  .btn-go:hover { background: #2ea043; }
+  .btn-go:disabled { background: #1a3a2a; color: #4a7a5a; cursor: default; }
+  .btn-secondary { background: #30363d; color: #e1e4e8; }
+  .btn-secondary:hover { background: #484f58; }
+
+  .status { font-size: 0.8rem; color: #8b949e; margin-left: auto; }
+
+  /* Results table */
+  table { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-bottom: 12px; }
+  th, td { padding: 6px 10px; text-align: right; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 500; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  td.metric-name { color: #e1e4e8; font-weight: 500; }
+  .delta-good { color: #3fb950; }
+  .delta-bad { color: #f85149; }
+  .delta-tie { color: #8b949e; }
+
+  /* Timing lists */
+  .timing-list { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px; max-height: 350px; overflow-y: auto; font-size: 0.75rem; line-height: 1.5; white-space: pre; }
+  .good { color: #3fb950; }
+  .ok { color: #d29922; }
+  .bad { color: #f85149; }
+  .info { color: #58a6ff; }
+  .dim { color: #484f58; }
+
+  /* Log output */
+  #log { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px; min-height: 60px; max-height: 200px; overflow-y: auto; font-size: 0.8rem; line-height: 1.6; white-space: pre-wrap; margin-bottom: 12px; }
+
+  .section-title { font-size: 0.9rem; color: #58a6ff; margin: 16px 0 8px; }
+
+  .winner-label { font-size: 0.75rem; font-weight: 600; padding: 1px 6px; border-radius: 3px; margin-left: 6px; }
+  .winner-zig { background: #f7a41d22; color: #f7a41d; }
+  .winner-go { background: #00add822; color: #00add8; }
+  .winner-tie { background: #30363d; color: #8b949e; }
+</style>
+</head>
+<body>
+
+<h1>WebTransport Latency Comparison</h1>
+
+<div class="row">
+  <div class="panel">
+    <div class="panel-header">
+      <span class="badge badge-zig">A</span>
+      <h3 style="margin:0">Server A (Zig)</h3>
+    </div>
+    <label>Server URL</label>
+    <input type="text" id="urlA" value="https://127.0.0.1:4433">
+    <label>Certificate SHA-256 (hex)</label>
+    <input type="text" id="hashA" placeholder="paste hex hash from server output">
+  </div>
+  <div class="panel">
+    <div class="panel-header">
+      <span class="badge badge-go">B</span>
+      <h3 style="margin:0">Server B (Go)</h3>
+    </div>
+    <label>Server URL</label>
+    <input type="text" id="urlB" value="https://127.0.0.1:4434">
+    <label>Certificate SHA-256 (hex)</label>
+    <input type="text" id="hashB" placeholder="paste hex hash (same cert = same hash)">
+  </div>
+</div>
+
+<div class="controls">
+  <div class="field">
+    <label>Bidi iterations</label>
+    <input type="number" id="bidiIter" value="100" min="1">
+  </div>
+  <div class="field">
+    <label>Datagram iterations</label>
+    <input type="number" id="dgIter" value="100" min="1">
+  </div>
+  <div class="field">
+    <label>Warmup</label>
+    <input type="number" id="warmup" value="5" min="0">
+  </div>
+  <div>
+    <button class="btn-go" id="btnRun" onclick="runComparison()">Run Both</button>
+    <button class="btn-secondary" onclick="copyHashAtoB()">Copy Hash A to B</button>
+  </div>
+  <span class="status" id="status"></span>
+</div>
+
+<div id="log"></div>
+
+<!-- Bidi comparison -->
+<div id="bidiSection" style="display:none">
+  <div class="section-title">Bidi Stream Echo</div>
+  <div class="panel">
+    <table id="bidiTable"></table>
+  </div>
+  <div class="row">
+    <div>
+      <h3><span class="badge badge-zig">A</span> Zig Bidi Timings</h3>
+      <div class="timing-list" id="bidiTimesA"></div>
+    </div>
+    <div>
+      <h3><span class="badge badge-go">B</span> Go Bidi Timings</h3>
+      <div class="timing-list" id="bidiTimesB"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Datagram comparison -->
+<div id="dgSection" style="display:none; margin-top: 16px;">
+  <div class="section-title">Datagram Echo</div>
+  <div class="panel">
+    <table id="dgTable"></table>
+  </div>
+  <div class="row">
+    <div>
+      <h3><span class="badge badge-zig">A</span> Zig Datagram Timings</h3>
+      <div class="timing-list" id="dgTimesA"></div>
+    </div>
+    <div>
+      <h3><span class="badge badge-go">B</span> Go Datagram Timings</h3>
+      <div class="timing-list" id="dgTimesB"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+
+function log(msg, cls = '') {
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = msg + '\n';
+  logEl.appendChild(span);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(msg) {
+  statusEl.textContent = msg;
+}
+
+function hexToBytes(hex) {
+  hex = hex.replace(/[^0-9a-fA-F]/g, '');
+  const b = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return b;
+}
+
+function copyHashAtoB() {
+  document.getElementById('hashB').value = document.getElementById('hashA').value;
+}
+
+function latencyClass(ms) {
+  if (ms < 2) return 'good';
+  if (ms <= 5) return 'ok';
+  return 'bad';
+}
+
+function computeStats(times) {
+  const sorted = [...times].sort((a, b) => a - b);
+  const n = sorted.length;
+  if (n === 0) return null;
+  const sum = times.reduce((a, b) => a + b, 0);
+  const avg = sum / n;
+  const variance = times.reduce((s, x) => s + (x - avg) ** 2, 0) / n;
+  return {
+    min: sorted[0],
+    max: sorted[n - 1],
+    median: sorted[Math.floor(n / 2)],
+    avg: avg,
+    p95: sorted[Math.floor(n * 0.95)],
+    p99: sorted[Math.min(Math.floor(n * 0.99), n - 1)],
+    stddev: Math.sqrt(variance)
+  };
+}
+
+function renderComparisonTable(tableId, statsA, statsB) {
+  const table = document.getElementById(tableId);
+  const metrics = ['min', 'max', 'median', 'avg', 'p95', 'p99', 'stddev'];
+  const labels = {
+    min: 'Min', max: 'Max', median: 'Median',
+    avg: 'Average', p95: 'P95', p99: 'P99', stddev: 'Std Dev'
+  };
+
+  let html = '<tr><th>Metric</th><th>Server A (Zig)</th><th>Server B (Go)</th><th>Delta</th><th></th></tr>';
+
+  for (const m of metrics) {
+    const a = statsA[m];
+    const b = statsB[m];
+    const delta = a - b;
+    const absDelta = Math.abs(delta);
+
+    let deltaClass, deltaSign, winnerHtml;
+    if (m === 'stddev') {
+      // For stddev, lower is better (more consistent)
+      if (absDelta < 0.05) {
+        deltaClass = 'delta-tie'; deltaSign = ''; winnerHtml = '';
+      } else if (delta < 0) {
+        deltaClass = 'delta-good'; deltaSign = '-';
+        winnerHtml = '<span class="winner-label winner-zig">Zig</span>';
+      } else {
+        deltaClass = 'delta-bad'; deltaSign = '+';
+        winnerHtml = '<span class="winner-label winner-go">Go</span>';
+      }
+    } else {
+      // For latency metrics, lower is better
+      if (absDelta < 0.05) {
+        deltaClass = 'delta-tie'; deltaSign = ''; winnerHtml = '';
+      } else if (delta < 0) {
+        deltaClass = 'delta-good'; deltaSign = '-';
+        winnerHtml = '<span class="winner-label winner-zig">Zig</span>';
+      } else {
+        deltaClass = 'delta-bad'; deltaSign = '+';
+        winnerHtml = '<span class="winner-label winner-go">Go</span>';
+      }
+    }
+
+    const deltaText = absDelta < 0.05 ? 'tie' : `${deltaSign}${absDelta.toFixed(2)}ms`;
+
+    html += `<tr>
+      <td class="metric-name">${labels[m]}</td>
+      <td>${a.toFixed(2)}ms</td>
+      <td>${b.toFixed(2)}ms</td>
+      <td class="${deltaClass}">${deltaText}</td>
+      <td>${winnerHtml}</td>
+    </tr>`;
+  }
+
+  table.innerHTML = html;
+}
+
+function renderTimingList(elId, times) {
+  const el = document.getElementById(elId);
+  el.innerHTML = '';
+  times.forEach((ms, i) => {
+    const span = document.createElement('span');
+    span.className = latencyClass(ms);
+    span.textContent = `#${String(i + 1).padStart(3)}  ${ms.toFixed(2).padStart(8)}ms\n`;
+    el.appendChild(span);
+  });
+}
+
+async function connectServer(url, hashHex, label) {
+  log(`[${label}] Connecting to ${url}...`, 'info');
+  const t0 = performance.now();
+  const transport = new WebTransport(url, {
+    serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBytes(hashHex).buffer }]
+  });
+  await transport.ready;
+  const connMs = (performance.now() - t0).toFixed(1);
+  log(`[${label}] Connected in ${connMs}ms`, 'info');
+  return transport;
+}
+
+async function runBidiTest(transport, iterations, warmup, label) {
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const times = [];
+
+  // Warmup
+  if (warmup > 0) {
+    log(`[${label}] Bidi warmup: ${warmup} iterations...`, 'dim');
+    for (let i = 0; i < warmup; i++) {
+      const stream = await transport.createBidirectionalStream();
+      const writer = stream.writable.getWriter();
+      await writer.write(enc.encode('ping'));
+      await writer.close();
+      const reader = stream.readable.getReader();
+      while (true) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    }
+  }
+
+  // Measured iterations
+  log(`[${label}] Bidi test: ${iterations} iterations...`, 'info');
+  for (let i = 0; i < iterations; i++) {
+    const start = performance.now();
+    const stream = await transport.createBidirectionalStream();
+    const writer = stream.writable.getWriter();
+    await writer.write(enc.encode('ping'));
+    await writer.close();
+    const reader = stream.readable.getReader();
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    const elapsed = performance.now() - start;
+    times.push(elapsed);
+  }
+
+  return times;
+}
+
+async function runDatagramTest(transport, iterations, warmup, label) {
+  const enc = new TextEncoder();
+  const times = [];
+  const dgReader = transport.datagrams.readable.getReader();
+
+  // Warmup
+  if (warmup > 0) {
+    log(`[${label}] Datagram warmup: ${warmup} iterations...`, 'dim');
+    for (let i = 0; i < warmup; i++) {
+      const dgWriter = transport.datagrams.writable.getWriter();
+      await dgWriter.write(enc.encode('ping'));
+      dgWriter.releaseLock();
+      await dgReader.read();
+    }
+  }
+
+  // Measured iterations
+  log(`[${label}] Datagram test: ${iterations} iterations...`, 'info');
+  for (let i = 0; i < iterations; i++) {
+    const start = performance.now();
+    const dgWriter = transport.datagrams.writable.getWriter();
+    await dgWriter.write(enc.encode('ping'));
+    dgWriter.releaseLock();
+    await dgReader.read();
+    const elapsed = performance.now() - start;
+    times.push(elapsed);
+  }
+
+  dgReader.releaseLock();
+  return times;
+}
+
+async function runComparison() {
+  logEl.innerHTML = '';
+  document.getElementById('bidiSection').style.display = 'none';
+  document.getElementById('dgSection').style.display = 'none';
+
+  const urlA = document.getElementById('urlA').value.trim();
+  const urlB = document.getElementById('urlB').value.trim();
+  const hashA = document.getElementById('hashA').value.trim();
+  const hashB = document.getElementById('hashB').value.trim();
+  const bidiIter = parseInt(document.getElementById('bidiIter').value) || 100;
+  const dgIter = parseInt(document.getElementById('dgIter').value) || 100;
+  const warmup = parseInt(document.getElementById('warmup').value) || 5;
+
+  if (!hashA || hashA.replace(/[^0-9a-fA-F]/g, '').length !== 64) {
+    log('Server A certificate hash must be 64 hex chars', 'bad');
+    return;
+  }
+  if (!hashB || hashB.replace(/[^0-9a-fA-F]/g, '').length !== 64) {
+    log('Server B certificate hash must be 64 hex chars', 'bad');
+    return;
+  }
+
+  const btn = document.getElementById('btnRun');
+  btn.disabled = true;
+
+  let transportA = null;
+  let transportB = null;
+
+  try {
+    // ============================================================
+    // Phase 1: Server A (Zig)
+    // ============================================================
+    setStatus('Testing Server A (Zig)...');
+    log('========================================', 'dim');
+    log('  Phase 1: Server A (Zig)', 'info');
+    log('========================================', 'dim');
+
+    transportA = await connectServer(urlA, hashA, 'Zig');
+
+    const bidiTimesA = await runBidiTest(transportA, bidiIter, warmup, 'Zig');
+    const bidiStatsA = computeStats(bidiTimesA);
+    log(`[Zig] Bidi median=${bidiStatsA.median.toFixed(2)}ms avg=${bidiStatsA.avg.toFixed(2)}ms p95=${bidiStatsA.p95.toFixed(2)}ms`, 'info');
+
+    const dgTimesA = await runDatagramTest(transportA, dgIter, warmup, 'Zig');
+    const dgStatsA = computeStats(dgTimesA);
+    log(`[Zig] Datagram median=${dgStatsA.median.toFixed(2)}ms avg=${dgStatsA.avg.toFixed(2)}ms p95=${dgStatsA.p95.toFixed(2)}ms`, 'info');
+
+    transportA.close();
+    transportA = null;
+    log('[Zig] Connection closed.', 'dim');
+    log('');
+
+    // ============================================================
+    // Phase 2: Server B (Go)
+    // ============================================================
+    setStatus('Testing Server B (Go)...');
+    log('========================================', 'dim');
+    log('  Phase 2: Server B (Go)', 'info');
+    log('========================================', 'dim');
+
+    transportB = await connectServer(urlB, hashB, 'Go');
+
+    const bidiTimesB = await runBidiTest(transportB, bidiIter, warmup, 'Go');
+    const bidiStatsB = computeStats(bidiTimesB);
+    log(`[Go] Bidi median=${bidiStatsB.median.toFixed(2)}ms avg=${bidiStatsB.avg.toFixed(2)}ms p95=${bidiStatsB.p95.toFixed(2)}ms`, 'info');
+
+    const dgTimesB = await runDatagramTest(transportB, dgIter, warmup, 'Go');
+    const dgStatsB = computeStats(dgTimesB);
+    log(`[Go] Datagram median=${dgStatsB.median.toFixed(2)}ms avg=${dgStatsB.avg.toFixed(2)}ms p95=${dgStatsB.p95.toFixed(2)}ms`, 'info');
+
+    transportB.close();
+    transportB = null;
+    log('[Go] Connection closed.', 'dim');
+    log('');
+
+    // ============================================================
+    // Phase 3: Render comparison
+    // ============================================================
+    setStatus('Rendering results...');
+    log('========================================', 'dim');
+    log('  Comparison complete!', 'good');
+    log('========================================', 'dim');
+
+    // Bidi comparison
+    document.getElementById('bidiSection').style.display = 'block';
+    renderComparisonTable('bidiTable', bidiStatsA, bidiStatsB);
+    renderTimingList('bidiTimesA', bidiTimesA);
+    renderTimingList('bidiTimesB', bidiTimesB);
+
+    // Datagram comparison
+    document.getElementById('dgSection').style.display = 'block';
+    renderComparisonTable('dgTable', dgStatsA, dgStatsB);
+    renderTimingList('dgTimesA', dgTimesA);
+    renderTimingList('dgTimesB', dgTimesB);
+
+    setStatus('Done.');
+
+  } catch (err) {
+    log(`Error: ${err}`, 'bad');
+    log(err.stack || '', 'dim');
+    setStatus('Failed.');
+    // Clean up on error
+    if (transportA) try { transportA.close(); } catch (_) {}
+    if (transportB) try { transportB.close(); } catch (_) {}
+  }
+
+  btn.disabled = false;
+}
+</script>
+</body>
+</html>

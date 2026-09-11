@@ -17,6 +17,7 @@ const testing = std.testing;
 const wire = @import("wire.zig");
 const codes = @import("message_codes.zig");
 const track = @import("track.zig");
+const version = @import("version.zig");
 
 pub const Error = error{
     InvalidStreamType,
@@ -72,10 +73,12 @@ pub const ParsedSubgroupHeader = struct {
     id_mode: codes.SubgroupIdMode,
 };
 
-pub fn readSubgroupHeader(fbs: *io.FixedBufferStream([]const u8)) !ParsedSubgroupHeader {
+pub fn readSubgroupHeader(fbs: *io.FixedBufferStream([]const u8), draft: version.Draft) !ParsedSubgroupHeader {
     const reader = fbs;
     const flags = try wire.readVarInt(reader);
-    if (!codes.isSubgroupStreamType(flags)) return Error.InvalidStreamType;
+    if (!codes.isSubgroupStreamType(flags, version.Rules.of(draft).subgroup_first_object_bit)) {
+        return Error.InvalidStreamType;
+    }
 
     const mode_bits: u2 = @truncate((flags & codes.SUBGROUP_MASK_ID_MODE) >> 1);
     const id_mode: codes.SubgroupIdMode = @enumFromInt(mode_bits);
@@ -214,7 +217,7 @@ test "subgroup header round-trip — explicit subgroup with priority" {
     const written = fbs.seek;
 
     var rb = io.fixedBufferStream(@as([]const u8, buf[0..written]));
-    const parsed = try readSubgroupHeader(&rb);
+    const parsed = try readSubgroupHeader(&rb, .draft_17);
     try testing.expectEqual(@as(u64, 42), parsed.header.track_alias);
     try testing.expectEqual(@as(u64, 7), parsed.header.group);
     try testing.expectEqual(@as(?u64, 3), parsed.header.subgroup);
@@ -237,7 +240,7 @@ test "subgroup header round-trip — zero subgroup, default priority, end-of-gro
     };
     try writeSubgroupHeader(&fbs, h);
     var rb = io.fixedBufferStream(@as([]const u8, buf[0..fbs.seek]));
-    const parsed = try readSubgroupHeader(&rb);
+    const parsed = try readSubgroupHeader(&rb, .draft_17);
     try testing.expectEqual(codes.SubgroupIdMode.zero, parsed.id_mode);
     try testing.expect(parsed.header.end_of_group);
     try testing.expectEqual(@as(?u8, null), parsed.header.publisher_priority);
@@ -247,7 +250,7 @@ test "subgroup header rejects reserved id-mode" {
     // Raw type byte with reserved mode bits (0b11 at bits 1-2) and selector set.
     const raw = [_]u8{ codes.SUBGROUP_BIT_SELECTOR | codes.SUBGROUP_MASK_ID_MODE, 0x01, 0x00 };
     var rb = io.fixedBufferStream(@as([]const u8, &raw));
-    try testing.expectError(Error.InvalidStreamType, readSubgroupHeader(&rb));
+    try testing.expectError(Error.InvalidStreamType, readSubgroupHeader(&rb, .draft_17));
 }
 
 test "datagram object round-trip with payload" {
@@ -301,4 +304,25 @@ test "fetch stream header round-trip" {
     var rb = io.fixedBufferStream(@as([]const u8, buf[0..fbs.seek]));
     const rid = try readFetchStreamHeader(&rb);
     try testing.expectEqual(@as(u64, 0xabcd), rid);
+}
+
+test "draft-18 accepts the FIRST_OBJECT bit that draft-17 rejects" {
+    // §11.4.2 added bit 0x40. A draft-17 reader must refuse the type code
+    // outright rather than ignore the bit, because the rest of the header
+    // would then be read at the wrong offset.
+    var buf: [32]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try wire.writeVarInt(&fbs, codes.SUBGROUP_BIT_SELECTOR | codes.SUBGROUP_BIT_FIRST_OBJECT);
+    try wire.writeVarInt(&fbs, 7); // track alias
+    try wire.writeVarInt(&fbs, 3); // group
+    try fbs.writeByte(128); // publisher priority
+    const encoded = buf[0..fbs.seek];
+
+    var r17 = io.fixedBufferStream(@as([]const u8, encoded));
+    try testing.expectError(Error.InvalidStreamType, readSubgroupHeader(&r17, .draft_17));
+
+    var r18 = io.fixedBufferStream(@as([]const u8, encoded));
+    const parsed = try readSubgroupHeader(&r18, .draft_18);
+    try testing.expectEqual(@as(u64, 7), parsed.header.track_alias);
+    try testing.expectEqual(@as(u64, 3), parsed.header.group);
 }

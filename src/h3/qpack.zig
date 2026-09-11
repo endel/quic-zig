@@ -142,24 +142,34 @@ fn findStaticMatch(name: []const u8, value: []const u8) ?struct { index: u8, ful
 
 /// Encode a QPACK integer with the given prefix bit count.
 /// RFC 9204 Section 4.1.1 (same as HPACK integer encoding).
-fn encodeInteger(buf: []u8, pos: *usize, value: usize, prefix_bits: u4, first_byte: u8) void {
+fn encodeInteger(buf: []u8, pos: *usize, value: usize, prefix_bits: u4, first_byte: u8) !void {
     const max_prefix: u8 = @intCast((@as(u16, 1) << prefix_bits) - 1);
 
     if (value < max_prefix) {
-        buf[pos.*] = first_byte | @as(u8, @intCast(value));
-        pos.* += 1;
+        try putByte(buf, pos, first_byte | @as(u8, @intCast(value)));
     } else {
-        buf[pos.*] = first_byte | max_prefix;
-        pos.* += 1;
+        try putByte(buf, pos, first_byte | max_prefix);
         var remaining = value - max_prefix;
         while (remaining >= 128) {
-            buf[pos.*] = @as(u8, @intCast(remaining & 0x7f)) | 0x80;
-            pos.* += 1;
+            try putByte(buf, pos, @as(u8, @intCast(remaining & 0x7f)) | 0x80);
             remaining >>= 7;
         }
-        buf[pos.*] = @as(u8, @intCast(remaining));
-        pos.* += 1;
+        try putByte(buf, pos, @as(u8, @intCast(remaining)));
     }
+}
+
+fn putByte(buf: []u8, pos: *usize, byte: u8) !void {
+    if (pos.* >= buf.len) return error.BufferTooSmall;
+    buf[pos.*] = byte;
+    pos.* += 1;
+}
+
+/// Copies a header name or value in at `pos`. Both are peer-sized on a
+/// proxy, so neither is bounded by anything but this check.
+fn putBytes(buf: []u8, pos: *usize, s: []const u8) !void {
+    if (pos.* > buf.len or s.len > buf.len - pos.*) return error.BufferTooSmall;
+    @memcpy(buf[pos.*..][0..s.len], s);
+    pos.* += s.len;
 }
 
 /// Decode a QPACK integer with the given prefix bit count.
@@ -172,11 +182,17 @@ fn decodeInteger(data: []const u8, pos: *usize, prefix_bits: u4) !usize {
 
     if (value < max_prefix) return value;
 
-    var shift: u6 = 0;
+    // RFC 7541 5.1 puts no bound on the continuation run, so a peer picks how
+    // long it is: ten bytes of 0x80 overflow the shift, and more overflow the
+    // accumulator. Both are reachable from any HTTP/3 peer.
+    var shift: u8 = 0;
     while (pos.* < data.len) {
         const b = data[pos.*];
         pos.* += 1;
-        value += @as(usize, b & 0x7f) << shift;
+        if (shift >= @bitSizeOf(usize)) return error.IntegerTooLarge;
+        const add = std.math.shlExact(usize, @as(usize, b & 0x7f), @intCast(shift)) catch
+            return error.IntegerTooLarge;
+        value = std.math.add(usize, value, add) catch return error.IntegerTooLarge;
         if (b & 0x80 == 0) return value;
         shift += 7;
     }
@@ -184,11 +200,10 @@ fn decodeInteger(data: []const u8, pos: *usize, prefix_bits: u4) !usize {
 }
 
 /// Encode a string literal (no Huffman encoding).
-fn encodeString(buf: []u8, pos: *usize, s: []const u8) void {
+fn encodeString(buf: []u8, pos: *usize, s: []const u8) !void {
     // Length prefix with H=0 (no Huffman), 7-bit prefix
-    encodeInteger(buf, pos, s.len, 7, 0x00);
-    @memcpy(buf[pos.*..][0..s.len], s);
-    pos.* += s.len;
+    try encodeInteger(buf, pos, s.len, 7, 0x00);
+    try putBytes(buf, pos, s);
 }
 
 /// Decode a string literal (plain or Huffman-encoded).
@@ -320,20 +335,33 @@ pub const DynamicTable = struct {
     }
 
     /// Insert a new entry, evicting oldest-first to make room.
+    ///
+    /// `name` and `value` may point into this table's own arena: the encoder
+    /// stream's Duplicate and Insert With Name Reference both name an entry
+    /// already in it (RFC 9204 4.3.4, 4.3.2). So they are staged out before
+    /// anything moves — otherwise the copy below either overlaps its source,
+    /// or reads from where `compact()` has just moved the entry away from,
+    /// which puts one peer-chosen entry's bytes under another's name.
     pub fn insert(self: *DynamicTable, name: []const u8, value: []const u8) !void {
         const entry_size = computeEntrySize(name, value);
         if (entry_size > self.capacity) return error.EntryTooLarge;
+
+        const content = name.len + value.len;
+        if (content > MAX_CAPACITY) return error.EntryTooLarge;
+
+        var staged: [MAX_CAPACITY]u8 = undefined;
+        @memcpy(staged[0..name.len], name);
+        @memcpy(staged[name.len..][0..value.len], value);
 
         while (self.size + entry_size > self.capacity and self.count > 0) {
             self.evict();
         }
 
-        const content = name.len + value.len;
         if (self.used + content > MAX_CAPACITY) self.compact();
 
         const off: u32 = @intCast(self.used);
-        @memcpy(self.arena[off..][0..name.len], name);
-        @memcpy(self.arena[off + name.len ..][0..value.len], value);
+        if (off + content > self.arena.len) return error.EntryTooLarge;
+        @memcpy(self.arena[off..][0..content], staged[0..content]);
 
         // Before insert_count moves — headIndex() is derived from it.
         self.descs[self.headIndex()] = .{
@@ -459,7 +487,9 @@ pub const QpackEncoder = struct {
         const effective = self.dynamic.capacity;
         if (effective > 0) {
             var pos = self.instruction_len;
-            encodeInteger(&self.instruction_buf, &pos, effective, 5, 0x20);
+            // instruction_len is only advanced on success, so a full buffer
+            // drops this instruction rather than truncating one.
+            encodeInteger(&self.instruction_buf, &pos, effective, 5, 0x20) catch return;
             self.instruction_len = pos;
         }
     }
@@ -493,7 +523,7 @@ pub const QpackEncoder = struct {
             if (findStaticMatch(h.name, h.value)) |smatch| {
                 if (smatch.full_match) {
                     // Indexed static: 11NNNNNN
-                    encodeInteger(&field_buf, &field_pos, smatch.index, 6, 0xc0);
+                    try encodeInteger(&field_buf, &field_pos, smatch.index, 6, 0xc0);
                     continue;
                 }
 
@@ -503,15 +533,15 @@ pub const QpackEncoder = struct {
                         // Indexed dynamic: 10NNNNNN (T=0, relative index)
                         const base = self.dynamic.insert_count;
                         const rel_idx = base - dmatch.abs_index - 1;
-                        encodeInteger(&field_buf, &field_pos, rel_idx, 6, 0x80);
+                        try encodeInteger(&field_buf, &field_pos, rel_idx, 6, 0x80);
                         used_dynamic = true;
                         continue;
                     }
                 }
 
                 // Static name match — literal with static name ref + insert to dynamic
-                encodeInteger(&field_buf, &field_pos, smatch.index, 4, 0x50);
-                encodeString(&field_buf, &field_pos, h.value);
+                try encodeInteger(&field_buf, &field_pos, smatch.index, 4, 0x50);
+                try encodeString(&field_buf, &field_pos, h.value);
 
                 // Try to insert into dynamic table + emit encoder instruction
                 self.tryInsertWithStaticNameRef(smatch.index, h.value);
@@ -524,14 +554,14 @@ pub const QpackEncoder = struct {
                 if (dmatch.full_match) {
                     // Indexed dynamic: 10NNNNNN
                     const rel_idx = base - dmatch.abs_index - 1;
-                    encodeInteger(&field_buf, &field_pos, rel_idx, 6, 0x80);
+                    try encodeInteger(&field_buf, &field_pos, rel_idx, 6, 0x80);
                     used_dynamic = true;
                     continue;
                 }
                 // Dynamic name match — literal with dynamic name ref
                 const rel_idx = base - dmatch.abs_index - 1;
-                encodeInteger(&field_buf, &field_pos, rel_idx, 4, 0x40);
-                encodeString(&field_buf, &field_pos, h.value);
+                try encodeInteger(&field_buf, &field_pos, rel_idx, 4, 0x40);
+                try encodeString(&field_buf, &field_pos, h.value);
 
                 // Try to insert with literal name
                 self.tryInsertWithLiteralName(h.name, h.value);
@@ -539,10 +569,9 @@ pub const QpackEncoder = struct {
             }
 
             // 4. No match — literal with literal name
-            encodeInteger(&field_buf, &field_pos, h.name.len, 3, 0x20);
-            @memcpy(field_buf[field_pos..][0..h.name.len], h.name);
-            field_pos += h.name.len;
-            encodeString(&field_buf, &field_pos, h.value);
+            try encodeInteger(&field_buf, &field_pos, h.name.len, 3, 0x20);
+            try putBytes(&field_buf, &field_pos, h.name);
+            try encodeString(&field_buf, &field_pos, h.value);
 
             // Try to insert for future use
             self.tryInsertWithLiteralName(h.name, h.value);
@@ -558,9 +587,9 @@ pub const QpackEncoder = struct {
             _ = ric_start;
             const max_entries = self.dynamic.maxEntries();
             const encoded_ric = encodeRequiredInsertCount(ric, max_entries);
-            encodeInteger(&prefix_buf, &prefix_pos, encoded_ric, 8, 0x00);
+            try encodeInteger(&prefix_buf, &prefix_pos, encoded_ric, 8, 0x00);
             // Delta Base = 0 (base == RIC), sign = 0
-            encodeInteger(&prefix_buf, &prefix_pos, 0, 7, 0x00);
+            try encodeInteger(&prefix_buf, &prefix_pos, 0, 7, 0x00);
         } else {
             // RIC = 0, Delta Base = 0
             prefix_buf[0] = 0x00;
@@ -585,8 +614,8 @@ pub const QpackEncoder = struct {
         // Encoder instruction: 1TNNNNNN — T=1 for static, 6-bit index
         var pos = self.instruction_len;
         if (pos + 2 + value.len + 8 > self.instruction_buf.len) return;
-        encodeInteger(&self.instruction_buf, &pos, static_idx, 6, 0xc0);
-        encodeString(&self.instruction_buf, &pos, value);
+        encodeInteger(&self.instruction_buf, &pos, static_idx, 6, 0xc0) catch return;
+        encodeString(&self.instruction_buf, &pos, value) catch return;
         self.instruction_len = pos;
     }
 
@@ -599,10 +628,9 @@ pub const QpackEncoder = struct {
         var pos = self.instruction_len;
         if (pos + 2 + name.len + value.len + 16 > self.instruction_buf.len) return;
         // 01HXXXXX — H=0 (no Huffman), 5-bit name length
-        encodeInteger(&self.instruction_buf, &pos, name.len, 5, 0x40);
-        @memcpy(self.instruction_buf[pos..][0..name.len], name);
-        pos += name.len;
-        encodeString(&self.instruction_buf, &pos, value);
+        encodeInteger(&self.instruction_buf, &pos, name.len, 5, 0x40) catch return;
+        putBytes(&self.instruction_buf, &pos, name) catch return;
+        encodeString(&self.instruction_buf, &pos, value) catch return;
         self.instruction_len = pos;
     }
 
@@ -884,7 +912,7 @@ pub const QpackDecoder = struct {
         var pos = self.instruction_len;
         if (pos + 8 > self.instruction_buf.len) return;
         // Header Ack: 1XXXXXXX — 7-bit stream ID
-        encodeInteger(&self.instruction_buf, &pos, stream_id, 7, 0x80);
+        encodeInteger(&self.instruction_buf, &pos, stream_id, 7, 0x80) catch return;
         self.instruction_len = pos;
     }
 
@@ -909,28 +937,25 @@ pub fn encodeHeaders(headers: []const Header, buf: []u8) !usize {
     pos = 2;
 
     for (headers) |h| {
-        if (pos >= buf.len) return error.BufferTooSmall;
-
         if (findStaticMatch(h.name, h.value)) |match| {
             if (match.full_match) {
                 // Indexed field line (static): 1TNNNNNN, T=1 for static
                 // Pattern: 11NNNNNN (6-bit index)
-                encodeInteger(buf, &pos, match.index, 6, 0xc0);
+                try encodeInteger(buf, &pos, match.index, 6, 0xc0);
             } else {
                 // Literal with name reference (static): 0101NNNN
                 // 4-bit index prefix, T=1 for static
-                encodeInteger(buf, &pos, match.index, 4, 0x50);
-                encodeString(buf, &pos, h.value);
+                try encodeInteger(buf, &pos, match.index, 4, 0x50);
+                try encodeString(buf, &pos, h.value);
             }
         } else {
             // Literal with literal name: 001NHNNN
             // N=0 (allow indexing), H=0 (no Huffman for name), 3-bit name length prefix
             // Name length is encoded in the first byte's lower 3 bits
-            encodeInteger(buf, &pos, h.name.len, 3, 0x20);
-            @memcpy(buf[pos..][0..h.name.len], h.name);
-            pos += h.name.len;
+            try encodeInteger(buf, &pos, h.name.len, 3, 0x20);
+            try putBytes(buf, &pos, h.name);
             // Value length + value (7-bit prefix, H=0)
-            encodeString(buf, &pos, h.value);
+            try encodeString(buf, &pos, h.value);
         }
     }
 
@@ -1043,6 +1068,23 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header, scratch: []u8) !us
 // Tests run sequentially and never hold header slices across calls.
 var test_scratch: [SCRATCH_SIZE]u8 = undefined;
 
+test "decodeInteger rejects a continuation run that overflows" {
+    // 0x7f opens a 7-bit-prefix integer at its maximum; every 0x80 after it
+    // asks for another 7 bits, and the peer decides how many it sends.
+    var data: [32]u8 = undefined;
+    data[0] = 0x7f;
+    @memset(data[1..], 0x80);
+
+    var pos: usize = 0;
+    try testing.expectError(error.IntegerTooLarge, decodeInteger(&data, &pos, 7));
+}
+
+test "encodeHeaders reports a buffer too small for the headers" {
+    const headers = [_]Header{.{ .name = "x-custom", .value = "0123456789" }};
+    var buf: [8]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, encodeHeaders(&headers, &buf));
+}
+
 test "QPACK: encode and decode indexed header" {
     var buf: [256]u8 = undefined;
     const headers = [_]Header{
@@ -1154,7 +1196,7 @@ test "QPACK: integer encoding edge cases" {
     var pos: usize = 0;
 
     // Value 63 with 6-bit prefix (exactly at boundary)
-    encodeInteger(&buf, &pos, 63, 6, 0xc0);
+    try encodeInteger(&buf, &pos, 63, 6, 0xc0);
     try testing.expectEqual(@as(usize, 2), pos); // needs continuation
 
     // Decode it back
@@ -1402,7 +1444,7 @@ test "QpackDecoder: process Set Capacity instruction" {
     // Encoder sends Set Capacity: 001XXXXX with value 2048
     var instr_buf: [16]u8 = undefined;
     var pos: usize = 0;
-    encodeInteger(&instr_buf, &pos, 2048, 5, 0x20);
+    try encodeInteger(&instr_buf, &pos, 2048, 5, 0x20);
 
     try decoder.processEncoderInstruction(instr_buf[0..pos]);
     try testing.expectEqual(@as(usize, 2048), decoder.dynamic.capacity);
@@ -1505,7 +1547,7 @@ test "QpackDecoder: Set Capacity above local max is rejected" {
     // 001 prefix, 5-bit prefix = 31 marker, then continuation for 2048-31=2017.
     var buf: [16]u8 = undefined;
     var pos: usize = 0;
-    encodeInteger(&buf, &pos, 2048, 5, 0x20);
+    try encodeInteger(&buf, &pos, 2048, 5, 0x20);
 
     try testing.expectError(
         error.CapacityExceeded,
@@ -1632,4 +1674,40 @@ test "DynamicTable: capacity beyond the arena is clamped, not trusted" {
         dt.insert("n", "v") catch break;
         try testing.expect(dt.count <= DynamicTable.MAX_CAPACITY / 32);
     }
+}
+
+test "an encoder-stream Duplicate copies an entry out of the arena it writes to" {
+    // RFC 9204 4.3.4: Duplicate names an entry the table already holds, so
+    // insert() is handed a slice of the arena it is about to write into. Here
+    // the duplicate does not fit alongside the original, so inserting it
+    // evicts the original first — and the arena offset resets to where the
+    // bytes being read from live. Source and destination are then the same
+    // address, which is an aliasing @memcpy and, once compaction is in play,
+    // one entry's bytes filed under another's name.
+    var dec = QpackDecoder{};
+    dec.setCapacity(4096);
+
+    // Set Dynamic Table Capacity (001XXXXX, 5-bit prefix) to 41 — exactly one
+    // "name"/"value" entry, 9 bytes of content plus the RFC's 32 of overhead.
+    try dec.processEncoderInstruction(&[_]u8{ 0x20 | 31, 10 });
+    try testing.expectEqual(@as(usize, 41), dec.dynamic.capacity);
+
+    // Insert With Literal Name: 01H0NNNN, 5-bit name length, then a string.
+    try dec.processEncoderInstruction(&[_]u8{
+        0x40 | 4, 'n', 'a', 'm', 'e',
+        5,        'v', 'a', 'l', 'u', 'e',
+    });
+    try testing.expectEqual(@as(usize, 1), dec.dynamic.count);
+
+    // Duplicate the entry, repeatedly — each one evicts the one it copies.
+    for (0..4) |i| {
+        const idx: u8 = @intCast(i);
+        try dec.processEncoderInstruction(&[_]u8{idx});
+
+        const newest = dec.dynamic.get(dec.dynamic.insert_count - 1) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("name", newest.name);
+        try testing.expectEqualStrings("value", newest.value);
+    }
+    try testing.expectEqual(@as(u64, 5), dec.dynamic.insert_count);
 }

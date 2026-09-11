@@ -195,7 +195,7 @@
 | 4.1 | Interface to TLS | ✅ Done | Action-based step() pattern |
 | 4.2 | TLS Version | ✅ Done | TLS 1.3 only |
 | 4.3 | ClientHello Size | ✅ Done | Initial packet padded to 1200 bytes (RFC 9001 requires packet padding, not CH padding) |
-| 4.4 | Peer Authentication | ✅ Done | Chain validation, hostname verify |
+| 4.4 | Peer Authentication | ✅ Done | Chain validation, hostname verify, trust anchors via `ClientConfig.ca`; answers a `CertificateRequest` with an empty certificate. See [RFC5280_CHAIN_VALIDATION.md](RFC5280_CHAIN_VALIDATION.md) for what is still not checked |
 | 4.5 | Session Resumption | ✅ Done | PSK/tickets, binder, NewSessionTicket |
 | 4.6 | 0-RTT | ✅ Done | Early key install, 0-RTT packing; `early_data` answered in EncryptedExtensions only when the ClientHello offered it (RFC 8446 §4.2.10) |
 | 4.7 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager |
@@ -549,27 +549,53 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
 | WebTransport | 17 | 0 | 0 | 100% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
-| MoQ Transport (draft-17) | 8 | 3 | 0 | see below |
+| MoQ Transport (draft-17, -18) | 15 | 1 | 0 | see below |
+| moq-lite (draft-05) | 6 | 2 | 1 | see below |
 
-### MoQ Transport (draft-ietf-moq-transport-17)
+### MoQ Transport (draft-ietf-moq-transport-17 and -18)
 
-See [DRAFT_IETF_MOQ_TRANSPORT_17.md](DRAFT_IETF_MOQ_TRANSPORT_17.md) for details.
+See [DRAFT_IETF_MOQ_TRANSPORT.md](DRAFT_IETF_MOQ_TRANSPORT.md) for
+details, and [moq-interop.md](moq-interop.md) for the interop runner.
 
 | Component | Status |
 |---|---|
 | Wire primitives (leading-ones varint, KV codec, tuples) | ✅ Done |
-| Control messages (SETUP, SUBSCRIBE, PUBLISH, FETCH, NAMESPACE, …) | ✅ Done (18 types) |
+| Control messages — all 18 encode and decode, matched to the §9 figures | ✅ Done |
+| Message parameters (§9.3 type→shape table) | ✅ Done |
 | Object framing (subgroup streams, datagrams, fetch streams) | ✅ Done |
-| Session SETUP handshake | ✅ Done |
-| Subscribe flow (raw QUIC) | ✅ Done |
-| Publish flow (raw QUIC) | ✅ Done |
-| Relay with alias-remapping fanout | ✅ Done |
-| WebTransport browser client/server | ✅ Done |
-| Datagram-object runtime (raw QUIC) | ⚠ Codec only |
+| Session state machine, shared by every app | ✅ Done |
+| Subscribe / publish flows (raw QUIC) | ✅ Done |
+| Relay: fanout, namespace registry, rendezvous timeouts, PUBLISH_DONE | ✅ Done |
+| WebTransport browser client/server + protocol negotiation | ✅ Done |
+| Interop test client (7 cases, TAP 14, containerised) | ✅ Done |
+| Datagram objects, relayed with alias remapping | ✅ Done |
 | FETCH request/response runtime | ⚠ Codec only |
-| Namespace-discovery runtime | ⚠ Codec only |
-| moq-rs interop (SETUP + SUBSCRIBE) | ✅ Validated |
-| moq-rs interop (data plane) | ⚠ Blocked by moq-rs auth config |
+| draft-18, alongside draft-17 | ✅ Done — chosen by ALPN, per peer |
+| Interop: both relays, both drafts | ✅ 7/7 each |
+| Interop: moq-relay v0.14.16 (both transports, both drafts) | ⚠ 6/7 — their non-standard error code |
+| Interop: cdn.moq.dev | ✅ moq-lite over both transports, verified against the system trust store |
+
+### moq-lite (draft-lcurley-moq-lite-05)
+
+See [DRAFT_LCURLEY_MOQ_LITE_05.md](DRAFT_LCURLEY_MOQ_LITE_05.md). A
+separate wire format from the IETF draft — QUIC varints, no message-type
+table — and the one the deployed ecosystem speaks.
+
+| Component | Status |
+|---|---|
+| Wire primitives (QUIC varint, zigzag, paths, optional groups) | ✅ Done |
+| Messages — every message in the draft, pinned to the reference's golden vector | ✅ Done |
+| Session: stream dispatch, setup, announce/subscribe/track/probe/goaway | ✅ Done |
+| Group framing and FrameReader | ✅ Done |
+| `moq-lite` client: publish, subscribe, announce, serve | ✅ Done |
+| Relay (`moq-lite-relay`) | ✅ Done |
+| Datagram delivery | ⚠ Codec only |
+| Fetch | ⚠ Codec only |
+| lite-03 / lite-04 | ❌ Not implemented; the ALPN offer says so |
+| Interop: WT protocol negotiation vs moq-relay | ✅ moq-lite-05 |
+| Interop: announce plane vs moq-relay | ✅ |
+| Interop: our pub → moq-relay → our sub | ✅ Data plane verified |
+| Interop: our pub → our relay → browser | ✅ |
 
 ### Top Priority Items Across All RFCs
 

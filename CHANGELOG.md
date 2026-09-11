@@ -7,6 +7,121 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- Certificate validity was checked against the monotonic clock, whose zero is
+  the last boot, so every real certificate looked not-yet-valid and no chain
+  could verify — which is why `skip_cert_verify` was the only way to connect
+  anywhere. Session tickets carried the same timestamp, making a ticket
+  issued by one host meaningless to another, and one older than 49 days
+  aborted the process instead of wrapping.
+- A server asking for a client certificate ended the handshake. Cloudflare's
+  edge does, so `cdn.moq.dev` — and presumably any relay behind Cloudflare —
+  could not be reached at all, over either transport. The request is now
+  answered the way RFC 8446 says to when there is nothing to offer: with an
+  empty certificate. `cdn.moq.dev` now runs a full session over either
+  transport, verified against the system trust store.
+- A peer could abort the process before the handshake completed. A QUIC packet
+  whose Length field was below its packet number length read gigabytes past
+  the datagram, and one below the 16-byte AEAD tag tripped an assertion; an
+  Initial carrying a token of ~500 bytes or more overflowed the buffer the
+  associated data is built in; and a QPACK integer with a long enough
+  continuation run overflowed its accumulator, which any HTTP/3 peer can send.
+- A peer's QPACK encoder stream could corrupt our dynamic table. `Duplicate`
+  and `Insert With Name Reference` both name an entry the table already holds,
+  and inserting the copy can evict the original first — so the insert read
+  from the bytes it was overwriting. The visible effect is one header's value
+  filed under another header's name, which for a proxy means attributing a
+  request field it was never sent.
+- QPACK header encoding wrote past the end of its output buffer when the
+  headers did not fit. The size check only covered the first byte of each one.
+- Rejecting a peer's packet no longer logs at error level. An unsupported QUIC
+  version, a failed decryption and an undecryptable packet are ordinary events
+  a peer chooses, so a junk-packet flood was also a log flood.
+
+### Added
+
+- `ClientConfig.ca` loads trust anchors — `.system` for the platform store,
+  `.file` for a PEM bundle of your own — and turns certificate verification
+  on when set. The `ca_cert_path` it replaces had done nothing but log a
+  warning since the Zig 0.16 migration, so a client could not verify a server
+  against anything. `moq-lite` and `moq-test-client` now use the trust store
+  unless `--tls-disable-verify` is passed.
+- `ClientConfig.loop` joins an event loop instead of creating one, so several
+  clients share it and one `run()` drives them all. A client needing two
+  connections at once no longer means two loops and a caller spinning `tick()`
+  over both.
+- Randomized sweeps over the QUIC packet, frame, transport-parameter, HTTP/3
+  frame, QPACK, Huffman and capsule parsers, and over a connection fed a
+  stream of datagrams. They are what found the above; `zig build fuzz` runs
+  them. Zig 0.16's `-ffuzz` does not compile, so until it does this is the
+  only thing feeding those parsers bytes they did not expect.
+
+## 0.3.0
+
+Media over QUIC, in both dialects the ecosystem uses, and an interop client
+for the runner that tests them. Closes
+[#21](https://github.com/endel/quic-zig/issues/21).
+
+### Added
+
+- **MoQ Transport draft-18**, alongside draft-17 and chosen by ALPN per
+  peer, so a relay serves each client at the draft it asked for. draft-18
+  is what the MoQ interop runner targets.
+- **moq-lite** (draft-lcurley-moq-lite-05), the dialect `moq-relay`,
+  `cdn.moq.dev` and the `@moq/net` browser client actually speak. Wire and
+  message codecs, a session layer, and a `moq-lite` binary that publishes,
+  subscribes, discovers broadcasts, or serves as an origin. Verified in both
+  directions against `moq-relay` v0.14.16 and `moq-clock`, and from a browser.
+- **`moq-test-client`**, the interop client for
+  [moq-interop-runner](https://github.com/englishm/moq-interop-runner): seven
+  control-plane test cases over either transport, TAP 14 output, packaged as a
+  container. `tools/moq_interop.sh` runs it against a relay list. Registering
+  with the runner is prepared but not submitted — see `SPEC/moq-interop.md`.
+  [#21](https://github.com/endel/quic-zig/issues/21)
+- **WebTransport application-protocol negotiation** (`WT-Available-Protocols` /
+  `WT-Protocol`). Both moq-lite and moq-transport from draft-15 on choose their
+  wire version this way over WebTransport, so nothing browser-facing could
+  negotiate one before.
+- MoQ relays hold a `SUBSCRIBE` open when the subscriber asks them to, and
+  answer `DOES_NOT_EXIST` when it does not.
+- An event-loop handler can declare `poll_interval_ms` to be woken on a
+  cadence rather than only when the peer sends something.
+- A `.quic` handler receives QUIC datagrams, and MoQ objects can be
+  published over them (`moq-client --mode publish --datagrams`).
+- `Connection.negotiatedAlpn()` reports the protocol in force.
+- The WebTransport MoQ relay negotiates its draft per session and enforces
+  the same namespace rules as the raw-QUIC one.
+
+### Fixed
+
+- A TLS server that advertised several ALPN protocols echoed
+  `config.alpn[0]` to every client rather than the one that matched, so
+  the client and server could disagree about what they were speaking.
+- An event-loop client queued its `CONNECTION_CLOSE` and never flushed it,
+  so the connection ended with the process and the peer held the session
+  until its own idle timeout — half a minute of a server's capacity per
+  short-lived client.
+- The browser MoQ demos encoded `PUBLISH` without its request id, delta or
+  parameter count, and subscribed with no `RENDEZVOUS_TIMEOUT`.
+- **MoQ draft-17 control messages did not match the draft.** Most were
+  encode-only, so their round-trip tests agreed with a shape no peer spoke.
+  PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, PUBLISH, REQUEST_UPDATE and FETCH
+  were missing their Request ID and Required Request ID Delta; GOAWAY its
+  Timeout, REQUEST_ERROR its Retry Interval, PUBLISH_DONE its Stream Count;
+  FETCH had no Fetch Type and so no joining form; FETCH_OK, PUBLISH_OK and
+  PUBLISH_BLOCKED had invented bodies; NAMESPACE_DONE carried nothing. The
+  error codes were a pre-draft-17 list that mixed the session and request
+  number spaces.
+- A MoQ peer could abort the process with one byte: a `GroupOrder` outside
+  `0x00`-`0x02` reached `@enumFromInt` in four decoders.
+- `decodeSubscribe` and `decodePublish` returned a track namespace that
+  pointed into their own stack frame.
+- The MoQ relay tracked stream roles in a 256-entry array indexed by stream
+  id, so a long-lived connection stopped being able to tell a control stream
+  from a subgroup header. It also read a connection pointer the event loop
+  had already freed.
+- `interop/runner/matrix.sh` removed every container on the machine between
+  test cases, not just its own.
+
 - Unidirectional receive streams were never freed. A connection kept a receive
   buffer and its reassembly state for every uni stream it had ever accepted, so
   anything that puts messages on uni streams — MoQ objects, WebTransport uni

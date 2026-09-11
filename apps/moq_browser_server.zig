@@ -15,6 +15,8 @@ const tls13 = quic.tls13;
 const connection_mod = quic.connection;
 const cm = quic.connection_manager;
 const wt = quic.webtransport;
+const wt_protocol = quic.webtransport_protocol;
+const qpack = quic.qpack;
 
 const moq_wire = quic.moq.wire;
 const moq_msg = quic.moq.message;
@@ -24,10 +26,16 @@ const moq_version = quic.moq.version;
 
 pub const std_options: std.Options = .{ .log_level = .err };
 
-const MAX_CLIENTS: usize = 8;
-const MAX_TRACKS: usize = 16;
-const MAX_SUBS_PER_TRACK: usize = 8;
+// A connection lingers in draining after its session closes, so a relay
+// that also serves a test suite needs headroom over its concurrent peers.
+const MAX_CLIENTS: usize = 32;
+const MAX_TRACKS: usize = 32;
+// A closed connection holds its slot until QUIC finishes draining, so
+// these bound concurrent-plus-draining peers, not concurrent ones.
+const MAX_SUBS_PER_TRACK: usize = 32;
 const MAX_STREAMS_PER_CLIENT: usize = 64;
+const MAX_NAMESPACES: usize = 32;
+const MAX_PENDING_SUBS: usize = 16;
 const STREAM_BUF_SIZE: usize = 65_536; // VP8 keyframes typically ≤ 16 KB
 const N_CACHED_GROUPS: usize = 2; // number of completed groups retained per track
 const CACHE_GROUP_SIZE: usize = 256 * 1024; // 256 KB of object payload per group
@@ -102,6 +110,9 @@ const Track = struct {
 const Client = struct {
     active: bool = false,
     entry: ?*cm.ConnEntry = null,
+    /// Negotiated on the CONNECT. A peer that offers nothing gets
+    /// draft-17, which is what the demo pages speak.
+    draft: moq_version.Draft = .draft_17,
     wt_session_id: u64 = 0,
     control_out: ?u64 = null,
     setup_sent: bool = false,
@@ -183,12 +194,80 @@ const FwdState = struct {
     out_count: usize = 0,
 };
 
+/// A namespace a client advertised with PUBLISH_NAMESPACE. A track under
+/// an announced prefix can be subscribed to before its publisher opens it;
+/// anything else does not exist here.
+const AnnouncedNamespace = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+    client_idx: usize = 0,
+    active: bool = false,
+
+    fn key(self: *const AnnouncedNamespace) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// A SUBSCRIBE for an unannounced namespace, held open because the
+/// subscriber sent a non-zero RENDEZVOUS_TIMEOUT (§9.3.4).
+const PendingSub = struct {
+    ns_buf: [256]u8 = undefined,
+    ns_len: usize = 0,
+    name_buf: [128]u8 = undefined,
+    name_len: usize = 0,
+    client_idx: usize = 0,
+    stream_id: u64 = 0,
+    deadline_ns: i128 = 0,
+    active: bool = false,
+};
+
 const RelayHandler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
+    /// Rendezvous timeouts are ours to keep, and the loop otherwise only
+    /// wakes on peer traffic.
+    pub const poll_interval_ms: u64 = 50;
 
     clients: [MAX_CLIENTS]Client = [_]Client{.{}} ** MAX_CLIENTS,
     tracks: [MAX_TRACKS]Track = [_]Track{.{}} ** MAX_TRACKS,
     track_count: usize = 0,
+    namespaces: [MAX_NAMESPACES]AnnouncedNamespace = [_]AnnouncedNamespace{.{}} ** MAX_NAMESPACES,
+    pending: [MAX_PENDING_SUBS]PendingSub = [_]PendingSub{.{}} ** MAX_PENDING_SUBS,
+
+    /// The loop frees the connection right after this fires, so the entry
+    /// pointer stops being a valid key the moment we return. Without it a
+    /// relay simply runs out of client slots.
+    pub fn onSessionClosed(self: *RelayHandler, session: *event_loop.Session, _: u64, _: u32, _: []const u8) void {
+        const ci = blk: {
+            for (&self.clients, 0..) |*c, i| if (c.active and c.entry == session.entry) break :blk i;
+            return;
+        };
+        std.debug.print("[relay] client {d} gone\n", .{ci});
+
+        for (self.tracks[0..self.track_count]) |*t| {
+            if (!t.active) continue;
+            if (t.publisher_idx == ci) {
+                t.publisher_idx = null;
+                t.pub_alias = 0;
+            }
+            var si: usize = 0;
+            while (si < t.sub_count) {
+                if (t.sub_client_idx[si] != ci) {
+                    si += 1;
+                    continue;
+                }
+                t.sub_count -= 1;
+                t.sub_client_idx[si] = t.sub_client_idx[t.sub_count];
+                t.sub_alias[si] = t.sub_alias[t.sub_count];
+            }
+        }
+        for (&self.namespaces) |*n| {
+            if (n.active and n.client_idx == ci) n.active = false;
+        }
+        for (&self.pending) |*pn| {
+            if (pn.active and pn.client_idx == ci) pn.active = false;
+        }
+        self.clients[ci] = .{};
+    }
 
     fn findOrCreateClient(self: *RelayHandler, entry: *cm.ConnEntry) ?usize {
         for (&self.clients, 0..) |*c, i| {
@@ -222,20 +301,63 @@ const RelayHandler = struct {
         return null;
     }
 
-    pub fn onConnectRequest(self: *RelayHandler, session: *event_loop.Session, session_id: u64, _: []const u8) void {
-        session.acceptSession(session_id) catch return;
-        const ci = self.findOrCreateClient(session.entry) orelse return;
-        self.clients[ci].wt_session_id = session_id;
+    pub fn onConnectRequest(
+        self: *RelayHandler,
+        session: *event_loop.Session,
+        session_id: u64,
+        _: []const u8,
+        headers: []const qpack.Header,
+    ) void {
+        // draft-ietf-webtrans-http3-13 §3.3 is how a MoQ version is chosen
+        // over WebTransport; the QUIC ALPN stays "h3".
+        var alpn_buf: [4][]const u8 = undefined;
+        const supported = moq_version.alpnOffer(moq_version.PREFERRED, &alpn_buf);
+        var scratch: [256]u8 = undefined;
+        var value_buf: [64]u8 = undefined;
 
-        const ctrl = session.openUniStream(session_id, 0) catch return;
+        var chosen: moq_version.Draft = .draft_17;
+        var accepted = false;
+        if (wt_protocol.findHeader(headers, wt_protocol.HEADER_AVAILABLE)) |offer| {
+            if (wt_protocol.selectFromOffer(offer, supported, &scratch)) |name| {
+                chosen = moq_version.Draft.fromAlpn(name) orelse .draft_17;
+                if (wt_protocol.encodeItem(name, &value_buf)) |encoded| {
+                    const extra = [_]qpack.Header{
+                        .{ .name = wt_protocol.HEADER_SELECTED, .value = encoded },
+                    };
+                    session.acceptSessionWithHeaders(session_id, &extra) catch return;
+                    accepted = true;
+                } else |_| {}
+            }
+        }
+        if (!accepted) session.acceptSession(session_id) catch return;
+
+        const ci = self.findOrCreateClient(session.entry) orelse {
+            var live: usize = 0;
+            for (&self.clients) |*c| { if (c.active) live += 1; }
+            std.debug.print("[relay] client table full ({d} active); refusing session\n", .{live});
+            session.closeSession(session_id);
+            return;
+        };
+        self.clients[ci].wt_session_id = session_id;
+        self.clients[ci].draft = chosen;
+
+        const ctrl = session.openUniStream(session_id, 0) catch |e| {
+            std.debug.print("[relay] client {d}: no control stream: {t}\n", .{ ci, e });
+            return;
+        };
         self.clients[ci].control_out = ctrl;
 
         var buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
         moq_msg.writeSetup(&fbs, .{ .implementation = "quic-zig/moq-wt-relay" }) catch return;
-        session.sendStreamData(ctrl, buf[0..fbs.seek]) catch return;
+        session.sendStreamData(ctrl, buf[0..fbs.seek]) catch |e| {
+            std.debug.print("[relay] client {d}: SETUP not sent: {t}\n", .{ ci, e });
+            return;
+        };
         self.clients[ci].setup_sent = true;
-        std.debug.print("[relay] client {d} connected (WT session {d})\n", .{ ci, session_id });
+        std.debug.print("[relay] client {d} connected (WT session {d}, {s})\n", .{
+            ci, session_id, self.clients[ci].draft.alpn(),
+        });
     }
 
     pub fn onUniStream(_: *RelayHandler, _: *event_loop.Session, _: u64, _: u64) void {}
@@ -313,6 +435,7 @@ const RelayHandler = struct {
         switch (parsed.env.type) {
             moq_codes.MSG_SUBSCRIBE => self.handleSubscribe(ci, session, stream_id, parsed.env.payload),
             moq_codes.MSG_PUBLISH => self.handlePublish(ci, session, stream_id, parsed.env.payload),
+            moq_codes.MSG_PUBLISH_NAMESPACE => self.handlePublishNamespace(ci, session, stream_id, parsed.env.payload),
             else => std.debug.print("[relay] client {d} request type=0x{x}\n", .{ ci, parsed.env.type }),
         }
 
@@ -321,23 +444,163 @@ const RelayHandler = struct {
         buf.len = remaining.len;
     }
 
+    fn sendOnStream(_: *RelayHandler, session: *event_loop.Session, stream_id: u64, bytes: []const u8) void {
+        session.sendStreamData(stream_id, bytes) catch {};
+    }
+
+    /// Sends to a client other than the one being polled. onPollComplete
+    /// runs per connection, so a held subscription's deadline can expire
+    /// while some unrelated peer's session is the one in hand.
+    fn sendToClient(self: *RelayHandler, ci: usize, stream_id: u64, bytes: []const u8) void {
+        if (!self.clients[ci].active) return;
+        const entry = self.clients[ci].entry orelse return;
+        const wtc = entry.wt_conn orelse return;
+        wtc.sendStreamData(stream_id, bytes) catch {};
+    }
+
+    fn sendRequestOk(self: *RelayHandler, session: *event_loop.Session, stream_id: u64) void {
+        var buf: [64]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&buf);
+        moq_msg.writeRequestOk(&fbs, .{}) catch return;
+        self.sendOnStream(session, stream_id, buf[0..fbs.seek]);
+    }
+
+    fn sendRequestError(self: *RelayHandler, session: *event_loop.Session, stream_id: u64, code: u64, reason: []const u8) void {
+        var buf: [256]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&buf);
+        moq_msg.writeRequestError(&fbs, .{ .error_code = code, .reason = reason }) catch return;
+        self.sendOnStream(session, stream_id, buf[0..fbs.seek]);
+        std.debug.print("[relay] REQUEST_ERROR → client: code={d} {s}\n", .{ code, reason });
+    }
+
+    fn handlePublishNamespace(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
+        var ns_buf: moq_msg.NamespaceBuf = undefined;
+        const pn = moq_msg.decodePublishNamespace(payload, &ns_buf, self.clients[ci].draft) catch {
+            self.sendRequestError(session, stream_id, moq_codes.ERR_MALFORMED_TRACK, "malformed namespace");
+            return;
+        };
+        var key: [256]u8 = undefined;
+        const key_len = serializeNs(pn.track_namespace, &key);
+        std.debug.print("[relay] PUBLISH_NAMESPACE client={d} ns=\"{s}\"\n", .{ ci, key[0..key_len] });
+
+        if (!self.registerNamespace(ci, key[0..key_len])) {
+            self.sendRequestError(session, stream_id, moq_codes.ERR_EXCESSIVE_LOAD, "namespace table full");
+            return;
+        }
+        self.sendRequestOk(session, stream_id);
+        self.resolvePending(key[0..key_len]);
+    }
+
+    fn registerNamespace(self: *RelayHandler, ci: usize, key: []const u8) bool {
+        if (key.len > 256) return false;
+        for (&self.namespaces) |*n| {
+            if (n.active and n.client_idx == ci and std.mem.eql(u8, n.key(), key)) return true;
+        }
+        for (&self.namespaces) |*n| {
+            if (n.active) continue;
+            @memcpy(n.buf[0..key.len], key);
+            n.len = key.len;
+            n.client_idx = ci;
+            n.active = true;
+            return true;
+        }
+        return false;
+    }
+
+    fn namespaceAnnounced(self: *RelayHandler, ns: []const u8) bool {
+        for (&self.namespaces) |*n| {
+            if (n.active and std.mem.startsWith(u8, ns, n.key())) return true;
+        }
+        return false;
+    }
+
+    fn holdPending(self: *RelayHandler, ci: usize, stream_id: u64, ns: []const u8, name: []const u8, wait_ms: u64) bool {
+        if (ns.len > 256 or name.len > 128) return false;
+        for (&self.pending) |*p| {
+            if (p.active) continue;
+            @memcpy(p.ns_buf[0..ns.len], ns);
+            p.ns_len = ns.len;
+            @memcpy(p.name_buf[0..name.len], name);
+            p.name_len = name.len;
+            p.client_idx = ci;
+            p.stream_id = stream_id;
+            p.deadline_ns = sys.nanoTimestamp() + @as(i128, @intCast(wait_ms)) * 1_000_000;
+            p.active = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// Answers any held subscription this namespace now satisfies. The
+    /// waiting subscriber is a different connection from the publisher
+    /// whose PUBLISH_NAMESPACE got us here, so replies go through its own.
+    fn resolvePending(self: *RelayHandler, ns_key: []const u8) void {
+        for (&self.pending) |*p| {
+            if (!p.active) continue;
+            if (!std.mem.startsWith(u8, p.ns_buf[0..p.ns_len], ns_key)) continue;
+            p.active = false;
+            self.admitSubscriber(p.client_idx, p.stream_id, p.ns_buf[0..p.ns_len], p.name_buf[0..p.name_len]);
+        }
+    }
+
+    pub fn onPollComplete(self: *RelayHandler, _: *event_loop.Session) void {
+        const now = sys.nanoTimestamp();
+        for (&self.pending) |*p| {
+            if (!p.active or now < p.deadline_ns) continue;
+            p.active = false;
+            var buf: [256]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&buf);
+            moq_msg.writeRequestError(&fbs, .{
+                .error_code = moq_codes.ERR_TIMEOUT,
+                .reason = "rendezvous timeout",
+            }) catch continue;
+            self.sendToClient(p.client_idx, p.stream_id, buf[0..fbs.seek]);
+            std.debug.print("[relay] rendezvous timeout → client {d}\n", .{p.client_idx});
+        }
+    }
+
     fn handleSubscribe(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
-        const sub = moq_msg.decodeSubscribe(payload) catch return;
+        var ns_buf: moq_msg.NamespaceBuf = undefined;
+        const sub = moq_msg.decodeSubscribe(payload, &ns_buf, self.clients[ci].draft) catch {
+            self.sendRequestError(session, stream_id, moq_codes.ERR_MALFORMED_TRACK, "malformed subscribe");
+            return;
+        };
 
         var ns_key: [256]u8 = undefined;
         const ns_len = serializeNs(sub.track_namespace, &ns_key);
         std.debug.print("[relay] SUBSCRIBE client={d} ns=\"{s}\" track=\"{s}\"\n", .{ ci, ns_key[0..ns_len], sub.track_name });
 
-        const ti = self.findTrack(ns_key[0..ns_len], sub.track_name) orelse blk: {
+        // §9.3.4: with no RENDEZVOUS_TIMEOUT — the default is 0 — a
+        // subscriber wants DOES_NOT_EXIST now, not an open subscription.
+        if (self.findTrack(ns_key[0..ns_len], sub.track_name) == null and
+            !self.namespaceAnnounced(ns_key[0..ns_len]))
+        {
+            const wait_ms = sub.rendezvous_timeout_ms orelse 0;
+            if (wait_ms == 0) {
+                self.sendRequestError(session, stream_id, moq_codes.ERR_DOES_NOT_EXIST, "no such namespace");
+                return;
+            }
+            if (!self.holdPending(ci, stream_id, ns_key[0..ns_len], sub.track_name, wait_ms)) {
+                self.sendRequestError(session, stream_id, moq_codes.ERR_EXCESSIVE_LOAD, "too many pending subscriptions");
+            }
+            return;
+        }
+
+        self.admitSubscriber(ci, stream_id, ns_key[0..ns_len], sub.track_name);
+    }
+
+    fn admitSubscriber(self: *RelayHandler, ci: usize, stream_id: u64, ns_key: []const u8, track_name: []const u8) void {
+        const ns_len = ns_key.len;
+        const ti = self.findTrack(ns_key, track_name) orelse blk: {
             if (self.track_count >= MAX_TRACKS) return;
             const idx = self.track_count;
             self.track_count += 1;
             var t = &self.tracks[idx];
             t.active = true;
-            @memcpy(t.namespace_buf[0..ns_len], ns_key[0..ns_len]);
+            @memcpy(t.namespace_buf[0..ns_len], ns_key);
             t.namespace_len = ns_len;
-            @memcpy(t.name_buf[0..sub.track_name.len], sub.track_name);
-            t.name_len = sub.track_name.len;
+            @memcpy(t.name_buf[0..track_name.len], track_name);
+            t.name_len = track_name.len;
             break :blk idx;
         };
 
@@ -352,7 +615,7 @@ const RelayHandler = struct {
             var buf: [256]u8 = undefined;
             var fbs = io_compat.fixedBufferStream(&buf);
             moq_msg.writeSubscribeOk(&fbs, .{ .track_alias = alias }) catch return;
-            session.sendStreamData(stream_id, buf[0..fbs.seek]) catch return;
+            self.sendToClient(ci, stream_id, buf[0..fbs.seek]);
             std.debug.print("[relay] SUBSCRIBE_OK → client {d} alias={d} (track {d}, {d} subs, pub={?d})\n", .{
                 ci, alias, ti, t.sub_count, t.publisher_idx,
             });
@@ -396,7 +659,8 @@ const RelayHandler = struct {
     }
 
     fn handlePublish(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
-        const pub_msg = moq_msg.decodePublish(payload) catch return;
+        var ns_buf: moq_msg.NamespaceBuf = undefined;
+        const pub_msg = moq_msg.decodePublish(payload, &ns_buf, self.clients[ci].draft) catch return;
 
         var ns_key: [256]u8 = undefined;
         const ns_len = serializeNs(pub_msg.track_namespace, &ns_key);
@@ -418,10 +682,13 @@ const RelayHandler = struct {
         t.name_len = pub_msg.track_name.len;
         t.publisher_idx = ci;
         t.pub_alias = pub_msg.track_alias;
+        // A PUBLISH means this namespace exists here, so a later SUBSCRIBE
+        // under it is legitimate even if the publisher never announced.
+        _ = self.registerNamespace(ci, ns_key[0..ns_len]);
 
         var buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
-        moq_msg.writePublishOk(&fbs, .{}) catch return;
+        moq_msg.writePublishOk(&fbs, .{}, self.clients[ci].draft) catch return;
         session.sendStreamData(stream_id, buf[0..fbs.seek]) catch return;
         std.debug.print("[relay] PUBLISH_OK → client {d} (track {d}, {d} subs)\n", .{ ci, ti, t.sub_count });
     }
@@ -434,7 +701,7 @@ const RelayHandler = struct {
         if (!fs.header_parsed) {
             if (buf.len < 3) return; // need more bytes
             var fbs = io_compat.fixedBufferStream(@as([]const u8, buf.slice()));
-            const parsed = moq_obj.readSubgroupHeader(&fbs) catch return; // need more bytes or bad
+            const parsed = moq_obj.readSubgroupHeader(&fbs, self.clients[ci].draft) catch return; // need more bytes or bad
             const h = parsed.header;
 
             // Find the track by publisher alias.

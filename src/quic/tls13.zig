@@ -469,7 +469,7 @@ pub const SessionTicket = struct {
     }
 
     pub fn isExpired(self: *const SessionTicket) bool {
-        const now_sec = @divTrunc(sys.nanoTimestamp(), std.time.ns_per_s);
+        const now_sec = sys.realtimeSeconds();
         return (now_sec - self.creation_time) > @as(i64, self.lifetime);
     }
 };
@@ -653,14 +653,32 @@ pub const Tls13Handshake = struct {
     // PSK / 0-RTT fields
     using_psk: bool = false,
 
+    /// Client: the server asked for a client certificate. We have none, and
+    /// RFC 8446 4.4.2 says the answer is still a Certificate message — an
+    /// empty one — which has to be in the transcript before Finished.
+    certificate_requested: bool = false,
+
     /// Server: the ClientHello carried the early_data extension. RFC 8446
     /// 4.2.10 only lets EncryptedExtensions answer an extension the client
     /// offered, so accepting a PSK is not on its own a licence to send it.
     early_data_offered: bool = false,
+    /// Server side: which of `config.alpn` the client also offered. A
+    /// server advertising several has to echo the one that matched, not
+    /// its own first choice.
+    selected_alpn: [32]u8 = .{0} ** 32,
+    selected_alpn_len: usize = 0,
+
     zero_rtt_accepted: bool = false,
     pending_install_early: bool = false,
     received_ticket: ?SessionTicket = null,
     ticket_nonce_counter: u32 = 0,
+
+    /// The protocol in force: what the server matched, or — on a client,
+    /// or before a match — the first one we offered.
+    pub fn negotiatedAlpn(self: *const @This()) []const u8 {
+        if (self.selected_alpn_len > 0) return self.selected_alpn[0..self.selected_alpn_len];
+        return if (self.config.alpn.len > 0) self.config.alpn[0] else "";
+    }
 
     /// Builds the client handshake in place. Tls13Handshake is ~52 KB, and
     /// returning it by value is the single largest contributor to the stack
@@ -692,7 +710,9 @@ pub const Tls13Handshake = struct {
         self.leaf_pub_key_len = 0;
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
+        self.certificate_requested = false;
         self.early_data_offered = false;
+        self.selected_alpn_len = 0;
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
@@ -758,7 +778,9 @@ pub const Tls13Handshake = struct {
         self.leaf_pub_key_len = 0;
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
+        self.certificate_requested = false;
         self.early_data_offered = false;
+        self.selected_alpn_len = 0;
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
@@ -1070,6 +1092,16 @@ pub const Tls13Handshake = struct {
     fn clientProcessCertificate(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
 
+        // RFC 8446 4.3.2: a server that wants a client certificate asks here,
+        // between EncryptedExtensions and its own Certificate. Cloudflare's
+        // edge does — `cdn.moq.dev` failed at this message — and refusing it
+        // ends the handshake over a request we are allowed to decline.
+        if (msg[0] == @intFromEnum(tls.HandshakeType.certificate_request)) {
+            self.certificate_requested = true;
+            self.transcript.update(msg);
+            return ._continue;
+        }
+
         if (msg[0] != @intFromEnum(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
 
         const body = msg[4..];
@@ -1124,7 +1156,7 @@ pub const Tls13Handshake = struct {
 
                 // Chain validation: verify each cert against its issuer
                 if (prev_parsed) |prev| {
-                    const now_sec = @divTrunc(sys.nanoTimestamp(), std.time.ns_per_s);
+                    const now_sec = sys.realtimeSeconds();
                     prev.verify(parsed, now_sec) catch return error.BadCertificate;
 
                     // RFC 5280 §4.2.1.9: issuer cert must have basicConstraints CA:TRUE
@@ -1146,7 +1178,7 @@ pub const Tls13Handshake = struct {
                 // If this is the last cert, verify against CA bundle
                 if (pos >= cert_list_end) {
                     if (self.config.ca_bundle) |bundle| {
-                        const now_sec = @divTrunc(sys.nanoTimestamp(), std.time.ns_per_s);
+                        const now_sec = sys.realtimeSeconds();
                         bundle.verify(parsed, now_sec) catch return error.BadCertificate;
                     }
                 }
@@ -1242,6 +1274,25 @@ pub const Tls13Handshake = struct {
     }
 
     fn clientSendFinished(self: *Tls13Handshake) !Action {
+        var pos: usize = 0;
+
+        // RFC 8446 4.4.2: having been asked, the client answers even with
+        // nothing to offer — an empty certificate_list, and no
+        // CertificateVerify to go with it. The context is zero length:
+        // 4.3.2 only allows a non-empty one for post-handshake auth, which
+        // RFC 9001 4.4 forbids over QUIC anyway.
+        if (self.certificate_requested) {
+            const empty_cert = [_]u8{
+                @intFromEnum(tls.HandshakeType.certificate),
+                0, 0, 4, // length
+                0, // certificate_request_context length
+                0, 0, 0, // certificate_list length
+            };
+            self.transcript.update(&empty_cert);
+            @memcpy(self.out_buf[pos..][0..empty_cert.len], &empty_cert);
+            pos += empty_cert.len;
+        }
+
         // Compute client Finished
         const transcript_hash = self.transcript.current();
         const verify_data = KeySchedule.computeFinishedVerifyData(
@@ -1259,8 +1310,8 @@ pub const Tls13Handshake = struct {
 
         self.transcript.update(&msg);
 
-        @memcpy(self.out_buf[0..36], &msg);
-        self.out_len = 36;
+        @memcpy(self.out_buf[pos..][0..36], &msg);
+        self.out_len = pos + 36;
 
         self.state = .connected;
         return Action{ .send_data = .{
@@ -1394,6 +1445,9 @@ pub const Tls13Handshake = struct {
                         for (self.config.alpn) |our_proto| {
                             if (std.mem.eql(u8, proto, our_proto)) {
                                 matched = true;
+                                const n = @min(proto.len, self.selected_alpn.len);
+                                @memcpy(self.selected_alpn[0..n], proto[0..n]);
+                                self.selected_alpn_len = n;
                                 break;
                             }
                         }
@@ -1706,9 +1760,9 @@ pub const Tls13Handshake = struct {
         // Build ticket plaintext: psk(32) || creation_time(8) || alpn_len(1) || alpn
         var ticket_plain: [64]u8 = .{0} ** 64;
         @memcpy(ticket_plain[0..32], &psk);
-        const now_sec = @divTrunc(sys.nanoTimestamp(), std.time.ns_per_s);
+        const now_sec = sys.realtimeSeconds();
         std.mem.writeInt(i64, ticket_plain[32..40], now_sec, .big);
-        const alpn_bytes = if (self.config.alpn.len > 0) self.config.alpn[0] else "";
+        const alpn_bytes = self.negotiatedAlpn();
         const alpn_copy_len: u8 = @intCast(@min(alpn_bytes.len, 16));
         ticket_plain[40] = alpn_copy_len;
         @memcpy(ticket_plain[41..][0..alpn_copy_len], alpn_bytes[0..alpn_copy_len]);
@@ -1960,7 +2014,7 @@ pub const Tls13Handshake = struct {
         var ticket: SessionTicket = .{ .psk = psk };
         ticket.lifetime = lifetime;
         ticket.ticket_age_add = ticket_age_add;
-        ticket.creation_time = @divTrunc(sys.nanoTimestamp(), std.time.ns_per_s);
+        ticket.creation_time = sys.realtimeSeconds();
         ticket.max_early_data_size = max_early_data;
 
         const copy_len: u16 = @intCast(@min(ticket_data.len, ticket.ticket.len));
@@ -2208,8 +2262,10 @@ fn buildClientHello(
         // pre_shared_key extension (type=41) - MUST be last
         const ticket_bytes = ticket.getTicket();
         const obfuscated_age: u32 = blk: {
-            const now_sec = @divTrunc(sys.nanoTimestamp(), std.time.ns_per_s);
-            const age_ms: u32 = @intCast(@as(u64, @intCast(@max(0, now_sec - ticket.creation_time))) * 1000);
+            const now_sec = sys.realtimeSeconds();
+            // RFC 8446 4.2.11: the obfuscated age is mod 2^32, so a ticket
+            // older than ~49 days wraps rather than aborting.
+            const age_ms: u32 = @truncate(@as(u64, @intCast(@max(0, now_sec - ticket.creation_time))) *% 1000);
             break :blk age_ms +% ticket.ticket_age_add;
         };
 
@@ -3189,7 +3245,7 @@ test "NewSessionTicket: build and parse roundtrip" {
     var original = SessionTicket{ .psk = psk };
     original.lifetime = 86400;
     original.ticket_age_add = 0x12345678;
-    original.creation_time = @divTrunc(sys.nanoTimestamp(), std.time.ns_per_s);
+    original.creation_time = sys.realtimeSeconds();
     original.max_early_data_size = 0xffffffff;
     @memcpy(original.ticket[0..64], &ticket_data);
     original.ticket_len = 64;
@@ -3281,4 +3337,89 @@ test "server: early_data in EncryptedExtensions only answers a client that offer
 
     // The extension is 4 bytes of header and no payload (RFC 8446 §4.2.10).
     try std.testing.expectEqual(len_without + 4, with.len);
+}
+
+test "client answers a CertificateRequest with an empty Certificate" {
+    // Cloudflare's edge asks for a client certificate — cdn.moq.dev failed
+    // here with UnexpectedMessage — and RFC 8446 4.4.2 says the answer is a
+    // Certificate message even with nothing to put in it.
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    }, .{});
+
+    client.state = .client_wait_certificate;
+    client.provideData(&[_]u8{
+        0x0d, 0x00, 0x00, 0x1d, // CertificateRequest, 29 bytes
+        0x00, // certificate_request_context: empty
+        0x00, 0x1a, // extensions, 26 bytes
+        0x00, 0x0d, 0x00, 0x16, 0x00, 0x14, // signature_algorithms, 10 of them
+        0x05, 0x03, 0x04, 0x03, 0x08, 0x07, 0x08, 0x06, 0x08, 0x05,
+        0x08, 0x04, 0x06, 0x01, 0x05, 0x01, 0x04, 0x01, 0x02, 0x01,
+    });
+
+    try std.testing.expect(try client.step() == ._continue);
+    try std.testing.expect(client.certificate_requested);
+
+    // The empty Certificate goes out ahead of Finished and into the
+    // transcript with it, or the server rejects our Finished.
+    client.state = .client_send_finished;
+    const action = try client.step();
+    const out = action.send_data.data;
+
+    try std.testing.expectEqual(@as(usize, 8 + 36), out.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x0b, 0, 0, 4, 0, 0, 0, 0 }, out[0..8]);
+    try std.testing.expectEqual(@intFromEnum(tls.HandshakeType.finished), out[8]);
+}
+
+test "client without a CertificateRequest sends only Finished" {
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    }, .{});
+
+    client.state = .client_send_finished;
+    const action = try client.step();
+    try std.testing.expectEqual(@as(usize, 36), action.send_data.data.len);
+}
+
+test "the *Into constructors leave no bool to chance" {
+    // They assign field by field onto memory the caller allocated, so a field
+    // added with a default is silently never written. certificate_requested
+    // read as garbage that way and made the client answer a CertificateRequest
+    // no server had sent — which only showed up on one platform, because the
+    // byte happened to be zero on the other.
+    const config = TlsConfig{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    };
+
+    const hs = try std.testing.allocator.create(Tls13Handshake);
+    defer std.testing.allocator.destroy(hs);
+
+    inline for (.{ true, false }) |server| {
+        // 0x01, not a poison byte: an uninitialised bool has to read back
+        // as a *valid* `true` for the assertion below to mean anything.
+        @memset(std.mem.asBytes(hs), 0x01);
+        if (server) {
+            Tls13Handshake.initServerInto(hs, config, .{});
+        } else {
+            Tls13Handshake.initClientInto(hs, config, .{});
+        }
+
+        inline for (@typeInfo(Tls13Handshake).@"struct".fields) |f| {
+            if (f.type == bool and !std.mem.eql(u8, f.name, "is_server")) {
+                if (comptime f.defaultValue()) |dflt| {
+                    try std.testing.expectEqual(dflt, @field(hs, f.name));
+                }
+            }
+        }
+        try std.testing.expectEqual(server, hs.is_server);
+    }
 }

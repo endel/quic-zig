@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var handler = QuicEchoClient{};
     var client = try event_loop.Client(QuicEchoClient).init(alloc, &handler, .{
         .port = port,
-        .ca_cert_path = if (insecure) null else "interop/certs/ca.crt",
+        .ca = if (insecure) .none else .{ .file = "interop/certs/ca.crt" },
         .skip_cert_verify = insecure,
     });
     defer client.deinit();

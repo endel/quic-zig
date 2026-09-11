@@ -175,6 +175,27 @@ pub fn build(b: *std.Build) void {
     if (b.args) |moq_args| run_moq_server.addArgs(moq_args);
     b.step("run-moq-server", "Run MoQ Transport server (raw QUIC)").dependOn(&run_moq_server.step);
 
+    const exe_moq_lite = App.add(b, "moq-lite", "apps/moq_lite.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_moq_lite);
+    const run_moq_lite = b.addRunArtifact(exe_moq_lite);
+    run_moq_lite.step.dependOn(b.getInstallStep());
+    if (b.args) |moq_args| run_moq_lite.addArgs(moq_args);
+    b.step("run-moq-lite", "Run the moq-lite client").dependOn(&run_moq_lite.step);
+
+    const exe_moq_lite_relay = App.add(b, "moq-lite-relay", "apps/moq_lite_relay.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_moq_lite_relay);
+    const run_moq_lite_relay = b.addRunArtifact(exe_moq_lite_relay);
+    run_moq_lite_relay.step.dependOn(b.getInstallStep());
+    if (b.args) |moq_args| run_moq_lite_relay.addArgs(moq_args);
+    b.step("run-moq-lite-relay", "Run the moq-lite relay").dependOn(&run_moq_lite_relay.step);
+
+    const exe_moq_test_client = App.add(b, "moq-test-client", "apps/moq_test_client.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_moq_test_client);
+    const run_moq_test_client = b.addRunArtifact(exe_moq_test_client);
+    run_moq_test_client.step.dependOn(b.getInstallStep());
+    if (b.args) |moq_args| run_moq_test_client.addArgs(moq_args);
+    b.step("run-moq-test-client", "Run the MoQ interop test client").dependOn(&run_moq_test_client.step);
+
     const exe_moq_client = App.add(b, "moq-client", "apps/moq_client.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_moq_client);
     const run_moq_client = b.addRunArtifact(exe_moq_client);
@@ -239,6 +260,13 @@ pub fn build(b: *std.Build) void {
             exe_interop_wt_server,
             exe_interop_wt_client,
         }) |exe| step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
+    // Same idea for the MoQ interop image, which ships only the test client.
+    {
+        const step = b.step("moq-interop", "Build only the binaries the MoQ interop images ship");
+        step.dependOn(&b.addInstallArtifact(exe_moq_test_client, .{}).step);
+        step.dependOn(&b.addInstallArtifact(exe_moq_browser, .{}).step);
     }
 
     const exe_lb = App.add(b, "quic-lb", "apps/quic_lb.zig", target, optimize, need_libc, lib_mod);

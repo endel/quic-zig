@@ -2,6 +2,8 @@ const std = @import("std");
 const quic = @import("quic");
 const sys = quic.sys;
 const event_loop = quic.event_loop;
+const qpack = quic.qpack;
+const wt_protocol = quic.webtransport_protocol;
 const tls13 = quic.tls13;
 const connection = quic.connection;
 const quic_lb = quic.quic_lb;
@@ -12,7 +14,32 @@ pub const std_options: std.Options = .{
 
 const EchoHandler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
-    pub fn onConnectRequest(_: *EchoHandler, session: *event_loop.Session, session_id: u64, _: []const u8) void {
+    // Advertised in server preference order. "echo" is here so a browser
+    // that is not a MoQ client still has something to agree on.
+    const SUPPORTED_PROTOCOLS = [_][]const u8{ "moqt-18", "moqt-17", "echo" };
+
+    pub fn onConnectRequest(
+        _: *EchoHandler,
+        session: *event_loop.Session,
+        session_id: u64,
+        _: []const u8,
+        headers: []const qpack.Header,
+    ) void {
+        // draft-ietf-webtrans-http3-13 §3.3 application-protocol negotiation.
+        var scratch: [256]u8 = undefined;
+        var value_buf: [64]u8 = undefined;
+        if (wt_protocol.findHeader(headers, wt_protocol.HEADER_AVAILABLE)) |offer| {
+            if (wt_protocol.selectFromOffer(offer, &SUPPORTED_PROTOCOLS, &scratch)) |name| {
+                std.debug.print("WT protocol negotiated: {s}\n", .{name});
+                if (wt_protocol.encodeItem(name, &value_buf)) |encoded| {
+                    const extra = [_]qpack.Header{
+                        .{ .name = wt_protocol.HEADER_SELECTED, .value = encoded },
+                    };
+                    session.acceptSessionWithHeaders(session_id, &extra) catch {};
+                    return;
+                } else |_| {}
+            }
+        }
         session.acceptSession(session_id) catch return;
     }
 
