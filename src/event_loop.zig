@@ -1212,6 +1212,11 @@ pub const ClientConfig = struct {
     /// PEM bundle of your own — a private CA, an interop peer's.
     ///
     /// Anything but `.none` also turns `skip_cert_verify` off.
+    ///
+    /// Each client loads its own copy — about 13 ms for the 163 certificates
+    /// in the macOS store. For many short-lived clients in one process, build
+    /// one `ca_bundle.loadSystem()` yourself and hand it to every connection
+    /// through `tls_config`.
     ca: union(enum) {
         none,
         system,
