@@ -31,8 +31,8 @@ if [ $# -gt 0 ]; then
 else
   RELAYS=(
     "moqt://127.0.0.1:$LOCAL_PORT/"
-    "moqt://localhost:4443/anon"
-    "https://localhost:4443/anon"
+    "moqt://localhost:4448/anon"
+    "https://localhost:4448/anon"
   )
   # Off by default: these need the network, and our TLS 1.3 does not
   # implement HelloRetryRequest, which Cloudflare's edge asks for.

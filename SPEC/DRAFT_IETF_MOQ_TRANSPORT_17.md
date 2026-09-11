@@ -193,11 +193,15 @@ Invalid datagram types: `0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F` (STATUS
 
 `tools/moq_interop.sh` regenerates [moq-interop-results.md](moq-interop-results.md).
 
+The one case moq-relay does not pass is `rendezvous-timeout`: it answers
+`REQUEST_ERROR` with code `404`, which is not a code in the draft-17 §9.7
+table at all. Older builds held the subscription open and never answered.
+
 | Scenario | Result |
 | --- | --- |
 | `moq-test-client` → our relay (raw QUIC) | 7/7 |
-| `moq-test-client` → moq-rs relay (raw QUIC) | 5/7 — they hold a SUBSCRIBE for an unknown namespace open instead of answering |
-| `moq-test-client` → moq-rs relay (WebTransport) | 5/7, same two |
+| `moq-test-client` → moq-relay v0.14.16 (raw QUIC) | 6/7 |
+| `moq-test-client` → moq-relay v0.14.16 (WebTransport) | 6/7 |
 | `moq-test-client` → `cdn.moq.dev` | blocked at TLS: no HelloRetryRequest |
 | Zig pub → Zig relay → Zig sub (raw QUIC) | ✅ |
 | Datagram objects, pub → relay → sub (raw QUIC) | ✅ |

@@ -38,9 +38,17 @@ pub const Draft = enum(u8) {
     }
 };
 
-// Preference order for an ALPN offer: newest first, so a peer that speaks
-// several picks the newest we both have.
-pub const PREFERRED: []const Draft = &.{ .draft_18, .draft_17 };
+// What we offer. Only draft-17 is implemented — draft-18 moves
+// SUBSCRIBE_NAMESPACE, drops Required Request ID from every request
+// message, and relaxes the varint — so offering it would negotiate a
+// version we cannot speak. Over raw QUIC the QUIC ALPN says the same
+// thing; over WebTransport this list is what goes in
+// WT-Available-Protocols, where the mistake is easy to make because the
+// connection still succeeds and only the MoQ on top of it fails.
+pub const PREFERRED: []const Draft = &.{.draft_17};
+
+/// Every draft this module can name, implemented or not.
+pub const ALL: []const Draft = &.{ .draft_18, .draft_17 };
 
 // The draft this stack implements by default. draft-18 moved
 // SUBSCRIBE_NAMESPACE, dropped Required Request ID from every request
@@ -72,13 +80,20 @@ test "wire codes match the draft numbers" {
     try testing.expectEqual(@as(u64, 0xff00_0012), Draft.draft_18.wireCode());
 }
 
-test "alpn offer is newest-first and clamps to the buffer" {
+test "the offer names only what is implemented" {
     var buf: [4][]const u8 = undefined;
     const offer = alpnOffer(PREFERRED, &buf);
+    try testing.expectEqual(@as(usize, 1), offer.len);
+    try testing.expectEqualStrings("moqt-17", offer[0]);
+}
+
+test "alpn offer is newest-first and clamps to the buffer" {
+    var buf: [4][]const u8 = undefined;
+    const offer = alpnOffer(ALL, &buf);
     try testing.expectEqual(@as(usize, 2), offer.len);
     try testing.expectEqualStrings("moqt-18", offer[0]);
     try testing.expectEqualStrings("moqt-17", offer[1]);
 
     var small: [1][]const u8 = undefined;
-    try testing.expectEqual(@as(usize, 1), alpnOffer(PREFERRED, &small).len);
+    try testing.expectEqual(@as(usize, 1), alpnOffer(ALL, &small).len);
 }
