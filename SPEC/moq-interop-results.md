@@ -25,3 +25,51 @@ Test cases and their pass criteria are the moq-interop-runner's:
 - `https://localhost:4448/anon draft-17` announce-subscribe: "subscriber got no response"
 - `https://localhost:4448/anon draft-18` rendezvous-timeout: "REQUEST_ERROR code=404, expected TIMEOUT (2)"
 - `https://localhost:4448/anon draft-18` announce-subscribe: "subscriber got no response"
+
+---
+
+## Against the registry's public relays (2026-09-11)
+
+Run through the runner's own harness, not ours, with the published image:
+`./run-interop-tests.sh --client quic-zig --remote-only`, after adding
+`interop/moq-runner/implementations-entry.json` to their
+`implementations.json`. Every pairing negotiated draft-18, and every one
+verified the relay's certificate (`TLS_DISABLE_VERIFY=false`).
+
+| Relay | quic | webtransport |
+|---|---|---|
+| moq-rs-draft-18 (Cloudflare) | 7/7 ✅ | 7/7 ✅ |
+| moqt-nr (Nokia) | 7/7 ✅ | 7/7 ✅ |
+| moxygen (Meta) | 7/7 ✅ | 7/7 ✅ |
+| imquic | 6/7 † | 6/7 |
+| moqx | 6/7 | 6/7 |
+| stitcher-moq | 6/7 | 6/7 |
+| moqtail | — | 6/7 |
+| moq-dev-rs (`cdn.moq.dev`) | 0/7 ‡ | 6/7 |
+
+† The harness recorded 5/7 on the sweep; `announce-subscribe` passed on three
+standalone re-runs at 2.0-2.4 s against a 3 s budget, so it is flaky under
+container contention rather than broken.
+
+‡ `moqt://cdn.moq.dev:443/anon` never answers SETUP — that endpoint serves
+moq-lite, not IETF draft-18, though the registry lists it under draft-18.
+The same relay over WebTransport negotiates draft-18 and reaches 6/7.
+
+### Every remaining failure is one test case
+
+`rendezvous-timeout` wants `REQUEST_ERROR` with code `TIMEOUT` (0x2). Five of
+the eight relays answer `DOES_NOT_EXIST` (0x10) or `404` instead — imquic,
+moqx, stitcher-moq, moqtail and `cdn.moq.dev`. Three answer `TIMEOUT` and
+pass: moq-rs-draft-18, moqt-nr, moxygen.
+
+The runner's
+[TEST-CASES.md](https://github.com/englishm/moq-interop-runner/blob/main/docs/tests/TEST-CASES.md)
+is unambiguous — "REQUEST_ERROR received with error code TIMEOUT" — so our
+client is reading the spec correctly and the majority of the ecosystem is
+not. Answering "the track does not exist" to a SUBSCRIBE for a namespace
+nobody publishes is a defensible reading, which is probably why it is common.
+
+**This is not ours to decide quietly.** Loosening our check to accept
+`DOES_NOT_EXIST` would take us to 14/15 while hiding a real conformance
+disagreement. Raising it with the runner's maintainers is the honest route;
+there is no issue open about it as of 2026-09-11.

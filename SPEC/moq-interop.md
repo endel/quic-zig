@@ -168,6 +168,12 @@ private image.
 The images pass 7/7 against each other over a compose-style network, with
 certificates generated exactly the way the runner's `generate-certs.sh` does.
 
+Against the registry's eight public relays, through the runner's own harness:
+three pass 7/7 both transports (moq-rs-draft-18, moqt-nr, moxygen), the rest
+miss only `rendezvous-timeout`, and `moqt://cdn.moq.dev` does not speak IETF
+draft-18 at all. Full table and the conformance question that accounts for
+every remaining failure: [`moq-interop-results.md`](moq-interop-results.md).
+
 **The relay needs an ECDSA P-256 key.** Our TLS signs with ECDSA P-256 or
 Ed25519 and has no RSA signing path, so an RSA `priv.key` fails at startup
 with `error: DecodeError` and nothing pairs. Both the SEC1 and PKCS#8
