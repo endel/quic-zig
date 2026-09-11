@@ -119,10 +119,18 @@ tools/moq_interop.sh
 DRAFTS=18 tools/moq_interop.sh         # just one
 PUBLIC=1 tools/moq_interop.sh          # also cdn.moq.dev
 
-# The container the runner would pull.
-interop/moq-runner/build_image.sh
+# The containers the runner would pull.
+interop/moq-runner/build_image.sh        # client and relay images
 docker run --rm -e RELAY_URL=moqt://host.docker.internal:4455/ \
     -e TLS_DISABLE_VERIFY=1 quic-zig-moq-client:latest
+
+# Both sides containerised, the way compose runs them.
+docker network create moqnet
+docker run -d --rm --name relay --network moqnet \
+    -v "$PWD/certs:/certs:ro" quic-zig-moq-relay:latest
+docker run --rm --network moqnet \
+    -e RELAY_URL=https://relay:4443/moq -e TLS_DISABLE_VERIFY=1 \
+    quic-zig-moq-client:latest
 ```
 
 Peers to test against:
@@ -135,21 +143,15 @@ Peers to test against:
 
 ## Registering with the runner
 
-Not done, and it needs a decision that is not ours to make: it means
-publishing an image to GHCR and opening a PR against
-`englishm/moq-interop-runner`. The entry would be:
+Prepared but not submitted: it means publishing images to GHCR under your
+account and opening a PR against `englishm/moq-interop-runner`, neither of
+which is ours to do. The entry is written out in
+[`interop/moq-runner/implementations-entry.json`](../interop/moq-runner/implementations-entry.json)
+with `OWNER` left to fill in; validate it against their
+`implementations.schema.json` before sending.
 
-```json
-"quic-zig": {
-  "name": "quic-zig",
-  "organization": "Endel Dreyer",
-  "repository": "https://github.com/endel/quic-zig",
-  "draft_versions": ["draft-17", "draft-18"],
-  "roles": {
-    "client": { "docker": { "image": "ghcr.io/<owner>/quic-zig-moq-client:latest" } }
-  }
-}
-```
+Both images pass 7/7 against each other over a compose-style network, so
+what remains is `docker push` and the PR.
 
 Both drafts are implemented, so `draft_versions` would be
 `["draft-17", "draft-18"]`. draft-18 is the runner's `current_target` and

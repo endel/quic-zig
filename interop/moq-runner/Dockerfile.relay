@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+# Packages the binary interop/moq-runner/build_image.sh has already
+# cross-compiled — do not `docker build` this directory directly.
+#
+# The WebTransport relay rather than the raw-QUIC one: the runner's compose
+# file dials https://relay:4443, and its URL scheme is what selects the
+# transport.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY bin/moq-browser-server /app/moq-relay-wt
+COPY entrypoint-relay.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh /app/moq-relay-wt && mkdir -p /mlog /certs
+
+RUN useradd -r -u 1000 -g nogroup moq
+USER moq
+
+ENV MOQT_ROLE=relay
+ENV MOQT_PORT=4443
+EXPOSE 4443/udp
+
+HEALTHCHECK --interval=2s --timeout=2s --retries=15 \
+  CMD ss -uln | grep -q ":${MOQT_PORT:-4443}"
+
+ENTRYPOINT ["/app/entrypoint.sh"]
