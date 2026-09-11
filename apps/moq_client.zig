@@ -318,7 +318,8 @@ const MoqClientHandler = struct {
             .publisher_priority = 128,
             .end_of_group = true,
             .per_object_properties = false,
-        }) catch return;
+            .first_object = true,
+        }, self.draft) catch return;
         moq_wire.writeVarInt(w, 0) catch return;
         moq_wire.writeVarInt(w, payload.len) catch return;
         w.writeAll(payload) catch return;

@@ -73,7 +73,21 @@ const Track = struct {
     /// The subscriber's request stream, so PUBLISH_DONE can be sent on it.
     sub_stream_id: [MAX_SUBS_PER_TRACK]u64 = [_]u64{0} ** MAX_SUBS_PER_TRACK,
     sub_pending_initial: [MAX_SUBS_PER_TRACK]bool = [_]bool{false} ** MAX_SUBS_PER_TRACK,
+    /// Data streams opened per subscription, for PUBLISH_DONE's Stream Count.
+    sub_streams: [MAX_SUBS_PER_TRACK]u64 = [_]u64{0} ** MAX_SUBS_PER_TRACK,
     sub_count: usize = 0,
+    /// The bidi stream the publisher's PUBLISH arrived on; its PUBLISH_DONE
+    /// comes back on the same one.
+    pub_stream_id: ?u64 = null,
+
+    fn removeSub(self: *Track, si: usize) void {
+        self.sub_count -= 1;
+        self.sub_client_idx[si] = self.sub_client_idx[self.sub_count];
+        self.sub_alias[si] = self.sub_alias[self.sub_count];
+        self.sub_stream_id[si] = self.sub_stream_id[self.sub_count];
+        self.sub_pending_initial[si] = self.sub_pending_initial[self.sub_count];
+        self.sub_streams[si] = self.sub_streams[self.sub_count];
+    }
 
     fn matchesNsName(self: *const Track, ns: []const u8, name: []const u8) bool {
         return std.mem.eql(u8, self.namespace_buf[0..self.namespace_len], ns) and
@@ -337,29 +351,29 @@ const RelayHandler = struct {
         switch (parsed.env.type) {
             moq_codes.MSG_SUBSCRIBE => self.handleSubscribe(ci, stream_id, parsed.env.payload),
             moq_codes.MSG_PUBLISH => self.handlePublish(ci, stream_id, parsed.env.payload),
-            moq_codes.MSG_SUBSCRIBE_NAMESPACE => self.handleSubscribeNamespace(ci, stream_id, parsed.env.payload),
+            moq_codes.MSG_SUBSCRIBE_NAMESPACE,
+            moq_codes.MSG_SUBSCRIBE_NAMESPACE_18,
+            => self.handleSubscribeNamespace(ci, stream_id, parsed.env.payload),
             moq_codes.MSG_PUBLISH_NAMESPACE => self.handlePublishNamespace(ci, stream_id, parsed.env.payload),
+            moq_codes.MSG_PUBLISH_DONE => self.handlePublishDone(ci, stream_id, parsed.env.payload),
             else => std.debug.print("[relay] Request type=0x{x} from client {d}\n", .{ parsed.env.type, ci }),
         }
     }
 
     fn handleSubscribeNamespace(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
-        // Parse prefix tuple from payload.
-        var fbs = io_compat.fixedBufferStream(payload);
-        const reader = &fbs;
-        // request_id + delta (draft-17 request messages start with these).
-        _ = moq_wire.readVarInt(reader) catch return; // request_id
-        _ = moq_wire.readVarInt(reader) catch return; // required_request_id_delta
-        // Namespace prefix tuple.
-        const count = moq_wire.readVarInt(reader) catch return;
-        if (count > 32) return;
-        var prefix_parts: [32][]const u8 = undefined;
-        for (0..@as(usize, @intCast(count))) |i| {
-            prefix_parts[i] = moq_wire.readVarBytesZc(&fbs) catch return;
-        }
+        var ns_buf: moq_msg.NamespaceBuf = undefined;
+        const sn = moq_msg.decodeSubscribeNamespace(payload, &ns_buf, self.draftOf(ci)) catch |e| {
+            std.debug.print("[relay] undecodable SUBSCRIBE_NAMESPACE from client {d}: {t}\n", .{ ci, e });
+            if (e == error.ProtocolViolation) {
+                self.closeSessionViolation(ci, "invalid subscribe_namespace parameter");
+            } else {
+                self.sendRequestError(ci, stream_id, moq_codes.ERR_MALFORMED_TRACK, "malformed subscribe_namespace");
+            }
+            return;
+        };
 
         var prefix_key: [256]u8 = undefined;
-        const prefix_len = serializeNs(prefix_parts[0..@as(usize, @intCast(count))], &prefix_key);
+        const prefix_len = serializeNs(sn.track_namespace_prefix, &prefix_key);
         std.debug.print("[relay] SUBSCRIBE_NAMESPACE client={d} prefix=\"{s}\"\n", .{ ci, prefix_key[0..prefix_len] });
 
         const conn = self.clients[ci].conn orelse return;
@@ -379,17 +393,19 @@ const RelayHandler = struct {
             const tns = t.namespace_buf[0..t.namespace_len];
             if (tns.len < prefix_len) continue;
             if (!std.mem.startsWith(u8, tns, prefix_key[0..prefix_len])) continue;
-            self.sendNamespaceOnStream(stream_id, ci, tns) catch continue;
+            self.sendNamespaceOnStream(stream_id, ci, tns[prefix_len..]) catch continue;
             sent += 1;
         }
         std.debug.print("[relay] sent {d} NAMESPACE entries for prefix\n", .{sent});
     }
 
-    fn sendNamespaceOnStream(self: *RelayHandler, stream_id: u64, ci: usize, ns_flat: []const u8) !void {
-        // ns_flat is "a/b/c/" (slash-separated). Split back into tuple parts.
+    /// §10.16: NAMESPACE carries only what follows the prefix the subscription
+    /// asked for, so `suffix_flat` is already cut to it.
+    fn sendNamespaceOnStream(self: *RelayHandler, stream_id: u64, ci: usize, suffix_flat: []const u8) !void {
+        // suffix_flat is "a/b/c/" (slash-separated). Split back into tuple parts.
         var parts_buf: [32][]const u8 = undefined;
         var n_parts: usize = 0;
-        var it = std.mem.splitScalar(u8, ns_flat, '/');
+        var it = std.mem.splitScalar(u8, suffix_flat, '/');
         while (it.next()) |p| {
             if (p.len == 0) continue;
             if (n_parts >= 32) break;
@@ -474,11 +490,25 @@ const RelayHandler = struct {
         std.debug.print("[relay] REQUEST_ERROR to client {d}: code={d} {s}\n", .{ ci, code, reason });
     }
 
+    /// Several fields carry values the draft says MUST close the session with
+    /// PROTOCOL_VIOLATION rather than be answered with REQUEST_ERROR — an
+    /// undefined Subscription Filter type (§5.1.2), an unknown Message
+    /// Parameter (§10.2), a GROUP_ORDER or FORWARD outside its range.
+    fn closeSessionViolation(self: *RelayHandler, ci: usize, reason: []const u8) void {
+        std.debug.print("[relay] PROTOCOL_VIOLATION to client {d}: {s}\n", .{ ci, reason });
+        const conn = self.clients[ci].conn orelse return;
+        conn.close(moq_codes.SESSION_PROTOCOL_VIOLATION, reason);
+    }
+
     fn handleSubscribe(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
         var ns_buf: moq_msg.NamespaceBuf = undefined;
         const sub = moq_msg.decodeSubscribe(payload, &ns_buf, self.draftOf(ci)) catch |e| {
-            self.sendRequestError(ci, stream_id, moq_codes.ERR_MALFORMED_TRACK, "malformed subscribe");
-            std.debug.print("[relay] malformed SUBSCRIBE from client {d}: {t}\n", .{ ci, e });
+            std.debug.print("[relay] undecodable SUBSCRIBE from client {d}: {t} payload({d}B)={x}\n", .{ ci, e, payload.len, payload });
+            if (e == error.ProtocolViolation) {
+                self.closeSessionViolation(ci, "invalid subscribe parameter");
+            } else {
+                self.sendRequestError(ci, stream_id, moq_codes.ERR_MALFORMED_TRACK, "malformed subscribe");
+            }
             return;
         };
 
@@ -574,6 +604,7 @@ const RelayHandler = struct {
             t.sub_client_idx[t.sub_count] = ci;
             t.sub_alias[t.sub_count] = alias;
             t.sub_stream_id[t.sub_count] = stream_id;
+            t.sub_streams[t.sub_count] = 0;
             t.sub_pending_initial[t.sub_count] = true; // send first tick on next poll
             t.sub_count += 1;
 
@@ -605,6 +636,7 @@ const RelayHandler = struct {
         const sub_conn = self.clients[sub_ci].conn orelse return;
 
         const out = sub_conn.openUniStream() catch return;
+        t.sub_streams[si] += 1;
 
         var payload_buf: [128]u8 = undefined;
         const payload = std.fmt.bufPrint(&payload_buf, "tick {d} (track {d})", .{ self.group_id, ti }) catch return;
@@ -619,7 +651,8 @@ const RelayHandler = struct {
             .publisher_priority = 128,
             .end_of_group = true,
             .per_object_properties = false,
-        }) catch return;
+            .first_object = true,
+        }, self.draftOf(sub_ci)) catch return;
         moq_wire.writeVarInt(w, 0) catch return;
         moq_wire.writeVarInt(w, payload.len) catch return;
         w.writeAll(payload) catch return;
@@ -627,6 +660,49 @@ const RelayHandler = struct {
         out.writeData(buf[0..fbs.seek]) catch return;
         out.close();
         std.debug.print("[relay] Sent object to client {d} (track {d}, group {d})\n", .{ sub_ci, ti, self.group_id });
+    }
+
+    /// §10.11: the upstream publication has ended. Each downstream
+    /// subscription is a separate one, so each gets its own PUBLISH_DONE with
+    /// the number of data streams *we* opened for it — not the count upstream
+    /// sent us. Without this a subscriber waits for objects that will never
+    /// come; it is the relay, not the original publisher, that has to say so.
+    fn handlePublishDone(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
+        const done = moq_msg.decodePublishDone(payload) catch |e| {
+            std.debug.print("[relay] undecodable PUBLISH_DONE from client {d}: {t}\n", .{ ci, e });
+            return;
+        };
+        for (self.tracks[0..self.track_count]) |*t| {
+            if (!t.active or t.publisher_idx != ci) continue;
+            if (t.pub_stream_id) |sid| if (sid != stream_id) continue;
+            self.endSubscriptions(t, done.status_code, done.reason);
+            t.publisher_idx = null;
+            t.pub_alias = 0;
+            t.pub_stream_id = null;
+        }
+    }
+
+    /// Sends PUBLISH_DONE to every subscriber of `t` and forgets them.
+    fn endSubscriptions(self: *RelayHandler, t: *Track, status: u64, reason: []const u8) void {
+        while (t.sub_count > 0) {
+            const si = t.sub_count - 1;
+            const sub_ci = t.sub_client_idx[si];
+            var buf: [256]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&buf);
+            if (moq_msg.writePublishDone(&fbs, .{
+                .status_code = status,
+                .stream_count = t.sub_streams[si],
+                .reason = reason,
+            })) |_| {
+                if (self.clients[sub_ci].active) {
+                    self.sendOnStream(sub_ci, t.sub_stream_id[si], buf[0..fbs.seek]);
+                    std.debug.print("[relay] PUBLISH_DONE to client {d} status={d} streams={d}\n", .{
+                        sub_ci, status, t.sub_streams[si],
+                    });
+                }
+            } else |_| {}
+            t.removeSub(si);
+        }
     }
 
     fn handlePublish(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
@@ -655,6 +731,7 @@ const RelayHandler = struct {
         t.name_len = pub_msg.track_name.len;
         t.publisher_idx = ci;
         t.pub_alias = pub_msg.track_alias;
+        t.pub_stream_id = stream_id;
         // A PUBLISH means this namespace exists here, so a later SUBSCRIBE
         // under it is legitimate even if the publisher never announced.
         _ = self.registerNamespace(ci, stream_id, ns_key[0..ns_len]);
@@ -698,6 +775,7 @@ const RelayHandler = struct {
             const sub_conn = self.clients[sub_ci].conn orelse continue;
 
             const out = sub_conn.openUniStream() catch continue;
+            t.sub_streams[si] += 1;
 
             // Rewrite the subgroup header with the subscriber's alias.
             var out_buf: [512]u8 = undefined;
@@ -711,7 +789,8 @@ const RelayHandler = struct {
                 .publisher_priority = h.publisher_priority,
                 .end_of_group = h.end_of_group,
                 .per_object_properties = h.per_object_properties,
-            }) catch continue;
+                .first_object = h.first_object,
+            }, self.draftOf(sub_ci)) catch continue;
 
             // Copy the object data (everything after the subgroup header).
             w.writeAll(data[fbs.seek..]) catch continue;
@@ -741,22 +820,10 @@ const RelayHandler = struct {
             // Tracks this client published: tell the subscribers, then free
             // the publisher slot so a new one can take over.
             if (t.publisher_idx == ci) {
-                var buf: [128]u8 = undefined;
-                var fbs = io_compat.fixedBufferStream(&buf);
-                moq_msg.writePublishDone(&fbs, .{
-                    .status_code = moq_codes.DONE_TRACK_ENDED,
-                    .reason = "publisher disconnected",
-                }) catch continue;
-                const done_bytes = buf[0..fbs.seek];
-
-                for (0..t.sub_count) |si| {
-                    const sub_ci = t.sub_client_idx[si];
-                    if (sub_ci == ci) continue;
-                    if (!self.clients[sub_ci].active) continue;
-                    self.sendOnStream(sub_ci, t.sub_stream_id[si], done_bytes);
-                }
+                self.endSubscriptions(t, moq_codes.DONE_TRACK_ENDED, "publisher disconnected");
                 t.publisher_idx = null;
                 t.pub_alias = 0;
+                t.pub_stream_id = null;
             }
 
             // Drop this client's subscriptions, closing the gap in place.
@@ -766,11 +833,7 @@ const RelayHandler = struct {
                     si += 1;
                     continue;
                 }
-                t.sub_count -= 1;
-                t.sub_client_idx[si] = t.sub_client_idx[t.sub_count];
-                t.sub_alias[si] = t.sub_alias[t.sub_count];
-                t.sub_stream_id[si] = t.sub_stream_id[t.sub_count];
-                t.sub_pending_initial[si] = t.sub_pending_initial[t.sub_count];
+                t.removeSub(si);
             }
         }
 
@@ -792,6 +855,7 @@ const RelayHandler = struct {
         const sub_conn = self.clients[sub_ci].conn orelse return;
 
         const out = sub_conn.openUniStream() catch return;
+        t.sub_streams[si] += 1;
 
         var payload_buf: [128]u8 = undefined;
         const payload = std.fmt.bufPrint(&payload_buf, "tick {d}", .{group_id}) catch return;
@@ -806,7 +870,8 @@ const RelayHandler = struct {
             .publisher_priority = 128,
             .end_of_group = true,
             .per_object_properties = false,
-        }) catch return;
+            .first_object = true,
+        }, self.draftOf(sub_ci)) catch return;
         moq_wire.writeVarInt(w, 0) catch return;
         moq_wire.writeVarInt(w, payload.len) catch return;
         w.writeAll(payload) catch return;

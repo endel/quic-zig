@@ -166,7 +166,8 @@ const MoqServerHandler = struct {
                 .publisher_priority = 128,
                 .end_of_group = true,
                 .per_object_properties = false,
-            }) catch continue;
+                .first_object = true,
+            }, self.draft) catch continue;
 
             moq_wire.writeVarInt(w, 0) catch continue;
             moq_wire.writeVarInt(w, payload.len) catch continue;

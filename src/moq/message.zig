@@ -28,6 +28,9 @@ pub const Error = error{
     ReservedLegacyMessage,
     PayloadTooLarge,
     MalformedMessage,
+    /// A value the draft says MUST close the session with
+    /// PROTOCOL_VIOLATION rather than be answered with REQUEST_ERROR.
+    ProtocolViolation,
 } || wire.Error;
 
 // Envelope I/O -------------------------------------------------------------
@@ -226,7 +229,7 @@ pub fn readParams(fbs: *io.FixedBufferStream([]const u8), out: []Param) ![]Param
         const delta = try wire.readVarInt(fbs);
         const t = if (i == 0) delta else std.math.add(u64, prev, delta) catch return Error.MalformedMessage;
         prev = t;
-        const shape = paramShape(t) orelse return Error.MalformedMessage;
+        const shape = paramShape(t) orelse return Error.ProtocolViolation;
         out[i] = .{
             .type = t,
             .value = switch (shape) {
@@ -271,7 +274,7 @@ pub const Filter = struct {
     fn decode(bytes: []const u8) !Filter {
         var fbs = io.fixedBufferStream(bytes);
         const raw = try wire.readVarInt(&fbs);
-        var f = Filter{ .type = track.FilterType.fromInt(raw) orelse return Error.MalformedMessage };
+        var f = Filter{ .type = track.FilterType.fromInt(raw) orelse return Error.ProtocolViolation };
         switch (f.type) {
             .next_group_start, .latest_object => {},
             .absolute_start, .absolute_range => {
@@ -380,11 +383,14 @@ pub const Subscribe = struct {
         self.group_order = null;
         for (params) |p| switch (p.type) {
             ParamType.RENDEZVOUS_TIMEOUT => self.rendezvous_timeout_ms = p.value.varint,
-            ParamType.FORWARD => self.forward = p.value.uint8 != 0,
+            ParamType.FORWARD => self.forward = switch (p.value.uint8) {
+                0, 1 => p.value.uint8 == 1,
+                else => return Error.ProtocolViolation,
+            },
             ParamType.SUBSCRIBER_PRIORITY => self.subscriber_priority = p.value.uint8,
             ParamType.SUBSCRIPTION_FILTER => self.filter = try Filter.decode(p.value.bytes),
             ParamType.GROUP_ORDER => self.group_order = track.GroupOrder.fromInt(p.value.uint8) orelse
-                return Error.MalformedMessage,
+                return Error.ProtocolViolation,
             else => {},
         };
     }
@@ -1122,7 +1128,7 @@ test "readParams rejects an unknown type" {
     const bytes = [_]u8{ 0x01, 0x7e, 0x00 };
     var fbs = io.fixedBufferStream(@as([]const u8, &bytes));
     var out: [MAX_PARAMS]Param = undefined;
-    try testing.expectError(Error.MalformedMessage, readParams(&fbs, &out));
+    try testing.expectError(Error.ProtocolViolation, readParams(&fbs, &out));
 }
 
 test "SUBSCRIBE has the request id and delta §9.8 requires" {
@@ -1488,6 +1494,32 @@ test "draft-18 drops Required Request ID Delta from SUBSCRIBE" {
     try testing.expectEqual(@as(u64, 5), s18.request_id);
     try testing.expectEqualStrings("v", s18.track_name);
     try testing.expectEqualStrings("moq", s18.track_namespace[0]);
+}
+
+test "an undefined Subscription Filter type is a protocol violation, not a request error" {
+    // Captured from moxygen's interop client (draft-18, subscribe-error):
+    // request id 0, namespace ("nonexistent"), track "no-such-track", one
+    // SUBSCRIPTION_FILTER parameter whose filter type is 250 — moxygen's
+    // private "LargestGroup", which §5.1.2 does not define
+    // (facebookexperimental/moxygen#225).
+    const payload = [_]u8{
+        0x00, 0x01, 0x0b, 'n',  'o',  'n',  'e',  'x',  'i', 's', 't',
+        'e',  'n',  't',  0x0d, 'n',  'o',  '-',  's',  'u', 'c', 'h',
+        '-',  't',  'r',  'a',  'c',  'k',  0x01, 0x21, 0x02, 0x80, 0xfa,
+    };
+    var ns_buf: NamespaceBuf = undefined;
+    try testing.expectError(
+        Error.ProtocolViolation,
+        decodeSubscribe(&payload, &ns_buf, .draft_18),
+    );
+
+    // The same message with a filter type the draft defines parses.
+    var ok = payload;
+    ok[ok.len - 2] = 0x80;
+    ok[ok.len - 1] = 0x02; // non-minimal encoding of Largest Object (0x2)
+    const sub = try decodeSubscribe(&ok, &ns_buf, .draft_18);
+    try testing.expectEqualStrings("no-such-track", sub.track_name);
+    try testing.expectEqual(track.FilterType.latest_object, sub.filter.?.type);
 }
 
 test "reading a draft-18 message as draft-17 does not quietly succeed" {

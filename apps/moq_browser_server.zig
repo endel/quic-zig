@@ -36,6 +36,7 @@ const MAX_SUBS_PER_TRACK: usize = 32;
 const MAX_STREAMS_PER_CLIENT: usize = 64;
 const MAX_NAMESPACES: usize = 32;
 const MAX_PENDING_SUBS: usize = 16;
+const MAX_NAMESPACE_SUBS: usize = 16;
 const STREAM_BUF_SIZE: usize = 65_536; // VP8 keyframes typically ≤ 16 KB
 const N_CACHED_GROUPS: usize = 2; // number of completed groups retained per track
 const CACHE_GROUP_SIZE: usize = 256 * 1024; // 256 KB of object payload per group
@@ -52,6 +53,9 @@ const CachedGroup = struct {
     publisher_priority: ?u8 = 128,
     end_of_group: bool = true,
     per_object_properties: bool = false,
+    /// Whether the publisher's stream for this group began at the subgroup's
+    /// first object — a replay of the whole group begins there too.
+    first_object: bool = false,
     payload: [CACHE_GROUP_SIZE]u8 = undefined,
     payload_len: usize = 0,
 
@@ -68,9 +72,16 @@ const Track = struct {
     name_len: usize = 0,
     publisher_idx: ?usize = null,
     pub_alias: u64 = 0,
+    /// The bidi stream the publisher's PUBLISH arrived on; its PUBLISH_DONE
+    /// comes back on the same one.
+    pub_stream_id: ?u64 = null,
     active: bool = false,
     sub_client_idx: [MAX_SUBS_PER_TRACK]usize = [_]usize{0} ** MAX_SUBS_PER_TRACK,
     sub_alias: [MAX_SUBS_PER_TRACK]u64 = [_]u64{0} ** MAX_SUBS_PER_TRACK,
+    /// Each subscriber's SUBSCRIBE stream — where its PUBLISH_DONE goes.
+    sub_stream_id: [MAX_SUBS_PER_TRACK]u64 = [_]u64{0} ** MAX_SUBS_PER_TRACK,
+    /// Data streams opened per subscription, for PUBLISH_DONE's Stream Count.
+    sub_streams: [MAX_SUBS_PER_TRACK]u64 = [_]u64{0} ** MAX_SUBS_PER_TRACK,
     sub_count: usize = 0,
 
     // Completed groups cached for late subscribers.
@@ -78,6 +89,14 @@ const Track = struct {
     next_cache_idx: usize = 0,
     // The live group being assembled from the publisher's current stream.
     live: CachedGroup = .{},
+
+    fn removeSub(self: *Track, si: usize) void {
+        self.sub_count -= 1;
+        self.sub_client_idx[si] = self.sub_client_idx[self.sub_count];
+        self.sub_alias[si] = self.sub_alias[self.sub_count];
+        self.sub_stream_id[si] = self.sub_stream_id[self.sub_count];
+        self.sub_streams[si] = self.sub_streams[self.sub_count];
+    }
 
     fn matchesNsName(self: *const Track, ns: []const u8, name: []const u8) bool {
         return std.mem.eql(u8, self.namespace_buf[0..self.namespace_len], ns) and
@@ -93,6 +112,7 @@ const Track = struct {
     fn dropPublisherState(self: *Track) void {
         self.publisher_idx = null;
         self.pub_alias = 0;
+        self.pub_stream_id = null;
         for (&self.cached) |*g| g.valid = false;
         self.next_cache_idx = 0;
         self.live = .{};
@@ -222,6 +242,21 @@ const AnnouncedNamespace = struct {
     }
 };
 
+/// A SUBSCRIBE_NAMESPACE: this client wants to hear about every namespace
+/// under a prefix, the ones already here and the ones that arrive later
+/// (§6.1). §6.2 makes answering it a MUST for a relay holding the namespace.
+const NamespaceSub = struct {
+    prefix_buf: [256]u8 = undefined,
+    prefix_len: usize = 0,
+    client_idx: usize = 0,
+    stream_id: u64 = 0,
+    active: bool = false,
+
+    fn prefix(self: *const NamespaceSub) []const u8 {
+        return self.prefix_buf[0..self.prefix_len];
+    }
+};
+
 /// A SUBSCRIBE for an unannounced namespace, held open because the
 /// subscriber sent a non-zero RENDEZVOUS_TIMEOUT (§9.3.4).
 const PendingSub = struct {
@@ -246,6 +281,7 @@ const RelayHandler = struct {
     track_count: usize = 0,
     namespaces: [MAX_NAMESPACES]AnnouncedNamespace = [_]AnnouncedNamespace{.{}} ** MAX_NAMESPACES,
     pending: [MAX_PENDING_SUBS]PendingSub = [_]PendingSub{.{}} ** MAX_PENDING_SUBS,
+    ns_subs: [MAX_NAMESPACE_SUBS]NamespaceSub = [_]NamespaceSub{.{}} ** MAX_NAMESPACE_SUBS,
 
     /// The loop frees the connection right after this fires, so the entry
     /// pointer stops being a valid key the moment we return. Without it a
@@ -259,20 +295,31 @@ const RelayHandler = struct {
 
         for (self.tracks[0..self.track_count]) |*t| {
             if (!t.active) continue;
-            if (t.publisher_idx == ci) t.dropPublisherState();
+            if (t.publisher_idx == ci) {
+                // §10.11: a subscription state is not destroyed until its
+                // publisher says so. The publisher is gone and cannot, so the
+                // relay says it on its behalf.
+                self.endSubscriptions(t, moq_codes.DONE_TRACK_ENDED, "publisher gone");
+                t.dropPublisherState();
+            }
             var si: usize = 0;
             while (si < t.sub_count) {
                 if (t.sub_client_idx[si] != ci) {
                     si += 1;
                     continue;
                 }
-                t.sub_count -= 1;
-                t.sub_client_idx[si] = t.sub_client_idx[t.sub_count];
-                t.sub_alias[si] = t.sub_alias[t.sub_count];
+                t.removeSub(si);
             }
         }
-        for (&self.namespaces) |*n| {
+        for (&self.ns_subs) |*n| {
             if (n.active and n.client_idx == ci) n.active = false;
+        }
+        for (&self.namespaces) |*n| {
+            if (!n.active or n.client_idx != ci) continue;
+            n.active = false;
+            // Nobody else announced it, so as far as this relay is concerned
+            // the namespace is gone and its subscribers should hear so.
+            if (!self.namespaceAnnounced(n.key())) self.announceNamespace(n.key(), true);
         }
         for (&self.pending) |*pn| {
             if (pn.active and pn.client_idx == ci) pn.active = false;
@@ -447,6 +494,10 @@ const RelayHandler = struct {
             moq_codes.MSG_SUBSCRIBE => self.handleSubscribe(ci, session, stream_id, parsed.env.payload),
             moq_codes.MSG_PUBLISH => self.handlePublish(ci, session, stream_id, parsed.env.payload),
             moq_codes.MSG_PUBLISH_NAMESPACE => self.handlePublishNamespace(ci, session, stream_id, parsed.env.payload),
+            moq_codes.MSG_PUBLISH_DONE => self.handlePublishDone(ci, stream_id, parsed.env.payload),
+            moq_codes.MSG_SUBSCRIBE_NAMESPACE,
+            moq_codes.MSG_SUBSCRIBE_NAMESPACE_18,
+            => self.handleSubscribeNamespace(ci, session, stream_id, parsed.env.payload),
             else => std.debug.print("[relay] client {d} request type=0x{x}\n", .{ ci, parsed.env.type }),
         }
 
@@ -484,6 +535,96 @@ const RelayHandler = struct {
         std.debug.print("[relay] REQUEST_ERROR → client: code={d} {s}\n", .{ code, reason });
     }
 
+    /// Several fields carry values the draft says MUST close the session with
+    /// PROTOCOL_VIOLATION rather than be answered with REQUEST_ERROR — an
+    /// undefined Subscription Filter type (§5.1.2), an unknown Message
+    /// Parameter (§10.2), a GROUP_ORDER or FORWARD outside its range.
+    fn closeSessionViolation(self: *RelayHandler, ci: usize, session: *event_loop.Session, reason: []const u8) void {
+        std.debug.print("[relay] PROTOCOL_VIOLATION → client {d}: {s}\n", .{ ci, reason });
+        session.closeSessionWithError(
+            self.clients[ci].wt_session_id,
+            @intCast(moq_codes.SESSION_PROTOCOL_VIOLATION),
+            reason,
+        ) catch session.closeSession(self.clients[ci].wt_session_id);
+    }
+
+    /// §6.1 namespace discovery: answer REQUEST_OK, then NAMESPACE for every
+    /// namespace already under the prefix. Later arrivals are pushed by
+    /// announceNamespace.
+    fn handleSubscribeNamespace(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
+        var ns_buf: moq_msg.NamespaceBuf = undefined;
+        const sn = moq_msg.decodeSubscribeNamespace(payload, &ns_buf, self.clients[ci].draft) catch |e| {
+            std.debug.print("[relay] undecodable SUBSCRIBE_NAMESPACE client={d}: {t}\n", .{ ci, e });
+            if (e == error.ProtocolViolation) {
+                self.closeSessionViolation(ci, session, "invalid subscribe_namespace parameter");
+            } else {
+                self.sendRequestError(session, stream_id, moq_codes.ERR_MALFORMED_TRACK, "malformed subscribe_namespace");
+            }
+            return;
+        };
+
+        var prefix: [256]u8 = undefined;
+        const prefix_len = serializeNs(sn.track_namespace_prefix, &prefix);
+
+        const slot = for (&self.ns_subs) |*n| {
+            if (!n.active) break n;
+        } else {
+            self.sendRequestError(session, stream_id, moq_codes.ERR_EXCESSIVE_LOAD, "too many namespace subscriptions");
+            return;
+        };
+        @memcpy(slot.prefix_buf[0..prefix_len], prefix[0..prefix_len]);
+        slot.prefix_len = prefix_len;
+        slot.client_idx = ci;
+        slot.stream_id = stream_id;
+        slot.active = true;
+
+        self.sendRequestOk(session, stream_id);
+        std.debug.print("[relay] SUBSCRIBE_NAMESPACE client={d} prefix=\"{s}\"\n", .{ ci, prefix[0..prefix_len] });
+
+        var sent: usize = 0;
+        for (&self.namespaces) |*n| {
+            if (!n.active) continue;
+            if (!std.mem.startsWith(u8, n.key(), prefix[0..prefix_len])) continue;
+            self.sendNamespace(slot.*, n.key(), false);
+            sent += 1;
+        }
+        if (sent > 0) std.debug.print("[relay] → {d} NAMESPACE to client {d}\n", .{ sent, ci });
+    }
+
+    /// NAMESPACE / NAMESPACE_DONE carry only what follows the prefix the
+    /// subscription asked for (§10.16), so the suffix is cut here rather than
+    /// the whole namespace being echoed back.
+    fn sendNamespace(self: *RelayHandler, sub: NamespaceSub, ns_key: []const u8, done: bool) void {
+        var parts: [32][]const u8 = undefined;
+        var n_parts: usize = 0;
+        var it = std.mem.splitScalar(u8, ns_key[sub.prefix_len..], '/');
+        while (it.next()) |part| {
+            if (part.len == 0 or n_parts >= parts.len) continue;
+            parts[n_parts] = part;
+            n_parts += 1;
+        }
+
+        var buf: [512]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&buf);
+        const msg = moq_msg.Namespace{ .track_namespace_suffix = parts[0..n_parts] };
+        if (done) {
+            moq_msg.writeNamespaceDone(&fbs, msg) catch return;
+        } else {
+            moq_msg.writeNamespace(&fbs, msg) catch return;
+        }
+        self.sendToClient(sub.client_idx, sub.stream_id, buf[0..fbs.seek]);
+    }
+
+    /// Tell every namespace subscription whose prefix matches that `ns_key`
+    /// has appeared (or, with `done`, gone).
+    fn announceNamespace(self: *RelayHandler, ns_key: []const u8, done: bool) void {
+        for (&self.ns_subs) |*n| {
+            if (!n.active) continue;
+            if (!std.mem.startsWith(u8, ns_key, n.prefix())) continue;
+            self.sendNamespace(n.*, ns_key, done);
+        }
+    }
+
     fn handlePublishNamespace(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
         var ns_buf: moq_msg.NamespaceBuf = undefined;
         const pn = moq_msg.decodePublishNamespace(payload, &ns_buf, self.clients[ci].draft) catch {
@@ -494,11 +635,15 @@ const RelayHandler = struct {
         const key_len = serializeNs(pn.track_namespace, &key);
         std.debug.print("[relay] PUBLISH_NAMESPACE client={d} ns=\"{s}\"\n", .{ ci, key[0..key_len] });
 
+        const known = self.namespaceAnnounced(key[0..key_len]);
         if (!self.registerNamespace(ci, key[0..key_len])) {
             self.sendRequestError(session, stream_id, moq_codes.ERR_EXCESSIVE_LOAD, "namespace table full");
             return;
         }
         self.sendRequestOk(session, stream_id);
+        // §6.2: a relay holding a namespace MUST tell anyone subscribed to a
+        // prefix of it. Only the first announcement is news.
+        if (!known) self.announceNamespace(key[0..key_len], false);
         self.resolvePending(key[0..key_len]);
     }
 
@@ -572,8 +717,13 @@ const RelayHandler = struct {
 
     fn handleSubscribe(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
         var ns_buf: moq_msg.NamespaceBuf = undefined;
-        const sub = moq_msg.decodeSubscribe(payload, &ns_buf, self.clients[ci].draft) catch {
-            self.sendRequestError(session, stream_id, moq_codes.ERR_MALFORMED_TRACK, "malformed subscribe");
+        const sub = moq_msg.decodeSubscribe(payload, &ns_buf, self.clients[ci].draft) catch |e| {
+            std.debug.print("[relay] undecodable SUBSCRIBE client={d}: {t} payload({d}B)={x}\n", .{ ci, e, payload.len, payload });
+            if (e == error.ProtocolViolation) {
+                self.closeSessionViolation(ci, session, "invalid subscribe parameter");
+            } else {
+                self.sendRequestError(session, stream_id, moq_codes.ERR_MALFORMED_TRACK, "malformed subscribe");
+            }
             return;
         };
 
@@ -621,6 +771,8 @@ const RelayHandler = struct {
             self.clients[ci].next_alias += 1;
             t.sub_client_idx[t.sub_count] = ci;
             t.sub_alias[t.sub_count] = alias;
+            t.sub_stream_id[t.sub_count] = stream_id;
+            t.sub_streams[t.sub_count] = 0;
             t.sub_count += 1;
 
             var buf: [256]u8 = undefined;
@@ -633,14 +785,15 @@ const RelayHandler = struct {
 
             // Replay any cached groups to this new subscriber so it starts
             // playback immediately instead of waiting for the next keyframe.
-            self.replayCachedGroups(ci, t, alias);
+            self.replayCachedGroups(ci, t, t.sub_count - 1);
         }
     }
 
     // Replay every cached complete group to a freshly-subscribed subscriber.
     // Each cached group is sent as a fresh uni stream on the subscriber's WT
     // session with the subscriber's track alias remapped.
-    fn replayCachedGroups(self: *RelayHandler, sub_ci: usize, t: *const Track, sub_alias: u64) void {
+    fn replayCachedGroups(self: *RelayHandler, sub_ci: usize, t: *Track, si: usize) void {
+        const sub_alias = t.sub_alias[si];
         if (!self.clients[sub_ci].active) return;
         const sub_entry = self.clients[sub_ci].entry orelse return;
         const sub_wtc = sub_entry.wt_conn orelse return;
@@ -651,6 +804,7 @@ const RelayHandler = struct {
         for (0..n) |i| {
             const cg = slots[i];
             const out = sub_wtc.openUniStream(sub_sid, null) catch continue;
+            t.sub_streams[si] += 1;
 
             var hdr_buf: [128]u8 = undefined;
             var hdr_fbs = io_compat.fixedBufferStream(&hdr_buf);
@@ -661,7 +815,8 @@ const RelayHandler = struct {
                 .publisher_priority = cg.publisher_priority,
                 .end_of_group = cg.end_of_group,
                 .per_object_properties = cg.per_object_properties,
-            }) catch continue;
+                .first_object = cg.first_object,
+            }, self.clients[sub_ci].draft) catch continue;
             sub_wtc.sendStreamData(out, hdr_buf[0..hdr_fbs.seek]) catch continue;
             sub_wtc.sendStreamData(out, cg.payload[0..cg.payload_len]) catch {};
             sub_wtc.closeStream(out);
@@ -701,6 +856,7 @@ const RelayHandler = struct {
         }
         t.publisher_idx = ci;
         t.pub_alias = pub_msg.track_alias;
+        t.pub_stream_id = stream_id;
         // A PUBLISH means this namespace exists here, so a later SUBSCRIBE
         // under it is legitimate even if the publisher never announced.
         _ = self.registerNamespace(ci, ns_key[0..ns_len]);
@@ -710,6 +866,54 @@ const RelayHandler = struct {
         moq_msg.writePublishOk(&fbs, .{}, self.clients[ci].draft) catch return;
         session.sendStreamData(stream_id, buf[0..fbs.seek]) catch return;
         std.debug.print("[relay] PUBLISH_OK → client {d} (track {d}, {d} subs)\n", .{ ci, ti, t.sub_count });
+    }
+
+    /// §10.11: the upstream publication has ended. Each downstream
+    /// subscription is a separate one, so each gets its own PUBLISH_DONE with
+    /// the number of data streams *we* opened for it — not the count upstream
+    /// sent us. Without this a subscriber waits for objects that will never
+    /// come; it is the relay, not the original publisher, that has to say so.
+    fn handlePublishDone(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
+        const done = moq_msg.decodePublishDone(payload) catch |e| {
+            std.debug.print("[relay] undecodable PUBLISH_DONE client={d}: {t}\n", .{ ci, e });
+            return;
+        };
+        for (self.tracks[0..self.track_count]) |*t| {
+            if (!t.active or t.publisher_idx != ci) continue;
+            if (t.pub_stream_id) |sid| if (sid != stream_id) continue;
+            self.endSubscriptions(t, done.status_code, done.reason);
+            t.dropPublisherState();
+        }
+    }
+
+    /// Sends PUBLISH_DONE to every subscriber of `t` and forgets them. The
+    /// draft asks for a FIN on the subscription's bidi stream right after.
+    fn endSubscriptions(self: *RelayHandler, t: *Track, status: u64, reason: []const u8) void {
+        while (t.sub_count > 0) {
+            const si = t.sub_count - 1;
+            const sub_ci = t.sub_client_idx[si];
+            var buf: [256]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&buf);
+            if (moq_msg.writePublishDone(&fbs, .{
+                .status_code = status,
+                .stream_count = t.sub_streams[si],
+                .reason = reason,
+            })) |_| {
+                self.sendToClient(sub_ci, t.sub_stream_id[si], buf[0..fbs.seek]);
+                self.closeClientStream(sub_ci, t.sub_stream_id[si]);
+                std.debug.print("[relay] PUBLISH_DONE → client {d} status={d} streams={d}\n", .{
+                    sub_ci, status, t.sub_streams[si],
+                });
+            } else |_| {}
+            t.removeSub(si);
+        }
+    }
+
+    fn closeClientStream(self: *RelayHandler, ci: usize, stream_id: u64) void {
+        if (!self.clients[ci].active) return;
+        const entry = self.clients[ci].entry orelse return;
+        const wtc = entry.wt_conn orelse return;
+        wtc.closeStream(stream_id);
     }
 
     fn tryForwardData(self: *RelayHandler, ci: usize, stream_id: u64, fin: bool) void {
@@ -743,6 +947,7 @@ const RelayHandler = struct {
             t.live.publisher_priority = h.publisher_priority;
             t.live.end_of_group = h.end_of_group;
             t.live.per_object_properties = h.per_object_properties;
+            t.live.first_object = h.first_object;
 
             // Open a subscriber output stream for each subscriber, write rewritten header.
             fs.out_count = 0;
@@ -757,6 +962,9 @@ const RelayHandler = struct {
                     std.debug.print("[relay] openUniStream failed for sub {d}: {}\n", .{ sub_ci, e });
                     continue;
                 };
+                // Counted at the open, not after the header: PUBLISH_DONE's
+                // Stream Count has to cover every stream the subscriber sees.
+                t.sub_streams[si] += 1;
 
                 var hdr_buf: [128]u8 = undefined;
                 var hdr_fbs = io_compat.fixedBufferStream(&hdr_buf);
@@ -767,7 +975,8 @@ const RelayHandler = struct {
                     .publisher_priority = h.publisher_priority,
                     .end_of_group = h.end_of_group,
                     .per_object_properties = h.per_object_properties,
-                }) catch continue;
+                    .first_object = h.first_object,
+                }, self.clients[sub_ci].draft) catch continue;
                 sub_wtc.sendStreamData(out, hdr_buf[0..hdr_fbs.seek]) catch continue;
 
                 fs.out_stream_ids[fs.out_count] = out;

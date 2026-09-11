@@ -30,14 +30,14 @@ pub const ObjectId = u64;
 pub const Priority = u8;
 
 // §9.8 "Group Order" parameter value.
+// §10.2.8: the GROUP_ORDER parameter is Ascending or Descending only —
+// "use the publisher's preference" is said by omitting it, not by a value.
 pub const GroupOrder = enum(u8) {
-    publisher_default = 0x00,
     ascending = 0x01,
     descending = 0x02,
 
     pub fn fromInt(v: u8) ?GroupOrder {
         return switch (v) {
-            0x00 => .publisher_default,
             0x01 => .ascending,
             0x02 => .descending,
             else => null,

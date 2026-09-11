@@ -38,6 +38,10 @@ pub const SubgroupHeader = struct {
     end_of_group: bool,
     // Whether each Object carries a Properties (KV list) field.
     per_object_properties: bool,
+    // §2.2: set when this stream starts at the first Object ever published in
+    // the subgroup. An original publisher opening a new subgroup MUST set it,
+    // and so MUST a relay forwarding such a subgroup on. draft-18 only.
+    first_object: bool = false,
 };
 
 fn subgroupIdMode(h: SubgroupHeader, first_object: ?track.ObjectId) codes.SubgroupIdMode {
@@ -47,11 +51,14 @@ fn subgroupIdMode(h: SubgroupHeader, first_object: ?track.ObjectId) codes.Subgro
     return .explicit;
 }
 
-pub fn writeSubgroupHeader(writer: anytype, h: SubgroupHeader) !void {
+pub fn writeSubgroupHeader(writer: anytype, h: SubgroupHeader, draft: version.Draft) !void {
     var flags: u64 = codes.SUBGROUP_BIT_SELECTOR;
     if (h.per_object_properties) flags |= codes.SUBGROUP_BIT_PROPERTIES;
     if (h.end_of_group) flags |= codes.SUBGROUP_BIT_END_OF_GROUP;
     if (h.publisher_priority == null) flags |= codes.SUBGROUP_BIT_DEFAULT_PRIORITY;
+    if (h.first_object and version.Rules.of(draft).subgroup_first_object_bit) {
+        flags |= codes.SUBGROUP_BIT_FIRST_OBJECT;
+    }
 
     // Encode subgroup id mode. Without knowledge of the first object
     // we can't use .first_object; pick .zero when sg is 0, else .explicit.
@@ -108,6 +115,7 @@ pub fn readSubgroupHeader(fbs: *io.FixedBufferStream([]const u8), draft: version
             .publisher_priority = pri,
             .end_of_group = (flags & codes.SUBGROUP_BIT_END_OF_GROUP) != 0,
             .per_object_properties = (flags & codes.SUBGROUP_BIT_PROPERTIES) != 0,
+            .first_object = (flags & codes.SUBGROUP_BIT_FIRST_OBJECT) != 0,
         },
         .id_mode = id_mode,
     };
@@ -213,7 +221,7 @@ test "subgroup header round-trip — explicit subgroup with priority" {
         .end_of_group = false,
         .per_object_properties = true,
     };
-    try writeSubgroupHeader(&fbs, h);
+    try writeSubgroupHeader(&fbs, h, .draft_17);
     const written = fbs.seek;
 
     var rb = io.fixedBufferStream(@as([]const u8, buf[0..written]));
@@ -238,12 +246,42 @@ test "subgroup header round-trip — zero subgroup, default priority, end-of-gro
         .end_of_group = true,
         .per_object_properties = false,
     };
-    try writeSubgroupHeader(&fbs, h);
+    try writeSubgroupHeader(&fbs, h, .draft_17);
     var rb = io.fixedBufferStream(@as([]const u8, buf[0..fbs.seek]));
     const parsed = try readSubgroupHeader(&rb, .draft_17);
     try testing.expectEqual(codes.SubgroupIdMode.zero, parsed.id_mode);
     try testing.expect(parsed.header.end_of_group);
     try testing.expectEqual(@as(?u8, null), parsed.header.publisher_priority);
+}
+
+test "FIRST_OBJECT is a draft-18 bit, and a draft-17 reader would not know it" {
+    const h = SubgroupHeader{
+        .track_alias = 1,
+        .group = 0,
+        .subgroup = 0,
+        .publisher_priority = 128,
+        .end_of_group = false,
+        .per_object_properties = false,
+        .first_object = true,
+    };
+
+    var b18: [16]u8 = undefined;
+    var f18 = io.fixedBufferStream(&b18);
+    try writeSubgroupHeader(&f18, h, .draft_18);
+    try testing.expectEqual(
+        codes.SUBGROUP_BIT_SELECTOR | codes.SUBGROUP_BIT_FIRST_OBJECT,
+        b18[0],
+    );
+    var r18 = io.fixedBufferStream(@as([]const u8, b18[0..f18.seek]));
+    try testing.expect((try readSubgroupHeader(&r18, .draft_18)).header.first_object);
+
+    // draft-17 has no such bit: setting it would make the type invalid there.
+    var b17: [16]u8 = undefined;
+    var f17 = io.fixedBufferStream(&b17);
+    try writeSubgroupHeader(&f17, h, .draft_17);
+    try testing.expectEqual(@as(u8, codes.SUBGROUP_BIT_SELECTOR), b17[0]);
+    var r17 = io.fixedBufferStream(@as([]const u8, b18[0..f18.seek]));
+    try testing.expectError(Error.InvalidStreamType, readSubgroupHeader(&r17, .draft_17));
 }
 
 test "subgroup header rejects reserved id-mode" {
