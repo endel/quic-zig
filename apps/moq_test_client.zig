@@ -131,6 +131,8 @@ fn Peer(comptime proto: event_loop.Protocol) type {
 
         sess: Sess = undefined,
         role: Role = .idle,
+        /// Set once the transport says which draft was negotiated.
+        draft: moq_version.Draft = moq_version.DEFAULT,
         verbose: bool = false,
 
         // Valid only inside a callback: event_loop builds the session
@@ -237,7 +239,14 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                 var scratch: [64]u8 = undefined;
                 if (wt_protocol.decodeItem(raw, &scratch)) |v| {
                     self.setNegotiated(v);
+                    // The peer's choice decides the wire format from here.
+                    if (moq_version.Draft.fromAlpn(v)) |d| self.draft = d;
                 } else |_| {}
+            } else {
+                // No WT-Protocol means the server ignored the offer, which
+                // in practice means an older peer: fall back to what we
+                // asked for first.
+                self.setNegotiated(self.draft.alpn());
             }
             self.startSession();
         }
@@ -278,7 +287,7 @@ fn Peer(comptime proto: event_loop.Protocol) type {
         fn setNegotiatedFromAlpn(self: *Self) void {
             // Raw QUIC negotiates the MoQT version with the QUIC ALPN, which
             // is what we asked for; record it so the YAML block can report it.
-            self.setNegotiated(moq_version.DEFAULT.alpn());
+            self.setNegotiated(self.draft.alpn());
         }
 
         pub fn negotiatedSlice(self: *const Self) []const u8 {
@@ -351,12 +360,12 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             switch (self.role) {
                 .publisher => moq_msg.writePublishNamespace(&fbs, .{
                     .track_namespace = &TEST_NAMESPACE,
-                }) catch return,
+                }, self.draft) catch return,
                 .subscriber => moq_msg.writeSubscribe(&fbs, .{
                     .track_namespace = self.subscribe_namespace,
                     .track_name = TEST_TRACK,
                     .rendezvous_timeout_ms = self.rendezvous_timeout_ms,
-                }) catch return,
+                }, self.draft) catch return,
                 .idle => unreachable,
             }
             self.request_sid = self.sess.sendRequest(buf[0..fbs.seek]) catch |e| {
@@ -381,6 +390,9 @@ const Target = struct {
     ipv6: bool = false,
     tls_disable_verify: bool = false,
     verbose: bool = false,
+    /// One draft per run. The runner has no way to ask for a version, so
+    /// this is a flag rather than something it controls.
+    draft: moq_version.Draft = moq_version.DEFAULT,
 
     fn addressSlice(self: *const Target) []const u8 {
         return self.address[0..self.address_len];
@@ -464,7 +476,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                 .server_name = moq_url.bareHost(target.locator.host),
                 .path = target.locator.path,
                 .ipv6 = target.ipv6,
-                .alpn = if (proto == .quic) moq_version.DEFAULT.alpn() else null,
+                .alpn = if (proto == .quic) target.draft.alpn() else null,
                 .skip_cert_verify = target.tls_disable_verify,
                 .connect_headers = connect_headers,
             };
@@ -480,7 +492,8 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             // ALPN carries the same information.
             var offer_buf: [128]u8 = undefined;
             var alpn_buf: [4][]const u8 = undefined;
-            const alpns = moq_version.alpnOffer(moq_version.PREFERRED, &alpn_buf);
+            const one = [_]moq_version.Draft{target.draft};
+            const alpns = moq_version.alpnOffer(&one, &alpn_buf);
             const offer = wt_protocol.encodeList(alpns, &offer_buf) catch "";
             const connect_headers = [_]qpack.Header{
                 .{ .name = wt_protocol.HEADER_AVAILABLE, .value = offer },
@@ -523,6 +536,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
 
             for (legs[0..leg_count]) |*l| {
                 l.peer.verbose = target.verbose;
+                l.peer.draft = target.draft;
                 l.peer.prepare();
             }
             defer for (legs[0..leg_count]) |*l| l.deinit();
@@ -736,6 +750,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var list = false;
     var verbose = envFlag("VERBOSE");
     var tls_disable_verify = envFlag("TLS_DISABLE_VERIFY");
+    var draft: moq_version.Draft = moq_version.DEFAULT;
 
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
@@ -748,10 +763,23 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             list = true;
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             verbose = true;
+        } else if (std.mem.eql(u8, arg, "--draft")) {
+            if (args.next()) |v| {
+                const n = std.fmt.parseInt(u8, v, 10) catch 0;
+                draft = switch (n) {
+                    17 => .draft_17,
+                    18 => .draft_18,
+                    else => {
+                        std.debug.print("unknown draft: {s} (17 or 18)\n", .{v});
+                        return 127;
+                    },
+                };
+            }
         } else if (std.mem.eql(u8, arg, "--tls-disable-verify")) {
             tls_disable_verify = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            out("moq-test-client [--relay URL] [--test NAME] [--list] [--verbose] [--tls-disable-verify]\n", .{});
+            out("moq-test-client [--relay URL] [--test NAME] [--list] [--verbose]\n" ++
+                "                [--tls-disable-verify] [--draft 17|18]\n", .{});
             return 0;
         }
     }
@@ -789,6 +817,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         },
         .tls_disable_verify = tls_disable_verify,
         .verbose = verbose,
+        .draft = draft,
     };
     resolve(&target) catch |e| {
         out("TAP version 14\n", .{});
@@ -799,7 +828,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     out("TAP version 14\n", .{});
     out("# moq-test-client v{s}\n", .{VERSION});
     out("# Relay: {s}\n", .{relay_url});
-    out("# Draft: draft-{d}\n", .{moq_version.DEFAULT.number()});
+    out("# Draft: draft-{d}\n", .{draft.number()});
     out("1..{d}\n", .{selected_len});
 
     var failures: usize = 0;

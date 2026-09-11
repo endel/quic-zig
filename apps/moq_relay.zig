@@ -113,6 +113,8 @@ const PendingSub = struct {
 const Client = struct {
     active: bool = false,
     conn: ?*connection_mod.Connection = null,
+    /// Which draft this peer chose, read off the ALPN it negotiated.
+    draft: moq_version.Draft = moq_version.DEFAULT,
     setup_done: bool = false,
     impl_name: [64]u8 = undefined,
     impl_len: usize = 0,
@@ -188,6 +190,10 @@ const RelayHandler = struct {
     group_id: u64 = 0,
     last_tick_ns: i128 = 0,
 
+    fn draftOf(self: *RelayHandler, ci: usize) moq_version.Draft {
+        return self.clients[ci].draft;
+    }
+
     fn findOrCreateClient(self: *RelayHandler, conn: *connection_mod.Connection) ?usize {
         // Check if this connection is already tracked.
         for (&self.clients, 0..) |*c, i| {
@@ -196,7 +202,12 @@ const RelayHandler = struct {
         // Allocate a new slot.
         for (&self.clients, 0..) |*c, i| {
             if (!c.active) {
-                c.* = .{ .active = true, .conn = conn };
+                c.* = .{
+                    .active = true,
+                    .conn = conn,
+                    .draft = moq_version.Draft.fromAlpn(conn.negotiatedAlpn()) orelse moq_version.DEFAULT,
+                };
+                std.debug.print("[relay] client {d} speaks {s}\n", .{ i, c.draft.alpn() });
                 return i;
             }
         }
@@ -397,7 +408,7 @@ const RelayHandler = struct {
 
     fn handlePublishNamespace(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
         var ns_buf: moq_msg.NamespaceBuf = undefined;
-        const pn = moq_msg.decodePublishNamespace(payload, &ns_buf) catch |e| {
+        const pn = moq_msg.decodePublishNamespace(payload, &ns_buf, self.draftOf(ci)) catch |e| {
             std.debug.print("[relay] malformed PUBLISH_NAMESPACE from client {d}: {t}\n", .{ ci, e });
             self.sendRequestError(ci, stream_id, moq_codes.ERR_MALFORMED_TRACK, "malformed namespace");
             return;
@@ -465,7 +476,7 @@ const RelayHandler = struct {
 
     fn handleSubscribe(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
         var ns_buf: moq_msg.NamespaceBuf = undefined;
-        const sub = moq_msg.decodeSubscribe(payload, &ns_buf) catch |e| {
+        const sub = moq_msg.decodeSubscribe(payload, &ns_buf, self.draftOf(ci)) catch |e| {
             self.sendRequestError(ci, stream_id, moq_codes.ERR_MALFORMED_TRACK, "malformed subscribe");
             std.debug.print("[relay] malformed SUBSCRIBE from client {d}: {t}\n", .{ ci, e });
             return;
@@ -620,7 +631,7 @@ const RelayHandler = struct {
 
     fn handlePublish(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
         var ns_buf: moq_msg.NamespaceBuf = undefined;
-        const pub_msg = moq_msg.decodePublish(payload, &ns_buf) catch return;
+        const pub_msg = moq_msg.decodePublish(payload, &ns_buf, self.draftOf(ci)) catch return;
 
         var ns_key: [256]u8 = undefined;
         const ns_len = serializeNs(pub_msg.track_namespace, &ns_key);
@@ -650,7 +661,7 @@ const RelayHandler = struct {
         const stream = conn.streams.getStream(stream_id) orelse return;
         var buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
-        moq_msg.writePublishOk(&fbs, .{}) catch return;
+        moq_msg.writePublishOk(&fbs, .{}, self.draftOf(ci)) catch return;
         stream.send.writeData(buf[0..fbs.seek]) catch return;
 
         std.debug.print("[relay] PUBLISH_OK to client {d} (track {d})\n", .{ ci, ti });
@@ -659,7 +670,7 @@ const RelayHandler = struct {
     fn handleDataStream(self: *RelayHandler, ci: usize, _: u64, data: []const u8) void {
         // Parse subgroup header to get track_alias → find track → fan out to subscribers.
         var fbs = io_compat.fixedBufferStream(data);
-        const parsed = moq_obj.readSubgroupHeader(&fbs) catch return;
+        const parsed = moq_obj.readSubgroupHeader(&fbs, self.draftOf(ci)) catch return;
         const h = parsed.header;
 
         // Find the track by publisher alias.
@@ -901,14 +912,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const ec_key = tls13.extractEcPrivateKey(key_der) catch try tls13.extractPkcs8EcPrivateKey(key_der);
     const key_owned = try alloc.dupe(u8, ec_key);
 
-    const alpn = try alloc.alloc([]const u8, 1);
-    alpn[0] = moq_version.ALPN;
+    // Advertise every draft we implement and let the peer choose; the TLS
+    // layer records which one matched and each client is served at that
+    // draft. Newest first, so a peer that speaks both gets the newer.
+    const alpn = try alloc.alloc([]const u8, moq_version.PREFERRED.len);
+    _ = moq_version.alpnOffer(moq_version.PREFERRED, alpn);
 
     var ticket_key: [16]u8 = undefined;
     sys.randomBytes(&ticket_key);
 
-    std.debug.print("\n=== MoQ Relay (draft-17) ===\n", .{});
-    std.debug.print("Listening on 0.0.0.0:{d}  ALPN: {s}\n\n", .{ port, moq_version.ALPN });
+    std.debug.print("\n=== MoQ Relay ===\n", .{});
+    std.debug.print("Listening on 0.0.0.0:{d}  ALPN:", .{port});
+    for (alpn) |a| std.debug.print(" {s}", .{a});
+    std.debug.print("\n\n", .{});
 
     const handler = try alloc.create(RelayHandler);
     handler.* = RelayHandler{};

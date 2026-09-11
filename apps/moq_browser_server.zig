@@ -186,6 +186,9 @@ const FwdState = struct {
 const RelayHandler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
 
+    /// One draft for the whole server: WebTransport negotiates it per
+    /// session on the CONNECT, and this relay answers with one choice.
+    draft: moq_version.Draft = moq_version.DEFAULT,
     clients: [MAX_CLIENTS]Client = [_]Client{.{}} ** MAX_CLIENTS,
     tracks: [MAX_TRACKS]Track = [_]Track{.{}} ** MAX_TRACKS,
     track_count: usize = 0,
@@ -323,7 +326,7 @@ const RelayHandler = struct {
 
     fn handleSubscribe(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
         var ns_buf: moq_msg.NamespaceBuf = undefined;
-        const sub = moq_msg.decodeSubscribe(payload, &ns_buf) catch return;
+        const sub = moq_msg.decodeSubscribe(payload, &ns_buf, self.draft) catch return;
 
         var ns_key: [256]u8 = undefined;
         const ns_len = serializeNs(sub.track_namespace, &ns_key);
@@ -398,7 +401,7 @@ const RelayHandler = struct {
 
     fn handlePublish(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
         var ns_buf: moq_msg.NamespaceBuf = undefined;
-        const pub_msg = moq_msg.decodePublish(payload, &ns_buf) catch return;
+        const pub_msg = moq_msg.decodePublish(payload, &ns_buf, self.draft) catch return;
 
         var ns_key: [256]u8 = undefined;
         const ns_len = serializeNs(pub_msg.track_namespace, &ns_key);
@@ -423,7 +426,7 @@ const RelayHandler = struct {
 
         var buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
-        moq_msg.writePublishOk(&fbs, .{}) catch return;
+        moq_msg.writePublishOk(&fbs, .{}, self.draft) catch return;
         session.sendStreamData(stream_id, buf[0..fbs.seek]) catch return;
         std.debug.print("[relay] PUBLISH_OK → client {d} (track {d}, {d} subs)\n", .{ ci, ti, t.sub_count });
     }
@@ -436,7 +439,7 @@ const RelayHandler = struct {
         if (!fs.header_parsed) {
             if (buf.len < 3) return; // need more bytes
             var fbs = io_compat.fixedBufferStream(@as([]const u8, buf.slice()));
-            const parsed = moq_obj.readSubgroupHeader(&fbs) catch return; // need more bytes or bad
+            const parsed = moq_obj.readSubgroupHeader(&fbs, self.draft) catch return; // need more bytes or bad
             const h = parsed.header;
 
             // Find the track by publisher alias.

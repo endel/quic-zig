@@ -38,22 +38,57 @@ pub const Draft = enum(u8) {
     }
 };
 
-// What we offer. Only draft-17 is implemented — draft-18 moves
-// SUBSCRIBE_NAMESPACE, drops Required Request ID from every request
-// message, and relaxes the varint — so offering it would negotiate a
-// version we cannot speak. Over raw QUIC the QUIC ALPN says the same
-// thing; over WebTransport this list is what goes in
-// WT-Available-Protocols, where the mistake is easy to make because the
-// connection still succeeds and only the MoQ on top of it fails.
-pub const PREFERRED: []const Draft = &.{.draft_17};
+// Newest first, so a peer that speaks several picks the newest we share.
+//
+// Only offer what is implemented. Over raw QUIC the QUIC ALPN carries one
+// token and a mismatch fails the handshake, but over WebTransport this
+// list goes in WT-Available-Protocols, where the connection still succeeds
+// and only the MoQ on top of it goes quiet.
+pub const PREFERRED: []const Draft = &.{ .draft_18, .draft_17 };
 
-/// Every draft this module can name, implemented or not.
-pub const ALL: []const Draft = &.{ .draft_18, .draft_17 };
+/// Every draft this module can name.
+pub const ALL: []const Draft = PREFERRED;
+
+/// Where the two drafts differ on the wire, in one place.
+///
+/// draft-18 (§10) removed `Required Request ID Delta` from every request
+/// message, moved SUBSCRIBE_NAMESPACE, stopped sending PUBLISH_OK as its
+/// own type, and added a FIRST_OBJECT bit to the subgroup header.
+pub const Rules = struct {
+    /// draft-17 only: a varint after the Request ID in every request.
+    required_request_id_delta: bool,
+    subscribe_namespace_code: u64,
+    /// draft-18 answers PUBLISH with REQUEST_OK instead.
+    publish_ok_is_own_message: bool,
+    /// draft-17 only: SUBSCRIBE_NAMESPACE carries a Subscribe Options varint.
+    subscribe_namespace_options: bool,
+    /// draft-18 only: SUBGROUP_HEADER bit 0x40.
+    subgroup_first_object_bit: bool,
+
+    pub fn of(draft: Draft) Rules {
+        return switch (draft) {
+            .draft_17 => .{
+                .required_request_id_delta = true,
+                .subscribe_namespace_code = 0x11,
+                .publish_ok_is_own_message = true,
+                .subscribe_namespace_options = true,
+                .subgroup_first_object_bit = false,
+            },
+            .draft_18 => .{
+                .required_request_id_delta = false,
+                .subscribe_namespace_code = 0x50,
+                .publish_ok_is_own_message = false,
+                .subscribe_namespace_options = false,
+                .subgroup_first_object_bit = true,
+            },
+        };
+    }
+};
 
 // The draft this stack implements by default. draft-18 moved
 // SUBSCRIBE_NAMESPACE, dropped Required Request ID from every request
 // message and relaxed the varint, so it is not yet the default.
-pub const DEFAULT: Draft = .draft_17;
+pub const DEFAULT: Draft = .draft_18;
 
 // Fills `out` with the ALPN tokens for `drafts`, in the given order.
 pub fn alpnOffer(drafts: []const Draft, out: [][]const u8) [][]const u8 {
@@ -67,6 +102,19 @@ pub const DRAFT_NUMBER: u32 = @intFromEnum(DEFAULT);
 pub const WIRE_VERSION: u64 = 0xff00_0011;
 pub const ALPN: []const u8 = "moqt-17";
 
+test "the rules table says where the drafts differ" {
+    const r17 = Rules.of(.draft_17);
+    const r18 = Rules.of(.draft_18);
+    try testing.expect(r17.required_request_id_delta);
+    try testing.expect(!r18.required_request_id_delta);
+    try testing.expectEqual(@as(u64, 0x11), r17.subscribe_namespace_code);
+    try testing.expectEqual(@as(u64, 0x50), r18.subscribe_namespace_code);
+    try testing.expect(r17.publish_ok_is_own_message);
+    try testing.expect(!r18.publish_ok_is_own_message);
+    try testing.expect(!r17.subgroup_first_object_bit);
+    try testing.expect(r18.subgroup_first_object_bit);
+}
+
 test "alpn round-trips through the draft table" {
     try testing.expectEqualStrings("moqt-17", Draft.draft_17.alpn());
     try testing.expectEqualStrings("moqt-18", Draft.draft_18.alpn());
@@ -78,13 +126,6 @@ test "alpn round-trips through the draft table" {
 test "wire codes match the draft numbers" {
     try testing.expectEqual(WIRE_VERSION, Draft.draft_17.wireCode());
     try testing.expectEqual(@as(u64, 0xff00_0012), Draft.draft_18.wireCode());
-}
-
-test "the offer names only what is implemented" {
-    var buf: [4][]const u8 = undefined;
-    const offer = alpnOffer(PREFERRED, &buf);
-    try testing.expectEqual(@as(usize, 1), offer.len);
-    try testing.expectEqualStrings("moqt-17", offer[0]);
 }
 
 test "alpn offer is newest-first and clamps to the buffer" {

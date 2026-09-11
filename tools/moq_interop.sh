@@ -2,7 +2,8 @@
 # Run the MoQ interop test client against a list of relays and write the
 # results to SPEC/moq-interop-results.md.
 #
-#   tools/moq_interop.sh                 # local relays only
+#   tools/moq_interop.sh                 # local relays, both drafts
+#   DRAFTS=18 tools/moq_interop.sh       # one draft
 #   PUBLIC=1 tools/moq_interop.sh        # also the public ones
 #   tools/moq_interop.sh <url> [<url>…]  # specific relays
 #
@@ -49,6 +50,7 @@ if [ "$START_LOCAL" = 1 ]; then
 fi
 
 CASES=$("$CLIENT" --list)
+DRAFTS=${DRAFTS:-"17 18"}
 
 {
   echo "# MoQ interop results"
@@ -59,20 +61,21 @@ CASES=$("$CLIENT" --list)
   echo
   echo "\`moqt://\` rows are native QUIC, \`https://\` rows WebTransport."
   echo
-  printf '| Relay |'
+  printf '| Relay | Draft |'
   for c in $CASES; do printf ' %s |' "$c"; done
-  printf '\n|---|'
+  printf '\n|---|---|'
   for c in $CASES; do printf '%s' '---|'; done
   printf '\n'
 } > "$TMP/out.md"
 
 for url in "${RELAYS[@]}"; do
-  echo "=== $url ===" >&2
-  "$CLIENT" --relay "$url" --tls-disable-verify > "$TMP/tap.txt" 2>"$TMP/err.txt"
+ for draft in $DRAFTS; do
+  echo "=== $url draft-$draft ===" >&2
+  "$CLIENT" --relay "$url" --draft "$draft" --tls-disable-verify > "$TMP/tap.txt" 2>"$TMP/err.txt"
   code=$?
   echo "  exit $code" >&2
 
-  printf '| `%s` |' "$url" >> "$TMP/out.md"
+  printf '| `%s` | %s |' "$url" "$draft" >> "$TMP/out.md"
   if grep -q '^Bail out!' "$TMP/tap.txt"; then
     reason=$(sed -n 's/^Bail out! //p' "$TMP/tap.txt" | head -1)
     for c in $CASES; do printf ' — |' >> "$TMP/out.md"; done
@@ -92,10 +95,11 @@ for url in "${RELAYS[@]}"; do
   printf '\n' >> "$TMP/out.md"
 
   # Keep the failure reasons; a bare ❌ is not worth much on its own.
-  awk -v relay="$url" '
+  awk -v relay="$url draft-$draft" '
     /^not ok /   { name = substr($0, index($0, "- ") + 2) }
     /^  message:/{ print "- `" relay "` " name ": " substr($0, 12) }
   ' "$TMP/tap.txt" >> "$TMP/notes.md" 2>/dev/null || true
+ done
 done
 
 if [ -s "$TMP/notes.md" ]; then

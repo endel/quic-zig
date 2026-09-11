@@ -14,6 +14,7 @@ const testing = std.testing;
 const wire = @import("wire.zig");
 const codes = @import("message_codes.zig");
 const track = @import("track.zig");
+const version = @import("version.zig");
 
 pub const MAX_PAYLOAD_LEN: usize = std.math.maxInt(u16);
 
@@ -389,12 +390,14 @@ pub const Subscribe = struct {
     }
 };
 
-fn writeSubscribeLike(writer: anytype, msg_type: u64, s: Subscribe) !void {
+fn writeSubscribeLike(writer: anytype, msg_type: u64, s: Subscribe, draft: version.Draft) !void {
     var scratch: [MAX_PAYLOAD_LEN]u8 = undefined;
     var fbs = io.fixedBufferStream(&scratch);
     const w = &fbs;
     try wire.writeVarInt(w, s.request_id);
-    try wire.writeVarInt(w, s.required_request_id_delta);
+    if (version.Rules.of(draft).required_request_id_delta) {
+        try wire.writeVarInt(w, s.required_request_id_delta);
+    }
     try wire.writeTuple(w, s.track_namespace);
     try wire.writeVarBytes(w, s.track_name);
 
@@ -405,15 +408,18 @@ fn writeSubscribeLike(writer: anytype, msg_type: u64, s: Subscribe) !void {
     try writeEnvelope(writer, msg_type, scratch[0..fbs.seek]);
 }
 
-pub fn writeSubscribe(writer: anytype, s: Subscribe) !void {
-    return writeSubscribeLike(writer, codes.MSG_SUBSCRIBE, s);
+pub fn writeSubscribe(writer: anytype, s: Subscribe, draft: version.Draft) !void {
+    return writeSubscribeLike(writer, codes.MSG_SUBSCRIBE, s, draft);
 }
 
-fn decodeSubscribeLike(payload: []const u8, ns_buf: *NamespaceBuf) !Subscribe {
+fn decodeSubscribeLike(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft) !Subscribe {
     var fbs = io.fixedBufferStream(payload);
     var s = Subscribe{
         .request_id = try wire.readVarInt(&fbs),
-        .required_request_id_delta = try wire.readVarInt(&fbs),
+        .required_request_id_delta = if (version.Rules.of(draft).required_request_id_delta)
+            try wire.readVarInt(&fbs)
+        else
+            0,
         .track_namespace = wire.readTuple(&fbs, ns_buf) catch return Error.MalformedMessage,
         .track_name = try wire.readVarBytesZc(&fbs),
     };
@@ -423,8 +429,8 @@ fn decodeSubscribeLike(payload: []const u8, ns_buf: *NamespaceBuf) !Subscribe {
 }
 
 /// See the NamespaceBuf contract: `ns_buf` must outlive the result.
-pub fn decodeSubscribe(payload: []const u8, ns_buf: *NamespaceBuf) !Subscribe {
-    return decodeSubscribeLike(payload, ns_buf);
+pub fn decodeSubscribe(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft) !Subscribe {
+    return decodeSubscribeLike(payload, ns_buf, draft);
 }
 
 // SUBSCRIBE_OK (0x04, §9.9) ------------------------------------------------
@@ -481,12 +487,14 @@ pub const RequestUpdate = struct {
     filter: ?Filter = null,
 };
 
-pub fn writeRequestUpdate(writer: anytype, u: RequestUpdate) !void {
+pub fn writeRequestUpdate(writer: anytype, u: RequestUpdate, draft: version.Draft) !void {
     var scratch: [MAX_PAYLOAD_LEN]u8 = undefined;
     var fbs = io.fixedBufferStream(&scratch);
     const w = &fbs;
     try wire.writeVarInt(w, u.request_id);
-    try wire.writeVarInt(w, u.required_request_id_delta);
+    if (version.Rules.of(draft).required_request_id_delta) {
+        try wire.writeVarInt(w, u.required_request_id_delta);
+    }
 
     var params: [MAX_PARAMS]Param = undefined;
     var filter_buf: [32]u8 = undefined;
@@ -507,11 +515,14 @@ pub fn writeRequestUpdate(writer: anytype, u: RequestUpdate) !void {
     try writeEnvelope(writer, codes.MSG_REQUEST_UPDATE, scratch[0..fbs.seek]);
 }
 
-pub fn decodeRequestUpdate(payload: []const u8) !RequestUpdate {
+pub fn decodeRequestUpdate(payload: []const u8, draft: version.Draft) !RequestUpdate {
     var fbs = io.fixedBufferStream(payload);
     var u = RequestUpdate{
         .request_id = try wire.readVarInt(&fbs),
-        .required_request_id_delta = try wire.readVarInt(&fbs),
+        .required_request_id_delta = if (version.Rules.of(draft).required_request_id_delta)
+            try wire.readVarInt(&fbs)
+        else
+            0,
     };
     var params: [MAX_PARAMS]Param = undefined;
     const parsed = try readParams(&fbs, &params);
@@ -533,12 +544,14 @@ pub const Publish = struct {
     largest: ?track.Location = null,
 };
 
-pub fn writePublish(writer: anytype, p: Publish) !void {
+pub fn writePublish(writer: anytype, p: Publish, draft: version.Draft) !void {
     var scratch: [MAX_PAYLOAD_LEN]u8 = undefined;
     var fbs = io.fixedBufferStream(&scratch);
     const w = &fbs;
     try wire.writeVarInt(w, p.request_id);
-    try wire.writeVarInt(w, p.required_request_id_delta);
+    if (version.Rules.of(draft).required_request_id_delta) {
+        try wire.writeVarInt(w, p.required_request_id_delta);
+    }
     try wire.writeTuple(w, p.track_namespace);
     try wire.writeVarBytes(w, p.track_name);
     try wire.writeVarInt(w, p.track_alias);
@@ -558,11 +571,14 @@ pub fn writePublish(writer: anytype, p: Publish) !void {
 }
 
 /// See the NamespaceBuf contract: `ns_buf` must outlive the result.
-pub fn decodePublish(payload: []const u8, ns_buf: *NamespaceBuf) !Publish {
+pub fn decodePublish(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft) !Publish {
     var fbs = io.fixedBufferStream(payload);
     var p = Publish{
         .request_id = try wire.readVarInt(&fbs),
-        .required_request_id_delta = try wire.readVarInt(&fbs),
+        .required_request_id_delta = if (version.Rules.of(draft).required_request_id_delta)
+            try wire.readVarInt(&fbs)
+        else
+            0,
         .track_namespace = wire.readTuple(&fbs, ns_buf) catch return Error.MalformedMessage,
         .track_name = try wire.readVarBytesZc(&fbs),
         .track_alias = try wire.readVarInt(&fbs),
@@ -582,7 +598,10 @@ pub const PublishOk = struct {
     filter: ?Filter = null,
 };
 
-pub fn writePublishOk(writer: anytype, p: PublishOk) !void {
+/// draft-18 removed the PUBLISH_OK code point (#1611) — the response to a
+/// PUBLISH is a REQUEST_OK, with the same body. Table 5 still lists a 0x1E
+/// row, which is a spec bug.
+pub fn writePublishOk(writer: anytype, p: PublishOk, draft: version.Draft) !void {
     var scratch: [MAX_PAYLOAD_LEN]u8 = undefined;
     var fbs = io.fixedBufferStream(&scratch);
     var params: [MAX_PARAMS]Param = undefined;
@@ -601,7 +620,11 @@ pub fn writePublishOk(writer: anytype, p: PublishOk) !void {
         n += 1;
     }
     try writeParams(&fbs, params[0..n]);
-    try writeEnvelope(writer, codes.MSG_PUBLISH_OK, scratch[0..fbs.seek]);
+    const msg_type = if (version.Rules.of(draft).publish_ok_is_own_message)
+        codes.MSG_PUBLISH_OK
+    else
+        codes.MSG_REQUEST_OK;
+    try writeEnvelope(writer, msg_type, scratch[0..fbs.seek]);
 }
 
 pub fn decodePublishOk(payload: []const u8) !PublishOk {
@@ -684,12 +707,14 @@ pub const Fetch = struct {
     group_order: ?track.GroupOrder = null,
 };
 
-pub fn writeFetch(writer: anytype, f: Fetch) !void {
+pub fn writeFetch(writer: anytype, f: Fetch, draft: version.Draft) !void {
     var scratch: [MAX_PAYLOAD_LEN]u8 = undefined;
     var fbs = io.fixedBufferStream(&scratch);
     const w = &fbs;
     try wire.writeVarInt(w, f.request_id);
-    try wire.writeVarInt(w, f.required_request_id_delta);
+    if (version.Rules.of(draft).required_request_id_delta) {
+        try wire.writeVarInt(w, f.required_request_id_delta);
+    }
     try wire.writeVarInt(w, @intFromEnum(std.meta.activeTag(f.body)));
     switch (f.body) {
         .standalone => |s| {
@@ -721,10 +746,13 @@ pub fn writeFetch(writer: anytype, f: Fetch) !void {
 }
 
 /// See the NamespaceBuf contract: `ns_buf` must outlive the result.
-pub fn decodeFetch(payload: []const u8, ns_buf: *NamespaceBuf) !Fetch {
+pub fn decodeFetch(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft) !Fetch {
     var fbs = io.fixedBufferStream(payload);
     const request_id = try wire.readVarInt(&fbs);
-    const delta = try wire.readVarInt(&fbs);
+    const delta = if (version.Rules.of(draft).required_request_id_delta)
+        try wire.readVarInt(&fbs)
+    else
+        0;
     const kind = FetchType.fromInt(try wire.readVarInt(&fbs)) orelse return Error.MalformedMessage;
 
     var f: Fetch = switch (kind) {
@@ -810,13 +838,13 @@ pub fn decodeFetchOk(payload: []const u8) !FetchOk {
 
 pub const TrackStatus = Subscribe;
 
-pub fn writeTrackStatus(writer: anytype, t: TrackStatus) !void {
-    return writeSubscribeLike(writer, codes.MSG_TRACK_STATUS, t);
+pub fn writeTrackStatus(writer: anytype, t: TrackStatus, draft: version.Draft) !void {
+    return writeSubscribeLike(writer, codes.MSG_TRACK_STATUS, t, draft);
 }
 
 /// See the NamespaceBuf contract: `ns_buf` must outlive the result.
-pub fn decodeTrackStatus(payload: []const u8, ns_buf: *NamespaceBuf) !TrackStatus {
-    return decodeSubscribeLike(payload, ns_buf);
+pub fn decodeTrackStatus(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft) !TrackStatus {
+    return decodeSubscribeLike(payload, ns_buf, draft);
 }
 
 // PUBLISH_NAMESPACE (0x06, §9.17) ------------------------------------------
@@ -827,23 +855,28 @@ pub const PublishNamespace = struct {
     track_namespace: []const []const u8,
 };
 
-pub fn writePublishNamespace(writer: anytype, p: PublishNamespace) !void {
+pub fn writePublishNamespace(writer: anytype, p: PublishNamespace, draft: version.Draft) !void {
     var scratch: [MAX_PAYLOAD_LEN]u8 = undefined;
     var fbs = io.fixedBufferStream(&scratch);
     const w = &fbs;
     try wire.writeVarInt(w, p.request_id);
-    try wire.writeVarInt(w, p.required_request_id_delta);
+    if (version.Rules.of(draft).required_request_id_delta) {
+        try wire.writeVarInt(w, p.required_request_id_delta);
+    }
     try wire.writeTuple(w, p.track_namespace);
     try writeParams(w, &.{});
     try writeEnvelope(writer, codes.MSG_PUBLISH_NAMESPACE, scratch[0..fbs.seek]);
 }
 
 /// See the NamespaceBuf contract: `ns_buf` must outlive the result.
-pub fn decodePublishNamespace(payload: []const u8, ns_buf: *NamespaceBuf) !PublishNamespace {
+pub fn decodePublishNamespace(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft) !PublishNamespace {
     var fbs = io.fixedBufferStream(payload);
     const p = PublishNamespace{
         .request_id = try wire.readVarInt(&fbs),
-        .required_request_id_delta = try wire.readVarInt(&fbs),
+        .required_request_id_delta = if (version.Rules.of(draft).required_request_id_delta)
+            try wire.readVarInt(&fbs)
+        else
+            0,
         .track_namespace = wire.readTuple(&fbs, ns_buf) catch return Error.MalformedMessage,
     };
     var params: [MAX_PARAMS]Param = undefined;
@@ -876,14 +909,15 @@ pub const SubscribeNamespace = struct {
     forward: ?bool = null,
 };
 
-pub fn writeSubscribeNamespace(writer: anytype, s: SubscribeNamespace) !void {
+fn writeSubscribeNamespaceLike(writer: anytype, msg_type: u64, s: SubscribeNamespace, draft: version.Draft) !void {
+    const rules = version.Rules.of(draft);
     var scratch: [MAX_PAYLOAD_LEN]u8 = undefined;
     var fbs = io.fixedBufferStream(&scratch);
     const w = &fbs;
     try wire.writeVarInt(w, s.request_id);
-    try wire.writeVarInt(w, s.required_request_id_delta);
+    if (rules.required_request_id_delta) try wire.writeVarInt(w, s.required_request_id_delta);
     try wire.writeTuple(w, s.track_namespace_prefix);
-    try wire.writeVarInt(w, @intFromEnum(s.options));
+    if (rules.subscribe_namespace_options) try wire.writeVarInt(w, @intFromEnum(s.options));
 
     var params: [MAX_PARAMS]Param = undefined;
     var n: usize = 0;
@@ -892,17 +926,37 @@ pub fn writeSubscribeNamespace(writer: anytype, s: SubscribeNamespace) !void {
         n += 1;
     }
     try writeParams(w, params[0..n]);
-    try writeEnvelope(writer, codes.MSG_SUBSCRIBE_NAMESPACE, scratch[0..fbs.seek]);
+    try writeEnvelope(writer, msg_type, scratch[0..fbs.seek]);
+}
+
+pub fn writeSubscribeNamespace(writer: anytype, s: SubscribeNamespace, draft: version.Draft) !void {
+    return writeSubscribeNamespaceLike(writer, version.Rules.of(draft).subscribe_namespace_code, s, draft);
+}
+
+/// draft-18 §10.19 only. SUBSCRIBE_NAMESPACE yields NAMESPACE/NAMESPACE_DONE
+/// there; this is the half that yields PUBLISH.
+pub fn writeSubscribeTracks(writer: anytype, s: SubscribeNamespace, draft: version.Draft) !void {
+    if (version.Rules.of(draft).subscribe_namespace_options) return Error.UnknownMessageType;
+    return writeSubscribeNamespaceLike(writer, codes.MSG_SUBSCRIBE_TRACKS, s, draft);
 }
 
 /// See the NamespaceBuf contract: `ns_buf` must outlive the result.
-pub fn decodeSubscribeNamespace(payload: []const u8, ns_buf: *NamespaceBuf) !SubscribeNamespace {
+pub fn decodeSubscribeNamespace(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft) !SubscribeNamespace {
+    const rules = version.Rules.of(draft);
     var fbs = io.fixedBufferStream(payload);
     var s = SubscribeNamespace{
         .request_id = try wire.readVarInt(&fbs),
-        .required_request_id_delta = try wire.readVarInt(&fbs),
+        .required_request_id_delta = if (rules.required_request_id_delta)
+            try wire.readVarInt(&fbs)
+        else
+            0,
         .track_namespace_prefix = wire.readTuple(&fbs, ns_buf) catch return Error.MalformedMessage,
-        .options = SubscribeOptions.fromInt(try wire.readVarInt(&fbs)) orelse return Error.MalformedMessage,
+        .options = if (rules.subscribe_namespace_options)
+            SubscribeOptions.fromInt(try wire.readVarInt(&fbs)) orelse return Error.MalformedMessage
+        else
+            // draft-18 split the choice into two message types, so the
+            // caller knows which it read rather than the message saying.
+            .namespace,
     };
     var params: [MAX_PARAMS]Param = undefined;
     const parsed = try readParams(&fbs, &params);
@@ -1082,7 +1136,7 @@ test "SUBSCRIBE has the request id and delta §9.8 requires" {
         .subscriber_priority = 128,
         .group_order = .ascending,
         .filter = .{ .type = .latest_object },
-    });
+    }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
     try testing.expectEqual(codes.MSG_SUBSCRIBE, p.env.type);
 
@@ -1092,7 +1146,7 @@ test "SUBSCRIBE has the request id and delta §9.8 requires" {
     try testing.expectEqual(@as(u8, 2), p.env.payload[2]); // tuple count
 
     var ns_buf: NamespaceBuf = undefined;
-    const s = try decodeSubscribe(p.env.payload, &ns_buf);
+    const s = try decodeSubscribe(p.env.payload, &ns_buf, .draft_17);
     try testing.expectEqual(@as(u64, 3), s.request_id);
     try testing.expectEqual(@as(usize, 2), s.track_namespace.len);
     try testing.expectEqualStrings("video", s.track_name);
@@ -1114,10 +1168,10 @@ test "SUBSCRIBE carries an absolute-range filter" {
             .start = .{ .group = 4, .object = 2 },
             .end_group_delta = 9,
         },
-    });
+    }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
     var ns_buf: NamespaceBuf = undefined;
-    const s = try decodeSubscribe(p.env.payload, &ns_buf);
+    const s = try decodeSubscribe(p.env.payload, &ns_buf, .draft_17);
     const f = s.filter.?;
     try testing.expectEqual(track.FilterType.absolute_range, f.type);
     try testing.expectEqual(@as(u64, 4), f.start.?.group);
@@ -1133,10 +1187,10 @@ test "SUBSCRIBE carries RENDEZVOUS_TIMEOUT" {
         .track_namespace = &ns,
         .track_name = "v",
         .rendezvous_timeout_ms = 500,
-    });
+    }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
     var ns_buf: NamespaceBuf = undefined;
-    const s = try decodeSubscribe(p.env.payload, &ns_buf);
+    const s = try decodeSubscribe(p.env.payload, &ns_buf, .draft_17);
     try testing.expectEqual(@as(u64, 500), s.rendezvous_timeout_ms.?);
 }
 
@@ -1189,9 +1243,9 @@ test "REQUEST_UPDATE round-trip" {
         .subscriber_priority = 7,
         .forward = false,
         .filter = .{ .type = .next_group_start },
-    });
+    }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
-    const u = try decodeRequestUpdate(p.env.payload);
+    const u = try decodeRequestUpdate(p.env.payload, .draft_17);
     try testing.expectEqual(@as(u64, 4), u.request_id);
     try testing.expectEqual(@as(u8, 7), u.subscriber_priority.?);
     try testing.expect(!u.forward.?);
@@ -1209,11 +1263,11 @@ test "PUBLISH round-trip" {
         .track_alias = 7,
         .forward = true,
         .largest = .{ .group = 3, .object = 1 },
-    });
+    }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
     try testing.expectEqual(codes.MSG_PUBLISH, p.env.type);
     var ns_buf: NamespaceBuf = undefined;
-    const pub_ = try decodePublish(p.env.payload, &ns_buf);
+    const pub_ = try decodePublish(p.env.payload, &ns_buf, .draft_17);
     try testing.expectEqual(@as(u64, 1), pub_.request_id);
     try testing.expectEqual(@as(usize, 2), pub_.track_namespace.len);
     try testing.expectEqualStrings("video", pub_.track_name);
@@ -1225,7 +1279,7 @@ test "PUBLISH round-trip" {
 test "PUBLISH_OK is parameters only" {
     var buf: [64]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
-    try writePublishOk(&fbs, .{ .forward = true, .subscriber_priority = 9 });
+    try writePublishOk(&fbs, .{ .forward = true, .subscriber_priority = 9 }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
     const ok = try decodePublishOk(p.env.payload);
     try testing.expect(ok.forward.?);
@@ -1233,7 +1287,7 @@ test "PUBLISH_OK is parameters only" {
 
     var buf2: [64]u8 = undefined;
     var fbs2 = io.fixedBufferStream(&buf2);
-    try writePublishOk(&fbs2, .{});
+    try writePublishOk(&fbs2, .{}, .draft_17);
     const p2 = try parseEnvelope(buf2[0..fbs2.seek]);
     try testing.expectEqualSlices(u8, &.{0x00}, p2.env.payload); // just count=0
 }
@@ -1263,10 +1317,10 @@ test "standalone FETCH round-trip" {
         } },
         .subscriber_priority = 3,
         .group_order = .ascending,
-    });
+    }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
     var ns_buf: NamespaceBuf = undefined;
-    const f = try decodeFetch(p.env.payload, &ns_buf);
+    const f = try decodeFetch(p.env.payload, &ns_buf, .draft_17);
     try testing.expectEqual(@as(u64, 2), f.request_id);
     try testing.expectEqualStrings("video", f.body.standalone.track_name);
     try testing.expectEqual(@as(u64, 1), f.body.standalone.start.group);
@@ -1281,10 +1335,10 @@ test "joining FETCH round-trip" {
     try writeFetch(&fbs, .{
         .request_id = 5,
         .body = .{ .relative_joining = .{ .joining_request_id = 3, .joining_start = 2 } },
-    });
+    }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
     var ns_buf: NamespaceBuf = undefined;
-    const f = try decodeFetch(p.env.payload, &ns_buf);
+    const f = try decodeFetch(p.env.payload, &ns_buf, .draft_17);
     try testing.expectEqual(FetchType.relative_joining, std.meta.activeTag(f.body));
     try testing.expectEqual(@as(u64, 3), f.body.relative_joining.joining_request_id);
     try testing.expectEqual(@as(u64, 2), f.body.relative_joining.joining_start);
@@ -1309,11 +1363,11 @@ test "TRACK_STATUS has the SUBSCRIBE shape under its own type" {
     var buf: [256]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
     const ns = [_][]const u8{"moq"};
-    try writeTrackStatus(&fbs, .{ .request_id = 8, .track_namespace = &ns, .track_name = "audio" });
+    try writeTrackStatus(&fbs, .{ .request_id = 8, .track_namespace = &ns, .track_name = "audio" }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
     try testing.expectEqual(codes.MSG_TRACK_STATUS, p.env.type);
     var ns_buf: NamespaceBuf = undefined;
-    const t = try decodeTrackStatus(p.env.payload, &ns_buf);
+    const t = try decodeTrackStatus(p.env.payload, &ns_buf, .draft_17);
     try testing.expectEqual(@as(u64, 8), t.request_id);
     try testing.expectEqualStrings("audio", t.track_name);
 }
@@ -1322,7 +1376,7 @@ test "PUBLISH_NAMESPACE has the request id, delta and parameter count" {
     var buf: [128]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
     const ns = [_][]const u8{ "moq-test", "interop" };
-    try writePublishNamespace(&fbs, .{ .request_id = 0, .track_namespace = &ns });
+    try writePublishNamespace(&fbs, .{ .request_id = 0, .track_namespace = &ns }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
 
     // request_id=0, delta=0, tuple count=2, "moq-test", "interop", params=0.
@@ -1333,7 +1387,7 @@ test "PUBLISH_NAMESPACE has the request id, delta and parameter count" {
     try testing.expectEqual(@as(u8, 0), body[body.len - 1]);
 
     var ns_buf: NamespaceBuf = undefined;
-    const pn = try decodePublishNamespace(body, &ns_buf);
+    const pn = try decodePublishNamespace(body, &ns_buf, .draft_17);
     try testing.expectEqual(@as(usize, 2), pn.track_namespace.len);
     try testing.expectEqualStrings("interop", pn.track_namespace[1]);
 }
@@ -1347,10 +1401,10 @@ test "SUBSCRIBE_NAMESPACE carries its subscribe options" {
         .track_namespace_prefix = &ns,
         .options = .namespace,
         .forward = true,
-    });
+    }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
     var ns_buf: NamespaceBuf = undefined;
-    const s = try decodeSubscribeNamespace(p.env.payload, &ns_buf);
+    const s = try decodeSubscribeNamespace(p.env.payload, &ns_buf, .draft_17);
     try testing.expectEqual(@as(u64, 1), s.request_id);
     try testing.expectEqual(SubscribeOptions.namespace, s.options);
     try testing.expect(s.forward.?);
@@ -1393,11 +1447,11 @@ test "decoded namespace outlives the decode call" {
     const ns = [_][]const u8{ "alpha", "beta", "gamma" };
     var buf: [256]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
-    try writeSubscribe(&fbs, .{ .track_namespace = &ns, .track_name = "t" });
+    try writeSubscribe(&fbs, .{ .track_namespace = &ns, .track_name = "t" }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
 
     var ns_buf: NamespaceBuf = undefined;
-    const sub = try decodeSubscribe(p.env.payload, &ns_buf);
+    const sub = try decodeSubscribe(p.env.payload, &ns_buf, .draft_17);
 
     var scratch: [wire.MAX_TUPLE_PARTS][]const u8 = undefined;
     for (&scratch) |*e| e.* = "xxxxx";
@@ -1406,4 +1460,129 @@ test "decoded namespace outlives the decode call" {
     try testing.expectEqual(@as(usize, 3), sub.track_namespace.len);
     try testing.expectEqualStrings("alpha", sub.track_namespace[0]);
     try testing.expectEqualStrings("gamma", sub.track_namespace[2]);
+}
+
+// --- draft-18 ---------------------------------------------------------
+//
+// The delta is small but load-bearing: a draft-17 reader on a draft-18
+// message reads every field one varint late.
+
+test "draft-18 drops Required Request ID Delta from SUBSCRIBE" {
+    const ns = [_][]const u8{"moq"};
+    var b17: [256]u8 = undefined;
+    var f17 = io.fixedBufferStream(&b17);
+    try writeSubscribe(&f17, .{ .request_id = 5, .track_namespace = &ns, .track_name = "v" }, .draft_17);
+
+    var b18: [256]u8 = undefined;
+    var f18 = io.fixedBufferStream(&b18);
+    try writeSubscribe(&f18, .{ .request_id = 5, .track_namespace = &ns, .track_name = "v" }, .draft_18);
+
+    // One varint shorter, and the tuple starts where the delta was.
+    try testing.expectEqual(f17.seek - 1, f18.seek);
+    const p18 = try parseEnvelope(b18[0..f18.seek]);
+    try testing.expectEqual(@as(u8, 5), p18.env.payload[0]);
+    try testing.expectEqual(@as(u8, 1), p18.env.payload[1]); // tuple count
+
+    var ns_buf: NamespaceBuf = undefined;
+    const s18 = try decodeSubscribe(p18.env.payload, &ns_buf, .draft_18);
+    try testing.expectEqual(@as(u64, 5), s18.request_id);
+    try testing.expectEqualStrings("v", s18.track_name);
+    try testing.expectEqualStrings("moq", s18.track_namespace[0]);
+}
+
+test "reading a draft-18 message as draft-17 does not quietly succeed" {
+    const ns = [_][]const u8{ "moq", "demo" };
+    var buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try writeSubscribe(&fbs, .{ .request_id = 1, .track_namespace = &ns, .track_name = "video" }, .draft_18);
+    const p = try parseEnvelope(buf[0..fbs.seek]);
+
+    var ns_buf: NamespaceBuf = undefined;
+    const wrong = decodeSubscribe(p.env.payload, &ns_buf, .draft_17);
+    // Whatever it does, it must not produce the right answer by accident.
+    if (wrong) |s| {
+        try testing.expect(!std.mem.eql(u8, s.track_name, "video"));
+    } else |_| {}
+}
+
+test "draft-18 moves SUBSCRIBE_NAMESPACE and splits off SUBSCRIBE_TRACKS" {
+    const ns = [_][]const u8{"moq"};
+    var buf: [256]u8 = undefined;
+
+    var f17 = io.fixedBufferStream(&buf);
+    try writeSubscribeNamespace(&f17, .{ .track_namespace_prefix = &ns }, .draft_17);
+    try testing.expectEqual(codes.MSG_SUBSCRIBE_NAMESPACE, (try parseEnvelope(buf[0..f17.seek])).env.type);
+
+    var b18: [256]u8 = undefined;
+    var f18 = io.fixedBufferStream(&b18);
+    try writeSubscribeNamespace(&f18, .{ .track_namespace_prefix = &ns }, .draft_18);
+    const p18 = try parseEnvelope(b18[0..f18.seek]);
+    try testing.expectEqual(codes.MSG_SUBSCRIBE_NAMESPACE_18, p18.env.type);
+
+    var bt: [256]u8 = undefined;
+    var ft = io.fixedBufferStream(&bt);
+    try writeSubscribeTracks(&ft, .{ .track_namespace_prefix = &ns }, .draft_18);
+    try testing.expectEqual(codes.MSG_SUBSCRIBE_TRACKS, (try parseEnvelope(bt[0..ft.seek])).env.type);
+
+    // draft-17 has one message for both, so there is nothing to write.
+    var bx: [256]u8 = undefined;
+    var fx = io.fixedBufferStream(&bx);
+    try testing.expectError(
+        Error.UnknownMessageType,
+        writeSubscribeTracks(&fx, .{ .track_namespace_prefix = &ns }, .draft_17),
+    );
+
+    var ns_buf: NamespaceBuf = undefined;
+    const back = try decodeSubscribeNamespace(p18.env.payload, &ns_buf, .draft_18);
+    try testing.expectEqualStrings("moq", back.track_namespace_prefix[0]);
+}
+
+test "draft-18 answers PUBLISH with REQUEST_OK" {
+    var b17: [64]u8 = undefined;
+    var f17 = io.fixedBufferStream(&b17);
+    try writePublishOk(&f17, .{}, .draft_17);
+    try testing.expectEqual(codes.MSG_PUBLISH_OK, (try parseEnvelope(b17[0..f17.seek])).env.type);
+
+    var b18: [64]u8 = undefined;
+    var f18 = io.fixedBufferStream(&b18);
+    try writePublishOk(&f18, .{}, .draft_18);
+    try testing.expectEqual(codes.MSG_REQUEST_OK, (try parseEnvelope(b18[0..f18.seek])).env.type);
+}
+
+test "draft-18 request messages round-trip" {
+    const ns = [_][]const u8{ "moq", "demo" };
+    var ns_buf: NamespaceBuf = undefined;
+    var buf: [512]u8 = undefined;
+
+    var f = io.fixedBufferStream(&buf);
+    try writePublishNamespace(&f, .{ .request_id = 2, .track_namespace = &ns }, .draft_18);
+    const pn = try decodePublishNamespace((try parseEnvelope(buf[0..f.seek])).env.payload, &ns_buf, .draft_18);
+    try testing.expectEqual(@as(u64, 2), pn.request_id);
+    try testing.expectEqual(@as(usize, 2), pn.track_namespace.len);
+
+    f = io.fixedBufferStream(&buf);
+    try writePublish(&f, .{
+        .request_id = 3,
+        .track_namespace = &ns,
+        .track_name = "video",
+        .track_alias = 4,
+    }, .draft_18);
+    const pb = try decodePublish((try parseEnvelope(buf[0..f.seek])).env.payload, &ns_buf, .draft_18);
+    try testing.expectEqual(@as(u64, 3), pb.request_id);
+    try testing.expectEqual(@as(u64, 4), pb.track_alias);
+
+    f = io.fixedBufferStream(&buf);
+    try writeFetch(&f, .{
+        .request_id = 6,
+        .body = .{ .relative_joining = .{ .joining_request_id = 1, .joining_start = 2 } },
+    }, .draft_18);
+    const fe = try decodeFetch((try parseEnvelope(buf[0..f.seek])).env.payload, &ns_buf, .draft_18);
+    try testing.expectEqual(@as(u64, 6), fe.request_id);
+    try testing.expectEqual(@as(u64, 1), fe.body.relative_joining.joining_request_id);
+
+    f = io.fixedBufferStream(&buf);
+    try writeRequestUpdate(&f, .{ .request_id = 7, .subscriber_priority = 9 }, .draft_18);
+    const ru = try decodeRequestUpdate((try parseEnvelope(buf[0..f.seek])).env.payload, .draft_18);
+    try testing.expectEqual(@as(u64, 7), ru.request_id);
+    try testing.expectEqual(@as(u8, 9), ru.subscriber_priority.?);
 }

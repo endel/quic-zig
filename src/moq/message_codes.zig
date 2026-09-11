@@ -19,7 +19,13 @@ pub const MSG_TRACK_STATUS: u64 = 0x0D;
 pub const MSG_PUBLISH_NAMESPACE: u64 = 0x06;
 pub const MSG_NAMESPACE: u64 = 0x08;
 pub const MSG_NAMESPACE_DONE: u64 = 0x0E;
+/// draft-17 only. draft-18 moved it to 0x50 and split off SUBSCRIBE_TRACKS,
+/// so use `subscribeNamespaceCode(draft)` rather than this constant.
 pub const MSG_SUBSCRIBE_NAMESPACE: u64 = 0x11;
+pub const MSG_SUBSCRIBE_NAMESPACE_18: u64 = 0x50;
+/// draft-18 (§10.19): SUBSCRIBE_NAMESPACE yields NAMESPACE/NAMESPACE_DONE,
+/// and this yields PUBLISH. In draft-17 one message did both.
+pub const MSG_SUBSCRIBE_TRACKS: u64 = 0x51;
 pub const MSG_PUBLISH_BLOCKED: u64 = 0x0F;
 
 pub fn isReservedLegacyMessageType(t: u64) bool {
@@ -47,6 +53,10 @@ pub const SUBGROUP_MASK_ID_MODE: u64 = 0x06;
 pub const SUBGROUP_BIT_END_OF_GROUP: u64 = 0x08;
 pub const SUBGROUP_BIT_SELECTOR: u64 = 0x10;
 pub const SUBGROUP_BIT_DEFAULT_PRIORITY: u64 = 0x20;
+/// draft-18 (§11.4.2): the first object on this stream is the first the
+/// original publisher put in the subgroup. Unknown to draft-17, which
+/// rejects the whole type code as out of range.
+pub const SUBGROUP_BIT_FIRST_OBJECT: u64 = 0x40;
 
 pub const SubgroupIdMode = enum(u2) {
     zero = 0b00, // Subgroup ID is 0; absent from header.
@@ -55,14 +65,15 @@ pub const SubgroupIdMode = enum(u2) {
     reserved = 0b11, // Receipt is a PROTOCOL_VIOLATION.
 };
 
-pub fn isSubgroupStreamType(t: u64) bool {
+/// `first_object` widens the accepted range to draft-18's `0b0XX1XXXX`.
+pub fn isSubgroupStreamType(t: u64, first_object: bool) bool {
     // Must have selector bit set.
     if ((t & SUBGROUP_BIT_SELECTOR) == 0) return false;
     // Reserved-id-mode must not be present.
     const mode: u2 = @truncate((t & SUBGROUP_MASK_ID_MODE) >> 1);
     if (mode == @intFromEnum(SubgroupIdMode.reserved)) return false;
-    // High bits above those we know (0-5) must be zero for the range we accept.
-    return (t & ~@as(u64, 0x3F)) == 0;
+    const known: u64 = if (first_object) 0x7F else 0x3F;
+    return (t & ~known) == 0;
 }
 
 // Datagram object type bit-field (§10.3.1). Valid codes 0x00..0x0F, 0x20..0x2F.

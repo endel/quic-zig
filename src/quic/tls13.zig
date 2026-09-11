@@ -657,10 +657,23 @@ pub const Tls13Handshake = struct {
     /// 4.2.10 only lets EncryptedExtensions answer an extension the client
     /// offered, so accepting a PSK is not on its own a licence to send it.
     early_data_offered: bool = false,
+    /// Server side: which of `config.alpn` the client also offered. A
+    /// server advertising several has to echo the one that matched, not
+    /// its own first choice.
+    selected_alpn: [32]u8 = .{0} ** 32,
+    selected_alpn_len: usize = 0,
+
     zero_rtt_accepted: bool = false,
     pending_install_early: bool = false,
     received_ticket: ?SessionTicket = null,
     ticket_nonce_counter: u32 = 0,
+
+    /// The protocol in force: what the server matched, or — on a client,
+    /// or before a match — the first one we offered.
+    pub fn negotiatedAlpn(self: *const @This()) []const u8 {
+        if (self.selected_alpn_len > 0) return self.selected_alpn[0..self.selected_alpn_len];
+        return if (self.config.alpn.len > 0) self.config.alpn[0] else "";
+    }
 
     /// Builds the client handshake in place. Tls13Handshake is ~52 KB, and
     /// returning it by value is the single largest contributor to the stack
@@ -693,6 +706,7 @@ pub const Tls13Handshake = struct {
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
         self.early_data_offered = false;
+        self.selected_alpn_len = 0;
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
@@ -759,6 +773,7 @@ pub const Tls13Handshake = struct {
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
         self.early_data_offered = false;
+        self.selected_alpn_len = 0;
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
@@ -1394,6 +1409,9 @@ pub const Tls13Handshake = struct {
                         for (self.config.alpn) |our_proto| {
                             if (std.mem.eql(u8, proto, our_proto)) {
                                 matched = true;
+                                const n = @min(proto.len, self.selected_alpn.len);
+                                @memcpy(self.selected_alpn[0..n], proto[0..n]);
+                                self.selected_alpn_len = n;
                                 break;
                             }
                         }
@@ -1708,7 +1726,7 @@ pub const Tls13Handshake = struct {
         @memcpy(ticket_plain[0..32], &psk);
         const now_sec = @divTrunc(sys.nanoTimestamp(), std.time.ns_per_s);
         std.mem.writeInt(i64, ticket_plain[32..40], now_sec, .big);
-        const alpn_bytes = if (self.config.alpn.len > 0) self.config.alpn[0] else "";
+        const alpn_bytes = self.negotiatedAlpn();
         const alpn_copy_len: u8 = @intCast(@min(alpn_bytes.len, 16));
         ticket_plain[40] = alpn_copy_len;
         @memcpy(ticket_plain[41..][0..alpn_copy_len], alpn_bytes[0..alpn_copy_len]);

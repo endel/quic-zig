@@ -259,7 +259,7 @@ pub fn Session(comptime Transport: type) type {
                 } },
                 codes.MSG_PUBLISH => Event{ .publish = .{
                     .stream_id = stream_id,
-                    .publish = try msg.decodePublish(env.payload, &self.ns_buf),
+                    .publish = try msg.decodePublish(env.payload, &self.ns_buf, self.draft),
                 } },
                 codes.MSG_NAMESPACE => Event{ .namespace = .{
                     .stream_id = stream_id,
@@ -401,7 +401,7 @@ test "a request opens a bidi stream and FIN releases it" {
     var buf: [256]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
     const ns = [_][]const u8{ "moq-test", "interop" };
-    try msg.writePublishNamespace(&fbs, .{ .track_namespace = &ns });
+    try msg.writePublishNamespace(&fbs, .{ .track_namespace = &ns }, .draft_17);
 
     const sid = try s.sendRequest(buf[0..fbs.seek]);
     try testing.expectEqual(@as(u64, 0), sid);

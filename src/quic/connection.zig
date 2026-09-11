@@ -3888,6 +3888,14 @@ pub const Connection = struct {
 
     /// Receive a QUIC DATAGRAM frame (RFC 9221).
     /// Returns the number of bytes written to buf, or null if no datagram available.
+    /// The ALPN this connection settled on, or "" before the handshake
+    /// has got that far. A server that advertises several — two MoQ drafts,
+    /// say — needs this to know which one it is speaking.
+    pub fn negotiatedAlpn(self: *const Connection) []const u8 {
+        const hs = self.tls13_hs orelse return "";
+        return hs.negotiatedAlpn();
+    }
+
     pub fn recvDatagram(self: *Connection, buf: []u8) ?usize {
         const now: i64 = @intCast(sys.nanoTimestamp());
         return self.datagram_recv_queue.popSkipExpired(buf, now);

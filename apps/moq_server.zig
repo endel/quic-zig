@@ -35,6 +35,8 @@ const MoqServerHandler = struct {
     /// on a cadence rather than only when the peer sends something.
     pub const poll_interval_ms: u64 = 100;
 
+    /// Fixed by the ALPN this server advertises.
+    draft: moq_version.Draft = moq_version.DEFAULT,
     control_out: ?u64 = null,
     peer_control: ?u64 = null,
     setup_sent: bool = false,
@@ -116,7 +118,7 @@ const MoqServerHandler = struct {
 
     fn handleSubscribe(self: *MoqServerHandler, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
         var ns_buf: moq_msg.NamespaceBuf = undefined;
-        const sub = moq_msg.decodeSubscribe(payload, &ns_buf) catch return;
+        const sub = moq_msg.decodeSubscribe(payload, &ns_buf, self.draft) catch return;
         std.debug.print("[MoQ] SUBSCRIBE ns_parts={d} name=\"{s}\"\n", .{ sub.track_namespace.len, sub.track_name });
 
         const alias: u64 = self.subscriber_count + 1;
@@ -224,14 +226,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const ec_key = tls13.extractEcPrivateKey(key_der) catch try tls13.extractPkcs8EcPrivateKey(key_der);
     const key_owned = try alloc.dupe(u8, ec_key);
 
-    const alpn = try alloc.alloc([]const u8, 1);
-    alpn[0] = moq_version.ALPN; // "moqt-17"
+    // Advertise every draft we implement; the peer chooses.
+    const alpn = try alloc.alloc([]const u8, moq_version.PREFERRED.len);
+    _ = moq_version.alpnOffer(moq_version.PREFERRED, alpn);
 
     var ticket_key: [16]u8 = undefined;
     sys.randomBytes(&ticket_key);
 
     std.debug.print("\n=== MoQ Server (draft-17, raw QUIC) ===\n", .{});
-    std.debug.print("Listening on 0.0.0.0:{d}  ALPN: {s}, h3\n\n", .{ port, moq_version.ALPN });
+    std.debug.print("Listening on 0.0.0.0:{d}  ALPN:", .{port});
+    for (alpn) |a| std.debug.print(" {s}", .{a});
+    std.debug.print(", h3\n\n", .{});
 
     var handler = MoqServerHandler{};
     var server = try event_loop.Server(MoqServerHandler).init(alloc, &handler, .{
