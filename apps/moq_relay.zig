@@ -337,7 +337,8 @@ const RelayHandler = struct {
     }
 
     fn handleSubscribe(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
-        const sub = moq_msg.decodeSubscribe(payload) catch return;
+        var ns_buf: moq_msg.NamespaceBuf = undefined;
+        const sub = moq_msg.decodeSubscribe(payload, &ns_buf) catch return;
 
         var ns_key: [256]u8 = undefined;
         const ns_len = serializeNs(sub.track_namespace, &ns_key);
@@ -423,7 +424,8 @@ const RelayHandler = struct {
     }
 
     fn handlePublish(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
-        const pub_msg = moq_msg.decodePublish(payload) catch return;
+        var ns_buf: moq_msg.NamespaceBuf = undefined;
+        const pub_msg = moq_msg.decodePublish(payload, &ns_buf) catch return;
 
         var ns_key: [256]u8 = undefined;
         const ns_len = serializeNs(pub_msg.track_namespace, &ns_key);

@@ -265,6 +265,16 @@ pub fn writeTuple(writer: anytype, parts: []const []const u8) !void {
     for (parts) |p| try writeVarBytes(writer, p);
 }
 
+// Reads a tuple into a caller-provided buffer, so the returned slice of
+// slices outlives the call. The parts themselves point into `fbs.buffer`.
+pub fn readTuple(fbs: *io.FixedBufferStream([]const u8), out: [][]const u8) ![][]const u8 {
+    const count = try readVarInt(fbs);
+    if (count > out.len) return Error.ValueTooLong;
+    const n: usize = @intCast(count);
+    for (0..n) |i| out[i] = try readVarBytesZc(fbs);
+    return out[0..n];
+}
+
 pub fn tupleEncodedLen(parts: []const []const u8) usize {
     var n: usize = varIntLength(parts.len);
     for (parts) |p| n += varIntLength(p.len) + p.len;

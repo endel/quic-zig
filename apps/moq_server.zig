@@ -112,7 +112,8 @@ const MoqServerHandler = struct {
     }
 
     fn handleSubscribe(self: *MoqServerHandler, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
-        const sub = moq_msg.decodeSubscribe(payload) catch return;
+        var ns_buf: moq_msg.NamespaceBuf = undefined;
+        const sub = moq_msg.decodeSubscribe(payload, &ns_buf) catch return;
         std.debug.print("[MoQ] SUBSCRIBE ns_parts={d} name=\"{s}\"\n", .{ sub.track_namespace.len, sub.track_name });
 
         const alias: u64 = self.subscriber_count + 1;
