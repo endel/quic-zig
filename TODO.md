@@ -134,17 +134,28 @@ spec, so the consequence is recorded alongside the fix.
   comment had claimed it did for as long as it had not. Regression test
   `stop() leaves nothing queued for the peer`, which fails without it.
 
-- [ ] **F2. 23 of 26 fuzz targets never see a random byte (M)** — `fuzz.zig`.
+- [x] **F2. 23 of 26 fuzz targets never see a random byte (M)** — `fuzz.zig`.
   `-ffuzz` does not compile on Zig 0.16.0: 27 errors inside the toolchain's
   own `lib/compiler/test_runner.zig` (`*builtin.StackTrace` vs
   `*debug.StackTrace`), so `std.testing.fuzz` runs each body once on its seed
-  and the whole file is a smoke test. The three MoQ parsers have a fixed-seed
+  and the whole file was a smoke test. The three MoQ parsers had a fixed-seed
   sweep instead — random bytes, plus real encoded messages with a few bytes
   flipped — and it found a one-byte remote abort within seconds of being
-  written (`@enumFromInt` on an attacker-controlled `GroupOrder`). The same
-  shape applied to the QUIC packet/frame, transport-parameter, QPACK, HPACK
-  and capsule parsers is the cheapest coverage available until the toolchain
-  is fixed. See `moq decoders survive a randomized sweep` for the pattern.
+  written (`@enumFromInt` on an attacker-controlled `GroupOrder`).
+
+  Fixed: the same shape now covers the QUIC packet headers, frames, transport
+  parameters, HTTP/3 frames, QPACK, Huffman and capsules, plus a connection
+  fed a stream of datagrams — `handleDatagram` being the whole pipeline. Four
+  remote aborts fell out in the first hour, three of them pre-handshake: a
+  QPACK integer whose continuation run overflows its accumulator, a packet
+  Length below the packet number length (reads gigabytes past the datagram),
+  one below the 16-byte AEAD tag, and an Initial token past the 512-byte
+  buffer the associated data is built in. `SWEEP_ITERATIONS` is what
+  `zig build fuzz` can afford; raise it locally when touching a parser, the
+  seeds are fixed so a longer run is a superset.
+
+  Still open underneath: `-ffuzz` itself, which would replace all of this
+  with coverage-guided input. Recheck on the next Zig release.
 
 - [ ] **F3. `Client` is one connection per loop (M)** — `event_loop.zig:1432`.
   Any client needing two concurrent connections — the MoQ interop runner's

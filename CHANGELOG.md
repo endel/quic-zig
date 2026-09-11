@@ -3,6 +3,30 @@
 Notable changes to quic-zig. Versions follow [semantic versioning](https://semver.org);
 `Unreleased` collects what has landed on `main` since the last tag.
 
+## Unreleased
+
+### Fixed
+
+- A peer could abort the process before the handshake completed. A QUIC packet
+  whose Length field was below its packet number length read gigabytes past
+  the datagram, and one below the 16-byte AEAD tag tripped an assertion; an
+  Initial carrying a token of ~500 bytes or more overflowed the buffer the
+  associated data is built in; and a QPACK integer with a long enough
+  continuation run overflowed its accumulator, which any HTTP/3 peer can send.
+- QPACK header encoding wrote past the end of its output buffer when the
+  headers did not fit. The size check only covered the first byte of each one.
+- Rejecting a peer's packet no longer logs at error level. An unsupported QUIC
+  version, a failed decryption and an undecryptable packet are ordinary events
+  a peer chooses, so a junk-packet flood was also a log flood.
+
+### Added
+
+- Randomized sweeps over the QUIC packet, frame, transport-parameter, HTTP/3
+  frame, QPACK, Huffman and capsule parsers, and over a connection fed a
+  stream of datagrams. They are what found the above; `zig build fuzz` runs
+  them. Zig 0.16's `-ffuzz` does not compile, so until it does this is the
+  only thing feeding those parsers bytes they did not expect.
+
 ## 0.3.0
 
 Media over QUIC, in both dialects the ecosystem uses, and an interop client

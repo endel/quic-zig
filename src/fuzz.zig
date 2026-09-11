@@ -688,6 +688,507 @@ test "fuzz: coalesced packet headers" {
 }
 
 // ════════════════════════════════════════════════════════
+// Randomized sweeps
+//
+// See the sweep note above: this is where the MoQ parsers
+// actually get fed bytes they did not expect.
+//
+// Pure noise mostly dies at the first length check, so each
+// sweep splits its inputs: half noise, half a real encoded
+// value with a few bytes flipped, which gets past the
+// header and into the body.
+// ════════════════════════════════════════════════════════
+
+/// Iterations per sweep, kept to what `zig build fuzz` can afford. Raise it
+/// locally when changing a parser: the seed is fixed and each iteration
+/// draws in order, so a longer run is a superset of a shorter one.
+const SWEEP_ITERATIONS = 50_000;
+
+/// Flips one to three bytes, so a seeded message stays structurally
+/// plausible while being wrong somewhere a validator has to catch.
+fn corrupt(buf: []u8, rand: std.Random) void {
+    if (buf.len == 0) return;
+    for (0..1 + rand.uintLessThan(usize, 3)) |_| {
+        buf[rand.uintLessThan(usize, buf.len)] = rand.int(u8);
+    }
+}
+
+/// A parser handing back a slice must hand back a slice of what it was
+/// given. Two MoQ decoders returned one pointing into their own stack
+/// frame instead, and their round-trip tests could not see it because the
+/// memory was still readable.
+fn borrowedFrom(outer: []const u8, inner: []const u8) bool {
+    if (inner.len == 0) return true;
+    const base = @intFromPtr(outer.ptr);
+    const at = @intFromPtr(inner.ptr);
+    return at >= base and at + inner.len <= base + outer.len;
+}
+
+test "QUIC packet headers survive a randomized sweep" {
+    var prng = std.Random.DefaultPrng.init(0x7061636b);
+    const rand = prng.random();
+
+    var buf: [1500]u8 = undefined;
+
+    for (0..SWEEP_ITERATIONS) |i| {
+        const len = 1 + rand.uintLessThan(usize, buf.len - 1);
+        const input = buf[0..len];
+        rand.bytes(input);
+
+        if (i % 2 == 0) {
+            const n = seedPacketHeader(input, rand) orelse continue;
+            corrupt(input[0..n], rand);
+        }
+
+        // A short header's DCID length is connection state, not on the
+        // wire, so the parser is trusted to bound it against the datagram.
+        for ([_]u8{ 0, 8, 20 }) |dcid_len| {
+            var fbs = io_compat.fixedBufferStream(input);
+            const hdr = packet.Header.parse(&fbs, dcid_len) catch continue;
+            try testing.expect(fbs.seek <= input.len);
+            try testing.expect(borrowedFrom(input, hdr.dcid));
+            try testing.expect(borrowedFrom(input, hdr.scid));
+            if (hdr.token) |t| try testing.expect(borrowedFrom(input, t));
+        }
+    }
+}
+
+/// One encoded QUIC long or short header, chosen at random.
+fn seedPacketHeader(buf: []u8, rand: std.Random) ?usize {
+    const cid = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+    const token = [_]u8{0xaa} ** 24;
+
+    var hdr = packet.Header{
+        // v2 assigns the type bits differently, and version 0 is a version
+        // negotiation packet — both change how the first byte reads.
+        .version = switch (rand.uintLessThan(u8, 4)) {
+            0 => 0x00000001,
+            1 => 0x6b3343cf,
+            2 => 0,
+            else => rand.int(u32),
+        },
+        .dcid = cid[0..rand.uintLessThan(usize, cid.len + 1)],
+        .scid = cid[0..rand.uintLessThan(usize, cid.len + 1)],
+        .packet_number_len = 1 + rand.uintLessThan(usize, 4),
+    };
+    hdr.packet_type = switch (rand.uintLessThan(u8, 5)) {
+        0 => .initial,
+        1 => .handshake,
+        2 => .zero_rtt,
+        3 => .retry,
+        else => .one_rtt,
+    };
+    if (hdr.packet_type == .initial or hdr.packet_type == .retry) hdr.token = &token;
+
+    var fbs = io_compat.fixedBufferStream(buf);
+    hdr.encode(&fbs) catch return null;
+
+    // encode() stops short of the Length field — the packet packer writes
+    // it once the payload is known — but it is the next thing the parser
+    // reads on every long header except Retry.
+    switch (hdr.packet_type) {
+        .initial, .handshake, .zero_rtt => {
+            if (hdr.version != 0) {
+                packet.writeVarInt(&fbs, rand.uintLessThan(u64, 2000)) catch return null;
+            }
+        },
+        else => {},
+    }
+    return fbs.seek;
+}
+
+test "QUIC frame decoders survive a randomized sweep" {
+    var prng = std.Random.DefaultPrng.init(0x71756963);
+    const rand = prng.random();
+
+    var buf: [1024]u8 = undefined;
+
+    for (0..SWEEP_ITERATIONS) |i| {
+        const len = 1 + rand.uintLessThan(usize, buf.len - 1);
+        const input = buf[0..len];
+        rand.bytes(input);
+
+        if (i % 2 == 0) {
+            const n = seedFrame(input, rand) orelse continue;
+            corrupt(input[0..n], rand);
+        }
+
+        const f1 = frame.Frame.parse(input) catch continue;
+        try testing.expect(borrowedFrom(input, framePayload(f1)));
+
+        // Re-encoding catches a field the parser widened past anything the
+        // encoder can represent.
+        var out: [4096]u8 = undefined;
+        var wfbs = io_compat.fixedBufferStream(&out);
+        f1.write(&wfbs) catch continue;
+
+        var again: [4096]u8 = undefined;
+        const written = wfbs.buffered();
+        @memcpy(again[0..written.len], written);
+        const f2 = frame.Frame.parse(again[0..written.len]) catch continue;
+        try testing.expectEqual(@as(frame.FrameType, f1), @as(frame.FrameType, f2));
+    }
+}
+
+/// The bytes a frame borrows from the datagram it was parsed out of.
+fn framePayload(f: frame.Frame) []const u8 {
+    return switch (f) {
+        .crypto => |c| c.data,
+        .new_token => |t| t,
+        .stream => |s| s.data,
+        .new_connection_id => |n| n.conn_id,
+        .connection_close => |c| c.reason,
+        .application_close => |c| c.reason,
+        .datagram => |d| d.data,
+        .datagram_with_length => |d| d.data,
+        else => &.{},
+    };
+}
+
+/// One encoded QUIC frame, chosen at random.
+fn seedFrame(buf: []u8, rand: std.Random) ?usize {
+    var payload = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const stream_id = rand.int(u16);
+    const big = rand.uintLessThan(u64, 1 << 40);
+
+    const f: frame.Frame = switch (rand.uintLessThan(u8, 18)) {
+        0 => .{ .padding = rand.uintLessThan(usize, 16) },
+        1 => .ping,
+        // The ACK ranges live in a fixed array the field defaults leave
+        // undefined, so these two need filling in rather than a literal.
+        2 => blk: {
+            var a = frame.Frame{ .ack = .{ .largest_ack = 40, .ack_delay = 3, .first_ack_range = 2 } };
+            a.ack.ack_range_count = 2;
+            a.ack.ack_ranges[0] = .{ .start = 20, .end = 30 };
+            a.ack.ack_ranges[1] = .{ .start = 5, .end = 10 };
+            break :blk a;
+        },
+        3 => blk: {
+            var a = frame.Frame{ .ack_ecn = .{
+                .largest_ack = 40,
+                .ack_delay = 3,
+                .first_ack_range = 2,
+                .ecn_ect0 = 1,
+                .ecn_ect1 = 0,
+                .ecn_ce = 2,
+            } };
+            a.ack_ecn.ack_range_count = 1;
+            a.ack_ecn.ack_ranges[0] = .{ .start = 20, .end = 30 };
+            break :blk a;
+        },
+        4 => .{ .reset_stream = .{ .stream_id = stream_id, .error_code = 7, .final_size = big } },
+        5 => .{ .stop_sending = .{ .stream_id = stream_id, .error_code = 7 } },
+        6 => .{ .crypto = .{ .offset = big, .data = &payload } },
+        7 => .{ .new_token = &payload },
+        8 => .{ .stream = .{
+            .stream_id = stream_id,
+            .offset = big,
+            .length = payload.len,
+            .fin = rand.boolean(),
+            .data = &payload,
+        } },
+        9 => .{ .max_data = big },
+        10 => .{ .max_stream_data = .{ .stream_id = stream_id, .max = big } },
+        11 => .{ .stream_data_blocked = .{ .stream_id = stream_id, .limit = big } },
+        12 => .{ .new_connection_id = .{
+            .seq_num = 3,
+            .retire_prior_to = 1,
+            .conn_id = payload[0..8],
+            .stateless_reset_token = [_]u8{0x5a} ** 16,
+        } },
+        13 => .{ .retire_connection_id = .{ .seq_num = 3 } },
+        14 => .{ .path_challenge = [_]u8{0x11} ** 8 },
+        15 => .{ .connection_close = .{ .error_code = 0x0a, .frame_type = 0x08, .reason = &payload } },
+        16 => .{ .datagram_with_length = .{ .data = &payload } },
+        else => .{ .ack_frequency = .{
+            .sequence_number = 1,
+            .ack_eliciting_threshold = 2,
+            .request_max_ack_delay = 25000,
+            .reordering_threshold = 3,
+        } },
+    };
+    var fbs = io_compat.fixedBufferStream(buf);
+    f.write(&fbs) catch return null;
+    return fbs.seek;
+}
+
+test "a connection survives a randomized datagram stream" {
+    var prng = std.Random.DefaultPrng.init(0x64677261);
+    const rand = prng.random();
+
+    const local = std.mem.zeroes(std.posix.sockaddr.storage);
+    const remote = std.mem.zeroes(std.posix.sockaddr.storage);
+
+    var buf: [1500]u8 = undefined;
+    var seed_buf: [1500]u8 = undefined;
+
+    // handleDatagram is the whole pipeline — header, decryption, frames,
+    // state machine — and accept() is the expensive part of reaching it, so
+    // each connection takes a run of datagrams rather than one. A state
+    // machine a few hundred datagrams deep is its own target.
+    const per_conn = 256;
+    for (0..@max(1, SWEEP_ITERATIONS / per_conn)) |_| {
+        const n = seedPacketHeader(&seed_buf, rand) orelse continue;
+        var hfbs = io_compat.fixedBufferStream(seed_buf[0..n]);
+        const hdr = packet.Header.parse(&hfbs, 8) catch continue;
+
+        var conn = connection.Connection.accept(
+            testing.allocator,
+            hdr,
+            local,
+            remote,
+            true,
+            .{},
+            null,
+            null,
+            null,
+        ) catch continue;
+        defer conn.deinit();
+
+        for (0..per_conn) |i| {
+            const len = 1 + rand.uintLessThan(usize, buf.len - 1);
+            const input = buf[0..len];
+            rand.bytes(input);
+
+            if (i % 2 == 0) {
+                const m = seedPacketHeader(input, rand) orelse continue;
+                corrupt(input[0..m], rand);
+            }
+
+            conn.handleDatagram(input, .{
+                .to = local,
+                .from = remote,
+                .ecn = 0,
+                .datagram_size = len,
+            });
+        }
+    }
+}
+
+test "transport parameters survive a randomized sweep" {
+    var prng = std.Random.DefaultPrng.init(0x7470726d);
+    const rand = prng.random();
+
+    var buf: [1024]u8 = undefined;
+
+    for (0..SWEEP_ITERATIONS) |i| {
+        const len = rand.uintLessThan(usize, buf.len);
+        const input = buf[0..len];
+        rand.bytes(input);
+
+        if (i % 2 == 0) {
+            const n = seedTransportParams(input, rand) orelse continue;
+            corrupt(input[0..n], rand);
+        }
+
+        const p = transport_params.TransportParams.decode(input) catch continue;
+        if (p.original_destination_connection_id) |c| try testing.expect(borrowedFrom(input, c));
+        if (p.initial_source_connection_id) |c| try testing.expect(borrowedFrom(input, c));
+        if (p.retry_source_connection_id) |c| try testing.expect(borrowedFrom(input, c));
+
+        var out: [4096]u8 = undefined;
+        var wfbs = io_compat.fixedBufferStream(&out);
+        p.encode(&wfbs) catch continue;
+        const p2 = transport_params.TransportParams.decode(wfbs.buffered()) catch continue;
+        try testing.expectEqual(p.max_idle_timeout, p2.max_idle_timeout);
+        try testing.expectEqual(p.initial_max_data, p2.initial_max_data);
+        try testing.expectEqual(p.initial_max_streams_bidi, p2.initial_max_streams_bidi);
+        try testing.expectEqual(p.active_connection_id_limit, p2.active_connection_id_limit);
+        try testing.expectEqual(p.max_datagram_frame_size, p2.max_datagram_frame_size);
+    }
+}
+
+/// One encoded transport-parameter block, chosen at random.
+fn seedTransportParams(buf: []u8, rand: std.Random) ?usize {
+    const cid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var p = transport_params.TransportParams{
+        .max_idle_timeout = rand.int(u32),
+        .initial_max_data = rand.int(u32),
+        .initial_max_stream_data_bidi_local = rand.int(u32),
+        .initial_max_stream_data_bidi_remote = rand.int(u32),
+        .initial_max_stream_data_uni = rand.int(u32),
+        .initial_max_streams_bidi = rand.int(u16),
+        .initial_max_streams_uni = rand.int(u16),
+        .ack_delay_exponent = rand.uintLessThan(u64, 21),
+        .max_ack_delay = rand.int(u14),
+        .disable_active_migration = rand.boolean(),
+        .active_connection_id_limit = 2 + rand.uintLessThan(u64, 6),
+        .initial_source_connection_id = cid[0..rand.uintLessThan(usize, cid.len + 1)],
+    };
+    if (rand.boolean()) p.original_destination_connection_id = &cid;
+    if (rand.boolean()) p.retry_source_connection_id = &cid;
+    if (rand.boolean()) p.stateless_reset_token = [_]u8{0x5a} ** 16;
+    if (rand.boolean()) p.max_datagram_frame_size = rand.int(u16);
+    if (rand.boolean()) p.min_ack_delay = rand.int(u16);
+    if (rand.boolean()) {
+        p.version_info_chosen = 0x00000001;
+        p.version_info_available[0] = 0x00000001;
+        p.version_info_available[1] = 0x6b3343cf;
+        p.version_info_available_count = 2;
+    }
+
+    var fbs = io_compat.fixedBufferStream(buf);
+    p.encode(&fbs) catch return null;
+    return fbs.seek;
+}
+
+test "HTTP/3 frame, QPACK and Huffman decoders survive a randomized sweep" {
+    var prng = std.Random.DefaultPrng.init(0x68337170);
+    const rand = prng.random();
+
+    var buf: [1024]u8 = undefined;
+    var headers: [64]qpack.Header = undefined;
+    var headers2: [64]qpack.Header = undefined;
+    var scratch: [qpack.SCRATCH_SIZE]u8 = undefined;
+    var scratch2: [qpack.SCRATCH_SIZE]u8 = undefined;
+
+    for (0..SWEEP_ITERATIONS) |i| {
+        const len = rand.uintLessThan(usize, buf.len);
+        const input = buf[0..len];
+        rand.bytes(input);
+
+        switch (i % 3) {
+            0 => {
+                const n = seedH3Frame(input, rand) orelse continue;
+                corrupt(input[0..n], rand);
+            },
+            1 => {
+                const n = seedQpackHeaders(input, rand) orelse continue;
+                corrupt(input[0..n], rand);
+            },
+            else => {},
+        }
+
+        if (h3_frame.parse(input)) |r| {
+            try testing.expect(r.consumed <= input.len);
+        } else |_| {}
+
+        // The decoder handed out slices of one process-wide buffer once, so
+        // two connections decoding at the same time corrupted each other's
+        // headers. Decoding the same bytes into a second scratch buffer must
+        // leave what the first call returned intact.
+        if (qpack.decodeHeaders(input, &headers, &scratch)) |count| {
+            if (qpack.decodeHeaders(input, &headers2, &scratch2)) |count2| {
+                try testing.expectEqual(count, count2);
+                for (headers[0..count], headers2[0..count2]) |a, b| {
+                    try testing.expectEqualSlices(u8, a.name, b.name);
+                    try testing.expectEqualSlices(u8, a.value, b.value);
+                }
+            } else |_| {}
+        } else |_| {}
+
+        var dec = qpack.QpackDecoder{};
+        dec.setCapacity(4096);
+        dec.processEncoderInstruction(input) catch {};
+
+        var enc = qpack.QpackEncoder{};
+        enc.processDecoderInstruction(input) catch {};
+
+        // Huffman is a bit-level trie walk: a truncated code, an EOS symbol
+        // and over-long padding all end in the same place.
+        var out: [8192]u8 = undefined;
+        if (huffman.decode(input, &out)) |n| {
+            var re: [16384]u8 = undefined;
+            const re_len = huffman.encode(out[0..n], &re) catch continue;
+            var back: [8192]u8 = undefined;
+            const back_len = huffman.decode(re[0..re_len], &back) catch continue;
+            try testing.expectEqualSlices(u8, out[0..n], back[0..back_len]);
+        } else |_| {}
+    }
+}
+
+/// One encoded HTTP/3 frame, chosen at random.
+fn seedH3Frame(buf: []u8, rand: std.Random) ?usize {
+    const body = [_]u8{ 0x00, 0x00, 0xc1, 0xd1, 0xd7 };
+    const f: h3_frame.H3Frame = switch (rand.uintLessThan(u8, 6)) {
+        0 => .{ .data = &body },
+        1 => .{ .headers = &body },
+        2 => .{ .settings = .{
+            .max_field_section_size = rand.int(u16),
+            .qpack_max_table_capacity = rand.int(u16),
+            .h3_datagram = true,
+            .enable_webtransport = true,
+            .webtransport_max_sessions = 1,
+        } },
+        3 => .{ .goaway = rand.int(u16) },
+        4 => .{ .max_push_id = rand.int(u16) },
+        else => .{ .close_webtransport_session = .{ .error_code = rand.int(u16), .reason = "bye" } },
+    };
+
+    var fbs = io_compat.fixedBufferStream(buf);
+    h3_frame.write(f, &fbs) catch return null;
+    return fbs.seek;
+}
+
+/// One QPACK-encoded field section, chosen at random.
+fn seedQpackHeaders(buf: []u8, rand: std.Random) ?usize {
+    const names = [_][]const u8{ ":method", ":path", ":authority", "user-agent", "x-custom" };
+    const values = [_][]const u8{ "GET", "/", "example.com", "quic-zig/0.3.0", "" };
+
+    var hdrs: [8]qpack.Header = undefined;
+    const count = 1 + rand.uintLessThan(usize, hdrs.len);
+    for (hdrs[0..count]) |*h| {
+        h.* = .{
+            .name = names[rand.uintLessThan(usize, names.len)],
+            .value = values[rand.uintLessThan(usize, values.len)],
+        };
+    }
+    return qpack.encodeHeaders(hdrs[0..count], buf) catch return null;
+}
+
+test "capsules survive a randomized sweep" {
+    var prng = std.Random.DefaultPrng.init(0x63617073);
+    const rand = prng.random();
+
+    var buf: [1024]u8 = undefined;
+
+    for (0..SWEEP_ITERATIONS) |i| {
+        const len = rand.uintLessThan(usize, buf.len);
+        const input = buf[0..len];
+        rand.bytes(input);
+
+        if (i % 2 == 0) {
+            const n = seedCapsules(input, rand) orelse continue;
+            corrupt(input[0..n], rand);
+        }
+
+        if (capsule.parse(input)) |r| {
+            try testing.expect(r.consumed <= input.len);
+            try testing.expect(r.capsule.value.len <= r.consumed);
+            try testing.expect(borrowedFrom(input, r.capsule.value));
+        } else |_| {}
+
+        // The iterator is the real entry point: a capsule whose length is a
+        // lie has to stop the walk, not restart it at the same offset.
+        var it = capsule.CapsuleIterator.init(input);
+        var prev: usize = 0;
+        while (true) {
+            const c = (it.next() catch break) orelse break;
+            try testing.expect(borrowedFrom(input, c.value));
+            try testing.expect(it.pos > prev);
+            prev = it.pos;
+        }
+    }
+}
+
+/// A run of encoded capsules, so the iterator has more than one to walk.
+fn seedCapsules(buf: []u8, rand: std.Random) ?usize {
+    const payload = [_]u8{ 0xc0, 0xff, 0xee, 0x00, 0x11 };
+    var fbs = io_compat.fixedBufferStream(buf);
+    for (0..1 + rand.uintLessThan(usize, 4)) |_| {
+        const t: u64 = switch (rand.uintLessThan(u8, 4)) {
+            0 => 0x00, // DATAGRAM
+            1 => 0x2843, // CLOSE_WEBTRANSPORT_SESSION
+            2 => 0x78ae, // DRAIN_WEBTRANSPORT_SESSION
+            else => rand.int(u16),
+        };
+        const n = rand.uintLessThan(usize, payload.len + 1);
+        capsule.write(&fbs, t, payload[0..n]) catch break;
+    }
+    return if (fbs.seek == 0) null else fbs.seek;
+}
+
+// ════════════════════════════════════════════════════════
 // MoQ Transport (draft-17)
 //
 // wire.zig, message.zig and object.zig are pure parsers fed
@@ -790,7 +1291,7 @@ test "moq decoders survive a randomized sweep" {
     var ns: moq_msg.NamespaceBuf = undefined;
     var kvs: [moq_msg.MAX_PARAMS]moq_msg.Param = undefined;
 
-    for (0..20_000) |i| {
+    for (0..SWEEP_ITERATIONS) |i| {
         const len = rand.uintLessThan(usize, buf.len);
         const input = buf[0..len];
         rand.bytes(input);
@@ -809,9 +1310,7 @@ test "moq decoders survive a randomized sweep" {
             1 => {
                 const n = seedMoqMessage(input, rand, .draft_17) orelse continue;
                 const seeded = input[0..n];
-                for (0..1 + rand.uintLessThan(usize, 3)) |_| {
-                    seeded[rand.uintLessThan(usize, seeded.len)] = rand.int(u8);
-                }
+                corrupt(seeded, rand);
                 try sweepMoqDecoders(seeded, &ns, &kvs);
                 continue;
             },
@@ -997,7 +1496,7 @@ test "moq-lite decoders survive a randomized sweep" {
 
     var buf: [512]u8 = undefined;
 
-    for (0..20_000) |i| {
+    for (0..SWEEP_ITERATIONS) |i| {
         const len = rand.uintLessThan(usize, buf.len);
         const input = buf[0..len];
         rand.bytes(input);
@@ -1005,9 +1504,7 @@ test "moq-lite decoders survive a randomized sweep" {
         if (i % 2 == 0) {
             const n = seedLiteMessage(input, rand) orelse continue;
             const seeded = input[0..n];
-            for (0..1 + rand.uintLessThan(usize, 3)) |_| {
-                seeded[rand.uintLessThan(usize, seeded.len)] = rand.int(u8);
-            }
+            corrupt(seeded, rand);
             try sweepLiteDecoders(seeded);
             continue;
         }
