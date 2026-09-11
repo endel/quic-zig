@@ -1271,7 +1271,7 @@ pub const Connection = struct {
         } else {
             payload = packet.decrypt(header, fbs, space) catch {
                 // Silently drop undecryptable packets
-                std.log.warn("silently dropping packet enc_level={s}", .{@tagName(enc_level)});
+                std.log.debug("silently dropping packet enc_level={s}", .{@tagName(enc_level)});
                 return;
             };
         }
