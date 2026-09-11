@@ -710,6 +710,7 @@ pub const Tls13Handshake = struct {
         self.leaf_pub_key_len = 0;
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
+        self.certificate_requested = false;
         self.early_data_offered = false;
         self.selected_alpn_len = 0;
         self.zero_rtt_accepted = false;
@@ -777,6 +778,7 @@ pub const Tls13Handshake = struct {
         self.leaf_pub_key_len = 0;
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
+        self.certificate_requested = false;
         self.early_data_offered = false;
         self.selected_alpn_len = 0;
         self.zero_rtt_accepted = false;
@@ -3383,4 +3385,41 @@ test "client without a CertificateRequest sends only Finished" {
     client.state = .client_send_finished;
     const action = try client.step();
     try std.testing.expectEqual(@as(usize, 36), action.send_data.data.len);
+}
+
+test "the *Into constructors leave no bool to chance" {
+    // They assign field by field onto memory the caller allocated, so a field
+    // added with a default is silently never written. certificate_requested
+    // read as garbage that way and made the client answer a CertificateRequest
+    // no server had sent — which only showed up on one platform, because the
+    // byte happened to be zero on the other.
+    const config = TlsConfig{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    };
+
+    const hs = try std.testing.allocator.create(Tls13Handshake);
+    defer std.testing.allocator.destroy(hs);
+
+    inline for (.{ true, false }) |server| {
+        // 0x01, not a poison byte: an uninitialised bool has to read back
+        // as a *valid* `true` for the assertion below to mean anything.
+        @memset(std.mem.asBytes(hs), 0x01);
+        if (server) {
+            Tls13Handshake.initServerInto(hs, config, .{});
+        } else {
+            Tls13Handshake.initClientInto(hs, config, .{});
+        }
+
+        inline for (@typeInfo(Tls13Handshake).@"struct".fields) |f| {
+            if (f.type == bool and !std.mem.eql(u8, f.name, "is_server")) {
+                if (comptime f.defaultValue()) |dflt| {
+                    try std.testing.expectEqual(dflt, @field(hs, f.name));
+                }
+            }
+        }
+        try std.testing.expectEqual(server, hs.is_server);
+    }
 }
