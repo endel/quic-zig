@@ -10,7 +10,7 @@ implementation.
     tools/interop_local.sh      # 11/11
     interop/run_local_tests.sh  # 9/9
     interop/runner/matrix.sh    # 64/88, identical to the previous run
-    tools/moq_interop.sh        # MoQ: 7/7 against ours, 6/7 against moq-relay
+    tools/moq_interop.sh        # MoQ, both drafts: 7/7 ours, 6/7 moq-relay
     node tools/moq_lite_browser_test.mjs          # moq-lite in Chrome
     RELAY=1 node tools/moq_lite_browser_test.mjs  # ... through our relay
 
@@ -21,7 +21,7 @@ peer, which the corruption notes below already say.
 
 What changed and why: [`CHANGELOG.md`](CHANGELOG.md). MoQ specifics:
 [`SPEC/moq-interop.md`](SPEC/moq-interop.md),
-[`SPEC/DRAFT_IETF_MOQ_TRANSPORT_17.md`](SPEC/DRAFT_IETF_MOQ_TRANSPORT_17.md),
+[`SPEC/DRAFT_IETF_MOQ_TRANSPORT.md`](SPEC/DRAFT_IETF_MOQ_TRANSPORT.md),
 [`SPEC/DRAFT_LCURLEY_MOQ_LITE_05.md`](SPEC/DRAFT_LCURLEY_MOQ_LITE_05.md).
 
 ## Running things
@@ -88,6 +88,24 @@ broken, host-cross-compiled ReleaseSafe fine.
 "12 pre-existing failures, no regressions" line in the previous handover.
 
 ## What landed
+
+### draft-18, alongside draft-17
+
+The runner targets draft-18 and draft-17 pairs with only four of its
+eighteen relays, so both are implemented. Where they differ is one table,
+`version.Rules` in `src/moq/version.zig`, rather than a condition per call
+site; the draft travels with each message because a relay serves peers at
+different ones, read off the ALPN each negotiated.
+
+That meant fixing something underneath: a server matching a client's ALPN
+never recorded *which* entry matched and echoed `config.alpn[0]`
+regardless, so advertising two protocols told every client the first one.
+`Connection.negotiatedAlpn()` is the accessor.
+
+What of draft-18 is deliberately skipped is written down in
+`SPEC/DRAFT_IETF_MOQ_TRANSPORT.md` — chiefly the relaxed varint, which
+would need the draft threaded through every length and tuple read for one
+byte on values almost nothing emits.
 
 ### The interop test client
 
@@ -224,11 +242,12 @@ the alias rewritten as for subgroup streams.
 and a PR against `englishm/moq-interop-runner`. Everything else is done and
 the entry is written out in `SPEC/moq-interop.md`.
 
-**b. draft-18.** The runner's target, and draft-17 pairs with only four of
-its eighteen relays. The full delta is in
-`SPEC/DRAFT_IETF_MOQ_TRANSPORT_17.md` — bounded, but it touches every
-request message, and the varint has to become version-aware because
-draft-18 makes the 7-byte form valid.
+**b. The draft-18 corners that were skipped.** The relaxed varint,
+`REQUEST_ERROR`'s `Redirect`, `REQUEST_OK`'s Track Properties,
+delta-encoded FETCH object ids, the renamed timeout parameters. None are
+exercised by the runner's cases, and each is listed in
+`SPEC/DRAFT_IETF_MOQ_TRANSPORT.md`. draft-19 and -20 are another row in
+`version.Rules` each.
 
 **c. moq-lite over raw QUIC, and lite-04.** The relay and origin are
 WebTransport-only; `moq-lite` the client does both. Supporting lite-04

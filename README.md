@@ -301,7 +301,7 @@ Produces binaries in `zig-out/bin/`:
 | `wt-server` | WebTransport echo server |
 | `wt-client` | WebTransport client |
 | `wt-browser-server` | WebTransport server for browser clients (0.0.0.0:4433) |
-| `moq-server` | MoQ Transport publisher over raw QUIC (ALPN `moqt-17`) |
+| `moq-server` | MoQ Transport publisher over raw QUIC (ALPN `moqt-18`/`moqt-17`) |
 | `moq-client` | MoQ Transport client over raw QUIC — subscribe or `--mode publish` |
 | `moq-relay` | MoQ Transport relay over raw QUIC (pub/sub fanout, synthetic origin) |
 | `moq-browser-server` | MoQ Transport relay over WebTransport for browser clients |
@@ -403,7 +403,7 @@ of all, moq-lite uses the QUIC varint where draft-17 uses a leading-ones one.
 
 | | Module | Spec |
 |---|---|---|
-| IETF MoQ Transport draft-17 | `src/moq/`, `quic.moq` | [DRAFT_IETF_MOQ_TRANSPORT_17.md](./SPEC/DRAFT_IETF_MOQ_TRANSPORT_17.md) |
+| IETF MoQ Transport draft-17 and draft-18 | `src/moq/`, `quic.moq` | [DRAFT_IETF_MOQ_TRANSPORT.md](./SPEC/DRAFT_IETF_MOQ_TRANSPORT.md) |
 | moq-lite draft-05 | `src/moq/lite/`, `quic.moq.lite` | [DRAFT_LCURLEY_MOQ_LITE_05.md](./SPEC/DRAFT_LCURLEY_MOQ_LITE_05.md) |
 
 Interop with the [MoQ interop runner](https://github.com/englishm/moq-interop-runner):

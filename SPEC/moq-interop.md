@@ -26,7 +26,10 @@ can be a Docker image or just a public URL.
 | `VERBOSE` | `1` for diagnostics on stderr |
 
 CLI: `--relay URL`, `--test NAME`, `--list`, `--verbose`,
-`--tls-disable-verify`. Flags win over env.
+`--tls-disable-verify`, `--draft 17|18`. Flags win over env.
+
+The runner has no way to ask for a draft — a pair negotiates whatever it
+negotiates — so `--draft` is ours, for running the matrix at each.
 
 Output is **TAP version 14 on stdout** and nothing else:
 
@@ -80,6 +83,9 @@ reads as though draft-17 cannot run that case. It can: the parameter is
 default is 0", which is what makes `subscribe-error` expect an immediate
 `DOES_NOT_EXIST` rather than an open subscription.
 
+`moq-relay` answers that case with `REQUEST_ERROR` code `404`, which is not
+in either draft's error table. It is the one case it does not pass.
+
 ## Relay contract
 
 `MOQT_ROLE=relay`, `MOQT_PORT=4443`, certs at `/certs/cert.pem` and
@@ -105,8 +111,9 @@ zig build
 zig-out/bin/moq-test-client --relay moqt://127.0.0.1:4455/ \
     --test setup-only --verbose --tls-disable-verify
 
-# The local matrix, written to SPEC/moq-interop-results.md.
+# The local matrix at both drafts, written to SPEC/moq-interop-results.md.
 tools/moq_interop.sh
+DRAFTS=18 tools/moq_interop.sh         # just one
 PUBLIC=1 tools/moq_interop.sh          # also cdn.moq.dev
 
 # The container the runner would pull.
@@ -134,16 +141,16 @@ publishing an image to GHCR and opening a PR against
   "name": "quic-zig",
   "organization": "Endel Dreyer",
   "repository": "https://github.com/endel/quic-zig",
-  "draft_versions": ["draft-17"],
+  "draft_versions": ["draft-17", "draft-18"],
   "roles": {
     "client": { "docker": { "image": "ghcr.io/<owner>/quic-zig-moq-client:latest" } }
   }
 }
 ```
 
-draft-17 pairs with four of the eighteen registered relays. The runner's
-`current_target` is draft-18; see the draft-18 section of
-`SPEC/DRAFT_IETF_MOQ_TRANSPORT_17.md` for what that would take.
+Both drafts are implemented, so `draft_versions` would be
+`["draft-17", "draft-18"]`. draft-18 is the runner's `current_target` and
+pairs with most of its eighteen relays; draft-17 with four.
 
 ## Known blockers
 

@@ -1,6 +1,6 @@
 // Numeric constants for MoQ Transport draft-17.
 // Single source of truth — ranges/tables cross-referenced in
-// SPEC/DRAFT_IETF_MOQ_TRANSPORT_17.md.
+// SPEC/DRAFT_IETF_MOQ_TRANSPORT.md.
 
 // Control message types (draft-17 §9 Table 4).
 pub const MSG_SETUP: u64 = 0x2F00;

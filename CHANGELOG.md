@@ -7,6 +7,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Added
 
+- **MoQ Transport draft-18**, alongside draft-17 and chosen by ALPN per
+  peer, so a relay serves each client at the draft it asked for. draft-18
+  is what the MoQ interop runner targets.
 - **moq-lite** (draft-lcurley-moq-lite-05), the dialect `moq-relay`,
   `cdn.moq.dev` and the `@moq/net` browser client actually speak. Wire and
   message codecs, a session layer, and a `moq-lite` binary that publishes,
@@ -24,9 +27,15 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   answer `DOES_NOT_EXIST` when it does not.
 - An event-loop handler can declare `poll_interval_ms` to be woken on a
   cadence rather than only when the peer sends something.
+- A `.quic` handler receives QUIC datagrams, and MoQ objects can be
+  published over them (`moq-client --mode publish --datagrams`).
+- `Connection.negotiatedAlpn()` reports the protocol in force.
 
 ### Fixed
 
+- A TLS server that advertised several ALPN protocols echoed
+  `config.alpn[0]` to every client rather than the one that matched, so
+  the client and server could disagree about what they were speaking.
 - **MoQ draft-17 control messages did not match the draft.** Most were
   encode-only, so their round-trip tests agreed with a shape no peer spoke.
   PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, PUBLISH, REQUEST_UPDATE and FETCH

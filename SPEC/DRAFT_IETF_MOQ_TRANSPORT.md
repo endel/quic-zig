@@ -1,4 +1,11 @@
-# Media-over-QUIC Transport — draft-ietf-moq-transport-17
+# Media-over-QUIC Transport — draft-ietf-moq-transport
+
+Both **draft-17** and **draft-18** are implemented. The version is chosen
+by ALPN (`moqt-17` / `moqt-18`) on native QUIC, and by
+`WT-Available-Protocols` / `WT-Protocol` over WebTransport; a server
+advertises both and serves each peer at the one it picked. Everything
+below is draft-17 unless it says otherwise; where the two differ,
+`src/moq/version.zig`'s `Rules` table is the single place that says so.
 
 Status: **working end-to-end**. Wire layer complete. Raw-QUIC + WebTransport relays operational. Live browser video demo verified with multiple simultaneous subscribers.
 
@@ -187,7 +194,7 @@ Invalid datagram types: `0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F` (STATUS
 | Datagram objects | done — `moq-client --mode publish --datagrams`, relayed with alias remapping |
 | FETCH | codec done; no runtime request/response flow |
 | AUTHORIZATION_TOKEN | decoded at the KV level and discarded; no policy engine |
-| draft-18 | not implemented; see below |
+| draft-18 | done — see below for what it changes, and what of it is skipped |
 
 ## Verified interop
 
@@ -199,53 +206,50 @@ table at all. Older builds held the subscription open and never answered.
 
 | Scenario | Result |
 | --- | --- |
-| `moq-test-client` → our relay (raw QUIC) | 7/7 |
-| `moq-test-client` → moq-relay v0.14.16 (raw QUIC) | 6/7 |
-| `moq-test-client` → moq-relay v0.14.16 (WebTransport) | 6/7 |
+| `moq-test-client` → our relay, draft-17 and draft-18 | 7/7 each |
+| `moq-test-client` → moq-relay v0.14.16, raw QUIC, both drafts | 6/7 each |
+| `moq-test-client` → moq-relay v0.14.16, WebTransport, both drafts | 6/7 each |
 | `moq-test-client` → `cdn.moq.dev` | blocked at TLS: no HelloRetryRequest |
 | Zig pub → Zig relay → Zig sub (raw QUIC) | ✅ |
-| Datagram objects, pub → relay → sub (raw QUIC) | ✅ |
+| Datagram objects, pub → relay → sub (raw QUIC) | ✅ both drafts |
 | Browser ↔ Zig WT relay (clock, live video) | ✅ |
 
-## What draft-18 would take
+## Where draft-18 differs
 
-The runner's `current_target` is draft-18, and draft-17 pairs with only
-four of its eighteen registered relays. The delta is bounded but real —
-it touches every request message, so it is wire work rather than an ALPN
-bump:
+`version.Rules` is the table; this is what it encodes, from the draft's
+Appendix A.1 and its §10/§11 tables.
 
 - **`Required Request ID Delta` is removed from every request message**
   (#1615): SUBSCRIBE, REQUEST_UPDATE, PUBLISH, FETCH, PUBLISH_NAMESPACE,
-  SUBSCRIBE_NAMESPACE.
+  SUBSCRIBE_NAMESPACE. A draft-17 reader on a draft-18 message therefore
+  reads every following field one varint late, which is why the two must
+  never be guessed at.
 - `SUBSCRIBE_NAMESPACE` moves **0x11 → 0x50** and loses `Subscribe
   Options`; the new **`SUBSCRIBE_TRACKS` (0x51)** takes over yielding
   PUBLISH while 0x50 yields only NAMESPACE/NAMESPACE_DONE.
 - **`PUBLISH_OK` (0x1E) is no longer sent** — respond to PUBLISH with
   `REQUEST_OK` (0x07). Table 5 still lists a 0x1E row pointing at §10.5;
   that is a spec bug, PR #1611 is explicit that the code point changed.
-- `REQUEST_OK` gains trailing Track Properties; `REQUEST_ERROR` gains an
-  optional `Redirect` and the `REDIRECT` / `UNSUPPORTED_EXTENSION` codes.
-- **`PUBLISH_DONE` status codes swap**: `TOO_FAR_BEHIND` 0x6 → 0x5,
-  `EXPIRED` 0x5 → 0x6.
-- The varint **stays leading-ones**, but the **7-byte form becomes valid**
-  and non-minimal encodings are explicitly allowed — `wire.zig` currently
-  returns `Error.InvalidVarInt` for exactly those, so a draft-17 decoder
-  rejects valid draft-18 input.
-- `SUBGROUP_HEADER` gains a **FIRST_OBJECT bit (0x40)**; the type pattern
-  widens to `0b0XX1XXXX`. Datagram headers are unchanged.
-- FETCH per-object fields become delta-encoded Group/Object IDs.
-- Message parameter `0x02 DELIVERY_TIMEOUT` → `OBJECT_DELIVERY_TIMEOUT`;
-  new `0x06 SUBGROUP_DELIVERY_TIMEOUT`, `0x0A FILL_TIMEOUT`,
-  `0x34 TRACK_NAMESPACE_PREFIX`.
-- Unified `moqt://` URI for both transports (`src/moq/url.zig` already
-  takes it), GOAWAY on request streams, generalized reset codes (§3.3.3),
-  mandatory-to-understand track properties.
+- `SUBGROUP_HEADER` gains a **FIRST_OBJECT bit (0x40)**, widening the type
+  pattern to `0b0XX1XXXX`. Datagram headers are unchanged.
 - Sections renumber: control messages §9 → §10, data streams §10 → §11.
+
+Known and deliberately not implemented:
+
+- The varint stays leading-ones, but draft-18 makes the **7-byte form
+  valid** and allows non-minimal encodings. We still reject the 7-byte
+  form on both drafts. It saves one byte over eight for values in
+  2^42..2^49 and nothing observed emits it; accepting it needs the draft
+  threaded into the varint reader, which every length and tuple read goes
+  through.
+- `REQUEST_ERROR`'s optional `Redirect`, `REQUEST_OK`'s Track Properties,
+  delta-encoded FETCH object ids, the renamed and new timeout parameters,
+  GOAWAY on request streams, and mandatory-to-understand track
+  properties. None are exercised by the interop runner's cases.
 
 draft-19 and draft-20 also exist, and -19 reverted some of the above
 (Request ID removed from GOAWAY again, `PUBLISH_BLOCKED` renamed
-`PUBLISH_SKIPPED`). `src/moq/version.zig` is a table so a second draft can
-be added beside draft-17 rather than replacing it.
+`PUBLISH_SKIPPED`). Adding one is another row in `Rules`.
 
 ## Video demo architecture
 

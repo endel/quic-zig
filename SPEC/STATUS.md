@@ -549,12 +549,12 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
 | WebTransport | 17 | 0 | 0 | 100% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
-| MoQ Transport (draft-17) | 13 | 1 | 1 | see below |
+| MoQ Transport (draft-17, -18) | 15 | 1 | 0 | see below |
 | moq-lite (draft-05) | 6 | 2 | 1 | see below |
 
-### MoQ Transport (draft-ietf-moq-transport-17)
+### MoQ Transport (draft-ietf-moq-transport-17 and -18)
 
-See [DRAFT_IETF_MOQ_TRANSPORT_17.md](DRAFT_IETF_MOQ_TRANSPORT_17.md) for
+See [DRAFT_IETF_MOQ_TRANSPORT.md](DRAFT_IETF_MOQ_TRANSPORT.md) for
 details, and [moq-interop.md](moq-interop.md) for the interop runner.
 
 | Component | Status |
@@ -570,9 +570,9 @@ details, and [moq-interop.md](moq-interop.md) for the interop runner.
 | Interop test client (7 cases, TAP 14, containerised) | ✅ Done |
 | Datagram objects, relayed with alias remapping | ✅ Done |
 | FETCH request/response runtime | ⚠ Codec only |
-| draft-18 | ❌ Not started — delta documented |
-| Interop: our relay | ✅ 7/7 |
-| Interop: moq-rs relay (QUIC and WebTransport) | ⚠ 5/7 — their gap, see results |
+| draft-18, alongside draft-17 | ✅ Done — chosen by ALPN, per peer |
+| Interop: our relay, both drafts | ✅ 7/7 each |
+| Interop: moq-relay v0.14.16 (both transports, both drafts) | ⚠ 6/7 — their non-standard error code |
 | Interop: cdn.moq.dev | ❌ Blocked at TLS (no HelloRetryRequest) |
 
 ### moq-lite (draft-lcurley-moq-lite-05)
