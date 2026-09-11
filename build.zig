@@ -175,6 +175,13 @@ pub fn build(b: *std.Build) void {
     if (b.args) |moq_args| run_moq_server.addArgs(moq_args);
     b.step("run-moq-server", "Run MoQ Transport server (raw QUIC)").dependOn(&run_moq_server.step);
 
+    const exe_moq_test_client = App.add(b, "moq-test-client", "apps/moq_test_client.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_moq_test_client);
+    const run_moq_test_client = b.addRunArtifact(exe_moq_test_client);
+    run_moq_test_client.step.dependOn(b.getInstallStep());
+    if (b.args) |moq_args| run_moq_test_client.addArgs(moq_args);
+    b.step("run-moq-test-client", "Run the MoQ interop test client").dependOn(&run_moq_test_client.step);
+
     const exe_moq_client = App.add(b, "moq-client", "apps/moq_client.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_moq_client);
     const run_moq_client = b.addRunArtifact(exe_moq_client);
