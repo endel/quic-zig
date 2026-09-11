@@ -11,6 +11,8 @@ implementation.
     interop/run_local_tests.sh  # 9/9
     interop/runner/matrix.sh    # 64/88, identical to the previous run
     tools/moq_interop.sh        # MoQ: 7/7 against ours, 6/7 against moq-relay
+    node tools/moq_lite_browser_test.mjs          # moq-lite in Chrome
+    RELAY=1 node tools/moq_lite_browser_test.mjs  # ... through our relay
 
 The docker matrix landed one case away from the baseline on the first
 pass — `quiche<-quic-zig handshakecorruption` — and passed on a re-run, so
@@ -171,9 +173,17 @@ CONNECT, SETUP both ways, announce plane round-tripping, and the data plane
 end to end — our publisher, their relay, our subscriber, ten frames with
 the timestamps they were sent with.
 
+`moq-lite-relay` is a relay: it learns what each session carries by being
+a subscriber to it, routes a subscription upstream to the broadcast's
+origin, and forwards the origin's group streams with the subscribe id
+rewritten. Verified with a Zig publisher and the browser client as the
+subscriber, so three implementations sit in the path.
+
 Only lite-05 is implemented and the ALPN offer says so; lite-04 has no
 Setup or Track stream, no ANNOUNCE_OK and a different SUBSCRIBE_OK body.
-There is no moq-lite relay yet.
+That is also why `moq-clock` cannot use our relay — it offers up to
+lite-04 — and the cheapest way to widen that is lite-04 support rather
+than anything structural.
 
 ### Datagrams
 
@@ -220,10 +230,10 @@ its eighteen relays. The full delta is in
 request message, and the varint has to become version-aware because
 draft-18 makes the 7-byte form valid.
 
-**c. A moq-lite relay.** `moq-lite serve` is an origin, not a relay, so
-there is no moq-lite path through our own infrastructure yet and no browser
-demo on it. The session layer is transport-generic, so this is
-broadcast/subscription bookkeeping rather than protocol work.
+**c. moq-lite over raw QUIC, and lite-04.** The relay and origin are
+WebTransport-only; `moq-lite` the client does both. Supporting lite-04
+would let `moq-clock` and the rest of the moq-dev tooling use our relay,
+which is the widest external validation available for it.
 
 **d. `cdn.moq.dev` is unreachable — no HelloRetryRequest.** Both transports
 fail identically at TLS with `error.UnexpectedMessage`, before any MoQ.

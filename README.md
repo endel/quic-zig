@@ -307,6 +307,7 @@ Produces binaries in `zig-out/bin/`:
 | `moq-browser-server` | MoQ Transport relay over WebTransport for browser clients |
 | `moq-test-client` | MoQ interop-runner test client (TAP 14) |
 | `moq-lite` | moq-lite client: `publish`, `subscribe`, `announce`, `serve` |
+| `moq-lite-relay` | moq-lite relay over WebTransport |
 | `interop-server` | QUIC Interop Runner server endpoint |
 | `interop-client` | QUIC Interop Runner client endpoint |
 | `interop-wt-server` | QUIC Interop Runner WebTransport server |
@@ -412,8 +413,10 @@ Interop with the [MoQ interop runner](https://github.com/englishm/moq-interop-ru
 ### moq-lite
 
 ```bash
-zig build run-moq-lite -- serve --port 4447 --broadcast clock --track seconds
-zig build run-moq-lite -- subscribe --url https://127.0.0.1:4447/ \
+zig build run-moq-lite-relay -- --port 4450
+zig build run-moq-lite -- publish   --url https://127.0.0.1:4450/ \
+    --broadcast clock --track seconds --tls-disable-verify
+zig build run-moq-lite -- subscribe --url https://127.0.0.1:4450/ \
     --broadcast clock --track seconds --tls-disable-verify
 ```
 
