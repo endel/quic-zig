@@ -653,6 +653,11 @@ pub const Tls13Handshake = struct {
     // PSK / 0-RTT fields
     using_psk: bool = false,
 
+    /// Client: the server asked for a client certificate. We have none, and
+    /// RFC 8446 4.4.2 says the answer is still a Certificate message — an
+    /// empty one — which has to be in the transcript before Finished.
+    certificate_requested: bool = false,
+
     /// Server: the ClientHello carried the early_data extension. RFC 8446
     /// 4.2.10 only lets EncryptedExtensions answer an extension the client
     /// offered, so accepting a PSK is not on its own a licence to send it.
@@ -1085,6 +1090,16 @@ pub const Tls13Handshake = struct {
     fn clientProcessCertificate(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
 
+        // RFC 8446 4.3.2: a server that wants a client certificate asks here,
+        // between EncryptedExtensions and its own Certificate. Cloudflare's
+        // edge does — `cdn.moq.dev` failed at this message — and refusing it
+        // ends the handshake over a request we are allowed to decline.
+        if (msg[0] == @intFromEnum(tls.HandshakeType.certificate_request)) {
+            self.certificate_requested = true;
+            self.transcript.update(msg);
+            return ._continue;
+        }
+
         if (msg[0] != @intFromEnum(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
 
         const body = msg[4..];
@@ -1257,6 +1272,25 @@ pub const Tls13Handshake = struct {
     }
 
     fn clientSendFinished(self: *Tls13Handshake) !Action {
+        var pos: usize = 0;
+
+        // RFC 8446 4.4.2: having been asked, the client answers even with
+        // nothing to offer — an empty certificate_list, and no
+        // CertificateVerify to go with it. The context is zero length:
+        // 4.3.2 only allows a non-empty one for post-handshake auth, which
+        // RFC 9001 4.4 forbids over QUIC anyway.
+        if (self.certificate_requested) {
+            const empty_cert = [_]u8{
+                @intFromEnum(tls.HandshakeType.certificate),
+                0, 0, 4, // length
+                0, // certificate_request_context length
+                0, 0, 0, // certificate_list length
+            };
+            self.transcript.update(&empty_cert);
+            @memcpy(self.out_buf[pos..][0..empty_cert.len], &empty_cert);
+            pos += empty_cert.len;
+        }
+
         // Compute client Finished
         const transcript_hash = self.transcript.current();
         const verify_data = KeySchedule.computeFinishedVerifyData(
@@ -1274,8 +1308,8 @@ pub const Tls13Handshake = struct {
 
         self.transcript.update(&msg);
 
-        @memcpy(self.out_buf[0..36], &msg);
-        self.out_len = 36;
+        @memcpy(self.out_buf[pos..][0..36], &msg);
+        self.out_len = pos + 36;
 
         self.state = .connected;
         return Action{ .send_data = .{
@@ -3299,4 +3333,52 @@ test "server: early_data in EncryptedExtensions only answers a client that offer
 
     // The extension is 4 bytes of header and no payload (RFC 8446 §4.2.10).
     try std.testing.expectEqual(len_without + 4, with.len);
+}
+
+test "client answers a CertificateRequest with an empty Certificate" {
+    // Cloudflare's edge asks for a client certificate — cdn.moq.dev failed
+    // here with UnexpectedMessage — and RFC 8446 4.4.2 says the answer is a
+    // Certificate message even with nothing to put in it.
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    }, .{});
+
+    client.state = .client_wait_certificate;
+    client.provideData(&[_]u8{
+        0x0d, 0x00, 0x00, 0x1d, // CertificateRequest, 29 bytes
+        0x00, // certificate_request_context: empty
+        0x00, 0x1a, // extensions, 26 bytes
+        0x00, 0x0d, 0x00, 0x16, 0x00, 0x14, // signature_algorithms, 10 of them
+        0x05, 0x03, 0x04, 0x03, 0x08, 0x07, 0x08, 0x06, 0x08, 0x05,
+        0x08, 0x04, 0x06, 0x01, 0x05, 0x01, 0x04, 0x01, 0x02, 0x01,
+    });
+
+    try std.testing.expect(try client.step() == ._continue);
+    try std.testing.expect(client.certificate_requested);
+
+    // The empty Certificate goes out ahead of Finished and into the
+    // transcript with it, or the server rejects our Finished.
+    client.state = .client_send_finished;
+    const action = try client.step();
+    const out = action.send_data.data;
+
+    try std.testing.expectEqual(@as(usize, 8 + 36), out.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x0b, 0, 0, 4, 0, 0, 0, 0 }, out[0..8]);
+    try std.testing.expectEqual(@intFromEnum(tls.HandshakeType.finished), out[8]);
+}
+
+test "client without a CertificateRequest sends only Finished" {
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    }, .{});
+
+    client.state = .client_send_finished;
+    const action = try client.step();
+    try std.testing.expectEqual(@as(usize, 36), action.send_data.data.len);
 }
