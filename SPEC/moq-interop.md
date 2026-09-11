@@ -22,7 +22,7 @@ can be a Docker image or just a public URL.
 |---|---|
 | `RELAY_URL` | Relay locator; the scheme selects the transport |
 | `TESTCASE` | One test name, or unset/empty for all |
-| `TLS_DISABLE_VERIFY` | `1` to skip certificate verification (the image defaults to `1`: every relay in the matrix is self-signed) |
+| `TLS_DISABLE_VERIFY` | `1` to skip certificate verification; the harness sets it either way, so the image defaults to `0` |
 | `VERBOSE` | `1` for diagnostics on stderr |
 
 CLI: `--relay URL`, `--test NAME`, `--list`, `--verbose`,
@@ -101,9 +101,13 @@ working around them.
 `MOQT_ROLE=relay`, `MOQT_PORT=4443`, certs at `/certs/cert.pem` and
 `/certs/priv.key`, logs under `/mlog`, `EXPOSE 4443/udp`, running as uid
 1000. The compose file defaults `RELAY_URL=https://relay:4443`, so a relay
-entry has to speak WebTransport.
+entry has to speak WebTransport: the image ships
+`apps/moq_browser_server.zig`, not the raw-QUIC `apps/moq_relay.zig`.
 
-We do not ship a relay image yet — `apps/moq_relay.zig` is raw-QUIC only.
+A relay entry may override that URL, and two clients need it to —
+imquic's and moqlivemock's dial raw QUIC whatever the scheme says. Serving
+both ALPNs on the one port is what would collect them; see
+[`moq-interop-results.md`](moq-interop-results.md).
 
 ## URL schemes
 
@@ -168,9 +172,12 @@ private image.
 The images pass 7/7 against each other over a compose-style network, with
 certificates generated exactly the way the runner's `generate-certs.sh` does.
 
-As a relay, against third-party clients: moq-rs 8/9, moxygen 5/6 — three bugs
-our own client cannot see, one fixed and two open. Registering the relay role
-should wait on those; see
+As a relay, against third-party clients: moq-rs 9/9, moq-dev-rs 6/6, moxygen
+5/6. Four bugs our own client could not see, three of them ours and fixed; the
+fourth is moxygen's non-spec subscription filter
+([moxygen#225](https://github.com/facebookexperimental/moxygen/issues/225)),
+which the reference relay refuses in the same way we do. Two further clients
+score 0 because they dial raw QUIC at a WebTransport relay. Full write-up:
 [`moq-interop-results.md`](moq-interop-results.md).
 
 Against the registry's eight public relays, through the runner's own harness:

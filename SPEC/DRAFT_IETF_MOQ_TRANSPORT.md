@@ -235,8 +235,21 @@ Appendix A.1 and its §10/§11 tables.
   `REQUEST_OK` (0x07). Table 5 still lists a 0x1E row pointing at §10.5;
   that is a spec bug, PR #1611 is explicit that the code point changed.
 - `SUBGROUP_HEADER` gains a **FIRST_OBJECT bit (0x40)**, widening the type
-  pattern to `0b0XX1XXXX`. Datagram headers are unchanged.
+  pattern to `0b0XX1XXXX`. Datagram headers are unchanged. §2.2 makes the
+  bit mandatory for an original publisher opening a subgroup and for a
+  relay forwarding one from its first object, so `writeSubgroupHeader`
+  takes the draft: on draft-17 the bit does not exist and is never set.
 - Sections renumber: control messages §9 → §10, data streams §10 → §11.
+
+Values the draft makes session-fatal are decoded as
+`message.Error.ProtocolViolation` rather than `MalformedMessage`, and both
+relays answer them by closing the session with `PROTOCOL_VIOLATION`
+instead of a REQUEST_ERROR: an undefined Subscription Filter type
+(§5.1.2), an unknown Message Parameter type (§10.2), and a `GROUP_ORDER`
+or `FORWARD` outside its range (§10.2.8, §10.2.12). The distinction is not
+cosmetic — a peer that sends a filter type nobody defined is told which of
+the two it did, and `subscribe-error` no longer passes on a message we
+never parsed.
 
 Known and deliberately not implemented:
 

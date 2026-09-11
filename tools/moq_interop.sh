@@ -110,6 +110,16 @@ if [ -s "$TMP/notes.md" ]; then
 fi
 
 mkdir -p "$(dirname "$OUT")"
+# Only the table above KEEP_MARK is generated. Everything below it is written
+# by hand — the runner-harness results and what they mean — so carry it over
+# rather than overwriting the analysis with a fresh table.
+KEEP_MARK='<!-- Everything below is written by hand; the generator keeps it. -->'
+if [ -f "$OUT" ] && grep -qF "$KEEP_MARK" "$OUT"; then
+  sed -n "/$(printf '%s' "$KEEP_MARK" | sed 's/[][\/.*^$]/\\&/g')/,\$p" "$OUT" > "$TMP/keep.md"
+else
+  printf '%s\n' "$KEEP_MARK" > "$TMP/keep.md"
+fi
+{ echo; cat "$TMP/keep.md"; } >> "$TMP/out.md"
 cp "$TMP/out.md" "$OUT"
 echo "wrote $OUT" >&2
 cat "$OUT"

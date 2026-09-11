@@ -7,6 +7,27 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A MoQ subscription through the relay never ended. Our relay ignored the
+  publisher's PUBLISH_DONE, so a subscriber sat waiting for objects that were
+  never coming — for moq-rs's test client, until its ten-second deadline. Each
+  subscriber is now told the publication has finished, with the number of data
+  streams the relay opened for it, and a publisher that disconnects without a
+  PUBLISH_DONE has one sent on its behalf.
+- The relay's WebTransport side answered no namespace discovery at all:
+  SUBSCRIBE_NAMESPACE was dropped, so a subscriber that waits to be told a
+  namespace exists before subscribing — moq-dev-rs's client does — never got
+  past it. The raw-QUIC side did answer, but parsed draft-18 with draft-17's
+  field list and sent the whole namespace where only the part after the
+  subscribed prefix belongs.
+- Every subgroup stream the relay forwarded said it did not start at the
+  subgroup's first object, whether or not it did; draft-18 §2.2 requires the
+  FIRST_OBJECT bit in exactly that case.
+- A parameter value the draft makes session-fatal — an undefined subscription
+  filter type, an unknown parameter type, a GROUP_ORDER or FORWARD outside its
+  range — is answered with the PROTOCOL_VIOLATION session close it asks for
+  rather than a REQUEST_ERROR. A peer sending one used to get an error that
+  read as "that track is malformed", which let a subscribe test pass on a
+  message we had never parsed.
 - Certificate validity was checked against the monotonic clock, whose zero is
   the last boot, so every real certificate looked not-yet-valid and no chain
   could verify — which is why `skip_cert_verify` was the only way to connect
