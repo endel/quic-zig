@@ -68,6 +68,9 @@ pub const Event = union(enum) {
     peer_setup: struct { stream_id: u64, options: msg.SetupOptions },
     request_ok: struct { stream_id: u64 },
     request_error: struct { stream_id: u64, err: msg.RequestError },
+    /// A peer asking us to serve a track. A relay sends this to whoever
+    /// published the namespace, which is how a subscription is routed.
+    subscribe: struct { stream_id: u64, subscribe: msg.Subscribe },
     subscribe_ok: struct { stream_id: u64, ok: msg.SubscribeOk },
     publish: struct { stream_id: u64, publish: msg.Publish },
     namespace: struct { stream_id: u64, namespace: msg.Namespace },
@@ -252,6 +255,10 @@ pub fn Session(comptime Transport: type) type {
                 codes.MSG_REQUEST_ERROR => Event{ .request_error = .{
                     .stream_id = stream_id,
                     .err = try msg.decodeRequestError(env.payload),
+                } },
+                codes.MSG_SUBSCRIBE => Event{ .subscribe = .{
+                    .stream_id = stream_id,
+                    .subscribe = try msg.decodeSubscribe(env.payload, &self.ns_buf, self.draft),
                 } },
                 codes.MSG_SUBSCRIBE_OK => Event{ .subscribe_ok = .{
                     .stream_id = stream_id,

@@ -83,8 +83,18 @@ reads as though draft-17 cannot run that case. It can: the parameter is
 default is 0", which is what makes `subscribe-error` expect an immediate
 `DOES_NOT_EXIST` rather than an open subscription.
 
-`moq-relay` answers that case with `REQUEST_ERROR` code `404`, which is not
-in either draft's error table. It is the one case it does not pass.
+Two cases `moq-relay` does not pass, both its side:
+
+- `rendezvous-timeout`: it answers `REQUEST_ERROR` with code `404`, which
+  is in neither draft's error table.
+- `announce-subscribe`: it passes against a freshly started relay and fails
+  once the earlier cases have run, so it is holding state from publishers
+  that have since withdrawn or disconnected. Our relay passes it either
+  way. The runner drives all seven against one relay in sequence, so this
+  is the shape a real run would see.
+
+Both are what the matrix is for, and the harness records them rather than
+working around them.
 
 ## Relay contract
 

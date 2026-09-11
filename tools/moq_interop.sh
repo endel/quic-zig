@@ -95,9 +95,12 @@ for url in "${RELAYS[@]}"; do
   printf '\n' >> "$TMP/out.md"
 
   # Keep the failure reasons; a bare ❌ is not worth much on its own.
+  # A passing test can carry a message too, so only report the ones that
+  # belong to the failure above them.
   awk -v relay="$url draft-$draft" '
-    /^not ok /   { name = substr($0, index($0, "- ") + 2) }
-    /^  message:/{ print "- `" relay "` " name ": " substr($0, 12) }
+    /^ok /       { failing = 0 }
+    /^not ok /   { failing = 1; name = substr($0, index($0, "- ") + 2) }
+    /^  message:/{ if (failing) print "- `" relay "` " name ": " substr($0, 12) }
   ' "$TMP/tap.txt" >> "$TMP/notes.md" 2>/dev/null || true
  done
 done

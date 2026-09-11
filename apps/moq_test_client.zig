@@ -153,6 +153,8 @@ fn Peer(comptime proto: event_loop.Protocol) type {
         got_request_ok: bool = false,
         got_request_error: bool = false,
         got_subscribe_ok: bool = false,
+        /// Publisher side: we answered a relay's SUBSCRIBE for our track.
+        served_subscribe: bool = false,
         error_code: u64 = 0,
         error_reason: [64]u8 = undefined,
         error_reason_len: usize = 0,
@@ -344,6 +346,18 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                     if (self.request_sid != null and r.stream_id != self.request_sid.?) return;
                     self.got_subscribe_ok = true;
                     self.note("SUBSCRIBE_OK alias={d}", .{r.ok.track_alias});
+                },
+                .subscribe => |r| {
+                    // A relay routes a subscription by asking the namespace's
+                    // publisher for the track. announce-subscribe only
+                    // completes if we answer.
+                    if (self.role != .publisher) return;
+                    var buf: [128]u8 = undefined;
+                    var fbs = io_compat.fixedBufferStream(&buf);
+                    moq_msg.writeSubscribeOk(&fbs, .{ .track_alias = 1 }) catch return;
+                    self.sess.transport.write(r.stream_id, buf[0..fbs.seek]) catch return;
+                    self.served_subscribe = true;
+                    self.note("served a SUBSCRIBE on stream {d}", .{r.stream_id});
                 },
                 .goaway => self.note("GOAWAY", .{}),
                 .other => |o| self.note("message type=0x{x}", .{o.type}),
