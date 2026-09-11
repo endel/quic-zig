@@ -549,27 +549,52 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
 | WebTransport | 17 | 0 | 0 | 100% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
-| MoQ Transport (draft-17) | 8 | 3 | 0 | see below |
+| MoQ Transport (draft-17) | 12 | 2 | 1 | see below |
+| moq-lite (draft-05) | 5 | 2 | 1 | see below |
 
 ### MoQ Transport (draft-ietf-moq-transport-17)
 
-See [DRAFT_IETF_MOQ_TRANSPORT_17.md](DRAFT_IETF_MOQ_TRANSPORT_17.md) for details.
+See [DRAFT_IETF_MOQ_TRANSPORT_17.md](DRAFT_IETF_MOQ_TRANSPORT_17.md) for
+details, and [moq-interop.md](moq-interop.md) for the interop runner.
 
 | Component | Status |
 |---|---|
 | Wire primitives (leading-ones varint, KV codec, tuples) | ✅ Done |
-| Control messages (SETUP, SUBSCRIBE, PUBLISH, FETCH, NAMESPACE, …) | ✅ Done (18 types) |
+| Control messages — all 18 encode and decode, matched to the §9 figures | ✅ Done |
+| Message parameters (§9.3 type→shape table) | ✅ Done |
 | Object framing (subgroup streams, datagrams, fetch streams) | ✅ Done |
-| Session SETUP handshake | ✅ Done |
-| Subscribe flow (raw QUIC) | ✅ Done |
-| Publish flow (raw QUIC) | ✅ Done |
-| Relay with alias-remapping fanout | ✅ Done |
-| WebTransport browser client/server | ✅ Done |
-| Datagram-object runtime (raw QUIC) | ⚠ Codec only |
+| Session state machine, shared by every app | ✅ Done |
+| Subscribe / publish flows (raw QUIC) | ✅ Done |
+| Relay: fanout, namespace registry, rendezvous timeouts, PUBLISH_DONE | ✅ Done |
+| WebTransport browser client/server + protocol negotiation | ✅ Done |
+| Interop test client (7 cases, TAP 14, containerised) | ✅ Done |
+| Datagram-object runtime | ⚠ Codec only |
 | FETCH request/response runtime | ⚠ Codec only |
-| Namespace-discovery runtime | ⚠ Codec only |
-| moq-rs interop (SETUP + SUBSCRIBE) | ✅ Validated |
-| moq-rs interop (data plane) | ⚠ Blocked by moq-rs auth config |
+| draft-18 | ❌ Not started — delta documented |
+| Interop: our relay | ✅ 7/7 |
+| Interop: moq-rs relay (QUIC and WebTransport) | ⚠ 5/7 — their gap, see results |
+| Interop: cdn.moq.dev | ❌ Blocked at TLS (no HelloRetryRequest) |
+
+### moq-lite (draft-lcurley-moq-lite-05)
+
+See [DRAFT_LCURLEY_MOQ_LITE_05.md](DRAFT_LCURLEY_MOQ_LITE_05.md). A
+separate wire format from the IETF draft — QUIC varints, no message-type
+table — and the one the deployed ecosystem speaks.
+
+| Component | Status |
+|---|---|
+| Wire primitives (QUIC varint, zigzag, paths, optional groups) | ✅ Done |
+| Messages — every message in the draft, pinned to the reference's golden vector | ✅ Done |
+| Session: stream dispatch, setup, announce/subscribe/track/probe/goaway | ✅ Done |
+| Group framing and FrameReader | ✅ Done |
+| `moq-lite` client: publish, subscribe, announce, serve | ✅ Done |
+| Relay | ❌ Not started |
+| Datagram delivery | ⚠ Codec only |
+| Fetch | ⚠ Codec only |
+| lite-03 / lite-04 | ❌ Not implemented; the ALPN offer says so |
+| Interop: WT protocol negotiation vs moq-relay | ✅ moq-lite-05 |
+| Interop: announce plane vs moq-relay | ✅ |
+| Interop: our pub → moq-relay → our sub | ✅ Data plane verified |
 
 ### Top Priority Items Across All RFCs
 
