@@ -30,12 +30,20 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - A `.quic` handler receives QUIC datagrams, and MoQ objects can be
   published over them (`moq-client --mode publish --datagrams`).
 - `Connection.negotiatedAlpn()` reports the protocol in force.
+- The WebTransport MoQ relay negotiates its draft per session and enforces
+  the same namespace rules as the raw-QUIC one.
 
 ### Fixed
 
 - A TLS server that advertised several ALPN protocols echoed
   `config.alpn[0]` to every client rather than the one that matched, so
   the client and server could disagree about what they were speaking.
+- An event-loop client queued its `CONNECTION_CLOSE` and never flushed it,
+  so the connection ended with the process and the peer held the session
+  until its own idle timeout — half a minute of a server's capacity per
+  short-lived client.
+- The browser MoQ demos encoded `PUBLISH` without its request id, delta or
+  parameter count, and subscribed with no `RENDEZVOUS_TIMEOUT`.
 - **MoQ draft-17 control messages did not match the draft.** Most were
   encode-only, so their round-trip tests agreed with a shape no peer spoke.
   PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, PUBLISH, REQUEST_UPDATE and FETCH
