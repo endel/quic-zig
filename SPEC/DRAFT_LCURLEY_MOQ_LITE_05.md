@@ -18,6 +18,7 @@ It is what the deployed ecosystem speaks: `moq-relay`, `cdn.moq.dev`, the
 | Binary | Purpose |
 | --- | --- |
 | `moq-lite` | `publish` / `subscribe` / `announce` over either transport, and `serve` as an origin |
+| `moq-lite-relay` | WebTransport relay: announce discovery, subscription routing, group forwarding |
 
 `interop/browser/moq_lite.html` is a standalone JS subscriber — no shared
 code with the Zig encoder, which is the point of it.
@@ -172,7 +173,7 @@ Gone entirely: `MAX_SUBSCRIBE_ID`, `REQUESTS_BLOCKED`, `SUBSCRIBE_ERROR`,
 | Versions (`src/moq/lite/version.zig`) | done — lite-03/04/05 ALPN offer |
 | Session (`src/moq/lite/session.zig`) | done — stream dispatch, setup, announce/subscribe/track/probe/goaway, group framing |
 | `moq-lite` client | `publish`, `subscribe`, `announce` over QUIC and WebTransport |
-| Relay | not started — `apps/moq_relay.zig` is the IETF draft, not this |
+| Relay (`moq-lite-relay`) | done — broadcast registry, announce fanout, upstream subscriptions, group forwarding with subscribe-id rewriting |
 | Datagram delivery | codec done; no runtime path |
 | Fetch | codec and stream dispatch done; no runtime path |
 | lite-03 / lite-04 compatibility | not implemented — the ALPN is offered, the differences are not handled |
@@ -194,10 +195,13 @@ so these also cross a version boundary inside the relay.
 | **their** `moq-clock` publish → `moq-relay` → our subscribe | ✅ clock frames and timestamps |
 | our `moq-lite serve` → our subscribe (no relay) | ✅ |
 | our `moq-lite serve` → **browser** (`interop/browser/moq_lite.html`) | ✅ via `tools/moq_lite_browser_test.mjs` |
+| our publish → **our relay** → our subscribe | ✅ |
+| our publish → **our relay** → **browser** | ✅ via `RELAY=1 tools/moq_lite_browser_test.mjs` |
 
 ## Caveats
 
-- Only lite-05 is implemented, and the ALPN offer says so. lite-04 differs
+- Only lite-05 is implemented, and the ALPN offer says so. This is why
+  `moq-clock` cannot use our relay: it offers up to lite-04. lite-04 differs
   in at least: no Setup Stream, no Track Stream, no ANNOUNCE_OK, and a
   different SUBSCRIBE_OK body. `version.ALL` names the older ones for
   peers that log them.

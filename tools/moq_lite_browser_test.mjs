@@ -5,7 +5,8 @@
 // interop/browser/moq_lite.html through Chrome instead, which at least
 // shares no code with the Zig encoder.
 //
-// Usage: node tools/moq_lite_browser_test.mjs
+// Usage: node tools/moq_lite_browser_test.mjs           # against the origin
+//        RELAY=1 node tools/moq_lite_browser_test.mjs   # through the relay
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -16,17 +17,37 @@ import puppeteer from 'puppeteer';
 const ROOT = path.resolve('interop/browser');
 const HTTP_PORT = 8125;
 const MOQ_PORT = 4449;
+// With RELAY=1 the page subscribes through our relay, with a separate
+// moq-lite publisher upstream of it — three implementations in the path.
+const VIA_RELAY = process.env.RELAY === '1';
 const procs = [];
 const cleanup = () => procs.forEach((p) => { try { p.kill('SIGKILL'); } catch {} });
 
 try {
-  const server = spawn('zig-out/bin/moq-lite', [
-    'serve', '--port', String(MOQ_PORT),
-    '--broadcast', 'clock', '--track', 'seconds',
-    '--cert', 'interop/browser/certs/server.crt',
-    '--key', 'interop/browser/certs/server.key',
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const serverArgs = VIA_RELAY
+    ? ['--port', String(MOQ_PORT),
+       '--cert', 'interop/browser/certs/server.crt',
+       '--key', 'interop/browser/certs/server.key']
+    : ['serve', '--port', String(MOQ_PORT),
+       '--broadcast', 'clock', '--track', 'seconds',
+       '--cert', 'interop/browser/certs/server.crt',
+       '--key', 'interop/browser/certs/server.key'];
+  const server = spawn(
+    VIA_RELAY ? 'zig-out/bin/moq-lite-relay' : 'zig-out/bin/moq-lite',
+    serverArgs,
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
   procs.push(server);
+
+  if (VIA_RELAY) {
+    await delay(1200);
+    const pub = spawn('zig-out/bin/moq-lite', [
+      'publish', '--url', `https://127.0.0.1:${MOQ_PORT}/`,
+      '--broadcast', 'clock', '--track', 'seconds',
+      '--tls-disable-verify', '--seconds', '60',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    procs.push(pub);
+  }
 
   let out = '';
   server.stdout.on('data', (b) => { out += b.toString(); });

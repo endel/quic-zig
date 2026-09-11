@@ -182,6 +182,13 @@ pub fn build(b: *std.Build) void {
     if (b.args) |moq_args| run_moq_lite.addArgs(moq_args);
     b.step("run-moq-lite", "Run the moq-lite client").dependOn(&run_moq_lite.step);
 
+    const exe_moq_lite_relay = App.add(b, "moq-lite-relay", "apps/moq_lite_relay.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_moq_lite_relay);
+    const run_moq_lite_relay = b.addRunArtifact(exe_moq_lite_relay);
+    run_moq_lite_relay.step.dependOn(b.getInstallStep());
+    if (b.args) |moq_args| run_moq_lite_relay.addArgs(moq_args);
+    b.step("run-moq-lite-relay", "Run the moq-lite relay").dependOn(&run_moq_lite_relay.step);
+
     const exe_moq_test_client = App.add(b, "moq-test-client", "apps/moq_test_client.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_moq_test_client);
     const run_moq_test_client = b.addRunArtifact(exe_moq_test_client);

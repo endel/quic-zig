@@ -550,7 +550,7 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | WebTransport | 17 | 0 | 0 | 100% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
 | MoQ Transport (draft-17) | 13 | 1 | 1 | see below |
-| moq-lite (draft-05) | 5 | 2 | 1 | see below |
+| moq-lite (draft-05) | 6 | 2 | 1 | see below |
 
 ### MoQ Transport (draft-ietf-moq-transport-17)
 
@@ -588,13 +588,14 @@ table — and the one the deployed ecosystem speaks.
 | Session: stream dispatch, setup, announce/subscribe/track/probe/goaway | ✅ Done |
 | Group framing and FrameReader | ✅ Done |
 | `moq-lite` client: publish, subscribe, announce, serve | ✅ Done |
-| Relay | ❌ Not started |
+| Relay (`moq-lite-relay`) | ✅ Done |
 | Datagram delivery | ⚠ Codec only |
 | Fetch | ⚠ Codec only |
 | lite-03 / lite-04 | ❌ Not implemented; the ALPN offer says so |
 | Interop: WT protocol negotiation vs moq-relay | ✅ moq-lite-05 |
 | Interop: announce plane vs moq-relay | ✅ |
 | Interop: our pub → moq-relay → our sub | ✅ Data plane verified |
+| Interop: our pub → our relay → browser | ✅ |
 
 ### Top Priority Items Across All RFCs
 
