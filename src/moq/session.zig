@@ -18,6 +18,12 @@
 // Buffering: a control message can arrive split across reads, and a peer
 // may coalesce several into one. Bytes are accumulated per stream and every
 // complete envelope is drained before returning.
+//
+// This is the control plane only. A subgroup stream's header is not an
+// envelope and will never parse as one, so the caller classifies data
+// streams itself and does not feed them here — a stream that fills its
+// buffer without producing a message is reported as a protocol violation
+// rather than accumulating forever.
 
 const std = @import("std");
 const testing = std.testing;
@@ -37,6 +43,8 @@ const NO_STREAM: u64 = std.math.maxInt(u64);
 pub const Error = error{
     TooManyStreams,
     NotConnected,
+    /// A stream filled its buffer without yielding a control message.
+    StreamStalled,
 } || msg.Error;
 
 /// §3.3.3 stream reset codes. draft-18 generalises these to every request
@@ -51,10 +59,8 @@ pub const StreamKind = enum {
     control_out,
     /// The peer's control stream (SETUP in).
     control_in,
-    /// A bidirectional request stream we opened.
+    /// A bidirectional request stream, ours or the peer's.
     request,
-    /// A data stream — subgroup header, then objects.
-    data,
 };
 
 /// What the peer did, surfaced to the caller one event at a time.
@@ -77,7 +83,9 @@ pub const Event = union(enum) {
 
 const StreamState = struct {
     id: u64 = NO_STREAM,
-    kind: StreamKind = .data,
+    /// Until a message arrives, a stream is assumed to be a request — a
+    /// SETUP reclassifies it as the peer's control stream.
+    kind: StreamKind = .request,
     buf: [STREAM_BUF_SIZE]u8 = undefined,
     len: usize = 0,
 
@@ -195,8 +203,12 @@ pub fn Session(comptime Transport: type) type {
             var n: usize = 0;
 
             if (data.len > 0) {
-                const s = self.claim(stream_id, .data) orelse return Error.TooManyStreams;
+                const s = self.claim(stream_id, .request) orelse return Error.TooManyStreams;
                 s.append(data);
+
+                // A full buffer with nothing parsable is not going to
+                // improve by waiting for more bytes.
+                if (s.len == s.buf.len) return Error.StreamStalled;
 
                 while (n < out.len) {
                     const parsed = msg.parseEnvelope(s.buf[0..s.len]) catch break;
@@ -234,8 +246,6 @@ pub fn Session(comptime Transport: type) type {
                     .options = try msg.decodeSetupPayload(env.payload),
                 } };
             }
-
-            if (s.kind == .data) s.kind = .request;
 
             return switch (env.type) {
                 codes.MSG_REQUEST_OK => Event{ .request_ok = .{ .stream_id = stream_id } },
@@ -447,10 +457,28 @@ test "namespaces decoded from an event outlive the call" {
     try testing.expectEqualStrings("interop", got[1]);
 }
 
+test "a stream that never yields a message is not buffered forever" {
+    var t = FakeTransport{};
+    var s = TestSession.init(&t);
+
+    // A subgroup header is not an envelope and never will be. Rather than
+    // growing until the buffer is full and then silently stalling, say so.
+    const junk = [_]u8{0xff} ** 512;
+    var events: [4]Event = undefined;
+    var pushed: usize = 0;
+    while (pushed < STREAM_BUF_SIZE) : (pushed += junk.len) {
+        _ = s.onStreamData(0, &junk, false, &events) catch |e| {
+            try testing.expectEqual(Error.StreamStalled, e);
+            return;
+        };
+    }
+    try testing.expectError(Error.StreamStalled, s.onStreamData(0, &junk, false, &events));
+}
+
 test "stream table refuses to overflow" {
     var t = FakeTransport{};
     var s = TestSession.init(&t);
-    for (0..MAX_STREAMS) |i| _ = s.claim(@intCast(i), .data).?;
+    for (0..MAX_STREAMS) |i| _ = s.claim(@intCast(i), .request).?;
     var events: [2]Event = undefined;
     try testing.expectError(Error.TooManyStreams, s.onStreamData(999, "x", false, &events));
 }
