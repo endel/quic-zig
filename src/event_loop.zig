@@ -11,6 +11,11 @@ const io_compat = @import("io_compat.zig");
 // io_uring init fails in some containers used by the interop runner.
 const xev = if (builtin.os.tag == .linux) xev_mod.Epoll else xev_mod;
 
+/// The libxev backend this build selected. A caller sharing one loop across
+/// several clients has to create it from here: on Linux this is `Epoll`, not
+/// what a bare `@import("xev")` gives you, and the two are different types.
+pub const Xev = xev;
+
 const connection = @import("quic/connection.zig");
 const connection_manager = @import("quic/connection_manager.zig");
 const ConnEntry = connection_manager.ConnEntry;
@@ -1211,6 +1216,18 @@ pub const ClientConfig = struct {
 
     // IPv6
     ipv6: bool = false,
+
+    /// An event loop to join rather than create. Several clients sharing one
+    /// loop is how you drive more than one connection at a time without
+    /// spinning `tick()` over each of them in turn: the caller owns the loop,
+    /// calls `start()` on each client, and then runs it. A client that joined
+    /// a loop never stops it, so one shutting down leaves the others running.
+    ///
+    /// The loop outlives the client, so the client's completions have to be
+    /// off it before `deinit()`: `stop()`, then `tick()` until
+    /// `conn.isClosed()`. Deinitialising every client before the loop and not
+    /// running it again does just as well.
+    loop: ?*xev.Loop = null,
 };
 
 /// ClientSession wraps a single client-side connection and provides the same
@@ -1491,8 +1508,11 @@ pub fn Client(comptime Handler: type) type {
         allocator: std.mem.Allocator,
         handler: *Handler,
 
-        // libxev
-        loop: xev.Loop,
+        // libxev. `own_loop` is unused when the caller supplied one, and the
+        // active loop comes from eventLoop() rather than a stored pointer:
+        // init() returns by value, so a pointer into self would dangle.
+        own_loop: xev.Loop,
+        shared_loop: ?*xev.Loop,
         file: xev.File,
         timer: xev.Timer,
         poll_completion: xev.Completion,
@@ -1624,14 +1644,15 @@ pub fn Client(comptime Handler: type) type {
             ecn_socket.enableEcnRecv(sockfd) catch {};
 
             // Init libxev
-            const loop = try xev.Loop.init(.{});
+            const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
             const file_handle = xev.File.initFd(sockfd);
             const timer_handle = try xev.Timer.init();
 
             return .{
                 .allocator = alloc,
                 .handler = handler,
-                .loop = loop,
+                .own_loop = loop,
+                .shared_loop = config.loop,
                 .file = file_handle,
                 .timer = timer_handle,
                 .poll_completion = .{},
@@ -1667,27 +1688,43 @@ pub fn Client(comptime Handler: type) type {
             if (self.owned_alpn) |a| self.allocator.free(a);
             self.finished_streams.deinit();
             self.timer.deinit();
-            self.loop.deinit();
+            if (self.shared_loop == null) self.own_loop.deinit();
             sys.close(self.sockfd);
             self.conn.deinit();
             self.allocator.destroy(self.conn);
         }
 
+        /// The loop this client runs on, ours or the caller's.
+        pub fn eventLoop(self: *Self) *xev.Loop {
+            return self.shared_loop orelse &self.own_loop;
+        }
+
         pub fn start(self: *Self) void {
-            self.file.poll(&self.loop, &self.poll_completion, .read, Self, self, onReadable);
-            self.timer.run(&self.loop, &self.timer_completion, 1, Self, self, onTimer);
+            const loop = self.eventLoop();
+            self.file.poll(loop, &self.poll_completion, .read, Self, self, onReadable);
+            self.timer.run(loop, &self.timer_completion, 1, Self, self, onTimer);
             self.timer_armed = true;
             self.started = true;
         }
 
+        /// Runs until this client's connection closes. Only for a client that
+        /// owns its loop: on a shared one this would drive the other clients
+        /// too and return when the last of them finished.
         pub fn run(self: *Self) !void {
+            std.debug.assert(self.shared_loop == null);
             self.start();
-            try self.loop.run(.until_done);
+            try self.own_loop.run(.until_done);
         }
 
         pub fn tick(self: *Self) !void {
             if (!self.started) self.start();
-            try self.loop.run(.no_wait);
+            try self.eventLoop().run(.no_wait);
+        }
+
+        /// A shared loop belongs to the caller and outlives us, so leaving it
+        /// running is the whole point of sharing it.
+        fn stopOwnLoop(self: *Self) void {
+            if (self.shared_loop == null) self.own_loop.stop();
         }
 
         pub fn flush(self: *Self) void {
@@ -1746,7 +1783,7 @@ pub fn Client(comptime Handler: type) type {
             }
 
             if (self.stopping and self.conn.isClosed()) {
-                self.loop.stop();
+                self.stopOwnLoop();
                 return .disarm;
             }
 
@@ -1769,7 +1806,7 @@ pub fn Client(comptime Handler: type) type {
             self.tickAndSend();
 
             if (self.stopping and self.conn.isClosed()) {
-                self.loop.stop();
+                self.stopOwnLoop();
                 return .disarm;
             }
 
@@ -2074,7 +2111,7 @@ pub fn Client(comptime Handler: type) type {
             }
 
             if (conn.isClosed()) {
-                if (self.stopping) self.loop.stop();
+                if (self.stopping) self.stopOwnLoop();
                 return;
             }
 
@@ -2102,9 +2139,10 @@ pub fn Client(comptime Handler: type) type {
         fn rescheduleTimer(self: *Self) void {
             const next_ms = self.computeNextTimeoutMs() orelse return;
 
+            const loop = self.eventLoop();
             if (self.timer_armed) {
                 self.timer.reset(
-                    &self.loop,
+                    loop,
                     &self.timer_completion,
                     &self.timer_cancel_completion,
                     next_ms,
@@ -2114,7 +2152,7 @@ pub fn Client(comptime Handler: type) type {
                 );
             } else {
                 self.timer.run(
-                    &self.loop,
+                    loop,
                     &self.timer_completion,
                     next_ms,
                     Self,
@@ -2445,4 +2483,52 @@ test "Client: closeConnection from a handler arms the run loop's exit" {
     var session = client.makeSession();
     session.closeConnection();
     try testing.expect(client.stopping);
+}
+
+test "two clients share one loop" {
+    // Driving two connections used to mean two loops and a caller spinning
+    // tick() over both. On a shared loop one run() drives them, and one
+    // stopping must not take the other down with it.
+    const H = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    };
+    var handler = H{};
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var a = try Client(H).init(testing.allocator, &handler, .{
+        .port = 19882,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    defer a.deinit();
+
+    var b = try Client(H).init(testing.allocator, &handler, .{
+        .port = 19883,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    defer b.deinit();
+
+    try testing.expectEqual(a.eventLoop(), b.eventLoop());
+
+    a.start();
+    b.start();
+    try loop.run(.no_wait);
+
+    a.stop();
+    try testing.expect(a.conn.state == .closing or a.conn.isClosed());
+
+    // b still has work on a loop a did not stop.
+    try loop.run(.no_wait);
+    try testing.expect(!b.conn.isClosed());
+
+    // The teardown order the config documents: drain each client off the
+    // loop before the loop goes away.
+    for (0..8) |_| {
+        a.tick() catch break;
+        if (a.conn.isClosed()) break;
+    }
 }
