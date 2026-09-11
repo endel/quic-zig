@@ -31,6 +31,9 @@ const moq_wire = @import("moq/wire.zig");
 const moq_msg = @import("moq/message.zig");
 const moq_codes = @import("moq/message_codes.zig");
 const moq_obj = @import("moq/object.zig");
+const lite_wire = @import("moq/lite/wire.zig");
+const lite_msg = @import("moq/lite/message.zig");
+const lite_session = @import("moq/lite/session.zig");
 
 // ════════════════════════════════════════════════════════
 // Target 1: QUIC Variable-Length Integer (RFC 9000 §16)
@@ -895,4 +898,130 @@ fn seedMoqMessage(buf: []u8, rand: std.Random) ?usize {
         }) catch return null,
     }
     return fbs.seek;
+}
+
+// ════════════════════════════════════════════════════════
+// moq-lite (draft-lcurley-moq-lite-05)
+//
+// A separate parser from the draft-17 one above — QUIC
+// varints, length-prefixed framing, no message-type table.
+// ════════════════════════════════════════════════════════
+
+fn sweepLiteDecoders(input: []const u8) !void {
+    var hop_buf: [lite_msg.MAX_HOPS]u64 = undefined;
+
+    // The framing layer first: it decides how much of the buffer a message
+    // claims, which is where a length can run past the end.
+    const f = (lite_msg.frame(input) catch return) orelse return;
+    const body = f.body;
+
+    // Every decoder sees every body: a stream's type decides which one is
+    // correct, and a peer can put the wrong bytes on any stream.
+    _ = lite_msg.decodeSetup(body) catch {};
+    _ = lite_msg.decodeAnnounceRequest(body) catch {};
+    _ = lite_msg.decodeAnnounceOk(body) catch {};
+    _ = lite_msg.decodeAnnounceBroadcast(body, &hop_buf) catch {};
+    _ = lite_msg.decodeSubscribe(body) catch {};
+    _ = lite_msg.decodeSubscribeUpdate(body) catch {};
+    _ = lite_msg.decodeTrack(body) catch {};
+    _ = lite_msg.decodeTrackInfo(body) catch {};
+    _ = lite_msg.decodeFetch(body) catch {};
+    _ = lite_msg.decodeProbe(body) catch {};
+    _ = lite_msg.decodeGoaway(body) catch {};
+    _ = lite_msg.decodeGroup(body) catch {};
+    inline for (comptime std.enums.values(lite_msg.ResponseType)) |k| {
+        _ = lite_msg.decodeSubscribeResponse(k, body) catch {};
+    }
+    _ = lite_msg.decodeDatagram(input) catch {};
+
+    // Frames are not framed messages — the timestamp delta sits outside
+    // the length prefix, so this is a second parser.
+    var rest = input;
+    var guard: usize = 0;
+    while (guard < 64) : (guard += 1) {
+        const r = (lite_msg.readFrame(rest) catch break) orelse break;
+        rest = rest[r.consumed..];
+    }
+}
+
+/// One valid encoded moq-lite message, chosen at random.
+fn seedLiteMessage(buf: []u8, rand: std.Random) ?usize {
+    var fbs = io_compat.fixedBufferStream(buf);
+    const w = &fbs;
+    const hops = [_]u64{ 1, 2 };
+    switch (rand.uintLessThan(u8, 12)) {
+        0 => lite_msg.writeSetup(w, .{ .probe = .report, .path = "/anon" }) catch return null,
+        1 => lite_msg.writeAnnounceRequest(w, .{ .prefix = "room", .exclude_hop = 3 }) catch return null,
+        2 => lite_msg.writeAnnounceOk(w, .{ .hop_id = 9, .active_count = 2 }) catch return null,
+        3 => lite_msg.writeAnnounceBroadcast(w, .{ .suffix = "alice", .hops = &hops }) catch return null,
+        4 => lite_msg.writeSubscribe(w, .{
+            .id = 1,
+            .broadcast = "room",
+            .track = "video",
+            .group_start = 4,
+        }) catch return null,
+        5 => lite_msg.writeSubscribeUpdate(w, .{ .priority = 2, .ordered = true }) catch return null,
+        6 => lite_msg.writeTrack(w, .{ .broadcast = "room", .track = "video" }) catch return null,
+        7 => lite_msg.writeTrackInfo(w, .{}) catch return null,
+        8 => lite_msg.writeFetch(w, .{ .broadcast = "room", .track = "v", .group = 7 }) catch return null,
+        9 => lite_msg.writeProbe(w, .{ .bitrate = 1000, .rtt_ms = 5 }) catch return null,
+        10 => lite_msg.writeGroup(w, .{ .subscribe_id = 2, .sequence = 3 }) catch return null,
+        else => lite_msg.writeSubscribeResponse(w, .{ .drop = .{
+            .group_start = 1,
+            .group_end = 2,
+            .error_code = 3,
+        } }) catch return null,
+    }
+    return fbs.seek;
+}
+
+test "moq-lite decoders survive a randomized sweep" {
+    var prng = std.Random.DefaultPrng.init(0x6c697465);
+    const rand = prng.random();
+
+    var buf: [512]u8 = undefined;
+
+    for (0..20_000) |i| {
+        const len = rand.uintLessThan(usize, buf.len);
+        const input = buf[0..len];
+        rand.bytes(input);
+
+        if (i % 2 == 0) {
+            const n = seedLiteMessage(input, rand) orelse continue;
+            const seeded = input[0..n];
+            for (0..1 + rand.uintLessThan(usize, 3)) |_| {
+                seeded[rand.uintLessThan(usize, seeded.len)] = rand.int(u8);
+            }
+            try sweepLiteDecoders(seeded);
+            continue;
+        }
+
+        try sweepLiteDecoders(input);
+
+        // Paths take attacker-controlled bytes too.
+        var out: [256]u8 = undefined;
+        _ = lite_wire.normalizePath(input, &out) catch {};
+        _ = lite_wire.stripPathPrefix(input, input[0..@min(4, input.len)]);
+    }
+}
+
+test "moq-lite FrameReader survives a randomized byte stream" {
+    var prng = std.Random.DefaultPrng.init(0x6672616d);
+    const rand = prng.random();
+
+    var rbuf: [4096]u8 = undefined;
+    var chunk: [128]u8 = undefined;
+
+    for (0..2_000) |_| {
+        var reader = lite_session.FrameReader.init(&rbuf);
+        for (0..8) |_| {
+            const n = rand.uintLessThan(usize, chunk.len);
+            rand.bytes(chunk[0..n]);
+            reader.push(chunk[0..n]) catch break;
+            var guard: usize = 0;
+            while (guard < 64) : (guard += 1) {
+                _ = reader.next() catch break;
+            }
+        }
+    }
 }
