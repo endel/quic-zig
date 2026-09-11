@@ -491,6 +491,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                 .ipv6 = target.ipv6,
                 .alpn = if (proto == .quic) target.draft.alpn() else null,
                 .skip_cert_verify = target.tls_disable_verify,
+                .ca = if (target.tls_disable_verify) .none else .system,
                 .connect_headers = connect_headers,
             };
         }

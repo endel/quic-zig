@@ -663,6 +663,9 @@ fn Run(comptime proto: event_loop.Protocol) type {
                 // keeps "h3" and negotiates it on the CONNECT instead.
                 .alpn = if (proto == .quic) lite_version.DEFAULT.alpn() else null,
                 .skip_cert_verify = skip_verify,
+                // Public relays are the point of this client, so the trust
+                // store is the default unless verification is turned off.
+                .ca = if (skip_verify) .none else .system,
                 .connect_headers = if (proto == .webtransport) &connect_headers else &.{},
             });
             defer client.deinit();

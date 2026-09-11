@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var handler = EchoClient{};
     var client = try event_loop.Client(EchoClient).init(alloc, &handler, .{
         .port = port,
-        .ca_cert_path = "interop/certs/ca.crt",
+        .ca = .{ .file = "interop/certs/ca.crt" },
         .connect_headers = &connect_headers,
     });
     defer client.deinit();

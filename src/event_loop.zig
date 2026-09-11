@@ -28,6 +28,7 @@ const qpack = @import("h3/qpack.zig");
 const wt = @import("webtransport/session.zig");
 const packet = @import("quic/packet.zig");
 const Certificate = std.crypto.Certificate;
+const ca_bundle = @import("quic/ca_bundle.zig");
 
 pub const Protocol = enum { quic, h3, h0, webtransport };
 
@@ -1204,7 +1205,18 @@ pub const ClientConfig = struct {
     alpn: ?[]const u8 = null,
 
     // TLS verification
-    ca_cert_path: ?[]const u8 = null,
+    /// Where the trust anchors come from. `.none` leaves the chain unrooted:
+    /// the hostname, each link's signature, CA:TRUE/keyCertSign and the
+    /// validity dates are still checked, but nothing says the chain ends
+    /// anywhere you trust. `.system` reads the platform's store, `.file` a
+    /// PEM bundle of your own — a private CA, an interop peer's.
+    ///
+    /// Anything but `.none` also turns `skip_cert_verify` off.
+    ca: union(enum) {
+        none,
+        system,
+        file: []const u8,
+    } = .none,
     skip_cert_verify: bool = false,
 
     // QUIC transport
@@ -1558,9 +1570,13 @@ pub fn Client(comptime Handler: type) type {
         /// The default ALPN list, when we built it rather than the caller.
         owned_alpn: ?[][]const u8,
 
+        /// The trust anchors, when `ClientConfig.ca` asked us to load them.
+        owned_ca: ?*Certificate.Bundle,
+
         pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: ClientConfig) !Self {
             // Build TLS config
             var owned_alpn: ?[][]const u8 = null;
+            var owned_ca: ?*Certificate.Bundle = null;
             const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
                 const alpn = try alloc.alloc([]const u8, 1);
                 owned_alpn = alpn;
@@ -1569,14 +1585,17 @@ pub fn Client(comptime Handler: type) type {
                     .quic, .h0 => "h3", // default; override via config.alpn for custom protocols
                 };
 
-                const ca_bundle: ?*Certificate.Bundle = null;
-                if (config.ca_cert_path) |ca_path| {
-                    _ = ca_path;
-                    // TODO(zig-0.16): Certificate.Bundle.addCertsFromFilePath now
-                    // requires an Io instance and Io.Dir — needs an Io threaded
-                    // through the event_loop Config. Skipped for Phase 2 since
-                    // skip_cert_verify covers the interop test paths.
-                    log.warn("ca_cert_path ignored: pending 0.16 Io threading", .{});
+                // On the heap: init() returns by value, so a bundle stored
+                // in the client would move out from under this pointer.
+                if (config.ca != .none) {
+                    const b = try alloc.create(Certificate.Bundle);
+                    errdefer alloc.destroy(b);
+                    b.* = switch (config.ca) {
+                        .none => unreachable,
+                        .system => try ca_bundle.loadSystem(alloc),
+                        .file => |path| try ca_bundle.loadFile(alloc, path),
+                    };
+                    owned_ca = b;
                 }
 
                 break :blk .{
@@ -1584,8 +1603,8 @@ pub fn Client(comptime Handler: type) type {
                     .private_key_bytes = &.{},
                     .alpn = alpn,
                     .server_name = config.server_name,
-                    .skip_cert_verify = config.skip_cert_verify,
-                    .ca_bundle = ca_bundle,
+                    .skip_cert_verify = if (owned_ca != null) false else config.skip_cert_verify,
+                    .ca_bundle = owned_ca,
                 };
             };
 
@@ -1601,6 +1620,10 @@ pub fn Client(comptime Handler: type) type {
             // Heap-allocate for pointer stability, then build in place: the
             // by-value connect() would stage all ~137 KB on the stack first.
             errdefer if (owned_alpn) |a| alloc.free(a);
+            errdefer if (owned_ca) |b| {
+                b.deinit(alloc);
+                alloc.destroy(b);
+            };
 
             const conn_ptr = try alloc.create(connection.Connection);
             errdefer alloc.destroy(conn_ptr);
@@ -1678,6 +1701,7 @@ pub fn Client(comptime Handler: type) type {
                 .path = config.path,
                 .connect_headers = config.connect_headers,
                 .owned_alpn = owned_alpn,
+                .owned_ca = owned_ca,
             };
         }
 
@@ -1686,6 +1710,10 @@ pub fn Client(comptime Handler: type) type {
             self.wt_conn = null;
             self.h3_conn = null;
             if (self.owned_alpn) |a| self.allocator.free(a);
+            if (self.owned_ca) |b| {
+                b.deinit(self.allocator);
+                self.allocator.destroy(b);
+            }
             self.finished_streams.deinit();
             self.timer.deinit();
             if (self.shared_loop == null) self.own_loop.deinit();
