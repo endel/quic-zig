@@ -16,6 +16,7 @@ pub const h0 = @import("h0/connection.zig");
 pub const http1 = @import("http1/server.zig");
 pub const qpack = @import("h3/qpack.zig");
 pub const webtransport = @import("webtransport/session.zig");
+pub const webtransport_protocol = @import("webtransport/protocol.zig");
 pub const quic_lb = @import("quic/quic_lb.zig");
 pub const event_loop = @import("event_loop.zig");
 pub const moq = struct {

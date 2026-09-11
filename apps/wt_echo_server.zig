@@ -1,6 +1,13 @@
 const std = @import("std");
 const quic = @import("quic");
 const event_loop = quic.event_loop;
+const qpack = quic.qpack;
+const wt_protocol = quic.webtransport_protocol;
+
+// Advertised in server preference order; the first one the client also
+// offered wins. "echo" exists so the negotiation has something to agree on
+// when the peer is not a MoQ client.
+const SUPPORTED_PROTOCOLS = [_][]const u8{ "moqt-18", "moqt-17", "echo" };
 
 pub const std_options: std.Options = .{
     .log_level = .err,
@@ -9,11 +16,43 @@ pub const std_options: std.Options = .{
 const EchoHandler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
 
-    pub fn onConnectRequest(_: *EchoHandler, session: *event_loop.Session, session_id: u64, path: []const u8) void {
+    pub fn onConnectRequest(
+        _: *EchoHandler,
+        session: *event_loop.Session,
+        session_id: u64,
+        path: []const u8,
+        headers: []const qpack.Header,
+    ) void {
         std.log.info("WT session request (id={d}, path={s})", .{ session_id, path });
+
+        // draft-ietf-webtrans-http3-13 §3.3: pick one of the client's
+        // offered application protocols and name it on the response.
+        var scratch: [256]u8 = undefined;
+        var value_buf: [64]u8 = undefined;
+        const offer = wt_protocol.findHeader(headers, wt_protocol.HEADER_AVAILABLE);
+        const chosen: ?[]const u8 = if (offer) |o|
+            wt_protocol.selectFromOffer(o, &SUPPORTED_PROTOCOLS, &scratch)
+        else
+            null;
+
+        if (chosen) |name| {
+            std.log.info("WT protocol negotiated: {s}", .{name});
+            const encoded = wt_protocol.encodeItem(name, &value_buf) catch {
+                session.acceptSession(session_id) catch {};
+                return;
+            };
+            const extra = [_]qpack.Header{
+                .{ .name = wt_protocol.HEADER_SELECTED, .value = encoded },
+            };
+            session.acceptSessionWithHeaders(session_id, &extra) catch |err| {
+                std.log.err("WT accept error: {any}", .{err});
+            };
+            return;
+        }
+
+        if (offer != null) std.log.info("WT protocol offer had no overlap; accepting without one", .{});
         session.acceptSession(session_id) catch |err| {
             std.log.err("WT accept error: {any}", .{err});
-            return;
         };
     }
 

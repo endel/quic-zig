@@ -1,12 +1,84 @@
-// Media-over-QUIC Transport — draft-ietf-moq-transport-17.
-// Version identifiers. See SPEC/DRAFT_IETF_MOQ_TRANSPORT_17.md.
+// Media-over-QUIC Transport — IETF draft version identifiers.
+//
+// Since draft-15 the version is chosen by ALPN alone: on native QUIC the
+// ALPN token itself, and over WebTransport the same token carried in the
+// WT-Available-Protocols / WT-Protocol CONNECT headers (§3.1). There is no
+// version list in SETUP. The wire codes below are only used by peers that
+// still negotiate through the pre-draft-15 `moq-00` ALPN.
 
-pub const DRAFT_NUMBER: u32 = 17;
+const std = @import("std");
+const testing = std.testing;
 
-// Internal version code used by moq-rs and other implementations to
-// identify draft-17. Not placed on the wire in draft-17 (version
-// negotiation is ALPN-only; see §3.1 and §9.4).
+pub const Draft = enum(u8) {
+    draft_17 = 17,
+    draft_18 = 18,
+
+    pub fn number(self: Draft) u8 {
+        return @intFromEnum(self);
+    }
+
+    pub fn alpn(self: Draft) []const u8 {
+        return switch (self) {
+            .draft_17 => "moqt-17",
+            .draft_18 => "moqt-18",
+        };
+    }
+
+    // The code a pre-draft-15 peer would negotiate with. Not on the wire
+    // for the drafts we speak; kept because peers log and compare it.
+    pub fn wireCode(self: Draft) u64 {
+        return 0xff00_0000 | @as(u64, @intFromEnum(self));
+    }
+
+    pub fn fromAlpn(token: []const u8) ?Draft {
+        inline for (comptime std.enums.values(Draft)) |d| {
+            if (std.mem.eql(u8, token, d.alpn())) return d;
+        }
+        return null;
+    }
+};
+
+// Preference order for an ALPN offer: newest first, so a peer that speaks
+// several picks the newest we both have.
+pub const PREFERRED: []const Draft = &.{ .draft_18, .draft_17 };
+
+// The draft this stack implements by default. draft-18 moved
+// SUBSCRIBE_NAMESPACE, dropped Required Request ID from every request
+// message and relaxed the varint, so it is not yet the default.
+pub const DEFAULT: Draft = .draft_17;
+
+// Fills `out` with the ALPN tokens for `drafts`, in the given order.
+pub fn alpnOffer(drafts: []const Draft, out: [][]const u8) [][]const u8 {
+    const n = @min(drafts.len, out.len);
+    for (drafts[0..n], out[0..n]) |d, *slot| slot.* = d.alpn();
+    return out[0..n];
+}
+
+// Back-compat aliases for call sites that predate the version table.
+pub const DRAFT_NUMBER: u32 = @intFromEnum(DEFAULT);
 pub const WIRE_VERSION: u64 = 0xff00_0011;
-
-// ALPN for raw QUIC connections. Final RFC will use "moqt".
 pub const ALPN: []const u8 = "moqt-17";
+
+test "alpn round-trips through the draft table" {
+    try testing.expectEqualStrings("moqt-17", Draft.draft_17.alpn());
+    try testing.expectEqualStrings("moqt-18", Draft.draft_18.alpn());
+    try testing.expectEqual(Draft.draft_18, Draft.fromAlpn("moqt-18").?);
+    try testing.expectEqual(@as(?Draft, null), Draft.fromAlpn("moqt-99"));
+    try testing.expectEqual(@as(?Draft, null), Draft.fromAlpn("h3"));
+}
+
+test "wire codes match the draft numbers" {
+    try testing.expectEqual(WIRE_VERSION, Draft.draft_17.wireCode());
+    try testing.expectEqual(@as(u64, 0xff00_0012), Draft.draft_18.wireCode());
+}
+
+test "alpn offer is newest-first and clamps to the buffer" {
+    var buf: [4][]const u8 = undefined;
+    const offer = alpnOffer(PREFERRED, &buf);
+    try testing.expectEqual(@as(usize, 2), offer.len);
+    try testing.expectEqualStrings("moqt-18", offer[0]);
+    try testing.expectEqualStrings("moqt-17", offer[1]);
+
+    var small: [1][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), alpnOffer(PREFERRED, &small).len);
+}

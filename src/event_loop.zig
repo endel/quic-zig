@@ -851,14 +851,10 @@ pub fn Server(comptime Handler: type) type {
 
                 switch (event.?) {
                     .connect_request => |req| {
-                        if (@hasDecl(Handler, "onConnectRequest")) {
-                            self.handler.onConnectRequest(&session, req.session_id, req.path);
-                        }
+                        self.dispatchConnectRequest(&session, req.session_id, req.path, req.headers);
                     },
                     .session_ready => |sr| {
-                        if (@hasDecl(Handler, "onSessionReady")) {
-                            self.handler.onSessionReady(&session, sr.session_id);
-                        }
+                        self.dispatchSessionReady(&session, sr.session_id, sr.headers);
                     },
                     .stream_data => |sd| {
                         self.dispatchStreamData(&session, sd.stream_id, sd.data, sd.fin);
@@ -901,6 +897,28 @@ pub fn Server(comptime Handler: type) type {
                 self.handler.onStreamData(session, stream_id, data, fin);
             } else if (data.len > 0) {
                 self.handler.onStreamData(session, stream_id, data);
+            }
+        }
+
+        // The 5-arity form also receives the CONNECT request headers, which
+        // is where WebTransport carries the application-protocol offer.
+        fn dispatchConnectRequest(self: *Self, session: *Session, session_id: u64, path: []const u8, headers: []const qpack.Header) void {
+            if (!@hasDecl(Handler, "onConnectRequest")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onConnectRequest)).@"fn".params.len == 5) {
+                self.handler.onConnectRequest(session, session_id, path, headers);
+            } else {
+                self.handler.onConnectRequest(session, session_id, path);
+            }
+        }
+
+        fn dispatchSessionReady(self: *Self, session: *Session, session_id: u64, headers: []const qpack.Header) void {
+            if (!@hasDecl(Handler, "onSessionReady")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".params.len == 4) {
+                self.handler.onSessionReady(session, session_id, headers);
+            } else {
+                self.handler.onSessionReady(session, session_id);
             }
         }
 
@@ -1149,6 +1167,10 @@ pub const ClientConfig = struct {
 
     // WebTransport session path (auto-CONNECT on handshake complete)
     path: []const u8 = "/.well-known/webtransport",
+
+    // Extra headers on the extended CONNECT — this is where
+    // WT-Available-Protocols goes. The slices must outlive the client.
+    connect_headers: []const qpack.Header = &.{},
 
     // TLS ALPN override (when null, derived from handler protocol: "h3" for h3/webtransport)
     alpn: ?[]const u8 = null,
@@ -1485,6 +1507,7 @@ pub fn Client(comptime Handler: type) type {
         // Config retained for protocol init
         server_name: []const u8,
         path: []const u8,
+        connect_headers: []const qpack.Header,
 
         /// The default ALPN list, when we built it rather than the caller.
         owned_alpn: ?[][]const u8,
@@ -1606,6 +1629,7 @@ pub fn Client(comptime Handler: type) type {
                 .finished_streams = std.AutoHashMap(u64, void).init(alloc),
                 .server_name = config.server_name,
                 .path = config.path,
+                .connect_headers = config.connect_headers,
                 .owned_alpn = owned_alpn,
             };
         }
@@ -1803,9 +1827,10 @@ pub fn Client(comptime Handler: type) type {
                     self.wt_conn = wtc;
 
                     // Send Extended CONNECT to establish WebTransport session
-                    const session_id = wtc.connect(
+                    const session_id = wtc.connectWithHeaders(
                         self.server_name,
                         self.path,
+                        self.connect_headers,
                     ) catch return;
                     self.session_id = session_id;
                 },
@@ -1836,9 +1861,7 @@ pub fn Client(comptime Handler: type) type {
 
                 switch (event.?) {
                     .session_ready => |sr| {
-                        if (@hasDecl(Handler, "onSessionReady")) {
-                            self.handler.onSessionReady(&session, sr.session_id);
-                        }
+                        self.dispatchSessionReady(&session, sr.session_id, sr.headers);
                     },
                     .session_rejected => |rej| {
                         if (@hasDecl(Handler, "onSessionRejected")) {
@@ -1876,6 +1899,18 @@ pub fn Client(comptime Handler: type) type {
                     },
                     .connect_request => {},
                 }
+            }
+        }
+
+        // The 4-arity form also receives the CONNECT response headers, which
+        // is where WebTransport names the negotiated application protocol.
+        fn dispatchSessionReady(self: *Self, session: *ClientSession, session_id: u64, headers: []const qpack.Header) void {
+            if (!@hasDecl(Handler, "onSessionReady")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".params.len == 4) {
+                self.handler.onSessionReady(session, session_id, headers);
+            } else {
+                self.handler.onSessionReady(session, session_id);
             }
         }
 
@@ -2146,6 +2181,27 @@ test "Server: handler validation compiles for valid handlers" {
     // These should compile without error
     _ = Server(TestWtHandler);
     _ = Server(TestH3Handler);
+}
+
+test "Server: handlers may take the CONNECT headers" {
+    // The extra parameter is how a WebTransport handler sees
+    // WT-Available-Protocols; both arities have to keep compiling.
+    const WithHeaders = struct {
+        pub const protocol: Protocol = .webtransport;
+        pub fn onConnectRequest(_: *@This(), _: *Session, _: u64, _: []const u8, _: []const qpack.Header) void {}
+        pub fn onSessionReady(_: *@This(), _: *Session, _: u64, _: []const qpack.Header) void {}
+        pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    };
+    _ = Server(WithHeaders);
+}
+
+test "Client: handlers may take the CONNECT response headers" {
+    const WithHeaders = struct {
+        pub const protocol: Protocol = .webtransport;
+        pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    };
+    _ = Client(WithHeaders);
 }
 
 test "Client: handler validation compiles for valid handlers" {
