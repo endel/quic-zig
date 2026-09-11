@@ -262,9 +262,13 @@ connection. `Client.stop()` queues; `Client.flush()` sends.
 
 ### MoQ, from this session
 
-**a. Register with the interop runner.** Needs your go-ahead: a GHCR image
-and a PR against `englishm/moq-interop-runner`. Everything else is done and
-the entry is written out in `SPEC/moq-interop.md`.
+**a. Register with the interop runner.** Needs your go-ahead: `docker
+push` to GHCR under your account, and a PR against
+`englishm/moq-interop-runner`. Everything else is done — client and relay
+images both build from `interop/moq-runner/build_image.sh` and pass 7/7
+against each other on a compose-style network, and the registration entry
+is written out in `interop/moq-runner/implementations-entry.json` with
+`OWNER` left to fill in.
 
 **b. The draft-18 corners that were skipped.** The relaxed varint,
 `REQUEST_ERROR`'s `Redirect`, `REQUEST_OK`'s Track Properties,
@@ -282,11 +286,6 @@ which is the widest external validation available for it.
 fail identically at TLS with `error.UnexpectedMessage`, before any MoQ.
 Cloudflare's edge asks for HRR and `src/quic/tls13.zig` has no notion of
 it. This blocks every public MoQ relay, and probably more than MoQ.
-
-**e. A relay image for the runner.** Both relays pass 7/7 at both drafts
-now, so this is packaging rather than protocol: a Dockerfile following
-`interop/moq-runner/`, honouring `MOQT_ROLE`/`MOQT_PORT`/`/certs`/`/mlog`,
-and a `roles.relay` entry alongside the client one.
 
 ### Carried over
 
