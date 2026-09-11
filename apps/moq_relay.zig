@@ -36,6 +36,8 @@ const StreamRole = enum { control, request, data, unknown };
 
 const STREAM_BUF_SIZE: usize = 64 * 1024;
 const MAX_STREAM_SLOTS: usize = 32;
+const MAX_ROLE_SLOTS: usize = 128;
+const NO_STREAM: u64 = std.math.maxInt(u64);
 
 const StreamBuf = struct {
     data: [STREAM_BUF_SIZE]u8 = undefined,
@@ -84,23 +86,44 @@ const Client = struct {
     impl_len: usize = 0,
     control_out: ?u64 = null,
     next_alias: u64 = 1,
-    stream_roles: [256]StreamRole = [_]StreamRole{.unknown} ** 256,
+    // Roles are keyed by stream id, not indexed by it: a long-lived connection
+    // runs past any fixed id ceiling. Entries are released on FIN.
+    role_ids: [MAX_ROLE_SLOTS]u64 = [_]u64{NO_STREAM} ** MAX_ROLE_SLOTS,
+    role_vals: [MAX_ROLE_SLOTS]StreamRole = [_]StreamRole{.unknown} ** MAX_ROLE_SLOTS,
     // Slot-based buffer for streams currently being identified (role=.unknown)
     // or accumulating request messages that span multiple chunks.
-    slot_ids: [MAX_STREAM_SLOTS]u64 = [_]u64{std.math.maxInt(u64)} ** MAX_STREAM_SLOTS,
+    slot_ids: [MAX_STREAM_SLOTS]u64 = [_]u64{NO_STREAM} ** MAX_STREAM_SLOTS,
     slot_bufs: [MAX_STREAM_SLOTS]StreamBuf = [_]StreamBuf{.{}} ** MAX_STREAM_SLOTS,
 
-    fn setRole(self: *Client, sid: u64, role: StreamRole) void {
-        if (sid < 256) self.stream_roles[@intCast(sid)] = role;
+    // Returns false when the table is full — the caller must then drop the
+    // stream rather than leave it unclassified and re-parsed on every chunk.
+    fn setRole(self: *Client, sid: u64, role: StreamRole) bool {
+        for (&self.role_ids, 0..) |id, i| if (id == sid) {
+            self.role_vals[i] = role;
+            return true;
+        };
+        for (&self.role_ids, 0..) |id, i| if (id == NO_STREAM) {
+            self.role_ids[i] = sid;
+            self.role_vals[i] = role;
+            return true;
+        };
+        return false;
     }
     fn getRole(self: *Client, sid: u64) StreamRole {
-        if (sid < 256) return self.stream_roles[@intCast(sid)];
+        for (&self.role_ids, 0..) |id, i| if (id == sid) return self.role_vals[i];
         return .unknown;
+    }
+    fn clearRole(self: *Client, sid: u64) void {
+        for (&self.role_ids, 0..) |id, i| if (id == sid) {
+            self.role_ids[i] = NO_STREAM;
+            self.role_vals[i] = .unknown;
+            return;
+        };
     }
     fn slotFor(self: *Client, sid: u64) ?*StreamBuf {
         for (&self.slot_ids, 0..) |id, i| if (id == sid) return &self.slot_bufs[i];
         for (&self.slot_ids, 0..) |id, i| {
-            if (id == std.math.maxInt(u64)) {
+            if (id == NO_STREAM) {
                 self.slot_ids[i] = sid;
                 self.slot_bufs[i].reset();
                 return &self.slot_bufs[i];
@@ -111,7 +134,7 @@ const Client = struct {
     fn freeSlot(self: *Client, sid: u64) void {
         for (&self.slot_ids, 0..) |id, i| {
             if (id == sid) {
-                self.slot_ids[i] = std.math.maxInt(u64);
+                self.slot_ids[i] = NO_STREAM;
                 self.slot_bufs[i].reset();
                 return;
             }
@@ -170,10 +193,14 @@ const RelayHandler = struct {
         return null;
     }
 
-    pub fn onStreamData(self: *RelayHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, _: bool) void {
-        if (data.len == 0) return;
+    pub fn onStreamData(self: *RelayHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
         const conn = session.entry.conn;
         const ci = self.findOrCreateClient(conn) orelse return;
+        defer if (fin) {
+            self.clients[ci].clearRole(stream_id);
+            self.clients[ci].freeSlot(stream_id);
+        };
+        if (data.len == 0) return;
 
         const role = self.clients[ci].getRole(stream_id);
         switch (role) {
@@ -188,7 +215,7 @@ const RelayHandler = struct {
         // Buffer the stream bytes until we can identify its role.
         const buf = self.clients[ci].slotFor(stream_id) orelse {
             // Slots exhausted: abandon this stream.
-            self.clients[ci].setRole(stream_id, .data);
+            _ = self.clients[ci].setRole(stream_id, .data);
             return;
         };
         buf.append(data);
@@ -200,7 +227,10 @@ const RelayHandler = struct {
             // If we already have enough bytes but envelope parsing still
             // fails, treat it as a data stream (publisher subgroup header).
             if (buf.len >= 3) {
-                self.clients[ci].setRole(stream_id, .data);
+                if (!self.clients[ci].setRole(stream_id, .data)) {
+                    self.clients[ci].freeSlot(stream_id);
+                    return;
+                }
                 self.handleDataStream(ci, stream_id, buf.slice());
                 self.clients[ci].freeSlot(stream_id);
             }
@@ -208,7 +238,10 @@ const RelayHandler = struct {
         };
 
         if (parsed.env.type == moq_codes.MSG_SETUP) {
-            self.clients[ci].setRole(stream_id, .control);
+            if (!self.clients[ci].setRole(stream_id, .control)) {
+                self.clients[ci].freeSlot(stream_id);
+                return;
+            }
             const opts = moq_msg.decodeSetupPayload(parsed.env.payload) catch return;
             if (opts.implementation) |impl| {
                 const len = @min(impl.len, 64);
@@ -237,7 +270,10 @@ const RelayHandler = struct {
         } else {
             // It's a request on a bidi stream. Pass the buffered payload to
             // the request handler so it has the full envelope.
-            self.clients[ci].setRole(stream_id, .request);
+            if (!self.clients[ci].setRole(stream_id, .request)) {
+                self.clients[ci].freeSlot(stream_id);
+                return;
+            }
             const full = self.clients[ci].slotFor(stream_id).?.slice();
             // Copy slice before freeing the slot.
             var req_buf: [STREAM_BUF_SIZE]u8 = undefined;
