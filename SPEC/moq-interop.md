@@ -168,6 +168,11 @@ private image.
 The images pass 7/7 against each other over a compose-style network, with
 certificates generated exactly the way the runner's `generate-certs.sh` does.
 
+As a relay, against third-party clients: moq-rs 8/9, moxygen 5/6 — three bugs
+our own client cannot see, one fixed and two open. Registering the relay role
+should wait on those; see
+[`moq-interop-results.md`](moq-interop-results.md).
+
 Against the registry's eight public relays, through the runner's own harness:
 three pass 7/7 both transports (moq-rs-draft-18, moqt-nr, moxygen), the rest
 miss only `rendezvous-timeout`, and `moqt://cdn.moq.dev` does not speak IETF

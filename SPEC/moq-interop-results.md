@@ -73,3 +73,49 @@ nobody publishes is a defensible reading, which is probably why it is common.
 `DOES_NOT_EXIST` would take us to 14/15 while hiding a real conformance
 disagreement. Raising it with the runner's maintainers is the honest route;
 there is no issue open about it as of 2026-09-11.
+
+## As a relay, against third-party clients (2026-09-11)
+
+The registration offers a client *and* a relay. Only the client side had ever
+been tested against anyone else. Run with the runner's harness:
+`./run-interop-tests.sh --relay quic-zig --docker-only`.
+
+| Client | Result |
+|---|---|
+| moq-rs draft-18 (the reference client) | 8/9 |
+| moxygen (Meta) | 5/6 |
+| our own client | 7/7 |
+
+Three bugs, none of which our own client can see — it agrees with whatever we
+emit, which is the same trap the draft-17 control messages fell into.
+
+### 1. Stale content across broadcasts (fixed)
+
+`publish-track-subscribe` received `publish-track-only`'s payload. A track's
+cached groups outlived the publisher that produced them, so the next
+subscriber was replayed a finished broadcast. Clearing the cache when the
+publisher's session closes is not enough — the relay hands the track to a new
+publisher while the old one is still connected — so it is dropped on takeover
+too.
+
+### 2. A subscriber cannot read what we forward (open)
+
+With the cache fixed, the same test times out instead. The relay does forward
+(`stream from client 2 → 1 subs`) and caches the right bytes, but moq-rs's
+WebTransport layer reports `failed to read capsule: UnexpectedEnd` and the
+subscriber never gets a payload. Our own client reads the same stream without
+complaint, so this is something we emit that only a peer that is not us can
+tell is wrong.
+
+### 3. We cannot decode moxygen's SUBSCRIBE (open)
+
+`REQUEST_ERROR → client: code=18 malformed subscribe`. Our draft-18 SUBSCRIBE
+decoder rejects what Meta's client sends. We reach their *relay* at 7/7 in
+both transports, so the incompatibility is specific to what their client puts
+on the wire.
+
+It also makes `subscribe-error` pass for the wrong reason: that test wants an
+error for a nonexistent track, and we return one — because we could not parse
+the request at all. The client's own log says so: *"Subscribe correctly
+returned error: malformed subscribe"*. One of our six moxygen passes is not
+a pass.
