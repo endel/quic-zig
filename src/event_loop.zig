@@ -1146,11 +1146,16 @@ pub fn Server(comptime Handler: type) type {
                 }
             }
 
-            const deadline = earliest orelse return null;
+            // A handler with its own deadlines — a publisher on a tick, a
+            // relay holding a subscription open — cannot rely on QUIC having
+            // a timer pending, so let it name a cadence to be woken on.
+            const floor: ?u64 = if (@hasDecl(Handler, "poll_interval_ms")) Handler.poll_interval_ms else null;
+
+            const deadline = earliest orelse return floor;
             const delta_ns = deadline - now;
             if (delta_ns <= 0) return 1; // overdue — fire on next tick
             const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
-            return ms;
+            return if (floor) |f| @min(ms, f) else ms;
         }
     };
 }
@@ -2089,12 +2094,14 @@ pub fn Client(comptime Handler: type) type {
         }
 
         fn computeNextTimeoutMs(self: *Self) ?u64 {
-            const deadline = self.conn.nextTimeoutNs() orelse return null;
+            const floor: ?u64 = if (@hasDecl(Handler, "poll_interval_ms")) Handler.poll_interval_ms else null;
+            const deadline = self.conn.nextTimeoutNs() orelse return floor;
             const now: i64 = sys.nanoTimestamp();
             const delta_ns = deadline - now;
             if (delta_ns <= 0) return 1;
             const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
-            return if (ms == 0) 1 else ms;
+            const clamped = if (floor) |f| @min(ms, f) else ms;
+            return if (clamped == 0) 1 else clamped;
         }
 
         fn makeSession(self: *Self) ClientSession {

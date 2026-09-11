@@ -139,6 +139,10 @@ fn Peer(comptime proto: event_loop.Protocol) type {
         wt_session_id: u64 = 0,
         wt_ready: bool = false,
 
+        /// §9.3.4: how long the relay should hold a subscription waiting
+        /// for a publisher. Absent means 0 — answer immediately.
+        rendezvous_timeout_ms: ?u64 = null,
+
         request_sid: ?u64 = null,
         request_sent: bool = false,
         cancel_after_ok: bool = false,
@@ -254,7 +258,7 @@ fn Peer(comptime proto: event_loop.Protocol) type {
 
             var events: [8]moq_session.Event = undefined;
             const n = self.sess.onStreamData(stream_id, data, fin, &events) catch |e| {
-                self.fail("session error: {t}", .{e});
+                self.fail("session error on stream {d}: {t}", .{ stream_id, e });
                 return;
             };
             for (events[0..n]) |ev| self.handle(ev);
@@ -281,9 +285,15 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             return self.negotiated[0..self.negotiated_len];
         }
 
-        fn startSession(self: *Self) void {
+        /// Must run before the connection is created: a stream event can
+        /// reach onStreamData ahead of the ready callback, and the session's
+        /// stream table has to be initialised by then.
+        pub fn prepare(self: *Self) void {
             self.sess = Sess.init(self);
             self.sess.implementation = "quic-zig/moq-test-client";
+        }
+
+        fn startSession(self: *Self) void {
             self.sess.sendSetup() catch |e| {
                 self.fail("could not send SETUP: {t}", .{e});
                 return;
@@ -345,6 +355,7 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                 .subscriber => moq_msg.writeSubscribe(&fbs, .{
                     .track_namespace = self.subscribe_namespace,
                     .track_name = TEST_TRACK,
+                    .rendezvous_timeout_ms = self.rendezvous_timeout_ms,
                 }) catch return,
                 .idle => unreachable,
             }
@@ -493,10 +504,9 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                     legs[0].peer.subscribe_namespace = &MISSING_NAMESPACE;
                 },
                 .rendezvous_timeout => {
-                    // Needs the RENDEZVOUS_TIMEOUT parameter, which arrives
-                    // in draft-18 (§10.2.6). Reported as a SKIP by the caller.
                     legs[0].peer.role = .subscriber;
                     legs[0].peer.subscribe_namespace = &RENDEZVOUS_NAMESPACE;
+                    legs[0].peer.rendezvous_timeout_ms = 500;
                 },
                 .announce_subscribe => {
                     legs[0].peer.role = .publisher;
@@ -511,7 +521,10 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                 },
             }
 
-            for (legs[0..leg_count]) |*l| l.peer.verbose = target.verbose;
+            for (legs[0..leg_count]) |*l| {
+                l.peer.verbose = target.verbose;
+                l.peer.prepare();
+            }
             defer for (legs[0..leg_count]) |*l| l.deinit();
 
             const deadline = start + case.timeoutMs();
@@ -595,7 +608,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                         result.setMsg("no REQUEST_OK for PUBLISH_NAMESPACE", .{});
                     }
                 },
-                .subscribe_error, .rendezvous_timeout => {
+                .subscribe_error => {
                     if (a.got_request_error) {
                         result.outcome = .pass;
                     } else if (a.got_subscribe_ok) {
@@ -607,6 +620,28 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                     } else {
                         result.outcome = .fail;
                         result.setMsg("no response to SUBSCRIBE", .{});
+                    }
+                },
+                .rendezvous_timeout => {
+                    if (a.got_request_error) {
+                        if (a.error_code == moq_codes.ERR_TIMEOUT) {
+                            result.outcome = .pass;
+                        } else {
+                            // The relay answered, but not the way §9.3.4 says.
+                            result.outcome = .fail;
+                            result.setMsg("REQUEST_ERROR code={d}, expected TIMEOUT ({d})", .{
+                                a.error_code, moq_codes.ERR_TIMEOUT,
+                            });
+                        }
+                    } else if (a.got_subscribe_ok) {
+                        result.outcome = .fail;
+                        result.setMsg("received SUBSCRIBE_OK instead of REQUEST_ERROR", .{});
+                    } else if (!a.sess.setup_received) {
+                        result.outcome = .fail;
+                        result.setMsg("no SETUP from peer", .{});
+                    } else {
+                        result.outcome = .fail;
+                        result.setMsg("relay never timed out the rendezvous", .{});
                     }
                 },
                 .announce_subscribe => {
@@ -770,15 +805,6 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var failures: usize = 0;
     for (selected[0..selected_len], 1..) |case, i| {
         var r = Result{};
-
-        // draft-17 has no RENDEZVOUS_TIMEOUT parameter to send, so the case
-        // cannot be driven; report it honestly rather than as a pass.
-        if (case == .rendezvous_timeout and moq_version.DEFAULT == .draft_17) {
-            r.outcome = .skip;
-            r.setMsg("RENDEZVOUS_TIMEOUT requires draft-18", .{});
-            reportTap(i, case, &r, relay_url);
-            continue;
-        }
 
         switch (target.locator.defaultTransport()) {
             .quic => Runner(.quic).run(alloc, &target, case, &r),
