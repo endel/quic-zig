@@ -24,10 +24,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # interop/runner/Dockerfile packages pre-built binaries; its COPY paths
+      # are relative to the staging dir, as in interop/runner/build_image.sh.
+      - name: Cross-compile interop binaries
+        run: |
+          zig build interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -j1 --prefix "$PWD/stage"
+          cp interop/runner/run_endpoint.sh stage/run_endpoint.sh
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: stage
           file: interop/runner/Dockerfile
           push: true
           tags: |
