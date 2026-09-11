@@ -77,10 +77,13 @@ pub const Session = struct {
         }
     }
 
+    /// `session_id` names the WebTransport session; on raw QUIC there is
+    /// none and it is ignored.
     pub fn sendDatagram(self: *Session, session_id: u64, data: []const u8) !void {
         if (self.entry.wt_conn) |wtc| {
-            try wtc.sendDatagram(session_id, data);
+            return wtc.sendDatagram(session_id, data);
         }
+        return self.entry.conn.sendDatagram(data);
     }
 
     pub fn acceptSession(self: *Session, session_id: u64) !void {
@@ -992,6 +995,16 @@ pub fn Server(comptime Handler: type) type {
                 self.handler.onPollComplete(&session);
             }
 
+            // Raw QUIC has no session id to report, so 0 stands in.
+            // WebTransport installs a zero-copy callback instead and does
+            // not reach here.
+            if (@hasDecl(Handler, "onDatagram")) {
+                while (conn.peekDatagram()) |dg| {
+                    self.handler.onDatagram(&session, 0, dg);
+                    conn.consumeDatagram();
+                }
+            }
+
             // Poll bidirectional streams.
             var stream_it = conn.streams.streams.iterator();
             while (stream_it.next()) |kv| {
@@ -1297,10 +1310,13 @@ pub const ClientSession = struct {
         } else return error.NoWtConnection;
     }
 
+    /// `session_id` names the WebTransport session; on raw QUIC there is
+    /// none and it is ignored.
     pub fn sendDatagram(self: *ClientSession, session_id: u64, data: []const u8) !void {
         if (self.wt_conn) |wtc| {
-            try wtc.sendDatagram(session_id, data);
-        } else return error.NoWtConnection;
+            return wtc.sendDatagram(session_id, data);
+        }
+        return self.conn.sendDatagram(data);
     }
 
     pub fn closeStream(self: *ClientSession, stream_id: u64) void {
@@ -1983,6 +1999,14 @@ pub fn Client(comptime Handler: type) type {
 
             if (@hasDecl(Handler, "onPollComplete")) {
                 self.handler.onPollComplete(&session);
+            }
+
+            // Raw QUIC has no session id to report, so 0 stands in.
+            if (@hasDecl(Handler, "onDatagram")) {
+                while (conn.peekDatagram()) |dg| {
+                    self.handler.onDatagram(&session, 0, dg);
+                    conn.consumeDatagram();
+                }
             }
 
             // Poll bidi streams for incoming data

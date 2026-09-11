@@ -801,6 +801,39 @@ const RelayHandler = struct {
         out.close();
     }
 
+    /// §10.3.1 datagram objects. A relay forwards them to every subscriber
+    /// of the track, rewriting the alias as it does for subgroup streams —
+    /// unreliably, which is the point of sending one.
+    pub fn onDatagram(self: *RelayHandler, session: *event_loop.Session, _: u64, data: []const u8) void {
+        const conn = session.entry.conn;
+        const ci = self.clientIdx(conn) orelse return;
+
+        const obj = moq_obj.readDatagramObject(data) catch return;
+        const ti = self.trackByPublisherAlias(ci, obj.track_alias) orelse return;
+        const t = &self.tracks[ti];
+
+        for (0..t.sub_count) |si| {
+            const sub_ci = t.sub_client_idx[si];
+            if (sub_ci == ci) continue;
+            if (!self.clients[sub_ci].active) continue;
+            const sub_conn = self.clients[sub_ci].conn orelse continue;
+
+            var out = obj;
+            out.track_alias = t.sub_alias[si];
+            var buf: [1500]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&buf);
+            moq_obj.writeDatagramObject(&fbs, out) catch continue;
+            sub_conn.sendDatagram(buf[0..fbs.seek]) catch continue;
+        }
+    }
+
+    fn trackByPublisherAlias(self: *RelayHandler, ci: usize, alias: u64) ?usize {
+        for (self.tracks[0..self.track_count], 0..) |*t, i| {
+            if (t.active and t.publisher_idx == ci and t.pub_alias == alias) return i;
+        }
+        return null;
+    }
+
     pub fn onPollComplete(self: *RelayHandler, _: *event_loop.Session) void {
         self.expirePending();
 

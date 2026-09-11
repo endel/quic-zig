@@ -38,8 +38,14 @@ const TrackSub = struct {
 
 const MoqClientHandler = struct {
     pub const protocol: event_loop.Protocol = .quic;
+    /// The publish tick is ours, not QUIC's, so the loop has to be woken
+    /// on a cadence rather than only when the peer sends something.
+    pub const poll_interval_ms: u64 = 100;
 
     mode: Mode = .subscribe,
+    /// §10.3.1: publish objects as datagrams instead of on subgroup
+    /// streams. Unreliable, unordered, and one object per datagram.
+    use_datagrams: bool = false,
     // Legacy single-track fields (kept for publish mode + backward compat).
     ns_parts: []const []const u8,
     track_name: []const u8,
@@ -85,6 +91,22 @@ const MoqClientHandler = struct {
         session.writeStream(ctrl, buf[0..fbs.seek]) catch return;
         self.setup_sent = true;
         std.debug.print("[MoQ] Sent SETUP on stream {d}\n", .{ctrl});
+    }
+
+    pub fn onDatagram(self: *MoqClientHandler, _: *event_loop.ClientSession, _: u64, data: []const u8) void {
+        const obj = moq_obj.readDatagramObject(data) catch |e| {
+            std.debug.print("[MoQ] bad datagram object: {t}\n", .{e});
+            return;
+        };
+        const name = if (self.trackByAlias(obj.track_alias)) |ts| ts.name else "?";
+        switch (obj.body) {
+            .payload => |pl| std.debug.print("[MoQ] Datagram track=\"{s}\" group={d} payload=\"{s}\"\n", .{
+                name, obj.group, pl,
+            }),
+            .status => |st| std.debug.print("[MoQ] Datagram track=\"{s}\" group={d} status={t}\n", .{
+                name, obj.group, st,
+            }),
+        }
     }
 
     pub fn onStreamData(self: *MoqClientHandler, session: *event_loop.ClientSession, stream_id: u64, data: []const u8, _: bool) void {
@@ -258,10 +280,31 @@ const MoqClientHandler = struct {
         if (now - self.last_tick_ns < 1_000_000_000) return;
         self.last_tick_ns = now;
 
-        // Publish a tick object on a new uni stream.
-        const out_id = session.openQuicUniStream() catch return;
         var payload_buf: [128]u8 = undefined;
         const payload = std.fmt.bufPrint(&payload_buf, "pub tick {d}", .{self.group_id}) catch return;
+
+        if (self.use_datagrams) {
+            var dbuf: [256]u8 = undefined;
+            var dfbs = io_compat.fixedBufferStream(&dbuf);
+            moq_obj.writeDatagramObject(&dfbs, .{
+                .track_alias = 1,
+                .group = self.group_id,
+                .object = null,
+                .publisher_priority = 128,
+                .end_of_group = true,
+                .body = .{ .payload = payload },
+            }) catch return;
+            session.sendDatagram(0, dbuf[0..dfbs.seek]) catch |e| {
+                std.debug.print("[MoQ] datagram send failed: {t}\n", .{e});
+                return;
+            };
+            std.debug.print("[MoQ] Published tick {d} as a datagram\n", .{self.group_id});
+            self.group_id += 1;
+            return;
+        }
+
+        // Publish a tick object on a new uni stream.
+        const out_id = session.openQuicUniStream() catch return;
 
         var buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
@@ -296,6 +339,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var ns_str: []const u8 = "moq-clock";
     var track_name: []const u8 = "seconds";
     var mode: Mode = .subscribe;
+    var use_datagrams = false;
 
     // For multi-track subscribe: repeated --track flags accumulate here.
     var track_names = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
@@ -322,6 +366,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         } else if (std.mem.eql(u8, arg, "--server-name")) {
             if (args.next()) |v| server_name = v;
+        } else if (std.mem.eql(u8, arg, "--datagrams")) {
+            use_datagrams = true;
         } else if (std.mem.eql(u8, arg, "--mode")) {
             if (args.next()) |v| {
                 if (std.mem.eql(u8, v, "publish")) mode = .publish;
@@ -358,6 +404,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var handler = MoqClientHandler{
         .mode = mode,
+        .use_datagrams = use_datagrams,
         .ns_parts = ns_list.items,
         .track_name = track_name,
     };

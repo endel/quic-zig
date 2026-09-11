@@ -184,7 +184,7 @@ Invalid datagram types: `0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F` (STATUS
 | Relay (`moq-relay`) | pub/sub fanout with alias remapping, namespace registry, rendezvous timeouts, PUBLISH_DONE on publisher loss |
 | Browser (WebTransport) | `moq-browser-server` + `interop/browser/moq.html`, with WT application-protocol negotiation |
 | Interop test client | `moq-test-client`, 7 cases, TAP 14, containerised |
-| Datagram objects | codec done and fuzzed; no runtime path |
+| Datagram objects | done — `moq-client --mode publish --datagrams`, relayed with alias remapping |
 | FETCH | codec done; no runtime request/response flow |
 | AUTHORIZATION_TOKEN | decoded at the KV level and discarded; no policy engine |
 | draft-18 | not implemented; see below |
@@ -200,6 +200,7 @@ Invalid datagram types: `0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F` (STATUS
 | `moq-test-client` → moq-rs relay (WebTransport) | 5/7, same two |
 | `moq-test-client` → `cdn.moq.dev` | blocked at TLS: no HelloRetryRequest |
 | Zig pub → Zig relay → Zig sub (raw QUIC) | ✅ |
+| Datagram objects, pub → relay → sub (raw QUIC) | ✅ |
 | Browser ↔ Zig WT relay (clock, live video) | ✅ |
 
 ## What draft-18 would take
@@ -260,5 +261,4 @@ The one-stream-per-group design is what allowed scaling past ~1000 frames per su
 - VP8 video is in the demo app only; MoQ core treats object payloads as opaque bytes (as the spec intends: the media codec is not part of MoQ).
 - moq-lite is implemented separately — see [DRAFT_LCURLEY_MOQ_LITE_05.md](DRAFT_LCURLEY_MOQ_LITE_05.md). It is a different wire format, not a profile of this one.
 - FETCH request/response flow is codec-only. Namespace discovery is wired up in the raw-QUIC relay.
-- Raw QUIC datagram objects (for low-latency frame delivery) require wiring `.quic` protocol datagram dispatch in the event loop — the codec itself is done.
 - The earlier note that moq-rs interop was blocked by their auth config is stale: `demo/relay/localhost.toml` sets `auth.public = ""`, and with it the interop client reaches 5/7 against them.

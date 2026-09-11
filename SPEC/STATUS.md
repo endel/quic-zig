@@ -549,7 +549,7 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
 | WebTransport | 17 | 0 | 0 | 100% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
-| MoQ Transport (draft-17) | 12 | 2 | 1 | see below |
+| MoQ Transport (draft-17) | 13 | 1 | 1 | see below |
 | moq-lite (draft-05) | 5 | 2 | 1 | see below |
 
 ### MoQ Transport (draft-ietf-moq-transport-17)
@@ -568,7 +568,7 @@ details, and [moq-interop.md](moq-interop.md) for the interop runner.
 | Relay: fanout, namespace registry, rendezvous timeouts, PUBLISH_DONE | ✅ Done |
 | WebTransport browser client/server + protocol negotiation | ✅ Done |
 | Interop test client (7 cases, TAP 14, containerised) | ✅ Done |
-| Datagram-object runtime | ⚠ Codec only |
+| Datagram objects, relayed with alias remapping | ✅ Done |
 | FETCH request/response runtime | ⚠ Codec only |
 | draft-18 | ❌ Not started — delta documented |
 | Interop: our relay | ✅ 7/7 |

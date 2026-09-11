@@ -31,6 +31,9 @@ const Subscriber = struct {
 
 const MoqServerHandler = struct {
     pub const protocol: event_loop.Protocol = .quic;
+    /// The publish tick is ours, not QUIC's, so the loop has to be woken
+    /// on a cadence rather than only when the peer sends something.
+    pub const poll_interval_ms: u64 = 100;
 
     control_out: ?u64 = null,
     peer_control: ?u64 = null,
