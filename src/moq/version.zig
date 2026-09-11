@@ -46,9 +46,6 @@ pub const Draft = enum(u8) {
 // and only the MoQ on top of it goes quiet.
 pub const PREFERRED: []const Draft = &.{ .draft_18, .draft_17 };
 
-/// Every draft this module can name.
-pub const ALL: []const Draft = PREFERRED;
-
 /// Where the two drafts differ on the wire, in one place.
 ///
 /// draft-18 (§10) removed `Required Request ID Delta` from every request
@@ -130,11 +127,11 @@ test "wire codes match the draft numbers" {
 
 test "alpn offer is newest-first and clamps to the buffer" {
     var buf: [4][]const u8 = undefined;
-    const offer = alpnOffer(ALL, &buf);
+    const offer = alpnOffer(PREFERRED, &buf);
     try testing.expectEqual(@as(usize, 2), offer.len);
     try testing.expectEqualStrings("moqt-18", offer[0]);
     try testing.expectEqualStrings("moqt-17", offer[1]);
 
     var small: [1][]const u8 = undefined;
-    try testing.expectEqual(@as(usize, 1), alpnOffer(ALL, &small).len);
+    try testing.expectEqual(@as(usize, 1), alpnOffer(PREFERRED, &small).len);
 }
