@@ -84,6 +84,20 @@ const Track = struct {
             std.mem.eql(u8, self.name_buf[0..self.name_len], name);
     }
 
+    // Forget everything the departed publisher left behind. The cache exists
+    // so a late subscriber joins mid-broadcast without waiting for the next
+    // group — but once the publisher is gone there is no broadcast, and
+    // replaying it hands the next subscriber content from a session that has
+    // already ended. moq-rs's test client catches this as
+    // `publish-track-subscribe` receiving `publish-track-only`'s payload.
+    fn dropPublisherState(self: *Track) void {
+        self.publisher_idx = null;
+        self.pub_alias = 0;
+        for (&self.cached) |*g| g.valid = false;
+        self.next_cache_idx = 0;
+        self.live = .{};
+    }
+
     // Store a completed group; oldest entry is overwritten.
     fn cacheGroup(self: *Track, src: *const CachedGroup) void {
         self.cached[self.next_cache_idx] = src.*;
@@ -245,10 +259,7 @@ const RelayHandler = struct {
 
         for (self.tracks[0..self.track_count]) |*t| {
             if (!t.active) continue;
-            if (t.publisher_idx == ci) {
-                t.publisher_idx = null;
-                t.pub_alias = 0;
-            }
+            if (t.publisher_idx == ci) t.dropPublisherState();
             var si: usize = 0;
             while (si < t.sub_count) {
                 if (t.sub_client_idx[si] != ci) {
@@ -680,6 +691,14 @@ const RelayHandler = struct {
         t.namespace_len = ns_len;
         @memcpy(t.name_buf[0..pub_msg.track_name.len], pub_msg.track_name);
         t.name_len = pub_msg.track_name.len;
+        // A different publisher taking the track over makes everything the
+        // last one left behind stale — it belongs to a broadcast that is no
+        // longer this one. Dropping it only when the old publisher's session
+        // closes is too late: it may still be connected, and the next
+        // subscriber would be replayed the previous broadcast's groups.
+        if (t.publisher_idx) |prev| {
+            if (prev != ci) t.dropPublisherState();
+        }
         t.publisher_idx = ci;
         t.pub_alias = pub_msg.track_alias;
         // A PUBLISH means this namespace exists here, so a later SUBSCRIBE
