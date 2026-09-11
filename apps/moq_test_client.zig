@@ -459,9 +459,12 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             fn deinit(self: *Leg) void {
                 if (self.client) |*c| {
                     c.stop();
-                    // Let the CONNECTION_CLOSE reach the wire before the
-                    // socket goes away; a relay that sees a reset instead
-                    // may log the run as a failure.
+                    // stop() only queues the CONNECTION_CLOSE. Without an
+                    // explicit flush it leaves with the process and the
+                    // peer holds the connection open until its idle
+                    // timeout — half a minute of a relay's capacity per
+                    // test, which a suite exhausts long before it expires.
+                    c.flush();
                     for (0..20) |_| c.tick() catch break;
                     c.deinit();
                     self.client = null;

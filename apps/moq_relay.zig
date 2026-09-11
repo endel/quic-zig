@@ -655,6 +655,9 @@ const RelayHandler = struct {
         t.name_len = pub_msg.track_name.len;
         t.publisher_idx = ci;
         t.pub_alias = pub_msg.track_alias;
+        // A PUBLISH means this namespace exists here, so a later SUBSCRIBE
+        // under it is legitimate even if the publisher never announced.
+        _ = self.registerNamespace(ci, stream_id, ns_key[0..ns_len]);
 
         // Send PUBLISH_OK back.
         const conn = self.clients[ci].conn orelse return;

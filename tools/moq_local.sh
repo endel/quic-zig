@@ -85,6 +85,18 @@ for draft in 17 18; do
 done
 
 echo
+echo "=== MoQ over WebTransport ==="
+WT_PORT=4467
+start "$TMP/wt-relay.log" zig-out/bin/moq-browser-server --port "$WT_PORT"
+for draft in 17 18; do
+  zig-out/bin/moq-test-client --relay "https://127.0.0.1:$WT_PORT/moq" \
+      --draft "$draft" --tls-disable-verify > "$TMP/wt-tap-$draft.txt" 2>&1
+  ok=$(grep -cE '^ok ' "$TMP/wt-tap-$draft.txt")
+  [ "$ok" = 7 ] && report "WebTransport relay, draft-$draft (7/7)" 1 \
+                || report "WebTransport relay, draft-$draft" 0 "$ok/7"
+done
+
+echo
 echo "=== moq-lite ==="
 start "$TMP/lite-origin.log" zig-out/bin/moq-lite serve \
     --port "$LITE_ORIGIN_PORT" --broadcast clock --track seconds \

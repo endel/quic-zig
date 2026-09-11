@@ -180,30 +180,42 @@ function buildSetup() {
 }
 
 function buildSubscribe(nsParts, trackName) {
+  // draft-17 §9.8. Parameters are count-prefixed with delta-encoded types
+  // in ascending order, and each type fixes its own value encoding — this
+  // is not the key/value list SETUP options use.
   const reqId = moqVarintEncode(0);
   const reqDelta = moqVarintEncode(0);
   const ns = encodeTuple(nsParts);
   const name = encodeVarBytes(trackName);
-  // Count-prefixed params
-  const paramCount = moqVarintEncode(4);
-  // 0x10 forward = true (raw byte)
-  const p1 = concat(moqVarintEncode(0x10), new Uint8Array([1]));
-  // 0x20 (delta 0x10) subscriber_priority (raw byte)
-  const p2 = concat(moqVarintEncode(0x10), new Uint8Array([128]));
-  // 0x21 (delta 1) filter_type (length-prefixed varint)
-  const ft = moqVarintEncode(0x02); // latest_object
+
+  const paramCount = moqVarintEncode(5);
+  // 0x04 RENDEZVOUS_TIMEOUT (varint ms). Without it the default is 0, and
+  // a relay answers DOES_NOT_EXIST rather than waiting for the publisher.
+  const p0 = concat(moqVarintEncode(0x04), moqVarintEncode(30000));
+  // 0x10 FORWARD (uint8)
+  const p1 = concat(moqVarintEncode(0x10 - 0x04), new Uint8Array([1]));
+  // 0x20 SUBSCRIBER_PRIORITY (uint8)
+  const p2 = concat(moqVarintEncode(0x20 - 0x10), new Uint8Array([128]));
+  // 0x21 SUBSCRIPTION_FILTER (length-prefixed; latest object)
+  const ft = moqVarintEncode(0x02);
   const p3 = concat(moqVarintEncode(1), moqVarintEncode(ft.length), ft);
-  // 0x22 (delta 1) group_order (raw byte, 1=asc)
+  // 0x22 GROUP_ORDER (uint8, 1 = ascending)
   const p4 = concat(moqVarintEncode(1), new Uint8Array([1]));
-  return buildEnvelope(MSG_SUBSCRIBE, concat(reqId, reqDelta, ns, name, paramCount, p1, p2, p3, p4));
+
+  return buildEnvelope(MSG_SUBSCRIBE, concat(reqId, reqDelta, ns, name, paramCount, p0, p1, p2, p3, p4));
 }
 
 function buildPublish(nsParts, trackName, alias) {
+  // draft-17 §9.11: request id and delta come first, and the priority is a
+  // parameter rather than a field.
+  const reqId = moqVarintEncode(0);
+  const reqDelta = moqVarintEncode(0);
   const ns = encodeTuple(nsParts);
   const name = encodeVarBytes(trackName);
   const aliasBytes = moqVarintEncode(alias);
-  const pri = new Uint8Array([128]);
-  return buildEnvelope(MSG_PUBLISH, concat(ns, name, aliasBytes, pri));
+  // One parameter: 0x10 FORWARD = 1.
+  const params = concat(moqVarintEncode(1), moqVarintEncode(0x10), new Uint8Array([1]));
+  return buildEnvelope(MSG_PUBLISH, concat(reqId, reqDelta, ns, name, aliasBytes, params));
 }
 
 function buildSubgroupHeader(alias, group, subgroup, priority) {
@@ -263,7 +275,11 @@ async function connectWt() {
   const hashHex = document.getElementById('hash').value.trim();
   if (!hashHex) throw new Error('Paste certificate hash from server');
   const hashBytes = new Uint8Array(hashHex.match(/.{2}/g).map(h => parseInt(h, 16)));
-  wt = new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: hashBytes.buffer }] });
+  wt = new WebTransport(url, {
+    // The MoQ version rides the CONNECT, not the QUIC ALPN.
+    protocols: ['moqt-17'],
+    serverCertificateHashes: [{ algorithm: 'sha-256', value: hashBytes.buffer }],
+  });
   await wt.ready;
   log('log-info', `WebTransport connected to ${url}`);
 
