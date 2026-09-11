@@ -255,8 +255,11 @@ fn Peer(comptime proto: event_loop.Protocol) type {
         }
 
         fn serveAnnounce(self: *Self, stream_id: u64, req: lite_msg.AnnounceRequest) void {
-            // Announce our one broadcast if it falls under the prefix.
-            self.sess.sendAnnounceOk(stream_id, .{ .hop_id = 1, .active_count = 1 }) catch return;
+            // A relay asks everyone, including subscribers. Only a
+            // publisher has anything to say.
+            const active: u64 = if (self.mode == .publish) 1 else 0;
+            self.sess.sendAnnounceOk(stream_id, .{ .hop_id = 1, .active_count = active }) catch return;
+            if (self.mode != .publish) return;
             const suffix = lite.wire.stripPathPrefix(self.broadcast, req.prefix) orelse {
                 // Nothing under this prefix; the stream stays open in case
                 // something appears later.
@@ -270,7 +273,8 @@ fn Peer(comptime proto: event_loop.Protocol) type {
         }
 
         fn serveSubscribe(self: *Self, stream_id: u64, sub: lite_msg.Subscribe) void {
-            if (!std.mem.eql(u8, sub.broadcast, self.broadcast) or
+            if (self.mode != .publish or
+                !std.mem.eql(u8, sub.broadcast, self.broadcast) or
                 !std.mem.eql(u8, sub.track, self.track))
             {
                 // §5.1.2: a refusal is a stream reset, not a message.
