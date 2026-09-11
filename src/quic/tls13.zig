@@ -3423,3 +3423,146 @@ test "the *Into constructors leave no bool to chance" {
         try std.testing.expectEqual(server, hs.is_server);
     }
 }
+
+// A three-level chain valid to 2046: root (a trust anchor), intermediate
+// (sent on the wire), leaf (sent on the wire). Every other certificate in the
+// tree is a lone self-signed leaf, so without these nothing exercises a chain
+// walk — and a chain is the shape every real deployment has. Let's Encrypt is
+// exactly this: ISRG Root in the store, E5 and the leaf in fullchain.pem.
+const fixture_leaf =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBVjCB/qADAgECAgkA2A1zZvnL+u8wCgYIKoZIzj0EAwIwKDEmMCQGA1UEAwwd
+    \\cXVpYy16aWcgZml4dHVyZSBpbnRlcm1lZGlhdGUwHhcNMjYwOTExMTM0MTU2WhcN
+    \\NDYwOTA2MTM0MTU2WjAVMRMwEQYDVQQDDApyZWxheS50ZXN0MFkwEwYHKoZIzj0C
+    \\AQYIKoZIzj0DAQcDQgAEJzmLFpJZ9az9Dg6V9u9Mke0X/8j01EuVVO8I0DVdAeHb
+    \\0QPE8QCyFas9qJhVXHRjtN+5nNXvRli6iY+HOUsINaMkMCIwFQYDVR0RBA4wDIIK
+    \\cmVsYXkudGVzdDAJBgNVHRMEAjAAMAoGCCqGSM49BAMCA0cAMEQCIAcEdrG8ry9P
+    \\YxcHAI/ds49yad7swdrwqjCHUqyCapg1AiAQDVqSjXrWRgAeqm/J3P97HdI/h6yi
+    \\/AcoDYvs2Yb/bQ==
+    \\-----END CERTIFICATE-----
+;
+const fixture_intermediate =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBZTCCAQugAwIBAgIJAKHq7AjLsUNqMAoGCCqGSM49BAMCMCAxHjAcBgNVBAMM
+    \\FXF1aWMtemlnIGZpeHR1cmUgcm9vdDAeFw0yNjA5MTExMzQxNTZaFw00NjA5MDYx
+    \\MzQxNTZaMCgxJjAkBgNVBAMMHXF1aWMtemlnIGZpeHR1cmUgaW50ZXJtZWRpYXRl
+    \\MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEP0EB+lxfpqCqzJl98QH7O0HLIfCJ
+    \\890l8e3IFcKGzDhHzwfb9ePmv0CKyAU+g0LYlAYzS3IF419OMs9orzEizKMmMCQw
+    \\EgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwID
+    \\SAAwRQIgfG8RhWW/ZqVtQKhWR76Q6hcbTodlRK0PzOVsRLPqkXoCIQD6G7a1s0eZ
+    \\Fb0qKJtYGzVWkzgzx508kEZ3gk3RKexeBA==
+    \\-----END CERTIFICATE-----
+;
+const fixture_root =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBLzCB1gIJAKVkZyJDeY6aMAoGCCqGSM49BAMCMCAxHjAcBgNVBAMMFXF1aWMt
+    \\emlnIGZpeHR1cmUgcm9vdDAeFw0yNjA5MTExMzQxNTZaFw00NjA5MDYxMzQxNTZa
+    \\MCAxHjAcBgNVBAMMFXF1aWMtemlnIGZpeHR1cmUgcm9vdDBZMBMGByqGSM49AgEG
+    \\CCqGSM49AwEHA0IABFpmS92sjxWx4Qhg2OMKyX/mgCCGFNdxxQaezXDhbbpxOcCP
+    \\AjyNLmhIt7XDDOvVwMYY4eW4d0ZVbjYXLFXuCNowCgYIKoZIzj0EAwIDSAAwRQIg
+    \\C9dJETrUnxyNjcpk2EHfRM7vSeCMUfUM4crZhgVWKl4CIQDqUJLhcW2mREVSRQVv
+    \\luhi6v7Gxy8HKYIcmzCZDIUHfg==
+    \\-----END CERTIFICATE-----
+;
+const fixture_leaf_key =
+    \\-----BEGIN EC PRIVATE KEY-----
+    \\MHcCAQEEIPlZKSaxENtfhyr7zS8jSd0Ih9+bRiz8mxzuByRfU6kaoAoGCCqGSM49
+    \\AwEHoUQDQgAEJzmLFpJZ9az9Dg6V9u9Mke0X/8j01EuVVO8I0DVdAeHb0QPE8QCy
+    \\Fas9qJhVXHRjtN+5nNXvRli6iY+HOUsINQ==
+    \\-----END EC PRIVATE KEY-----
+;
+
+fn fixtureBundle(gpa: std.mem.Allocator) !Certificate.Bundle {
+    var bundle: Certificate.Bundle = .empty;
+    errdefer bundle.deinit(gpa);
+    var der_buf: [4096]u8 = undefined;
+    const der = try parsePemCert(fixture_root, &der_buf);
+    try bundle.bytes.appendSlice(gpa, der);
+    try bundle.parseCert(gpa, 0, sys.realtimeSeconds());
+    return bundle;
+}
+
+fn fixtureHandshake(gpa: std.mem.Allocator, chain: []const []const u8) !bool {
+    var key_buf: [4096]u8 = undefined;
+    const key_der = try parsePemPrivateKey(fixture_leaf_key, &key_buf);
+    const key_scalar = extractEcPrivateKey(key_der) catch try extractPkcs8EcPrivateKey(key_der);
+
+    var bundle = try fixtureBundle(gpa);
+    defer bundle.deinit(gpa);
+
+    const tp = transport_params.TransportParams{ .initial_max_data = 1 << 20, .initial_max_streams_bidi = 10 };
+    const server = try gpa.create(Tls13Handshake);
+    defer gpa.destroy(server);
+    const client = try gpa.create(Tls13Handshake);
+    defer gpa.destroy(client);
+
+    Tls13Handshake.initServerInto(server, .{
+        .cert_chain_der = chain,
+        .private_key_bytes = key_scalar,
+        .alpn = &[_][]const u8{"h3"},
+    }, tp);
+    Tls13Handshake.initClientInto(client, .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "relay.test",
+        .skip_cert_verify = false,
+        .ca_bundle = &bundle,
+    }, tp);
+
+    var client_done = false;
+    var server_done = false;
+    var i: usize = 0;
+    while ((!client_done or !server_done) and i < 100) : (i += 1) {
+        if (!client_done) {
+            const action = client.step() catch return false;
+            switch (action) {
+                .send_data => |sd| server.provideData(sd.data),
+                .complete => client_done = true,
+                else => {},
+            }
+        }
+        if (!server_done) {
+            const action = server.step() catch return false;
+            switch (action) {
+                .send_data => client.provideData(server.out_buf[0..server.out_len]),
+                .complete => server_done = true,
+                else => {},
+            }
+        }
+    }
+    return client_done and server_done;
+}
+
+test "a server serves its full chain and the client roots it in a trust anchor" {
+    const gpa = std.testing.allocator;
+
+    var pem_buf: [8192]u8 = undefined;
+    const full = try std.fmt.bufPrint(&pem_buf, "{s}\n{s}\n", .{ fixture_leaf, fixture_intermediate });
+    const chain = try parsePemCertChain(gpa, full);
+    defer {
+        for (chain) |der| gpa.free(der);
+        gpa.free(chain);
+    }
+    try std.testing.expectEqual(@as(usize, 2), chain.len);
+
+    try std.testing.expect(try fixtureHandshake(gpa, chain));
+}
+
+test "a server that sends only its leaf cannot be verified" {
+    // The intermediate is not in the trust store and never will be, so a
+    // server that omits it leaves the client with nothing to build on. This
+    // is the failure mode of deploying cert.pem where fullchain.pem was meant.
+    const gpa = std.testing.allocator;
+
+    var pem_buf: [8192]u8 = undefined;
+    const full = try std.fmt.bufPrint(&pem_buf, "{s}\n", .{fixture_leaf});
+    const chain = try parsePemCertChain(gpa, full);
+    defer {
+        for (chain) |der| gpa.free(der);
+        gpa.free(chain);
+    }
+    try std.testing.expectEqual(@as(usize, 1), chain.len);
+
+    try std.testing.expect(!try fixtureHandshake(gpa, chain));
+}
