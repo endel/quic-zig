@@ -1,15 +1,23 @@
 # quic-zig — handover
 
-Branch `moq-interop-and-lite`, unpushed. This session was MoQ: an interop
-test client for <https://github.com/englishm/moq-interop-runner>, a
-substantial correction to the draft-17 control messages, and a moq-lite
-implementation.
+Branch `core-followups`, unpushed, on top of `moq-interop-and-lite`. Two
+sessions, both unpushed:
+
+- `moq-interop-and-lite` — MoQ: an interop test client for
+  <https://github.com/englishm/moq-interop-runner>, a substantial correction
+  to the draft-17 control messages, and a moq-lite implementation.
+- `core-followups` — the core problems that work turned up (Tier 5 in
+  [`TODO.md`](TODO.md), all four closed), and the certificate handling they
+  led to. Eight bugs a peer could reach: four remote aborts found by the new
+  randomized sweeps, a QPACK out-of-bounds write, and the three that together
+  meant no TLS certificate could ever be verified.
 
     zig build test                    # green
     zig build fuzz                    # green
     tools/interop_local.sh            # 11/11
     interop/run_local_tests.sh        # 9/9
     interop/runner/matrix.sh          # 64/88, verdict for verdict as before
+    docker run -e RELAY_URL=... quic-zig-moq-client   # 7/7 containerised
     tools/moq_local.sh                # 11/11, MoQ end to end, our binaries
     tools/moq_interop.sh              # MoQ vs peers, both drafts
     node tools/moq_browser_test.mjs   # the video demo, through Chrome
@@ -294,7 +302,6 @@ missing HelloRetryRequest. It was two other things:
    and RFC 8446 4.4.2 wants an empty Certificate back rather than silence.
 2. Certificate validity compared against `CLOCK_MONOTONIC`, whose zero is the
    last boot, so every real certificate read as not-yet-valid.
-
 3. No trust store: `ca_cert_path` had done nothing but log a warning since
    the Zig 0.16 migration, so a chain could not be rooted even in principle.
    `ClientConfig.ca` replaces it (`.system` or `.file`).
@@ -302,14 +309,12 @@ missing HelloRetryRequest. It was two other things:
 Both transports now run a full moq-lite session against it, verified against
 the system trust store.
 
-### Core quic-zig, for a session that is not about MoQ
+### Core quic-zig — Tier 5, all four closed
 
 Building MoQ on this stack turned up four core problems, none of them MoQ's.
 They are written up as **Tier 5** in [`TODO.md`](TODO.md) with the
 consequence each one had, which is the part that is hard to reconstruct
-later:
-
-All four are now fixed, and the sweeps turned up four more:
+later. All four are fixed, and the second one found four more bugs on its own:
 
 - `Client.stop()` queued the CONNECTION_CLOSE and never sent it, so a
   `tick()`-driven client that exited left the peer holding the session for
