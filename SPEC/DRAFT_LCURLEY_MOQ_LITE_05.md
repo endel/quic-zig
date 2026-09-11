@@ -176,12 +176,20 @@ Gone entirely: `MAX_SUBSCRIBE_ID`, `REQUESTS_BLOCKED`, `SUBSCRIBE_ERROR`,
 
 ## Verified interop
 
+Peers: `moq-relay` v0.14.16 and `moq-clock` v0.10.21, both from
+`cargo install`. The relay speaks lite-05 to us and lite-04 to moq-clock,
+so these also cross a version boundary inside the relay.
+
 | Scenario | Result |
 | --- | --- |
 | WT protocol negotiation vs `moq-relay` | ✅ `moq-lite-05` selected |
 | SETUP exchange vs `moq-relay` | ✅ both directions |
 | ANNOUNCE_REQUEST → ANNOUNCE_OK vs `moq-relay` | ✅ real hop id returned |
 | Our announcement echoed back through the relay | ✅ |
+| our publish → `moq-relay` → our subscribe | ✅ |
+| our publish → `moq-relay` → **their** `moq-clock` subscribe | ✅ frames arrive intact |
+| **their** `moq-clock` publish → `moq-relay` → our subscribe | ✅ clock frames and timestamps |
+| our `moq-lite serve` → our subscribe (no relay) | ✅ |
 
 ## Caveats
 
@@ -194,3 +202,6 @@ Gone entirely: `MAX_SUBSCRIBE_ID`, `REQUESTS_BLOCKED`, `SUBSCRIBE_ERROR`,
   subscriber; its buffer bounds the largest frame it can reassemble.
 - `Publisher Max Latency` and the expiration rules in §6.2 are decoded but
   not acted on.
+- The subscriber never opens a Track stream, so it does not know the
+  track's timescale and prints frame timestamps raw. moq-clock's are
+  absolute values in its own timescale, which is why they look large.

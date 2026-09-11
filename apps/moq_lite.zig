@@ -244,7 +244,10 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                     };
                     while (self.frames.next() catch null) |item| {
                         self.frames_seen += 1;
-                        print("  +{d}ms {s}\n", .{ item.timestamp, item.payload });
+                        // Absolute, not a delta, and in the track's
+                        // timescale — which TRACK_INFO carries and we do
+                        // not ask for, so it is printed raw.
+                        print("  ts={d} {s}\n", .{ item.timestamp, item.payload });
                     }
                 },
                 .group_end => {},
