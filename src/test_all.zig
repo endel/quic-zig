@@ -40,5 +40,6 @@ test {
     _ = @import("moq/lite/wire.zig");
     _ = @import("moq/lite/message.zig");
     _ = @import("moq/lite/version.zig");
+    _ = @import("moq/lite/session.zig");
     _ = @import("event_loop.zig");
 }

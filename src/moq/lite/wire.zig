@@ -28,6 +28,8 @@ pub const Error = error{
     ValueTooLong,
     TooManyParts,
     InvalidUtf8,
+    /// A varint or byte read ran off the end of the buffer.
+    EndOfStream,
 };
 
 /// §4: the largest value a QUIC varint can carry.

@@ -35,5 +35,6 @@ pub const moq = struct {
         pub const wire = @import("moq/lite/wire.zig");
         pub const message = @import("moq/lite/message.zig");
         pub const version = @import("moq/lite/version.zig");
+        pub const session = @import("moq/lite/session.zig");
     };
 };

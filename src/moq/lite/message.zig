@@ -18,6 +18,8 @@ pub const Error = error{
     MalformedMessage,
     UnknownStreamType,
     MessageTooLarge,
+    /// A reader ran off the end of the buffer mid-value.
+    EndOfStream,
 } || wire.Error;
 
 // --- stream types (§5.1, §6.3) --------------------------------------------
