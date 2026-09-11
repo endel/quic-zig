@@ -120,7 +120,7 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
 Core issues, not MoQ ones. Each was hit in practice rather than read off a
 spec, so the consequence is recorded alongside the fix.
 
-- [ ] **F1. `Client.stop()` queues CONNECTION_CLOSE but never sends it (S)** —
+- [x] **F1. `Client.stop()` queues CONNECTION_CLOSE but never sends it (S)** —
   `event_loop.zig:1710`. `stop()` calls `conn.close()`, which only queues the
   frame; it reaches the wire on the next flush. An app driving the loop with
   `run()` is fine, because the armed timer fires and drains before the loop
@@ -130,9 +130,9 @@ spec, so the consequence is recorded alongside the fix.
   timeout — 30 s of a server's per-client capacity for a client that ran for
   two. It surfaces far from the cause: a relay's client table fills and some
   *later*, unrelated connection fails with "no SETUP from peer". Either make
-  `stop()` flush, or say in its doc comment that it does not and that callers
-  driving `tick()` must. `apps/moq_test_client.zig` and `apps/moq_lite.zig`
-  call `flush()` explicitly as a workaround; no other app calls `stop()`.
+  Fixed: both `Server.stop()` and `Client.stop()` flush. The server's doc
+  comment had claimed it did for as long as it had not. Regression test
+  `stop() leaves nothing queued for the peer`, which fails without it.
 
 - [ ] **F2. 23 of 26 fuzz targets never see a random byte (M)** — `fuzz.zig`.
   `-ffuzz` does not compile on Zig 0.16.0: 27 errors inside the toolchain's

@@ -603,6 +603,11 @@ pub fn Server(comptime Handler: type) type {
                     conn.close(0, "server shutdown");
                 }
             }
+            // close() only queues the frame. Waiting for the loop to send it
+            // is fine when the caller goes on to run(), and silently wrong
+            // when it exits instead — the peer then holds the connection
+            // until its idle timeout rather than learning we are gone.
+            self.flush();
         }
 
         // ---- Internal callbacks ----
@@ -1707,12 +1712,15 @@ pub fn Client(comptime Handler: type) type {
             self.rescheduleTimer();
         }
 
+        /// Closes the connection and puts the CONNECTION_CLOSE on the wire.
+        /// See the note on the server's stop() for why it flushes here.
         pub fn stop(self: *Self) void {
             self.stopping = true;
             const conn = self.conn;
             if (!conn.isClosed() and conn.state != .closing and conn.state != .draining) {
                 conn.close(0, "client shutdown");
             }
+            self.flush();
         }
 
         // ---- Internal callbacks ----
@@ -2389,6 +2397,32 @@ test "Client QUIC: start, tick, stop lifecycle" {
 
     client.stop();
     try testing.expect(client.stopping);
+}
+
+test "stop() leaves nothing queued for the peer" {
+    // The CONNECTION_CLOSE has to be on the wire when stop() returns. If it
+    // is merely queued, a caller that exits instead of running the loop
+    // leaves the peer holding the connection until its idle timeout, and
+    // the symptom shows up on some unrelated connection much later.
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19881,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try client.tick();
+    client.stop();
+
+    try testing.expect(client.conn.state == .closing or client.conn.isClosed());
+
+    // Nothing left to send means the close was drained, not just queued.
+    var buf: [2048]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), client.conn.send(&buf) catch 0);
 }
 
 test "Client: closeConnection from a handler arms the run loop's exit" {

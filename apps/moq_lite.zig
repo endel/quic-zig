@@ -672,10 +672,6 @@ fn Run(comptime proto: event_loop.Protocol) type {
                 try client.tick();
             }
             client.stop();
-            // stop() queues the CONNECTION_CLOSE; flush puts it on the
-            // wire, so the peer frees the session now rather than at its
-            // idle timeout.
-            client.flush();
             for (0..20) |_| client.tick() catch break;
         }
     };
