@@ -17,8 +17,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   edge does, so `cdn.moq.dev` — and presumably any relay behind Cloudflare —
   could not be reached at all, over either transport. The request is now
   answered the way RFC 8446 says to when there is nothing to offer: with an
-  empty certificate. With both fixed, `cdn.moq.dev` runs a full session over
-  either transport, verified against the system trust store.
+  empty certificate. `cdn.moq.dev` now runs a full session over either
+  transport, verified against the system trust store.
 - A peer could abort the process before the handshake completed. A QUIC packet
   whose Length field was below its packet number length read gigabytes past
   the datagram, and one below the 16-byte AEAD tag tripped an assertion; an
