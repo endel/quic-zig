@@ -27,6 +27,10 @@ const ranges = @import("quic/ranges.zig");
 const stream = @import("quic/stream.zig");
 const connection = @import("quic/connection.zig");
 const tls13 = @import("quic/tls13.zig");
+const moq_wire = @import("moq/wire.zig");
+const moq_msg = @import("moq/message.zig");
+const moq_codes = @import("moq/message_codes.zig");
+const moq_obj = @import("moq/object.zig");
 
 // ════════════════════════════════════════════════════════
 // Target 1: QUIC Variable-Length Integer (RFC 9000 §16)
@@ -677,4 +681,217 @@ test "fuzz: coalesced packet headers" {
             }
         }
     }.f, .{});
+}
+
+// ════════════════════════════════════════════════════════
+// MoQ Transport (draft-17)
+//
+// wire.zig, message.zig and object.zig are pure parsers fed
+// straight off the network, and have already shipped one
+// out-of-bounds read (commit 17df27e).
+// ════════════════════════════════════════════════════════
+
+test "fuzz: moq varint round-trip" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+            var fbs = io_compat.fixedBufferStream(input);
+            const val = moq_wire.readVarInt(&fbs) catch return;
+
+            var buf: [9]u8 = undefined;
+            var wfbs = io_compat.fixedBufferStream(&buf);
+            try moq_wire.writeVarInt(&wfbs, val);
+
+            var rfbs = io_compat.fixedBufferStream(wfbs.buffered());
+            try testing.expectEqual(val, try moq_wire.readVarInt(&rfbs));
+        }
+    }.f, .{});
+}
+
+test "fuzz: moq kv list and tuple decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+
+            var it = moq_wire.KvIterator.init(input);
+            while (it.next() catch null) |_| {}
+
+            var fbs = io_compat.fixedBufferStream(input);
+            var parts: [moq_wire.MAX_TUPLE_PARTS][]const u8 = undefined;
+            _ = moq_wire.readTuple(&fbs, &parts) catch {};
+        }
+    }.f, .{});
+}
+
+test "fuzz: moq control message decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+            const parsed = moq_msg.parseEnvelope(input) catch return;
+            const body = parsed.env.payload;
+
+            // Every decoder sees every payload: a peer can put any message
+            // type on the wire, and a mis-typed body must not be a crash.
+            var ns: moq_msg.NamespaceBuf = undefined;
+            var kvs: [16]moq_wire.KvEntry = undefined;
+            _ = moq_msg.decodeSetupPayload(body) catch {};
+            _ = moq_msg.decodeGoaway(body) catch {};
+            _ = moq_msg.decodeRequestOk(body, &kvs) catch {};
+            _ = moq_msg.decodeRequestError(body) catch {};
+            _ = moq_msg.decodeRequestUpdate(body) catch {};
+            _ = moq_msg.decodeSubscribe(body, &ns) catch {};
+            _ = moq_msg.decodeSubscribeOk(body) catch {};
+            _ = moq_msg.decodePublish(body, &ns) catch {};
+            _ = moq_msg.decodePublishOk(body) catch {};
+            _ = moq_msg.decodePublishDone(body) catch {};
+            _ = moq_msg.decodePublishNamespace(body, &ns) catch {};
+            _ = moq_msg.decodeSubscribeNamespace(body, &ns) catch {};
+            _ = moq_msg.decodeNamespace(body, &ns) catch {};
+            _ = moq_msg.decodeFetch(body, &ns) catch {};
+            _ = moq_msg.decodeFetchOk(body) catch {};
+            _ = moq_msg.decodeTrackStatus(body, &ns) catch {};
+            _ = moq_msg.decodePublishBlocked(body) catch {};
+        }
+    }.f, .{});
+}
+
+test "fuzz: moq data stream headers" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+
+            var f1 = io_compat.fixedBufferStream(input);
+            _ = moq_obj.readSubgroupHeader(&f1) catch {};
+
+            _ = moq_obj.readDatagramObject(input) catch {};
+
+            var f3 = io_compat.fixedBufferStream(input);
+            _ = moq_obj.readFetchStreamHeader(&f3) catch {};
+        }
+    }.f, .{});
+}
+
+// `zig build fuzz` runs without -ffuzz (that mode does not compile on
+// Zig 0.16.0 — the errors are in lib/compiler/test_runner.zig), so
+// testing.fuzz above only ever sees its seed input. This sweep gives the
+// MoQ parsers real coverage under plain `zig build test`: fixed seed, so a
+// failure reproduces.
+test "moq decoders survive a randomized sweep" {
+    var prng = std.Random.DefaultPrng.init(0x4d6f5100);
+    const rand = prng.random();
+
+    var buf: [512]u8 = undefined;
+    var ns: moq_msg.NamespaceBuf = undefined;
+    var kvs: [16]moq_wire.KvEntry = undefined;
+
+    for (0..20_000) |i| {
+        const len = rand.uintLessThan(usize, buf.len);
+        const input = buf[0..len];
+        rand.bytes(input);
+
+        // Pure noise mostly dies at the envelope, so two thirds of the
+        // inputs are steered towards the payload decoders: one third gets a
+        // plausible type+length header, one third is a real encoded message
+        // with a few bytes corrupted.
+        switch (i % 3) {
+            0 => if (len >= 8) {
+                var wfbs = io_compat.fixedBufferStream(input);
+                moq_wire.writeVarInt(&wfbs, rand.uintLessThan(u64, 0x60)) catch {};
+                const body_len: u16 = @intCast(@min(len - wfbs.seek - 2, rand.uintLessThan(usize, len)));
+                std.mem.writeInt(u16, input[wfbs.seek..][0..2], body_len, .big);
+            },
+            1 => {
+                const n = seedMoqMessage(input, rand) orelse continue;
+                const seeded = input[0..n];
+                for (0..1 + rand.uintLessThan(usize, 3)) |_| {
+                    seeded[rand.uintLessThan(usize, seeded.len)] = rand.int(u8);
+                }
+                try sweepMoqDecoders(seeded, &ns, &kvs);
+                continue;
+            },
+            else => {},
+        }
+
+        try sweepMoqDecoders(input, &ns, &kvs);
+    }
+}
+
+fn sweepMoqDecoders(input: []const u8, ns: *moq_msg.NamespaceBuf, kvs: []moq_wire.KvEntry) !void {
+    var f1 = io_compat.fixedBufferStream(input);
+    _ = moq_wire.readVarInt(&f1) catch {};
+    var f2 = io_compat.fixedBufferStream(input);
+    var parts: [moq_wire.MAX_TUPLE_PARTS][]const u8 = undefined;
+    _ = moq_wire.readTuple(&f2, &parts) catch {};
+    var it = moq_wire.KvIterator.init(input);
+    while (it.next() catch null) |_| {}
+
+    var f3 = io_compat.fixedBufferStream(input);
+    _ = moq_obj.readSubgroupHeader(&f3) catch {};
+    _ = moq_obj.readDatagramObject(input) catch {};
+    var f4 = io_compat.fixedBufferStream(input);
+    _ = moq_obj.readFetchStreamHeader(&f4) catch {};
+
+    const parsed = moq_msg.parseEnvelope(input) catch return;
+    const body = parsed.env.payload;
+    _ = moq_msg.decodeSetupPayload(body) catch {};
+    _ = moq_msg.decodeGoaway(body) catch {};
+    _ = moq_msg.decodeRequestOk(body, kvs) catch {};
+    _ = moq_msg.decodeRequestError(body) catch {};
+    _ = moq_msg.decodeRequestUpdate(body) catch {};
+    _ = moq_msg.decodeSubscribe(body, ns) catch {};
+    _ = moq_msg.decodeSubscribeOk(body) catch {};
+    _ = moq_msg.decodePublish(body, ns) catch {};
+    _ = moq_msg.decodePublishOk(body) catch {};
+    _ = moq_msg.decodePublishDone(body) catch {};
+    _ = moq_msg.decodePublishNamespace(body, ns) catch {};
+    _ = moq_msg.decodeSubscribeNamespace(body, ns) catch {};
+    _ = moq_msg.decodeNamespace(body, ns) catch {};
+    _ = moq_msg.decodeFetch(body, ns) catch {};
+    _ = moq_msg.decodeFetchOk(body) catch {};
+    _ = moq_msg.decodeTrackStatus(body, ns) catch {};
+    _ = moq_msg.decodePublishBlocked(body) catch {};
+}
+
+// Writes one valid encoded control message into `buf`, chosen at random.
+// Returns its length, or null if it did not fit.
+fn seedMoqMessage(buf: []u8, rand: std.Random) ?usize {
+    const ns = [_][]const u8{ "moq", "demo" };
+    var fbs = io_compat.fixedBufferStream(buf);
+    const w = &fbs;
+    switch (rand.uintLessThan(u8, 12)) {
+        0 => moq_msg.writeSetup(w, .{ .path = "/moq", .implementation = "fuzz" }) catch return null,
+        1 => moq_msg.writeGoaway(w, .{ .new_uri = "https://x/moq" }) catch return null,
+        2 => moq_msg.writeRequestError(w, .{ .error_code = 3, .reason = "no" }) catch return null,
+        3 => moq_msg.writeSubscribe(w, .{ .track_namespace = &ns, .track_name = "video" }) catch return null,
+        4 => moq_msg.writeSubscribeOk(w, .{ .track_alias = 9, .group_order = .descending }) catch return null,
+        5 => moq_msg.writePublish(w, .{
+            .track_namespace = &ns,
+            .track_name = "video",
+            .track_alias = 2,
+            .publisher_priority = 128,
+        }) catch return null,
+        6 => moq_msg.writePublishOk(w, .{ .largest = .{ .group = 4, .object = 5 } }) catch return null,
+        7 => moq_msg.writePublishDone(w, .{ .status_code = 1, .reason = "bye", .final_group = 3 }) catch return null,
+        8 => moq_msg.writeFetch(w, .{
+            .track_namespace = &ns,
+            .track_name = "video",
+            .subscriber_priority = 1,
+            .group_order = .ascending,
+            .start = .{ .group = 0, .object = 0 },
+            .end = .{ .group = 1, .object = 1 },
+        }) catch return null,
+        9 => moq_msg.writeTrackStatus(w, .{
+            .track_namespace = &ns,
+            .track_name = "audio",
+            .status_code = 0,
+            .largest = .{ .group = 1, .object = 1 },
+        }) catch return null,
+        10 => moq_msg.writeSubscribeNamespace(w, .{ .track_namespace_prefix = &ns }) catch return null,
+        else => moq_msg.writeRequestUpdate(w, .{
+            .subscriber_priority = 3,
+            .group_order = .ascending,
+            .end = .{ .group = 2, .object = 2 },
+        }) catch return null,
+    }
+    return fbs.seek;
 }

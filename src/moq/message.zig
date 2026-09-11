@@ -284,7 +284,8 @@ pub fn decodeSubscribe(payload: []const u8, ns_buf: *NamespaceBuf) !Subscribe {
             },
             PARAM_GROUP_ORDER => {
                 // u8 Param encoding = raw byte.
-                sub.group_order = @enumFromInt(reader.takeByte() catch break);
+                const raw = reader.takeByte() catch break;
+                sub.group_order = track.GroupOrder.fromInt(raw) orelse return Error.MalformedMessage;
             },
             else => break,
         }
@@ -332,7 +333,10 @@ pub fn decodeSubscribeOk(payload: []const u8) !SubscribeOk {
         const key = if (i == 0) delta else prev_key + delta;
         prev_key = key;
         switch (key) {
-            PARAM_GROUP_ORDER => result.group_order = @enumFromInt(reader.takeByte() catch break),
+            PARAM_GROUP_ORDER => {
+                const raw = reader.takeByte() catch break;
+                result.group_order = track.GroupOrder.fromInt(raw) orelse return Error.MalformedMessage;
+            },
             else => break, // unknown key: value shape unknown, stop parsing
         }
     }
@@ -367,7 +371,7 @@ pub fn decodeRequestUpdate(payload: []const u8) !RequestUpdate {
     const order = reader.takeByte() catch return wire.Error.BufferTooShort;
     var u = RequestUpdate{
         .subscriber_priority = pri,
-        .group_order = @enumFromInt(order),
+        .group_order = track.GroupOrder.fromInt(order) orelse return Error.MalformedMessage,
     };
     // The end Location is optional: present only when bytes remain.
     if (fbs.seek < payload.len) {
@@ -579,7 +583,7 @@ pub fn decodeFetch(payload: []const u8, ns_buf: *NamespaceBuf) !Fetch {
         .track_namespace = ns,
         .track_name = name,
         .subscriber_priority = pri,
-        .group_order = @enumFromInt(order),
+        .group_order = track.GroupOrder.fromInt(order) orelse return Error.MalformedMessage,
         .start = .{ .group = try wire.readVarInt(reader), .object = try wire.readVarInt(reader) },
         .end = .{ .group = try wire.readVarInt(reader), .object = try wire.readVarInt(reader) },
     };
