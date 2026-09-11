@@ -7,12 +7,32 @@
 //
 // Usage: node tools/moq_lite_browser_test.mjs           # against the origin
 //        RELAY=1 node tools/moq_lite_browser_test.mjs   # through the relay
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import puppeteer from 'puppeteer';
+
+
+// Chrome caps a serverCertificateHashes cert at 14 days, and the certs
+// directory is untracked — so a fresh checkout has none and an old one has
+// an expired one. Both fail every case identically, which reads like a
+// protocol regression.
+function ensureCert() {
+  const dir = 'interop/browser/certs';
+  const crt = `${dir}/server.crt`;
+  let stale = true;
+  try {
+    const notAfter = execFileSync('openssl', ['x509', '-in', crt, '-noout', '-enddate'],
+      { stdio: ['ignore', 'pipe', 'ignore'] }).toString().split('=')[1].trim();
+    stale = new Date(notAfter).getTime() < Date.now() + 24 * 3600 * 1000;
+  } catch { stale = true; }
+  if (stale) {
+    console.log('regenerating interop/browser/certs (missing or expiring)');
+    execFileSync('interop/browser/generate-cert.sh', { stdio: 'ignore' });
+  }
+}
 
 const ROOT = path.resolve('interop/browser');
 const HTTP_PORT = 8125;
@@ -24,6 +44,8 @@ const procs = [];
 const cleanup = () => procs.forEach((p) => { try { p.kill('SIGKILL'); } catch {} });
 
 try {
+  ensureCert();
+
   const serverArgs = VIA_RELAY
     ? ['--port', String(MOQ_PORT),
        '--cert', 'interop/browser/certs/server.crt',
