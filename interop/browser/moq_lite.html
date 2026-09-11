@@ -1,0 +1,273 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>moq-lite subscriber</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem; }
+  h1 { font-size: 1.1rem; }
+  label { display: block; margin: .4rem 0; }
+  input { font: inherit; width: 26rem; }
+  #status { font-weight: 600; }
+  #log { white-space: pre-wrap; border: 1px solid #ccc; padding: .5rem; height: 22rem; overflow: auto; }
+</style>
+
+<h1>moq-lite subscriber (draft-lcurley-moq-lite-05)</h1>
+
+<label>URL <input id="url" value="https://127.0.0.1:4447/"></label>
+<label>Certificate SHA-256 <input id="hash" placeholder="hex, for a self-signed server"></label>
+<label>Broadcast <input id="broadcast" value="clock"></label>
+<label>Track <input id="track" value="seconds"></label>
+<button id="go" onclick="connect()">Subscribe</button>
+
+<p>Status: <span id="status">idle</span> — protocol: <span id="protocol">-</span></p>
+<p>Groups: <span id="groups">0</span>, frames: <span id="frames">0</span></p>
+<div id="log"></div>
+
+<script>
+// A moq-lite client, on the wire, in the browser. Deliberately standalone:
+// the point is to check our server against something that is not our
+// encoder. See SPEC/DRAFT_LCURLEY_MOQ_LITE_05.md for the shapes.
+
+const ALPN = ["moq-lite-05"];
+
+const ControlType = { announce: 1, subscribe: 2, fetch: 3, probe: 4, goaway: 5, track: 6 };
+const DataType = { group: 0, setup: 1 };
+
+const log = (s) => {
+  const el = document.getElementById("log");
+  el.textContent += s + "\n";
+  el.scrollTop = el.scrollHeight;
+};
+const setText = (id, v) => { document.getElementById(id).textContent = String(v); };
+
+// --- QUIC varints (RFC 9000 §16) ---------------------------------------
+
+function varintLen(v) {
+  if (v <= 63n) return 1;
+  if (v <= 16383n) return 2;
+  if (v <= 1073741823n) return 4;
+  return 8;
+}
+
+function writeVarint(out, value) {
+  const v = BigInt(value);
+  const n = varintLen(v);
+  const start = out.length;
+  for (let i = 0; i < n; i++) out.push(0);
+  let x = v;
+  for (let i = n - 1; i >= 0; i--) { out[start + i] = Number(x & 0xffn); x >>= 8n; }
+  // The two high bits of the first byte carry log2 of the length.
+  out[start] |= [0x00, 0x40, 0, 0x80, 0, 0, 0, 0xc0][n - 1];
+  return out;
+}
+
+// Returns [value, bytesRead] or null when `buf` is too short.
+function readVarint(buf, off) {
+  if (off >= buf.length) return null;
+  const n = 1 << (buf[off] >> 6);
+  if (off + n > buf.length) return null;
+  let v = BigInt(buf[off] & 0x3f);
+  for (let i = 1; i < n; i++) v = (v << 8n) | BigInt(buf[off + i]);
+  return [v, n];
+}
+
+function zigzagDecode(u) {
+  return (u >> 1n) ^ -(u & 1n);
+}
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+function writeString(out, s) {
+  const b = enc.encode(s);
+  writeVarint(out, b.length);
+  for (const x of b) out.push(x);
+  return out;
+}
+
+/// varint length + body, which is every control message.
+function framed(bodyBytes) {
+  const out = [];
+  writeVarint(out, bodyBytes.length);
+  return new Uint8Array([...out, ...bodyBytes]);
+}
+
+// --- messages -----------------------------------------------------------
+
+function setupMessage() {
+  // No parameters: PATH is forbidden over WebTransport and we do not probe.
+  return framed(writeVarint([], 0));
+}
+
+function subscribeMessage(id, broadcast, track) {
+  const b = [];
+  writeVarint(b, id);
+  writeString(b, broadcast);
+  writeString(b, track);
+  b.push(0);            // priority
+  b.push(1);            // ordered: older groups first
+  writeVarint(b, 0);    // max latency
+  writeVarint(b, 0);    // group start: latest
+  writeVarint(b, 0);    // group end: unbounded
+  return framed(b);
+}
+
+// --- transport ----------------------------------------------------------
+
+async function readAll(reader, onBytes) {
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    if (value && value.length) onBytes(value);
+  }
+}
+
+function concat(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+let groups = 0, frames = 0;
+
+async function connect() {
+  const url = document.getElementById("url").value;
+  const hashHex = document.getElementById("hash").value.trim();
+  const broadcast = document.getElementById("broadcast").value;
+  const track = document.getElementById("track").value;
+
+  groups = 0; frames = 0;
+  setText("groups", 0); setText("frames", 0);
+  setText("status", "connecting");
+
+  const opts = { protocols: ALPN, congestionControl: "low-latency" };
+  if (hashHex) {
+    opts.serverCertificateHashes = [{
+      algorithm: "sha-256",
+      value: Uint8Array.from(hashHex.match(/../g).map((h) => parseInt(h, 16))),
+    }];
+  }
+
+  let wt;
+  try {
+    wt = new WebTransport(url, opts);
+    await wt.ready;
+  } catch (e) {
+    setText("status", "failed");
+    log("connect failed: " + e.message);
+    return;
+  }
+  setText("status", "connected");
+  setText("protocol", wt.protocol || "(none)");
+  log("connected, protocol=" + (wt.protocol || "(none)"));
+
+  // §6.3.1: our SETUP goes out on its own uni stream, which we then close.
+  // We do not wait for the peer's.
+  const setupStream = await wt.createUnidirectionalStream();
+  const sw = setupStream.getWriter();
+  await sw.write(new Uint8Array([DataType.setup, ...setupMessage()]));
+  await sw.close();
+  log("-> SETUP");
+
+  // The subscription is the stream: closing it unsubscribes.
+  const sub = await wt.createBidirectionalStream();
+  const subw = sub.writable.getWriter();
+  await subw.write(new Uint8Array([ControlType.subscribe, ...subscribeMessage(0, broadcast, track)]));
+  log(`-> SUBSCRIBE ${broadcast}/${track}`);
+
+  readAll(sub.readable.getReader(), (bytes) => handleSubscribeResponse(bytes))
+    .catch((e) => log("subscribe stream: " + e.message));
+
+  // Group streams arrive as unidirectional streams.
+  (async () => {
+    const streams = wt.incomingUnidirectionalStreams.getReader();
+    for (;;) {
+      const { value, done } = await streams.read();
+      if (done) return;
+      handleUniStream(value).catch((e) => log("uni stream: " + e.message));
+    }
+  })().catch((e) => log("accept: " + e.message));
+}
+
+let subBuf = new Uint8Array(0);
+
+function handleSubscribeResponse(bytes) {
+  subBuf = concat(subBuf, bytes);
+  for (;;) {
+    const t = readVarint(subBuf, 0);
+    if (!t) return;
+    const l = readVarint(subBuf, t[1]);
+    if (!l) return;
+    const start = t[1] + l[1];
+    const len = Number(l[0]);
+    if (subBuf.length < start + len) return;
+    const body = subBuf.subarray(start, start + len);
+    const g = readVarint(body, 0);
+    const kind = Number(t[0]);
+    log(["<- SUBSCRIBE_OK", "<- SUBSCRIBE_END", "<- SUBSCRIBE_DROP"][kind] +
+        (g ? ` group=${g[0]}` : ""));
+    subBuf = subBuf.subarray(start + len);
+  }
+}
+
+async function handleUniStream(stream) {
+  const reader = stream.getReader();
+  let buf = new Uint8Array(0);
+  let kind = null;      // stream type, once read
+  let group = null;     // GROUP message, once read
+  let ts = 0n;
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (value && value.length) buf = concat(buf, value);
+    if (done && buf.length === 0) break;
+
+    if (kind === null) {
+      const t = readVarint(buf, 0);
+      if (!t) { if (done) break; continue; }
+      kind = Number(t[0]);
+      buf = buf.subarray(t[1]);
+    }
+
+    if (kind === DataType.setup) {
+      log("<- peer SETUP");
+      break;
+    }
+    if (kind !== DataType.group) { log("<- unknown uni stream " + kind); break; }
+
+    if (group === null) {
+      const l = readVarint(buf, 0);
+      if (!l) { if (done) break; continue; }
+      const len = Number(l[0]);
+      if (buf.length < l[1] + len) { if (done) break; continue; }
+      const body = buf.subarray(l[1], l[1] + len);
+      const sid = readVarint(body, 0);
+      const seq = readVarint(body, sid[1]);
+      group = { sub: sid[0], seq: seq[0] };
+      buf = buf.subarray(l[1] + len);
+      groups++;
+      setText("groups", groups);
+      log(`<- GROUP ${group.seq}`);
+    }
+
+    // Frames: zigzag delta, then length, then payload.
+    for (;;) {
+      const d = readVarint(buf, 0);
+      if (!d) break;
+      const l = readVarint(buf, d[1]);
+      if (!l) break;
+      const start = d[1] + l[1];
+      const len = Number(l[0]);
+      if (buf.length < start + len) break;
+      ts += zigzagDecode(d[0]);
+      const payload = dec.decode(buf.subarray(start, start + len));
+      buf = buf.subarray(start + len);
+      frames++;
+      setText("frames", frames);
+      log(`   ts=${ts} ${payload}`);
+    }
+
+    if (done) break;
+  }
+}
+</script>

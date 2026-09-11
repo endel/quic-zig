@@ -17,7 +17,10 @@ It is what the deployed ecosystem speaks: `moq-relay`, `cdn.moq.dev`, the
 
 | Binary | Purpose |
 | --- | --- |
-| `moq-lite` | `publish` / `subscribe` / `announce` over either transport |
+| `moq-lite` | `publish` / `subscribe` / `announce` over either transport, and `serve` as an origin |
+
+`interop/browser/moq_lite.html` is a standalone JS subscriber — no shared
+code with the Zig encoder, which is the point of it.
 
 ## Wire facts pinned for implementation
 
@@ -190,6 +193,7 @@ so these also cross a version boundary inside the relay.
 | our publish → `moq-relay` → **their** `moq-clock` subscribe | ✅ frames arrive intact |
 | **their** `moq-clock` publish → `moq-relay` → our subscribe | ✅ clock frames and timestamps |
 | our `moq-lite serve` → our subscribe (no relay) | ✅ |
+| our `moq-lite serve` → **browser** (`interop/browser/moq_lite.html`) | ✅ via `tools/moq_lite_browser_test.mjs` |
 
 ## Caveats
 
