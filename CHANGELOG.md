@@ -3,10 +3,38 @@
 Notable changes to quic-zig. Versions follow [semantic versioning](https://semver.org);
 `Unreleased` collects what has landed on `main` since the last tag.
 
-## Unreleased
+## 0.4.0
+
+WebTransport, held to what browsers actually do: one conformance suite that the
+Zig client and Chrome, Firefox and Safari all run against the same server, and
+the draft-13 session flow control Safari needs before it will open a stream.
+MoQ relay and certificate fixes ride along from the same cycle.
 
 ### Fixed
 
+- A WebTransport connection never read its peer's SETTINGS. The WebTransport
+  layer looks at the peer's unidirectional streams before HTTP/3 does, and it
+  consumed the control stream's first read — SETTINGS and all. Nothing looked
+  broken (`webtransport_max_sessions` quietly read as 1, the QPACK dynamic
+  table stayed off) until a feature needed to know what the peer advertised.
+- Datagrams larger than 8 KB were dropped as decryption failures. A peer may
+  fill the path MTU, which on loopback is 16 KB, and the receive buffer was
+  8 KB: such a datagram arrived truncated and failed AEAD authentication. A
+  64 KB WebTransport stream write from Safari lost its first packets and
+  stalled for good. The buffer is now sized from the `max_udp_payload_size` we
+  advertise, and a datagram that still does not fit is reported as truncated
+  rather than left to surface as a decryption error.
+- Every browser lost the WebTransport session close code. Outgoing capsules
+  were written bare instead of inside an HTTP/3 DATA frame (RFC 9297 §3.2), so
+  peers discarded them as an unknown frame type and the session ended on the
+  FIN alone: Chrome and Safari timed out, Firefox reported `closeCode: 0`.
+- A peer's RESET_STREAM or STOP_SENDING on a WebTransport stream never reached
+  the application — the code was recorded and nothing was emitted, so a stream
+  died silently. `onStreamReset` and `onStopSending` now report it with the
+  application error code the peer sent.
+- The draft-13 `WT_MAX_SESSIONS` setting was never sent, despite a comment
+  saying it was emitted alongside the older codepoint. Safari 26.4 reads only
+  the new one.
 - A MoQ subscription through the relay never ended. Our relay ignored the
   publisher's PUBLISH_DONE, so a subscriber sat waiting for objects that were
   never coming — for moq-rs's test client, until its ten-second deadline. Each
@@ -60,6 +88,24 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Added
 
+- WebTransport session flow control (draft-ietf-webtrans-http3-13 §5.3-§5.6):
+  `WT_MAX_STREAMS`, `WT_MAX_DATA` and their `*_BLOCKED` partners. Safari 26.4
+  opens no client-initiated stream without them, so bidirectional and
+  unidirectional streams from Safari now work against a quic-zig server — nine
+  of the ten conformance scenarios it used to fail. Peers that do not speak
+  draft-13, Chrome and Firefox among them, see none of it.
+- `Session.peerSettings()` reports what the peer advertised in its HTTP/3
+  SETTINGS, which is what says which WebTransport draft it speaks.
+- A WebTransport conformance suite: one scenario list that the Zig client and
+  Chrome, Firefox and Safari all run against the same Zig server, so our own
+  client is held to the bar a browser sets. `./tools/wt_conformance.sh`; the
+  Zig leg runs in CI.
+- `ClientConfig.ca = .{ .pinned_hashes = … }` accepts a server by the SHA-256
+  of its leaf certificate, which is how a browser reaches a self-signed test
+  server — the `serverCertificateHashes` equivalent. CertificateVerify still
+  runs.
+- Server-side `Session.drainSession()`, so a Zig server can resolve a browser's
+  `WebTransport.draining` promise. It existed on the client only.
 - `ClientConfig.ca` loads trust anchors — `.system` for the platform store,
   `.file` for a PEM bundle of your own — and turns certificate verification
   on when set. The `ca_cert_path` it replaces had done nothing but log a
