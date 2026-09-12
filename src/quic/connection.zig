@@ -761,6 +761,11 @@ pub const Connection = struct {
         odcid: ?[]const u8,
         retry_scid: ?[]const u8,
     ) !void {
+        // A connection is accepted from a long header: the peer's SCID is the
+        // address we answer to, and a 1-RTT packet carries none. Without this
+        // a short header produced a connection with a zero-length DCID.
+        if (is_server and header.scid.len == 0) return error.PacketError;
+
         var initial_path = NetworkPath.init(local, remote, true);
         // If Retry was used, the path is already validated
         if (odcid != null) {

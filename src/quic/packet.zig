@@ -164,11 +164,14 @@ pub const Header = struct {
     version: u32 = 0,
     packet_type: PacketType = undefined,
 
-    /// Destination Connection ID
-    dcid: []const u8 = undefined,
+    /// Destination Connection ID. Empty until the parser fills it — a short
+    /// header whose DCID does not fit the datagram leaves it unset.
+    dcid: []const u8 = &.{},
 
-    /// Source Connection ID
-    scid: []const u8 = undefined,
+    /// Source Connection ID. Only a long header carries one, so this stays
+    /// empty for every 1-RTT packet. It was `undefined`, which made reading it
+    /// after a short-header parse depend on whatever was on the stack.
+    scid: []const u8 = &.{},
 
     /// The address verification token of the packet. Only present in `Initial`
     /// and `Retry` packets.
@@ -992,6 +995,30 @@ pub fn writeVarInt(writer: anytype, value: u64) !void {
         try writer.writeInt(u64, value | (0b11 << 62), ENDIAN);
     } else {
         return error.VarIntTooLarge;
+    }
+}
+
+test "QUIC: a parsed header hands back real slices, even where it filled none" {
+    // Both defaulted to `undefined`, so a caller that read `scid` after a
+    // short-header parse read the stack. The randomized sweeps found it as a
+    // usize overflow in one test and a failed @intCast in another, on Linux
+    // only — which is what reading undefined memory looks like.
+    {
+        // Short header: one byte of flags, then a DCID the caller sizes.
+        const short = [_]u8{ 0x40, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0xff };
+        var fbs = io.fixedBufferStream(&short);
+        const hdr = try Header.parse(&fbs, 8);
+        try std.testing.expectEqual(PacketType.one_rtt, hdr.packet_type);
+        try std.testing.expectEqual(@as(usize, 0), hdr.scid.len);
+        try std.testing.expectEqual(@as(usize, 8), hdr.dcid.len);
+    }
+    {
+        // ... and a DCID that does not fit leaves that one empty too.
+        const truncated = [_]u8{ 0x40, 0xde, 0xad };
+        var fbs = io.fixedBufferStream(&truncated);
+        const hdr = try Header.parse(&fbs, 8);
+        try std.testing.expectEqual(@as(usize, 0), hdr.dcid.len);
+        try std.testing.expectEqual(@as(usize, 0), hdr.scid.len);
     }
 }
 
