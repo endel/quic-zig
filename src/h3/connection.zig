@@ -669,50 +669,58 @@ pub const H3Connection = struct {
             defer self.allocator.free(data);
             if (data.len == 0) continue;
 
-            var fbs = io.fixedBufferStream(data);
-            const stream_type = h3_frame.readUniStreamType(&fbs) catch |err| {
-                std.log.debug("H3 uni stream type parse error on stream {d}: {}", .{ stream_id, err });
-                continue;
-            };
-
-            switch (stream_type) {
-                .control => {
-                    self.peer_control_stream_id = stream_id;
-                    // If there's remaining data, buffer it for SETTINGS parsing
-                    if (fbs.seek < data.len) {
-                        const remaining = data[fbs.seek..];
-                        var buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-                        try buf.appendSlice(self.allocator, remaining);
-                        try self.stream_bufs.put(stream_id, buf);
-                    }
-                },
-                .qpack_encoder => {
-                    self.peer_qpack_enc_stream_id = stream_id;
-                    // Buffer remaining data (encoder instructions after type byte)
-                    if (fbs.seek < data.len) {
-                        const remaining = data[fbs.seek..];
-                        self.qpack_decoder.processEncoderInstruction(remaining) catch {
-                            self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
-                            return error.H3GeneralProtocolError;
-                        };
-                    }
-                },
-                .qpack_decoder => {
-                    self.peer_qpack_dec_stream_id = stream_id;
-                    // Buffer remaining data (decoder instructions after type byte)
-                    if (fbs.seek < data.len) {
-                        const remaining = data[fbs.seek..];
-                        self.qpack_encoder.processDecoderInstruction(remaining) catch {
-                            self.closeWithError(.general_protocol_error, "QPACK decoder stream error");
-                            return error.H3GeneralProtocolError;
-                        };
-                    }
-                },
-                .push => {}, // ignore server push
-            }
+            try self.adoptUniStream(stream_id, data);
         }
 
         return null;
+    }
+
+    /// Claim a peer uni stream by its type byte, and take whatever followed it.
+    ///
+    /// Public because the WebTransport layer polls the same receive streams
+    /// looking for its own stream type, and `read()` transfers ownership: the
+    /// first read of the peer's control stream usually carries the SETTINGS
+    /// with it, and whoever gets there first has to hand them over.
+    pub fn adoptUniStream(self: *H3Connection, stream_id: u64, data: []const u8) !void {
+        var fbs = io.fixedBufferStream(data);
+        const stream_type = h3_frame.readUniStreamType(&fbs) catch |err| {
+            std.log.debug("H3 uni stream type parse error on stream {d}: {}", .{ stream_id, err });
+            return;
+        };
+        const remaining = data[fbs.seek..];
+
+        switch (stream_type) {
+            .control => {
+                self.peer_control_stream_id = stream_id;
+                // If there's remaining data, buffer it for SETTINGS parsing
+                if (remaining.len > 0) {
+                    var buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                    try buf.appendSlice(self.allocator, remaining);
+                    try self.stream_bufs.put(stream_id, buf);
+                }
+            },
+            .qpack_encoder => {
+                self.peer_qpack_enc_stream_id = stream_id;
+                // Buffer remaining data (encoder instructions after type byte)
+                if (remaining.len > 0) {
+                    self.qpack_decoder.processEncoderInstruction(remaining) catch {
+                        self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
+                        return error.H3GeneralProtocolError;
+                    };
+                }
+            },
+            .qpack_decoder => {
+                self.peer_qpack_dec_stream_id = stream_id;
+                // Buffer remaining data (decoder instructions after type byte)
+                if (remaining.len > 0) {
+                    self.qpack_encoder.processDecoderInstruction(remaining) catch {
+                        self.closeWithError(.general_protocol_error, "QPACK decoder stream error");
+                        return error.H3GeneralProtocolError;
+                    };
+                }
+            },
+            .push => {}, // ignore server push
+        }
     }
 
     /// Poll the peer's control stream for SETTINGS/GOAWAY frames.
@@ -1135,11 +1143,7 @@ pub const H3Connection = struct {
 
     /// Consume `consumed` bytes from the front of a stream buffer.
     fn consumeFrameFromBuf(_: *H3Connection, buf: *std.ArrayList(u8), consumed: usize) void {
-        const remaining = buf.items.len - consumed;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, buf.items[0..remaining], buf.items[consumed..]);
-        }
-        buf.items.len = remaining;
+        h3_frame.consumeFromBuf(buf, consumed);
     }
 
     /// Process data from peer's QPACK encoder and decoder streams.

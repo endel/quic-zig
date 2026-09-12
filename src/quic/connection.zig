@@ -1910,6 +1910,7 @@ pub const Connection = struct {
                 }
                 if (self.streams.getStream(ss.stream_id)) |s| {
                     s.send.reset(ss.error_code);
+                    s.send.peer_stop_sending = ss.error_code;
                 }
             },
 

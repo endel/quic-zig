@@ -1,0 +1,323 @@
+{
+  "$comment": [
+    "The authoritative WebTransport conformance scenario list. Both runners —",
+    "interop/conformance/scenarios.mjs (browsers) and apps/wpt_client.zig (Zig) —",
+    "read this file and refuse to start unless they implement exactly these ids,",
+    "so a scenario cannot quietly exist on only one side.",
+    "",
+    "handler/query name a path on apps/wpt_server.zig, which mirrors the Python",
+    "handlers in web-platform-tests/wpt/webtransport/handlers.",
+    "",
+    "runners lists who can run it: a browser is left out when the API the",
+    "scenario needs does not exist there. expect_fail records a known failure",
+    "with its reason, so a red cell is a tracked cell rather than a surprise."
+  ],
+  "scenarios": [
+    {
+      "id": "connect-echo",
+      "handler": "echo.py",
+      "title": "establish and close a session",
+      "exercises": [
+        "WebTransport()",
+        "ready",
+        "close()",
+        "closed"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "client-close-code",
+      "handler": "echo.py",
+      "title": "client close carries code and reason to the server",
+      "exercises": [
+        "close(WebTransportCloseInfo)",
+        "closed"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "server-close-code0",
+      "handler": "server-close.py?code=0&reason=bye",
+      "title": "server close with code 0 and a reason",
+      "exercises": [
+        "closed",
+        "WebTransportCloseInfo.reason"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "server-close-code42",
+      "handler": "server-close.py?code=42&reason=test",
+      "title": "server close with a non-zero code",
+      "exercises": [
+        "closed",
+        "WebTransportCloseInfo.closeCode"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "server-close-code3999",
+      "handler": "server-close.py?code=3999&reason=max",
+      "title": "server close with the largest code WPT exercises",
+      "exercises": [
+        "closed",
+        "WebTransportCloseInfo.closeCode"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "server-connection-close",
+      "handler": "server-connection-close.py",
+      "title": "abrupt QUIC close rejects rather than resolves",
+      "exercises": [
+        "closed"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "bidi-echo-small",
+      "handler": "echo.py",
+      "title": "echo a short message on a bidirectional stream",
+      "exercises": [
+        "createBidirectionalStream()",
+        "WebTransportSendStream"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "bidi-echo-3-streams",
+      "handler": "echo.py",
+      "title": "three concurrent bidirectional streams stay distinct",
+      "exercises": [
+        "createBidirectionalStream()"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "bidi-echo-64kb",
+      "handler": "echo.py",
+      "title": "64 KB round trip on a bidirectional stream",
+      "exercises": [
+        "createBidirectionalStream()"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "uni-echo",
+      "handler": "echo.py",
+      "title": "client uni stream echoed back on a new server uni stream",
+      "exercises": [
+        "createUnidirectionalStream()",
+        "incomingUnidirectionalStreams"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "uni-echo-64kb",
+      "handler": "echo.py",
+      "title": "64 KB on a unidirectional stream",
+      "exercises": [
+        "createUnidirectionalStream()",
+        "incomingUnidirectionalStreams"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "uni-multiple-streams",
+      "handler": "server-create-multiple-streams.py?count=5",
+      "title": "five server uni streams all arrive, whole and distinct",
+      "exercises": [
+        "incomingUnidirectionalStreams"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ],
+      "expect_fail": {
+        "firefox": "Firefox 148 surfaces only 2 of the 5; Chrome and the Zig client receive all five from the same server, and the peer granted max_uni=100, so this is not stream credit."
+      }
+    },
+    {
+      "id": "datagram-echo",
+      "handler": "echo.py",
+      "title": "datagram round trip",
+      "exercises": [
+        "datagrams.readable",
+        "datagrams.createWritable()"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "datagram-maxsize",
+      "handler": "echo.py",
+      "title": "maxDatagramSize is positive",
+      "exercises": [
+        "datagrams.maxDatagramSize"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "datagram-length-echo",
+      "handler": "echo-datagram-length.py",
+      "title": "a datagram at maxDatagramSize arrives whole",
+      "exercises": [
+        "datagrams.maxDatagramSize",
+        "datagrams.readable"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ],
+      "expect_fail": {
+        "safari": "Safari 26.4 reports maxDatagramSize as the QUIC max_datagram_frame_size (65535) rather than a path-MTU-derived size, so a datagram of that size is refused by its own stack. Chrome reports 1024 and the Zig client 1199."
+      }
+    },
+    {
+      "id": "server-abort-stream",
+      "handler": "abort-stream-from-server.py?code=42",
+      "title": "a server RESET_STREAM surfaces with its application code",
+      "exercises": [
+        "incomingUnidirectionalStreams",
+        "WebTransportError.streamErrorCode"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "client-abort-stream",
+      "handler": "abort-echo.py",
+      "title": "a client RESET_STREAM reaches the server with its code",
+      "exercises": [
+        "WebTransportSendStream.abort(code)"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "server-stop-sending",
+      "handler": "stop-sending.py?code=19",
+      "title": "a server STOP_SENDING surfaces with its application code",
+      "exercises": [
+        "WebTransportSendStream",
+        "WebTransportError.streamErrorCode"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
+    },
+    {
+      "id": "server-drain",
+      "handler": "server-drain.py",
+      "title": "DRAIN_WEBTRANSPORT_SESSION resolves draining without closing",
+      "exercises": [
+        "draining"
+      ],
+      "runners": [
+        "zig",
+        "firefox",
+        "safari"
+      ],
+      "expect_fail": {
+        "safari-preview": "Safari Technology Preview 27.0 never resolves `WebTransport.draining` on a WT_DRAIN_SESSION capsule: the scenario times out in both clean runs of three, where release 26.4 passes it in all three against the same server. Preview's own regression, alongside the server-connection-close one."
+      }
+    },
+    {
+      "id": "wt-protocol-negotiation",
+      "handler": "echo.py",
+      "title": "WT-Available-Protocols offer answered with WT-Protocol",
+      "exercises": [
+        "WebTransportOptions.protocols",
+        "protocol"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ],
+      "expect_fail": {
+        "firefox": "WebTransport.protocol lands in Firefox 155; 148 leaves it undefined."
+      }
+    }
+  ]
+}

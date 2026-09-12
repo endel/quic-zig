@@ -99,6 +99,10 @@ pub const RecvResult = struct {
     from_addr: posix.sockaddr.storage,
     addr_len: posix.socklen_t,
     ecn: u2,
+    /// The datagram was longer than `buf` and the tail is gone. Worth saying
+    /// out loud: a truncated QUIC packet fails AEAD authentication, so it
+    /// otherwise surfaces as a decryption failure rather than a short read.
+    truncated: bool = false,
 };
 
 /// Receive a UDP datagram and extract the ECN codepoint from ancillary data.
@@ -180,6 +184,7 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
         .from_addr = from_addr,
         .addr_len = addr_len,
         .ecn = ecn,
+        .truncated = msg.flags & @as(i32, @intCast(posix.MSG.TRUNC)) != 0,
     };
 }
 

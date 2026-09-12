@@ -429,7 +429,7 @@ cross-impl byte-exact UTF-8 header check.
 | § | Section | Status | Notes |
 |---|---------|--------|-------|
 | — | Extended CONNECT handshake | ✅ Done | RFC 9220 |
-| — | WT SETTINGS negotiation | ✅ Done | ENABLE_WEBTRANSPORT + WT_MAX_SESSIONS |
+| — | WT SETTINGS negotiation | ✅ Done | ENABLE_WEBTRANSPORT + WT_MAX_SESSIONS, under both the pre-draft-13 and draft-13 (0x14e9cd29) codepoints |
 | — | Bidi streams (0x41 prefix) | ✅ Done | Type prefix + session ID |
 | — | Uni streams (0x54 prefix) | ✅ Done | Type prefix + session ID |
 | — | Datagram demux | ✅ Done | quarter_stream_id routing |
@@ -438,20 +438,31 @@ cross-impl byte-exact UTF-8 header check.
 | — | CLOSE_WEBTRANSPORT_SESSION (0x2843) | ✅ Done | Capsule send/receive, error code + reason (up to 1024 bytes) |
 | — | DRAIN_WEBTRANSPORT_SESSION (0x78ae) | ✅ Done | Graceful shutdown capsule, session_draining event |
 | — | WEBTRANSPORT_SESSION_GONE (0x170d7b68) | ✅ Done | Streams reset with this code on session close |
-| — | WEBTRANSPORT_BUFFERED_STREAM_REJECTED (0x3994bd84) | ✅ Done | Streams to unknown sessions rejected |
+| — | WEBTRANSPORT_BUFFERED_STREAM_REJECTED (0x3994bd84) | ❌ Missing | Constant declared, never sent. A stream naming an unknown session is registered and surfaced instead — see the test at `src/webtransport/session.zig` |
 | — | Stream error code remapping | ✅ Done | appErrorCodeToH3() maps 32-bit codes to H3 range, resetStream() API |
 | — | H3_ID_ERROR validation | ✅ Done | Invalid session IDs (not client-initiated bidi) close connection |
 | — | H3_MESSAGE_ERROR post-close | ✅ Done | Data on CONNECT stream after CLOSE triggers reset |
-| — | Sub-protocol negotiation | ✅ Done | Via sec-webtransport-protocol / WebTransport-Subprotocol headers |
+| — | Application-protocol negotiation | ✅ Done | draft-13 §3.3 `WT-Available-Protocols` / `WT-Protocol`, RFC 8941 structured fields (`src/webtransport/protocol.zig`). The older `sec-webtransport-protocol` spelling survives only in the interop apps |
 | — | Session prioritization | ✅ Done | Priority header on CONNECT parsed by H3 layer, PRIORITY_UPDATE frames supported |
 | — | GOAWAY → session interaction | ✅ Done | H3 GOAWAY triggers session_draining events for active WT sessions |
+| — | Capsules ride in H3 DATA frames | ✅ Done | RFC 9297 §3.2. Sent bare until Sep 2026, which cost every browser the close code |
+| — | Peer RESET_STREAM / STOP_SENDING reported | ✅ Done | `stream_reset` / `stream_stop_sending` events, `onStreamReset` / `onStopSending` callbacks; codes mapped back with `h3ToAppErrorCode` |
+| — | Session flow control (§5.3-§5.6) | ✅ Done | `WT_MAX_STREAMS` / `WT_MAX_DATA` and their `*_BLOCKED` partners, granted per session and raised as the peer spends them. Binds only when both endpoints sent the draft-13 `WT_MAX_SESSIONS` above one (§5.1), which is what keeps it invisible to Chrome and quic-go. This is what lets Safari 26.4 open a client-initiated stream |
+| — | draft-13 §5.5 initial credits in SETTINGS | ⚠️ Partial | `WT_INITIAL_MAX_DATA` / `_STREAMS_BIDI` / `_STREAMS_UNI` serialize and are configurable, but are **not advertised by default**: Safari 26.4 refuses the session outright when it sees them. The same credit reaches every peer as a capsule instead — `SPEC/DRAFT_IETF_WEBTRANS_HTTP3_13.md` |
+| — | RESET_STREAM_AT reliable reset | ❌ Missing | Needed by draft-13; `TODO.md` I5 |
 
-### Summary — WebTransport: ✅ Complete (17/17)
+### Summary — WebTransport: 20 done, 1 partial, 2 missing
 
 | Status | Count |
 |--------|-------|
-| ✅ Done | 17 |
-| ❌ Missing | 0 |
+| ✅ Done | 20 |
+| ⚠️ Partial | 1 |
+| ❌ Missing | 2 |
+
+Conformance against three browsers and our own client:
+`SPEC/webtransport_conformance.md`. What of draft-13 is implemented, and the
+decisions inside §5: `SPEC/DRAFT_IETF_WEBTRANS_HTTP3_13.md`. API gap analysis
+against the W3C spec: `SPEC/webtransport_w3c_api.md`.
 
 ---
 
@@ -547,7 +558,7 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | RFC 9221 (QUIC DG) | 3 | 0 | 0 | 100% |
 | RFC 9368 (Version Neg) | 3 | 0 | 0 | 100% |
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
-| WebTransport | 17 | 0 | 0 | 100% |
+| WebTransport | 20 | 1 | 2 | 87% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
 | MoQ Transport (draft-17, -18) | 15 | 1 | 0 | see below |
 | moq-lite (draft-05) | 6 | 2 | 1 | see below |

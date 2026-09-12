@@ -283,6 +283,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         .uni_stream => |us| {
                             std.debug.print("WT new uni stream {d} on session {d}\n", .{ us.stream_id, us.session_id });
                         },
+                        .stream_reset => |rst| {
+                            std.debug.print("WT stream {d} reset by peer (code={d})\n", .{ rst.stream_id, rst.error_code });
+                        },
+                        .stream_stop_sending => |ss| {
+                            std.debug.print("WT stream {d} STOP_SENDING from peer (code={d})\n", .{ ss.stream_id, ss.error_code });
+                        },
                         .session_rejected => {},
                     }
                 }

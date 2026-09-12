@@ -15,6 +15,15 @@ pub const H3FrameType = enum(u64) {
     priority_update = 0xF0700, // RFC 9218
     close_webtransport_session = 0x2843, // draft-ietf-webtrans-http3
     drain_webtransport_session = 0x78ae, // draft-ietf-webtrans-http3
+    // draft-ietf-webtrans-http3-13 §5.6 session flow control. Capsules, not
+    // H3 frames: they travel inside DATA on a session's CONNECT stream, which
+    // is the same TLV grammar, so they share this table.
+    wt_max_data = 0x190B4D3D,
+    wt_max_streams_bidi = 0x190B4D3F,
+    wt_max_streams_uni = 0x190B4D40,
+    wt_data_blocked = 0x190B4D41,
+    wt_streams_blocked_bidi = 0x190B4D43,
+    wt_streams_blocked_uni = 0x190B4D44,
     // Sentinel for frame types not recognized by this implementation.
     // Never sent on the wire; constructed only when parse() encounters an
     // unknown type (e.g. RFC 9114 GREASE frames 0x1f*N+0x21).
@@ -32,6 +41,12 @@ pub const H3FrameType = enum(u64) {
             0xF0700 => .priority_update,
             0x2843 => .close_webtransport_session,
             0x78ae => .drain_webtransport_session,
+            0x190B4D3D => .wt_max_data,
+            0x190B4D3F => .wt_max_streams_bidi,
+            0x190B4D40 => .wt_max_streams_uni,
+            0x190B4D41 => .wt_data_blocked,
+            0x190B4D43 => .wt_streams_blocked_bidi,
+            0x190B4D44 => .wt_streams_blocked_uni,
             else => null,
         };
     }
@@ -100,10 +115,12 @@ pub const Settings = struct {
     h3_datagram: bool = false,
     enable_webtransport: bool = false,
     webtransport_max_sessions: ?u64 = null,
-    // draft-ietf-webtrans-http3-13 §9.2. Null = not advertised (spec default = 0).
-    // On serialization, `webtransport_max_sessions` is emitted under BOTH the
-    // pre-draft-13 ID and the draft-13 ID (wt_max_sessions_v13) — Safari 26.4
-    // only reads the new one, Chrome reads the old.
+    /// draft-13 renamed this codepoint. Set independently of the legacy field
+    /// so a peer can be served one draft, the other, or both.
+    wt_max_sessions_v13: ?u64 = null,
+    // draft-ietf-webtrans-http3-13 §9.2 per-session credits.
+    // Null = not advertised, which the peer reads as the spec default of 0 —
+    // i.e. it may not open WT streams or send session bytes at all.
     wt_initial_max_data: ?u64 = null,
     wt_initial_max_streams_bidi: ?u64 = null,
     wt_initial_max_streams_uni: ?u64 = null,
@@ -133,6 +150,15 @@ pub const H3Frame = union(H3FrameType) {
     priority_update: PriorityUpdate,
     close_webtransport_session: CloseWebtransportSession,
     drain_webtransport_session: void,
+    /// §5.6.4: cumulative bytes the peer may send on the session.
+    wt_max_data: u64,
+    /// §5.6.2: cumulative streams of that type the peer may open.
+    wt_max_streams_bidi: u64,
+    wt_max_streams_uni: u64,
+    /// §5.6.5, §5.6.3: the limit the sender was sitting at when it blocked.
+    wt_data_blocked: u64,
+    wt_streams_blocked_bidi: u64,
+    wt_streams_blocked_uni: u64,
     unknown: void,
 };
 
@@ -218,6 +244,7 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
                         .enable_webtransport, .wt_enabled => settings.enable_webtransport = (value != 0),
                         .webtransport_max_sessions, .wt_max_sessions_v13 => {
                             settings.webtransport_max_sessions = value;
+                            if (id == .wt_max_sessions_v13) settings.wt_max_sessions_v13 = value;
                             // Draft-13 §9.2: max_sessions > 0 IS the enablement signal
                             // (SETTINGS_WT_ENABLED was removed). Mirror to the legacy
                             // flag so existing call sites work regardless of draft.
@@ -277,6 +304,19 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
             } };
         },
         .drain_webtransport_session => .{ .drain_webtransport_session = {} },
+        // §5.6: every flow control capsule is one varint. A longer payload is
+        // legal padding and is skipped by `consumed`, not by this read.
+        inline .wt_max_data,
+        .wt_max_streams_bidi,
+        .wt_max_streams_uni,
+        .wt_data_blocked,
+        .wt_streams_blocked_bidi,
+        .wt_streams_blocked_uni,
+        => |t| blk: {
+            var vfbs = io.fixedBufferStream(payload);
+            const value = packet.readVarInt(&vfbs) catch return error.MalformedFrame;
+            break :blk @unionInit(H3Frame, @tagName(t), value);
+        },
         .unknown => unreachable, // .unknown is only produced by the fromInt fallback above
     };
 
@@ -337,7 +377,11 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
                 try packet.writeVarInt(sw, @intFromEnum(SettingsId.webtransport_max_sessions));
                 try packet.writeVarInt(sw, max_sessions);
             }
-            // draft-15 §9.2 per-session WT credits. Default 0 = peer refuses to
+            if (s.wt_max_sessions_v13) |max_sessions| {
+                try packet.writeVarInt(sw, @intFromEnum(SettingsId.wt_max_sessions_v13));
+                try packet.writeVarInt(sw, max_sessions);
+            }
+            // draft-13 §9.2 per-session WT credits. Default 0 = peer refuses to
             // open WT streams / send bytes. Required for Safari 26.4 bidi.
             if (s.wt_initial_max_data) |n| {
                 try packet.writeVarInt(sw, @intFromEnum(SettingsId.wt_initial_max_data));
@@ -414,8 +458,31 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
             try packet.writeVarInt(writer, 0x78ae);
             try packet.writeVarInt(writer, 0); // zero-length payload
         },
+        .wt_max_data,
+        .wt_max_streams_bidi,
+        .wt_max_streams_uni,
+        .wt_data_blocked,
+        .wt_streams_blocked_bidi,
+        .wt_streams_blocked_uni,
+        => |n, capsule| try writeVarIntCapsule(writer, capsule, n),
         .unknown => {}, // never serialized
     }
+}
+
+/// Type + length + one varint: the shape every §5.6 flow control capsule has.
+fn writeVarIntCapsule(writer: anytype, capsule: H3FrameType, value: u64) !void {
+    try packet.writeVarInt(writer, @intFromEnum(capsule));
+    try packet.writeVarInt(writer, packet.varIntLength(value));
+    try packet.writeVarInt(writer, value);
+}
+
+/// Drop the `n` bytes a parse consumed from the front of a stream buffer.
+/// Both the HTTP/3 request/control streams and the WebTransport capsule stream
+/// parse out of an ArrayList they then have to compact.
+pub fn consumeFromBuf(buf: *std.ArrayList(u8), n: usize) void {
+    const remaining = buf.items.len - n;
+    if (remaining > 0) std.mem.copyForwards(u8, buf.items[0..remaining], buf.items[n..]);
+    buf.items.len = remaining;
 }
 
 /// Write a uni stream type byte to a writer.
@@ -449,6 +516,45 @@ test "H3Frame: unknown frame type parsed as .unknown (RFC 9114 §7.2.8 GREASE)" 
     // The next frame should parse as SETTINGS.
     const next = try parse(grease_with_settings[result.consumed..]);
     try testing.expectEqual(H3FrameType.settings, std.meta.activeTag(next.frame));
+}
+
+test "H3Frame: flow control capsules match the draft-13 §9.6 codepoints" {
+    // Asserted as bytes, not round-tripped: a round trip against our own
+    // encoder proves self-consistency, and these codepoints are how a browser
+    // recognises the capsule at all. 4-byte varint, prefix 0b10.
+    const cases = [_]struct { frame: H3Frame, bytes: []const u8 }{
+        .{ .frame = .{ .wt_max_data = 0x1234 }, .bytes = &.{ 0x99, 0x0b, 0x4d, 0x3d, 0x02, 0x52, 0x34 } },
+        .{ .frame = .{ .wt_max_streams_bidi = 100 }, .bytes = &.{ 0x99, 0x0b, 0x4d, 0x3f, 0x02, 0x40, 0x64 } },
+        .{ .frame = .{ .wt_max_streams_uni = 100 }, .bytes = &.{ 0x99, 0x0b, 0x4d, 0x40, 0x02, 0x40, 0x64 } },
+        .{ .frame = .{ .wt_data_blocked = 0 }, .bytes = &.{ 0x99, 0x0b, 0x4d, 0x41, 0x01, 0x00 } },
+        .{ .frame = .{ .wt_streams_blocked_bidi = 0 }, .bytes = &.{ 0x99, 0x0b, 0x4d, 0x43, 0x01, 0x00 } },
+        .{ .frame = .{ .wt_streams_blocked_uni = 7 }, .bytes = &.{ 0x99, 0x0b, 0x4d, 0x44, 0x01, 0x07 } },
+    };
+
+    for (cases) |c| {
+        var buf: [32]u8 = undefined;
+        var fbs = io.fixedBufferStream(&buf);
+        try write(c.frame, &fbs);
+        try testing.expectEqualSlices(u8, c.bytes, fbs.buffered());
+
+        const parsed = try parse(c.bytes);
+        try testing.expectEqual(c.bytes.len, parsed.consumed);
+        try testing.expectEqualDeep(c.frame, parsed.frame);
+    }
+}
+
+test "H3Frame: a padded flow control capsule reads its value and skips the rest" {
+    // The Length may exceed the varint (§5.6 says nothing about padding, and
+    // RFC 9297 capsules carry their own length): read one varint, consume all.
+    const padded = [_]u8{ 0x99, 0x0b, 0x4d, 0x3f, 0x04, 0x40, 0x2a, 0xff, 0xff };
+    const parsed = try parse(&padded);
+    try testing.expectEqual(@as(u64, 42), parsed.frame.wt_max_streams_bidi);
+    try testing.expectEqual(@as(usize, 9), parsed.consumed);
+}
+
+test "H3Frame: an empty flow control capsule is malformed" {
+    const truncated = [_]u8{ 0x99, 0x0b, 0x4d, 0x3d, 0x00 };
+    try testing.expectError(error.MalformedFrame, parse(&truncated));
 }
 
 test "H3Frame: write and parse DATA" {

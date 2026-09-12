@@ -483,6 +483,13 @@ pub const TlsConfig = struct {
     alpn: []const []const u8,
     server_name: ?[]const u8 = null, // SNI (client only)
     skip_cert_verify: bool = true, // Skip X.509 chain + CertificateVerify validation
+    /// SHA-256 fingerprints of acceptable leaf certificates — the
+    /// `serverCertificateHashes` bargain from the W3C WebTransport API. When
+    /// set, the fingerprint stands in for the chain, the hostname and the
+    /// validity dates, and none of those are checked. Requires
+    /// `skip_cert_verify = false`, or CertificateVerify never runs and the pin
+    /// proves only that someone copied a public certificate.
+    cert_hashes: ?[]const [32]u8 = null,
     ca_bundle: ?*Certificate.Bundle = null, // Caller-owned CA bundle for trust anchor verification
     session_ticket: ?*const SessionTicket = null, // Stored ticket from previous connection (client)
     ticket_key: ?[16]u8 = null, // AES-128-GCM key for encrypting/decrypting tickets (server)
@@ -1135,7 +1142,28 @@ pub const Tls13Handshake = struct {
             const ext_len = (@as(usize, body[pos]) << 8) | @as(usize, body[pos + 1]);
             pos += 2 + ext_len;
 
-            if (!self.config.skip_cert_verify) {
+            if (self.config.cert_hashes) |hashes| {
+                // Pinned by leaf fingerprint: only the leaf is examined, and
+                // only to lift the public key CertificateVerify needs.
+                if (cert_index == 0) {
+                    const cert: Certificate = .{ .buffer = cert_der, .index = 0 };
+                    const parsed = cert.parse() catch return error.BadCertificate;
+                    const pub_key = parsed.pubKey();
+                    if (pub_key.len <= self.leaf_pub_key_buf.len) {
+                        @memcpy(self.leaf_pub_key_buf[0..pub_key.len], pub_key);
+                        self.leaf_pub_key_len = @intCast(pub_key.len);
+                        self.leaf_pub_key_algo = std.meta.activeTag(parsed.pub_key_algo);
+                    }
+
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(cert_der, &digest, .{});
+                    var matched = false;
+                    for (hashes) |h| {
+                        if (std.mem.eql(u8, &h, &digest)) matched = true;
+                    }
+                    if (!matched) return error.BadCertificate;
+                }
+            } else if (!self.config.skip_cert_verify) {
                 const cert: Certificate = .{ .buffer = cert_der, .index = 0 };
                 const parsed = cert.parse() catch return error.BadCertificate;
 

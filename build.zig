@@ -224,6 +224,18 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_wpt.addArgs(args);
     b.step("run-wpt-server", "Run WPT WebTransport test server").dependOn(&run_wpt.step);
 
+    const exe_wpt_client = App.add(b, "wpt-client", "apps/wpt_client.zig", target, optimize, need_libc, lib_mod);
+    // The scenario manifest is shared with the browser runner, so it is read
+    // from its own directory rather than copied next to the app.
+    exe_wpt_client.root_module.addAnonymousImport("conformance_scenarios", .{
+        .root_source_file = b.path("interop/conformance/scenarios.json"),
+    });
+    b.installArtifact(exe_wpt_client);
+    const run_wpt_client = b.addRunArtifact(exe_wpt_client);
+    run_wpt_client.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_wpt_client.addArgs(args);
+    b.step("run-wpt-client", "Run the WebTransport conformance client").dependOn(&run_wpt_client.step);
+
     const exe_interop_server = App.add(b, "interop-server", "apps/interop_server.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_interop_server);
     const run_interop_server = b.addRunArtifact(exe_interop_server);

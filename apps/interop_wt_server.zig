@@ -641,6 +641,14 @@ fn pollWtEvents(
             .session_draining => |sd| {
                 std.log.info("WT session {d} draining", .{sd.session_id});
             },
+
+            .stream_reset => |rst| {
+                std.log.info("WT stream {d} reset by peer, code {d}", .{ rst.stream_id, rst.error_code });
+            },
+
+            .stream_stop_sending => |ss| {
+                std.log.info("WT stream {d} STOP_SENDING from peer, code {d}", .{ ss.stream_id, ss.error_code });
+            },
         }
     }
 

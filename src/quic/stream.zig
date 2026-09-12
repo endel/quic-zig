@@ -423,6 +423,11 @@ pub const SendStream = struct {
     /// Whether the stream has been reset.
     reset_err: ?u64 = null,
 
+    /// Code from a STOP_SENDING the peer sent us. `reset_err` is also set so the
+    /// send side stops, but that field carries local intent too — only this one
+    /// says the peer asked. WebTransport reports it as a distinct event.
+    peer_stop_sending: ?u64 = null,
+
     /// Whether a RESET_STREAM frame has been queued for sending.
     reset_stream_sent: bool = false,
 

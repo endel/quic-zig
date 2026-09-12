@@ -202,7 +202,7 @@ const MyHandler = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
 
     pub fn onSessionReady(_: *MyHandler, session: *event_loop.ClientSession, session_id: u64) void {
-        const stream_id = session.openBidiStream(session_id) catch return;
+        const stream_id = session.openBidiStream(session_id, null) catch return; // null = no sendOrder
         session.sendStreamData(stream_id, "Hello!") catch {};
         session.closeStream(stream_id);
 
@@ -230,7 +230,7 @@ pub fn main() !void {
         .address = "127.0.0.1",
         .port = 4433,
         .server_name = "localhost",
-        .ca_cert_path = "ca.crt",
+        .ca = .{ .file = "ca.crt" },
     });
     defer client.deinit();
     try client.run();
@@ -245,9 +245,11 @@ pub fn main() !void {
 | `port` | `4433` | Server port |
 | `server_name` | `"localhost"` | TLS SNI / CONNECT authority |
 | `path` | `"/.well-known/webtransport"` | WebTransport CONNECT path |
-| `ca_cert_path` | `null` | CA certificate for TLS verification |
+| `ca` | `.none` | Trust anchors: `.none`, `.system`, `.file` (a PEM bundle), or `.pinned_hashes` (SHA-256 leaf fingerprints, the `serverCertificateHashes` equivalent). Anything but `.none` turns `skip_cert_verify` off |
 | `skip_cert_verify` | `false` | Skip certificate verification (testing only) |
 | `max_datagram_frame_size` | `65536` | QUIC datagram frame size limit |
+| `wt_credits` | QUIC's own limits | draft-13 §5.6 session credit granted to the peer, per session: `.max_streams_bidi`, `.max_streams_uni`, `.max_data` |
+| `wt_advertise_credits` | `false` | Also announce those credits in SETTINGS (§5.5). Off: Safari 26.4 refuses the session when it sees them |
 | `ipv6` | `false` | Use IPv6 dual-stack socket |
 | `tls_config` | `null` | Override TLS config directly |
 | `conn_config` | `null` | Override QUIC connection config |
@@ -263,6 +265,8 @@ Handler callbacks (all optional):
 | `onDatagram(session, session_id, data)` | Datagram received |
 | `onBidiStream(session, session_id, stream_id)` | Incoming bidi stream opened |
 | `onUniStream(session, session_id, stream_id)` | Incoming uni stream opened |
+| `onStreamReset(session, session_id, stream_id, error_code)` | Peer reset a stream — the `WebTransportError.streamErrorCode` equivalent |
+| `onStopSending(session, session_id, stream_id, error_code)` | Peer asked us to stop sending on a stream |
 | `onSessionClosed(session, session_id, error_code, reason)` | Session closed |
 | `onSessionDraining(session, session_id)` | Session draining |
 | `onPollComplete(session)` | Called each poll cycle |

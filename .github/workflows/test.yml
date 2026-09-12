@@ -31,3 +31,9 @@ jobs:
 
       - name: Fuzz (smoke test)
         run: zig build fuzz
+
+      # The Zig leg of the WebTransport conformance suite: a real client and a
+      # real server over a socket, no browser needed. The browser legs stay
+      # local — see SPEC/webtransport_conformance.md.
+      - name: WebTransport conformance (Zig client)
+        run: ./tools/wt_conformance.sh --zig-only

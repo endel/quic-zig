@@ -14,6 +14,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { execFileSync } from 'child_process';
+import { MANIFEST, BODIES, assertComplete, scenariosFor } from '../conformance/scenarios.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_URL = process.env.WT_SERVER || '127.0.0.1:4433';
@@ -29,7 +31,25 @@ for (let i = 0; i < args.length; i++) {
   if (args[i] === '--browser' && args[i + 1]) browserType = args[++i];
   if (args[i] === '--firefox') browserType = 'firefox';
   if (args[i] === '--safari') browserType = 'safari';
+  if (args[i] === '--safari-preview') browserType = 'safari-preview';
 }
+
+// An expired cert fails every test identically, which reads as a protocol
+// regression rather than a 13-day certificate that lapsed overnight.
+function ensureCert() {
+  try {
+    const end = execSync(`openssl x509 -in "${CERT_PATH}" -noout -enddate`).toString().trim();
+    const expiry = new Date(end.replace('notAfter=', ''));
+    if (expiry.getTime() - Date.now() > 24 * 3600 * 1000) return;
+    console.log(`  Certificate expires ${expiry.toISOString()} — regenerating`);
+  } catch {
+    console.log('  No usable certificate — generating one');
+  }
+  execFileSync(path.join(__dirname, 'generate-cert.sh'), { stdio: 'inherit' });
+}
+ensureCert();
+
+assertComplete();
 
 // Compute cert hash
 const certHash = execSync(
@@ -42,7 +62,7 @@ console.log(`Server:    ${SERVER_URL}`);
 console.log(`Browser:   ${browserType}`);
 
 // Generate test HTML with cert hash baked in
-function generateTestPage(testName, testCode) {
+function generateTestPage(test) {
   // Both Chrome and Firefox support serverCertificateHashes
   const useHash = true;
   return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>
@@ -50,18 +70,39 @@ function generateTestPage(testName, testCode) {
 const CERT_HASH = new Uint8Array([${hashBytes.join(',')}]);
 const SERVER = '${SERVER_URL}';
 const USE_CERT_HASH = ${useHash};
+// The handler path comes from the manifest, so the scenario body cannot name
+// one the manifest disagrees with.
+const HANDLER = '${test.handler}';
 
 function wtUrl(handler) {
   return 'https://' + SERVER + '/webtransport/handlers/' + handler;
 }
 
-function createWT(handler) {
+function createWT(handler, extra) {
   const url = wtUrl(handler);
-  const opts = USE_CERT_HASH
-    ? { serverCertificateHashes: [{ algorithm: 'sha-256', value: CERT_HASH.buffer }] }
-    : {};
-  const wt = new WebTransport(url, opts);
-  return wt;
+  const opts = Object.assign({}, extra || {});
+  if (USE_CERT_HASH) {
+    opts.serverCertificateHashes = [{ algorithm: 'sha-256', value: CERT_HASH.buffer }];
+  }
+  return new WebTransport(url, opts);
+}
+
+// Chrome takes the init dictionary as the only argument; the W3C IDL puts a
+// message first. Try both rather than picking one and being wrong somewhere.
+function webTransportError(code) {
+  try {
+    return new WebTransportError('abort', { streamErrorCode: code });
+  } catch {
+    return new WebTransportError({ streamErrorCode: code });
+  }
+}
+
+// Safari 26.4 dropped the datagrams.writable attribute for createWritable();
+// Chrome and Firefox still only have writable. Neither is safe to assume.
+function datagramWriter(wt) {
+  const d = wt.datagrams;
+  const w = typeof d.createWritable === 'function' ? d.createWritable() : d.writable;
+  return w.getWriter();
 }
 
 async function readStream(readable) {
@@ -85,7 +126,7 @@ async function readStreamText(readable) {
 }
 
 async function runTest() {
-  ${testCode}
+  ${test.code}
 }
 
 async function main() {
@@ -103,191 +144,41 @@ main();
 </script></body></html>`;
 }
 
-// Test definitions
-const TESTS = [
-  {
-    name: 'connect-echo',
-    code: `
-      const wt = createWT('echo.py');
-      await wt.ready;
-      wt.close();
-      await wt.closed;
-      return 'ok';
-    `,
-  },
-  {
-    name: 'client-close-code',
-    code: `
-      const wt = createWT('echo.py');
-      await wt.ready;
-      wt.close({ closeCode: 7, reason: 'done' });
-      const info = await wt.closed;
-      if (info.closeCode !== 7) throw new Error('code=' + info.closeCode);
-      if (info.reason !== 'done') throw new Error('reason=' + info.reason);
-      return 'ok';
-    `,
-  },
-  {
-    name: 'server-close-code0',
-    code: `
-      const wt = createWT('server-close.py?code=0&reason=bye');
-      await wt.ready;
-      const info = await wt.closed;
-      if (info.closeCode !== 0) throw new Error('code=' + info.closeCode);
-      if (info.reason !== 'bye') throw new Error('reason=' + info.reason);
-      return 'ok';
-    `,
-  },
-  {
-    name: 'server-close-code42',
-    code: `
-      const wt = createWT('server-close.py?code=42&reason=test');
-      await wt.ready;
-      const info = await wt.closed;
-      if (info.closeCode !== 42) throw new Error('code=' + info.closeCode);
-      return 'ok';
-    `,
-  },
-  {
-    name: 'server-close-code3999',
-    code: `
-      const wt = createWT('server-close.py?code=3999&reason=max');
-      await wt.ready;
-      const info = await wt.closed;
-      if (info.closeCode !== 3999) throw new Error('code=' + info.closeCode);
-      return 'ok';
-    `,
-  },
-  {
-    name: 'server-connection-close',
-    code: `
-      const wt = createWT('server-connection-close.py');
-      await wt.ready;
-      try { await wt.closed; } catch (e) { return 'ok: ' + e.message; }
-      return 'ok';
-    `,
-  },
-  {
-    name: 'bidi-echo-small',
-    code: `
-      const wt = createWT('echo.py');
-      await wt.ready;
-      const s = await wt.createBidirectionalStream();
-      const w = s.writable.getWriter();
-      await w.write(new TextEncoder().encode('hello'));
-      await w.close();
-      const text = await readStreamText(s.readable);
-      wt.close();
-      if (text !== 'hello') throw new Error('got "' + text + '"');
-      return 'ok';
-    `,
-  },
-  {
-    name: 'bidi-echo-3-streams',
-    code: `
-      const wt = createWT('echo.py');
-      await wt.ready;
-      const results = await Promise.all([0,1,2].map(async i => {
-        const s = await wt.createBidirectionalStream();
-        const w = s.writable.getWriter();
-        const msg = 'msg' + i;
-        await w.write(new TextEncoder().encode(msg));
-        await w.close();
-        const text = await readStreamText(s.readable);
-        if (text !== msg) throw new Error('stream ' + i + ': "' + text + '"');
-        return text;
-      }));
-      wt.close();
-      return results.join(',');
-    `,
-  },
-  {
-    name: 'bidi-echo-64kb',
-    code: `
-      const wt = createWT('echo.py');
-      await wt.ready;
-      const s = await wt.createBidirectionalStream();
-      const w = s.writable.getWriter();
-      const sent = new Uint8Array(65536);
-      for (let i = 0; i < sent.length; i++) sent[i] = i & 0xff;
-      await w.write(sent);
-      await w.close();
-      const recv = await readStream(s.readable);
-      wt.close();
-      if (recv.length !== 65536) throw new Error(recv.length + ' bytes');
-      return 'ok (' + recv.length + 'B)';
-    `,
-  },
-  {
-    name: 'uni-echo',
-    code: `
-      const wt = createWT('echo.py');
-      await wt.ready;
-      const sendStream = await wt.createUnidirectionalStream();
-      const w = sendStream.getWriter();
-      await w.write(new TextEncoder().encode('uni-test'));
-      await w.close();
-      const reader = wt.incomingUnidirectionalStreams.getReader();
-      const { value: recvStream } = await reader.read();
-      reader.releaseLock();
-      const text = await readStreamText(recvStream);
-      wt.close();
-      if (text !== 'uni-test') throw new Error('got "' + text + '"');
-      return 'ok';
-    `,
-  },
-  {
-    name: 'datagram-echo',
-    code: `
-      const wt = createWT('echo.py');
-      await wt.ready;
-      const w = wt.datagrams.writable.getWriter();
-      await w.write(new TextEncoder().encode('dg-test'));
-      w.releaseLock();
-      const r = wt.datagrams.readable.getReader();
-      const { value } = await r.read();
-      r.releaseLock();
-      const text = new TextDecoder().decode(value);
-      wt.close();
-      if (text !== 'dg-test') throw new Error('got "' + text + '"');
-      return 'ok';
-    `,
-  },
-  {
-    name: 'datagram-maxsize',
-    code: `
-      const wt = createWT('echo.py');
-      await wt.ready;
-      const sz = wt.datagrams.maxDatagramSize;
-      wt.close();
-      if (sz <= 0) throw new Error('maxDatagramSize=' + sz);
-      return 'ok (' + sz + ')';
-    `,
-  },
-  {
-    name: 'server-abort-stream',
-    code: `
-      const wt = createWT('abort-stream-from-server.py?code=42');
-      await wt.ready;
-      const reader = wt.incomingBidirectionalStreams.getReader();
-      try {
-        const result = await Promise.race([
-          reader.read(),
-          new Promise((_, r) => setTimeout(() => r(new Error('no-stream')), 3000)),
-        ]);
-        reader.releaseLock();
-        const r = result.value.readable.getReader();
-        try { await r.read(); } catch (e) { wt.close(); return 'ok: stream reset'; }
-        wt.close();
-        return 'ok: stream readable';
-      } catch (e) {
-        reader.releaseLock();
-        wt.close();
-        return 'ok: ' + e.message;
-      }
-    `,
-  },
-];
+// Test definitions come from the shared manifest; this runner only decides
+// which of them this browser is expected to be able to run.
+let passed = 0, failed = 0, xfailed = 0;
+const failures = [];
+const results = [];
+
+// A scenario the manifest already marks as failing here is reported but not
+// counted against the run; one that starts passing IS counted, so a stale note
+// gets noticed instead of quietly outliving the bug it describes.
+function record(test, ok, detail) {
+  if (ok && !test.expectFail) {
+    passed++;
+    console.log(`\x1b[32mPASS\x1b[0m ${detail}`);
+  } else if (ok && test.expectFail) {
+    failed++;
+    console.log(`\x1b[33mXPASS\x1b[0m ${detail}`);
+    failures.push({ name: test.name, error: `passed although marked expect_fail — drop the note: ${test.expectFail}` });
+  } else if (!ok && test.expectFail) {
+    xfailed++;
+    console.log(`\x1b[33mXFAIL\x1b[0m ${detail}`);
+  } else {
+    failed++;
+    console.log(`\x1b[31mFAIL\x1b[0m ${detail}`);
+    failures.push({ name: test.name, error: detail });
+  }
+  results.push({ id: test.name, ok, expected_fail: test.expectFail ?? null, detail });
+}
+
+const TESTS = scenariosFor(browserType).map((s) => ({
+  name: s.id,
+  handler: s.handler,
+  title: s.title,
+  expectFail: s.expect_fail?.[browserType] ?? null,
+  code: BODIES[s.id],
+}));
 
 async function main() {
   // Start a simple HTTP server to serve test pages
@@ -296,7 +187,7 @@ async function main() {
     const test = TESTS.find(t => t.name === testName);
     if (test) {
       res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(generateTestPage(test.name, test.code));
+      res.end(generateTestPage(test));
     } else {
       res.writeHead(404);
       res.end('Not found');
@@ -306,8 +197,14 @@ async function main() {
 
   console.log(`Browser:   ${browserType}\n`);
 
+  // Safari drives through safaridriver below and needs no Puppeteer browser;
+  // launching one anyway made a Safari run fail when Chrome was not installed.
+  const safari = browserType === 'safari' || browserType === 'safari-preview';
+
   let browser;
-  if (browserType === 'firefox') {
+  if (safari) {
+    // nothing to launch
+  } else if (browserType === 'firefox') {
     // Firefox needs the CA cert imported into a profile.
     // Create a temp profile, import cert, then launch.
     const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-wpt-'));
@@ -353,23 +250,40 @@ async function main() {
     ? TESTS.filter(t => t.name.includes(filterArg))
     : TESTS;
 
-  let passed = 0, failed = 0;
-  const failures = [];
 
   console.log(`Running ${testsToRun.length} tests...\n`);
 
-  if (browserType === 'safari') {
-    // Safari: use safaridriver via WebDriver protocol
+  if (safari) {
+    // Safari: use safaridriver via WebDriver protocol. Technology Preview
+    // ships its own driver and its own Allow Remote Automation setting, so it
+    // gets its own binary and port rather than a capability flag.
     const { execSync, spawn } = await import('child_process');
-    const driverProc = spawn('safaridriver', ['-p', '9515'], { stdio: 'ignore' });
+    const preview = browserType === 'safari-preview';
+    const driverBin = preview
+      ? '/Applications/Safari Technology Preview.app/Contents/MacOS/safaridriver'
+      : 'safaridriver';
+    const wdPort = preview ? 9516 : 9515;
+    const driverProc = spawn(driverBin, ['-p', String(wdPort)], { stdio: 'ignore' });
     await new Promise(r => setTimeout(r, 1500));
 
+    // safaridriver wedges from time to time — it stops answering and the next
+    // request hangs until undici's header timeout fires. Bound every call and
+    // return null instead of throwing, so one stuck scenario costs one result
+    // rather than the rest of the run.
     async function wdFetch(method, path, body) {
-      const url = `http://localhost:9515${path}`;
-      const opts = { method, headers: { 'Content-Type': 'application/json' } };
+      const url = `http://localhost:${wdPort}${path}`;
+      const opts = {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(TEST_TIMEOUT + 5000),
+      };
       if (body) opts.body = JSON.stringify(body);
-      const res = await fetch(url, opts);
-      return res.json();
+      try {
+        const res = await fetch(url, opts);
+        return await res.json();
+      } catch {
+        return null;
+      }
     }
 
     for (const test of testsToRun) {
@@ -377,13 +291,14 @@ async function main() {
 
       // Create new session per test
       const sessRes = await wdFetch('POST', '/session', {
-        capabilities: { alwaysMatch: { browserName: 'safari' } }
+        // Preview reports itself under its full product name, not 'safari'.
+        capabilities: { alwaysMatch: { browserName: preview ? 'Safari Technology Preview' : 'safari' } },
       });
       const sid = sessRes?.value?.sessionId;
       if (!sid) {
-        console.log(`\x1b[31mFAIL\x1b[0m could not create session`);
-        failed++;
-        failures.push({ name: test.name, error: 'session creation failed' });
+        // safaridriver's own message is the useful one — it names the setting
+        // that is off, and Technology Preview has its own copy of it.
+        record(test, false, sessRes?.value?.message || 'could not create session');
         continue;
       }
 
@@ -399,22 +314,23 @@ async function main() {
         while (Date.now() < deadline) {
           await new Promise(r => setTimeout(r, 200));
           const titleRes = await wdFetch('GET', `/session/${sid}/title`);
+          if (titleRes === null) throw new Error('safaridriver stopped responding');
           const title = titleRes?.value || '';
           if (title.startsWith('PASS:')) { result = title.slice(5); break; }
           if (title.startsWith('FAIL:')) { throw new Error(title.slice(5)); }
         }
         if (result === null) throw new Error('runner timeout');
 
-        console.log(`\x1b[32mPASS\x1b[0m ${result}`);
-        passed++;
+        record(test, true, result);
       } catch (err) {
-        const msg = err.message || String(err);
-        console.log(`\x1b[31mFAIL\x1b[0m ${msg}`);
-        failed++;
-        failures.push({ name: test.name, error: msg });
+        record(test, false, err.message || String(err));
       }
 
       await wdFetch('DELETE', `/session/${sid}`);
+      if (driverProc.exitCode !== null) {
+        console.log('  safaridriver exited — remaining scenarios not run');
+        break;
+      }
     }
 
     driverProc.kill();
@@ -446,13 +362,9 @@ async function main() {
           check();
         });
 
-        console.log(`\x1b[32mPASS\x1b[0m ${result}`);
-        passed++;
+        record(test, true, result);
       } catch (err) {
-        const msg = err.message || String(err);
-        console.log(`\x1b[31mFAIL\x1b[0m ${msg}`);
-        failed++;
-        failures.push({ name: test.name, error: msg });
+        record(test, false, err.message || String(err));
         if (consoleLogs.length) {
           for (const log of consoleLogs.slice(-5)) {
             console.log(`    console: ${log}`);
@@ -468,7 +380,11 @@ async function main() {
   server.close();
 
   console.log(`\n${'─'.repeat(50)}`);
-  console.log(`  \x1b[32m${passed} passed\x1b[0m  \x1b[31m${failed} failed\x1b[0m`);
+  const xf = xfailed ? `  \x1b[33m${xfailed} expected-fail\x1b[0m` : '';
+  console.log(`  \x1b[32m${passed} passed\x1b[0m  \x1b[31m${failed} failed\x1b[0m${xf}`);
+  if (process.env.RESULTS_JSON) {
+    fs.writeFileSync(process.env.RESULTS_JSON, JSON.stringify({ runner: browserType, results }, null, 2));
+  }
   if (failures.length) {
     console.log('\n  Failures:');
     for (const f of failures) {

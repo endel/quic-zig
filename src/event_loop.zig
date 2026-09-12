@@ -25,7 +25,10 @@ const h3 = @import("h3/connection.zig");
 const h0 = @import("h0/connection.zig");
 const http1 = @import("http1/server.zig");
 const qpack = @import("h3/qpack.zig");
+const h3_frame = @import("h3/frame.zig");
 const wt = @import("webtransport/session.zig");
+const wt_fc = @import("webtransport/flow_control.zig");
+const transport_params = @import("quic/transport_params.zig");
 const packet = @import("quic/packet.zig");
 const Certificate = std.crypto.Certificate;
 const ca_bundle = @import("quic/ca_bundle.zig");
@@ -34,6 +37,12 @@ pub const Protocol = enum { quic, h3, h0, webtransport };
 
 pub const Http1Config = http1.Http1Config;
 
+/// The largest datagram we can receive whole. It has to be whatever we tell
+/// peers they may send — a longer one is truncated by recvmsg and then fails
+/// AEAD authentication, which reads as a decryption bug rather than a short
+/// read. Safari fills the 16 KB loopback MTU and found that the hard way.
+const MAX_RECV_DATAGRAM: usize = (transport_params.TransportParams{}).max_udp_payload_size;
+
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
     port: u16 = 4433,
@@ -41,6 +50,34 @@ pub const Config = struct {
     key_path: []const u8 = "interop/certs/server.key",
     max_datagram_frame_size: u64 = 65536,
     webtransport_max_sessions: u64 = 4,
+    /// draft-ietf-webtrans-http3-13 §5.3-§5.6 session flow control: the window
+    /// each session grants its peer, handed over as a WT_MAX_STREAMS /
+    /// WT_MAX_DATA capsule when the session opens and raised as the peer
+    /// spends it.
+    ///
+    /// A zero grants nothing, which stops a draft-13 peer opening any stream at
+    /// all. Peers that never sent the draft-13 WT_MAX_SESSIONS get no capsules
+    /// and no limits either way; see `webtransport.flowControlEnabled`.
+    wt_credits: wt_fc.Credits = wt_fc.Credits.default,
+
+    /// Also announce those windows in SETTINGS, as §5.5 allows, so a peer may
+    /// open a stream in the same flight as its CONNECT rather than waiting for
+    /// the capsule.
+    ///
+    /// Off, because it costs a live browser: Safari 26.4 rejects the session
+    /// outright — every scenario, `connect-echo` included — when
+    /// SETTINGS_WT_INITIAL_MAX_DATA / _STREAMS_BIDI / _UNI (0x2b61, 0x2b65,
+    /// 0x2b64) are present, and goes back to passing when they are not.
+    /// Measured both ways; `WT_SETTINGS_CREDITS=1` on `wpt-server` reproduces it.
+    /// Nothing is lost meanwhile: the per-session capsule carries the same
+    /// credit to every peer that implements §5.6.
+    wt_advertise_credits: bool = false,
+
+    /// Also advertise the pre-draft-13 WebTransport settings
+    /// (ENABLE_WEBTRANSPORT, WT_ENABLED, the old WT_MAX_SESSIONS codepoint).
+    /// Chrome and Firefox read those; Safari 26.4 reads only the draft-13 ones,
+    /// which are always sent.
+    wt_legacy_settings: bool = true,
     require_retry: bool = false,
 
     // Advanced: provide pre-built TLS and connection configs directly.
@@ -136,6 +173,15 @@ pub const Session = struct {
         }
     }
 
+    /// Signal graceful shutdown without closing: the peer stops opening new
+    /// streams but finishes what is in flight. This is what resolves a
+    /// browser's `WebTransport.draining`.
+    pub fn drainSession(self: *Session, session_id: u64) !void {
+        if (self.entry.wt_conn) |wtc| {
+            try wtc.drainSession(session_id);
+        }
+    }
+
     pub fn resetStream(self: *Session, stream_id: u64, error_code: u32) void {
         if (self.entry.wt_conn) |wtc| {
             wtc.resetStream(stream_id, error_code);
@@ -152,6 +198,15 @@ pub const Session = struct {
         if (self.entry.wt_conn) |wtc| {
             try wtc.acceptSessionWithHeaders(session_id, extra_headers);
         }
+    }
+
+    /// What the peer advertised in its HTTP/3 SETTINGS, once they have
+    /// arrived. Worth logging when a peer's WebTransport behaviour is in
+    /// question: which draft's codepoints it speaks is in here.
+    pub fn peerSettings(self: *const Session) ?h3_frame.Settings {
+        const h3c = self.entry.h3_conn orelse return null;
+        if (!h3c.peer_settings_received) return null;
+        return h3c.peer_settings;
     }
 
     pub fn getStats(self: *const Session) connection.Connection.Stats {
@@ -262,9 +317,10 @@ pub fn Server(comptime Handler: type) type {
         const known = [_][]const u8{
             "onConnectRequest", "onSessionReady",  "onStreamData",
             "onDatagram",       "onSessionClosed", "onSessionDraining",
-            "onBidiStream",     "onUniStream",     "onPollComplete",
-            "onRequest",        "onData",          "onH0Request",
-            "onH0Data",         "onH0Finished",
+            "onBidiStream",     "onUniStream",     "onStreamReset",
+            "onStopSending",    "onPollComplete",  "onRequest",
+            "onData",           "onH0Request",     "onH0Data",
+            "onH0Finished",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -280,7 +336,8 @@ pub fn Server(comptime Handler: type) type {
                     @compileError("Handler has unrecognized callback '" ++ decl.name ++
                         "'. Known callbacks: onRequest, onData, onConnectRequest, " ++
                         "onSessionReady, onStreamData, onDatagram, onSessionClosed, " ++
-                        "onSessionDraining, onBidiStream, onUniStream, onPollComplete, " ++
+                        "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
+                        "onStopSending, onPollComplete, " ++
                         "onH0Request, onH0Data, onH0Finished");
                 }
             }
@@ -317,7 +374,7 @@ pub fn Server(comptime Handler: type) type {
         sockfd: posix.socket_t,
         local_addr: posix.sockaddr.storage,
         batch: ecn_socket.SendBatch,
-        recv_buf: [8192]u8,
+        recv_buf: [MAX_RECV_DATAGRAM]u8,
         out_buf: [1500]u8,
 
         /// Shared by every H3Connection on this loop — one 16 KB buffer for
@@ -337,6 +394,14 @@ pub fn Server(comptime Handler: type) type {
 
         /// Optional HTTP/1.1 static file server (runs on a separate thread).
         http1_server: ?http1.Http1Server,
+
+        /// WebTransport SETTINGS advertised to every peer, from Config.
+        wt_settings: struct {
+            max_sessions: u64,
+            legacy: bool,
+            advertise_credits: bool,
+            credits: wt_fc.Credits,
+        },
 
         const PreferredSocket = struct {
             sockfd: posix.socket_t,
@@ -501,6 +566,12 @@ pub fn Server(comptime Handler: type) type {
                 .owned_tls = owned_tls,
                 .preferred = preferred,
                 .http1_server = http1_server,
+                .wt_settings = .{
+                    .max_sessions = config.webtransport_max_sessions,
+                    .legacy = config.wt_legacy_settings,
+                    .advertise_credits = config.wt_advertise_credits,
+                    .credits = config.wt_credits,
+                },
             };
         }
 
@@ -707,6 +778,9 @@ pub fn Server(comptime Handler: type) type {
                     break;
                 };
                 received = true;
+                if (recv_result.truncated) {
+                    std.log.warn("datagram truncated at {d} bytes — raise MAX_RECV_DATAGRAM", .{recv_result.bytes_read});
+                }
 
                 switch (self.conn_mgr.recvDatagram(
                     self.recv_buf[0..recv_result.bytes_read],
@@ -800,14 +874,19 @@ pub fn Server(comptime Handler: type) type {
                     h3c.local_settings = .{
                         .enable_connect_protocol = true,
                         .h3_datagram = true,
-                        .enable_webtransport = true,
-                        .webtransport_max_sessions = 4,
+                        .enable_webtransport = self.wt_settings.legacy,
+                        .webtransport_max_sessions = if (self.wt_settings.legacy) self.wt_settings.max_sessions else null,
+                        .wt_max_sessions_v13 = self.wt_settings.max_sessions,
+                        .wt_initial_max_data = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_data),
+                        .wt_initial_max_streams_bidi = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_bidi),
+                        .wt_initial_max_streams_uni = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_uni),
                     };
                     entry.h3_conn = h3c;
                     h3c.initConnection() catch return;
 
                     const wtc = self.allocator.create(wt.WebTransportConnection) catch return;
                     wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, entry.conn, true);
+                    wtc.grants = self.wt_settings.credits;
                     entry.wt_conn = wtc;
 
                     // Install zero-copy datagram callback on the QUIC connection.
@@ -897,6 +976,16 @@ pub fn Server(comptime Handler: type) type {
                     .uni_stream => |us| {
                         if (@hasDecl(Handler, "onUniStream")) {
                             self.handler.onUniStream(&session, us.session_id, us.stream_id);
+                        }
+                    },
+                    .stream_reset => |rst| {
+                        if (@hasDecl(Handler, "onStreamReset")) {
+                            self.handler.onStreamReset(&session, rst.session_id, rst.stream_id, rst.error_code);
+                        }
+                    },
+                    .stream_stop_sending => |ss| {
+                        if (@hasDecl(Handler, "onStopSending")) {
+                            self.handler.onStopSending(&session, ss.session_id, ss.stream_id, ss.error_code);
                         }
                     },
                     .session_rejected => {},
@@ -1188,6 +1277,12 @@ pub fn Server(comptime Handler: type) type {
 // Client
 // ---------------------------------------------------------------------------
 
+/// draft-13 §5.5: a credit is announced in SETTINGS only when we chose to.
+/// Absent means the peer starts at zero and waits for the per-session capsule.
+fn announced(advertise: bool, credit: u64) ?u64 {
+    return if (advertise) credit else null;
+}
+
 pub const ClientConfig = struct {
     // Target server
     address: []const u8 = "127.0.0.1",
@@ -1211,6 +1306,12 @@ pub const ClientConfig = struct {
     /// anywhere you trust. `.system` reads the platform's store, `.file` a
     /// PEM bundle of your own — a private CA, an interop peer's.
     ///
+    /// `.pinned_hashes` is the browsers' `serverCertificateHashes`: SHA-256
+    /// fingerprints of leaf certificates to accept outright. The fingerprint
+    /// replaces the chain, the hostname and the validity dates, so it reaches
+    /// a self-signed server the trust store knows nothing about — the same
+    /// bargain that lets a browser talk to our test server.
+    ///
     /// Anything but `.none` also turns `skip_cert_verify` off.
     ///
     /// Each client loads its own copy — about 13 ms for the 163 certificates
@@ -1221,11 +1322,17 @@ pub const ClientConfig = struct {
         none,
         system,
         file: []const u8,
+        pinned_hashes: []const [32]u8,
     } = .none,
     skip_cert_verify: bool = false,
 
     // QUIC transport
     max_datagram_frame_size: u64 = 65536,
+
+    /// draft-13 §5.6 session flow control. See the identically named `Config`
+    /// fields.
+    wt_credits: wt_fc.Credits = wt_fc.Credits.default,
+    wt_advertise_credits: bool = false,
 
     // Advanced overrides
     tls_config: ?tls13.TlsConfig = null,
@@ -1487,7 +1594,8 @@ pub fn Client(comptime Handler: type) type {
             "onSessionReady",    "onSessionRejected",
             "onDatagram",        "onSessionClosed",
             "onSessionDraining", "onBidiStream",
-            "onUniStream",
+            "onUniStream",       "onStreamReset",
+            "onStopSending",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -1505,7 +1613,8 @@ pub fn Client(comptime Handler: type) type {
                         "onHeaders, onData, onFinished, onSettings, onGoaway, " ++
                         "onStreamData, " ++
                         "onSessionReady, onSessionRejected, onDatagram, onSessionClosed, " ++
-                        "onSessionDraining, onBidiStream, onUniStream");
+                        "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
+                        "onStopSending");
                 }
             }
         }
@@ -1543,7 +1652,7 @@ pub fn Client(comptime Handler: type) type {
         sockfd: posix.socket_t,
         local_addr: posix.sockaddr.storage,
         batch: ecn_socket.SendBatch,
-        recv_buf: [8192]u8,
+        recv_buf: [MAX_RECV_DATAGRAM]u8,
         out_buf: [1500]u8,
 
         /// Shared by every H3Connection on this loop — one 16 KB buffer for
@@ -1572,6 +1681,10 @@ pub fn Client(comptime Handler: type) type {
         path: []const u8,
         connect_headers: []const qpack.Header,
 
+        /// draft-13 §5.6 session windows, mirrored from ClientConfig.
+        wt_credits: wt_fc.Credits,
+        wt_advertise_credits: bool,
+
         /// The default ALPN list, when we built it rather than the caller.
         owned_alpn: ?[][]const u8,
 
@@ -1592,23 +1705,34 @@ pub fn Client(comptime Handler: type) type {
 
                 // On the heap: init() returns by value, so a bundle stored
                 // in the client would move out from under this pointer.
-                if (config.ca != .none) {
-                    const b = try alloc.create(Certificate.Bundle);
-                    errdefer alloc.destroy(b);
-                    b.* = switch (config.ca) {
-                        .none => unreachable,
-                        .system => try ca_bundle.loadSystem(alloc),
-                        .file => |path| try ca_bundle.loadFile(alloc, path),
-                    };
-                    owned_ca = b;
+                switch (config.ca) {
+                    .none, .pinned_hashes => {},
+                    .system, .file => {
+                        const b = try alloc.create(Certificate.Bundle);
+                        errdefer alloc.destroy(b);
+                        b.* = switch (config.ca) {
+                            .system => try ca_bundle.loadSystem(alloc),
+                            .file => |path| try ca_bundle.loadFile(alloc, path),
+                            else => unreachable,
+                        };
+                        owned_ca = b;
+                    },
                 }
+
+                const pins: ?[]const [32]u8 = switch (config.ca) {
+                    .pinned_hashes => |h| h,
+                    else => null,
+                };
 
                 break :blk .{
                     .cert_chain_der = &.{},
                     .private_key_bytes = &.{},
                     .alpn = alpn,
                     .server_name = config.server_name,
-                    .skip_cert_verify = if (owned_ca != null) false else config.skip_cert_verify,
+                    // Pinning needs CertificateVerify, so it forces verification
+                    // on just as a trust store does.
+                    .skip_cert_verify = if (owned_ca != null or pins != null) false else config.skip_cert_verify,
+                    .cert_hashes = pins,
                     .ca_bundle = owned_ca,
                 };
             };
@@ -1705,6 +1829,8 @@ pub fn Client(comptime Handler: type) type {
                 .server_name = config.server_name,
                 .path = config.path,
                 .connect_headers = config.connect_headers,
+                .wt_credits = config.wt_credits,
+                .wt_advertise_credits = config.wt_advertise_credits,
                 .owned_alpn = owned_alpn,
                 .owned_ca = owned_ca,
             };
@@ -1855,6 +1981,9 @@ pub fn Client(comptime Handler: type) type {
                     break;
                 };
                 received = true;
+                if (recv_result.truncated) {
+                    std.log.warn("datagram truncated at {d} bytes — raise MAX_RECV_DATAGRAM", .{recv_result.bytes_read});
+                }
 
                 // Update remote addr (may change due to preferred address migration)
                 self.remote_addr = recv_result.from_addr;
@@ -1916,13 +2045,23 @@ pub fn Client(comptime Handler: type) type {
                         .enable_connect_protocol = true,
                         .h3_datagram = true,
                         .enable_webtransport = true,
-                        .webtransport_max_sessions = 1,
+                        // §5.1 reads a WT_MAX_SESSIONS above one as "this
+                        // endpoint supports several sessions, and therefore
+                        // flow control". A client receives no sessions, but the
+                        // setting is the mutual signal and the number is the
+                        // truth: that many session slots exist.
+                        .webtransport_max_sessions = wt.MAX_SESSIONS,
+                        .wt_max_sessions_v13 = wt.MAX_SESSIONS,
+                        .wt_initial_max_data = announced(self.wt_advertise_credits, self.wt_credits.max_data),
+                        .wt_initial_max_streams_bidi = announced(self.wt_advertise_credits, self.wt_credits.max_streams_bidi),
+                        .wt_initial_max_streams_uni = announced(self.wt_advertise_credits, self.wt_credits.max_streams_uni),
                     };
                     self.h3_conn = h3c;
                     h3c.initConnection() catch return;
 
                     const wtc = self.allocator.create(wt.WebTransportConnection) catch return;
                     wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, self.conn, false);
+                    wtc.grants = self.wt_credits;
                     self.wt_conn = wtc;
 
                     // Send Extended CONNECT to establish WebTransport session
@@ -1994,6 +2133,16 @@ pub fn Client(comptime Handler: type) type {
                     .uni_stream => |us| {
                         if (@hasDecl(Handler, "onUniStream")) {
                             self.handler.onUniStream(&session, us.session_id, us.stream_id);
+                        }
+                    },
+                    .stream_reset => |rst| {
+                        if (@hasDecl(Handler, "onStreamReset")) {
+                            self.handler.onStreamReset(&session, rst.session_id, rst.stream_id, rst.error_code);
+                        }
+                    },
+                    .stream_stop_sending => |ss| {
+                        if (@hasDecl(Handler, "onStopSending")) {
+                            self.handler.onStopSending(&session, ss.session_id, ss.stream_id, ss.error_code);
                         }
                     },
                     .connect_request => {},
