@@ -23,7 +23,7 @@
 | 4.5 | Stream Final Size | ✅ Done | FIN/RESET_STREAM final_size validation, FINAL_SIZE_ERROR on mismatch |
 | 4.6 | Controlling Concurrency | ✅ Done | MAX_STREAMS + STREAMS_BLOCKED; blocked peers are granted accumulated credit, and the last partial batch is granted once the peer is at the limit (bidi and uni) |
 | **5** | **Connections** | | |
-| 5.1 | Connection ID | ✅ Done | LocalCidPool + ConnectionIdPool |
+| 5.1 | Connection ID | ✅ Done | LocalCidPool + ConnectionIdPool. A client's zero-length SCID is accepted (Safari sends one); only a short header is refused as a connection's first packet |
 | 5.1.1 | Issuing Connection IDs | ✅ Done | NEW_CONNECTION_ID with stateless reset tokens |
 | 5.1.2 | Consuming and Retiring CIDs | ✅ Done | RETIRE_CONNECTION_ID, retire_prior_to |
 | 5.2 | Matching Packets to Connections | ✅ Done | CID-based routing via ConnectionManager |

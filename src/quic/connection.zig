@@ -761,10 +761,9 @@ pub const Connection = struct {
         odcid: ?[]const u8,
         retry_scid: ?[]const u8,
     ) !void {
-        // A connection is accepted from a long header: the peer's SCID is the
-        // address we answer to, and a 1-RTT packet carries none. Without this
-        // a short header produced a connection with a zero-length DCID.
-        if (is_server and header.scid.len == 0) return error.PacketError;
+        // A 1-RTT packet carries no SCID to answer to. A long header's may be
+        // empty (RFC 9000 §5.1) — Safari's is — so test the type, not the length.
+        if (is_server and header.packet_type == .one_rtt) return error.PacketError;
 
         var initial_path = NetworkPath.init(local, remote, true);
         // If Retry was used, the path is already validated
@@ -5278,6 +5277,36 @@ test "accept: create server connection" {
     try std.testing.expectEqual(@as(u8, 8), conn.scid_len);
     // Path should be initialized
     try std.testing.expect(conn.path_initialized);
+}
+
+test "accept: a client may choose a zero-length SCID" {
+    // RFC 9000 §5.1 allows it and Safari does it; we answer to an empty DCID.
+    const local = makeIpv4Addr(0, 0, 0, 0, 443);
+    const remote = makeIpv4Addr(192, 168, 1, 100, 12345);
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+
+    var header = packet.Header{
+        .packet_type = .initial,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .dcid = &dcid,
+        .scid = &.{},
+        .token = &.{},
+        .packet_number = 0,
+        .packet_number_len = 1,
+        .remainder_len = 0,
+    };
+
+    var conn = try Connection.accept(std.testing.allocator, header, local, remote, true, .{}, null, null, null);
+    defer conn.deinit();
+    try std.testing.expectEqual(@as(u8, 0), conn.dcid_len);
+    try std.testing.expectEqual(@as(u8, 8), conn.scid_len);
+
+    // A short header still cannot open one.
+    header.packet_type = .one_rtt;
+    try std.testing.expectError(
+        error.PacketError,
+        Connection.accept(std.testing.allocator, header, local, remote, true, .{}, null, null, null),
+    );
 }
 
 test "PathValidator: checkTimeout after max retries" {
