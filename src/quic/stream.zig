@@ -362,6 +362,17 @@ const RetransmitRange = struct {
     fin: bool,
 };
 
+/// Stream bytes committed against the peer's MAX_DATA: everything written to
+/// any stream, less what a reset abandoned unsent. That is what connection
+/// credit will have been spent on once the buffers drain, so it says how far
+/// ahead of the credit an application is before any of it goes out.
+///
+/// Shared by pointer because `writeData` is reached without the map, and
+/// heap-allocated so the pointer survives a move of the owning connection.
+pub const SendLedger = struct {
+    committed: u64 = 0,
+};
+
 /// A QUIC send stream.
 pub const SendStream = struct {
     stream_id: u64,
@@ -428,6 +439,9 @@ pub const SendStream = struct {
     /// says the peer asked. WebTransport reports it as a distinct event.
     peer_stop_sending: ?u64 = null,
 
+    /// The connection's; null for a stream built outside a StreamsMap.
+    ledger: ?*SendLedger = null,
+
     /// Whether a RESET_STREAM frame has been queued for sending.
     reset_stream_sent: bool = false,
 
@@ -452,8 +466,10 @@ pub const SendStream = struct {
         self.write_buffer.deinit(self.allocator);
     }
 
-    /// Write data to the stream. Buffers it for later sending.
+    /// Write data to the stream. Buffers it for later sending. Dropped once the
+    /// stream is reset: RFC 9000 §3.1 lets nothing follow RESET_STREAM.
     pub fn writeData(self: *SendStream, data: []const u8) !void {
+        if (self.reset_err != null) return;
         // Once the stream has buffered more than a few small writes, jump
         // capacity to 4 KiB in one shot. Avoids the 8→16→32→… realloc cascade
         // for streaming workloads (measured 2-5× faster on multi-write patterns)
@@ -467,6 +483,7 @@ pub const SendStream = struct {
         }
         try self.write_buffer.appendSlice(self.allocator, data);
         self.write_offset += data.len;
+        if (self.ledger) |l| l.committed += data.len;
     }
 
     /// Drop the acknowledged prefix once it is worth the memmove. Without this
@@ -547,6 +564,11 @@ pub const SendStream = struct {
 
     /// Cancel the stream with an error code (sends RESET_STREAM).
     pub fn reset(self: *SendStream, error_code: u64) void {
+        // The unsent tail will never spend connection credit: RESET_STREAM
+        // names send_offset as the final size.
+        if (self.reset_err == null) {
+            if (self.ledger) |l| l.committed -= self.write_offset - self.send_offset;
+        }
         self.reset_err = error_code;
     }
 
@@ -556,6 +578,13 @@ pub const SendStream = struct {
             self.send_window = new_max;
             self.blocked_at = null;
         }
+    }
+
+    /// Bytes MAX_STREAM_DATA still admits past what is already written. Zero
+    /// once the stream is reset or its FIN is queued: nothing more can go.
+    pub fn sendCredit(self: *const SendStream) u64 {
+        if (self.reset_err != null or self.fin_queued) return 0;
+        return self.send_window -| self.write_offset;
     }
 
     // Check if we should send STREAM_DATA_BLOCKED. Returns the limit if yes.
@@ -877,6 +906,9 @@ pub const StreamsMap = struct {
     /// Receive-only streams (unidirectional, peer initiated).
     recv_streams: std.AutoHashMap(u64, *ReceiveStream),
 
+    /// Created with the first stream; see `SendLedger`.
+    send_ledger: ?*SendLedger = null,
+
     /// Next outgoing stream IDs.
     next_bidi_stream_id: u64,
     next_uni_stream_id: u64,
@@ -1004,6 +1036,8 @@ pub const StreamsMap = struct {
             self.allocator.destroy(s.*);
         }
         self.recv_streams.deinit();
+
+        if (self.send_ledger) |l| self.allocator.destroy(l);
     }
 
     /// Update the maximum stream limits from peer's transport parameters.
@@ -1042,12 +1076,14 @@ pub const StreamsMap = struct {
             return error.StreamLimitError;
         }
 
+        const ledger = try self.sendLedger();
         const id = self.next_bidi_stream_id;
         self.next_bidi_stream_id += 4;
         self.open_bidi_streams += 1;
 
         const s = try self.allocator.create(Stream);
         s.* = Stream.init(self.allocator, id);
+        s.send.ledger = ledger;
         // We initiated this stream → peer's "bidi_remote" limit applies to our sends
         s.send.send_window = self.peer_initial_max_stream_data_bidi_remote;
         // Our local receive window for streams we initiated
@@ -1064,12 +1100,14 @@ pub const StreamsMap = struct {
             return error.StreamLimitError;
         }
 
+        const ledger = try self.sendLedger();
         const id = self.next_uni_stream_id;
         self.next_uni_stream_id += 4;
         self.open_uni_streams += 1;
 
         const s = try self.allocator.create(SendStream);
         s.* = SendStream.init(self.allocator, id);
+        s.ledger = ledger;
         s.send_window = self.peer_initial_max_stream_data_uni;
         try self.send_streams.put(id, s);
         return s;
@@ -1108,8 +1146,10 @@ pub const StreamsMap = struct {
 
     /// Build one peer-initiated bidi stream and add it to the map.
     fn openPeerBidiStream(self: *StreamsMap, stream_id: u64) !*Stream {
+        const ledger = try self.sendLedger();
         const s = try self.allocator.create(Stream);
         s.* = Stream.init(self.allocator, stream_id);
+        s.send.ledger = ledger;
         // Peer initiated this stream → peer's "bidi_local" limit applies to our sends
         s.send.send_window = self.peer_initial_max_stream_data_bidi_local;
         // Our local receive window for peer-initiated streams
@@ -1188,6 +1228,26 @@ pub const StreamsMap = struct {
     pub fn localNeverOpened(self: *const StreamsMap, stream_id: u64) bool {
         const next = if (isBidi(stream_id)) self.next_bidi_stream_id else self.next_uni_stream_id;
         return stream_id >= next;
+    }
+
+    /// The send half of any stream we can send on: a bidi stream, or our uni.
+    pub fn getSendStream(self: *const StreamsMap, stream_id: u64) ?*SendStream {
+        if (self.streams.get(stream_id)) |s| return &s.send;
+        return self.send_streams.get(stream_id);
+    }
+
+    /// Bytes written to every stream that will spend connection credit.
+    pub fn committedSendBytes(self: *const StreamsMap) u64 {
+        const l = self.send_ledger orelse return 0;
+        return l.committed;
+    }
+
+    fn sendLedger(self: *StreamsMap) !*SendLedger {
+        if (self.send_ledger) |l| return l;
+        const l = try self.allocator.create(SendLedger);
+        l.* = .{};
+        self.send_ledger = l;
+        return l;
     }
 
     /// Maximum number of streams returned by getScheduledStreams().

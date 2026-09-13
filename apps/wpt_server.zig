@@ -56,7 +56,16 @@ const WptHandler = struct {
         abort_echo,
         echo_datagram_length,
         server_create_multiple_streams,
+        firehose,
         unknown,
+    };
+
+    /// The peer's send credit as the firehose last saw it.
+    const Credit = struct {
+        quic_max_data: u64 = 0,
+        quic_max_uni: u64 = 0,
+        wt_max_uni: ?u64 = null,
+        wt_max_data: ?u64 = null,
     };
 
     const SessionInfo = struct {
@@ -74,6 +83,27 @@ const WptHandler = struct {
         /// wait for credit rather than being dropped.
         streams_owed: u32 = 0,
         streams_next: u32 = 0,
+        /// firehose: WebKit 319818's traffic — one FIN'd uni stream of
+        /// `fh_size` bytes per FIREHOSE_INTERVAL_NS — and what the peer's
+        /// credit did while its page read them.
+        fh_size: u32 = 0,
+        fh_start_ns: i64 = 0,
+        fh_next_ns: i64 = 0,
+        fh_next_log_ns: i64 = 0,
+        fh_streams: u64 = 0,
+        fh_bytes: u64 = 0,
+        fh_held: bool = false,
+        /// `unbounded=1`: queue past the peer's credit rather than hold. That
+        /// is the bug's memory reproduction; the default is how an
+        /// application should behave.
+        fh_unbounded: bool = false,
+        /// `single=1`: one long stream instead of a FIN'd stream per chunk.
+        /// Only this can outgrow the peer's credit without bound; a stream
+        /// per chunk runs into MAX_STREAMS once the streams stop finishing.
+        fh_single: bool = false,
+        fh_stream: ?u64 = null,
+        fh_last_err: []const u8 = "",
+        fh_seen: Credit = .{},
         close_code: ?u32 = null,
         close_reason_buf: [256]u8 = undefined,
         close_reason_len: u16 = 0,
@@ -169,6 +199,8 @@ const WptHandler = struct {
         if (std.mem.endsWith(u8, path_only, "/server-create-multiple-streams.py") or
             std.mem.endsWith(u8, path_only, "/server-create-multiple-streams"))
             return .server_create_multiple_streams;
+        if (std.mem.endsWith(u8, path_only, "/firehose"))
+            return .firehose;
 
         // Default to echo for unrecognized paths
         return .echo;
@@ -350,6 +382,24 @@ const WptHandler = struct {
                 }
                 session.sendKeepAlive();
             },
+            .firehose => {
+                const size_str = getQueryParam(path, "size") orelse "16384";
+                const size = std.fmt.parseInt(u32, size_str, 10) catch 16384;
+                if (self.session_state.getPtr(keyFor(session, session_id))) |si| {
+                    const now = sys.nanoTimestamp();
+                    si.fh_size = std.math.clamp(size, 1, @as(u32, firehose_chunk.len));
+                    si.fh_start_ns = now;
+                    si.fh_next_ns = now;
+                    si.fh_unbounded = std.mem.eql(u8, getQueryParam(path, "unbounded") orelse "0", "1");
+                    si.fh_single = std.mem.eql(u8, getQueryParam(path, "single") orelse "0", "1");
+                }
+                if (session.entry.conn.peer_params) |pp| {
+                    std.log.info("[firehose] peer transport params: initial_max_data={d} initial_max_stream_data_uni={d} initial_max_streams_uni={d}", .{
+                        pp.initial_max_data, pp.initial_max_stream_data_uni, pp.initial_max_streams_uni,
+                    });
+                }
+                session.sendKeepAlive();
+            },
             .query => {
                 // Retrieve stashed data by token and send on a uni stream
                 const token = getQueryParam(path, "token") orelse "";
@@ -369,9 +419,96 @@ const WptHandler = struct {
         }
     }
 
+    /// The firehose keeps its own cadence, and a stalled one still has to log.
+    pub const poll_interval_ms = 8;
+
+    /// A held firehose asked to hear when its next stream fits.
+    pub fn onWritable(self: *WptHandler, session: *event_loop.Session, session_id: u64, stream_id: ?u64) void {
+        _ = stream_id;
+        const info = self.session_state.getPtr(keyFor(session, session_id)) orelse return;
+        if (info.handler != .firehose) return;
+        const t = @as(f64, @floatFromInt(sys.nanoTimestamp() - info.fh_start_ns)) / 1e9;
+        std.log.info("[firehose] t={d:.3}s writable again after a hold", .{t});
+        self.pumpFirehoses(session);
+    }
+
     pub fn onPollComplete(self: *WptHandler, session: *event_loop.Session) void {
         self.executeDeferredActions(session);
         self.openOwedStreams(session);
+        self.pumpFirehoses(session);
+    }
+
+    const FIREHOSE_INTERVAL_NS: i64 = 8 * std.time.ns_per_ms; // server.py's ~2 MiB/s at 16 KiB
+    const firehose_chunk = [_]u8{'x'} ** 65536;
+
+    fn pumpFirehoses(self: *WptHandler, session: *event_loop.Session) void {
+        const wtc = session.entry.wt_conn orelse return;
+        const conn = session.entry.conn;
+        const now = sys.nanoTimestamp();
+        for (&wtc.sessions) |*wts| {
+            if (!wts.occupied or wts.state != .active) continue;
+            const info = self.session_state.getPtr(keyFor(session, wts.session_id)) orelse continue;
+            if (info.handler != .firehose) continue;
+
+            // After a hold, resume at the cadence rather than bursting to catch up.
+            if (now - info.fh_next_ns > 100 * std.time.ns_per_ms) info.fh_next_ns = now;
+            while (info.fh_next_ns <= now) {
+                const cap = if (info.fh_stream) |sid|
+                    session.streamSendCapacity(sid) orelse 0
+                else
+                    session.sendCapacity(wts.session_id);
+                info.fh_held = !info.fh_unbounded and cap < info.fh_size;
+                if (info.fh_held) {
+                    session.notifyWritable(wts.session_id, info.fh_stream, info.fh_size) catch {};
+                    break;
+                }
+                const sid = info.fh_stream orelse (session.openUniStream(wts.session_id, null) catch |err| {
+                    info.fh_last_err = @errorName(err);
+                    break;
+                });
+                if (session.sendStreamData(sid, firehose_chunk[0..info.fh_size])) {
+                    info.fh_bytes += info.fh_size;
+                } else |err| {
+                    info.fh_last_err = @errorName(err);
+                }
+                if (info.fh_stream == null) info.fh_streams += 1;
+                if (info.fh_single) {
+                    info.fh_stream = sid;
+                } else {
+                    session.closeStream(sid);
+                }
+                info.fh_next_ns += FIREHOSE_INTERVAL_NS;
+            }
+
+            const t = @as(f64, @floatFromInt(now - info.fh_start_ns)) / 1e9;
+            const credit: Credit = .{
+                .quic_max_data = conn.conn_flow_ctrl.base.send_window,
+                .quic_max_uni = conn.streams.max_uni_streams,
+                .wt_max_uni = wts.fc.uni.max_send,
+                .wt_max_data = if (wts.fc.data_limited) wts.fc.data.send_window else null,
+            };
+            if (!std.meta.eql(credit, info.fh_seen)) {
+                std.log.info("[firehose] t={d:.3}s credit: MAX_DATA={d} MAX_STREAMS_UNI={d} | WT_MAX_DATA={?d} WT_MAX_STREAMS_UNI={?d}", .{
+                    t, credit.quic_max_data, credit.quic_max_uni, credit.wt_max_data, credit.wt_max_uni,
+                });
+                info.fh_seen = credit;
+            }
+            if (now >= info.fh_next_log_ns) {
+                info.fh_next_log_ns = now + std.time.ns_per_s;
+                std.log.info("[firehose] t={d:.1}s streams={d} written={d:.2}MiB conn_sent={d} unsent={d} of MAX_DATA={d} uni_opened={d} of MAX_STREAMS_UNI={d} held={} last_err={s}", .{
+                    t,
+                    info.fh_streams,
+                    @as(f64, @floatFromInt(info.fh_bytes)) / (1024 * 1024),
+                    conn.conn_flow_ctrl.base.bytes_sent,
+                    conn.streams.committedSendBytes() -| conn.conn_flow_ctrl.base.bytes_sent,
+                    credit.quic_max_data,
+                    conn.streams.next_uni_stream_id / 4,
+                    credit.quic_max_uni,
+                    info.fh_held,
+                    info.fh_last_err,
+                });
+            }
+        }
     }
 
     /// Open as many of the owed uni streams as the peer's current credit

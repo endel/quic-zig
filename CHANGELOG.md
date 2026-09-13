@@ -5,6 +5,14 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ## Unreleased
 
+### Added
+
+- WebTransport applications can tell when they are ahead of the peer's
+  flow-control credit. `sendCapacity` / `streamSendCapacity` report how much
+  more fits, and `notifyWritable` asks for an `onWritable` callback when there
+  is room again. A server writing to Safari, which never raises MAX_DATA, can
+  now hold instead of queueing without bound.
+
 ### Fixed
 
 - A peer's STOP_SENDING on a unidirectional stream we opened closed the whole

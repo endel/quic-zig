@@ -250,6 +250,25 @@ pub const Session = struct {
         return true;
     }
 
+    /// Bytes `session_id` can still write before the peer's credit is spent;
+    /// see `WebTransportConnection.sendCapacity`. On raw QUIC, the connection's.
+    pub fn sendCapacity(self: *const Session, session_id: u64) u64 {
+        if (self.entry.wt_conn) |wtc| return wtc.sendCapacity(session_id);
+        return self.entry.conn.sendCapacity();
+    }
+
+    pub fn streamSendCapacity(self: *const Session, stream_id: u64) ?u64 {
+        if (self.entry.wt_conn) |wtc| return wtc.streamSendCapacity(stream_id);
+        return self.entry.conn.streamSendCapacity(stream_id);
+    }
+
+    /// One `onWritable` once `min_bytes` fit; see
+    /// `WebTransportConnection.notifyWritable`.
+    pub fn notifyWritable(self: *Session, session_id: u64, stream_id: ?u64, min_bytes: u64) !void {
+        const wtc = self.entry.wt_conn orelse return error.NoWtConnection;
+        try wtc.notifyWritable(session_id, stream_id, min_bytes);
+    }
+
     pub fn maxDatagramPayloadSize(self: *const Session, session_id: u64) ?usize {
         if (self.entry.wt_conn) |wtc| {
             return wtc.maxDatagramPayloadSize(session_id);
@@ -320,7 +339,7 @@ pub fn Server(comptime Handler: type) type {
             "onBidiStream",     "onUniStream",     "onStreamReset",
             "onStopSending",    "onPollComplete",  "onRequest",
             "onData",           "onH0Request",     "onH0Data",
-            "onH0Finished",
+            "onH0Finished",     "onWritable",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -337,7 +356,7 @@ pub fn Server(comptime Handler: type) type {
                         "'. Known callbacks: onRequest, onData, onConnectRequest, " ++
                         "onSessionReady, onStreamData, onDatagram, onSessionClosed, " ++
                         "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
-                        "onStopSending, onPollComplete, " ++
+                        "onStopSending, onWritable, onPollComplete, " ++
                         "onH0Request, onH0Data, onH0Finished");
                 }
             }
@@ -988,6 +1007,11 @@ pub fn Server(comptime Handler: type) type {
                             self.handler.onStopSending(&session, ss.session_id, ss.stream_id, ss.error_code);
                         }
                     },
+                    .writable => |w| {
+                        if (@hasDecl(Handler, "onWritable")) {
+                            self.handler.onWritable(&session, w.session_id, w.stream_id);
+                        }
+                    },
                     .session_rejected => {},
                 }
             }
@@ -1540,6 +1564,25 @@ pub const ClientSession = struct {
         return null;
     }
 
+    /// Bytes `session_id` can still write before the peer's credit is spent;
+    /// see `WebTransportConnection.sendCapacity`. On raw QUIC, the connection's.
+    pub fn sendCapacity(self: *const ClientSession, session_id: u64) u64 {
+        if (self.wt_conn) |wtc| return wtc.sendCapacity(session_id);
+        return self.conn.sendCapacity();
+    }
+
+    pub fn streamSendCapacity(self: *const ClientSession, stream_id: u64) ?u64 {
+        if (self.wt_conn) |wtc| return wtc.streamSendCapacity(stream_id);
+        return self.conn.streamSendCapacity(stream_id);
+    }
+
+    /// One `onWritable` once `min_bytes` fit; see
+    /// `WebTransportConnection.notifyWritable`.
+    pub fn notifyWritable(self: *ClientSession, session_id: u64, stream_id: ?u64, min_bytes: u64) !void {
+        const wtc = self.wt_conn orelse return error.NoWtConnection;
+        try wtc.notifyWritable(session_id, stream_id, min_bytes);
+    }
+
     pub fn isDatagramSendQueueFull(self: *const ClientSession) bool {
         if (self.wt_conn) |wtc| {
             return wtc.isDatagramSendQueueFull();
@@ -1595,7 +1638,7 @@ pub fn Client(comptime Handler: type) type {
             "onDatagram",        "onSessionClosed",
             "onSessionDraining", "onBidiStream",
             "onUniStream",       "onStreamReset",
-            "onStopSending",
+            "onStopSending",     "onWritable",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -1614,7 +1657,7 @@ pub fn Client(comptime Handler: type) type {
                         "onStreamData, " ++
                         "onSessionReady, onSessionRejected, onDatagram, onSessionClosed, " ++
                         "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
-                        "onStopSending");
+                        "onStopSending, onWritable");
                 }
             }
         }
@@ -2143,6 +2186,11 @@ pub fn Client(comptime Handler: type) type {
                     .stream_stop_sending => |ss| {
                         if (@hasDecl(Handler, "onStopSending")) {
                             self.handler.onStopSending(&session, ss.session_id, ss.stream_id, ss.error_code);
+                        }
+                    },
+                    .writable => |w| {
+                        if (@hasDecl(Handler, "onWritable")) {
+                            self.handler.onWritable(&session, w.session_id, w.stream_id);
                         }
                     },
                     .connect_request => {},

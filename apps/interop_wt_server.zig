@@ -649,6 +649,7 @@ fn pollWtEvents(
             .stream_stop_sending => |ss| {
                 std.log.info("WT stream {d} STOP_SENDING from peer, code {d}", .{ ss.stream_id, ss.error_code });
             },
+            .writable => {}, // never asked for: no notifyWritable here
         }
     }
 

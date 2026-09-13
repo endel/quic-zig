@@ -289,6 +289,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         .stream_stop_sending => |ss| {
                             std.debug.print("WT stream {d} STOP_SENDING from peer (code={d})\n", .{ ss.stream_id, ss.error_code });
                         },
+                        .writable => {}, // never asked for: no notifyWritable here
                         .session_rejected => {},
                     }
                 }

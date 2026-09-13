@@ -267,9 +267,16 @@ Handler callbacks (all optional):
 | `onUniStream(session, session_id, stream_id)` | Incoming uni stream opened |
 | `onStreamReset(session, session_id, stream_id, error_code)` | Peer reset a stream — the `WebTransportError.streamErrorCode` equivalent |
 | `onStopSending(session, session_id, stream_id, error_code)` | Peer asked us to stop sending on a stream |
+| `onWritable(session, session_id, stream_id)` | The peer's credit now fits what `notifyWritable` asked for — the `writer.ready` equivalent. `stream_id` is null for a session-wide wait |
 | `onSessionClosed(session, session_id, error_code, reason)` | Session closed |
 | `onSessionDraining(session, session_id)` | Session draining |
 | `onPollComplete(session)` | Called each poll cycle |
+
+Writes are never refused for want of the peer's credit: `sendStreamData`
+buffers. Check `sendCapacity(session_id)` or `streamSendCapacity(stream_id)`
+before writing much, and call `notifyWritable(session_id, stream_id, n)` to
+hear when `n` bytes fit — the session form (`stream_id = null`) is for opening
+a stream per message.
 
 ### Low-level API (direct connection control)
 

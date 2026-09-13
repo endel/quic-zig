@@ -33,8 +33,25 @@ wants parity needs them.
 | `options.protocols` / `protocol` | `WT-Available-Protocols` / `WT-Protocol` (`src/webtransport/protocol.zig`) |
 | **`WebTransportError.streamErrorCode` on an inbound abort** | **added — see below** |
 | **`options.serverCertificateHashes`** | **added — see below** |
+| **`WritableStream` backpressure: `writer.desiredSize`, `writer.ready`** | **added — see below** |
 
-Two of those were missing and are now implemented.
+Three of those were missing and are now implemented.
+
+### Writers could not tell they were ahead of the peer
+
+A browser's `writer.write()` never refuses: it queues, `desiredSize` goes
+negative, and `ready` stays pending until there is room. `sendStreamData`
+queued the same way but offered neither of the other two, so a Zig server
+writing to a peer that stopped granting MAX_DATA grew its send buffers without
+limit. Safari is that peer (WebKit bug 319818).
+
+`streamSendCapacity(stream_id)` is `desiredSize`, measured against the peer's
+credit rather than a local high-water mark. `notifyWritable(session_id,
+stream_id, n)` with the `onWritable` callback is `ready`. Both also work per
+session, with no stream: a browser has no use for that, but a server that opens
+a stream per message — a MoQ relay, the firehose handler — has no stream to wait
+on until it opens one. The mechanics are in
+[RFC9000_3.md](RFC9000_3.md#send-credit-and-backpressure).
 
 ### Inbound resets were invisible
 

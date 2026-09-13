@@ -179,6 +179,12 @@ pub const SessionFlowControl = struct {
         self.data.updateSendWindow(limit);
     }
 
+    /// Session bytes WT_MAX_DATA still admits; unbounded when the peer set none.
+    pub fn sendCredit(self: *const SessionFlowControl) u64 {
+        if (!self.data_limited) return std.math.maxInt(u64);
+        return self.data.sendWindowSize();
+    }
+
     pub fn canSend(self: *const SessionFlowControl, len: usize) bool {
         if (!self.data_limited) return true;
         return self.data.sendWindowSize() >= len;

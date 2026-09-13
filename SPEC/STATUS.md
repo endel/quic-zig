@@ -16,7 +16,7 @@
 | 3.4 | Bidirectional Stream States | ✅ Done | Composite of send + recv states; reclaimed once fully acked — see [RFC9000_3.md](RFC9000_3.md) |
 | 3.5 | Solicited State Transitions | ✅ Done | STOP_SENDING triggers RESET_STREAM |
 | **4** | **Flow Control** | | |
-| 4.1 | Data Flow Control | ✅ Done | Connection + stream level |
+| 4.1 | Data Flow Control | ✅ Done | Connection + stream level. The send credit left is exposed to applications as `sendCapacity` / `streamSendCapacity` — see [RFC9000_3.md](RFC9000_3.md) |
 | 4.2 | Increasing Flow Control Limits | ✅ Done | Auto-tuning window (up to 6MB) |
 | 4.3 | Flow Control Performance | ✅ Done | Auto-tuning prevents stalls |
 | 4.4 | Handling Stream Cancellation | ✅ Done | RESET_STREAM/STOP_SENDING, final_size validation, conn flow ctrl accounting |
@@ -135,8 +135,8 @@
 | 19.3 | ACK (0x02-0x03) | ✅ Done | Including ECN variant |
 | 19.3.1 | ACK Ranges | ✅ Done | Varint-encoded gap+ack ranges |
 | 19.3.2 | ECN Counts | ✅ Done | Three counters in ACK_ECN |
-| 19.4 | RESET_STREAM (0x04) | ✅ Done | |
-| 19.5 | STOP_SENDING (0x05) | ✅ Done | |
+| 19.4 | RESET_STREAM (0x04) | ✅ Done | Final size is the bytes sent, not written; uni streams included |
+| 19.5 | STOP_SENDING (0x05) | ✅ Done | Uni streams included; one naming a stream we reclaimed is ignored, not a STREAM_STATE_ERROR |
 | 19.6 | CRYPTO (0x06) | ✅ Done | |
 | 19.7 | NEW_TOKEN (0x07) | ✅ Done | |
 | 19.8 | STREAM (0x08-0x0f) | ✅ Done | All flag combinations |
@@ -144,7 +144,7 @@
 | 19.10 | MAX_STREAM_DATA (0x11) | ✅ Done | |
 | 19.11 | MAX_STREAMS (0x12-0x13) | ✅ Done | Bidi + uni |
 | 19.12 | DATA_BLOCKED (0x14) | ✅ Done | |
-| 19.13 | STREAM_DATA_BLOCKED (0x15) | ✅ Done | |
+| 19.13 | STREAM_DATA_BLOCKED (0x15) | ✅ Done | Uni streams included |
 | 19.14 | STREAMS_BLOCKED (0x16-0x17) | ✅ Done | Bidi + uni |
 | 19.15 | NEW_CONNECTION_ID (0x18) | ✅ Done | |
 | 19.16 | RETIRE_CONNECTION_ID (0x19) | ✅ Done | |
@@ -447,6 +447,7 @@ cross-impl byte-exact UTF-8 header check.
 | — | GOAWAY → session interaction | ✅ Done | H3 GOAWAY triggers session_draining events for active WT sessions |
 | — | Capsules ride in H3 DATA frames | ✅ Done | RFC 9297 §3.2. Sent bare until Sep 2026, which cost every browser the close code |
 | — | Peer RESET_STREAM / STOP_SENDING reported | ✅ Done | `stream_reset` / `stream_stop_sending` events, `onStreamReset` / `onStopSending` callbacks; codes mapped back with `h3ToAppErrorCode` |
+| — | Send backpressure | ✅ Done | `sendCapacity` / `streamSendCapacity` report the peer's remaining credit — QUIC MAX_DATA and MAX_STREAM_DATA, narrowed by WT_MAX_DATA where it binds. `notifyWritable` asks for one `writable` event (`onWritable`) when it rises. Advisory, like a browser `WritableStream`: a write past it is buffered |
 | — | Session flow control (§5.3-§5.6) | ✅ Done | `WT_MAX_STREAMS` / `WT_MAX_DATA` and their `*_BLOCKED` partners, granted per session and raised as the peer spends them. Binds only when both endpoints sent the draft-13 `WT_MAX_SESSIONS` above one (§5.1), which is what keeps it invisible to Chrome and quic-go. This is what lets Safari 26.4 open a client-initiated stream |
 | — | draft-13 §5.5 initial credits in SETTINGS | ⚠️ Partial | `WT_INITIAL_MAX_DATA` / `_STREAMS_BIDI` / `_STREAMS_UNI` serialize and are configurable, but are **not advertised by default**: Safari 26.4 refuses the session outright when it sees them. The same credit reaches every peer as a capsule instead — `SPEC/DRAFT_IETF_WEBTRANS_HTTP3_13.md` |
 | — | RESET_STREAM_AT reliable reset | ❌ Missing | Needed by draft-13; `TODO.md` I5 |

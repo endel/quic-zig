@@ -101,6 +101,10 @@ pub const WtEvent = union(enum) {
     /// The peer asked us to stop sending. Mirrors the browser rejecting the
     /// WritableStream with a WebTransportError.
     stream_stop_sending: struct { session_id: u64, stream_id: u64, error_code: u32 },
+    /// A `notifyWritable` wait was met: the peer's credit now admits the bytes
+    /// asked for, on the stream or, with `stream_id` null, anywhere in the
+    /// session. Mirrors a browser's `writer.ready` resolving.
+    writable: struct { session_id: u64, stream_id: ?u64 },
 };
 
 /// Which halves of a stream have already reported a peer-side abort, so each
@@ -108,6 +112,13 @@ pub const WtEvent = union(enum) {
 const ResetDelivery = struct {
     reset: bool = false,
     stop_sending: bool = false,
+};
+
+/// A `notifyWritable` request waiting on the peer's credit.
+const WritableWait = struct {
+    session_id: u64,
+    stream_id: ?u64,
+    min_bytes: u64,
 };
 
 /// Per-stream send statistics (matches browser WebTransportSendStream.getStats()).
@@ -158,6 +169,9 @@ pub const WebTransportConnection = struct {
     // Streams that have already reported a peer RESET_STREAM / STOP_SENDING.
     reset_delivered: std.AutoHashMap(u64, ResetDelivery),
 
+    /// Outstanding `notifyWritable` requests; few, and re-checked every poll.
+    writable_waits: std.ArrayList(WritableWait) = .empty,
+
     /// The draft-13 §5.6 window each session grants its peer. Separate from
     /// `h3.local_settings`, which only decides whether the same numbers are
     /// *also* announced in SETTINGS — one shipping browser refuses a session
@@ -193,6 +207,7 @@ pub const WebTransportConnection = struct {
         self.stream_bufs.deinit();
         self.fin_delivered.deinit();
         self.reset_delivered.deinit();
+        self.writable_waits.deinit(self.allocator);
         self.wt_bidi_streams.deinit();
         self.wt_uni_streams.deinit();
         self.pending_uni_streams.deinit();
@@ -427,6 +442,52 @@ pub const WebTransportConnection = struct {
         if (self.quic.streams.send_streams.get(stream_id)) |send_stream| {
             send_stream.close();
         }
+    }
+
+    /// Bytes session `session_id` can still write, over its streams old and
+    /// new, before the peer's credit is spent: QUIC's MAX_DATA, narrowed by the
+    /// session's WT_MAX_DATA where draft-13 flow control is in force. Advisory
+    /// like `Connection.sendCapacity`, except that a write past WT_MAX_DATA is
+    /// refused rather than buffered.
+    ///
+    /// This is a browser `WritableStream`'s `desiredSize`, measured against
+    /// the peer instead of a local high-water mark.
+    pub fn sendCapacity(self: *WebTransportConnection, session_id: u64) u64 {
+        const quic_cap = self.quic.sendCapacity();
+        const sess = self.limitedSession(session_id) orelse return quic_cap;
+        return @min(quic_cap, sess.fc.sendCredit());
+    }
+
+    /// `sendCapacity` narrowed by the stream's own MAX_STREAM_DATA. Null for a
+    /// stream we cannot send on; zero once it is reset or its FIN is queued.
+    pub fn streamSendCapacity(self: *WebTransportConnection, stream_id: u64) ?u64 {
+        const quic_cap = self.quic.streamSendCapacity(stream_id) orelse return null;
+        const sess = self.limitedSessionForStream(stream_id) orelse return quic_cap;
+        return @min(quic_cap, sess.fc.sendCredit());
+    }
+
+    /// Ask for one `writable` event once `min_bytes` fit: on `stream_id`, or
+    /// anywhere in the session when it is null. The session form is for an
+    /// application that opens a stream per message and so has none to wait on.
+    ///
+    /// Checked every poll, so a wait that is already met fires on the next
+    /// one. A second call for the same target replaces the first. A wait on a
+    /// stream that is reset, finished or gone, or on a session that has ended,
+    /// is dropped without an event — `stream_stop_sending` and `session_closed`
+    /// say why. A `min_bytes` larger than the peer's window never fires.
+    pub fn notifyWritable(self: *WebTransportConnection, session_id: u64, stream_id: ?u64, min_bytes: u64) !void {
+        const wait: WritableWait = .{
+            .session_id = session_id,
+            .stream_id = stream_id,
+            .min_bytes = @max(min_bytes, 1),
+        };
+        for (self.writable_waits.items) |*w| {
+            if (w.session_id == session_id and std.meta.eql(w.stream_id, stream_id)) {
+                w.* = wait;
+                return;
+            }
+        }
+        try self.writable_waits.append(self.allocator, wait);
     }
 
     /// Send a QUIC DATAGRAM carrying WT session data.
@@ -736,7 +797,11 @@ pub const WebTransportConnection = struct {
         //    reset is delivered first.
         if (self.pollWtStreamAborts()) |event| return event;
 
-        // 7. Poll H3 for events (settings, connect requests, responses)
+        // 7. Wake writers whose credit has arrived — after aborts, so a stopped
+        //    stream's wait is dropped rather than fired.
+        if (self.pollWritable()) |event| return event;
+
+        // 8. Poll H3 for events (settings, connect requests, responses)
         if (try self.pollH3Events()) |event| return event;
 
         return null;
@@ -1268,6 +1333,35 @@ pub const WebTransportConnection = struct {
             }
         }
         return null;
+    }
+
+    /// The first `notifyWritable` wait the peer's credit now meets, as an
+    /// event. Waits that can no longer be met are dropped on the way.
+    fn pollWritable(self: *WebTransportConnection) ?WtEvent {
+        var i: usize = 0;
+        while (i < self.writable_waits.items.len) {
+            const w = self.writable_waits.items[i];
+            const cap = self.waitCapacity(w) orelse {
+                _ = self.writable_waits.swapRemove(i);
+                continue;
+            };
+            if (cap >= w.min_bytes) {
+                _ = self.writable_waits.swapRemove(i);
+                return .{ .writable = .{ .session_id = w.session_id, .stream_id = w.stream_id } };
+            }
+            i += 1;
+        }
+        return null;
+    }
+
+    /// What a wait is measured against, or null once it can never be met.
+    fn waitCapacity(self: *WebTransportConnection, w: WritableWait) ?u64 {
+        const sess = self.getSession(w.session_id) orelse return null;
+        if (sess.state == .draining or sess.state == .closed) return null;
+        const stream_id = w.stream_id orelse return self.sendCapacity(w.session_id);
+        const ss = self.quic.streams.getSendStream(stream_id) orelse return null;
+        if (ss.reset_err != null or ss.fin_queued) return null;
+        return self.streamSendCapacity(stream_id);
     }
 
     /// Poll H3 events and translate to WT events.
@@ -2787,6 +2881,98 @@ test "WT flow control: a spent data credit blocks the write, and WT_MAX_DATA fre
     _ = try setup.wt.poll();
     try setup.wt.sendStreamData(stream_id, "efgh");
     try testing.expectError(error.WtDataLimitReached, setup.wt.sendStreamData(stream_id, "i"));
+}
+
+test "WT backpressure: sendCapacity follows MAX_DATA, and a session wait fires when it rises" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // What H3 has written already — SETTINGS, the CONNECT response — counts too.
+    const fc = &setup.quic_conn.conn_flow_ctrl;
+    fc.base.send_window = setup.quic_conn.streams.committedSendBytes() + 100;
+    try testing.expectEqual(@as(u64, 100), setup.wt.sendCapacity(session_id));
+
+    const stream_id = try setup.wt.openUniStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, &([_]u8{'x'} ** 200));
+    try testing.expectEqual(@as(u64, 0), setup.wt.sendCapacity(session_id));
+    try testing.expectEqual(@as(?u64, 0), setup.wt.streamSendCapacity(stream_id));
+
+    try setup.wt.notifyWritable(session_id, null, 50);
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .writable));
+
+    // Enough to cover the backlog, not yet the 50 bytes asked for.
+    const committed = setup.quic_conn.streams.committedSendBytes();
+    fc.updateSendWindow(committed + 49);
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .writable));
+
+    fc.updateSendWindow(committed + 50);
+    const ev = try pollFor(&setup.wt, .writable);
+    try testing.expectEqual(session_id, ev.writable.session_id);
+    try testing.expectEqual(@as(?u64, null), ev.writable.stream_id);
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .writable)); // once
+}
+
+test "WT backpressure: a stream wait fires when MAX_STREAM_DATA rises" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    setup.quic_conn.conn_flow_ctrl.base.send_window = 1 << 30;
+
+    const stream_id = try setup.wt.openUniStream(session_id, null);
+    const ss = setup.quic_conn.streams.send_streams.get(stream_id).?;
+    ss.send_window = ss.write_offset + 10;
+    try setup.wt.sendStreamData(stream_id, "0123456789");
+    try testing.expectEqual(@as(?u64, 0), setup.wt.streamSendCapacity(stream_id));
+
+    try setup.wt.notifyWritable(session_id, stream_id, 4);
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .writable));
+
+    ss.updateSendWindow(ss.write_offset + 4);
+    const ev = try pollFor(&setup.wt, .writable);
+    try testing.expectEqual(@as(?u64, stream_id), ev.writable.stream_id);
+}
+
+test "WT backpressure: a wait on a stream the peer stopped is dropped, not fired" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    setup.quic_conn.conn_flow_ctrl.base.send_window = 1 << 30;
+
+    const stream_id = try setup.wt.openUniStream(session_id, null);
+    const ss = setup.quic_conn.streams.send_streams.get(stream_id).?;
+    ss.send_window = ss.write_offset + 1;
+    try setup.wt.sendStreamData(stream_id, "x");
+    try setup.wt.notifyWritable(session_id, stream_id, 1);
+
+    ss.reset(appErrorCodeToH3(3));
+    ss.peer_stop_sending = appErrorCodeToH3(3);
+    ss.updateSendWindow(ss.write_offset + 100);
+
+    _ = try pollFor(&setup.wt, .stream_stop_sending);
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .writable));
+    try testing.expectEqual(@as(usize, 0), setup.wt.writable_waits.items.len);
+}
+
+test "WT backpressure: WT_MAX_DATA narrows the capacity, and raising it wakes the session" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServerWith(.{ .streams = 8, .data = 4096, .peer_data = 4 });
+    defer setup.deinit();
+    setup.quic_conn.conn_flow_ctrl.base.send_window = 1 << 30;
+
+    _ = try setup.wt.poll(); // drain the grant this session starts with
+    try testing.expectEqual(@as(u64, 4), setup.wt.sendCapacity(session_id));
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, "abcd");
+    try testing.expectEqual(@as(u64, 0), setup.wt.sendCapacity(session_id));
+    try testing.expectEqual(@as(?u64, 0), setup.wt.streamSendCapacity(stream_id));
+
+    try setup.wt.notifyWritable(session_id, null, 4);
+    var wire: [64]u8 = undefined;
+    try injectOnConnectStream(&setup, session_id, wrapCapsules(&wire, &.{.{ .wt_max_data = 8 }}));
+    const ev = try pollFor(&setup.wt, .writable);
+    try testing.expectEqual(session_id, ev.writable.session_id);
+    try testing.expectEqual(@as(u64, 4), setup.wt.sendCapacity(session_id));
 }
 
 test "WT flow control: capsules sharing one read are all acted on" {

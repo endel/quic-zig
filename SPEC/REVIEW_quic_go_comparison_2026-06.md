@@ -43,6 +43,9 @@ retransmission, ACK validation), (b) flow-control enforcement, (c) resource boun
    multi-GB in RAM. quic-go retains only unsent data + lost frames (`send_stream.go:379,666`).
    Fix: `buf_base` offset + compaction (or ring/segmented buffer); rebase index math.
    Effort L — but the most consequential memory issue for HTTP/3/WT/MoQ workloads.
+   **Fixed:** `buf_base` + `compactAcked`; see "Send buffers" in `SPEC/RFC9000_3.md`. Unsent
+   bytes written ahead of the peer's credit are a separate question, answered by "Send credit
+   and backpressure" in the same file.
 
 5. **Incoming unidirectional streams never receive MAX_STREAM_DATA.**
    `queueFlowControlUpdates` iterates only the bidi map (`connection.zig:2838-2849`); the

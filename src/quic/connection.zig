@@ -3856,6 +3856,21 @@ pub const Connection = struct {
     }
 
     /// Returns true if the datagram send queue is full.
+    /// Bytes the application can still write, across every stream, before the
+    /// peer's MAX_DATA is spent. Bytes written but not yet sent count as spent:
+    /// they spend it on the way out. Advisory — a write past it is not refused,
+    /// it waits in the send buffer for credit.
+    pub fn sendCapacity(self: *const Connection) u64 {
+        return self.conn_flow_ctrl.base.send_window -| self.streams.committedSendBytes();
+    }
+
+    /// `sendCapacity` narrowed by the stream's own MAX_STREAM_DATA. Null for a
+    /// stream we cannot send on; zero once it is reset or its FIN is queued.
+    pub fn streamSendCapacity(self: *const Connection, stream_id: u64) ?u64 {
+        const ss = self.streams.getSendStream(stream_id) orelse return null;
+        return @min(ss.sendCredit(), self.sendCapacity());
+    }
+
     pub fn isDatagramSendQueueFull(self: *const Connection) bool {
         return self.datagram_send_queue.isFull();
     }
@@ -5681,6 +5696,70 @@ test "frames naming a local stream never opened are a STREAM_STATE_ERROR" {
         defer conn.deinit();
         try std.testing.expectError(error.ProtocolViolation, conn.processFrame(f, .application, 0));
     }
+}
+
+test "sendCapacity counts bytes written on every stream against MAX_DATA" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    conn.conn_flow_ctrl.base.send_window = 1000;
+
+    const a = try conn.streams.openUniStream();
+    const b = try conn.streams.openBidiStream();
+    try a.writeData(&([_]u8{'a'} ** 300));
+    try b.send.writeData(&([_]u8{'b'} ** 500));
+    try std.testing.expectEqual(@as(u64, 200), conn.sendCapacity());
+    try std.testing.expectEqual(@as(?u64, 200), conn.streamSendCapacity(a.stream_id));
+
+    // Sending spends credit the write already counted.
+    _ = a.popStreamFrame(100).?;
+    try std.testing.expectEqual(@as(u64, 200), conn.sendCapacity());
+
+    // A write past it is buffered, not refused.
+    try b.send.writeData(&([_]u8{'b'} ** 400));
+    try std.testing.expectEqual(@as(u64, 0), conn.sendCapacity());
+
+    try conn.processFrame(&.{ .max_data = 2000 }, .application, 0);
+    try std.testing.expectEqual(@as(u64, 800), conn.sendCapacity());
+}
+
+test "streamSendCapacity is bounded by MAX_STREAM_DATA and ends with the stream" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    conn.streams.setPeerInitialMaxStreamData(1000, 1000, 64);
+    conn.conn_flow_ctrl.base.send_window = 1 << 20;
+
+    const ss = try conn.streams.openUniStream();
+    try ss.writeData(&([_]u8{'x'} ** 40));
+    try std.testing.expectEqual(@as(?u64, 24), conn.streamSendCapacity(ss.stream_id));
+
+    try conn.processFrame(&.{ .max_stream_data = .{ .stream_id = ss.stream_id, .max = 100 } }, .application, 0);
+    try std.testing.expectEqual(@as(?u64, 60), conn.streamSendCapacity(ss.stream_id));
+
+    ss.close();
+    try std.testing.expectEqual(@as(?u64, 0), conn.streamSendCapacity(ss.stream_id));
+    try std.testing.expectEqual(@as(?u64, null), conn.streamSendCapacity(ss.stream_id + 4));
+}
+
+test "a reset gives back the credit its unsent bytes had claimed" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    conn.conn_flow_ctrl.base.send_window = 1000;
+
+    const ss = try conn.streams.openUniStream();
+    try ss.writeData(&([_]u8{'x'} ** 600));
+    _ = ss.popStreamFrame(100).?;
+    try std.testing.expectEqual(@as(u64, 400), conn.sendCapacity());
+
+    // Only what went out stays spent; that is the final size RESET_STREAM names.
+    try conn.processFrame(&.{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = 1 } }, .application, 0);
+    try std.testing.expectEqual(@as(u64, 900), conn.sendCapacity());
+
+    // Nothing written after the reset can go, so none of it counts.
+    try ss.writeData("late");
+    try std.testing.expectEqual(@as(u64, 900), conn.sendCapacity());
 }
 
 test "a handshake-space PTO with nothing to resend still probes" {
