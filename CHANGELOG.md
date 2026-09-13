@@ -3,7 +3,11 @@
 Notable changes to quic-zig. Versions follow [semantic versioning](https://semver.org);
 `Unreleased` collects what has landed on `main` since the last tag.
 
-## Unreleased
+## 0.5.0
+
+Servers that stay up: finished unidirectional streams are freed, a WebTransport
+writer can see its peer's flow-control credit and wait for it instead of
+queueing, and a peer can no longer grow stream reassembly without bound.
 
 ### Added
 
@@ -30,6 +34,12 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - RESET_STREAM gave the bytes written rather than the bytes sent as the final
   size, so resetting a stream with data queued past the peer's window was a
   flow-control violation on the peer's side.
+- A peer could burn a server's CPU and memory by sending stream data full of
+  gaps: nothing capped how many out-of-order pieces were buffered, and each
+  cost more to place than the last — 236 ms once 32k were held. A stream now
+  closes the connection past 1000 gaps, and CRYPTO data has a ceiling of its
+  own. [#24](https://github.com/endel/quic-zig/issues/24)
+- A malformed packet could crash a server on Linux.
 
 ## 0.4.0
 
