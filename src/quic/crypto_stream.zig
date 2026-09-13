@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const Frame = @import("frame.zig").Frame;
+const limits = @import("limits.zig");
 const stream_mod = @import("stream.zig");
 const FrameSorter = stream_mod.FrameSorter;
 
@@ -47,6 +48,10 @@ pub const CryptoStream = struct {
     /// Handle an incoming CRYPTO frame.
     pub fn handleCryptoFrame(self: *CryptoStream, offset: u64, data: []const u8) !void {
         std.log.info("CryptoStream.handleCryptoFrame: offset={d} len={d}", .{ offset, data.len });
+        // RFC 9000 7.5: CRYPTO frames are not flow controlled, so this ceiling
+        // is the only thing bounding reassembly memory before the handshake
+        // completes — and the peer is unauthenticated until it does.
+        if (offset + data.len > limits.max_crypto_stream_offset) return error.CryptoBufferExceeded;
         try self.recv_sorter.push(offset, data, false);
     }
 
@@ -138,6 +143,18 @@ pub const CryptoStreamManager = struct {
 };
 
 // Tests
+
+// RFC 9000 §7.5: CRYPTO is not flow controlled, so the buffer has its own cap.
+test "CryptoStream: rejects data past the crypto buffer ceiling" {
+    var cs = CryptoStream.init(testing.allocator);
+    defer cs.deinit();
+
+    try testing.expectError(
+        error.CryptoBufferExceeded,
+        cs.handleCryptoFrame(limits.max_crypto_stream_offset, "x"),
+    );
+    try cs.handleCryptoFrame(0, "hello");
+}
 
 test "CryptoStream: write and pop" {
     var cs = CryptoStream.init(testing.allocator);

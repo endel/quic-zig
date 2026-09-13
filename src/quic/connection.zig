@@ -1924,7 +1924,15 @@ pub const Connection = struct {
 
             .crypto => |crypto_frame| {
                 const level: u8 = @intFromEnum(epoch);
-                try self.crypto_streams.handleCryptoFrame(level, crypto_frame.offset, crypto_frame.data);
+                self.crypto_streams.handleCryptoFrame(level, crypto_frame.offset, crypto_frame.data) catch |err| switch (err) {
+                    // RFC 9000 7.5: an oversized or heavily fragmented flight is
+                    // refused rather than buffered for an unauthenticated peer.
+                    error.CryptoBufferExceeded, error.TooManyChunks => {
+                        self.closeWithTransportError(@intFromEnum(TransportError.crypto_buffer_exceeded), @intFromEnum(FrameType.crypto), "CRYPTO buffer exceeded");
+                        return error.ProtocolViolation;
+                    },
+                    else => return err,
+                };
                 // Handshake advancement happens after all frames are processed
             },
 
@@ -1982,6 +1990,10 @@ pub const Connection = struct {
                             self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
                             return error.ProtocolViolation;
                         },
+                        error.TooManyChunks => {
+                            self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.stream), "too many reassembly gaps");
+                            return error.ProtocolViolation;
+                        },
                         else => return err,
                     };
                     if (s.fin) self.streams.needs_gc_scan = true;
@@ -2006,6 +2018,10 @@ pub const Connection = struct {
                     recv_strm.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
                         error.FinalSizeError => {
                             self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
+                            return error.ProtocolViolation;
+                        },
+                        error.TooManyChunks => {
+                            self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.stream), "too many reassembly gaps");
                             return error.ProtocolViolation;
                         },
                         else => return err,
@@ -5596,6 +5612,90 @@ test "RESET_STREAM beyond MAX_STREAMS is a protocol violation" {
         .error_code = 3,
         .final_size = 10,
     } }, .application, 0));
+}
+
+// RFC 9000 §21.7: reaching the reassembly cap ends the connection rather than
+// dropping data, so the peer learns instead of stalling on a stream we stopped
+// buffering.
+test "a stream past the reassembly cap closes the connection" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    var payload = [_]u8{'x'};
+    // Peer-initiated bidi stream with a hole at 0, so nothing ever drains and
+    // every frame lands as its own run.
+    var i: u64 = 0;
+    while (i < limits.max_reassembly_chunks) : (i += 1) {
+        try conn.processFrame(&.{ .stream = .{
+            .stream_id = 0,
+            .offset = i * 2 + 2,
+            .length = payload.len,
+            .fin = false,
+            .data = &payload,
+        } }, .application, 0);
+    }
+
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .stream = .{
+        .stream_id = 0,
+        .offset = 4000,
+        .length = payload.len,
+        .fin = false,
+        .data = &payload,
+    } }, .application, 0));
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(TransportError.internal_error)),
+        conn.local_err.?.code,
+    );
+}
+
+// Uni streams reach the sorter down a different path than bidi ones, so the
+// cap needs its own cover here.
+test "a uni stream past the reassembly cap closes the connection" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    var payload = [_]u8{'x'};
+    var i: u64 = 0;
+    while (i < limits.max_reassembly_chunks) : (i += 1) {
+        try conn.processFrame(&.{ .stream = .{
+            .stream_id = 2,
+            .offset = i * 2 + 2,
+            .length = payload.len,
+            .fin = false,
+            .data = &payload,
+        } }, .application, 0);
+    }
+
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .stream = .{
+        .stream_id = 2,
+        .offset = 4000,
+        .length = payload.len,
+        .fin = false,
+        .data = &payload,
+    } }, .application, 0));
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(TransportError.internal_error)),
+        conn.local_err.?.code,
+    );
+}
+
+// RFC 9000 §7.5: exceeding the CRYPTO buffer is a MUST-close, and the peer is
+// still unauthenticated when it happens.
+test "CRYPTO past the buffer ceiling closes the connection" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    var payload = [_]u8{'x'};
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .crypto = .{
+        .offset = limits.max_crypto_stream_offset,
+        .data = &payload,
+    } }, .application, 0));
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(TransportError.crypto_buffer_exceeded)),
+        conn.local_err.?.code,
+    );
 }
 
 /// What the control-frame queue held for one stream. Drains the queue.

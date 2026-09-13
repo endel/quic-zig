@@ -6,7 +6,7 @@
 |---|---------|--------|-------|
 | **2** | **Streams** | | |
 | 2.1 | Stream Types and Identifiers | ✅ Done | Bidi + uni, client/server initiated, proper ID bits |
-| 2.2 | Sending and Receiving Data | ✅ Done | FrameSorter, SendStream, ReceiveStream |
+| 2.2 | Sending and Receiving Data | ✅ Done | FrameSorter, SendStream, ReceiveStream. Reassembly keeps chunks sorted by offset and caps them at 1000 per sorter — see [RFC9000_21.7.md](RFC9000_21.7.md) |
 | 2.3 | Stream Prioritization | ✅ Done | RFC 9218 extensible priorities: urgency (0-7), incremental, PRIORITY_UPDATE frame |
 | 2.4 | Operations on Streams | ✅ Done | Open, send, recv, close, reset |
 | **3** | **Stream States** | | |
@@ -42,7 +42,7 @@
 | 7.4 | Transport Parameters | ✅ Done | All parameters encode/decode |
 | 7.4.1 | Values of Transport Parameters for 0-RTT | ✅ Done | Session ticket stores 7 params; client restores on 0-RTT; validates server doesn't reduce |
 | 7.4.2 | New Transport Parameters | ✅ Done | Unknown params skipped per spec |
-| 7.5 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager per encryption level |
+| 7.5 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager per encryption level; out-of-order CRYPTO is bounded at 16 KiB, then CRYPTO_BUFFER_EXCEEDED — see [RFC9000_21.7.md](RFC9000_21.7.md) |
 | **8** | **Address Validation** | | |
 | 8.1 | Address Validation during Connection Establishment | ✅ Done | Anti-amplification 3:1 limit |
 | 8.1.1 | Token Construction | ✅ Done | AES-128-GCM encrypted tokens |

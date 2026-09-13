@@ -4,6 +4,7 @@ const testing = std.testing;
 
 const flow_control = @import("flow_control.zig");
 const Frame = @import("frame.zig").Frame;
+const limits = @import("limits.zig");
 const ranges = @import("ranges.zig");
 
 /// Stream ID encoding per RFC 9000 Section 2.1:
@@ -40,10 +41,23 @@ pub fn isLocal(stream_id: u64, is_server: bool) bool {
 /// Gap-based frame sorter for out-of-order reassembly of stream data.
 /// Tracks received byte ranges and returns contiguous data starting from read_pos.
 pub const FrameSorter = struct {
+    /// One buffered run of stream bytes.
+    pub const Chunk = struct {
+        offset: u64,
+        data: []const u8,
+
+        fn end(self: Chunk) u64 {
+            return self.offset + self.data.len;
+        }
+    };
+
     allocator: Allocator,
 
-    /// Buffered data chunks, keyed by offset.
-    chunks: std.AutoArrayHashMapUnmanaged(u64, []const u8),
+    /// Buffered data chunks, sorted ascending by offset and never overlapping.
+    /// Sorted order is what keeps overlap resolution to a binary-search probe
+    /// of the neighbouring run; a hash map has to scan every chunk instead,
+    /// which goes quadratic under the reordering of RFC 9000 21.7.
+    chunks: std.ArrayList(Chunk),
 
     /// Next offset to be read by the application.
     read_pos: u64 = 0,
@@ -58,16 +72,30 @@ pub const FrameSorter = struct {
     pub fn init(allocator: Allocator) FrameSorter {
         return .{
             .allocator = allocator,
-            .chunks = .{},
+            .chunks = .{ .items = &.{}, .capacity = 0 },
         };
     }
 
     pub fn deinit(self: *FrameSorter) void {
-        // Free any owned data
-        for (self.chunks.values()) |data| {
-            self.allocator.free(data);
-        }
+        for (self.chunks.items) |c| self.allocator.free(c.data);
         self.chunks.deinit(self.allocator);
+    }
+
+    /// Index of the first chunk ending after `pos`, or `items.len` if none is.
+    fn lowerBound(self: *const FrameSorter, pos: u64) usize {
+        var lo: usize = 0;
+        var hi: usize = self.chunks.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.chunks.items[mid].end() <= pos) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    /// RFC 9000 21.7: a peer that withholds every other byte pins one chunk
+    /// per hole, so the tracking structure needs a ceiling of its own.
+    fn reserveChunk(self: *const FrameSorter) error{TooManyChunks}!void {
+        if (self.chunks.items.len >= limits.max_reassembly_chunks) return error.TooManyChunks;
     }
 
     /// Return the highest byte offset buffered (or read_pos if no chunks).
@@ -107,67 +135,54 @@ pub const FrameSorter = struct {
 
         // Fast path for the dominant receive case: new STREAM data appends at
         // or beyond the highest byte ever buffered. It cannot overlap an
-        // existing chunk, so avoid scanning the full chunk map for every packet.
+        // existing chunk, and sorts after every one already held.
         if (effective_offset >= self.highest_buffered) {
+            try self.reserveChunk();
             const owned = try self.allocator.dupe(u8, effective_data);
             errdefer self.allocator.free(owned);
-            try self.chunks.put(self.allocator, effective_offset, owned);
+            try self.chunks.append(self.allocator, .{ .offset = effective_offset, .data = owned });
             self.highest_buffered = effective_offset + owned.len;
             return;
         }
 
-        while (true) {
-            const new_start = effective_offset;
-            const new_end = effective_offset + effective_data.len;
-            var changed = false;
-            var i: usize = 0;
-            while (i < self.chunks.count()) {
-                const existing_offset = self.chunks.keys()[i];
-                const existing = self.chunks.values()[i];
-                const existing_end = existing_offset + existing.len;
-                if (existing_end <= new_start or existing_offset >= new_end) {
-                    i += 1;
-                    continue;
-                }
+        // Chunks are sorted and disjoint, so only the run starting at the first
+        // chunk ending past us can overlap this data.
+        const new_end = effective_offset + effective_data.len;
+        var i = self.lowerBound(effective_offset);
+        while (i < self.chunks.items.len and self.chunks.items[i].offset < new_end) {
+            const existing = self.chunks.items[i];
 
-                if (existing_offset <= new_start and existing_end >= new_end) {
-                    return;
-                }
+            // Already held in full.
+            if (existing.offset <= effective_offset and existing.end() >= new_end) return;
 
-                if (existing_offset <= new_start and existing_end > new_start) {
-                    const skip: usize = @intCast(existing_end - new_start);
-                    effective_offset = existing_end;
-                    effective_data = effective_data[skip..];
-                    if (effective_data.len == 0) return;
-                    changed = true;
-                    break;
-                }
+            // Existing covers our front: keep it, advance past it.
+            if (existing.offset <= effective_offset and existing.end() > effective_offset) {
+                const skip: usize = @intCast(existing.end() - effective_offset);
+                effective_offset = existing.end();
+                effective_data = effective_data[skip..];
+                if (effective_data.len == 0) return;
+                i += 1;
+                continue;
+            }
 
-                if (existing_offset < new_end and existing_end > new_end) {
-                    const suffix_start: usize = @intCast(new_end - existing_offset);
-                    const suffix = existing[suffix_start..];
-                    const owned_suffix = try self.allocator.dupe(u8, suffix);
-                    errdefer self.allocator.free(owned_suffix);
-                    _ = self.chunks.swapRemove(existing_offset);
-                    self.allocator.free(existing);
-                    try self.chunks.put(self.allocator, new_end, owned_suffix);
-                    changed = true;
-                    break;
-                }
-
-                _ = self.chunks.swapRemove(existing_offset);
-                self.allocator.free(existing);
-                changed = true;
+            // Existing covers our tail: keep only the part beyond us.
+            if (existing.offset < new_end and existing.end() > new_end) {
+                const suffix_start: usize = @intCast(new_end - existing.offset);
+                const owned_suffix = try self.allocator.dupe(u8, existing.data[suffix_start..]);
+                self.allocator.free(existing.data);
+                self.chunks.items[i] = .{ .offset = new_end, .data = owned_suffix };
                 break;
             }
-            if (!changed) break;
+
+            // Existing lies wholly inside the new data.
+            self.allocator.free(existing.data);
+            _ = self.chunks.orderedRemove(i);
         }
 
-        // Copy data to owned buffer
+        try self.reserveChunk();
         const owned = try self.allocator.dupe(u8, effective_data);
         errdefer self.allocator.free(owned);
-
-        try self.chunks.put(self.allocator, effective_offset, owned);
+        try self.chunks.insert(self.allocator, i, .{ .offset = effective_offset, .data = owned });
 
         const end_offset = effective_offset + owned.len;
         if (end_offset > self.highest_buffered) self.highest_buffered = end_offset;
@@ -176,41 +191,28 @@ pub const FrameSorter = struct {
     /// Pop the next contiguous chunk of data from the read position.
     /// Returns null if there's no data available at the current read position.
     pub fn pop(self: *FrameSorter) ?[]const u8 {
-        if (self.chunks.fetchSwapRemove(self.read_pos)) |entry| {
-            self.read_pos += entry.value.len;
-            return entry.value;
-        }
+        if (self.chunks.items.len == 0) return null;
 
-        var best_index: ?usize = null;
-        var best_end: u64 = 0;
-        for (self.chunks.keys(), 0..) |offset, index| {
-            const data = self.chunks.values()[index];
-            const end = offset + data.len;
-            if (offset <= self.read_pos and self.read_pos < end and end > best_end) {
-                best_index = index;
-                best_end = end;
-            }
-        }
-        if (best_index) |index| {
-            const offset = self.chunks.keys()[index];
-            const data = self.chunks.values()[index];
-            _ = self.chunks.swapRemove(offset);
-            const skip: usize = @intCast(self.read_pos - offset);
-            const readable = data[skip..];
-            const owned = if (skip == 0)
-                data
-            else blk: {
-                const copy = self.allocator.dupe(u8, readable) catch {
-                    self.allocator.free(data);
-                    return null;
-                };
-                self.allocator.free(data);
-                break :blk copy;
+        // Sorted and disjoint: only the first chunk can hold read_pos, and one
+        // starting past it means the gap in front is still open.
+        const first = self.chunks.items[0];
+        if (first.offset > self.read_pos or first.end() <= self.read_pos) return null;
+
+        _ = self.chunks.orderedRemove(0);
+        const skip: usize = @intCast(self.read_pos - first.offset);
+        const readable = first.data[skip..];
+        const owned = if (skip == 0)
+            first.data
+        else blk: {
+            const copy = self.allocator.dupe(u8, readable) catch {
+                self.allocator.free(first.data);
+                return null;
             };
-            self.read_pos += readable.len;
-            return owned;
-        }
-        return null;
+            self.allocator.free(first.data);
+            break :blk copy;
+        };
+        self.read_pos += readable.len;
+        return owned;
     }
 
     /// Check if all data has been received (FIN reached and all data consumed).
@@ -1680,6 +1682,45 @@ test "FrameSorter: out-of-order gap still accepts sequential tail" {
     testing.allocator.free(chunk3.?);
 
     try testing.expect(sorter.isComplete());
+}
+
+test "FrameSorter: heavy reordering reassembles in order" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    // Deliver single bytes back to front: every push lands below the
+    // high-water mark, the path that used to scan the whole chunk map.
+    const n: usize = 512;
+    var i: usize = n;
+    while (i > 0) {
+        i -= 1;
+        const b = [_]u8{@intCast(i % 251)};
+        try sorter.push(@intCast(i), &b, false);
+    }
+
+    var out: [n]u8 = undefined;
+    var got: usize = 0;
+    while (sorter.pop()) |chunk| {
+        @memcpy(out[got..][0..chunk.len], chunk);
+        got += chunk.len;
+        testing.allocator.free(chunk);
+    }
+    try testing.expectEqual(n, got);
+    for (out, 0..) |v, k| try testing.expectEqual(@as(u8, @intCast(k % 251)), v);
+}
+
+// RFC 9000 §21.7: bound the reassembly tracking structure.
+test "FrameSorter: rejects more gaps than the reassembly cap" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    // The hole at 0 keeps everything buffered; each run lands past the last.
+    var i: u64 = 0;
+    while (i < limits.max_reassembly_chunks) : (i += 1) {
+        try sorter.push(i * 2 + 2, "x", false);
+    }
+    try testing.expectEqual(limits.max_reassembly_chunks, sorter.chunks.items.len);
+    try testing.expectError(error.TooManyChunks, sorter.push(1_000_000, "x", false));
 }
 
 // RFC 9000 §4.5: final size validation

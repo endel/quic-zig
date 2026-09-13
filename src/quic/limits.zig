@@ -18,6 +18,19 @@ pub const undecryptable_max_pkts: usize = 32;
 /// Control frames queued for the next packet.
 pub const pending_frames: usize = 128;
 
+/// Distinct out-of-order runs a single `FrameSorter` will hold before the
+/// connection is torn down. RFC 9000 21.7 asks that reassembly tracking be
+/// bounded: a peer that withholds every other byte otherwise pins one chunk
+/// per hole, paying both the memory and the per-push search cost. Peers cap
+/// comparably — quic-go 1000, quinn 1024, ngtcp2 4000.
+pub const max_reassembly_chunks: usize = 1000;
+
+/// Largest CRYPTO stream offset we will buffer. CRYPTO frames are not flow
+/// controlled (RFC 9000 7.5), so this is the only ceiling on pre-handshake
+/// reassembly memory; past it the peer gets CRYPTO_BUFFER_EXCEEDED. Matches
+/// `tls_handshake_in`, which is all of one peer flight we can stage anyway.
+pub const max_crypto_stream_offset: u64 = tls_handshake_in;
+
 /// Largest QPACK dynamic table capacity we will honour, in bytes, and the
 /// size of the per-table arena backing it. RFC 9204 3.2.1 bounds the table's
 /// total content by the negotiated capacity, so this is the whole storage
