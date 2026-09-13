@@ -186,7 +186,10 @@ pub const H3Connection = struct {
         if (self.initialized) return;
 
         // Open control stream (type 0x00)
+        // All three are written through pointers kept for the connection's
+        // life, so a peer's STOP_SENDING must not get them reclaimed.
         const ctrl = try self.quic_conn.openUniStream();
+        ctrl.pinned = true;
         self.local_control_stream = ctrl;
         // Write stream type
         var type_buf: [8]u8 = undefined;
@@ -202,6 +205,7 @@ pub const H3Connection = struct {
 
         // Open QPACK encoder stream (type 0x02) — empty for static-only
         const enc = try self.quic_conn.openUniStream();
+        enc.pinned = true;
         self.local_qpack_enc_stream = enc;
         type_fbs = io.fixedBufferStream(&type_buf);
         try h3_frame.writeUniStreamType(&type_fbs, .qpack_encoder);
@@ -209,6 +213,7 @@ pub const H3Connection = struct {
 
         // Open QPACK decoder stream (type 0x03) — empty for static-only
         const dec = try self.quic_conn.openUniStream();
+        dec.pinned = true;
         self.local_qpack_dec_stream = dec;
         type_fbs = io.fixedBufferStream(&type_buf);
         try h3_frame.writeUniStreamType(&type_fbs, .qpack_decoder);
@@ -1707,6 +1712,11 @@ test "H3 integration: initConnection opens control + QPACK streams" {
     try testing.expect(h3.local_qpack_dec_stream != null);
     try testing.expect(h3.local_qpack_dec_stream.?.write_buffer.items.len > 0);
     try testing.expectEqual(@as(u8, 0x03), h3.local_qpack_dec_stream.?.write_buffer.items[0]);
+
+    // RFC 9114 §6.2.1: none of them may close, so none may be reclaimed.
+    try testing.expect(ctrl.pinned);
+    try testing.expect(h3.local_qpack_enc_stream.?.pinned);
+    try testing.expect(h3.local_qpack_dec_stream.?.pinned);
 }
 
 test "H3 integration: initConnection sets initialized flag" {

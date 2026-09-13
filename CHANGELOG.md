@@ -15,6 +15,12 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- Unidirectional streams we open are freed once the peer has all of their
+  data, or once they are reset. A server sending a stream per message kept
+  every message until the connection closed: 178 MiB after 40 s of Chrome's
+  firehose, where it now holds at 6 MiB.
+- A lost tail on a unidirectional stream is resent by the PTO probe instead of
+  waiting for loss detection. [#25](https://github.com/endel/quic-zig/issues/25)
 - A peer's STOP_SENDING on a unidirectional stream we opened closed the whole
   connection with STREAM_STATE_ERROR; it now stops that stream. A late STREAM,
   STOP_SENDING or MAX_STREAM_DATA for a stream we had already freed hit the

@@ -71,6 +71,10 @@ retransmission, ACK validation), (b) flow-control enforcement, (c) resource boun
    MAX_STREAMS deadlock. quic-go re-queues lost frames via per-frame `OnLost` handlers
    (`retransmission_queue.go:139-158`). Fix: record popped control frames (value types) in
    `SentPacket`, re-push on loss/PTO. Effort M.
+   **Still open (re-checked 2026-09-13).** A uni stream we reset is now reclaimed as soon as
+   its RESET_STREAM is queued, so the fix must rebuild the frame from what `SentPacket`
+   recorded, not through the stream — see "Uni send streams live in their own map" in
+   `SPEC/RFC9000_3.md`.
 
 8. **Coalesced datagrams can exceed 1200 bytes before address validation.** Each
    `packSinglePacket` is capped at `max_packet_size` but the *sum* in `packCoalesced` is only

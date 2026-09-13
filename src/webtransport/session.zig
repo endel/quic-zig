@@ -2724,6 +2724,62 @@ test "WT integration: finished uni streams are reclaimed, not retained for the c
     try testing.expectEqual(@as(u32, 0), setup.wt.fin_delivered.count());
 }
 
+/// Send everything queued on our uni stream `id` in one packet, and have the
+/// peer acknowledge it.
+fn sendAndAck(conn: *quic_connection.Connection, id: u64) !void {
+    const ss = conn.streams.send_streams.get(id).?;
+    const f = ss.popStreamFrame(1 << 16).?.stream;
+    var pkt: ack_handler.SentPacket = .{
+        .pn = conn.pkt_handler.nextPacketNumber(.application),
+        .time_sent = 0,
+        .size = 100,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .enc_level = .application,
+    };
+    pkt.addStreamFrame(.{ .stream_id = id, .offset = f.offset, .length = f.length, .fin = f.fin });
+    try conn.pkt_handler.onPacketSent(pkt);
+    try conn.processFrame(&.{ .ack = .{ .largest_ack = pkt.pn, .ack_delay = 0, .first_ack_range = 0 } }, .application, std.time.ns_per_s);
+}
+
+test "WT integration: finished uni send streams are reclaimed with their bookkeeping" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // H3's control and QPACK streams are the ones that must survive.
+    const baseline = setup.quic_conn.streams.send_streams.count();
+    try testing.expectEqual(@as(u32, 3), baseline);
+
+    // A stream per message, the shape of the firehose and of MoQ groups.
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        const id = try setup.wt.openUniStream(session_id, null);
+        try setup.wt.sendStreamData(id, "object");
+        setup.wt.closeStream(id);
+        try sendAndAck(&setup.quic_conn, id);
+        setup.wt.drainDisposalQueue();
+        setup.quic_conn.streams.drainDisposalQueue();
+    }
+
+    // One the peer stops: the application hears of it, then it goes too.
+    const stopped = try setup.wt.openUniStream(session_id, null);
+    try setup.quic_conn.processFrame(&.{ .stop_sending = .{
+        .stream_id = stopped,
+        .error_code = appErrorCodeToH3(3),
+    } }, .application, 0);
+    _ = try pollFor(&setup.wt, .stream_stop_sending);
+    try testing.expect(setup.wt.reset_delivered.contains(stopped));
+    var out: [1500]u8 = undefined;
+    _ = setup.quic_conn.send(&out) catch 0; // queues its RESET_STREAM
+    setup.wt.drainDisposalQueue();
+    setup.quic_conn.streams.drainDisposalQueue();
+
+    try testing.expectEqual(baseline, setup.quic_conn.streams.send_streams.count());
+    try testing.expectEqual(@as(u32, 0), setup.wt.wt_uni_streams.count());
+    try testing.expectEqual(@as(u32, 0), setup.wt.reset_delivered.count());
+}
+
 // ---- Group H: draft-13 session flow control ----
 
 /// Parse everything written to a CONNECT stream, asserting each capsule is

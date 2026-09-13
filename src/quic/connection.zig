@@ -1583,6 +1583,7 @@ pub const Connection = struct {
                         } else {
                             if (self.streams.send_streams.get(sf.stream_id)) |s| {
                                 try s.onAck(sf.offset, sf.length, sf.fin);
+                                self.streams.disposeUniIfSettled(s);
                             }
                         }
                     }
@@ -1719,6 +1720,7 @@ pub const Connection = struct {
                         } else {
                             if (self.streams.send_streams.get(sf.stream_id)) |s| {
                                 try s.onAck(sf.offset, sf.length, sf.fin);
+                                self.streams.disposeUniIfSettled(s);
                             }
                         }
                     }
@@ -2920,19 +2922,22 @@ pub const Connection = struct {
         if (!self.handshake_confirmed) return false;
         var queued = false;
         var it = self.streams.streams.valueIterator();
-        while (it.next()) |s_ptr| {
-            const s = s_ptr.*;
-            if (!s.send.hasUnackedData()) continue;
-            const start = s.send.ack_offset;
-            const end = s.send.send_offset;
-            if (end > start) {
-                s.send.queueRetransmit(start, end - start, s.send.fin_sent);
-            } else if (s.send.fin_sent) {
-                s.send.queueRetransmit(end, 0, true);
-            }
-            queued = true;
-        }
+        while (it.next()) |s_ptr| queued = queuePtoRetransmit(&s_ptr.*.send) or queued;
+        var uni_it = self.streams.send_streams.valueIterator();
+        while (uni_it.next()) |ss_ptr| queued = queuePtoRetransmit(ss_ptr.*) or queued;
         return queued;
+    }
+
+    fn queuePtoRetransmit(ss: *stream_mod.SendStream) bool {
+        if (!ss.hasUnackedData()) return false;
+        const start = ss.ack_offset;
+        const end = ss.send_offset;
+        if (end > start) {
+            ss.queueRetransmit(start, end - start, ss.fin_sent);
+        } else if (ss.fin_sent) {
+            ss.queueRetransmit(end, 0, true);
+        }
+        return true;
     }
 
     /// Called when the TLS handshake produces application-level secrets.
@@ -3006,7 +3011,11 @@ pub const Connection = struct {
             var stream_it = self.streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| self.queueSendSideFrames(&s_ptr.*.send);
             var uni_it = self.streams.send_streams.valueIterator();
-            while (uni_it.next()) |ss_ptr| self.queueSendSideFrames(ss_ptr.*);
+            while (uni_it.next()) |ss_ptr| {
+                self.queueSendSideFrames(ss_ptr.*);
+                // A queued RESET_STREAM is the last thing a reset stream sends.
+                self.streams.disposeUniIfSettled(ss_ptr.*);
+            }
         }
 
         // STOP_SENDING: send for streams requesting peer to stop
@@ -5662,6 +5671,144 @@ test "STOP_SENDING on a uni stream we opened stops it and keeps the connection" 
     try std.testing.expect(conn.local_err == null);
     try std.testing.expectEqual(@as(?u64, 9), ss.peer_stop_sending);
     try std.testing.expectEqual(@as(?u64, 9), ss.reset_err);
+}
+
+/// Pop `ss`'s next STREAM frame and record it as sent in a 1-RTT packet, the
+/// way the packer does. Returns the packet number.
+fn sendStreamFrameOf(conn: *Connection, ss: *stream_mod.SendStream) !u64 {
+    const f = ss.popStreamFrame(1 << 16).?.stream;
+    var pkt: ack_handler.SentPacket = .{
+        .pn = conn.pkt_handler.nextPacketNumber(.application),
+        .time_sent = 0,
+        .size = 100,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .enc_level = .application,
+    };
+    pkt.addStreamFrame(.{ .stream_id = f.stream_id, .offset = f.offset, .length = f.length, .fin = f.fin });
+    try conn.pkt_handler.onPacketSent(pkt);
+    return pkt.pn;
+}
+
+fn ackPacket(conn: *Connection, pn: u64) !void {
+    try conn.processFrame(&.{ .ack = .{ .largest_ack = pn, .ack_delay = 0, .first_ack_range = 0 } }, .application, std.time.ns_per_s);
+}
+
+test "a uni stream is reclaimed once its FIN is acked" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    const ss = try conn.streams.openUniStream();
+    const id = ss.stream_id;
+    try ss.writeData("hello");
+    ss.close();
+    const pn = try sendStreamFrameOf(&conn, ss);
+
+    // Sent is not received: a lost FIN would need the buffer back.
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(conn.streams.send_streams.get(id) != null);
+
+    try ackPacket(&conn, pn);
+    conn.streams.drainDisposalQueue();
+    try std.testing.expectEqual(@as(u32, 0), conn.streams.send_streams.count());
+}
+
+test "a reset uni stream is reclaimed once its RESET_STREAM is queued" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    // One we reset, one the peer stopped.
+    const ours = try conn.streams.openUniStream();
+    const theirs = try conn.streams.openUniStream();
+    try ours.writeData("hello");
+    try theirs.writeData("hello");
+    ours.reset(9);
+    try conn.processFrame(&.{ .stop_sending = .{ .stream_id = theirs.stream_id, .error_code = 7 } }, .application, 0);
+
+    // Until RESET_STREAM is out, the stream is the only record that it is owed.
+    conn.streams.drainDisposalQueue();
+    try std.testing.expectEqual(@as(u32, 2), conn.streams.send_streams.count());
+
+    conn.queueFlowControlUpdates();
+    conn.streams.drainDisposalQueue();
+    try std.testing.expectEqual(@as(u32, 0), conn.streams.send_streams.count());
+}
+
+test "a pinned uni stream outlives the peer's STOP_SENDING" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    const ss = try conn.streams.openUniStream();
+    ss.pinned = true;
+    try conn.processFrame(&.{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = 7 } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    conn.streams.drainDisposalQueue();
+
+    try std.testing.expectEqual(@as(?*stream_mod.SendStream, ss), conn.streams.send_streams.get(ss.stream_id));
+}
+
+test "a closed bidi stream is reclaimed when its last byte is acked after the close" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    // Both FINs cross and the send pass marks the stream closed; only then
+    // does the ACK for our last byte arrive.
+    var req = "GET".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = req.len, .data = &req, .fin = true } }, .application, 0);
+    const s = conn.streams.getStream(0).?;
+    try s.send.writeData("response");
+    s.send.close();
+    const pn = try sendStreamFrameOf(&conn, &s.send);
+
+    conn.queueFlowControlUpdates();
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(s.closed_for_gc);
+    try std.testing.expect(conn.streams.getStream(0) != null);
+
+    try ackPacket(&conn, pn);
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(conn.streams.getStream(0) == null);
+}
+
+test "a PTO with only a uni stream's tail in flight resends the tail" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    const now: i64 = @intCast(sys.nanoTimestamp());
+    conn.state = .connected;
+    conn.handshake_confirmed = true;
+    conn.last_packet_received_time = now;
+    conn.last_packet_sent_time = now;
+
+    // The tail went out long ago, and no later ACK will declare it lost.
+    const ss = try conn.streams.openUniStream();
+    try ss.writeData("tail");
+    ss.close();
+    _ = try sendStreamFrameOf(&conn, ss);
+
+    try conn.onTimeout();
+    try std.testing.expect(ss.hasRetransmitData());
+}
+
+test "a PTO probe resends a uni stream's unacked tail" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    conn.handshake_confirmed = true;
+
+    const ss = try conn.streams.openUniStream();
+    try ss.writeData("hello");
+    ss.close();
+    _ = ss.popStreamFrame(100).?;
+    try std.testing.expect(!ss.hasRetransmitData());
+
+    try std.testing.expect(conn.queueStreamPtoRetransmissions());
+    try std.testing.expect(ss.hasRetransmitData());
 }
 
 test "late frames for a local stream we reclaimed are dropped, not a STREAM_STATE_ERROR" {

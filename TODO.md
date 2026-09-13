@@ -56,7 +56,8 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
 - [ ] **C6. Stateless reset dead both directions (S/M)** — share manager key into `accept()`;
   call `matchesStatelessReset` from recv path (`connection.zig:808,4104`).
 - [ ] **C7. Lost control frames never retransmitted (M)** — RFC §13.3; record popped control
-  frames in `SentPacket`, re-push on loss (`packet_packer.zig:419`).
+  frames in `SentPacket`, re-push on loss (`packet_packer.zig:419`). Rebuild RESET_STREAM
+  from the record, not via the stream: a reset uni stream is freed once it is queued.
 - [ ] **C8. Coalesced datagrams can exceed 1200 B pre-validation (S/M)** — thread datagram
   budget through `packCoalesced` + pad-to-1200 fixup (`packet_packer.zig:120-234`).
 - [ ] **C9. AEAD/key-update limits not enforced (M)** — failed-decrypt counter →

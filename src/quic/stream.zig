@@ -445,6 +445,15 @@ pub const SendStream = struct {
     /// Whether a RESET_STREAM frame has been queued for sending.
     reset_stream_sent: bool = false,
 
+    /// Never reclaimed, whatever its state. For streams a protocol layer
+    /// writes through a pointer it keeps for the whole connection: H3's
+    /// control and QPACK streams, which a peer's STOP_SENDING would otherwise
+    /// reset and free out from under it.
+    pinned: bool = false,
+
+    /// Already on the disposal queue; see `Stream.disposal_queued`.
+    disposal_queued: bool = false,
+
     /// Retransmission queue: ranges of data that were lost and need resending.
     retransmit_ranges: [MAX_RETRANSMIT_RANGES]RetransmitRange = undefined,
     retransmit_count: u8 = 0,
@@ -699,6 +708,17 @@ pub const SendStream = struct {
         if (self.reset_err != null) return false;
         return self.ack_offset < self.write_offset or
             (self.fin_queued and !self.fin_acked);
+    }
+
+    /// Whether one of our uni streams can be removed and freed: the peer has
+    /// every byte and the FIN (RFC 9000 §3.1 "Data Recvd"), or RESET_STREAM is
+    /// queued. A queued RESET_STREAM carries all of its own state, so the
+    /// stream holds nothing a resend of it would need. Bidi streams also wait
+    /// on their receive half; see `Stream.isDisposable`.
+    pub fn isDisposable(self: *const SendStream) bool {
+        if (self.pinned) return false;
+        if (self.reset_err != null) return self.reset_stream_sent;
+        return self.fin_acked and self.ack_offset >= self.write_offset;
     }
 
     /// Pop a STREAM frame with at most max_len bytes of payload.
@@ -968,6 +988,10 @@ pub const StreamsMap = struct {
     /// re-offers them: `collectClosedStreams` scans only bidi streams, and a
     /// released receive stream is released exactly once.
     recv_disposal_overflow: bool = false,
+
+    /// Same, for our uni streams: nothing offers one again once its last ACK
+    /// or its RESET_STREAM has gone by.
+    send_disposal_overflow: bool = false,
 
     /// Every peer-initiated bidi ID below this has been opened. RFC 9000 §3.2:
     /// using a stream ID implicitly opens every lower one of the same type, so
@@ -1425,6 +1449,14 @@ pub const StreamsMap = struct {
         s.disposal_queued = self.queueDisposal(s.stream_id);
     }
 
+    /// The same for one of our uni streams. O(1) and idempotent.
+    pub fn disposeUniIfSettled(self: *StreamsMap, ss: *SendStream) void {
+        std.debug.assert(!isBidi(ss.stream_id));
+        if (ss.disposal_queued or !ss.isDisposable()) return;
+        ss.disposal_queued = self.queueDisposal(ss.stream_id);
+        if (!ss.disposal_queued) self.send_disposal_overflow = true;
+    }
+
     /// Queue a stream for removal. O(1) — called when a stream is known to be
     /// fully closed (closed_for_gc set, no pending retransmissions).
     /// Returns false when the queue is full; the caller must try again later.
@@ -1453,25 +1485,33 @@ pub const StreamsMap = struct {
                 rs.deinit();
                 self.allocator.destroy(rs);
             }
+            if (self.send_streams.fetchRemove(id)) |kv| {
+                var ss = kv.value;
+                ss.deinit();
+                self.allocator.destroy(ss);
+                self.closeStream(id);
+            }
         }
         self.disposal_count = 0;
         if (self.disposal_overflow) {
             self.disposal_overflow = false;
             self.needs_gc_scan = true; // there was more than the queue could hold
         }
-        if (self.recv_disposal_overflow) {
-            self.recv_disposal_overflow = false;
-            var it = self.recv_streams.valueIterator();
-            while (it.next()) |rp| {
-                const rs = rp.*;
-                if (rs.disposal_queued or !rs.isDisposable()) continue;
-                rs.disposal_queued = self.queueDisposal(rs.stream_id);
-                if (!rs.disposal_queued) {
-                    self.recv_disposal_overflow = true; // still more than fits
-                    break;
-                }
-            }
+        if (self.recv_disposal_overflow) self.recv_disposal_overflow = self.requeueSettled(&self.recv_streams);
+        if (self.send_disposal_overflow) self.send_disposal_overflow = self.requeueSettled(&self.send_streams);
+    }
+
+    /// Offer the queue the settled streams of `map` that it turned away while
+    /// full. Returns whether some still do not fit.
+    fn requeueSettled(self: *StreamsMap, map: anytype) bool {
+        var it = map.valueIterator();
+        while (it.next()) |p| {
+            const s = p.*;
+            if (s.disposal_queued or !s.isDisposable()) continue;
+            s.disposal_queued = self.queueDisposal(s.stream_id);
+            if (!s.disposal_queued) return true;
         }
+        return false;
     }
 
     /// Check if MAX_STREAMS updates should be sent (sliding window pattern).
@@ -2554,6 +2594,60 @@ test "disposeIfSettled: queues each stream once" {
     sm.disposeIfSettled(s);
     sm.disposeIfSettled(s);
     try testing.expectEqual(@as(usize, 1), sm.disposal_count);
+}
+
+test "SendStream.isDisposable: every byte and the FIN acked, or RESET_STREAM queued" {
+    var ss = SendStream.init(testing.allocator, 3);
+    defer ss.deinit();
+    try ss.writeData("x" ** 10);
+    _ = ss.popStreamFrame(5).?;
+    try ss.onAck(0, 5, false);
+    try testing.expect(!ss.isDisposable()); // still open
+
+    ss.close();
+    _ = ss.popStreamFrame(100).?;
+    try ss.onAck(5, 5, true);
+    try testing.expect(ss.isDisposable());
+
+    // The FIN can be acked ahead of bytes a lost packet carried.
+    var gap = SendStream.init(testing.allocator, 7);
+    defer gap.deinit();
+    try gap.writeData("x" ** 10);
+    gap.close();
+    _ = gap.popStreamFrame(5).?;
+    _ = gap.popStreamFrame(100).?;
+    try gap.onAck(5, 5, true);
+    try testing.expect(!gap.isDisposable());
+
+    var reset = SendStream.init(testing.allocator, 11);
+    defer reset.deinit();
+    try reset.writeData("x" ** 10);
+    reset.reset(1);
+    try testing.expect(!reset.isDisposable()); // RESET_STREAM not out yet
+    reset.reset_stream_sent = true;
+    try testing.expect(reset.isDisposable());
+    reset.pinned = true;
+    try testing.expect(!reset.isDisposable());
+}
+
+test "drainDisposalQueue: uni streams the full queue turned away are picked up" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+    sm.setMaxStreams(1000, 1000);
+
+    const total = sm.disposal_queue.len + 4;
+    for (0..total) |_| {
+        const ss = try sm.openUniStream();
+        ss.reset(1);
+        ss.reset_stream_sent = true;
+        sm.disposeUniIfSettled(ss);
+    }
+    try testing.expect(sm.send_disposal_overflow);
+
+    sm.drainDisposalQueue(); // frees what fit, re-queues the rest
+    sm.drainDisposalQueue();
+    try testing.expectEqual(@as(u32, 0), sm.send_streams.count());
+    try testing.expectEqual(@as(u64, 0), sm.open_uni_streams);
 }
 
 test "collectClosedStreams: picks up streams the disposal queue could not hold" {

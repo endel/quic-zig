@@ -10,7 +10,7 @@
 | 2.3 | Stream Prioritization | ✅ Done | RFC 9218 extensible priorities: urgency (0-7), incremental, PRIORITY_UPDATE frame |
 | 2.4 | Operations on Streams | ✅ Done | Open, send, recv, close, reset |
 | **3** | **Stream States** | | |
-| 3.1 | Sending Stream States | ✅ Done | Ready→Send→DataSent→DataRecvd/ResetSent |
+| 3.1 | Sending Stream States | ✅ Done | Ready→Send→DataSent→DataRecvd/ResetSent; our uni streams are reclaimed at Data Recvd or once RESET_STREAM is queued — see [RFC9000_3.md](RFC9000_3.md) |
 | 3.2 | Receiving Stream States | ✅ Done | Recv→SizeKnown→DataRecvd→DataRead |
 | 3.3 | Permitted Frame Types | ✅ Done | Frame-in-wrong-state enforcement |
 | 3.4 | Bidirectional Stream States | ✅ Done | Composite of send + recv states; reclaimed once fully acked — see [RFC9000_3.md](RFC9000_3.md) |
@@ -99,7 +99,7 @@
 | 13.2.5 | Measuring and Reporting Host Delay | ✅ Done | ACK delay field |
 | 13.2.6 | ACK Frames and Packet Protection | ✅ Done | ACKs at correct encryption level |
 | 13.2.7 | PADDING Frames Consume Congestion Window | ✅ Done | Counted as in-flight bytes |
-| 13.3 | Retransmission of Information | ✅ Done | Frame-level retransmission (not packet) |
+| 13.3 | Retransmission of Information | ⚠️ Partial | STREAM, CRYPTO and HANDSHAKE_DONE are resent from the lost packet's record; control frames (RESET_STREAM, STOP_SENDING, MAX_*, NEW_CONNECTION_ID, …) are sent once and never again — `TODO.md` C7 |
 | 13.4 | Explicit Congestion Notification | ✅ Done | IP-level ECT(0) marking + reading via recvmsg |
 | 13.4.1 | Reporting ECN Counts | ✅ Done | ACK_ECN frames with counters |
 | 13.4.2 | ECN Validation | ✅ Done | Full validation state machine (ecn.zig) |
