@@ -1906,15 +1906,17 @@ pub const Connection = struct {
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.5: STOP_SENDING for a locally-initiated stream not yet created
-                if (stream_mod.isLocal(ss.stream_id, self.is_server)) {
-                    if (self.streams.getStream(ss.stream_id) == null) {
-                        self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stop_sending), "STOP_SENDING for stream not yet created");
-                        return error.ProtocolViolation;
-                    }
+                if (stream_mod.isLocal(ss.stream_id, self.is_server) and self.streams.localNeverOpened(ss.stream_id)) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stop_sending), "STOP_SENDING for stream not yet created");
+                    return error.ProtocolViolation;
                 }
-                if (self.streams.getStream(ss.stream_id)) |s| {
-                    s.send.reset(ss.error_code);
-                    s.send.peer_stop_sending = ss.error_code;
+                const sender: ?*stream_mod.SendStream = if (self.streams.getStream(ss.stream_id)) |s|
+                    &s.send
+                else
+                    self.streams.send_streams.get(ss.stream_id);
+                if (sender) |snd| {
+                    snd.reset(ss.error_code);
+                    snd.peer_stop_sending = ss.error_code;
                 }
             },
 
@@ -1944,11 +1946,9 @@ pub const Connection = struct {
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.8: STREAM for locally-initiated stream not yet created
-                if (stream_mod.isLocal(s.stream_id, self.is_server) and stream_mod.isBidi(s.stream_id)) {
-                    if (self.streams.getStream(s.stream_id) == null) {
-                        self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stream), "STREAM for locally-initiated stream not yet created");
-                        return error.ProtocolViolation;
-                    }
+                if (stream_mod.isLocal(s.stream_id, self.is_server) and self.streams.localNeverOpened(s.stream_id)) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stream), "STREAM for locally-initiated stream not yet created");
+                    return error.ProtocolViolation;
                 }
                 // RFC 9000 §4.1: STREAM frame offset exceeding flow control limit
                 if (s.offset + s.data.len > self.conn_flow_ctrl.base.receive_window) {
@@ -2033,11 +2033,9 @@ pub const Connection = struct {
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.10: MAX_STREAM_DATA for locally-initiated stream not yet created
-                if (stream_mod.isLocal(msd.stream_id, self.is_server)) {
-                    if (self.streams.getStream(msd.stream_id) == null and self.streams.send_streams.get(msd.stream_id) == null) {
-                        self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.max_stream_data), "MAX_STREAM_DATA for stream not yet created");
-                        return error.ProtocolViolation;
-                    }
+                if (stream_mod.isLocal(msd.stream_id, self.is_server) and self.streams.localNeverOpened(msd.stream_id)) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.max_stream_data), "MAX_STREAM_DATA for stream not yet created");
+                    return error.ProtocolViolation;
                 }
                 // Update send window on bidi streams
                 if (self.streams.getStream(msd.stream_id)) |s| {
@@ -2945,6 +2943,27 @@ pub const Connection = struct {
         std.log.info("installAppKeys: keys installed for space 2", .{});
     }
 
+    /// STREAM_DATA_BLOCKED and RESET_STREAM for one stream we send on, bidi or
+    /// uni alike.
+    fn queueSendSideFrames(self: *Connection, ss: *stream_mod.SendStream) void {
+        if (ss.shouldSendBlocked()) |limit| {
+            self.pending_frames.push(.{ .stream_data_blocked = .{
+                .stream_id = ss.stream_id,
+                .limit = limit,
+            } });
+        }
+        if (ss.reset_err != null and !ss.reset_stream_sent) {
+            ss.reset_stream_sent = true;
+            // What went out, not what was written: buffered bytes were never
+            // sent and may lie past the peer's window (RFC 9000 §4.5).
+            self.pending_frames.push(.{ .reset_stream = .{
+                .stream_id = ss.stream_id,
+                .error_code = ss.reset_err.?,
+                .final_size = ss.send_offset,
+            } });
+        }
+    }
+
     /// Check if connection-level flow control needs a MAX_DATA or MAX_STREAMS update.
     fn queueFlowControlUpdates(self: *Connection) void {
         // Garbage-collect fully-closed bidi streams so consumed count advances
@@ -2983,34 +3002,11 @@ pub const Connection = struct {
             self.pending_frames.push(.{ .data_blocked = limit });
         }
 
-        // STREAM_DATA_BLOCKED: signal peer when stream-level flow control blocks sending
         {
             var stream_it = self.streams.streams.valueIterator();
-            while (stream_it.next()) |s_ptr| {
-                const s: *stream_mod.Stream = s_ptr.*;
-                if (s.send.shouldSendBlocked()) |limit| {
-                    self.pending_frames.push(.{ .stream_data_blocked = .{
-                        .stream_id = s.stream_id,
-                        .limit = limit,
-                    } });
-                }
-            }
-        }
-
-        // RESET_STREAM: send for streams with reset_err set
-        {
-            var stream_it = self.streams.streams.valueIterator();
-            while (stream_it.next()) |s_ptr| {
-                const s: *stream_mod.Stream = s_ptr.*;
-                if (s.send.reset_err != null and !s.send.reset_stream_sent) {
-                    s.send.reset_stream_sent = true;
-                    self.pending_frames.push(.{ .reset_stream = .{
-                        .stream_id = s.stream_id,
-                        .error_code = s.send.reset_err.?,
-                        .final_size = s.send.write_offset,
-                    } });
-                }
-            }
+            while (stream_it.next()) |s_ptr| self.queueSendSideFrames(&s_ptr.*.send);
+            var uni_it = self.streams.send_streams.valueIterator();
+            while (uni_it.next()) |ss_ptr| self.queueSendSideFrames(ss_ptr.*);
         }
 
         // STOP_SENDING: send for streams requesting peer to stop
@@ -5576,6 +5572,115 @@ test "RESET_STREAM beyond MAX_STREAMS is a protocol violation" {
         .error_code = 3,
         .final_size = 10,
     } }, .application, 0));
+}
+
+/// What the control-frame queue held for one stream. Drains the queue.
+const PendingForStream = struct { reset_final_size: ?u64 = null, blocked_limit: ?u64 = null };
+
+fn drainPendingFor(conn: *Connection, stream_id: u64) PendingForStream {
+    var out: PendingForStream = .{};
+    while (conn.pending_frames.pop()) |f| {
+        switch (f) {
+            .reset_stream => |rs| if (rs.stream_id == stream_id) {
+                out.reset_final_size = rs.final_size;
+            },
+            .stream_data_blocked => |sdb| if (sdb.stream_id == stream_id) {
+                out.blocked_limit = sdb.limit;
+            },
+            else => {},
+        }
+    }
+    return out;
+}
+
+test "RESET_STREAM reports the bytes sent as its final size, not the bytes written" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    const s = try conn.streams.openBidiStream();
+    try s.send.writeData(&([_]u8{'x'} ** 100));
+    _ = s.send.popStreamFrame(40).?;
+    s.send.reset(5);
+    conn.queueFlowControlUpdates();
+
+    try std.testing.expectEqual(@as(?u64, 40), drainPendingFor(&conn, s.stream_id).reset_final_size);
+}
+
+test "a reset uni stream sends RESET_STREAM" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    const ss = try conn.streams.openUniStream();
+    try ss.writeData("hello");
+    _ = ss.popStreamFrame(100).?;
+    ss.reset(9);
+    conn.queueFlowControlUpdates();
+
+    try std.testing.expectEqual(@as(?u64, 5), drainPendingFor(&conn, ss.stream_id).reset_final_size);
+}
+
+test "a uni stream blocked on MAX_STREAM_DATA sends STREAM_DATA_BLOCKED" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    conn.streams.setPeerInitialMaxStreamData(1000, 1000, 4);
+
+    const ss = try conn.streams.openUniStream();
+    try ss.writeData("0123456789");
+    _ = ss.popStreamFrame(100).?;
+    conn.queueFlowControlUpdates();
+
+    try std.testing.expectEqual(@as(?u64, 4), drainPendingFor(&conn, ss.stream_id).blocked_limit);
+}
+
+test "STOP_SENDING on a uni stream we opened stops it and keeps the connection" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    const ss = try conn.streams.openUniStream();
+    try ss.writeData("hello");
+    try conn.processFrame(&.{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = 9 } }, .application, 0);
+
+    try std.testing.expect(conn.local_err == null);
+    try std.testing.expectEqual(@as(?u64, 9), ss.peer_stop_sending);
+    try std.testing.expectEqual(@as(?u64, 9), ss.reset_err);
+}
+
+test "late frames for a local stream we reclaimed are dropped, not a STREAM_STATE_ERROR" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    const id = (try conn.streams.openBidiStream()).stream_id;
+    _ = conn.streams.queueDisposal(id);
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(conn.streams.getStream(id) == null);
+
+    // Our ACK of the peer's FIN was lost, so it retransmits; STOP_SENDING and
+    // MAX_STREAM_DATA can cross the reclamation the same way.
+    var payload = "late".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = id, .offset = 0, .length = payload.len, .data = &payload, .fin = true } }, .application, 0);
+    try conn.processFrame(&.{ .stop_sending = .{ .stream_id = id, .error_code = 1 } }, .application, 0);
+    try conn.processFrame(&.{ .max_stream_data = .{ .stream_id = id, .max = 1 << 20 } }, .application, 0);
+    try std.testing.expect(conn.local_err == null);
+}
+
+test "frames naming a local stream never opened are a STREAM_STATE_ERROR" {
+    var payload = "x".*;
+    // Server-initiated bidi 1 and uni 3; testConnection has opened neither.
+    const frames = [_]Frame{
+        .{ .stream = .{ .stream_id = 1, .offset = 0, .length = 1, .data = &payload, .fin = false } },
+        .{ .stop_sending = .{ .stream_id = 3, .error_code = 1 } },
+        .{ .max_stream_data = .{ .stream_id = 3, .max = 100 } },
+    };
+    for (&frames) |*f| {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        try std.testing.expectError(error.ProtocolViolation, conn.processFrame(f, .application, 0));
+    }
 }
 
 test "a handshake-space PTO with nothing to resend still probes" {

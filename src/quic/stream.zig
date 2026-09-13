@@ -647,6 +647,8 @@ pub const SendStream = struct {
 
     /// Check if there's data available to send (including retransmissions).
     pub fn hasData(self: *const SendStream) bool {
+        // RFC 9000 §3.1: nothing follows RESET_STREAM, so unsent bytes stay unsent.
+        if (self.reset_err != null) return false;
         return self.retransmit_count > 0 or
             self.fin_lost or
             self.send_offset < self.write_offset or
@@ -1079,9 +1081,9 @@ pub const StreamsMap = struct {
             return existing;
         }
 
-        // Verify this is a valid peer-initiated stream
         if (isLocal(stream_id, self.is_server)) {
-            return error.StreamStateError; // We don't have this stream
+            // Below the watermark: ours, reclaimed, and the peer is retransmitting.
+            return if (self.localNeverOpened(stream_id)) error.StreamStateError else error.StreamAlreadyClosed;
         }
 
         if (!isBidi(stream_id)) {
@@ -1177,6 +1179,15 @@ pub const StreamsMap = struct {
     /// Get a stream by ID.
     pub fn getStream(self: *StreamsMap, stream_id: u64) ?*Stream {
         return self.streams.get(stream_id);
+    }
+
+    /// Whether a locally-initiated `stream_id` lies above every ID we have
+    /// opened. RFC 9000 §19 makes a frame naming one a STREAM_STATE_ERROR. One
+    /// below the watermark that is missing from the maps was opened and has
+    /// since been reclaimed, and a frame for it is merely late.
+    pub fn localNeverOpened(self: *const StreamsMap, stream_id: u64) bool {
+        const next = if (isBidi(stream_id)) self.next_bidi_stream_id else self.next_uni_stream_id;
+        return stream_id >= next;
     }
 
     /// Maximum number of streams returned by getScheduledStreams().

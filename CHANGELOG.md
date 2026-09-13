@@ -3,6 +3,20 @@
 Notable changes to quic-zig. Versions follow [semantic versioning](https://semver.org);
 `Unreleased` collects what has landed on `main` since the last tag.
 
+## Unreleased
+
+### Fixed
+
+- A peer's STOP_SENDING on a unidirectional stream we opened closed the whole
+  connection with STREAM_STATE_ERROR; it now stops that stream. A late STREAM,
+  STOP_SENDING or MAX_STREAM_DATA for a stream we had already freed hit the
+  same error.
+- Resetting a unidirectional stream never told the peer, leaving its side of
+  the stream hanging.
+- RESET_STREAM gave the bytes written rather than the bytes sent as the final
+  size, so resetting a stream with data queued past the peer's window was a
+  flow-control violation on the peer's side.
+
 ## 0.4.0
 
 WebTransport, held to what browsers actually do: one conformance suite that the
