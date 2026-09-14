@@ -140,34 +140,18 @@ pub fn main() !void {
     // Create UDP socket (dual-stack: try IPv6 first, fall back to IPv4)
     const listen_port: u16 = std.fmt.parseInt(u16, port_str, 10) catch 443;
     const sockfd, const local_addr = blk: {
-        // Try IPv6 dual-stack socket first (handles both IPv4 and IPv6)
-        const addr6 = try net.Address.parseIp6("::", listen_port);
-        const fd6 = sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0) catch {
-            // Fall back to IPv4-only
-            const addr4 = try net.Address.parseIp4("0.0.0.0", listen_port);
-            const fd4 = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-            sys.bind(fd4, &addr4.any, addr4.getOsSockLen()) catch {
-                sys.close(fd4);
-                return error.BindFailed;
+        for ([_]net.Address{
+            try net.Address.parseIp6("::", listen_port),
+            try net.Address.parseIp4("0.0.0.0", listen_port),
+        }) |addr| {
+            const fd = sys.udpSocket(addr.any.family, .{}) catch continue;
+            sys.bind(fd, &addr.any, addr.getOsSockLen()) catch {
+                sys.close(fd);
+                continue;
             };
-            break :blk .{ fd4, addr4 };
-        };
-        // Allow dual-stack (disable IPV6_V6ONLY)
-        const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
-        const zero: c_int = 0;
-        posix.setsockopt(fd6, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero)) catch {};
-        sys.bind(fd6, &addr6.any, addr6.getOsSockLen()) catch {
-            sys.close(fd6);
-            // Fall back to IPv4-only
-            const addr4 = try net.Address.parseIp4("0.0.0.0", listen_port);
-            const fd4 = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-            sys.bind(fd4, &addr4.any, addr4.getOsSockLen()) catch {
-                sys.close(fd4);
-                return error.BindFailed;
-            };
-            break :blk .{ fd4, addr4 };
-        };
-        break :blk .{ fd6, addr6 };
+            break :blk .{ fd, addr };
+        }
+        return error.BindFailed;
     };
     defer sys.close(sockfd);
     ecn_socket.enableEcnRecv(sockfd) catch {};
@@ -418,8 +402,12 @@ fn loadFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 /// Discover the server's non-loopback IPv4 and IPv6 addresses from network interfaces.
-/// Uses C getifaddrs() which works on Linux (Docker containers).
+/// Uses C getifaddrs() which works on Linux (Docker containers). Elsewhere it
+/// finds nothing: getifaddrs is POSIX, and the interop runner never runs this
+/// on Windows.
 fn getServerAddresses() struct { ipv4: ?[4]u8, ipv6: ?[16]u8 } {
+    if (@import("builtin").os.tag == .windows) return .{ .ipv4 = null, .ipv6 = null };
+
     const IfAddrs = extern struct {
         ifa_next: ?*@This(),
         ifa_name: [*:0]const u8,

@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var lb_key_hex: ?[]const u8 = null;
     var disable_pmtud = false;
 
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = sys.argsIterator(init.args);
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {

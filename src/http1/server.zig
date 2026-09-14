@@ -46,9 +46,7 @@ pub const Http1Server = struct {
         const fd = try sys.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer sys.close(fd);
 
-        // Allow immediate reuse after restart.
-        const yes: c_int = 1;
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes)) catch {};
+        sys.setReuseAddr(fd);
 
         try sys.bind(fd, &addr.any, addr.getOsSockLen());
         try sys.listen(fd, 128);

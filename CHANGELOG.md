@@ -3,6 +3,14 @@
 Notable changes to quic-zig. Versions follow [semantic versioning](https://semver.org);
 `Unreleased` collects what has landed on `main` since the last tag.
 
+## Unreleased
+
+### Added
+
+- Windows. The library, its tests and the apps build and run natively: sockets
+  on Winsock, the event loop on libxev's IOCP backend. ECN is not read or set
+  on Windows yet. See [SPEC/STATUS.md](SPEC/STATUS.md#platforms).
+
 ## 0.5.0
 
 Servers that stay up: finished unidirectional streams are freed, a WebTransport

@@ -245,8 +245,7 @@ pub const SendBatch = struct {
         self.count += 1;
     }
 
-    /// Send all queued packets via sendmsg (matches quic-go's approach).
-    /// Uses sendmsg instead of sendto for more reliable delivery on macOS loopback.
+    /// Send all queued packets.
     pub fn flush(self: *SendBatch) void {
         if (self.count == 0) return;
 
@@ -257,20 +256,7 @@ pub const SendBatch = struct {
                 setEcnMark(self.sockfd, self.current_ecn) catch {};
             }
             const data = self.data_buf[self.offsets[i]..][0..self.lengths[i]];
-            var iov = [1]posix.iovec_const{.{
-                .base = data.ptr,
-                .len = data.len,
-            }};
-            const msg = std.c.msghdr_const{
-                .name = @ptrCast(&self.addrs[i]),
-                .namelen = self.addr_lens[i],
-                .iov = &iov,
-                .iovlen = 1,
-                .control = null,
-                .controllen = 0,
-                .flags = 0,
-            };
-            _ = std.c.sendmsg(self.sockfd, &msg, 0);
+            sendDatagram(self.sockfd, data, &self.addrs[i], self.addr_lens[i]);
         }
 
         self.count = 0;
@@ -285,6 +271,17 @@ pub fn sendDirect(sockfd: posix.socket_t, data: []const u8, addr: *const posix.s
     if (ecn != current_ecn.*) {
         current_ecn.* = ecn;
         setEcnMark(sockfd, ecn) catch {};
+    }
+    sendDatagram(sockfd, data, addr, addr_len);
+}
+
+/// One datagram out, best effort. POSIX uses sendmsg (matches quic-go), which
+/// delivered more reliably than sendto on macOS loopback. Winsock has no
+/// sendmsg, and without control data sendto is all WSASendMsg would add up to.
+fn sendDatagram(sockfd: posix.socket_t, data: []const u8, addr: *const posix.sockaddr.storage, addr_len: posix.socklen_t) void {
+    if (comptime is_windows) {
+        _ = sys.sendto(sockfd, data, 0, @ptrCast(addr), addr_len) catch {};
+        return;
     }
     var iov = [1]posix.iovec_const{.{
         .base = data.ptr,
@@ -302,10 +299,10 @@ pub fn sendDirect(sockfd: posix.socket_t, data: []const u8, addr: *const posix.s
     _ = std.c.sendmsg(sockfd, &msg, 0);
 }
 
-// Tests — ECN ancillary data tests only run on POSIX platforms.
+// On Windows the ECN calls are no-ops and receive falls back to recvfrom, so
+// these check the sockets work rather than the ancillary data.
 test "enableEcnRecv on a real socket" {
-    if (comptime is_windows) return error.SkipZigTest;
-    const sockfd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sockfd = try sys.udpSocket(posix.AF.INET, .{});
     defer sys.close(sockfd);
 
     const addr = try net.Address.parseIp4("127.0.0.1", 0);
@@ -315,8 +312,7 @@ test "enableEcnRecv on a real socket" {
 }
 
 test "setEcnMark on a real socket" {
-    if (comptime is_windows) return error.SkipZigTest;
-    const sockfd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sockfd = try sys.udpSocket(posix.AF.INET, .{});
     defer sys.close(sockfd);
 
     const addr = try net.Address.parseIp4("127.0.0.1", 0);
@@ -329,8 +325,7 @@ test "setEcnMark on a real socket" {
 }
 
 test "recvmsgEcn returns WouldBlock on empty socket" {
-    if (comptime is_windows) return error.SkipZigTest;
-    const sockfd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sockfd = try sys.udpSocket(posix.AF.INET, .{});
     defer sys.close(sockfd);
 
     const addr = try net.Address.parseIp4("127.0.0.1", 0);

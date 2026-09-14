@@ -120,7 +120,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer if (keylog_file) |f| f.close();
 
     // Parse request URLs from CLI args
-    var args_iter = std.process.Args.Iterator.init(init.args);
+    var args_iter = sys.argsIterator(init.args);
     _ = args_iter.next(); // skip program name
     var urls: std.ArrayList(ParsedUrl) = .{ .items = &.{}, .capacity = 0 };
     while (args_iter.next()) |arg| {
@@ -226,12 +226,8 @@ fn downloadAll(
 
     // Always create IPv6 dual-stack socket to support preferred_address migration across families.
     // If the initial server address is IPv4, sendto converts it to IPv4-mapped IPv6 automatically.
-    const sockfd = try sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sockfd = try sys.udpSocket(posix.AF.INET6, .{});
     defer sys.close(sockfd);
-    // Disable IPV6_V6ONLY to allow dual-stack (IPv4 and IPv6 on same socket)
-    const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
-    const zero: c_int = 0;
-    posix.setsockopt(sockfd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero)) catch {};
 
     const local_addr = try net.Address.parseIp6("::", 0);
     try sys.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());

@@ -546,6 +546,42 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 
 ---
 
+## Platforms
+
+Every call into the OS goes through [`src/sys.zig`](../src/sys.zig); Windows
+lives in [`src/sys/windows.zig`](../src/sys/windows.zig).
+
+| Platform | Event loop | Tested |
+|---|---|---|
+| Linux | libxev epoll | CI |
+| macOS | libxev kqueue | CI |
+| Windows | libxev IOCP, readiness through AFD poll | CI |
+
+### Windows caveats
+
+- **libxev.** The event loop waits for readiness (`xev.File.poll`), which
+  upstream libxev's IOCP backend does not have. `build.zig.zon` pins a fork
+  that adds it by polling through the AFD driver, the mechanism beneath
+  `WSAPoll`, so the result completes on the loop's port.
+- **ECN** is neither read nor set: receive is plain `recvfrom`, with no
+  `WSARecvMsg` control data, and marking is a no-op. ECN validation sees an
+  unmarked path.
+- **No batching.** One `sendto` per datagram, and no UDP send/receive offload.
+- **Timer resolution.** Sleeps and timed waits round up to the system tick,
+  about 15.6 ms: a 200 µs sleep measured 15.7 ms. The manual-loop apps (`bench`,
+  `*_manual`) sleep between polls, so on Windows they measure the tick rather
+  than the stack — `bench` managed 382 req/s where Linux does ~18k. The event
+  loop's timers wait on the completion port in milliseconds and share the tick.
+- **ICMP resets are off.** Winsock fails a UDP socket's next receive after an
+  ICMP port-unreachable (`WSAECONNRESET`), so one departed client could break a
+  server's receive loop. `sys.udpSocket` turns that off.
+- **`SO_REUSEADDR` is not set**: on Windows it lets a second socket take a port
+  that is still in use.
+- The interop servers find their preferred address with `getifaddrs`, which is
+  POSIX; on Windows they advertise none.
+
+---
+
 ## Overall Progress
 
 | RFC | Done | Partial | Missing | Completion |

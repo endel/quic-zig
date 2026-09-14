@@ -11,10 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows dropped during Zig 0.16 port — src/sys.zig, sockaddr, and
-        # the libxev dep have @compileError branches for Windows pending a
-        # proper Winsock implementation.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,4 +33,6 @@ jobs:
       # real server over a socket, no browser needed. The browser legs stay
       # local — see SPEC/webtransport_conformance.md.
       - name: WebTransport conformance (Zig client)
+        # A bash script that has not been run on Windows yet.
+        if: runner.os != 'Windows'
         run: ./tools/wt_conformance.sh --zig-only

@@ -715,7 +715,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
 fn out(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    (sys.File{ .fd = 1 }).writeAll(s) catch {};
+    sys.stdout().writeAll(s) catch {};
 }
 
 fn reportTap(
@@ -766,7 +766,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var tls_disable_verify = envFlag("TLS_DISABLE_VERIFY");
     var draft: moq_version.Draft = moq_version.DEFAULT;
 
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = sys.argsIterator(init.args);
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--relay") or std.mem.eql(u8, arg, "-r")) {

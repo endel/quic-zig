@@ -43,6 +43,14 @@ pub const Http1Config = http1.Http1Config;
 /// read. Safari fills the 16 KB loopback MTU and found that the hard way.
 const MAX_RECV_DATAGRAM: usize = (transport_params.TransportParams{}).max_udp_payload_size;
 
+/// A nonblocking UDP socket bound to `addr`.
+fn bindUdp(addr: net.Address, options: sys.UdpSocketOptions) !posix.socket_t {
+    const fd = try sys.udpSocket(addr.any.family, options);
+    errdefer sys.close(fd);
+    try sys.bind(fd, &addr.any, addr.getOsSockLen());
+    return fd;
+}
+
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
     port: u16 = 4433,
@@ -485,50 +493,21 @@ pub fn Server(comptime Handler: type) type {
                 break :blk cc;
             };
 
-            // Create UDP socket
-            const sockfd, const local_addr = if (config.ipv6) blk: {
-                // IPv6 dual-stack socket (handles both IPv4 and IPv6)
-                const addr6 = try net.Address.parseIp6("::", config.port);
-                const fd6 = try sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-                errdefer sys.close(fd6);
-                // Allow dual-stack (disable IPV6_V6ONLY)
-                const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
-                const zero_val: c_int = 0;
-                posix.setsockopt(fd6, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero_val)) catch {};
-                posix.setsockopt(fd6, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
-                try sys.bind(fd6, &addr6.any, addr6.getOsSockLen());
-                break :blk .{ fd6, addr6 };
-            } else blk: {
-                // IPv4 socket
-                const addr4 = try net.Address.parseIp4(config.address, config.port);
-                const fd4 = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-                errdefer sys.close(fd4);
-                posix.setsockopt(fd4, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
-                try sys.bind(fd4, &addr4.any, addr4.getOsSockLen());
-                break :blk .{ fd4, addr4 };
-            };
+            // Create UDP socket. An IPv6 one is dual-stack, so it carries IPv4 too.
+            const local_addr = if (config.ipv6)
+                try net.Address.parseIp6("::", config.port)
+            else
+                try net.Address.parseIp4(config.address, config.port);
+            const sockfd = try bindUdp(local_addr, .{ .reuse_addr = true });
             ecn_socket.enableEcnRecv(sockfd) catch {};
 
             // Optional second socket for preferred_address (connectionmigration)
             const preferred: ?PreferredSocket = if (config.preferred_port) |pp| blk: {
-                const pfd, const paddr = if (config.ipv6) v6: {
-                    const a6 = try net.Address.parseIp6("::", pp);
-                    const fd = try sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-                    errdefer sys.close(fd);
-                    const IPV6_V6ONLY2: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
-                    const zero2: c_int = 0;
-                    posix.setsockopt(fd, posix.IPPROTO.IPV6, IPV6_V6ONLY2, std.mem.asBytes(&zero2)) catch {};
-                    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
-                    try sys.bind(fd, &a6.any, a6.getOsSockLen());
-                    break :v6 .{ fd, a6 };
-                } else v4: {
-                    const a4 = try net.Address.parseIp4(config.address, pp);
-                    const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-                    errdefer sys.close(fd);
-                    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
-                    try sys.bind(fd, &a4.any, a4.getOsSockLen());
-                    break :v4 .{ fd, a4 };
-                };
+                const paddr = if (config.ipv6)
+                    try net.Address.parseIp6("::", pp)
+                else
+                    try net.Address.parseIp4(config.address, pp);
+                const pfd = try bindUdp(paddr, .{ .reuse_addr = true });
                 ecn_socket.enableEcnRecv(pfd) catch {};
                 break :blk .{
                     .sockfd = pfd,
@@ -1819,22 +1798,11 @@ pub fn Client(comptime Handler: type) type {
             };
 
             // Create non-blocking UDP socket, bind to ephemeral port
-            const sockfd, const local_addr = if (config.ipv6) blk: {
-                const addr6 = try net.Address.parseIp6("::", 0);
-                const fd = try sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-                errdefer sys.close(fd);
-                const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
-                const zero_val: c_int = 0;
-                posix.setsockopt(fd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero_val)) catch {};
-                try sys.bind(fd, &addr6.any, addr6.getOsSockLen());
-                break :blk .{ fd, addr6 };
-            } else blk: {
-                const addr4 = try net.Address.parseIp4("0.0.0.0", 0);
-                const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-                errdefer sys.close(fd);
-                try sys.bind(fd, &addr4.any, addr4.getOsSockLen());
-                break :blk .{ fd, addr4 };
-            };
+            const local_addr = if (config.ipv6)
+                try net.Address.parseIp6("::", 0)
+            else
+                try net.Address.parseIp4("0.0.0.0", 0);
+            const sockfd = try bindUdp(local_addr, .{});
             errdefer sys.close(sockfd);
             ecn_socket.enableEcnRecv(sockfd) catch {};
 

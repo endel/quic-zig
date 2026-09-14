@@ -1037,7 +1037,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var cert_path: []const u8 = "interop/browser/certs/server.crt";
     var key_path: []const u8 = "interop/browser/certs/server.key";
 
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = sys.argsIterator(init.args);
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
