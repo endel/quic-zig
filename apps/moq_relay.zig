@@ -687,6 +687,9 @@ const RelayHandler = struct {
         stream.send.writeData(buf[0..fbs.seek]) catch return;
 
         std.debug.print("[relay] PUBLISH_OK to client {d} (track {d})\n", .{ ci, ti });
+
+        // A held subscriber may be waiting on this track (§9.3.4).
+        self.resolvePending(ns_key[0..ns_len]);
     }
 
     fn handleDataStream(self: *RelayHandler, ci: usize, _: u64, data: []const u8) void {

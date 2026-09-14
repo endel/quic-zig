@@ -858,6 +858,9 @@ const RelayHandler = struct {
         moq_msg.writePublishOk(&fbs, .{}, self.clients[ci].draft) catch return;
         session.sendStreamData(stream_id, buf[0..fbs.seek]) catch return;
         std.debug.print("[relay] PUBLISH_OK → client {d} (track {d}, {d} subs)\n", .{ ci, ti, t.sub_count });
+
+        // A held subscriber may be waiting on this track (§9.3.4).
+        self.resolvePending(ns_key[0..ns_len]);
     }
 
     /// §10.11: the upstream publication has ended. Each downstream
