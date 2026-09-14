@@ -459,7 +459,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             sendPendingDgramReplies(alloc, &wt, ss, &conn);
             // Continue drip-feeding GET requests for datagram-receive test
             // Pace at 20ms intervals (matching Go interop's time.Sleep(20ms))
-            if (ss.dgram_get_offset < ss.files.len and ss.session_ready) {
+            if (testcase == .transfer_datagram_receive and
+                ss.dgram_get_offset < ss.files.len and ss.session_ready)
+            {
                 const now_ns = sys.nanoTimestamp();
                 const elapsed = now_ns - ss.last_dgram_get_time;
                 if (elapsed >= 20 * std.time.ns_per_ms) {
@@ -630,8 +632,8 @@ fn pollWtEvents(
             },
 
             .datagram => |dg| {
+                // dg.data is borrowed until the next poll: not ours to free.
                 handleDatagram(alloc, wt, state, testcase, dg.session_id, dg.data);
-                if (dg.data.len > 0) alloc.free(dg.data);
             },
 
             .connect_request => {},

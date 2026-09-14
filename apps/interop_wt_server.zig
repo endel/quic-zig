@@ -363,12 +363,14 @@ pub fn main(_: std.process.Init.Minimal) !void {
                 sendPendingDgramReplies(alloc, state, conn);
                 // Continue drip-feeding GET requests for datagram-send test
                 // Pace at 20ms intervals (matching Go interop's time.Sleep(20ms))
-                if (state.dgram_get_offset < request_paths.items.len and state.session_ready) {
+                if (testcase == .transfer_datagram_send and
+                    state.dgram_get_offset < request_paths.items.len and state.session_ready)
+                {
                     const now_ns = sys.nanoTimestamp();
                     const elapsed = now_ns - state.last_dgram_get_time;
                     if (elapsed >= 20 * std.time.ns_per_ms) {
                         if (!conn.isDatagramSendQueueFull()) {
-                            var wt_for_dgram = &(state.wt_conn orelse continue);
+                            const wt_for_dgram = if (state.wt_conn) |*wt| wt else continue;
                             const filename = extractFilename(request_paths.items[state.dgram_get_offset]);
                             var get_buf: [1024]u8 = undefined;
                             const get_msg = std.fmt.bufPrint(&get_buf, "GET {s}", .{filename}) catch continue;
@@ -622,8 +624,8 @@ fn pollWtEvents(
             },
 
             .datagram => |dg| {
+                // dg.data is borrowed until the next poll: not ours to free.
                 handleDatagram(alloc, wt, state, testcase, dg.session_id, dg.data);
-                if (dg.data.len > 0) alloc.free(dg.data);
             },
 
             .session_ready => |sr| {
@@ -817,7 +819,7 @@ fn sendPendingDgramReplies(
     state: *ConnState,
     conn: *connection.Connection,
 ) void {
-    var wt = &(state.wt_conn orelse return);
+    const wt = if (state.wt_conn) |*w| w else return;
     const session_id = state.session_id orelse return;
 
     const max_batch: usize = 32;

@@ -321,7 +321,6 @@ fn benchStream(alloc: std.mem.Allocator, config: Config) !void {
                         total_received += sd.data.len;
                         if (sd.data.len > 0) alloc.free(sd.data);
                     },
-                    .datagram => |dg| alloc.free(dg.data),
                     else => {},
                 }
             }
@@ -407,10 +406,7 @@ fn benchDatagram(alloc: std.mem.Allocator, config: Config) !void {
             const ev = wtc.poll() catch break;
             if (ev == null) break;
             switch (ev.?) {
-                .datagram => |dg| {
-                    recv_count += 1;
-                    alloc.free(dg.data);
-                },
+                .datagram => recv_count += 1, // payload is borrowed, not ours to free
                 else => {},
             }
         }
