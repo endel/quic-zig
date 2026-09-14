@@ -349,7 +349,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var track_names = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
     defer track_names.deinit(alloc);
 
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = sys.argsIterator(init.args);
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--addr")) {

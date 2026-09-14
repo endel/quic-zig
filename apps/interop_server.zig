@@ -310,6 +310,10 @@ fn loadFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 
 /// Discover the server's non-loopback IPv4 and IPv6 addresses from network interfaces.
 fn getServerAddresses() struct { ipv4: ?[4]u8, ipv6: ?[16]u8 } {
+    // getifaddrs is POSIX, and the interop runner only runs this in a Linux
+    // container. Elsewhere it finds nothing.
+    if (@import("builtin").os.tag == .windows) return .{ .ipv4 = null, .ipv6 = null };
+
     const IfAddrs = extern struct {
         ifa_next: ?*@This(),
         ifa_name: [*:0]const u8,

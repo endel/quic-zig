@@ -200,7 +200,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     // Parse request URLs from CLI args
-    var args_iter = std.process.Args.Iterator.init(init.args);
+    var args_iter = sys.argsIterator(init.args);
     _ = args_iter.next(); // skip program name
     var urls: std.ArrayList(ParsedUrl) = .{ .items = &.{}, .capacity = 0 };
     while (args_iter.next()) |arg| {
@@ -239,11 +239,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
 
     // Create dual-stack UDP socket
-    const sockfd = try sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sockfd = try sys.udpSocket(posix.AF.INET6, .{});
     defer sys.close(sockfd);
-    const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
-    const zero: c_int = 0;
-    posix.setsockopt(sockfd, posix.IPPROTO.IPV6, IPV6_V6ONLY, mem.asBytes(&zero)) catch {};
     const local_addr = try net.Address.parseIp6("::", 0);
     try sys.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
     ecn_socket.enableEcnRecv(sockfd) catch {};

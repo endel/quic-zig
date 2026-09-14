@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // they give back — an arena would grow for as long as the process runs.
     const alloc = std.heap.smp_allocator;
 
-    var args_iter = std.process.Args.Iterator.init(init.args);
+    var args_iter = quic.sys.argsIterator(init.args);
     _ = args_iter.next(); // skip program name
 
     var cert_path: []const u8 = "/etc/letsencrypt/live/echo.web-transport.dev/fullchain.pem";

@@ -200,32 +200,20 @@ pub fn main(_: std.process.Init.Minimal) !void {
         .keylog_file = keylog_file,
     };
 
-    // Create UDP socket (dual-stack)
+    // Create UDP socket: IPv6 dual-stack, or IPv4 where IPv6 is unavailable
     const sockfd, const local_addr = blk: {
-        const addr6 = try net.Address.parseIp6("::", 443);
-        const fd6 = sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0) catch {
-            const addr4 = try net.Address.parseIp4("0.0.0.0", 443);
-            const fd4 = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-            sys.bind(fd4, &addr4.any, addr4.getOsSockLen()) catch {
-                sys.close(fd4);
-                return error.BindFailed;
+        for ([_]net.Address{
+            try net.Address.parseIp6("::", 443),
+            try net.Address.parseIp4("0.0.0.0", 443),
+        }) |addr| {
+            const fd = sys.udpSocket(addr.any.family, .{}) catch continue;
+            sys.bind(fd, &addr.any, addr.getOsSockLen()) catch {
+                sys.close(fd);
+                continue;
             };
-            break :blk .{ fd4, addr4 };
-        };
-        const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
-        const zero: c_int = 0;
-        posix.setsockopt(fd6, posix.IPPROTO.IPV6, IPV6_V6ONLY, mem.asBytes(&zero)) catch {};
-        sys.bind(fd6, &addr6.any, addr6.getOsSockLen()) catch {
-            sys.close(fd6);
-            const addr4 = try net.Address.parseIp4("0.0.0.0", 443);
-            const fd4 = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-            sys.bind(fd4, &addr4.any, addr4.getOsSockLen()) catch {
-                sys.close(fd4);
-                return error.BindFailed;
-            };
-            break :blk .{ fd4, addr4 };
-        };
-        break :blk .{ fd6, addr6 };
+            break :blk .{ fd, addr };
+        }
+        return error.BindFailed;
     };
     defer sys.close(sockfd);
     ecn_socket.enableEcnRecv(sockfd) catch {};

@@ -169,7 +169,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = gpa.allocator();
 
     // Parse command-line args
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = sys.argsIterator(init.args);
     _ = args.next(); // skip program name
     const config_path = args.next() orelse {
         std.log.err("usage: quic-lb <config-file>", .{});
@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.log.info("QUIC-LB: {d} backend server(s) configured", .{config.server_count});
 
     // Create UDP socket
-    const sock = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sock = try sys.udpSocket(posix.AF.INET, .{});
     defer sys.close(sock);
 
     // Bind to listen address

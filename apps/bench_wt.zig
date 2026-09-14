@@ -63,7 +63,7 @@ fn percentile(sorted: []const i64, p: f64) i64 {
 // ════════════════════════════════════════════════════════
 
 fn createSocket() !struct { fd: posix.socket_t, addr: net.Address } {
-    const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const fd = try sys.udpSocket(posix.AF.INET, .{});
     const addr = try net.Address.parseIp4("127.0.0.1", 0);
     try sys.bind(fd, &addr.any, addr.getOsSockLen());
     ecn_socket.enableEcnRecv(fd) catch {};
@@ -446,7 +446,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const alloc = arena.allocator();
 
     var config = Config{};
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = sys.argsIterator(init.args);
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
