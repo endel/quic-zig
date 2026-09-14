@@ -3,6 +3,14 @@
 Notable changes to quic-zig. Versions follow [semantic versioning](https://semver.org);
 `Unreleased` collects what has landed on `main` since the last tag.
 
+## Unreleased
+
+### Fixed
+
+- A MoQ relay now answers a subscriber that arrived before its publisher as
+  soon as the publisher sends PUBLISH, instead of leaving it to wait out its
+  rendezvous timeout. [#34](https://github.com/endel/quic-zig/pull/34)
+
 ## 0.5.0
 
 Servers that stay up: finished unidirectional streams are freed, a WebTransport
