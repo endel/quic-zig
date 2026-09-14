@@ -359,12 +359,14 @@ pub const Server = struct {
     fn closeListenFd(self: *Server) void {
         if (self.listen_fd == closed_fd) return;
         // Before the close: past it, the path may be a new server's.
-        if (self.unix_addr) |*addr| _ = std.c.unlink(@ptrCast(&addr.path));
+        if (comptime builtin.target.os.tag != .windows) {
+            if (self.unix_addr) |*addr| _ = std.c.unlink(@ptrCast(&addr.path));
+        }
         sys.close(self.listen_fd);
         self.listen_fd = closed_fd;
     }
 
-    const closed_fd: posix.socket_t = -1;
+    const closed_fd = sys.invalid_socket;
 
     /// Stop accepting and end every connection: each open WebSocket gets a
     /// Close with 1001 (sent if the socket takes it at once) and
@@ -431,7 +433,7 @@ pub const Server = struct {
         if (self.listen_fd == closed_fd or self.unix_addr != null) return 0;
         var addr: net.Address = undefined;
         var len: posix.socklen_t = @sizeOf(net.Address);
-        if (std.c.getsockname(self.listen_fd, &addr.any, &len) != 0) return 0;
+        sys.getsockname(self.listen_fd, &addr.any, &len) catch return 0;
         return addr.getPort();
     }
 
@@ -507,17 +509,11 @@ fn openListener(opts: ListenOptions, tcp_port: u16) !posix.socket_t {
     else
         try net.Address.parseIp4(opts.address, tcp_port);
     const family: u32 = if (opts.ipv6) posix.AF.INET6 else posix.AF.INET;
-    const fd = try sys.socket(family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    const fd = try sys.tcpSocket(family);
     errdefer sys.close(fd);
-    if (opts.ipv6) {
-        // Dual-stack: also accept IPv4 peers.
-        const IPV6_V6ONLY: u32 = if (builtin.target.os.tag == .linux) 26 else 27;
-        posix.setsockopt(fd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&@as(c_int, 0))) catch {};
-    }
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1))) catch {};
-    if (opts.reuse_port) {
-        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&@as(c_int, 1)));
-    }
+    if (opts.ipv6) sys.setDualStack(fd); // also accept IPv4 peers
+    sys.setReuseAddr(fd);
+    if (opts.reuse_port) try sys.setReusePort(fd);
     try sys.bind(fd, &addr.any, addr.getOsSockLen());
     try sys.listen(fd, 1024);
     return fd;
@@ -534,6 +530,7 @@ fn unixAddress(path: []const u8) !posix.sockaddr.un {
 }
 
 fn openUnixListener(addr: *const posix.sockaddr.un) !posix.socket_t {
+    if (comptime builtin.target.os.tag == .windows) return error.UnixSocketsUnsupported;
     const fd = try sys.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     errdefer sys.close(fd);
     sys.bind(fd, @ptrCast(addr), @sizeOf(posix.sockaddr.un)) catch |err| {

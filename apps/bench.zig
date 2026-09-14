@@ -236,7 +236,7 @@ fn runBench(alloc: std.mem.Allocator, config: BenchConfig) !void {
             .skip_cert_verify = true,
         };
 
-        const sockfd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+        const sockfd = try sys.udpSocket(posix.AF.INET, .{});
         defer sys.close(sockfd);
         const local_addr = try net.Address.parseIp4("127.0.0.1", 0);
         try sys.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
@@ -282,7 +282,7 @@ fn runBench(alloc: std.mem.Allocator, config: BenchConfig) !void {
 
     var conn_idx: u32 = 0;
     while (conn_idx < config.num_connections) : (conn_idx += 1) {
-        const sockfd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+        const sockfd = try sys.udpSocket(posix.AF.INET, .{});
         defer sys.close(sockfd);
         const local_addr = try net.Address.parseIp4("127.0.0.1", 0);
         try sys.bind(sockfd, &local_addr.any, local_addr.getOsSockLen());
@@ -367,7 +367,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var config = BenchConfig{};
 
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = sys.argsIterator(init.args);
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {

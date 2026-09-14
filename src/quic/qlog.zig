@@ -4,6 +4,7 @@
 // Events follow draft-ietf-quic-qlog-quic-events naming conventions.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sys = @import("../sys.zig");
 const frame_mod = @import("frame.zig");
 const Frame = frame_mod.Frame;
@@ -366,7 +367,9 @@ test "a trace never opens a file that is already there" {
     var dir_buf: [64]u8 = undefined;
     var rnd: [4]u8 = undefined;
     sys.randomBytes(&rnd);
-    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/quic-zig-qlog-{x}", .{rnd});
+    // Windows has no /tmp: there it goes in the working directory.
+    const root = if (builtin.target.os.tag == .windows) "" else "/tmp/";
+    const dir = try std.fmt.bufPrint(&dir_buf, "{s}quic-zig-qlog-{x}", .{ root, rnd });
     try sys.makeDir(dir);
     const odcid = [_]u8{ 0xab, 0xcd };
     var path_buf: [96]u8 = undefined;

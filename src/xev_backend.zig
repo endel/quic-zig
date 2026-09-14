@@ -45,6 +45,71 @@ pub fn pollFd(loop: *const xev.Loop) std.posix.fd_t {
     };
 }
 
+/// `pollFd` for a backend with no fd: a completion port can't be polled, so
+/// a thread blocks on it instead. What it finds it puts back for the loop to
+/// collect, calls `wake`, and waits for `rearm`: one call per tick, however
+/// many packets the tick takes. Electron embeds libuv's port the same way.
+pub const PortWatch = struct {
+    const windows = std.os.windows;
+    const infinite: u32 = 0xFFFFFFFF;
+
+    extern "kernel32" fn GetQueuedCompletionStatus(port: windows.HANDLE, bytes: *u32, key: *usize, overlapped: *?*anyopaque, ms: u32) callconv(.winapi) i32;
+    extern "kernel32" fn PostQueuedCompletionStatus(port: windows.HANDLE, bytes: u32, key: usize, overlapped: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn CreateEventW(attrs: ?*anyopaque, manual: i32, initial: i32, name: ?[*:0]const u16) callconv(.winapi) ?windows.HANDLE;
+    extern "kernel32" fn SetEvent(event: windows.HANDLE) callconv(.winapi) i32;
+    extern "kernel32" fn WaitForSingleObject(handle: windows.HANDLE, ms: u32) callconv(.winapi) u32;
+    extern "kernel32" fn CloseHandle(handle: windows.HANDLE) callconv(.winapi) i32;
+
+    port: windows.HANDLE,
+    wake: *const fn (?*anyopaque) void,
+    ctx: ?*anyopaque,
+    rearmed: windows.HANDLE,
+    stopping: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread,
+
+    /// `self` must stay put until `stop`.
+    pub fn start(self: *PortWatch, loop: *const xev.Loop, wake: *const fn (?*anyopaque) void, ctx: ?*anyopaque) !void {
+        self.* = .{
+            .port = loop.iocp_handle,
+            .wake = wake,
+            .ctx = ctx,
+            .rearmed = CreateEventW(null, 0, 0, null) orelse return error.SystemResources,
+            .thread = undefined,
+        };
+        errdefer _ = CloseHandle(self.rearmed);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    pub fn rearm(self: *PortWatch) void {
+        _ = SetEvent(self.rearmed);
+    }
+
+    /// Returns with the thread gone, so no `wake` follows.
+    pub fn stop(self: *PortWatch) void {
+        self.stopping.store(true, .release);
+        // Key 0, no overlapped: if the loop takes it, it reads as a wakeup.
+        _ = PostQueuedCompletionStatus(self.port, 0, 0, null);
+        self.rearm();
+        self.thread.join();
+        _ = CloseHandle(self.rearmed);
+    }
+
+    fn run(self: *PortWatch) void {
+        while (true) {
+            var bytes: u32 = 0;
+            var key: usize = 0;
+            var overlapped: ?*anyopaque = null;
+            const ok = GetQueuedCompletionStatus(self.port, &bytes, &key, &overlapped, infinite);
+            // A failed I/O comes back as false with its overlapped set.
+            if (ok != 0 or overlapped != null) _ = PostQueuedCompletionStatus(self.port, bytes, key, overlapped);
+            if (self.stopping.load(.acquire)) return;
+            self.wake(self.ctx);
+            _ = WaitForSingleObject(self.rearmed, infinite);
+            if (self.stopping.load(.acquire)) return;
+        }
+    }
+};
+
 /// Whether the loop holds work for its next tick that `pollFd` won't
 /// announce: completions added but not yet given to the kernel, and on
 /// kqueue, results waiting for their callbacks.
@@ -59,7 +124,11 @@ pub fn nextTimerMs(loop: *xev.Loop) ?u64 {
     const t = loop.timers.peek() orelse return null;
     loop.update_now();
     const now = loop.cached_now;
-    const ns = (@as(i128, t.next.sec) - now.sec) * std.time.ns_per_s + (t.next.nsec - now.nsec);
+    // IOCP keeps plain nanoseconds, the others a timespec.
+    const ns: i128 = if (xev.backend == .iocp)
+        @as(i128, t.next) - now
+    else
+        (@as(i128, t.next.sec) - now.sec) * std.time.ns_per_s + (t.next.nsec - now.nsec);
     if (ns <= 0) return 0;
     return @intCast(@divFloor(ns - 1, std.time.ns_per_ms) + 1);
 }
@@ -101,6 +170,7 @@ test "a timer is queued until the loop ticks, then nextTimerMs counts down to it
 }
 
 test "pollFd is readable while the loop has an event to collect" {
+    if (xev.backend == .iocp) return error.SkipZigTest; // `PortWatch` instead
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
     var wake = try xev.Async.init();

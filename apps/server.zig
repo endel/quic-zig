@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var port: u16 = 4434;
     var server_id_hex: ?[]const u8 = null;
     var lb_key_hex: ?[]const u8 = null;
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = quic.sys.argsIterator(init.args);
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {

@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Parse --port argument
     var port: u16 = 4434;
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = sys.argsIterator(init.args);
     _ = args.next(); // skip program name
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     const server_addr = try net.Address.parseIp4("127.0.0.1", port);
-    const sockfd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sockfd = try sys.udpSocket(posix.AF.INET, .{});
     defer sys.close(sockfd);
 
     // Create a local socket with any available port

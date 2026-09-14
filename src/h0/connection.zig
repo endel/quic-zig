@@ -278,7 +278,7 @@ test "serveFile answers nothing for a path outside the root or too long to build
 
     var h0 = H0Connection.init(testing.allocator, conn, true);
     defer h0.deinit();
-    var long: [5000]u8 = @splat('a');
+    var long: [std.fs.max_path_bytes + 1]u8 = @splat('a');
     long[0] = '/';
     for ([_][]const u8{ "/../etc/hosts", "/a/../../etc/hosts", "..", &long }) |path| {
         h0.serveFile(s.stream_id, "/tmp", path) catch {};

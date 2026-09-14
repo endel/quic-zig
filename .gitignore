@@ -1,6 +1,7 @@
 .claude
 zig-out
 .zig-cache
+zig-pkg
 .DS_Store
 .vscode
 interop/quiche/target

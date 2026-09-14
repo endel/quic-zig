@@ -354,7 +354,7 @@ const ServerFrame = struct {
 };
 
 const TestClient = struct {
-    fd: posix.socket_t = -1,
+    fd: posix.socket_t = sys.invalid_socket,
     tls_config: tls_client.Config = .{},
     tls: ?tls_client.Conn = null,
     /// Plaintext from the server; `pos` bytes of it consumed.
@@ -369,7 +369,7 @@ const TestClient = struct {
         errdefer sys.close(fd);
         const addr = try net.Address.parseIp4("127.0.0.1", port);
         if (std.c.connect(fd, &addr.any, addr.getOsSockLen()) != 0) return error.ConnectionRefused;
-        socket.setNonBlocking(fd);
+        sys.setNonBlocking(fd);
         self.fd = fd;
         if (use_tls) {
             self.tls_config = .{ .server_name = "localhost", .skip_cert_verify = true, .alpn = &.{"http/1.1"} };
@@ -385,15 +385,15 @@ const TestClient = struct {
         var addr: posix.sockaddr.un = .{ .path = @splat(0) };
         @memcpy(addr.path[0..path.len], path);
         if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) != 0) return error.ConnectionRefused;
-        socket.setNonBlocking(fd);
+        sys.setNonBlocking(fd);
         self.fd = fd;
     }
 
     fn deinit(self: *TestClient) void {
         if (self.tls) |*t| t.deinit();
         self.in.deinit(testing.allocator);
-        if (self.fd >= 0) sys.close(self.fd);
-        self.fd = -1;
+        if (self.fd != sys.invalid_socket) sys.close(self.fd);
+        self.fd = sys.invalid_socket;
     }
 
     /// Sends nothing more, reading on: a FIN, or over TLS a close_notify.
@@ -402,13 +402,13 @@ const TestClient = struct {
             t.close();
             return self.flushTls();
         }
-        _ = std.c.shutdown(self.fd, posix.SHUT.WR);
+        sys.shutdown(self.fd, .send);
     }
 
     /// Drops the connection with no Close frame.
     fn abort(self: *TestClient) void {
         sys.close(self.fd);
-        self.fd = -1;
+        self.fd = sys.invalid_socket;
     }
 
     fn writeAll(self: *TestClient, bytes: []const u8) void {
@@ -416,7 +416,7 @@ const TestClient = struct {
         while (rest.len > 0) {
             const rc = std.c.send(self.fd, rest.ptr, rest.len, 0);
             if (rc < 0) {
-                if (std.posix.errno(rc) == .AGAIN) {
+                if (sys.wouldBlock()) {
                     sys.sleepNs(100 * std.time.ns_per_us);
                     continue;
                 }
@@ -468,12 +468,12 @@ const TestClient = struct {
     }
 
     fn poll(self: *TestClient) void {
-        if (self.eof or self.fd < 0) return;
+        if (self.eof or self.fd == sys.invalid_socket) return;
         var buf: [16 * 1024]u8 = undefined;
         while (true) {
             const rc = std.c.recv(self.fd, &buf, buf.len, 0);
             if (rc < 0) {
-                if (std.posix.errno(rc) == .AGAIN) return;
+                if (sys.wouldBlock()) return;
                 self.eof = true;
                 return;
             }
@@ -593,6 +593,7 @@ fn pathExists(path: [*:0]const u8) bool {
 }
 
 test "unix socket: a WebSocket and a request, and stop() removes the file" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const path = "/tmp/quic-zig-e2e-29620.sock";
     var h: Harness = undefined;
     try h.init(29620, .{ .tls = false, .unix_path = path });
@@ -624,6 +625,7 @@ test "unix socket: a WebSocket and a request, and stop() removes the file" {
 }
 
 test "unix socket: replaces a dead server's file, not a live server's or a regular file" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const path = "/tmp/quic-zig-e2e-29622.sock";
     const opts: http1.ListenOptions = .{ .quic_port = 0 };
     const config: http1.Config = .{ .tls = false, .unix_path = path };
@@ -1083,6 +1085,8 @@ test "ws: a WebTransport client and a WebSocket client share one handler and loo
 }
 
 test "ws: handed over to a server on another loop, with the message behind the move" {
+    // A socket stays on its first completion port.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     for ([_]bool{ false, true }) |use_tls| {
         var p: Pair = undefined;
         try p.init(if (use_tls) 29472 else 29470, .{ .tls = use_tls });
@@ -1118,6 +1122,7 @@ test "ws: handed over to a server on another loop, with the message behind the m
 }
 
 test "ws: a handover waits out a write in flight, and the new server sends the rest" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // see the handover test
     // Asked for with a write in flight, or once the flood drained enough for
     // the next message to be read. `Pair.step` checks nothing was in flight
     // when it moved.
@@ -1155,6 +1160,7 @@ fn expectFloodThenBehind(p: *Pair, c: *TestClient) !void {
 }
 
 test "ws: a peer that drops while handed over is closed by the new server" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // see the handover test
     var p: Pair = undefined;
     try p.init(29480, .{ .tls = false });
     defer p.deinit();
@@ -1170,6 +1176,7 @@ test "ws: a peer that drops while handed over is closed by the new server" {
 }
 
 test "ws: handOver only from onWsMessage; a discarded handover ends the connection" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // see the handover test
     var h: Harness = undefined;
     try h.init(29478, .{ .tls = false });
     defer h.deinit();

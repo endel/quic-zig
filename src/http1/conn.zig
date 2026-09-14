@@ -556,9 +556,9 @@ pub const Conn = struct {
             .peer = undefined,
         };
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-        if (std.c.getpeername(fd, @ptrCast(&self.peer), &len) != 0) {
+        sys.getpeername(fd, @ptrCast(&self.peer), &len) catch {
             self.peer = std.mem.zeroes(posix.sockaddr.storage);
-        }
+        };
         try self.sock.init(self, server.loop, &server.timers, gpa, server.xevTcp(fd));
         server.timers.set(&self.deadline, server.config.handshake_timeout_ms);
         self.sock.startReading();
