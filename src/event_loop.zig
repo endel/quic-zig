@@ -3727,8 +3727,9 @@ test "Server: socket options, ALPN and connection cap come from Config" {
     var a = try S.init(testing.allocator, &handler, .{
         .port = 29415,
         .reuse_port = true,
-        .recv_buffer_size = 1 << 20,
-        .send_buffer_size = 1 << 20,
+        // Under Linux's default rmem_max, which clamps anything larger.
+        .recv_buffer_size = 150_000,
+        .send_buffer_size = 150_000,
         .max_connections = 1000,
         .alpn = &alpn,
     });
@@ -3741,10 +3742,17 @@ test "Server: socket options, ALPN and connection cap come from Config" {
     try testing.expectEqualStrings("hq-interop", a.owned_tls.?.alpn[1]);
     try testing.expectEqualStrings("h3", b.owned_tls.?.alpn[0]);
 
-    var rcvbuf: c_int = 0;
+    // Linux reports double what was asked; b shows the OS default.
+    const rcvbuf = try getRcvBuf(a.sockfd);
+    try testing.expect(rcvbuf >= 150_000);
+    try testing.expect(rcvbuf != try getRcvBuf(b.sockfd));
+}
+
+fn getRcvBuf(fd: posix.socket_t) !c_int {
+    var v: c_int = 0;
     var len: posix.socklen_t = @sizeOf(c_int);
-    try testing.expectEqual(@as(c_int, 0), std.c.getsockopt(a.sockfd, posix.SOL.SOCKET, posix.SO.RCVBUF, @ptrCast(&rcvbuf), &len));
-    try testing.expect(rcvbuf >= 1 << 20);
+    try testing.expectEqual(@as(c_int, 0), std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @ptrCast(&v), &len));
+    return v;
 }
 
 /// Answers every GET with a short body.
