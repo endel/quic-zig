@@ -408,7 +408,7 @@ pub const Session = struct {
     /// stream id as both; see `H3Connection.notifyWritable` — it also waits
     /// for the stream's unsent backlog to fall below `min_bytes`.
     pub fn notifyWritable(self: *Session, session_id: u64, stream_id: ?u64, min_bytes: u64) !void {
-        defer self.entry.wake(); // an already-met wait fires on the next pass
+        defer self.entry.repoll(); // an already-met wait fires on a poll pass
         if (stream_id) |sid| {
             if (self.isH3RequestStream(sid)) {
                 return self.entry.h3_conn.?.notifyWritable(sid, min_bytes);
