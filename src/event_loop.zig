@@ -983,6 +983,7 @@ pub fn Server(comptime Handler: type) type {
         /// CONNECTION_CLOSE, pending data is flushed, then the event loop exits.
         pub fn stop(self: *Self) void {
             self.stopping = true;
+            self.conn_mgr.refuse_new = true; // or arrivals keep stop() from finishing
             for (self.conn_mgr.entries.items) |entry| {
                 const conn = entry.conn;
                 if (!conn.isClosed() and conn.state != .closing and conn.state != .draining) {
@@ -3332,6 +3333,47 @@ test "stop() leaves nothing queued for the peer" {
     // Nothing left to send means the close was drained, not just queued.
     var buf: [2048]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), client.conn.send(&buf) catch 0);
+}
+
+test "stop() turns away a client that arrives while it finishes" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var sh = HelloServer{};
+    var server = try Server(HelloServer).init(testing.allocator, &sh, .{
+        .port = 29436,
+        .tls_config = makeTestTlsConfig(),
+        .loop = &loop,
+    });
+    server.start();
+    var ha = CheckingClient{};
+    var a = try Client(CheckingClient).init(testing.allocator, &ha, .{ .port = 29436, .skip_cert_verify = true, .loop = &loop });
+    a.start();
+    try runUntil(&loop, &ha, CheckingClient.done, 10_000);
+
+    // a's connection is still closing when b arrives. Served, b would hold
+    // stop() open for as long as it stayed.
+    server.stop();
+    var hb = CheckingClient{};
+    var b = try Client(CheckingClient).init(testing.allocator, &hb, .{ .port = 29436, .skip_cert_verify = true, .loop = &loop });
+    b.start();
+    const server_stopped = runUntil(&loop, &server, Server(HelloServer).isStopped, 5000);
+
+    a.stop();
+    b.stop();
+    const All = struct {
+        s: *Server(HelloServer),
+        a: *Client(CheckingClient),
+        b: *Client(CheckingClient),
+        fn stopped(self: *const @This()) bool {
+            return self.s.isStopped() and self.a.isStopped() and self.b.isStopped();
+        }
+    };
+    try runUntil(&loop, &All{ .s = &server, .a = &a, .b = &b }, All.stopped, 5000);
+    a.deinit();
+    b.deinit();
+    server.deinit();
+    try server_stopped;
+    try testing.expectEqual(@as(usize, 0), hb.received);
 }
 
 test "Client: closeConnection from a handler arms the run loop's exit" {

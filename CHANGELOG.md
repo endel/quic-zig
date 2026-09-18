@@ -95,6 +95,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   requires Retry.
 - Trailers on an HTTP/3 request or response no longer close the connection
   with H3_MESSAGE_ERROR. They are accepted, though not yet surfaced.
+- `Server.stop()` now refuses connections that arrive while it finishes;
+  under steady arrivals they could keep it from ever finishing.
 
 ## 0.5.0
 
