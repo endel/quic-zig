@@ -146,8 +146,12 @@ pub const ConnectionIdPool = struct {
     const MAX_POOL_SIZE: usize = 8;
 
     entries: [MAX_POOL_SIZE]ConnectionIdEntry = .{ConnectionIdEntry{}} ** MAX_POOL_SIZE,
+    /// Bumped whenever the set of entries changes, so the server's reset
+    /// token index knows when to resync.
+    generation: u32 = 0,
 
     pub fn addPeerCid(self: *ConnectionIdPool, seq_num: u64, cid: []const u8, reset_token: [16]u8) void {
+        self.generation +%= 1;
         // Find a free slot
         for (&self.entries) |*entry| {
             if (!entry.occupied) {
@@ -174,6 +178,7 @@ pub const ConnectionIdPool = struct {
     }
 
     pub fn retirePriorTo(self: *ConnectionIdPool, seq: u64) void {
+        self.generation +%= 1;
         for (&self.entries) |*entry| {
             if (entry.occupied and entry.seq_num < seq) {
                 entry.* = ConnectionIdEntry{};
@@ -189,6 +194,7 @@ pub const ConnectionIdPool = struct {
     }
 
     pub fn removeBySeq(self: *ConnectionIdPool, seq: u64) void {
+        self.generation +%= 1;
         for (&self.entries) |*entry| {
             if (entry.occupied and entry.seq_num == seq) {
                 entry.* = ConnectionIdEntry{};
@@ -533,6 +539,9 @@ pub const ConnectionConfig = struct {
     datagram_queue_capacity: usize = DatagramQueue.DEFAULT_MAX_ITEMS,
     // Auto-close connection when all data is sent and acknowledged.
     close_when_idle: bool = false,
+    // Key deriving our stateless reset tokens (server). Must be the key the
+    // ConnectionManager signs its resets with, or they never match.
+    static_reset_key: ?[16]u8 = null,
 };
 
 /// A QUIC connection.
@@ -730,6 +739,8 @@ pub const Connection = struct {
     peer_max_cid_seq: u64 = 0,
     active_cid_seq: u64 = 0,
     local_err: ?ConnectionError = null,
+    /// The peer ended the connection with a stateless reset (RFC 9000 §10.3).
+    received_stateless_reset: bool = false,
     handshake_confirmed: bool = false,
     spin_bit: bool = false, // Spin bit for passive RTT measurement (RFC 9000 §17.4)
     largest_pn_received: ?u64 = null, // Tracks largest 1-RTT PN for spin bit toggling
@@ -834,8 +845,11 @@ pub const Connection = struct {
             @memcpy(conn.scid[0..header.scid.len], header.scid);
         }
 
-        // Generate static reset key for deterministic tokens
-        sys.randomBytes(&conn.static_reset_key);
+        if (config.static_reset_key) |k| {
+            conn.static_reset_key = k;
+        } else {
+            sys.randomBytes(&conn.static_reset_key);
+        }
 
         // Register initial SCID in local CID pool with deterministic token
         conn.local_cid_pool.registerInitialCid(conn.scid[0..conn.scid_len], conn.static_reset_key);
@@ -1291,13 +1305,14 @@ pub const Connection = struct {
             // Decrypt using KeyUpdateManager: first do header unprotection with the
             // (unchanging) HP key, then select the right AEAD key based on key phase
             payload = packet.decryptWithKeyUpdate(header, fbs, &space, &self.key_update.?) catch {
-                // Undecryptable 1-RTT packets are silently dropped (RFC 9001 §6.3).
-                return;
+                // Dropped (RFC 9001 §6.3); the error lets the caller test for a stateless reset.
+                return error.UndecryptablePacket;
             };
         } else {
             payload = packet.decrypt(header, fbs, space) catch {
-                // Silently drop undecryptable packets
                 std.log.debug("silently dropping packet enc_level={s}", .{@tagName(enc_level)});
+                // A short header ends the datagram, and may be a stateless reset.
+                if (header.packet_type == .one_rtt) return error.UndecryptablePacket;
                 return;
             };
         }
@@ -4414,6 +4429,22 @@ pub const Connection = struct {
         return self.new_token_buf[0..self.new_token_len];
     }
 
+    /// Enter draining if `datagram` ends in a reset token the peer issued for
+    /// a connection ID it has not retired (RFC 9000 §10.3.1). Call only for a
+    /// datagram whose first packet could not be decrypted. Sends nothing;
+    /// the connection terminates after the draining period, with
+    /// `received_stateless_reset` set. Returns whether it was a reset.
+    pub fn handleStatelessReset(self: *Connection, datagram: []const u8) bool {
+        if (self.state == .closing or self.state == .draining or self.state == .terminated) return false;
+        if (!self.matchesStatelessReset(datagram)) return false;
+        std.log.info("stateless reset received, draining", .{});
+        self.state = .draining;
+        self.closing_start_time = @intCast(sys.nanoTimestamp());
+        self.received_stateless_reset = true;
+        self.local_err = .{ .is_app = false, .code = 0, .reason = "stateless reset" };
+        return true;
+    }
+
     // Check if a received packet is a stateless reset (RFC 9000 §10.3).
     // Collects all known peer reset tokens and checks the packet's last 16 bytes.
     pub fn matchesStatelessReset(self: *const Connection, data: []const u8) bool {
@@ -4464,7 +4495,10 @@ pub const Connection = struct {
             var pkt_info = info;
             if (!first_packet) pkt_info.datagram_size = 0;
             first_packet = false;
-            self.recv(&header, &fbs, pkt_info) catch break;
+            self.recv(&header, &fbs, pkt_info) catch |err| {
+                if (err == error.UndecryptablePacket and pkt_start == 0) _ = self.handleStatelessReset(bytes);
+                break;
+            };
 
             const next_pos = pkt_start + full_size;
             if (fbs.seek < next_pos) fbs.seek = next_pos;
@@ -5401,6 +5435,55 @@ test "Connection: getEcnMark" {
     // If ECN fails
     conn.ecn_validator.state = .failed;
     try std.testing.expectEqual(ECN_NOT_ECT, conn.getEcnMark());
+}
+
+test "Connection: a datagram ending in the peer's reset token drains without sending" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    try conn.pkt_num_spaces[@intFromEnum(ack_handler.EncLevel.application)].setupInitial("dest1234", conn.version, true);
+    conn.state = .connected;
+    const token = [_]u8{0xBB} ** 16;
+    conn.peer_cid_pool.addPeerCid(0, conn.dcid[0..conn.dcid_len], token);
+    const info: RecvInfo = .{ .to = undefined, .from = undefined, .datagram_size = 40 };
+
+    // Undecryptable junk that doesn't end in the token is dropped.
+    var junk: [40]u8 = undefined;
+    sys.randomBytes(&junk);
+    junk[0] = 0x40 | (junk[0] & 0x3f);
+    conn.handleDatagram(&junk, info);
+    try std.testing.expectEqual(State.connected, conn.state);
+
+    // Under 21 bytes a datagram is never a reset (RFC 9000 §10.3).
+    var tiny: [20]u8 = undefined;
+    @memcpy(tiny[0..4], junk[0..4]);
+    @memcpy(tiny[4..], &token);
+    conn.handleDatagram(&tiny, info);
+    try std.testing.expectEqual(State.connected, conn.state);
+
+    var reset = junk;
+    @memcpy(reset[reset.len - 16 ..], &token);
+    conn.handleDatagram(&reset, info);
+    try std.testing.expect(conn.isDraining());
+    try std.testing.expect(conn.received_stateless_reset);
+    var out: [1500]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try conn.send(&out));
+}
+
+test "Connection: a retired peer CID's reset token is no longer honoured" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    try conn.pkt_num_spaces[@intFromEnum(ack_handler.EncLevel.application)].setupInitial("dest1234", conn.version, true);
+    conn.state = .connected;
+    const token = [_]u8{0xBB} ** 16;
+    conn.peer_cid_pool.addPeerCid(0, conn.dcid[0..conn.dcid_len], token);
+    conn.peer_cid_pool.retirePriorTo(1);
+
+    var reset: [40]u8 = undefined;
+    sys.randomBytes(&reset);
+    reset[0] = 0x40 | (reset[0] & 0x3f);
+    @memcpy(reset[reset.len - 16 ..], &token);
+    conn.handleDatagram(&reset, .{ .to = undefined, .from = undefined, .datagram_size = 40 });
+    try std.testing.expectEqual(State.connected, conn.state);
 }
 
 test "Connection: matchesStatelessReset with no tokens" {

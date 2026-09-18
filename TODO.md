@@ -59,8 +59,9 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
 - [x] **C5. Incoming uni streams never get MAX_STREAM_DATA (S)** — `queueFlowControlUpdates`
   walks `recv_streams` too. The raw-QUIC event loop also read one chunk per stream per pass,
   which stalled a sender (or tripped the gap cap) on its own; it now drains.
-- [ ] **C6. Stateless reset dead both directions (S/M)** — share manager key into `accept()`;
-  call `matchesStatelessReset` from recv path (`connection.zig:808,4104`).
+- [x] **C6. Stateless reset dead both directions (S/M)** — server connections take the
+  manager's key; an undecryptable short header is checked for a peer token on both sides,
+  the server via a token index. See [SPEC/RFC9000_10.3.md](SPEC/RFC9000_10.3.md).
 - [x] **C7. Lost control frames never retransmitted (M)** — `SentPacket` records up to 4
   `SentControlFrame`s; `requeueLostControlFrames` resends credit at its current value,
   BLOCKED only while still blocked, RESET_STREAM from the record. See
