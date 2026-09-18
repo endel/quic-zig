@@ -109,6 +109,14 @@ pub const Config = struct {
     // Use IPv6 dual-stack socket (supports both IPv4 and IPv6)
     ipv6: bool = false,
 
+    /// A bound, non-blocking UDP socket to serve on instead of opening one.
+    /// The server owns it once `init` succeeds; on failure it is left open
+    /// for the caller. `address`, `port`, `ipv6`, `reuse_port` and the
+    /// buffer sizes are not applied to it. Lets a replacement server take
+    /// over a socket it could not bind itself: after dropping privileges,
+    /// say, or while an SO_REUSEPORT group is held by another user.
+    socket: ?posix.socket_t = null,
+
     // Optional second port for preferred_address (connectionmigration).
     // When set, a second socket is created on this port so that clients
     // migrating to the server's preferred address can reach us.
@@ -752,8 +760,8 @@ pub fn Server(comptime Handler: type) type {
             if (config.quic_lb) |lb| conn_config.quic_lb = lb;
             if (config.foreign_datagram != null and conn_config.quic_lb == null) return error.ForeignDatagramNeedsQuicLb;
 
-            const sockfd, const local_addr = try openUdpSocket(config, config.port);
-            errdefer sys.close(sockfd);
+            const sockfd, const local_addr = if (config.socket) |fd| .{ fd, try boundAddress(fd) } else try openUdpSocket(config, config.port);
+            errdefer if (config.socket == null) sys.close(sockfd);
 
             // Optional second socket for preferred_address (connectionmigration)
             const preferred: ?PreferredSocket = if (config.preferred_port) |pp| blk: {
@@ -1858,6 +1866,14 @@ pub fn Server(comptime Handler: type) type {
             return if (floor) |f| @min(ms, f) else ms;
         }
     };
+}
+
+/// The address `fd` is bound to.
+fn boundAddress(fd: posix.socket_t) !net.Address {
+    var addr: net.Address = undefined;
+    var len: posix.socklen_t = @sizeOf(net.Address);
+    try sys.getsockname(fd, &addr.any, &len);
+    return addr;
 }
 
 /// A bound, non-blocking UDP socket for the server, with Config's socket
@@ -4050,6 +4066,21 @@ test "Server: socket options, ALPN and connection cap come from Config" {
     const rcvbuf = try getRcvBuf(a.sockfd);
     try testing.expect(rcvbuf >= 150_000);
     try testing.expect(rcvbuf != try getRcvBuf(b.sockfd));
+}
+
+test "Server: serves on a socket it is given" {
+    var handler = TestH3Handler{};
+    const S = Server(TestH3Handler);
+    var a = try S.init(testing.allocator, &handler, .{ .port = 29416 });
+    // A dup of a's socket, as a replacement server after a restart would get.
+    const fd = std.c.fcntl(a.sockfd, posix.F.DUPFD_CLOEXEC, @as(c_int, 0));
+    try testing.expect(fd >= 0);
+    a.deinit();
+    var b = try S.init(testing.allocator, &handler, .{ .socket = fd, .port = 1 });
+    defer b.deinit();
+    try testing.expectEqual(fd, b.sockfd);
+    const local: *const posix.sockaddr.in = @ptrCast(@alignCast(&b.local_addr));
+    try testing.expectEqual(@as(u16, 29416), std.mem.bigToNative(u16, local.port));
 }
 
 fn getRcvBuf(fd: posix.socket_t) !c_int {
