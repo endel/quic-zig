@@ -536,7 +536,7 @@ pub fn selectCertificate(entries: []const CertEntry, sni: ?[]const u8) ?CertSele
 /// Returns null for a list with no host_name entry.
 pub fn parseServerNameExtension(data: []const u8) error{DecodeError}!?[]const u8 {
     if (data.len < 2) return error.DecodeError;
-    const list_len = readU16(data);
+    const list_len: usize = readU16(data); // widened: + 2 overflows u16 at 0xFFFF
     if (list_len + 2 != data.len or list_len == 0) return error.DecodeError;
     var pos: usize = 2;
     var host: ?[]const u8 = null;
@@ -3721,6 +3721,18 @@ test "selectCertificate: exact, then one-label wildcard, then the first entry" {
     try std.testing.expectEqual(.{ 0, true }, T.pick(&entries, "default.test"));
     try std.testing.expectEqual(.{ 0, false }, T.pick(&entries, null));
     try std.testing.expect(selectCertificate(&.{}, "x") == null);
+}
+
+test "server_name: a list length of 0xFFFF is a decode error, not an overflow" {
+    var ext: [2 + 3 + 9]u8 = undefined;
+    ext[0..2].* = .{ 0xff, 0xff };
+    ext[2] = 0;
+    ext[3..5].* = .{ 0, 9 };
+    @memcpy(ext[5..], "localhost");
+    try std.testing.expectError(error.DecodeError, parseServerNameExtension(&ext));
+
+    std.mem.writeInt(u16, ext[0..2], ext.len - 2, .big);
+    try std.testing.expectEqualStrings("localhost", (try parseServerNameExtension(&ext)).?);
 }
 
 test "a QUIC server picks its certificate by SNI" {
