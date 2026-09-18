@@ -31,6 +31,7 @@ const wt = @import("webtransport/session.zig");
 const wt_fc = @import("webtransport/flow_control.zig");
 const transport_params = @import("quic/transport_params.zig");
 const packet = @import("quic/packet.zig");
+const quic_lb = @import("quic/quic_lb.zig");
 const Certificate = std.crypto.Certificate;
 const ca_bundle = @import("quic/ca_bundle.zig");
 
@@ -126,8 +127,27 @@ pub const Config = struct {
     ///
     /// The kernel balances by 4-tuple (Linux) and knows nothing of QUIC, so a
     /// peer that migrates can land on a worker that does not have its
-    /// connection; it gets a stateless reset.
+    /// connection; it gets a stateless reset unless `quic_lb` and
+    /// `foreign_datagram` steer it back to the owner.
     reuse_port: bool = false,
+
+    /// QUIC-LB CID encoding (draft-ietf-quic-load-balancers): every CID this
+    /// server issues — the handshake SCID and each NEW_CONNECTION_ID —
+    /// carries `server_id`. Applied on top of `conn_config` when both are set.
+    /// Servers that steer to each other share everything but `server_id`.
+    quic_lb: ?quic_lb.Config = null,
+
+    /// Called for a Handshake or 1-RTT datagram whose DCID is not ours but
+    /// decodes, under `quic_lb`, to another server id: a peer of a sibling
+    /// server that migrated onto this socket. Without it such a datagram
+    /// gets a stateless reset. Requires `quic_lb`.
+    ///
+    /// Runs on this server's loop thread, during its receive pass. The hook
+    /// copies the bytes (they are only valid for the call), moves them to the
+    /// owner's thread — a queue plus an `xev.Async`, say — and there calls
+    /// the owner's `injectDatagram`. Initials are never reported: whichever
+    /// server receives one accepts the connection.
+    foreign_datagram: ?ForeignDatagramHook = null,
 
     /// SO_RCVBUF / SO_SNDBUF for the UDP socket(s). Null keeps the OS default,
     /// which is small for a busy server (~200 KB on Linux); several MB avoids
@@ -144,6 +164,27 @@ pub const Config = struct {
     /// off it before `deinit()`: call `stop()`, then keep running the loop
     /// until `isStopped()`.
     loop: ?*xev.Loop = null,
+};
+
+/// A datagram a server received for a connection another server owns; see
+/// `Config.foreign_datagram`.
+pub const ForeignDatagram = struct {
+    /// The whole UDP payload, valid only for the duration of the hook.
+    bytes: []const u8,
+    peer: posix.sockaddr.storage,
+    /// The receiving socket's address. Under SO_REUSEPORT it is the owner's
+    /// too, so hand it to `injectDatagram` unchanged.
+    local: posix.sockaddr.storage,
+    ecn: u2,
+    /// The QUIC-LB server id the DCID decodes to, `quic_lb.server_id_len`
+    /// bytes. Nothing checks that such a server exists: the hook drops
+    /// what it cannot route.
+    server_id: []const u8,
+};
+
+pub const ForeignDatagramHook = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, datagram: *const ForeignDatagram) void,
 };
 
 /// Session wraps a ConnEntry and provides convenience methods for sending data.
@@ -602,6 +643,8 @@ pub fn Server(comptime Handler: type) type {
         /// Optional HTTP/1.1 static file server (runs on a separate thread).
         http1_server: ?http1.Http1Server,
 
+        foreign_hook: ?ForeignDatagramHook,
+
         /// WebTransport SETTINGS advertised to every peer, from Config.
         wt_settings: struct {
             max_sessions: u64,
@@ -665,13 +708,15 @@ pub fn Server(comptime Handler: type) type {
             if (config.static_reset_key == null) sys.randomBytes(&static_reset_key);
 
             // Connection config
-            const conn_config: connection.ConnectionConfig = if (config.conn_config) |cc| cc else blk: {
+            var conn_config: connection.ConnectionConfig = if (config.conn_config) |cc| cc else blk: {
                 var cc: connection.ConnectionConfig = .{ .token_key = retry_token_key };
                 if (Handler.protocol == .webtransport or Handler.protocol == .quic) {
                     cc.max_datagram_frame_size = config.max_datagram_frame_size;
                 }
                 break :blk cc;
             };
+            if (config.quic_lb) |lb| conn_config.quic_lb = lb;
+            if (config.foreign_datagram != null and conn_config.quic_lb == null) return error.ForeignDatagramNeedsQuicLb;
 
             const sockfd, const local_addr = try openUdpSocket(config, config.port);
             errdefer sys.close(sockfd);
@@ -700,6 +745,7 @@ pub fn Server(comptime Handler: type) type {
             conn_mgr.require_retry = config.require_retry;
             conn_mgr.max_connections = config.max_connections;
             conn_mgr.reply_limits = .init(config.stateless_reply_rate);
+            conn_mgr.steer_foreign = config.foreign_datagram != null;
 
             // Init libxev
             const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
@@ -746,6 +792,7 @@ pub fn Server(comptime Handler: type) type {
                 .owned_tls = owned_tls,
                 .preferred = preferred,
                 .http1_server = http1_server,
+                .foreign_hook = config.foreign_datagram,
                 .wt_settings = .{
                     .max_sessions = config.webtransport_max_sessions,
                     .legacy = config.wt_legacy_settings,
@@ -1191,10 +1238,56 @@ pub fn Server(comptime Handler: type) type {
                         recv_batch.add(data, @ptrCast(&recv_result.from_addr), recv_result.addr_len, 0);
                     },
                     .dropped => {},
+                    .foreign => |server_id| if (self.foreign_hook) |hook| {
+                        const dg: ForeignDatagram = .{
+                            .bytes = self.recv_buf[0..recv_result.bytes_read],
+                            .peer = recv_result.from_addr,
+                            .local = local_addr,
+                            .ecn = recv_result.ecn,
+                            .server_id = server_id,
+                        };
+                        hook.func(hook.ctx, &dg);
+                    },
                 }
             }
 
             return received;
+        }
+
+        /// Process a datagram another server received for one of our
+        /// connections (see `Config.foreign_datagram`) as if it had arrived
+        /// on our own socket: the connection sees `peer` as its source, and
+        /// replies go out on our socket — the one whose address is `local`
+        /// if it is our preferred-address socket, else the main one.
+        ///
+        /// Must be called on this server's loop thread, and not from inside
+        /// one of its callbacks. `bytes` is decrypted in place.
+        ///
+        /// A datagram we do not recognise either is answered with a stateless
+        /// reset, never handed on again.
+        pub fn injectDatagram(
+            self: *Self,
+            bytes: []u8,
+            peer: posix.sockaddr.storage,
+            local: posix.sockaddr.storage,
+            ecn: u2,
+        ) void {
+            if (!self.started or self.halted) return;
+            var batch = &self.batch;
+            var on = self.local_addr;
+            if (self.preferred) |*p| {
+                if (connection.sockaddrPort(&local) == p.port) {
+                    batch = &p.batch;
+                    on = p.local_addr;
+                }
+            }
+            self.in_callback = true;
+            switch (self.conn_mgr.recvHandedOver(bytes, peer, on, ecn, &self.out_buf)) {
+                .send_response => |data| batch.add(data, @ptrCast(&peer), connection.sockaddrLen(&peer), 0),
+                .processed, .dropped, .foreign => {},
+            }
+            self.in_callback = false;
+            self.service();
         }
 
         /// Pick the correct SendBatch for a connection based on its local port.
@@ -4336,4 +4429,239 @@ test "e2e: a raw-QUIC handler may open streams from onStreamData" {
 
     try runUntil(&e2e.loop, &server_handler, FanoutServer.done, 10_000);
     try testing.expect(server_handler.opened > 0);
+}
+
+/// Server ids 1 and 2 under one QUIC-LB config, as a proxy's workers would
+/// share it.
+fn steerLbConfig(server_id: u8) quic_lb.Config {
+    var cfg: quic_lb.Config = .{ .config_id = 1, .server_id_len = 1, .nonce_len = 7, .key = [_]u8{0x5a} ** 16 };
+    cfg.server_id[0] = server_id;
+    return cfg;
+}
+
+/// A tiny spin lock: std 0.16 keeps its mutex behind `Io`.
+const SpinLock = struct {
+    held: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *SpinLock) void {
+        while (self.held.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.held.store(false, .release);
+    }
+};
+
+/// One worker of a proxy: a server on its own thread and loop, plus the inbox
+/// its siblings hand datagrams to, drained on its own thread by an Async.
+const SteerWorker = struct {
+    const Handed = struct {
+        buf: [1500]u8,
+        len: usize,
+        peer: posix.sockaddr.storage,
+        local: posix.sockaddr.storage,
+        ecn: u2,
+    };
+
+    server: Server(HelloServer),
+    wakeup: xev.Async,
+    wakeup_c: xev.Completion = .{},
+    thread: std.Thread = undefined,
+
+    lock: SpinLock = .{},
+    inbox: [32]Handed = undefined,
+    head: usize = 0,
+    count: usize = 0,
+    quit: std.atomic.Value(bool) = .init(false),
+
+    /// Owner thread only; read after join.
+    injected: usize = 0,
+
+    fn run(self: *SteerWorker) void {
+        self.server.start();
+        self.wakeup.wait(self.server.eventLoop(), &self.wakeup_c, SteerWorker, self, onWakeup);
+        self.server.eventLoop().run(.until_done) catch {};
+    }
+
+    fn onWakeup(self_opt: ?*SteerWorker, _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+        const self = self_opt.?;
+        _ = r catch return .rearm;
+        var item: Handed = undefined;
+        while (true) {
+            // Never inject under the lock: injecting reads our socket, and
+            // what arrives there may be handed to a sibling, taking its lock.
+            self.lock.lock();
+            if (self.count == 0) {
+                self.lock.unlock();
+                break;
+            }
+            item = self.inbox[self.head];
+            self.head = (self.head + 1) % self.inbox.len;
+            self.count -= 1;
+            self.lock.unlock();
+            self.server.injectDatagram(item.buf[0..item.len], item.peer, item.local, item.ecn);
+            self.injected += 1;
+        }
+        if (self.quit.load(.acquire)) {
+            self.server.stop();
+            return .disarm;
+        }
+        return .rearm;
+    }
+
+    /// Any thread.
+    fn hand(self: *SteerWorker, dg: *const ForeignDatagram) void {
+        if (dg.bytes.len > 1500) return;
+        self.lock.lock();
+        if (self.count < self.inbox.len) {
+            const slot = &self.inbox[(self.head + self.count) % self.inbox.len];
+            @memcpy(slot.buf[0..dg.bytes.len], dg.bytes);
+            slot.len = dg.bytes.len;
+            slot.peer = dg.peer;
+            slot.local = dg.local;
+            slot.ecn = dg.ecn;
+            self.count += 1;
+        }
+        self.lock.unlock();
+        self.wakeup.notify() catch {};
+    }
+};
+
+const SteerRouter = struct {
+    workers: [2]*SteerWorker,
+    forwarded: std.atomic.Value(usize) = .init(0),
+
+    fn onForeign(ctx: ?*anyopaque, dg: *const ForeignDatagram) void {
+        const self: *SteerRouter = @ptrCast(@alignCast(ctx.?));
+        const id = dg.server_id[0];
+        if (id < 1 or id > self.workers.len) return;
+        _ = self.forwarded.fetchAdd(1, .monotonic);
+        self.workers[id - 1].hand(dg);
+    }
+};
+
+/// Stands in for a NAT between client and servers: relays through one
+/// upstream socket to `first`, then — once `rebound` is set — through a
+/// fresh one to `second`, so the client's packets change both source
+/// address and receiving server.
+const RebindingRelay = struct {
+    front: posix.socket_t,
+    up: [2]posix.socket_t,
+    targets: [2]net.Address,
+    rebound: std.atomic.Value(bool) = .init(false),
+    quit: std.atomic.Value(bool) = .init(false),
+    client: posix.sockaddr.storage = undefined,
+    client_len: posix.socklen_t = 0,
+
+    fn udp(port: u16) !posix.socket_t {
+        const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+        errdefer sys.close(fd);
+        const addr = try net.Address.parseIp4("127.0.0.1", port);
+        try sys.bind(fd, &addr.any, addr.getOsSockLen());
+        return fd;
+    }
+
+    fn run(self: *RebindingRelay) void {
+        var buf: [2048]u8 = undefined;
+        while (!self.quit.load(.acquire)) {
+            var idle = true;
+            var from: posix.sockaddr.storage = undefined;
+            var from_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            if (sys.recvfrom(self.front, &buf, 0, @ptrCast(&from), &from_len)) |n| {
+                idle = false;
+                self.client = from;
+                self.client_len = from_len;
+                const i: usize = @intFromBool(self.rebound.load(.acquire));
+                const to = self.targets[i];
+                _ = sys.sendto(self.up[i], buf[0..n], 0, &to.any, to.getOsSockLen()) catch {};
+            } else |_| {}
+            for (self.up) |fd| {
+                if (sys.recvfrom(fd, &buf, 0, null, null)) |n| {
+                    idle = false;
+                    if (self.client_len != 0) {
+                        _ = sys.sendto(self.front, buf[0..n], 0, @ptrCast(&self.client), self.client_len) catch {};
+                    }
+                } else |_| {}
+            }
+            if (idle) sys.sleepNs(50 * std.time.ns_per_us);
+        }
+    }
+};
+
+test "e2e: a migrated peer landing on the wrong worker is steered to its owner" {
+    const relay_port: u16 = 29430;
+    const ports = [2]u16{ 29431, 29432 };
+
+    var handler = HelloServer{};
+    var router: SteerRouter = .{ .workers = undefined };
+    for (&router.workers, ports, 1..) |*w, port, id| {
+        w.* = try testing.allocator.create(SteerWorker);
+        w.*.* = .{
+            .server = try Server(HelloServer).init(testing.allocator, &handler, .{
+                .port = port,
+                .reuse_port = true,
+                .tls_config = makeTestTlsConfig(),
+                .quic_lb = steerLbConfig(@intCast(id)),
+                .foreign_datagram = .{ .ctx = &router, .func = SteerRouter.onForeign },
+            }),
+            .wakeup = try xev.Async.init(),
+        };
+    }
+    defer for (router.workers) |w| {
+        w.wakeup.deinit();
+        w.server.deinit();
+        testing.allocator.destroy(w);
+    };
+
+    var relay: RebindingRelay = .{
+        .front = try RebindingRelay.udp(relay_port),
+        .up = .{ try RebindingRelay.udp(0), try RebindingRelay.udp(0) },
+        .targets = .{ try net.Address.parseIp4("127.0.0.1", ports[0]), try net.Address.parseIp4("127.0.0.1", ports[1]) },
+    };
+    defer for ([_]posix.socket_t{ relay.front, relay.up[0], relay.up[1] }) |fd| sys.close(fd);
+
+    for (router.workers) |w| w.thread = try std.Thread.spawn(.{}, SteerWorker.run, .{w});
+    const relay_thread = try std.Thread.spawn(.{}, RebindingRelay.run, .{&relay});
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var client_handler = CheckingClient{};
+    var client = try Client(CheckingClient).init(testing.allocator, &client_handler, .{
+        .port = relay_port,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    client.start();
+
+    const first = runUntil(&loop, &client_handler, CheckingClient.done, 10_000);
+
+    // Rebind: from here on only worker 2 hears the client.
+    relay.rebound.store(true, .release);
+    const second: anyerror!void = if (first) |_| blk: {
+        client_handler.finished = false;
+        client_handler.received = 0;
+        var cs = client.clientSession();
+        client_handler.stream_id = try cs.sendRequest(&get_request, null);
+        break :blk runUntil(&loop, &client_handler, CheckingClient.done, 10_000);
+    } else |err| err;
+
+    client.stop();
+    runUntil(&loop, &client, Client(CheckingClient).isStopped, 5000) catch {};
+    client.deinit();
+    for (router.workers) |w| {
+        w.quit.store(true, .release);
+        w.wakeup.notify() catch {};
+    }
+    for (router.workers) |w| w.thread.join();
+    relay.quit.store(true, .release);
+    relay_thread.join();
+
+    try first;
+    try second;
+    try testing.expectEqualStrings("hello", client_handler.body[0..client_handler.received]);
+    // Worker 1 accepted the connection; worker 2 only ever passed packets on.
+    try testing.expect(router.forwarded.load(.monotonic) > 0);
+    try testing.expectEqual(router.forwarded.load(.monotonic), router.workers[0].injected);
+    try testing.expectEqual(@as(usize, 0), router.workers[1].injected);
+    try testing.expectEqual(@as(usize, 0), router.workers[1].server.conn_mgr.connectionCount());
 }

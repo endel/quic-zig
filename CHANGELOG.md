@@ -41,6 +41,11 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   buffer the whole upload.
 - Clients get an optional `onRequestCancelled` when the server resets a
   request, including the H3_REQUEST_REJECTED that follows a GOAWAY.
+- Workers sharing a port with `reuse_port` can pass a migrated client's
+  packets to the worker that owns its connection instead of resetting it:
+  give each worker its own id in `Config.quic_lb`, and hand what
+  `Config.foreign_datagram` reports to the owner's `Server.injectDatagram`.
+  See QUIC-LB.md.
 - `Config.stateless_reply_rate` caps Version Negotiation, stateless reset and
   CONNECTION_REFUSED replies per second, each kind separately (default 200).
 

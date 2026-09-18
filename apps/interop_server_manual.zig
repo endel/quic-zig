@@ -258,7 +258,7 @@ pub fn main() !void {
                 .send_response => |data| {
                     _ = sys.sendto(sockfd, data, 0, @ptrCast(&remote_addr), addr_size) catch {};
                 },
-                .dropped => {},
+                .dropped, .foreign => {},
             }
         }
 

@@ -244,6 +244,14 @@ pub const ConnectionManager = struct {
     /// Budgets for stateless replies; see `ReplyLimits`.
     reply_limits: ReplyLimits = .{},
 
+    /// Report packets for another server as `foreign` instead of answering
+    /// them with a stateless reset. Needs `conn_config.quic_lb`: a
+    /// Handshake or 1-RTT packet whose unknown DCID decodes, under the same
+    /// config_id, to a server id other than ours belongs to a sibling server
+    /// — typically another worker thread on the same port.
+    steer_foreign: bool = false,
+    foreign_id: [15]u8 = undefined,
+
     // Deferred free queue: entries invalidated by removeConnection are held
     // here until freeDeadEntries() is called after all event processing.
     // acceptConnection reserves a slot for every entry it creates, so
@@ -439,6 +447,10 @@ pub const ConnectionManager = struct {
         send_response: []const u8,
         /// Datagram was unroutable or invalid; no action needed.
         dropped: void,
+        /// Its DCID names another server (see `steer_foreign`); nothing was
+        /// processed. The QUIC-LB server id it decoded to, valid until the
+        /// next call.
+        foreign: []const u8,
     };
 
     /// Process a raw UDP datagram: route by DCID, handle version negotiation,
@@ -453,6 +465,32 @@ pub const ConnectionManager = struct {
         local: posix.sockaddr.storage,
         ecn_val: u2,
         out_buf: []u8,
+    ) RecvAction {
+        return self.route(bytes, from, local, ecn_val, out_buf, self.steer_foreign);
+    }
+
+    /// `recvDatagram` for a datagram another server already reported as
+    /// `foreign` and handed to us: never reported as foreign again, so a
+    /// DCID nobody owns cannot bounce between servers.
+    pub fn recvHandedOver(
+        self: *ConnectionManager,
+        bytes: []u8,
+        from: posix.sockaddr.storage,
+        local: posix.sockaddr.storage,
+        ecn_val: u2,
+        out_buf: []u8,
+    ) RecvAction {
+        return self.route(bytes, from, local, ecn_val, out_buf, false);
+    }
+
+    fn route(
+        self: *ConnectionManager,
+        bytes: []u8,
+        from: posix.sockaddr.storage,
+        local: posix.sockaddr.storage,
+        ecn_val: u2,
+        out_buf: []u8,
+        steer: bool,
     ) RecvAction {
         var fbs = io.fixedBufferStream(bytes);
         var current_entry: ?*ConnEntry = null;
@@ -479,6 +517,13 @@ pub const ConnectionManager = struct {
             var entry = current_entry orelse self.findByDcid(header.dcid);
 
             if (entry == null) {
+                // Initials open a connection wherever they land, and 0-RTT
+                // carries the client's own DCID, which encodes nothing.
+                if (steer and current_entry == null and
+                    (header.packet_type == .one_rtt or header.packet_type == .handshake))
+                {
+                    if (self.foreignServerId(header.dcid)) |id| return .{ .foreign = id };
+                }
                 if (header.packet_type != .initial) {
                     // Short-header for unknown CID: stateless reset (RFC 9000 §10.3)
                     if (header.packet_type == .one_rtt and full_size >= MIN_RESET_TRIGGER and
@@ -573,6 +618,18 @@ pub const ConnectionManager = struct {
             return .{ .processed = e };
         }
         return .{ .dropped = {} };
+    }
+
+    /// The server id `dcid` encodes, if it is another server's under our
+    /// QUIC-LB config.
+    fn foreignServerId(self: *ConnectionManager, dcid: []const u8) ?[]const u8 {
+        const lb = &(self.conn_config.quic_lb orelse return null);
+        if (dcid.len != quic_lb.cidLength(lb)) return null;
+        if (quic_lb.extractConfigId(dcid[0]) != lb.config_id) return null;
+        const n: usize = lb.server_id_len;
+        if (!quic_lb.extractServerId(lb, dcid, &self.foreign_id)) return null;
+        if (std.mem.eql(u8, self.foreign_id[0..n], lb.server_id[0..n])) return null;
+        return self.foreign_id[0..n];
     }
 
     /// Answer an Initial we will not serve with CONNECTION_REFUSED (RFC 9000
@@ -934,4 +991,76 @@ test "refuse_new turns away new connections while existing ones keep routing" {
     var out: [1500]u8 = undefined;
     try std.testing.expect(mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out) == .send_response);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+}
+
+fn lbConfig(server_id: u8) quic_lb.Config {
+    var cfg: quic_lb.Config = .{ .config_id = 0, .server_id_len = 1, .nonce_len = 6 };
+    cfg.server_id[0] = server_id;
+    return cfg;
+}
+
+fn steeringManager(alloc: Allocator, server_id: u8) ConnectionManager {
+    const tls_config: tls13.TlsConfig = .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &.{},
+    };
+    var mgr = ConnectionManager.init(alloc, tls_config, .{ .quic_lb = lbConfig(server_id) }, .{0} ** 16, .{0} ** 16);
+    mgr.steer_foreign = true;
+    return mgr;
+}
+
+/// A 1-RTT packet to `dcid`, long enough to earn a stateless reset.
+fn shortPacket(buf: []u8, dcid: []const u8) []u8 {
+    buf[0] = 0x41;
+    @memcpy(buf[1 .. 1 + dcid.len], dcid);
+    @memset(buf[1 + dcid.len .. 60], 0x22);
+    return buf[0..60];
+}
+
+test "a 1-RTT packet for another QUIC-LB server id is reported, not reset" {
+    const alloc = std.testing.allocator;
+    var mgr = steeringManager(alloc, 1);
+    defer mgr.deinit();
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+    var buf: [64]u8 = undefined;
+
+    var cid: [8]u8 = undefined;
+    quic_lb.generateCid(&lbConfig(2), &cid);
+    switch (mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out)) {
+        .foreign => |id| try std.testing.expectEqualSlices(u8, &.{2}, id),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Handed over and still unknown: reset, never passed on again.
+    try std.testing.expect(mgr.recvHandedOver(shortPacket(&buf, &cid), addr, addr, 0, &out) == .send_response);
+
+    // Our own id with no connection behind it is simply gone.
+    quic_lb.generateCid(&lbConfig(1), &cid);
+    try std.testing.expect(mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out) == .send_response);
+
+    mgr.steer_foreign = false;
+    quic_lb.generateCid(&lbConfig(2), &cid);
+    try std.testing.expect(mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out) == .send_response);
+}
+
+test "an Initial is accepted locally even when its DCID decodes to another server" {
+    const alloc = std.testing.allocator;
+    var mgr = steeringManager(alloc, 1);
+    defer mgr.deinit();
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+
+    var cid: [8]u8 = undefined;
+    quic_lb.generateCid(&lbConfig(2), &cid);
+    var buf = [_]u8{0} ** 1200;
+    _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &cid);
+    try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .processed);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+    // And the connection's own CID carries our id.
+    const scid = mgr.entries.items[0].conn.scid[0..8];
+    var id: [1]u8 = undefined;
+    try std.testing.expect(quic_lb.extractServerId(&lbConfig(1), scid, &id));
+    try std.testing.expectEqual(@as(u8, 1), id[0]);
 }

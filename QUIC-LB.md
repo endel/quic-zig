@@ -106,6 +106,26 @@ const conn_config = connection.ConnectionConfig{
 };
 ```
 
+## Steering between workers on one port
+
+A server that runs one `event_loop.Server` per thread, all bound to the same
+port with `Config.reuse_port`, needs no separate load balancer: the kernel
+spreads new connections across workers, and QUIC-LB CIDs steer the rest.
+
+- Give every worker the same `Config.quic_lb` with its own `server_id`.
+- Set `Config.foreign_datagram` on each. When a Handshake or 1-RTT datagram's
+  DCID is unknown to the worker that received it but decodes to another
+  worker's id — a client whose NAT rebound, say — the hook gets the bytes,
+  addresses and target id instead of the client getting a stateless reset.
+- The hook runs on the receiving worker's thread. Copy the bytes, move them to
+  the owner's thread (a queue and an `xev.Async`), and call the owner's
+  `Server.injectDatagram` there. The owner answers from its own socket, which
+  has the same address.
+
+Initials are never steered: whichever worker receives one accepts the
+connection. A datagram handed over is never handed on again, so a CID nobody
+owns gets a stateless reset from the worker it was steered to.
+
 ## Limitations
 
 - Initial packets from new clients have random DCIDs (not QUIC-LB encoded) — the LB uses round-robin for these
