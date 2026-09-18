@@ -580,12 +580,14 @@ test "fuzz: frame sorter" {
                         i = end;
                         const fin = (op & 0x04) != 0;
                         sorter.push(offset, data, fin) catch {};
+                        try testing.expect(sorter.isConsistent());
                     },
                     2 => {
                         // Pop
                         if (sorter.pop()) |data| {
                             testing.allocator.free(data);
                         }
+                        try testing.expect(sorter.isConsistent());
                         i += 2;
                     },
                     3 => {

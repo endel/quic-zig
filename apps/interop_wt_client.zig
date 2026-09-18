@@ -636,7 +636,7 @@ fn pollWtEvents(
                 handleDatagram(alloc, wt, state, testcase, dg.session_id, dg.data);
             },
 
-            .connect_request => {},
+            .connect_request, .request, .request_data, .request_end, .request_cancelled => {}, // server-side only
             .session_closed => |sc| {
                 std.log.info("WT session {d} closed (code={d})", .{ sc.session_id, sc.error_code });
                 // In transfer (responder) mode, exit when the peer closes the session

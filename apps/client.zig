@@ -186,7 +186,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 },
                 .connect_request => {},
                 .shutdown_complete => {},
-                .request_cancelled => {},
+                .request_cancelled, .writable => {},
             }
         }
 

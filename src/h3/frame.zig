@@ -180,6 +180,25 @@ pub const UniStreamType = enum(u64) {
     }
 };
 
+/// A frame's type and payload length, read ahead of its payload.
+pub const FrameHeader = struct {
+    frame_type: u64,
+    length: u64,
+    /// Bytes the type and length varints took.
+    len: usize,
+};
+
+/// Read the frame header at the front of `data`, or null if it is not all
+/// there yet. Lets a reader decide what to do with a frame — stream it, cap
+/// it, skip it — before its payload arrives.
+pub fn parseHeader(data: []const u8) error{H3FrameUnexpected}!?FrameHeader {
+    var fbs = io.fixedBufferStream(data);
+    const frame_type = packet.readVarInt(&fbs) catch return null;
+    if (isReservedH2FrameType(frame_type)) return error.H3FrameUnexpected;
+    const length = packet.readVarInt(&fbs) catch return null;
+    return .{ .frame_type = frame_type, .length = length, .len = fbs.seek };
+}
+
 /// Parse one HTTP/3 frame from a byte buffer.
 /// Returns the parsed frame and the number of bytes consumed.
 pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {

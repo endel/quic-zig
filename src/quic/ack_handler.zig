@@ -1,4 +1,5 @@
 const std = @import("std");
+const sys = @import("../sys.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
@@ -17,6 +18,10 @@ pub const EncLevel = enum(u2) {
     handshake = 1,
     application = 2,
 };
+
+/// Application packet numbers between skips, at first and at most.
+const SKIP_INITIAL_PERIOD: u64 = 24;
+const SKIP_MAX_PERIOD: u64 = 10_000;
 
 /// The number of packet-reordering threshold for declaring loss (RFC 9002).
 const PACKET_THRESHOLD: u64 = 3;
@@ -41,6 +46,51 @@ const MAX_HANDSHAKE_PTO: i64 = 3_000_000_000;
 // usefully-sized stream frames anyway — 12 is generous for real traffic and
 // keeps SentPacket at ~432 bytes instead of ~1.6KB.
 pub const MAX_STREAM_FRAMES_PER_PACKET: usize = 12;
+
+/// Retransmittable control frames recorded per sent packet. A packet that
+/// has used them all takes no more such frames; they wait for the next one.
+pub const MAX_CONTROL_FRAMES_PER_PACKET: usize = 4;
+
+/// A control frame RFC 9000 13.3 has us repeat when its packet is lost. Flow
+/// control credit is recorded by kind only: on loss the current value is sent,
+/// never the stale one. RESET_STREAM keeps everything, because a reset uni
+/// stream is freed as soon as the frame is queued.
+pub const SentControlFrame = union(enum) {
+    max_data: void,
+    max_stream_data: u64,
+    max_streams_bidi: void,
+    max_streams_uni: void,
+    data_blocked: u64,
+    stream_data_blocked: struct { stream_id: u64, limit: u64 },
+    streams_blocked_bidi: u64,
+    streams_blocked_uni: u64,
+    reset_stream: struct { stream_id: u64, error_code: u64, final_size: u64 },
+    stop_sending: struct { stream_id: u64, error_code: u64 },
+    new_connection_id: u64,
+    retire_connection_id: u64,
+    new_token: void,
+
+    /// The record for a queued frame, or null for one that is never repeated
+    /// (PING, PATH_*, CONNECTION_CLOSE, ACK_FREQUENCY, IMMEDIATE_ACK).
+    pub fn from(pcf: frame_mod.PendingControlFrame) ?SentControlFrame {
+        return switch (pcf) {
+            .max_data => .max_data,
+            .max_stream_data => |m| .{ .max_stream_data = m.stream_id },
+            .max_streams_bidi => .max_streams_bidi,
+            .max_streams_uni => .max_streams_uni,
+            .data_blocked => |l| .{ .data_blocked = l },
+            .stream_data_blocked => |b| .{ .stream_data_blocked = .{ .stream_id = b.stream_id, .limit = b.limit } },
+            .streams_blocked_bidi => |l| .{ .streams_blocked_bidi = l },
+            .streams_blocked_uni => |l| .{ .streams_blocked_uni = l },
+            .reset_stream => |r| .{ .reset_stream = .{ .stream_id = r.stream_id, .error_code = r.error_code, .final_size = r.final_size } },
+            .stop_sending => |ss| .{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = ss.error_code } },
+            .new_connection_id => |n| .{ .new_connection_id = n.seq_num },
+            .retire_connection_id => |seq| .{ .retire_connection_id = seq },
+            .new_token => .new_token,
+            .ping, .path_challenge, .path_response, .connection_close, .ack_frequency, .immediate_ack => null,
+        };
+    }
+};
 
 /// Tracks which stream data was carried in a sent packet for retransmission on loss.
 pub const StreamFrameInfo = struct {
@@ -73,6 +123,14 @@ pub const SentPacket = struct {
 
     /// Whether this packet contains DATAGRAM frames (for stats tracking on loss).
     has_datagram: bool = false,
+
+    /// Control frames to repeat if this packet is lost.
+    control_frames: [MAX_CONTROL_FRAMES_PER_PACKET]SentControlFrame = undefined,
+    control_frame_count: u8 = 0,
+
+    pub fn getControlFrames(self: *const SentPacket) []const SentControlFrame {
+        return self.control_frames[0..self.control_frame_count];
+    }
 
     /// Record a stream frame carried by this packet.
     pub fn addStreamFrame(self: *SentPacket, info: StreamFrameInfo) void {
@@ -321,6 +379,10 @@ pub const SentPacketTracker = struct {
     }
 };
 
+/// Received-packet ranges kept per space; the oldest go first. An ACK frame
+/// carries at most `MAX_ACK_RANGES` + 1 of them anyway.
+pub const MAX_RECEIVED_RANGES: usize = 64;
+
 /// Tracks received packets for generating ACK frames.
 pub const ReceivedPacketTracker = struct {
     allocator: Allocator,
@@ -356,6 +418,12 @@ pub const ReceivedPacketTracker = struct {
     pub fn onPacketReceived(self: *ReceivedPacketTracker, pn: u64, ack_eliciting: bool, now: i64, ecn: u2) !void {
         if (self.received.contains(pn)) return;
         try self.received.add(pn);
+        // A peer skipping every other PN would otherwise grow this without
+        // bound. Packets in the gaps we forget read as duplicates from here on.
+        const tracked = self.received.getRanges();
+        if (tracked.len > MAX_RECEIVED_RANGES) {
+            self.pruneAckedRanges(tracked[MAX_RECEIVED_RANGES - 1].start);
+        }
 
         if (self.largest_received == null or pn > self.largest_received.?) {
             self.largest_received = pn;
@@ -523,6 +591,14 @@ pub const PacketHandler = struct {
     pto_count: u32 = 0,
     next_pn: [3]u64 = .{ 0, 0, 0 },
 
+    /// RFC 9000 21.4: the application space leaves the odd packet number
+    /// unsent, so a peer acking what it never received (to inflate our
+    /// window) names one of these and is caught. The gap between skips
+    /// doubles, as quic-go's does, so the cost fades on long connections.
+    skip_pn: u64 = SKIP_INITIAL_PERIOD,
+    skip_period: u64 = SKIP_INITIAL_PERIOD,
+    skipped_pns: [2]?u64 = .{ null, null },
+
     pub fn init(allocator: Allocator) PacketHandler {
         return .{
             .allocator = allocator,
@@ -546,9 +622,38 @@ pub const PacketHandler = struct {
 
     pub fn nextPacketNumber(self: *PacketHandler, level: EncLevel) u64 {
         const idx = @intFromEnum(level);
+        if (level == .application and self.next_pn[idx] == self.skip_pn) {
+            self.skipped_pns = .{ self.skip_pn, self.skipped_pns[0] };
+            self.next_pn[idx] += 1;
+            self.skip_period = @min(self.skip_period * 2, SKIP_MAX_PERIOD);
+            const half = self.skip_period / 2;
+            self.skip_pn = self.next_pn[idx] + half + sys.randomInt(u64) % half;
+        }
         const pn = self.next_pn[idx];
         self.next_pn[idx] += 1;
         return pn;
+    }
+
+    /// Whether an ACK claims a packet we never sent: one past the last we
+    /// numbered, or one we skipped. RFC 9000 13.1 makes either a
+    /// PROTOCOL_VIOLATION.
+    pub fn acksUnsentPacket(
+        self: *const PacketHandler,
+        level: EncLevel,
+        largest_ack: u64,
+        first_ack_range: u64,
+        ack_ranges: []const AckRange,
+    ) bool {
+        if (largest_ack >= self.next_pn[@intFromEnum(level)]) return true;
+        if (level != .application) return false;
+        for (self.skipped_pns) |maybe| {
+            const skipped = maybe orelse continue;
+            if (skipped <= largest_ack and skipped >= largest_ack -| first_ack_range) return true;
+            for (ack_ranges) |r| {
+                if (skipped >= r.start and skipped <= r.end) return true;
+            }
+        }
+        return false;
     }
 
     /// Return the largest packet number acknowledged by the peer for this level.
@@ -961,6 +1066,47 @@ test "SentPacket: stream frame capacity limit" {
 }
 
 // ACK-of-ACK pruning (RFC 9000 §13.2.4)
+test "PacketHandler: skipped application packet numbers are never sent, and an ACK naming one is caught" {
+    var handler = PacketHandler.init(testing.allocator);
+    defer handler.deinit();
+
+    var last: u64 = 0;
+    var gaps: usize = 0;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const pn = handler.nextPacketNumber(.application);
+        if (i > 0 and pn != last + 1) {
+            gaps += 1;
+            try testing.expectEqual(last + 2, pn);
+            try testing.expect(handler.acksUnsentPacket(.application, pn, 1, &.{}));
+            try testing.expect(!handler.acksUnsentPacket(.application, pn, 0, &.{}));
+            try testing.expect(handler.acksUnsentPacket(.application, pn, 0, &.{.{ .start = last + 1, .end = last + 1 }}));
+        }
+        last = pn;
+    }
+    try testing.expect(gaps >= 2);
+    // Handshake spaces number densely: the peer's ACKs there come too early
+    // to matter, and those spaces are short-lived.
+    try testing.expectEqual(@as(u64, 0), handler.nextPacketNumber(.initial));
+    try testing.expectEqual(@as(u64, 1), handler.nextPacketNumber(.initial));
+}
+
+test "ReceivedPacketTracker: range count is capped, oldest dropped" {
+    var tracker = ReceivedPacketTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    // Every other PN: one range per packet.
+    var pn: u64 = 0;
+    while (pn < 4 * MAX_RECEIVED_RANGES) : (pn += 2) {
+        try tracker.onPacketReceived(pn, true, 0, 0);
+    }
+    try testing.expectEqual(MAX_RECEIVED_RANGES, tracker.received.len());
+    // The newest survive; a forgotten gap now reads as a duplicate.
+    try testing.expect(tracker.received.contains(pn - 2));
+    try testing.expect(tracker.isDuplicate(1));
+    try testing.expect(!tracker.isDuplicate(pn - 1));
+}
+
 test "ReceivedPacketTracker: pruneAckedRanges removes old ranges" {
     var tracker = ReceivedPacketTracker.init(testing.allocator);
     defer tracker.deinit();

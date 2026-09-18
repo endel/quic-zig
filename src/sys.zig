@@ -467,8 +467,13 @@ pub fn realtimeSeconds() i64 {
     return @intCast(ts.sec);
 }
 
+/// Tests set this to run connections on a virtual clock, so a simulated
+/// network is deterministic and seconds of loss recovery take none.
+pub var test_clock: if (builtin.is_test) ?i64 else void = if (builtin.is_test) null else {};
+
 /// Monotonic clock timestamp in nanoseconds (replaces `std.time.nanoTimestamp`).
 pub fn nanoTimestamp() i64 {
+    if (builtin.is_test) if (test_clock) |t| return t;
     switch (builtin.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.nanoTimestamp: Windows support pending (use QueryPerformanceCounter)"),

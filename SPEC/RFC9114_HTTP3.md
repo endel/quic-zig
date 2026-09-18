@@ -59,10 +59,24 @@ HTTP-client concern rather than an H3 protocol concern and is deferred.
 - Requests: `sendRequest(headers, body)` opens a bidi stream, encodes
   HEADERS via QPACK, optionally writes a DATA frame, then FINs.
 - Responses: `sendResponse(stream_id, headers, body)` writes HEADERS +
-  optional DATA + FIN on the request stream.
+  optional DATA + FIN on the request stream. Streamed form:
+  `sendResponseHeaders` (repeatable, for 1xx), `sendResponseData` (one DATA
+  frame per call; empty is a no-op), `finishResponse(stream_id, trailers)`.
+  Header blocks of any size are encoded (heap buffer past 4 KiB).
+- `notifyWritable(stream_id, n)` yields one `writable` event once `n` more
+  bytes fit the peer's credit and fewer than `n` sit unsent.
 - Incoming: `poll()` returns `headers` / `data` / `finished` /
   `request_cancelled` events. Body bytes are read via `recvBody(buf)`;
   `poll()` does not advance past a stream with a pending body.
+- Incoming frames are never buffered whole. `poll()` pulls a request
+  stream's QUIC data one chunk at a time, only when its buffer can make no
+  further progress; a DATA frame is surfaced as `data` events piece by piece
+  as it arrives (`len` is what is buffered now), and unknown or unsupported
+  frames are discarded as they arrive. A HEADERS frame longer than
+  `MAX_HEADERS_FRAME` (64 KiB) is `H3_EXCESSIVE_LOAD`; a stream that ends
+  mid-frame is `H3_FRAME_ERROR`. Bytes H3 holds are marked
+  `ReceiveStream.retained`, so MAX_STREAM_DATA and MAX_DATA credit only what
+  the application has taken.
 
 ### §4.1.1 Request Cancellation — ✅ Done
 
@@ -70,7 +84,10 @@ HTTP-client concern rather than an H3 protocol concern and is deferred.
   `STOP_SENDING` with the given H3 error code.
 - `rejectRequest(stream_id)`: shortcut that uses `H3_REQUEST_REJECTED`.
 - Peer-initiated cancellation is surfaced as a `request_cancelled` event
-  (stream_id + peer error code) after any buffered frames are drained.
+  (stream_id + peer error code) after any complete buffered frames are
+  delivered (a partial one is dropped) —
+  RESET_STREAM on the request, or (server) STOP_SENDING on the response,
+  including after the request is complete. Reported once per stream.
 
 ## §4.2 HTTP Fields — ✅ Done (via QPACK)
 
@@ -138,8 +155,43 @@ Two-phase GOAWAY per the spec:
   it arrives before SETTINGS (`H3_MISSING_SETTINGS`). Otherwise recorded
   as `peer_goaway_id`; `sendRequest()` returns `H3RequestRejected` when
   the next bidi ID would reach or exceed the peer's GOAWAY ID.
-- While in `going_away_final`, bidi streams ≥ our GOAWAY ID are reset
-  with `H3_REQUEST_REJECTED` inside the bidi poll loop.
+- Once the final GOAWAY is out (`going_away_final` or `drain_complete`),
+  bidi streams ≥ our GOAWAY ID are reset with `H3_REQUEST_REJECTED` inside
+  the bidi poll loop. A client learns of that reset through a
+  `request_cancelled` event even when no response byte arrived; the
+  client event loop hands it to an optional `onRequestCancelled`.
+
+### Server-wide drain (`event_loop.Server.drain()`)
+
+What a server does on SIGTERM. `drain()`:
+
+1. Sets `ConnectionManager.refuse_new`, so every new connection is answered
+   with CONNECTION_REFUSED in an Initial.
+2. Sends phase-1 GOAWAY on every H3 connection and DRAIN_WEBTRANSPORT_SESSION
+   on every active WebTransport session. Raw-QUIC and HTTP/0.9 connections,
+   which have no graceful signal, are closed at once. A connection still
+   handshaking gets GOAWAY(0) as soon as H3 is set up.
+3. One PTO later per connection (`ConnEntry.drain_final_goaway_at`, on the
+   server's timer), sends phase 2: `completeShutdown()`.
+4. Closes each connection with H3_NO_ERROR once `isDrainComplete()` holds,
+   no request stream has unacked data, and every rejection's RESET_STREAM
+   has been queued — closing sooner would drop the tail of a response.
+
+`isDrained()` is true once every connection is closing or closed; the caller
+waits on it against its own deadline and then calls `stop()`, which is also
+the fallback when the deadline passes first. WebTransport sessions keep their
+connection open until the handler or the peer closes them.
+
+## Request-body backpressure
+
+`H3Connection.pauseBody(stream_id)` / `resumeBody`, surfaced as
+`Session.pauseRequestBody` / `resumeRequestBody`. While paused, `poll()` skips
+the stream's data and FIN (a peer reset is still reported), so its bytes stay
+unread in QUIC and MAX_STREAM_DATA stops advancing: the client is held to one
+stream window rather than the server buffering the body. Pausing mid-frame is
+allowed: what `recvBody` has not returned stays buffered and is surfaced
+first after the resume, and other streams are not blocked behind it. `resumeRequestBody` asks the event loop for
+another pass (`ConnEntry.repoll`), since no packet may arrive to trigger one.
 
 ## §5.3 Immediate Closure — ✅ Done
 
@@ -180,6 +232,10 @@ sees the stream).
 - First frame on the peer control stream must be SETTINGS; anything
   else yields `H3_MISSING_SETTINGS`. Duplicate SETTINGS yields
   `H3_FRAME_UNEXPECTED`.
+- Control-stream frames are bounded: SETTINGS and PRIORITY_UPDATE past
+  `MAX_CONTROL_FRAME` (16 KiB) are `H3_EXCESSIVE_LOAD`, GOAWAY /
+  CANCEL_PUSH / MAX_PUSH_ID longer than one varint are `H3_FRAME_ERROR`, and
+  unknown frames are discarded as they arrive.
 
 ### §6.2.2 Push Streams — ❌ N/A
 
@@ -188,8 +244,10 @@ Deferred with Server Push.
 ## §7.1 Frame Layout — ✅ Done
 
 `h3/frame.zig:parse()` reads `varint type | varint length | payload`.
-Short buffers return `error.BufferTooShort`; callers accumulate bytes
-until a full frame is available.
+Short buffers return `error.BufferTooShort`. The connection reads the
+header alone first (`parseHeader`) and decides from the type and declared
+length whether to stream, cap or skip the payload, so only bounded frames
+are ever accumulated whole.
 
 ## §7.2 Frame Definitions
 
@@ -219,6 +277,7 @@ Server Push is not implemented.
   `H3_SETTINGS_ERROR` (frame.zig:49).
 - Supported identifiers:
   - `QPACK_MAX_TABLE_CAPACITY` (0x01) — advertised 4096 by default.
+    The peer's value is unused: our QPACK encoder is static-only.
   - `MAX_FIELD_SECTION_SIZE` (0x06) — optional.
   - `QPACK_BLOCKED_STREAMS` (0x07) — advertised as 0 (no blocked
     streams supported; see caveats).
@@ -237,7 +296,8 @@ HTTP/2 frame types `0x02, 0x06, 0x08, 0x09` on any H3 stream trigger
 `H3_FRAME_UNEXPECTED`. Unknown types (GREASE `0x1f*N+0x21`, etc.) are
 returned from `parse()` as a distinct `.unknown` variant that higher
 layers ignore while still advancing the buffer cursor — verified by the
-GREASE test in frame.zig:395.
+GREASE test in frame.zig. On request and control streams they are skipped
+incrementally from the header, whatever length they declare.
 
 ## §8 Error Handling — ✅ Done
 
@@ -289,9 +349,12 @@ Informational.
   present; header blocks that reference not-yet-inserted entries would
   need blocked-stream bookkeeping which is not implemented. This is
   only visible if a peer actually emits out-of-order header blocks.
-- **Decoded header count per frame capped at `MAX_HEADERS = 64`**
-  (connection.zig:72). Over-large header lists return
-  `error.TooManyHeaders` from QPACK and close the connection.
+- **Decoded header count per frame capped at `MAX_HEADERS = 128`**,
+  and decoded names + values at `qpack.SCRATCH_SIZE` (16 KiB). Over-large
+  header lists close the connection with QPACK_DECOMPRESSION_FAILED.
+- **Trailers are dropped.** A HEADERS frame after the head with no
+  pseudo-headers is taken as trailers, on requests and responses alike;
+  nothing surfaces them yet.
 - **`huffman_scratch`**: qpack.zig uses a 16 KiB file-scope scratch
   buffer for decoded field values. Not safe across concurrent decoder
   instances on the same thread.

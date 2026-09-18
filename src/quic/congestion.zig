@@ -24,6 +24,11 @@ fn initialWindow(max_datagram_size: u64) u64 {
 /// Minimum congestion window in bytes (2 * max_datagram_size per RFC 9002).
 const MIN_WINDOW_PACKETS: u64 = 2;
 
+/// Ceiling on the congestion window, in packets. Past this the window only
+/// measures how long the path has gone without loss, and a burst that size
+/// is an amplifier (quic-go uses the same bound).
+const MAX_WINDOW_PACKETS: u64 = 10_000;
+
 /// Default max datagram size.
 const DEFAULT_MAX_DATAGRAM_SIZE: u64 = 1200;
 
@@ -113,6 +118,7 @@ pub const NewReno = struct {
                 self.congestion_window += self.max_datagram_size;
             }
         }
+        self.congestion_window = @min(self.congestion_window, MAX_WINDOW_PACKETS * self.max_datagram_size);
     }
 
     /// Called on congestion event (packet loss detected).
@@ -253,11 +259,10 @@ pub const Cubic = struct {
         if (self.inSlowStart()) {
             // Slow start: increase by acked_bytes (same as NewReno)
             self.congestion_window += acked_bytes;
-            return;
+        } else {
+            self.cubicUpdate(acked_bytes);
         }
-
-        // Congestion avoidance: use CUBIC function
-        self.cubicUpdate(acked_bytes);
+        self.congestion_window = @min(self.congestion_window, MAX_WINDOW_PACKETS * self.max_datagram_size);
     }
 
     /// CUBIC window update during congestion avoidance.
@@ -432,6 +437,11 @@ pub const Pacer = struct {
     /// Last time a packet was sent (nanoseconds).
     last_sent_time: i64 = 0,
 
+    /// When `budget` last had the elapsed time credited to it. Crediting
+    /// from `last_sent_time` instead counts the same interval again on every
+    /// check between sends.
+    credited_at: i64 = 0,
+
     /// Bandwidth in bytes per nanosecond, left-shifted by BANDWIDTH_SHIFT for precision.
     /// This avoids u128 arithmetic on the hot send path.
     bandwidth_shifted: u64 = 0,
@@ -468,35 +478,47 @@ pub const Pacer = struct {
         self.replenish(now);
         self.budget -|= size;
         self.last_sent_time = now;
+        self.credited_at = now;
     }
 
     /// Returns the time when the next packet can be sent, or 0 if it can be sent now.
     pub fn timeUntilSend(self: *Pacer, now: i64) i64 {
         self.replenish(now);
-        if (self.budget >= self.max_datagram_size) {
-            return 0; // Can send now
-        }
+        return self.delayAt(now);
+    }
 
-        if (self.bandwidth_shifted == 0) return 0;
-
+    /// `timeUntilSend` without crediting the budget, for timer scheduling:
+    /// the two must agree, or a send the pacer refuses gets no wakeup.
+    pub fn delayAt(self: *const Pacer, now: i64) i64 {
+        const budget = self.budgetAt(now);
+        if (budget >= self.max_datagram_size or self.bandwidth_shifted == 0) return 0;
         // Time (ns) = deficit / bandwidth_bpns = (deficit << SHIFT) / bandwidth_shifted
-        const deficit = self.max_datagram_size - self.budget;
+        const deficit = self.max_datagram_size - budget;
         return @intCast((deficit << BANDWIDTH_SHIFT) / self.bandwidth_shifted);
+    }
+
+    fn budgetAt(self: *const Pacer, now: i64) u64 {
+        if (self.last_sent_time == 0 or self.bandwidth_shifted == 0) return self.max_burst;
+        const elapsed = now - self.credited_at;
+        if (elapsed <= 0) return self.budget;
+        // new_budget = bandwidth_bpns * elapsed = (bandwidth_shifted * elapsed) >> SHIFT
+        const new_budget = (self.bandwidth_shifted *| @as(u64, @intCast(elapsed))) >> BANDWIDTH_SHIFT;
+        return @min(self.budget +| new_budget, self.max_burst);
     }
 
     /// Replenish budget based on elapsed time.
     fn replenish(self: *Pacer, now: i64) void {
-        if (self.last_sent_time == 0 or self.bandwidth_shifted == 0) {
-            self.budget = self.max_burst;
+        const budget = self.budgetAt(now);
+        if (budget >= self.max_burst or self.bandwidth_shifted == 0) {
+            self.budget = budget;
+            self.credited_at = @max(self.credited_at, now);
             return;
         }
-
-        const elapsed = now - self.last_sent_time;
-        if (elapsed <= 0) return;
-
-        // new_budget = bandwidth_bpns * elapsed = (bandwidth_shifted * elapsed) >> SHIFT
-        const new_budget = (self.bandwidth_shifted *| @as(u64, @intCast(elapsed))) >> BANDWIDTH_SHIFT;
-        self.budget = @min(self.budget + new_budget, self.max_burst);
+        // Advance only by the time the whole bytes took, so the fraction
+        // of a byte earned so far is not lost to frequent checks.
+        const earned = budget - self.budget;
+        self.budget = budget;
+        self.credited_at += @intCast((earned << BANDWIDTH_SHIFT) / self.bandwidth_shifted);
     }
 };
 
@@ -732,4 +754,39 @@ test "Pacer: rate limiting after burst" {
     // Should now be rate-limited
     const delay = pacer.timeUntilSend(now);
     try testing.expect(delay > 0);
+}
+
+test "Pacer: checking between sends does not earn the same interval twice" {
+    var pacer = Pacer.init();
+    var rtt = RttStats{};
+    rtt.updateRtt(50_000_000, 0, false);
+    pacer.setBandwidth(12000, &rtt);
+
+    const t0: i64 = 1_000_000_000;
+    while (pacer.budget >= pacer.max_datagram_size) pacer.onPacketSent(1200, t0);
+    const wait = pacer.timeUntilSend(t0);
+    try testing.expect(wait > 1);
+
+    // Partway through the wait, however often the send path asks, the pacer
+    // still refuses, and the timer scheduling sees the same deadline.
+    const mid = t0 + @divTrunc(wait, 2) + 1;
+    const left = pacer.timeUntilSend(mid);
+    try testing.expect(left > 0);
+    try testing.expectEqual(left, pacer.timeUntilSend(mid));
+    try testing.expectEqual(left, pacer.delayAt(mid));
+    try testing.expect(pacer.timeUntilSend(mid + @divTrunc(left, 2)) > 0);
+    try testing.expectEqual(@as(i64, 0), pacer.timeUntilSend(t0 + wait + 1));
+}
+
+test "congestion window is capped at MAX_WINDOW_PACKETS" {
+    var reno = NewReno.init();
+    var cubic = Cubic.init();
+    const cap = MAX_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE;
+    var i: usize = 0;
+    while (i < 20_000) : (i += 1) {
+        reno.onPacketAcked(DEFAULT_MAX_DATAGRAM_SIZE, 1);
+        cubic.onPacketAcked(DEFAULT_MAX_DATAGRAM_SIZE, 1);
+    }
+    try testing.expectEqual(cap, reno.congestion_window);
+    try testing.expectEqual(cap, cubic.congestion_window);
 }

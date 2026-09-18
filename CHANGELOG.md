@@ -5,11 +5,98 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ## Unreleased
 
+### Added
+
+- `quic.tls_server`, a sans-IO TLS 1.3 server for TLS over TCP: feed it the
+  bytes you read and send what it queues, from any event loop. It negotiates
+  AES-GCM or ChaCha20, X25519 or P-256 (with HelloRetryRequest), picks the
+  certificate by SNI, and can resume sessions from tickets.
+- A QUIC server can serve several certificates and pick one by SNI, via
+  `TlsConfig.certs`.
+- `Server` can join an event loop you own through `Config.loop`, next to your
+  own sockets, timers and `Client`s. `stop()` then leaves the loop running, and
+  `isStopped()` says when `deinit()` is safe; `Client` gained the same
+  `isStopped()`, so one of several clients on a loop can be torn down alone.
+- HTTP/3 responses can be streamed: `sendResponseHeaders` (repeatable for 1xx),
+  `sendResponseData`, `finishResponse` with optional trailers, and
+  `resetRequest` to abort. Calls out of that order return an error rather
+  than sending the peer a malformed response. `notifyWritable` and `streamBufferedBytes` now work
+  on request streams, so a body can be paced against the peer.
+- New optional server callbacks: `onRequestEnd` when a request body is
+  complete, `onRequestCancelled` when the peer resets the request or stops the
+  response, and `onConnectionClosed` once per connection before it is freed.
+  `Session.id()` gives each connection a stable key.
+- A `.webtransport` server also serves ordinary HTTP/3 requests through
+  `onRequest` / `onData` / `onRequestEnd`, so one listener can do both.
+- `Config.reuse_port`, `recv_buffer_size` / `send_buffer_size`,
+  `max_connections` (default still 256) and `alpn`.
+- Writes made outside a `Server` or `Client` callback — from a TCP callback on
+  a shared loop, say — are sent on the next loop iteration without calling
+  `flush()`.
+- `Server.drain()` shuts an HTTP/3 server down gracefully: GOAWAY on every
+  connection, new connections refused, in-flight requests allowed to finish.
+  Poll `isDrained()` against your own deadline, then call `stop()`.
+- `Session.pauseRequestBody` / `resumeRequestBody` hold back a request body
+  through flow control, so a proxy with a slow upstream no longer has to
+  buffer the whole upload.
+- Clients get an optional `onRequestCancelled` when the server resets a
+  request, including the H3_REQUEST_REJECTED that follows a GOAWAY.
+- `Config.stateless_reply_rate` caps Version Negotiation, stateless reset and
+  CONNECTION_REFUSED replies per second, each kind separately (default 200).
+
+### Changed
+
+- A server at `max_connections` now answers new clients with
+  CONNECTION_REFUSED instead of ignoring them until they time out.
+
 ### Fixed
 
 - A MoQ relay now answers a subscriber that arrived before its publisher as
   soon as the publisher sends PUBLISH, instead of leaving it to wait out its
   rendezvous timeout. [#34](https://github.com/endel/quic-zig/pull/34)
+- HTTP/3 header sets over 4 KiB (large cookies) failed to encode; there is no
+  fixed limit now, and up to 128 headers are accepted instead of 64.
+- A Huffman-encoded header name or value that decodes past 4 KiB, such as a
+  large cookie from a browser, no longer closes the connection.
+- Peers that keep a QPACK dynamic table (Firefox, quic-go, ngtcp2) could
+  decode the wrong headers from us. The QPACK encoder is now static-only:
+  header blocks are larger, but always decode as sent.
+- QPACK Duplicate and dynamic Insert With Name Reference instructions from a
+  peer picked the wrong table entry, giving the wrong header or closing the
+  connection.
+- A malformed QPACK header block or encoder-stream instruction from a peer
+  could crash the process or read out of bounds; it now closes the connection.
+- An HTTP/3 body larger than one poll's worth could stall on the event-loop
+  client and server until the next packet arrived, and a response could lose
+  its tail once the stream was reclaimed.
+- Rescheduling a server or client timer right as it fired could corrupt
+  libxev's queue when the loop is run blocking (`.once`, `.until_done`).
+- A paused stream (WebTransport `pauseStream`, HTTP/3 `pauseRequestBody`)
+  receiving over a path that reorders packets no longer has its connection
+  closed with "too many reassembly gaps".
+- A peer can no longer send past a stream's flow-control window; it now gets
+  FLOW_CONTROL_ERROR instead of having the server buffer whatever it sends.
+- Peer-opened unidirectional streams (HTTP/3 control, WebTransport, MoQ)
+  stalled once their first 1 MiB was used, as their window was never raised.
+  A raw-QUIC server also stalled, or closed the connection, when a peer sent
+  faster than one read per loop pass.
+- Lost control frames — RESET_STREAM, STOP_SENDING, MAX_DATA,
+  MAX_STREAM_DATA, NEW_CONNECTION_ID and the like — are now resent, and a busy
+  connection no longer drops them when its queue fills. A lost window update
+  could stall a stream for good.
+- Hardening for servers on the open internet: an ACK for a packet never sent
+  or with malformed ranges closes the connection; a new connection needs a
+  full-size Initial with a DCID of at least 8 bytes; Version Negotiation is
+  sent only for full-size datagrams; a closing connection no longer answers
+  every packet with CONNECTION_CLOSE; stateless resets are not sent for small
+  packets; and CRYPTO buffering, received-packet tracking and the congestion
+  window are all bounded.
+- A client sending an oversized Retry token could crash a server that
+  requires Retry.
+- Trailers on an HTTP/3 request or response no longer close the connection
+  with H3_MESSAGE_ERROR. They are accepted, though not yet surfaced.
+- `Server.stop()` now refuses connections that arrive while it finishes;
+  under steady arrivals they could keep it from ever finishing.
 
 ## 0.5.0
 

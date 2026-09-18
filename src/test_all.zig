@@ -20,6 +20,7 @@ test {
     _ = @import("quic/ecn.zig");
     _ = @import("quic/ecn_socket.zig");
     _ = @import("quic/quic_lb.zig");
+    _ = @import("quic/lossy_link_test.zig");
     _ = @import("h3/frame.zig");
     _ = @import("h3/qpack.zig");
     _ = @import("h3/huffman.zig");
@@ -29,6 +30,7 @@ test {
     _ = @import("h3/capsule.zig");
     _ = @import("http1/server.zig");
     _ = @import("http1/tls.zig");
+    _ = @import("tls/server.zig");
     _ = @import("webtransport/protocol.zig");
     _ = @import("moq/wire.zig");
     _ = @import("moq/message_codes.zig");

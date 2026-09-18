@@ -44,28 +44,35 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
 
 ## Tier 1 — Correctness & security
 
-- [ ] **C1. ACK for unsent PN accepted; no PN skipping (S+M)** — `ack_handler.zig:210`. Validate
-  `largest_ack ≤ largest_sent` → PROTOCOL_VIOLATION; add skipping PN generator.
-- [ ] **C2. Per-stream receive flow control not enforced (S)** — `connection.zig:1868` only
-  checks conn window; `StreamFlowController` is dead code.
-- [ ] **C3. CRYPTO stream has no 16 KiB offset cap (S)** — pre-auth DoS (`crypto_stream.zig:48`).
+- [x] **C1. ACK for unsent PN accepted; no PN skipping (S+M)** — an ACK past the last PN we
+  numbered, or naming a skipped one, is PROTOCOL_VIOLATION. The application space skips a PN
+  at doubling intervals (24 → 10000), as quic-go does (`PacketHandler.acksUnsentPacket`).
+- [x] **C2. Per-stream receive flow control not enforced (S)** — `ReceiveStream.receive_window`
+  is enforced on STREAM and RESET_STREAM → FLOW_CONTROL_ERROR. `StreamFlowController` is still
+  unused. Connection-level receive accounting remains loose (per-stream offset against the
+  conn window, credit on receipt); see [SPEC/RFC9000_3.md](SPEC/RFC9000_3.md).
+- [x] **C3. CRYPTO stream has no 16 KiB offset cap (S)** — the cap (absolute since the
+  reassembly work) is now measured past the consumed offset per level, so 1-RTT tickets
+  never add up to it.
 - [x] **C4. Send buffers never reclaim acked bytes (L)** — `buf_base` + amortised
   compaction in `SendStream`; see [SPEC/RFC9000_3.md](SPEC/RFC9000_3.md).
-- [ ] **C5. Incoming uni streams never get MAX_STREAM_DATA (S)** — `connection.zig:2838` loops
-  bidi map only; H3/WT/MoQ uni streams stall after 1 MB.
+- [x] **C5. Incoming uni streams never get MAX_STREAM_DATA (S)** — `queueFlowControlUpdates`
+  walks `recv_streams` too. The raw-QUIC event loop also read one chunk per stream per pass,
+  which stalled a sender (or tripped the gap cap) on its own; it now drains.
 - [ ] **C6. Stateless reset dead both directions (S/M)** — share manager key into `accept()`;
   call `matchesStatelessReset` from recv path (`connection.zig:808,4104`).
-- [ ] **C7. Lost control frames never retransmitted (M)** — RFC §13.3; record popped control
-  frames in `SentPacket`, re-push on loss (`packet_packer.zig:419`). Rebuild RESET_STREAM
-  from the record, not via the stream: a reset uni stream is freed once it is queued.
+- [x] **C7. Lost control frames never retransmitted (M)** — `SentPacket` records up to 4
+  `SentControlFrame`s; `requeueLostControlFrames` resends credit at its current value,
+  BLOCKED only while still blocked, RESET_STREAM from the record. See
+  [SPEC/RFC9000_3.md](SPEC/RFC9000_3.md).
 - [ ] **C8. Coalesced datagrams can exceed 1200 B pre-validation (S/M)** — thread datagram
   budget through `packCoalesced` + pad-to-1200 fixup (`packet_packer.zig:120-234`).
 - [ ] **C9. AEAD/key-update limits not enforced (M)** — failed-decrypt counter →
   AEAD_LIMIT_REACHED; raise KEY_UPDATE_ERROR (`crypto.zig`, `connection.zig:1277`).
 - [ ] **C10. Stale tokens deadlock handshake (M)** — fall back to Retry on invalid token; split
   retry vs NEW_TOKEN lifetimes; carry RTT (`connection_manager.zig:355`).
-- [ ] **C11. Server ingress validation (S)** — drop Initials <1200 B / DCID <8 B; require
-  ≥1200 B + rate-limit before VN (`connection_manager.zig:307,317`).
+- [x] **C11. Server ingress validation (S)** — a new connection needs a ≥1200 B datagram and
+  a ≥8 B DCID; VN only for ≥1200 B, under `ReplyLimiter` (shared with R5, R8).
 - [ ] **C12. ECN CE cuts cwnd every ACK; validation holes (S+M)** — once-per-round dedupe;
   detect bleaching/mangling, stop marking in unknown (`connection.zig:1774`, `ecn.zig`).
 - [ ] **C13. Path migration gaps (M/L)** — PATH_RESPONSE on probed path; highest-PN switch rule;
@@ -75,20 +82,23 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
 
 ## Tier 3 — Robustness / DoS
 
-- [ ] **R1. Received-packet RangeSet unbounded (S)** — cap at 64 (`ack_handler.zig:356`).
-- [ ] **R2. FrameSorter no gap cap (S)** — cap at 1000 (`stream.zig:79`).
-- [ ] **R3. PendingFrameQueue overflow silently drops (S)** — `frame.zig:929`.
-- [ ] **R4. CONNECTION_CLOSE retransmit 1:1 → amplification (S)** — popcount backoff
-  (`connection.zig:1171,2910`).
-- [ ] **R5. Stateless reset inline, no rate limit (S)** — >42 B trigger + token bucket
-  (`connection_manager.zig:318`).
-- [ ] **R6. Malformed ACK ranges accepted via saturation (S)** — FRAME_ENCODING_ERROR
-  (`frame.zig:236`).
+- [x] **R1. Received-packet RangeSet unbounded (S)** — capped at 64; oldest ranges pruned.
+- [x] **R2. FrameSorter no gap cap (S)** — capped at 1000 by the 0.5.0 reassembly work. In-order
+  appends now coalesce (≤64 KiB), so unread in-order data (a paused body) doesn't count.
+- [x] **R3. PendingFrameQueue overflow silently drops (S)** — `tryPush` reports failure;
+  must-deliver producers retry or fall back to `control_retry`; one slot is reserved for
+  CONNECTION_CLOSE. Lossy `push` stays for PING/PATH_*/BLOCKED.
+- [x] **R4. CONNECTION_CLOSE retransmit 1:1 → amplification (S)** — resent on the 1st, 2nd,
+  4th, 8th… packet received while closing.
+- [x] **R5. Stateless reset inline, no rate limit (S)** — ≥43 B trigger, `ReplyLimiter`
+  token bucket (`Config.stateless_reply_rate`, 200/s).
+- [x] **R6. Malformed ACK ranges accepted via saturation (S)** — FRAME_ENCODING_ERROR, checked
+  for every range including those past `MAX_ACK_RANGES`.
 - [ ] **R7. CID lifecycle gaps (M)** — retire-on-switch, CONNECTION_ID_LIMIT_ERROR, in-use
   guard, RETIRE validation, delayed routing removal, rotation (`connection.zig:162,2063`).
-- [ ] **R8. At-capacity Initials silently dropped (S/M)** — send CONNECTION_REFUSED; Retry-under-
-  load callback (`connection_manager.zig:98,168`).
-- [ ] **R9. No max cwnd cap (S)** — 10000 pkts (`congestion.zig`).
+- [~] **R8. At-capacity Initials silently dropped (S/M)** — CONNECTION_REFUSED sent statelessly
+  (`writeRefusal`), rate-limited. Still open: the Retry-under-load callback.
+- [x] **R9. No max cwnd cap (S)** — 10000 × MSS, NewReno and CUBIC.
 - [ ] **R10. Persistent-congestion check loose vs §7.6.2 (S)** — `ack_handler.zig:313`.
 - [ ] **R11. Control-frame order not randomized (S, low)** — `packet_packer.zig:333`.
 

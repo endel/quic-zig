@@ -181,6 +181,13 @@ pub const ConnectionIdPool = struct {
         }
     }
 
+    pub fn contains(self: *const ConnectionIdPool, seq: u64) bool {
+        for (&self.entries) |*entry| {
+            if (entry.occupied and entry.seq_num == seq) return true;
+        }
+        return false;
+    }
+
     pub fn removeBySeq(self: *ConnectionIdPool, seq: u64) void {
         for (&self.entries) |*entry| {
             if (entry.occupied and entry.seq_num == seq) {
@@ -615,9 +622,17 @@ pub const Connection = struct {
 
     // Pending control frames queue
     pending_frames: frame_mod.PendingFrameQueue = .{},
+    /// Frames the peer must see that found `pending_frames` full. Moved over
+    /// before each send; bounded by what we have in flight or have issued.
+    control_retry: std.ArrayListUnmanaged(frame_mod.PendingControlFrame) = .empty,
 
     // Pool of peer-issued connection IDs for migration
     peer_cid_pool: ConnectionIdPool = .{},
+    /// Sequence numbers we have sent RETIRE_CONNECTION_ID for and the peer
+    /// has not yet acknowledged. Capped at twice our
+    /// active_connection_id_limit; a peer pushing past it gets
+    /// CONNECTION_ID_LIMIT_ERROR.
+    retiring_cids: std.ArrayListUnmanaged(u64) = .empty,
 
     // Pool of locally-issued connection IDs (RFC 9000 §5.1)
     local_cid_pool: LocalCidPool = .{},
@@ -734,6 +749,10 @@ pub const Connection = struct {
     close_pkt_buf: [256]u8 = undefined,
     close_pkt_len: u16 = 0,
     needs_close_retransmit: bool = false,
+    /// Packets received while closing. The close is resent only when this
+    /// reaches a power of two, so a peer (or a spoofer) cannot make us
+    /// answer each packet 1:1 (RFC 9000 10.2.1).
+    close_trigger_count: u64 = 0,
 
     // Retry state (client-side)
     odcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
@@ -976,6 +995,8 @@ pub const Connection = struct {
         self.crypto_streams.deinit();
         self.datagram_recv_queue.deinitQueue();
         self.datagram_send_queue.deinitQueue();
+        self.control_retry.deinit(self.allocator);
+        self.retiring_cids.deinit(self.allocator);
     }
 
     /// Handle a Version Negotiation packet (RFC 9000 §6.2, client only).
@@ -1201,7 +1222,8 @@ pub const Connection = struct {
             return;
         }
         if (self.state == .closing) {
-            self.needs_close_retransmit = true;
+            self.close_trigger_count += 1;
+            if (std.math.isPowerOfTwo(self.close_trigger_count)) self.needs_close_retransmit = true;
             self.last_packet_received_time = @intCast(sys.nanoTimestamp());
             return;
         }
@@ -1504,6 +1526,63 @@ pub const Connection = struct {
         }
     }
 
+    /// A fresh NEW_TOKEN for the current peer address (RFC 9000 8.1.3).
+    /// Announces one of our CIDs, with the current Retire Prior To.
+    fn newConnectionIdFrame(self: *const Connection, e: *const LocalCidEntry) frame_mod.PendingControlFrame {
+        return .{ .new_connection_id = .{
+            .seq_num = e.seq_num,
+            .retire_prior_to = self.local_cid_pool.retire_prior_to,
+            .cid_buf = e.cid_buf,
+            .cid_len = e.cid_len,
+            .stateless_reset_token = e.stateless_reset_token,
+        } };
+    }
+
+    fn newTokenFrame(self: *Connection) ?frame_mod.PendingControlFrame {
+        var nt_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
+        const nt_len = packet.generateNewToken(
+            &nt_buf,
+            self.paths[self.active_path_idx].peer_addr,
+            self.token_key,
+        ) catch return null;
+        var pcf: frame_mod.PendingControlFrame = .{ .new_token = .{} };
+        if (nt_len == 0 or nt_len > pcf.new_token.token_buf.len) return null;
+        @memcpy(pcf.new_token.token_buf[0..nt_len], nt_buf[0..nt_len]);
+        pcf.new_token.token_len = @intCast(nt_len);
+        return pcf;
+    }
+
+    /// Close for a RESET_STREAM the receive side refused (RFC 9000 4.5, 4.1).
+    fn rejectResetStream(self: *Connection, err: anyerror) error{ FlowControlError, ProtocolViolation } {
+        if (err == error.FlowControlError) {
+            self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM exceeds stream flow control");
+            return error.FlowControlError;
+        }
+        self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM final_size mismatch");
+        return error.ProtocolViolation;
+    }
+
+    /// Charge a STREAM frame to flow control and buffer it, closing the
+    /// connection for whatever the receive side refuses.
+    fn recvStreamFrame(self: *Connection, rs: *stream_mod.ReceiveStream, offset: u64, data: []const u8, fin: bool) !void {
+        try self.chargeConnWindow(rs, offset + data.len, .stream);
+        rs.handleStreamFrame(offset, data, fin) catch |err| switch (err) {
+            error.FinalSizeError => {
+                self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
+                return error.ProtocolViolation;
+            },
+            error.TooManyChunks => {
+                self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.stream), "too many reassembly gaps");
+                return error.ProtocolViolation;
+            },
+            error.FlowControlError => {
+                self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.stream), "STREAM exceeds stream flow control limit");
+                return error.FlowControlError;
+            },
+            else => return err,
+        };
+    }
+
     /// Queue retransmission for stream frames that were in a lost packet.
     fn queueStreamRetransmissions(self: *Connection, pkt: *const ack_handler.SentPacket) void {
         for (pkt.getStreamFrames()) |sf| {
@@ -1533,6 +1612,10 @@ pub const Connection = struct {
 
             .ack => |ack| {
                 const enc_level = epochToEncLevel(epoch);
+                if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack.ack_ranges[0..ack.ack_range_count])) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.ack), "ACK for unsent packet");
+                    return error.ProtocolViolation;
+                }
                 const peer_tp = self.peer_params orelse transport_params.TransportParams{};
 
                 // RFC 9002 §7.8: snapshot app_limited BEFORE processing ACKs,
@@ -1570,6 +1653,10 @@ pub const Connection = struct {
                     }
 
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent);
+                    for (pkt.getControlFrames()) |cf| switch (cf) {
+                        .retire_connection_id => |seq| self.onRetireCidAcked(seq),
+                        else => {},
+                    };
 
                     // Update stream ack_offset for ACKed stream frames
                     for (pkt.getStreamFrames()) |sf| {
@@ -1626,6 +1713,7 @@ pub const Connection = struct {
 
                     // Queue stream data retransmission for lost packets
                     self.queueStreamRetransmissions(&pkt);
+                    self.requeueLostControlFrames(&pkt);
 
                     // Queue CRYPTO frame retransmission for lost packets (RFC 9002 §6.2)
                     if (pkt.has_crypto_data) {
@@ -1669,6 +1757,10 @@ pub const Connection = struct {
 
             .ack_ecn => |ack| {
                 const enc_level = epochToEncLevel(epoch);
+                if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack.ack_ranges[0..ack.ack_range_count])) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.ack_ecn), "ACK for unsent packet");
+                    return error.ProtocolViolation;
+                }
                 const space_idx = @intFromEnum(enc_level);
                 const peer_tp = self.peer_params orelse transport_params.TransportParams{};
 
@@ -1701,6 +1793,10 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
                     }
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent);
+                    for (pkt.getControlFrames()) |cf| switch (cf) {
+                        .retire_connection_id => |seq| self.onRetireCidAcked(seq),
+                        else => {},
+                    };
 
                     // Stop including HANDSHAKE_DONE once a packet containing it is ACKed
                     if (pkt.has_handshake_done) {
@@ -1761,6 +1857,7 @@ pub const Connection = struct {
 
                     // Queue stream data retransmission for lost packets
                     self.queueStreamRetransmissions(&pkt);
+                    self.requeueLostControlFrames(&pkt);
 
                     // Queue CRYPTO frame retransmission for lost packets (RFC 9002 §6.2)
                     if (pkt.has_crypto_data) {
@@ -1855,24 +1952,10 @@ pub const Connection = struct {
                     }
                 }
                 if (self.streams.getStream(rs.stream_id)) |s| {
-                    s.recv.handleResetStream(rs.error_code, rs.final_size) catch {
-                        // RFC 9000 §4.5: FINAL_SIZE_ERROR
-                        self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM final_size mismatch");
-                        return error.ProtocolViolation;
-                    };
-                    // RFC 9000 §4.4: account for final_size in connection flow control
-                    self.conn_flow_ctrl.base.addBytesReceived(rs.final_size) catch {
-                        self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM exceeds flow control");
-                        return error.FlowControlError;
-                    };
-                    // Credit the bytes between what arrived and the final size,
-                    // so the connection window advances past a stream whose tail
-                    // will never be delivered. The bytes that did arrive were
-                    // already credited by the STREAM handler.
-                    const credited = s.recv.sorter.highestReceived();
-                    if (rs.final_size > credited) {
-                        self.conn_flow_ctrl.addBytesRead(rs.final_size - credited);
-                    }
+                    s.recv.handleResetStream(rs.error_code, rs.final_size) catch |err| return self.rejectResetStream(err);
+                    // RFC 9000 §4.5: the final size counts once; the credit
+                    // comes back when queueFlowControlUpdates harvests it.
+                    try self.chargeConnWindow(&s.recv, rs.final_size, .reset_stream);
                     // If send side is also done, stream is fully closed
                     if (s.send.fin_sent or s.send.reset_err != null) {
                         self.streams.closeStream(rs.stream_id);
@@ -1882,18 +1965,8 @@ pub const Connection = struct {
                     // against connection flow control when it sent the data, so
                     // we have to release that credit here or the connection
                     // stalls at the window even though the bytes never arrived.
-                    s.handleResetStream(rs.error_code, rs.final_size) catch {
-                        self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM final_size mismatch");
-                        return error.ProtocolViolation;
-                    };
-                    self.conn_flow_ctrl.base.addBytesReceived(rs.final_size) catch {
-                        self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM exceeds flow control");
-                        return error.FlowControlError;
-                    };
-                    const credited = s.sorter.highestReceived();
-                    if (rs.final_size > credited) {
-                        self.conn_flow_ctrl.addBytesRead(rs.final_size - credited);
-                    }
+                    s.handleResetStream(rs.error_code, rs.final_size) catch |err| return self.rejectResetStream(err);
+                    try self.chargeConnWindow(s, rs.final_size, .reset_stream);
                     if (!s.closed_counted) {
                         s.closed_counted = true;
                         self.streams.closeStream(rs.stream_id);
@@ -1960,11 +2033,6 @@ pub const Connection = struct {
                     self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stream), "STREAM for locally-initiated stream not yet created");
                     return error.ProtocolViolation;
                 }
-                // RFC 9000 §4.1: STREAM frame offset exceeding flow control limit
-                if (s.offset + s.data.len > self.conn_flow_ctrl.base.receive_window) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.stream), "STREAM exceeds connection flow control limit");
-                    return error.FlowControlError;
-                }
                 // RFC 9000 §4.6: stream ID exceeding peer's MAX_STREAMS limit
                 {
                     const stream_seq = s.stream_id / 4;
@@ -1985,17 +2053,7 @@ pub const Connection = struct {
                             return;
                         },
                     };
-                    strm.recv.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
-                        error.FinalSizeError => {
-                            self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
-                            return error.ProtocolViolation;
-                        },
-                        error.TooManyChunks => {
-                            self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.stream), "too many reassembly gaps");
-                            return error.ProtocolViolation;
-                        },
-                        else => return err,
-                    };
+                    try self.recvStreamFrame(&strm.recv, s.offset, s.data, s.fin);
                     if (s.fin) self.streams.needs_gc_scan = true;
 
                     // Check if stream is fully closed (both directions done)
@@ -2015,17 +2073,7 @@ pub const Connection = struct {
                             return;
                         },
                     };
-                    recv_strm.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
-                        error.FinalSizeError => {
-                            self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
-                            return error.ProtocolViolation;
-                        },
-                        error.TooManyChunks => {
-                            self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.stream), "too many reassembly gaps");
-                            return error.ProtocolViolation;
-                        },
-                        else => return err,
-                    };
+                    try self.recvStreamFrame(recv_strm, s.offset, s.data, s.fin);
 
                     // For incoming uni streams, FIN means the stream is done.
                     // A retransmitted FIN must not count against MAX_STREAMS twice.
@@ -2034,10 +2082,6 @@ pub const Connection = struct {
                         self.streams.closeStream(s.stream_id);
                     }
                 }
-
-                // Update flow control
-                try self.conn_flow_ctrl.base.addBytesReceived(s.offset + s.data.len);
-                self.conn_flow_ctrl.addBytesRead(s.data.len);
             },
 
             .max_data => |max| {
@@ -2098,17 +2142,9 @@ pub const Connection = struct {
                 // Same logic for per-stream credit. For bidi streams, the
                 // receive side carries the limit we advertise to the peer.
                 self.queueFlowControlUpdates();
-                if (self.streams.getStream(blocked.stream_id)) |s| {
-                    const current = s.recv.receive_window;
-                    if (current > blocked.limit) {
-                        self.pending_frames.push(.{ .max_stream_data = .{
-                            .stream_id = blocked.stream_id,
-                            .max = current,
-                        } });
-                    }
-                } else if (self.streams.recv_streams.get(blocked.stream_id)) |s| {
-                    const current = s.receive_window;
-                    if (current > blocked.limit) {
+                if (self.streams.getRecvStream(blocked.stream_id)) |rs| {
+                    const current = rs.receive_window;
+                    if (rs.receive_window_size > 0 and current > blocked.limit) {
                         self.pending_frames.push(.{ .max_stream_data = .{
                             .stream_id = blocked.stream_id,
                             .max = current,
@@ -2161,15 +2197,30 @@ pub const Connection = struct {
                     self.peer_max_cid_seq = ncid.seq_num;
                 }
 
-                // Retire old CIDs as requested by peer
+                // RFC 9000 19.15: a CID arriving already below Retire Prior To
+                // is retired straight away, never used.
+                if (ncid.seq_num < self.active_cid_seq) {
+                    try self.retirePeerCid(ncid.seq_num);
+                    return;
+                }
+
+                // Retire only the CIDs we actually hold: the jump itself can
+                // be as large as 2^62.
                 if (ncid.retire_prior_to > self.active_cid_seq) {
-                    var seq = self.active_cid_seq;
-                    while (seq < ncid.retire_prior_to) : (seq += 1) {
-                        self.pending_frames.push(.{ .retire_connection_id = seq });
+                    if (self.active_cid_seq == 0 and !self.peer_cid_pool.contains(0)) {
+                        try self.retirePeerCid(0); // the handshake DCID, never pooled on this side
+                    }
+                    for (&self.peer_cid_pool.entries) |*entry| {
+                        if (entry.occupied and entry.seq_num < ncid.retire_prior_to) {
+                            try self.retirePeerCid(entry.seq_num);
+                        }
                     }
                     self.active_cid_seq = ncid.retire_prior_to;
                     self.peer_cid_pool.retirePriorTo(ncid.retire_prior_to);
                 }
+
+                // A retransmitted frame repeats a CID we already hold.
+                if (self.peer_cid_pool.contains(ncid.seq_num)) return;
 
                 // Store CID in pool for future migration use
                 self.peer_cid_pool.addPeerCid(ncid.seq_num, ncid.conn_id, ncid.stateless_reset_token);
@@ -2194,13 +2245,7 @@ pub const Connection = struct {
                     else
                         self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key);
                     if (maybe_entry) |entry| {
-                        self.pending_frames.push(.{ .new_connection_id = .{
-                            .seq_num = entry.seq_num,
-                            .retire_prior_to = self.local_cid_pool.retire_prior_to,
-                            .cid_buf = entry.cid_buf,
-                            .cid_len = entry.cid_len,
-                            .stateless_reset_token = entry.stateless_reset_token,
-                        } });
+                        self.pushReliable(self.newConnectionIdFrame(entry));
                         std.log.info("issued replacement NEW_CONNECTION_ID seq={d}", .{entry.seq_num});
                     }
                 }
@@ -2221,7 +2266,7 @@ pub const Connection = struct {
             },
 
             .connection_close => |cc| {
-                std.log.err("CONNECTION_CLOSE: error_code=0x{x}, frame_type=0x{x}, reason_len={d}, reason={s}", .{
+                std.log.warn("peer CONNECTION_CLOSE: error_code=0x{x}, frame_type=0x{x}, reason_len={d}, reason={s}", .{
                     cc.error_code,
                     cc.frame_type,
                     cc.reason.len,
@@ -2836,13 +2881,7 @@ pub const Connection = struct {
                             else
                                 self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key);
                             if (maybe_entry) |entry| {
-                                self.pending_frames.push(.{ .new_connection_id = .{
-                                    .seq_num = entry.seq_num,
-                                    .retire_prior_to = self.local_cid_pool.retire_prior_to,
-                                    .cid_buf = entry.cid_buf,
-                                    .cid_len = entry.cid_len,
-                                    .stateless_reset_token = entry.stateless_reset_token,
-                                } });
+                                self.pushReliable(self.newConnectionIdFrame(entry));
                                 std.log.info("issued NEW_CONNECTION_ID seq={d}, cid_len={d}", .{ entry.seq_num, entry.cid_len });
                             } else break; // pool full
                         }
@@ -2850,18 +2889,9 @@ pub const Connection = struct {
 
                     // Server: issue NEW_TOKEN for client address validation (RFC 9000 §8.1.3)
                     if (self.is_server) {
-                        var nt_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
-                        const nt_len = packet.generateNewToken(
-                            &nt_buf,
-                            self.paths[self.active_path_idx].peer_addr,
-                            self.token_key,
-                        ) catch 0;
-                        if (nt_len > 0) {
-                            var pcf: frame_mod.PendingControlFrame = .{ .new_token = .{} };
-                            @memcpy(pcf.new_token.token_buf[0..nt_len], nt_buf[0..nt_len]);
-                            pcf.new_token.token_len = @intCast(nt_len);
-                            self.pending_frames.push(pcf);
-                            std.log.info("issued NEW_TOKEN ({d} bytes)", .{nt_len});
+                        if (self.newTokenFrame()) |pcf| {
+                            self.pushReliable(pcf);
+                            std.log.info("issued NEW_TOKEN ({d} bytes)", .{pcf.new_token.token_len});
                         }
                     }
 
@@ -2974,10 +3004,10 @@ pub const Connection = struct {
             } });
         }
         if (ss.reset_err != null and !ss.reset_stream_sent) {
-            ss.reset_stream_sent = true;
             // What went out, not what was written: buffered bytes were never
             // sent and may lie past the peer's window (RFC 9000 §4.5).
-            self.pending_frames.push(.{ .reset_stream = .{
+            // Marked sent only once queued; a full queue is retried next pass.
+            ss.reset_stream_sent = self.pending_frames.tryPush(.{ .reset_stream = .{
                 .stream_id = ss.stream_id,
                 .error_code = ss.reset_err.?,
                 .final_size = ss.send_offset,
@@ -2987,34 +3017,57 @@ pub const Connection = struct {
 
     /// Check if connection-level flow control needs a MAX_DATA or MAX_STREAMS update.
     fn queueFlowControlUpdates(self: *Connection) void {
+        // Frames that found the queue full last time go first.
+        var moved: usize = 0;
+        for (self.control_retry.items) |f| {
+            if (!self.pending_frames.tryPush(f)) break;
+            moved += 1;
+        }
+        if (moved > 0) {
+            const rest = self.control_retry.items[moved..];
+            std.mem.copyForwards(frame_mod.PendingControlFrame, self.control_retry.items[0..rest.len], rest);
+            self.control_retry.shrinkRetainingCapacity(rest.len);
+        }
+
         // Garbage-collect fully-closed bidi streams so consumed count advances
         // and MAX_STREAMS updates can fire.
         self.streams.collectClosedStreams();
 
-        if (self.conn_flow_ctrl.getWindowUpdate(&self.pkt_handler.rtt_stats)) |new_max| {
-            self.pending_frames.push(.{ .max_data = new_max });
+        // MAX_DATA grows only with what the consumer took or a reset abandoned.
+        // With every byte charged already credited, no stream has any to give.
+        const conn_fc = &self.conn_flow_ctrl.base;
+        if (conn_fc.bytes_read != conn_fc.highest_received) self.conn_flow_ctrl.addBytesRead(self.streams.takeConnCredit());
+
+        // Credit generators commit the new limit as they return it, so each
+        // one runs only when its frame is sure to fit.
+        if (self.pending_frames.hasRoomFor(1)) {
+            if (self.conn_flow_ctrl.getWindowUpdate(&self.pkt_handler.rtt_stats)) |new_max| {
+                self.pending_frames.push(.{ .max_data = new_max });
+            }
         }
 
         // Check if MAX_STREAMS updates are needed (sliding window)
-        const ms_update = self.streams.getMaxStreamsUpdates();
-        if (ms_update.bidi) |new_max| {
-            self.pending_frames.push(.{ .max_streams_bidi = new_max });
-        }
-        if (ms_update.uni) |new_max| {
-            self.pending_frames.push(.{ .max_streams_uni = new_max });
+        if (self.pending_frames.hasRoomFor(2)) {
+            const ms_update = self.streams.getMaxStreamsUpdates();
+            if (ms_update.bidi) |new_max| {
+                self.pending_frames.push(.{ .max_streams_bidi = new_max });
+            }
+            if (ms_update.uni) |new_max| {
+                self.pending_frames.push(.{ .max_streams_uni = new_max });
+            }
         }
 
         // MAX_STREAM_DATA: update peer's send window as we consume stream data
         {
             var stream_it = self.streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| {
-                const s: *stream_mod.Stream = s_ptr.*;
-                if (s.recv.getWindowUpdate()) |new_max| {
-                    self.pending_frames.push(.{ .max_stream_data = .{
-                        .stream_id = s.stream_id,
-                        .max = new_max,
-                    } });
-                }
+                if (!self.queueWindowUpdate(&s_ptr.*.recv)) break;
+            }
+            // Peer-initiated uni streams carry H3 control, QPACK, WT and MoQ
+            // data; without this they stall once the initial window is spent.
+            var recv_it = self.streams.recv_streams.valueIterator();
+            while (recv_it.next()) |rs_ptr| {
+                if (!self.queueWindowUpdate(rs_ptr.*)) break;
             }
         }
 
@@ -3038,15 +3091,126 @@ pub const Connection = struct {
         {
             var stream_it = self.streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| {
-                const s: *stream_mod.Stream = s_ptr.*;
-                if (s.recv.stop_sending_err != null and !s.recv.stop_sending_sent) {
-                    s.recv.stop_sending_sent = true;
-                    self.pending_frames.push(.{ .stop_sending = .{
-                        .stream_id = s.stream_id,
-                        .error_code = s.recv.stop_sending_err.?,
-                    } });
-                }
+                self.queueStopSending(&s_ptr.*.recv);
             }
+            var recv_it = self.streams.recv_streams.valueIterator();
+            while (recv_it.next()) |rs_ptr| self.queueStopSending(rs_ptr.*);
+        }
+    }
+
+    /// MAX_STREAM_DATA for window the consumer freed. False once the queue is
+    /// full: getWindowUpdate commits the limit it returns, so it runs only
+    /// when the frame is sure to fit.
+    fn queueWindowUpdate(self: *Connection, rs: *stream_mod.ReceiveStream) bool {
+        if (!self.pending_frames.hasRoomFor(1)) return false;
+        if (rs.getWindowUpdate()) |new_max| {
+            self.pending_frames.push(.{ .max_stream_data = .{ .stream_id = rs.stream_id, .max = new_max } });
+        }
+        return true;
+    }
+
+    fn queueStopSending(self: *Connection, rs: *stream_mod.ReceiveStream) void {
+        if (rs.stop_sending_err == null or rs.stop_sending_sent) return;
+        rs.stop_sending_sent = self.pending_frames.tryPush(.{ .stop_sending = .{
+            .stream_id = rs.stream_id,
+            .error_code = rs.stop_sending_err.?,
+        } });
+    }
+
+    /// RFC 9000 4.1: the connection window bounds the sum over streams of each
+    /// stream's highest offset (or final size), so only growth past what the
+    /// stream already charged counts — a retransmission charges nothing.
+    fn chargeConnWindow(self: *Connection, rs: *stream_mod.ReceiveStream, end: u64, frame_type: FrameType) error{FlowControlError}!void {
+        if (end <= rs.conn_counted) return;
+        // Data after a reset is dropped, and its final size already counted.
+        if (frame_type == .stream and rs.reset_err != null) return;
+        const fc = &self.conn_flow_ctrl.base;
+        fc.addBytesReceived(fc.highest_received + (end - rs.conn_counted)) catch {
+            self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(frame_type), "data exceeds connection flow control limit");
+            return error.FlowControlError;
+        };
+        rs.conn_counted = end;
+    }
+
+    /// Queue a frame the peer must eventually see, holding it back if the
+    /// queue is full rather than dropping it.
+    fn pushReliable(self: *Connection, frame: frame_mod.PendingControlFrame) void {
+        if (self.pending_frames.tryPush(frame)) return;
+        self.control_retry.append(self.allocator, frame) catch
+            std.log.warn("control frame {s} dropped: out of memory", .{@tagName(frame)});
+    }
+
+    /// Queue RETIRE_CONNECTION_ID for a peer CID, tracking it until acked.
+    /// RFC 9000 5.1.2 lets us bound retirements in flight: past twice our
+    /// active_connection_id_limit the peer is closed with
+    /// CONNECTION_ID_LIMIT_ERROR, as quic-go and quinn do.
+    fn retirePeerCid(self: *Connection, seq: u64) error{ProtocolViolation}!void {
+        if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq) != null) return;
+        if (self.retiring_cids.items.len >= 2 * self.local_params.active_connection_id_limit) {
+            self.closeWithTransportError(@intFromEnum(TransportError.connection_id_limit_error), @intFromEnum(FrameType.new_connection_id), "too many connection IDs pending retirement");
+            return error.ProtocolViolation;
+        }
+        self.retiring_cids.append(self.allocator, seq) catch {
+            self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.new_connection_id), "out of memory");
+            return error.ProtocolViolation;
+        };
+        self.pushReliable(.{ .retire_connection_id = seq });
+    }
+
+    fn onRetireCidAcked(self: *Connection, seq: u64) void {
+        if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq)) |i| {
+            _ = self.retiring_cids.swapRemove(i);
+        }
+    }
+
+    /// RFC 9000 13.3: what a lost packet's control frames become. Credit is
+    /// resent at its current value, not the one lost; anything the stream
+    /// no longer needs is not resent at all.
+    fn requeueLostControlFrames(self: *Connection, pkt: *const ack_handler.SentPacket) void {
+        for (pkt.getControlFrames()) |cf| {
+            const frame: frame_mod.PendingControlFrame = switch (cf) {
+                .max_data => .{ .max_data = self.conn_flow_ctrl.base.receive_window },
+                .max_stream_data => |id| blk: {
+                    const rs = self.streams.getRecvStream(id) orelse continue;
+                    // The final size is known: no more credit is needed.
+                    if (rs.receive_window_size == 0 or rs.sorter.fin_offset != null) continue;
+                    break :blk .{ .max_stream_data = .{ .stream_id = id, .max = rs.receive_window } };
+                },
+                .max_streams_bidi => .{ .max_streams_bidi = self.streams.max_incoming_bidi_streams },
+                .max_streams_uni => .{ .max_streams_uni = self.streams.max_incoming_uni_streams },
+                .data_blocked => |limit| blk: {
+                    const fc = &self.conn_flow_ctrl.base;
+                    if (fc.send_window != limit or !fc.isBlocked()) continue;
+                    break :blk .{ .data_blocked = limit };
+                },
+                .stream_data_blocked => |b| blk: {
+                    const ss = self.streams.getSendStream(b.stream_id) orelse continue;
+                    if (ss.send_window != b.limit or ss.reset_err != null) continue;
+                    break :blk .{ .stream_data_blocked = .{ .stream_id = b.stream_id, .limit = b.limit } };
+                },
+                .streams_blocked_bidi => |l| if (self.streams.max_bidi_streams == l) .{ .streams_blocked_bidi = l } else continue,
+                .streams_blocked_uni => |l| if (self.streams.max_uni_streams == l) .{ .streams_blocked_uni = l } else continue,
+                // Rebuilt from the record: a reset uni stream is already gone.
+                .reset_stream => |r| .{ .reset_stream = .{ .stream_id = r.stream_id, .error_code = r.error_code, .final_size = r.final_size } },
+                .stop_sending => |ss| blk: {
+                    const rs = self.streams.getRecvStream(ss.stream_id) orelse continue;
+                    // Data Recvd or Reset Recvd: the request is moot.
+                    if (rs.reset_err != null or rs.sorter.fin_offset != null) continue;
+                    break :blk .{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = ss.error_code } };
+                },
+                .new_connection_id => |seq| blk: {
+                    for (&self.local_cid_pool.entries) |*e| {
+                        if (e.occupied and !e.retired and e.seq_num == seq) break :blk self.newConnectionIdFrame(e);
+                    }
+                    continue;
+                },
+                .retire_connection_id => |seq| if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq) != null)
+                    .{ .retire_connection_id = seq }
+                else
+                    continue,
+                .new_token => self.newTokenFrame() orelse continue,
+            };
+            self.pushReliable(frame);
         }
     }
 
@@ -3512,6 +3676,7 @@ pub const Connection = struct {
                     }
                 }
                 self.queueStreamRetransmissions(&pkt);
+                self.requeueLostControlFrames(&pkt);
                 if (pkt.has_crypto_data) {
                     self.queueCryptoRetransmission(pkt.enc_level);
                 }
@@ -3896,6 +4061,14 @@ pub const Connection = struct {
         return @min(ss.sendCredit(), self.sendCapacity());
     }
 
+    /// Bytes written to the stream but not yet sent, whatever holds them back.
+    /// Null for a stream we cannot send on.
+    pub fn streamBufferedBytes(self: *const Connection, stream_id: u64) ?u64 {
+        const ss = self.streams.getSendStream(stream_id) orelse return null;
+        if (ss.reset_err != null) return 0;
+        return ss.write_offset -| ss.send_offset;
+    }
+
     pub fn isDatagramSendQueueFull(self: *const Connection) bool {
         return self.datagram_send_queue.isFull();
     }
@@ -4075,16 +4248,8 @@ pub const Connection = struct {
         // next-send time so the event loop wakes up promptly to send more data.
         if (self.pacer.bandwidth_shifted > 0 and self.state == .connected) {
             const now: i64 = @intCast(sys.nanoTimestamp());
-            // Estimate pacer delay without mutating: budget is replenished by elapsed time
-            const elapsed = now - self.pacer.last_sent_time;
-            var budget = self.pacer.budget;
-            if (self.pacer.last_sent_time > 0 and elapsed > 0) {
-                const replenished = (self.pacer.bandwidth_shifted *| @as(u64, @intCast(elapsed))) >> 20;
-                budget = @min(budget + replenished, self.pacer.max_burst);
-            }
-            if (budget < self.pacer.max_datagram_size) {
-                const deficit = self.pacer.max_datagram_size - budget;
-                const delay: i64 = @intCast((deficit << 20) / self.pacer.bandwidth_shifted);
+            const delay = self.pacer.delayAt(now);
+            if (delay > 0) {
                 const pacer_deadline = now + delay;
                 if (earliest == null or pacer_deadline < earliest.?) {
                     earliest = pacer_deadline;
@@ -5482,7 +5647,8 @@ test "RESET_STREAM on a peer uni stream releases connection flow control" {
     } }, .application, 0);
 
     // The peer counted all 100 bytes against the connection window when it
-    // sent them; without crediting the 90 that never arrived we stall short.
+    // sent them; the 10 unread and the 90 that never arrived are all credited.
+    conn.queueFlowControlUpdates();
     try std.testing.expectEqual(@as(u64, 100), conn.conn_flow_ctrl.base.highest_received);
     try std.testing.expectEqual(@as(u64, 100), conn.conn_flow_ctrl.base.bytes_read);
     try std.testing.expect(conn.conn_flow_ctrl.base.receive_window >= before);
@@ -5598,6 +5764,7 @@ test "RESET_STREAM opens a uni stream we had not heard of" {
     } }, .application, 0);
 
     try std.testing.expect(conn.streams.recv_streams.get(2) != null);
+    conn.queueFlowControlUpdates();
     try std.testing.expectEqual(@as(u64, 500), conn.conn_flow_ctrl.base.bytes_read);
     try std.testing.expectEqual(@as(u64, 1), conn.streams.consumed_uni_streams);
 }
@@ -6031,4 +6198,410 @@ test "a handshake-space PTO with nothing to resend still probes" {
     const f = conn.pending_frames.pop();
     try std.testing.expect(f != null);
     try std.testing.expect(f.? == .ping);
+}
+
+test "an ACK for a packet number never sent is a PROTOCOL_VIOLATION" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // Two packets sent: 0 and 1. Acking 1 is fine, acking 2 is not.
+    _ = conn.pkt_handler.nextPacketNumber(.application);
+    _ = conn.pkt_handler.nextPacketNumber(.application);
+    try conn.processFrame(&.{ .ack = .{ .largest_ack = 1, .ack_delay = 0, .first_ack_range = 1, .ack_range_count = 0 } }, .application, 0);
+    try std.testing.expect(conn.local_err == null);
+
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack = .{ .largest_ack = 2, .ack_delay = 0, .first_ack_range = 0, .ack_range_count = 0 } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+}
+
+test "an ACK_ECN for a packet number never sent is a PROTOCOL_VIOLATION" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack_ecn = .{
+        .largest_ack = 0,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_range_count = 0,
+        .ecn_ect0 = 0,
+        .ecn_ect1 = 0,
+        .ecn_ce = 0,
+    } }, .initial, 0));
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+}
+
+test "STREAM data past a bidi stream's window is a FLOW_CONTROL_ERROR" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    conn.streams.local_max_stream_data_bidi_remote = 100;
+
+    var ok = [_]u8{'a'} ** 100;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = ok.len, .data = &ok, .fin = false } }, .application, 0);
+
+    var over = [_]u8{'b'};
+    try std.testing.expectError(error.FlowControlError, conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 100, .length = 1, .data = &over, .fin = false } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.flow_control_error)), conn.local_err.?.code);
+}
+
+test "STREAM data past a uni stream's window is a FLOW_CONTROL_ERROR" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    conn.streams.local_max_stream_data_uni = 100;
+
+    // A far offset alone is enough: no byte below it has to arrive first.
+    var over = [_]u8{'b'};
+    try std.testing.expectError(error.FlowControlError, conn.processFrame(&.{ .stream = .{ .stream_id = 2, .offset = 100, .length = 1, .data = &over, .fin = false } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.flow_control_error)), conn.local_err.?.code);
+}
+
+test "RESET_STREAM with a final size past the stream window is a FLOW_CONTROL_ERROR" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    conn.streams.local_max_stream_data_uni = 100;
+
+    try std.testing.expectError(error.FlowControlError, conn.processFrame(&.{ .reset_stream = .{ .stream_id = 2, .error_code = 0, .final_size = 101 } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.flow_control_error)), conn.local_err.?.code);
+}
+
+test "a peer uni stream keeps getting MAX_STREAM_DATA past its initial window" {
+    const alloc = std.testing.allocator;
+    var conn = testConnection(alloc);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    // The peer honours both windows, as a real one would; if we never raise
+    // them it runs out of credit below `total` and the test fails.
+    var stream_max: u64 = conn.streams.local_max_stream_data_uni;
+    var conn_max: u64 = conn.conn_flow_ctrl.base.receive_window;
+    const total: u64 = 3 * 1024 * 1024;
+    var chunk = [_]u8{'u'} ** 1200;
+    var off: u64 = 0;
+    var read_total: u64 = 0;
+    while (off < total) {
+        const limit = @min(stream_max, conn_max);
+        if (off >= limit) return error.TestUnexpectedResult; // stalled
+        const n: usize = @intCast(@min(chunk.len, limit - off, total - off));
+        try conn.processFrame(&.{ .stream = .{ .stream_id = 2, .offset = off, .length = n, .data = chunk[0..n], .fin = false } }, .application, 0);
+        off += n;
+
+        const rs = conn.streams.recv_streams.get(2).?;
+        while (rs.read()) |d| {
+            read_total += d.len;
+            alloc.free(d);
+        }
+        conn.queueFlowControlUpdates();
+        while (conn.pending_frames.pop()) |f| switch (f) {
+            .max_stream_data => |m| if (m.stream_id == 2) {
+                stream_max = @max(stream_max, m.max);
+            },
+            .max_data => |m| conn_max = @max(conn_max, m),
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(total, read_total);
+    try std.testing.expect(stream_max > conn.streams.local_max_stream_data_uni);
+}
+
+test "a closing connection resends its close with exponential backoff, not per packet" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.close(0, "");
+    // As if the first CONNECTION_CLOSE already went out.
+    conn.close_pkt_len = 32;
+    @memset(conn.close_pkt_buf[0..32], 0xcc);
+
+    var header: packet.Header = .{
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .packet_type = .one_rtt,
+        .dcid = &.{},
+        .scid = &.{},
+    };
+    var junk = [_]u8{0} ** 8;
+    var out: [1500]u8 = undefined;
+    var resent: usize = 0;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var fbs = io.fixedBufferStream(&junk);
+        try conn.recv(&header, &fbs, .{ .to = undefined, .from = undefined });
+        if (try conn.send(&out) > 0) resent += 1;
+    }
+    // Packets 1, 2, 4, ..., 64.
+    try std.testing.expectEqual(@as(usize, 7), resent);
+}
+
+/// Record `frames` as carried by a packet sent now, then send and ack three
+/// more so packet-threshold loss detection declares the first one lost.
+fn loseControlFrames(conn: *Connection, frames: []const frame_mod.PendingControlFrame) !void {
+    const now: i64 = 1_000_000_000;
+    var lost: ack_handler.SentPacket = .{
+        .pn = conn.pkt_handler.nextPacketNumber(.application),
+        .time_sent = now,
+        .size = 100,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .enc_level = .application,
+    };
+    for (frames) |f| {
+        lost.control_frames[lost.control_frame_count] = ack_handler.SentControlFrame.from(f).?;
+        lost.control_frame_count += 1;
+    }
+    try conn.pkt_handler.onPacketSent(lost);
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        try conn.pkt_handler.onPacketSent(.{
+            .pn = conn.pkt_handler.nextPacketNumber(.application),
+            .time_sent = now,
+            .size = 100,
+            .ack_eliciting = true,
+            .in_flight = true,
+            .enc_level = .application,
+        });
+    }
+    const largest = conn.pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.application)] - 1;
+    try conn.processFrame(&.{ .ack = .{ .largest_ack = largest, .ack_delay = 0, .first_ack_range = 2, .ack_range_count = 0 } }, .application, now + 1_000_000);
+}
+
+test "a lost RESET_STREAM is rebuilt from its record after the uni stream is freed" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    const ss = try conn.streams.openUniStream();
+    const id = ss.stream_id;
+    try ss.writeData("hello");
+    _ = ss.popStreamFrame(100).?;
+    ss.reset(9);
+    conn.queueFlowControlUpdates();
+    var queued: ?frame_mod.PendingControlFrame = null;
+    while (conn.pending_frames.pop()) |f| {
+        if (f == .reset_stream) queued = f;
+    }
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(conn.streams.send_streams.get(id) == null);
+
+    try loseControlFrames(&conn, &.{queued.?});
+    try std.testing.expectEqual(@as(?u64, 5), drainPendingFor(&conn, id).reset_final_size);
+}
+
+test "a lost MAX_STREAM_DATA is resent at the current window, not the lost one" {
+    const alloc = std.testing.allocator;
+    var conn = testConnection(alloc);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    conn.streams.local_max_stream_data_uni = 1000;
+
+    var data = [_]u8{'x'} ** 1000;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 2, .offset = 0, .length = data.len, .data = &data, .fin = false } }, .application, 0);
+    const rs = conn.streams.recv_streams.get(2).?;
+    while (rs.read()) |d| alloc.free(d);
+    conn.queueFlowControlUpdates();
+    var lost_frame: ?frame_mod.PendingControlFrame = null;
+    while (conn.pending_frames.pop()) |f| {
+        if (f == .max_stream_data) lost_frame = f;
+    }
+    try std.testing.expectEqual(@as(u64, 2000), lost_frame.?.max_stream_data.max);
+    rs.receive_window = 2500; // raised again meanwhile
+
+    try loseControlFrames(&conn, &.{lost_frame.?});
+    var resent: ?u64 = null;
+    while (conn.pending_frames.pop()) |f| {
+        if (f == .max_stream_data) resent = f.max_stream_data.max;
+    }
+    try std.testing.expectEqual(@as(?u64, 2500), resent);
+}
+
+test "a lost STOP_SENDING is not resent once the stream's final size is known" {
+    const alloc = std.testing.allocator;
+    var conn = testConnection(alloc);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    var data = [_]u8{'x'} ** 10;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = data.len, .data = &data, .fin = false } }, .application, 0);
+    const stop: frame_mod.PendingControlFrame = .{ .stop_sending = .{ .stream_id = 0, .error_code = 3 } };
+
+    try loseControlFrames(&conn, &.{stop});
+    var count: usize = 0;
+    while (conn.pending_frames.pop()) |f| {
+        if (f == .stop_sending) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 10, .length = 0, .data = &.{}, .fin = true } }, .application, 0);
+    try loseControlFrames(&conn, &.{stop});
+    while (conn.pending_frames.pop()) |f| try std.testing.expect(f != .stop_sending);
+}
+
+test "a RESET_STREAM that finds the queue full is queued on a later pass" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    while (conn.pending_frames.hasRoomFor(1)) conn.pending_frames.push(.{ .path_challenge = .{0} ** 8 });
+    const s = try conn.streams.openBidiStream();
+    s.send.reset(4);
+    conn.queueFlowControlUpdates();
+    try std.testing.expect(!s.send.reset_stream_sent);
+
+    _ = conn.pending_frames.pop();
+    conn.queueFlowControlUpdates();
+    try std.testing.expect(s.send.reset_stream_sent);
+    try std.testing.expectEqual(@as(?u64, 0), drainPendingFor(&conn, s.stream_id).reset_final_size);
+}
+
+test "a full window of unread in-order data is not mistaken for reassembly gaps" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    conn.conn_flow_ctrl.base.receive_window = 16 << 20;
+
+    // What a paused consumer leaves behind: 5000 frames, far more than the
+    // gap cap, none of them out of order.
+    var payload = [_]u8{'x'} ** 1200;
+    var i: u64 = 0;
+    while (i < 5000) : (i += 1) {
+        try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = i * payload.len, .length = payload.len, .fin = false, .data = &payload } }, .application, 0);
+    }
+    try std.testing.expect(conn.local_err == null);
+}
+
+test "a paused stream's window arriving reordered is not mistaken for reassembly gaps" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    conn.conn_flow_ctrl.base.receive_window = 16 << 20;
+
+    // 5000 frames, each delayed by up to 32 slots of jitter; none lost.
+    const n = 5000;
+    var order: [n]struct { idx: u64, arrival: u64 } = undefined;
+    var prng = std.Random.DefaultPrng.init(0x6a697474);
+    const rand = prng.random();
+    for (&order, 0..) |*o, k| o.* = .{ .idx = k, .arrival = k + rand.uintLessThan(u64, 32) };
+    std.mem.sort(@TypeOf(order[0]), &order, {}, struct {
+        fn lt(_: void, a: @TypeOf(order[0]), b: @TypeOf(order[0])) bool {
+            return a.arrival < b.arrival;
+        }
+    }.lt);
+
+    var payload: [1200]u8 = undefined;
+    for (order) |o| {
+        const offset = o.idx * payload.len;
+        for (&payload, offset..) |*b, k| b.* = @intCast(k % 251);
+        try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = offset, .length = payload.len, .fin = false, .data = &payload } }, .application, 0);
+    }
+    try std.testing.expect(conn.local_err == null);
+
+    const s = conn.streams.getStream(0).?;
+    var got: u64 = 0;
+    while (s.recv.read()) |chunk| {
+        defer std.testing.allocator.free(chunk);
+        for (chunk, got..) |v, k| try std.testing.expectEqual(@as(u8, @intCast(k % 251)), v);
+        got += chunk.len;
+    }
+    try std.testing.expectEqual(@as(u64, n * payload.len), got);
+}
+
+test "NEW_CONNECTION_ID: a huge Retire Prior To retires only the CIDs we hold" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    var cid = [_]u8{0xab} ** 8;
+    const top: u64 = (1 << 62) - 1;
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = top, .retire_prior_to = top, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    try std.testing.expect(conn.local_err == null);
+    try std.testing.expectEqual(top, conn.active_cid_seq);
+    // Only the handshake DCID (seq 0) was ever issued to us.
+    try std.testing.expectEqualSlices(u64, &.{0}, conn.retiring_cids.items);
+    try std.testing.expectEqual(@as(usize, 0), conn.control_retry.items.len);
+    try std.testing.expectEqual(@as(u8, 1), conn.pending_frames.len);
+    try std.testing.expect(conn.peer_cid_pool.contains(top));
+}
+
+test "NEW_CONNECTION_ID: unacked retirements past twice the limit close the connection" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    var cid = [_]u8{0xab} ** 8;
+    const limit = conn.local_params.active_connection_id_limit;
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 100, .retire_prior_to = 100, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    // Late CIDs below Retire Prior To are retired on arrival; a retransmit
+    // of one is not retired twice.
+    var seq: u64 = 1;
+    while (seq < 2 * limit) : (seq += 1) {
+        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    }
+    try std.testing.expect(conn.local_err == null);
+    try std.testing.expectEqual(@as(usize, @intCast(2 * limit)), conn.retiring_cids.items.len);
+
+    // An ACK frees a slot.
+    conn.onRetireCidAcked(0);
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 50, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    try std.testing.expect(conn.local_err == null);
+
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 51, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.connection_id_limit_error)), conn.local_err.?.code);
+}
+
+test "connection flow control: the window bounds the sum over streams" {
+    const alloc = std.testing.allocator;
+    var conn = testConnection(alloc);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(100, 100);
+    const win = conn.conn_flow_ctrl.base.receive_window;
+    const buf = try alloc.alloc(u8, @intCast(win / 2));
+    defer alloc.free(buf);
+    @memset(buf, 'z');
+
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = buf.len, .data = buf, .fin = false } }, .application, 0);
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 4, .offset = 0, .length = buf.len, .data = buf, .fin = false } }, .application, 0);
+    // A retransmission of counted bytes charges nothing.
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = buf.len, .data = buf, .fin = false } }, .application, 0);
+    try std.testing.expectEqual(win, conn.conn_flow_ctrl.base.highest_received);
+    try std.testing.expect(conn.local_err == null);
+
+    // Each stream is well inside its own window, but the sum is not.
+    try std.testing.expectError(error.FlowControlError, conn.processFrame(&.{ .stream = .{ .stream_id = 8, .offset = 0, .length = 1, .data = buf[0..1], .fin = false } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.flow_control_error)), conn.local_err.?.code);
+}
+
+test "connection flow control: MAX_DATA is granted for data read, not data received" {
+    const alloc = std.testing.allocator;
+    var conn = testConnection(alloc);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(100, 100);
+    const win = conn.conn_flow_ctrl.base.receive_window;
+    const buf = try alloc.alloc(u8, @intCast(win));
+    defer alloc.free(buf);
+    @memset(buf, 'z');
+
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = buf.len, .data = buf, .fin = false } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(win, conn.conn_flow_ctrl.base.receive_window);
+    try std.testing.expectEqual(@as(u64, 0), conn.conn_flow_ctrl.base.bytes_read);
+
+    const rs = &conn.streams.getStream(0).?.recv;
+    while (rs.read()) |d| alloc.free(d);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(win, conn.conn_flow_ctrl.base.bytes_read);
+    try std.testing.expect(conn.conn_flow_ctrl.base.receive_window > win);
+}
+
+test "connection flow control: a repeated RESET_STREAM counts its final size once" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    var payload = "0123456789".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = payload.len, .data = &payload, .fin = false } }, .application, 0);
+    const reset: Frame = .{ .reset_stream = .{ .stream_id = 0, .error_code = 1, .final_size = 1000 } };
+    try conn.processFrame(&reset, .application, 0);
+    try conn.processFrame(&reset, .application, 0);
+    conn.queueFlowControlUpdates();
+    conn.queueFlowControlUpdates();
+
+    try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.highest_received);
+    try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.bytes_read);
 }

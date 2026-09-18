@@ -290,6 +290,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                             std.debug.print("WT stream {d} STOP_SENDING from peer (code={d})\n", .{ ss.stream_id, ss.error_code });
                         },
                         .writable => {}, // never asked for: no notifyWritable here
+                        // Plain HTTP/3 requests on the WebTransport listener: not served here.
+                        .request, .request_data, .request_end, .request_cancelled => {},
                         .session_rejected => {},
                     }
                 }

@@ -104,7 +104,20 @@ pub const WtEvent = union(enum) {
     /// A `notifyWritable` wait was met: the peer's credit now admits the bytes
     /// asked for, on the stream or, with `stream_id` null, anywhere in the
     /// session. Mirrors a browser's `writer.ready` resolving.
+    ///
+    /// For an ordinary HTTP/3 request stream (see `request`) waited on through
+    /// `H3Connection.notifyWritable`, both fields carry the stream's id.
     writable: struct { session_id: u64, stream_id: ?u64 },
+    /// Server: an ordinary HTTP/3 request on this connection — anything but an
+    /// Extended CONNECT for `webtransport`. Answer it through the H3
+    /// connection's response methods, as on a plain HTTP/3 server.
+    request: struct { stream_id: u64, headers: []const qpack.Header },
+    /// Server: request body bytes, valid until the next poll.
+    request_data: struct { stream_id: u64, data: []const u8 },
+    /// Server: the request body is complete.
+    request_end: u64,
+    /// Server: the peer abandoned the request; see `H3Event.request_cancelled`.
+    request_cancelled: struct { stream_id: u64, error_code: u64 },
 };
 
 /// Which halves of a stream have already reported a peer-side abort, so each
@@ -172,6 +185,9 @@ pub const WebTransportConnection = struct {
     /// Outstanding `notifyWritable` requests; few, and re-checked every poll.
     writable_waits: std.ArrayList(WritableWait) = .empty,
 
+    /// Backs `request_data` slices; reused, so they last until the next poll.
+    request_body: std.ArrayList(u8) = .empty,
+
     /// The draft-13 §5.6 window each session grants its peer. Separate from
     /// `h3.local_settings`, which only decides whether the same numbers are
     /// *also* announced in SETTINGS — one shipping browser refuses a session
@@ -208,6 +224,7 @@ pub const WebTransportConnection = struct {
         self.fin_delivered.deinit();
         self.reset_delivered.deinit();
         self.writable_waits.deinit(self.allocator);
+        self.request_body.deinit(self.allocator);
         self.wt_bidi_streams.deinit();
         self.wt_uni_streams.deinit();
         self.pending_uni_streams.deinit();
@@ -846,6 +863,20 @@ pub const WebTransportConnection = struct {
         return null;
     }
 
+    /// Take over what HTTP/3 read past the CONNECT's HEADERS: capsules that
+    /// came in the same read — a close sent right after the 200, say — would
+    /// otherwise sit in its buffer, which it no longer looks at.
+    fn adoptConnectStream(self: *WebTransportConnection, stream_id: u64) !void {
+        var kv = self.h3.stream_bufs.fetchRemove(stream_id) orelse return;
+        defer kv.value.deinit(self.allocator);
+        if (kv.value.items.len == 0) return;
+        // HTTP/3 held these back from flow control until consumed; we read
+        // capsules as they come, so they are credited now.
+        if (self.quic.streams.getStream(stream_id)) |s| s.recv.retained -|= kv.value.items.len;
+        const buf = try self.streamBuf(stream_id);
+        try buf.insertSlice(self.allocator, 0, kv.value.items);
+    }
+
     /// The buffer holding a stream's not-yet-parsed bytes, created on first
     /// use. A session's CONNECT stream is keyed here like any other, and freed
     /// by the same disposal path.
@@ -1141,6 +1172,7 @@ pub const WebTransportConnection = struct {
                     break :blk self.h3.stream_bufs.getPtr(stream_id).?;
                 };
                 try buf.appendSlice(self.allocator, data);
+                stream.recv.retained += data.len; // credited as H3 consumes it
             }
         }
         return null;
@@ -1377,6 +1409,7 @@ pub const WebTransportConnection = struct {
                     self.active_session_count += 1;
                     // Exclude this stream from H3 bidi processing
                     try self.h3.excluded_bidi_streams.put(req.stream_id, {});
+                    try self.adoptConnectStream(req.stream_id);
                     return .{ .connect_request = .{
                         .session_id = req.stream_id,
                         .protocol = req.protocol,
@@ -1385,6 +1418,7 @@ pub const WebTransportConnection = struct {
                         .headers = req.headers,
                     } };
                 }
+                if (self.is_server) return .{ .request = .{ .stream_id = req.stream_id, .headers = req.headers } };
             },
             .headers => |hdr| {
                 // Client: check if this is a response to our CONNECT
@@ -1397,6 +1431,7 @@ pub const WebTransportConnection = struct {
                                     session.state = .active;
                                     // Exclude CONNECT stream from H3 — WT layer owns it now
                                     self.h3.excluded_bidi_streams.put(hdr.stream_id, {}) catch {};
+                                    try self.adoptConnectStream(hdr.stream_id);
                                     return .{ .session_ready = .{ .session_id = hdr.stream_id, .headers = hdr.headers } };
                                 } else {
                                     self.finalizeSession(session);
@@ -1408,6 +1443,8 @@ pub const WebTransportConnection = struct {
                             }
                         }
                     }
+                } else if (self.is_server) {
+                    return .{ .request = .{ .stream_id = hdr.stream_id, .headers = hdr.headers } };
                 }
             },
             .settings => {
@@ -1418,8 +1455,14 @@ pub const WebTransportConnection = struct {
                     if (session.occupied) self.applyPeerCredit(&session.fc);
                 }
             },
-            .data => {
-                // Drain body to clear pending state
+            .data => |d| {
+                // The body has to be drained either way: poll stalls on it.
+                if (self.is_server) {
+                    self.request_body.clearRetainingCapacity();
+                    try self.request_body.resize(self.allocator, d.len);
+                    const n = self.h3.recvBody(self.request_body.items);
+                    return .{ .request_data = .{ .stream_id = d.stream_id, .data = self.request_body.items[0..n] } };
+                }
                 var sink: [4096]u8 = undefined;
                 while (self.h3.recvBody(&sink) > 0) {}
             },
@@ -1439,6 +1482,8 @@ pub const WebTransportConnection = struct {
                             .reason = session.close_reason_buf[0..reason_len],
                         } };
                     }
+                } else if (self.is_server) {
+                    return .{ .request_end = stream_id };
                 }
             },
             .goaway => {
@@ -1454,7 +1499,12 @@ pub const WebTransportConnection = struct {
                 }
             },
             .shutdown_complete => {},
-            .request_cancelled => {},
+            .request_cancelled => |rc| {
+                if (self.is_server and self.getSession(rc.stream_id) == null) {
+                    return .{ .request_cancelled = .{ .stream_id = rc.stream_id, .error_code = rc.error_code } };
+                }
+            },
+            .writable => |sid| return .{ .writable = .{ .session_id = sid, .stream_id = sid } },
         }
 
         return null;
@@ -2086,6 +2136,34 @@ test "WT integration: client receives session_ready on 200 response" {
 
     const session = setup.wt.getSession(session_id).?;
     try testing.expectEqual(SessionState.active, session.state);
+}
+
+test "WT integration: a close arriving with the 200 is not lost" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, false);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, false);
+    defer wt.deinit();
+
+    const session_id = try wt.connect("example.com", "/wt");
+
+    // HEADERS and WT_CLOSE_SESSION in one read, as a server closing at once sends them.
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(@as([]u8, &buf));
+    fbs.seek = buildConnectResponse(&buf);
+    try h3_frame.write(.{ .close_webtransport_session = .{ .error_code = 42, .reason = "test" } }, &fbs);
+    const len = fbs.seek;
+    const stream = quic_conn.streams.getStream(session_id).?;
+    try stream.recv.handleStreamFrame(stream.recv.sorter.highestReceived(), buf[0..len], true);
+
+    _ = try pollFor(&wt, .session_ready);
+    const closed = try pollFor(&wt, .session_closed);
+    try testing.expectEqual(@as(u32, 42), closed.session_closed.error_code);
+    try testing.expectEqualStrings("test", closed.session_closed.reason);
 }
 
 test "WT integration: client receives session_rejected on non-200" {
@@ -3071,4 +3149,40 @@ test "WT flow control: the peer's opens slide our grant forward" {
     var buf: [4]h3_frame.H3Frame = undefined;
     const capsules = try collectCapsules(stream.send.write_buffer.items[pre_len..], &buf);
     try testing.expectEqualDeep(&[_]h3_frame.H3Frame{.{ .wt_max_streams_bidi = 3 }}, capsules);
+}
+
+test "WT integration: a server delivers ordinary HTTP/3 requests alongside sessions" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    const req_headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/upload" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = try qpack.encodeHeaders(&req_headers, &qpack_buf);
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, &fbs);
+    try h3_frame.write(.{ .data = "hello body" }, &fbs);
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, fbs.buffered(), true);
+
+    const req = try pollFor(&setup.wt, .request);
+    try testing.expectEqual(@as(u64, 4), req.request.stream_id);
+    try testing.expectEqualStrings("POST", req.request.headers[0].value);
+
+    const body = try pollFor(&setup.wt, .request_data);
+    try testing.expectEqual(@as(u64, 4), body.request_data.stream_id);
+    try testing.expectEqualStrings("hello body", body.request_data.data);
+
+    const end = try pollFor(&setup.wt, .request_end);
+    try testing.expectEqual(@as(u64, 4), end.request_end);
+
+    // Answered through H3, like any request; the session is untouched.
+    try setup.h3.sendResponse(4, &.{.{ .name = ":status", .value = "200" }}, "ok");
+    try testing.expect(setup.wt.getSession(0) != null);
 }

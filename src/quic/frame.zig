@@ -238,22 +238,29 @@ pub const Frame = union(FrameType) {
                 const ack_range_count = try packet.readVarInt(reader);
                 const first_ack_range = try packet.readVarInt(reader);
 
+                // RFC 9000 19.3.1: a range reaching below packet number 0 is
+                // FRAME_ENCODING_ERROR, not something to clamp into range.
+                if (first_ack_range > largest_ack) return error.FrameEncodingError;
+
                 // Parse additional ACK ranges, computing absolute PN ranges
                 var additional_ranges: [MAX_ACK_RANGES]AckRange = undefined;
                 var range_count: u8 = 0;
-                var smallest = largest_ack -| first_ack_range;
+                var smallest = largest_ack - first_ack_range;
 
                 var i: u64 = 0;
                 while (i < ack_range_count) : (i += 1) {
                     const gap = try packet.readVarInt(reader);
                     const ack_range_len = try packet.readVarInt(reader);
+                    // Validate every range, including the ones past our cap.
+                    if (smallest < gap +| 2) return error.FrameEncodingError;
+                    const range_largest = smallest - gap - 2;
+                    if (ack_range_len > range_largest) return error.FrameEncodingError;
+                    const range_smallest = range_largest - ack_range_len;
                     if (range_count < MAX_ACK_RANGES) {
-                        const range_largest = smallest -| gap -| 2;
-                        const range_smallest = range_largest -| ack_range_len;
                         additional_ranges[range_count] = .{ .start = range_smallest, .end = range_largest };
                         range_count += 1;
-                        smallest = range_smallest;
                     }
+                    smallest = range_smallest;
                 }
 
                 var ecn_ect0: u64 = 0;
@@ -867,28 +874,56 @@ pub const PendingControlFrame = union(enum) {
 };
 
 /// Fixed-capacity queue for pending control frames.
+///
+/// Full means the connection is producing control frames faster than it can
+/// send them. What happens then depends on the frame, so callers choose:
+/// `push` is for frames that are safe to lose (PING, PATH_*, BLOCKED — each
+/// regenerated or superseded); frames the peer must eventually see go through
+/// `tryPush`, and their producer retries on a later pass when it fails.
+/// CONNECTION_CLOSE always gets in: one slot is held back for it.
 pub const PendingFrameQueue = struct {
     const capacity = @import("limits.zig").pending_frames;
 
     items: [capacity]PendingControlFrame = undefined,
     len: u8 = 0,
 
+    /// Queue `frame`, dropping it if the queue is full; see `tryPush`.
     pub fn push(self: *PendingFrameQueue, frame: PendingControlFrame) void {
+        _ = self.tryPush(frame);
+    }
+
+    /// Whether `n` new, unmerged frames would fit.
+    pub fn hasRoomFor(self: *const PendingFrameQueue, n: usize) bool {
+        return self.len + n < capacity;
+    }
+
+    /// Put back a frame just popped. Never fails: `pop` freed its slot.
+    pub fn requeue(self: *PendingFrameQueue, frame: PendingControlFrame) void {
+        if (self.tryPush(frame)) return;
+        if (self.len < capacity) {
+            self.items[self.len] = frame;
+            self.len += 1;
+        }
+    }
+
+    /// Queue `frame`, merging it into a queued frame of the same kind where
+    /// one exists. False if it did not fit.
+    pub fn tryPush(self: *PendingFrameQueue, frame: PendingControlFrame) bool {
         var i: u8 = 0;
         while (i < self.len) : (i += 1) {
             switch (frame) {
                 .ping => switch (self.items[i]) {
-                    .ping => return,
+                    .ping => return true,
                     else => {},
                 },
                 .immediate_ack => switch (self.items[i]) {
-                    .immediate_ack => return,
+                    .immediate_ack => return true,
                     else => {},
                 },
                 .max_data => |new_max| switch (self.items[i]) {
                     .max_data => |old_max| {
                         self.items[i] = .{ .max_data = @max(old_max, new_max) };
-                        return;
+                        return true;
                     },
                     else => {},
                 },
@@ -898,28 +933,28 @@ pub const PendingFrameQueue = struct {
                             .stream_id = new_msd.stream_id,
                             .max = @max(old_msd.max, new_msd.max),
                         } };
-                        return;
+                        return true;
                     },
                     else => {},
                 },
                 .max_streams_bidi => |new_max| switch (self.items[i]) {
                     .max_streams_bidi => |old_max| {
                         self.items[i] = .{ .max_streams_bidi = @max(old_max, new_max) };
-                        return;
+                        return true;
                     },
                     else => {},
                 },
                 .max_streams_uni => |new_max| switch (self.items[i]) {
                     .max_streams_uni => |old_max| {
                         self.items[i] = .{ .max_streams_uni = @max(old_max, new_max) };
-                        return;
+                        return true;
                     },
                     else => {},
                 },
                 .data_blocked => |new_limit| switch (self.items[i]) {
                     .data_blocked => |old_limit| {
                         self.items[i] = .{ .data_blocked = @max(old_limit, new_limit) };
-                        return;
+                        return true;
                     },
                     else => {},
                 },
@@ -929,31 +964,39 @@ pub const PendingFrameQueue = struct {
                             .stream_id = new_sdb.stream_id,
                             .limit = @max(old_sdb.limit, new_sdb.limit),
                         } };
-                        return;
+                        return true;
                     },
                     else => {},
                 },
                 .streams_blocked_bidi => |new_limit| switch (self.items[i]) {
                     .streams_blocked_bidi => |old_limit| {
                         self.items[i] = .{ .streams_blocked_bidi = @max(old_limit, new_limit) };
-                        return;
+                        return true;
                     },
                     else => {},
                 },
                 .streams_blocked_uni => |new_limit| switch (self.items[i]) {
                     .streams_blocked_uni => |old_limit| {
                         self.items[i] = .{ .streams_blocked_uni = @max(old_limit, new_limit) };
-                        return;
+                        return true;
                     },
                     else => {},
                 },
                 else => {},
             }
         }
-        if (self.len < capacity) {
+        const is_close = frame == .connection_close;
+        if (self.len < capacity - 1 or (is_close and self.len < capacity)) {
             self.items[self.len] = frame;
             self.len += 1;
+            return true;
         }
+        if (is_close) {
+            // Nothing queued matters once we are closing.
+            self.items[self.len - 1] = frame;
+            return true;
+        }
+        return false;
     }
 
     pub fn pop(self: *PendingFrameQueue) ?PendingControlFrame {
@@ -1029,6 +1072,26 @@ test "parse ack frame" {
             else => unreachable,
         }
     }
+}
+
+test "ACK ranges reaching below packet number 0 are FRAME_ENCODING_ERROR" {
+    // first_ack_range 11 below largest 10.
+    var first = [_]u8{ 0x02, 0x0a, 0x00, 0x00, 0x0b };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&first));
+
+    // [7,10], then a gap of 6 would put the next range's top at -1.
+    var gap = [_]u8{ 0x02, 0x0a, 0x00, 0x01, 0x03, 0x06, 0x00 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&gap));
+
+    // [7,10], gap 1 → next range tops at 4; a length of 5 reaches -1.
+    var len = [_]u8{ 0x02, 0x0a, 0x00, 0x01, 0x03, 0x01, 0x05 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&len));
+
+    // The same range ending exactly at 0 is fine.
+    var ok = [_]u8{ 0x02, 0x0a, 0x00, 0x01, 0x03, 0x01, 0x04 };
+    const f = try Frame.parse(&ok);
+    try std.testing.expectEqual(@as(u64, 0), f.ack.ack_ranges[0].start);
+    try std.testing.expectEqual(@as(u64, 4), f.ack.ack_ranges[0].end);
 }
 
 test "parse reset_stream frame" {
@@ -1473,4 +1536,22 @@ test "frame body longer than the datagram is rejected, not sliced" {
     // 0x07 NEW_TOKEN with a length past the end.
     var token_frame = [_]u8{ 0x07, 0x7f, 0xff, 0x01, 0x02 };
     try std.testing.expectError(error.FrameEncodingError, Frame.parse(&token_frame));
+}
+
+test "PendingFrameQueue: full refuses new frames but always admits CONNECTION_CLOSE" {
+    var q = PendingFrameQueue{};
+    var i: u64 = 0;
+    while (q.tryPush(.{ .reset_stream = .{ .stream_id = i * 4, .error_code = 0, .final_size = 0 } })) i += 1;
+    try std.testing.expect(!q.hasRoomFor(1));
+    try std.testing.expect(!q.tryPush(.{ .stop_sending = .{ .stream_id = 1, .error_code = 0 } }));
+
+    // The reserved slot, then eviction: a close is never lost.
+    try std.testing.expect(q.tryPush(.{ .connection_close = .{ .error_code = 1, .frame_type = 0, .is_app = false } }));
+    try std.testing.expect(q.tryPush(.{ .connection_close = .{ .error_code = 2, .frame_type = 0, .is_app = false } }));
+    try std.testing.expect(q.items[q.len - 1] == .connection_close);
+
+    // A popped frame can always be put back.
+    const f = q.pop().?;
+    q.requeue(f);
+    try std.testing.expectEqual(@as(usize, @import("limits.zig").pending_frames), q.len);
 }
