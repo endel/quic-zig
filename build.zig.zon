@@ -2,9 +2,10 @@
     .name = .quic,
     .version = "0.5.0",
     .dependencies = .{
+        // mitchellh/libxev a82a04e plus a kqueue rearm fix (kqueue-rearm-state).
         .libxev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/a82a04eabb46.tar.gz",
-            .hash = "libxev-0.0.0-86vtcwIRFACVrx54GaHsMFFlyC4dTi0tcVh10V7btRUc",
+            .url = "https://github.com/endel/libxev/archive/1d5bbf18d1d67b1a54220a75d393e2102914db2b.tar.gz",
+            .hash = "libxev-0.0.0-86vtc8EXFAD0au-BBhmfB5tUmmHcMI5NM9AMK4G_bqGF",
         },
     },
     .fingerprint = 0xc079525234abfc4c,
