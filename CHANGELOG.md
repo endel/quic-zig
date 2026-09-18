@@ -63,6 +63,10 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- On macOS/BSD, a busy event loop could log "invalid state in submission queue"
+  and lose or double-queue a socket event. libxev now comes from the
+  [endel/libxev](https://github.com/endel/libxev/tree/kqueue-rearm-state) fork,
+  which carries the kqueue fix.
 - Stateless resets now work in both directions: a client whose server lost the
   connection (after an idle timeout or restart) stops sending and closes instead of
   retransmitting until its own timeout, and a server drops a connection its
