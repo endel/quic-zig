@@ -2071,8 +2071,11 @@ pub const Connection = struct {
                     try self.recvStreamFrame(&strm.recv, s.offset, s.data, s.fin);
                     if (s.fin) self.streams.needs_gc_scan = true;
 
-                    // Check if stream is fully closed (both directions done)
-                    if (s.fin and (strm.send.fin_sent or strm.send.reset_err != null) and !strm.closed_for_gc) {
+                    // Closed once both directions are done; with the FIN ahead
+                    // of a hole, that is when the frame filling it lands.
+                    if (strm.recv.fin_received and strm.recv.allReceived() and
+                        (strm.send.fin_sent or strm.send.reset_err != null) and !strm.closed_for_gc)
+                    {
                         strm.closed_for_gc = true;
                         self.streams.closeStream(s.stream_id);
                         self.streams.disposeIfSettled(strm);
@@ -6120,6 +6123,40 @@ test "a closed bidi stream is reclaimed when its last byte is acked after the cl
     try std.testing.expect(conn.streams.getStream(0) != null);
 
     try ackPacket(&conn, pn);
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(conn.streams.getStream(0) == null);
+}
+
+test "a bidi stream whose FIN arrives ahead of a hole outlives our acked FIN" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    // The request's tail and FIN overtake its head.
+    var tail = "world".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 5, .length = tail.len, .data = &tail, .fin = true } }, .application, 0);
+    const s = conn.streams.getStream(0).?;
+    try s.send.writeData("response");
+    s.send.close();
+    const pn = try sendStreamFrameOf(&conn, &s.send);
+    try ackPacket(&conn, pn);
+    conn.queueFlowControlUpdates();
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(!s.closed_for_gc);
+    try std.testing.expect(conn.streams.getStream(0) != null);
+
+    // The head's retransmission still finds the stream, and completes it.
+    var head = "hello".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = head.len, .data = &head, .fin = false } }, .application, 0);
+    try std.testing.expect(s.closed_for_gc);
+    var body: [10]u8 = undefined;
+    var n: usize = 0;
+    while (s.recv.read()) |d| {
+        @memcpy(body[n..][0..d.len], d);
+        n += d.len;
+        std.testing.allocator.free(d);
+    }
+    try std.testing.expectEqualStrings("helloworld", body[0..n]);
     conn.streams.drainDisposalQueue();
     try std.testing.expect(conn.streams.getStream(0) == null);
 }

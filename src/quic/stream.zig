@@ -386,6 +386,12 @@ pub const FrameSorter = struct {
     }
 
     /// Check if all data has been received (FIN reached and all data consumed).
+    /// Every byte up to the final size has arrived, read or not.
+    pub fn isFullyReceived(self: *const FrameSorter) bool {
+        const fin = self.fin_offset orelse return false;
+        return self.holes() == 0 and self.highestReceived() >= fin;
+    }
+
     pub fn isComplete(self: *const FrameSorter) bool {
         if (self.fin_offset) |fin| {
             return self.read_pos >= fin;
@@ -506,6 +512,13 @@ pub const ReceiveStream = struct {
             self.finished = true;
         }
         return data;
+    }
+
+    /// The peer can send nothing more: the FIN and every byte before it have
+    /// arrived. A FIN alone is not enough while a hole before it is open —
+    /// the retransmission filling it still has to find the stream.
+    pub fn allReceived(self: *const ReceiveStream) bool {
+        return self.finished or (self.reset_err == null and self.sorter.isFullyReceived());
     }
 
     /// Bytes the consumer has read and let go of.
@@ -1636,7 +1649,7 @@ pub const StreamsMap = struct {
         var it = self.streams.iterator();
         while (it.next()) |kv| {
             const s = kv.value_ptr.*;
-            if (!s.closed_for_gc and (s.recv.finished or s.recv.fin_received) and s.send.fin_sent) {
+            if (!s.closed_for_gc and s.recv.allReceived() and s.send.fin_sent) {
                 s.closed_for_gc = true;
                 self.closeStream(s.stream_id);
             }
@@ -2924,7 +2937,7 @@ test "collectClosedStreams: marks a stream once both FINs have crossed" {
     try testing.expectEqual(@as(u64, 1), sm.open_bidi_streams);
 
     s.send.fin_sent = true;
-    s.recv.fin_received = true;
+    try s.recv.handleStreamFrame(0, "", true);
 
     sm.needs_gc_scan = true;
     sm.collectClosedStreams();
@@ -2933,6 +2946,39 @@ test "collectClosedStreams: marks a stream once both FINs have crossed" {
     // Locally initiated, so the open count drops but nothing is consumed.
     try testing.expectEqual(@as(u64, 0), sm.open_bidi_streams);
     try testing.expectEqual(@as(u64, 0), sm.consumed_bidi_streams);
+}
+
+test "collectClosedStreams: a FIN ahead of a hole keeps the stream until the hole fills" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.getOrCreateStream(0);
+    s.send.fin_sent = true;
+    try s.recv.handleStreamFrame(5, "world", true);
+    try testing.expect(!s.recv.allReceived());
+
+    sm.needs_gc_scan = true;
+    sm.collectClosedStreams();
+    sm.drainDisposalQueue();
+    try testing.expect(!s.closed_for_gc);
+    try testing.expect(sm.streams.get(0) != null);
+    try testing.expectEqual(@as(u64, 0), sm.consumed_bidi_streams);
+
+    try s.recv.handleStreamFrame(0, "hello", false);
+    try testing.expect(s.recv.allReceived());
+    sm.collectClosedStreams();
+    try testing.expect(s.closed_for_gc);
+    try testing.expectEqual(@as(u64, 1), sm.consumed_bidi_streams);
+
+    var body: [10]u8 = undefined;
+    var n: usize = 0;
+    while (s.recv.read()) |d| {
+        @memcpy(body[n..][0..d.len], d);
+        n += d.len;
+        testing.allocator.free(d);
+    }
+    try testing.expectEqualStrings("helloworld", body[0..n]);
 }
 
 test "collectClosedStreams: keeps an unacked stream for PTO" {
@@ -2944,7 +2990,7 @@ test "collectClosedStreams: keeps an unacked stream for PTO" {
     try s.send.writeData("x" ** 1000);
     s.send.send_offset = 1000;
     s.send.fin_sent = true;
-    s.recv.fin_received = true;
+    try s.recv.handleStreamFrame(0, "", true);
 
     sm.needs_gc_scan = true;
     sm.collectClosedStreams();
@@ -2965,7 +3011,7 @@ test "disposeIfSettled: reclaims a closed stream once the last byte is acked" {
     try s.send.writeData("x" ** 100);
     s.send.send_offset = 100;
     s.send.fin_sent = true;
-    s.recv.fin_received = true;
+    try s.recv.handleStreamFrame(0, "", true);
 
     sm.needs_gc_scan = true;
     sm.collectClosedStreams();
@@ -2989,7 +3035,7 @@ test "disposeIfSettled: queues each stream once" {
 
     const s = try sm.openBidiStream();
     s.send.fin_sent = true;
-    s.recv.fin_received = true;
+    try s.recv.handleStreamFrame(0, "", true);
     s.closed_for_gc = true;
 
     sm.disposeIfSettled(s);
@@ -3062,7 +3108,7 @@ test "collectClosedStreams: picks up streams the disposal queue could not hold" 
     for (0..overflow) |_| {
         const s = try sm.openBidiStream();
         s.send.fin_sent = true;
-        s.recv.fin_received = true;
+        try s.recv.handleStreamFrame(0, "", true);
     }
 
     sm.needs_gc_scan = true;
@@ -3088,7 +3134,7 @@ test "StreamsMap: a caller that never drains does not keep the GC scan armed" {
     for (0..sm.disposal_queue.len + 1) |_| {
         const s = try sm.openBidiStream();
         s.send.fin_sent = true;
-        s.recv.fin_received = true;
+        try s.recv.handleStreamFrame(0, "", true);
     }
 
     // Two scans with no drain in between: everything settled, the queue is
@@ -3107,7 +3153,7 @@ test "getOrCreateStream: a reclaimed stream is not resurrected by a retransmit" 
 
     const s = try sm.getOrCreateStream(0);
     s.send.fin_sent = true;
-    s.recv.fin_received = true;
+    try s.recv.handleStreamFrame(0, "", true);
     s.closed_for_gc = true;
     sm.disposeIfSettled(s);
     sm.drainDisposalQueue();
