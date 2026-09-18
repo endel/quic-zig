@@ -1476,6 +1476,13 @@ pub const StreamsMap = struct {
         return self.send_streams.get(stream_id);
     }
 
+    /// The receive half of any stream we can receive on: a bidi stream, or
+    /// the peer's uni.
+    pub fn getRecvStream(self: *const StreamsMap, stream_id: u64) ?*ReceiveStream {
+        if (self.streams.get(stream_id)) |s| return &s.recv;
+        return self.recv_streams.get(stream_id);
+    }
+
     /// Bytes written to every stream that will spend connection credit.
     pub fn committedSendBytes(self: *const StreamsMap) u64 {
         const l = self.send_ledger orelse return 0;

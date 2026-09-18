@@ -1555,41 +1555,25 @@ pub fn Server(comptime Handler: type) type {
             ids.ensureTotalCapacity(self.allocator, conn.streams.streams.count() + conn.streams.recv_streams.count()) catch return;
             var key_it = conn.streams.streams.keyIterator();
             while (key_it.next()) |k| ids.appendAssumeCapacity(k.*);
-            const bidi_count = ids.items.len;
             var recv_key_it = conn.streams.recv_streams.keyIterator();
             while (recv_key_it.next()) |k| ids.appendAssumeCapacity(k.*);
 
             // Looked up again each time: the handler may have closed it.
-            for (ids.items[0..bidi_count]) |stream_id| {
-                while (conn.streams.streams.get(stream_id)) |stream| {
-                    const data = stream.recv.read() orelse break;
-                    const fin = stream.recv.finished;
-                    if (fin) entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
-                    self.dispatchStreamData(&session, stream_id, data, fin);
-                    self.allocator.free(data);
-                }
-                const stream = conn.streams.streams.get(stream_id) orelse continue;
-                if (stream.recv.finished and !entry.finished_streams.contains(stream_id)) {
-                    entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
-                    self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
-                }
-            }
-
-            // Peer-initiated unidirectional receive streams.
-            for (ids.items[bidi_count..]) |stream_id| {
-                while (conn.streams.recv_streams.get(stream_id)) |rs| {
+            for (ids.items) |stream_id| {
+                while (conn.streams.getRecvStream(stream_id)) |rs| {
                     const data = rs.read() orelse break;
                     const fin = rs.finished;
                     if (fin) entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
                     self.allocator.free(data);
                 }
-                const rs = conn.streams.recv_streams.get(stream_id) orelse continue;
+                const rs = conn.streams.getRecvStream(stream_id) orelse continue;
                 if (rs.finished and !entry.finished_streams.contains(stream_id)) {
                     entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
                 }
-                if (rs.finished) conn.streams.releaseRecvStream(stream_id);
+                // A peer's uni stream has no send side left to wait on.
+                if (rs.finished and !stream_mod.isBidi(stream_id)) conn.streams.releaseRecvStream(stream_id);
             }
         }
 
@@ -2923,40 +2907,23 @@ pub fn Client(comptime Handler: type) type {
             ids.ensureTotalCapacity(self.allocator, conn.streams.streams.count() + conn.streams.recv_streams.count()) catch return;
             var key_it = conn.streams.streams.keyIterator();
             while (key_it.next()) |k| ids.appendAssumeCapacity(k.*);
-            const bidi_count = ids.items.len;
             var recv_key_it = conn.streams.recv_streams.keyIterator();
             while (recv_key_it.next()) |k| ids.appendAssumeCapacity(k.*);
 
-            for (ids.items[0..bidi_count]) |stream_id| {
-                while (conn.streams.streams.get(stream_id)) |stream| {
-                    const data = stream.recv.read() orelse break;
-                    const fin = stream.recv.finished;
-                    if (fin) self.finished_streams.put(stream_id, {}) catch {};
-                    self.dispatchStreamData(&session, stream_id, data, fin);
-                    self.allocator.free(data);
-                }
-                const stream = conn.streams.streams.get(stream_id) orelse continue;
-                if (stream.recv.finished and !self.finished_streams.contains(stream_id)) {
-                    self.finished_streams.put(stream_id, {}) catch {};
-                    self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
-                }
-            }
-
-            // Peer-initiated unidirectional receive streams.
-            for (ids.items[bidi_count..]) |stream_id| {
-                while (conn.streams.recv_streams.get(stream_id)) |rs| {
+            for (ids.items) |stream_id| {
+                while (conn.streams.getRecvStream(stream_id)) |rs| {
                     const data = rs.read() orelse break;
                     const fin = rs.finished;
                     if (fin) self.finished_streams.put(stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
                     self.allocator.free(data);
                 }
-                const rs = conn.streams.recv_streams.get(stream_id) orelse continue;
+                const rs = conn.streams.getRecvStream(stream_id) orelse continue;
                 if (rs.finished and !self.finished_streams.contains(stream_id)) {
                     self.finished_streams.put(stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
                 }
-                if (rs.finished) conn.streams.releaseRecvStream(stream_id);
+                if (rs.finished and !stream_mod.isBidi(stream_id)) conn.streams.releaseRecvStream(stream_id);
             }
         }
 

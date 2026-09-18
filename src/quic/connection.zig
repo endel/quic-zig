@@ -2140,17 +2140,9 @@ pub const Connection = struct {
                 // Same logic for per-stream credit. For bidi streams, the
                 // receive side carries the limit we advertise to the peer.
                 self.queueFlowControlUpdates();
-                if (self.streams.getStream(blocked.stream_id)) |s| {
-                    const current = s.recv.receive_window;
-                    if (s.recv.receive_window_size > 0 and current > blocked.limit) {
-                        self.pending_frames.push(.{ .max_stream_data = .{
-                            .stream_id = blocked.stream_id,
-                            .max = current,
-                        } });
-                    }
-                } else if (self.streams.recv_streams.get(blocked.stream_id)) |s| {
-                    const current = s.receive_window;
-                    if (s.receive_window_size > 0 and current > blocked.limit) {
+                if (self.streams.getRecvStream(blocked.stream_id)) |rs| {
+                    const current = rs.receive_window;
+                    if (rs.receive_window_size > 0 and current > blocked.limit) {
                         self.pending_frames.push(.{ .max_stream_data = .{
                             .stream_id = blocked.stream_id,
                             .max = current,
@@ -3192,10 +3184,7 @@ pub const Connection = struct {
             const frame: frame_mod.PendingControlFrame = switch (cf) {
                 .max_data => .{ .max_data = self.conn_flow_ctrl.base.receive_window },
                 .max_stream_data => |id| blk: {
-                    const rs: *stream_mod.ReceiveStream = if (self.streams.getStream(id)) |st|
-                        &st.recv
-                    else
-                        self.streams.recv_streams.get(id) orelse continue;
+                    const rs = self.streams.getRecvStream(id) orelse continue;
                     // The final size is known: no more credit is needed.
                     if (rs.receive_window_size == 0 or rs.sorter.fin_offset != null) continue;
                     break :blk .{ .max_stream_data = .{ .stream_id = id, .max = rs.receive_window } };
@@ -3217,23 +3206,14 @@ pub const Connection = struct {
                 // Rebuilt from the record: a reset uni stream is already gone.
                 .reset_stream => |r| .{ .reset_stream = .{ .stream_id = r.stream_id, .error_code = r.error_code, .final_size = r.final_size } },
                 .stop_sending => |ss| blk: {
-                    const rs: *stream_mod.ReceiveStream = if (self.streams.getStream(ss.stream_id)) |st|
-                        &st.recv
-                    else
-                        self.streams.recv_streams.get(ss.stream_id) orelse continue;
+                    const rs = self.streams.getRecvStream(ss.stream_id) orelse continue;
                     // Data Recvd or Reset Recvd: the request is moot.
                     if (rs.reset_err != null or rs.sorter.fin_offset != null) continue;
                     break :blk .{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = ss.error_code } };
                 },
                 .new_connection_id => |seq| blk: {
                     for (&self.local_cid_pool.entries) |*e| {
-                        if (e.occupied and !e.retired and e.seq_num == seq) break :blk .{ .new_connection_id = .{
-                            .seq_num = e.seq_num,
-                            .retire_prior_to = self.local_cid_pool.retire_prior_to,
-                            .cid_buf = e.cid_buf,
-                            .cid_len = e.cid_len,
-                            .stateless_reset_token = e.stateless_reset_token,
-                        } };
+                        if (e.occupied and !e.retired and e.seq_num == seq) break :blk self.newConnectionIdFrame(e);
                     }
                     continue;
                 },
