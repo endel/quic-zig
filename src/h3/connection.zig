@@ -308,31 +308,12 @@ pub const H3Connection = struct {
     /// Opens a bidi stream, sends HEADERS with :method=CONNECT, :protocol, etc.
     /// Does NOT close the stream — session lifetime = stream lifetime.
     pub fn sendConnectRequest(self: *H3Connection, protocol_name: []const u8, authority: []const u8, path: []const u8) !u64 {
-        // RFC 9114 §5.2: must not initiate requests on streams >= peer's GOAWAY ID
-        if (self.peer_goaway_id) |goaway_id| {
-            if (self.quic_conn.streams.next_bidi_stream_id >= goaway_id) {
-                return error.H3RequestRejected;
-            }
-        }
-        const stream = try self.quic_conn.openStream();
-        const stream_id = stream.stream_id;
-
-        const req_headers = [_]qpack.Header{
-            .{ .name = ":method", .value = "CONNECT" },
-            .{ .name = ":protocol", .value = protocol_name },
-            .{ .name = ":scheme", .value = "https" },
-            .{ .name = ":authority", .value = authority },
-            .{ .name = ":path", .value = path },
-        };
-
-        try self.writeHeadersFrame(&stream.send, &req_headers);
-
-        // Do NOT close the stream — session stays open
-        return stream_id;
+        return self.sendConnectRequestWithHeaders(protocol_name, authority, path, &.{});
     }
 
     /// Send a CONNECT request with additional headers (client-side, RFC 9220).
     pub fn sendConnectRequestWithHeaders(self: *H3Connection, protocol_name: []const u8, authority: []const u8, path: []const u8, extra_headers: []const qpack.Header) !u64 {
+        // RFC 9114 §5.2: must not initiate requests on streams >= peer's GOAWAY ID
         if (self.peer_goaway_id) |goaway_id| {
             if (self.quic_conn.streams.next_bidi_stream_id >= goaway_id) {
                 return error.H3RequestRejected;
@@ -359,16 +340,7 @@ pub const H3Connection = struct {
     /// Send a CONNECT response (server-side, RFC 9220).
     /// Sends :status response HEADERS, does NOT close the stream.
     pub fn sendConnectResponse(self: *H3Connection, stream_id: u64, status: []const u8) !void {
-        const stream = self.quic_conn.streams.getStream(stream_id) orelse return error.StreamNotFound;
-
-        const resp_headers = [_]qpack.Header{
-            .{ .name = ":status", .value = status },
-        };
-
-        try self.writeHeadersFrame(&stream.send, &resp_headers);
-        try self.response_states.put(self.allocator, stream_id, .final);
-
-        // Do NOT close the stream — session stays open
+        return self.sendConnectResponseWithHeaders(stream_id, status, &.{});
     }
 
     /// Send a CONNECT response with additional headers (server-side, RFC 9220).
