@@ -25,7 +25,7 @@
 | **5** | **Connections** | | |
 | 5.1 | Connection ID | ✅ Done | LocalCidPool + ConnectionIdPool. A client's zero-length SCID is accepted (Safari sends one); only a short header is refused as a connection's first packet |
 | 5.1.1 | Issuing Connection IDs | ✅ Done | NEW_CONNECTION_ID with stateless reset tokens |
-| 5.1.2 | Consuming and Retiring CIDs | ✅ Done | RETIRE_CONNECTION_ID, retire_prior_to |
+| 5.1.2 | Consuming and Retiring CIDs | ✅ Done | RETIRE_CONNECTION_ID, retire_prior_to. Only held CIDs are retired; more than 2× `active_connection_id_limit` unacked retirements is CONNECTION_ID_LIMIT_ERROR |
 | 5.2 | Matching Packets to Connections | ✅ Done | CID-based routing via ConnectionManager |
 | 5.2.1 | Client Packet Handling | ✅ Done | DCID matching |
 | 5.2.2 | Server Packet Handling | ✅ Done | Multi-connection demux via CID→ConnEntry HashMap. A new connection needs a ≥1200-byte datagram and a ≥8-byte DCID; past `max_connections` (or while draining) the client gets CONNECTION_REFUSED in an Initial, rate-limited |

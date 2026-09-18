@@ -181,6 +181,13 @@ pub const ConnectionIdPool = struct {
         }
     }
 
+    pub fn contains(self: *const ConnectionIdPool, seq: u64) bool {
+        for (&self.entries) |*entry| {
+            if (entry.occupied and entry.seq_num == seq) return true;
+        }
+        return false;
+    }
+
     pub fn removeBySeq(self: *ConnectionIdPool, seq: u64) void {
         for (&self.entries) |*entry| {
             if (entry.occupied and entry.seq_num == seq) {
@@ -621,6 +628,11 @@ pub const Connection = struct {
 
     // Pool of peer-issued connection IDs for migration
     peer_cid_pool: ConnectionIdPool = .{},
+    /// Sequence numbers we have sent RETIRE_CONNECTION_ID for and the peer
+    /// has not yet acknowledged. Capped at twice our
+    /// active_connection_id_limit; a peer pushing past it gets
+    /// CONNECTION_ID_LIMIT_ERROR.
+    retiring_cids: std.ArrayListUnmanaged(u64) = .empty,
 
     // Pool of locally-issued connection IDs (RFC 9000 §5.1)
     local_cid_pool: LocalCidPool = .{},
@@ -984,6 +996,7 @@ pub const Connection = struct {
         self.datagram_recv_queue.deinitQueue();
         self.datagram_send_queue.deinitQueue();
         self.control_retry.deinit(self.allocator);
+        self.retiring_cids.deinit(self.allocator);
     }
 
     /// Handle a Version Negotiation packet (RFC 9000 §6.2, client only).
@@ -1608,6 +1621,10 @@ pub const Connection = struct {
                     }
 
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent);
+                    for (pkt.getControlFrames()) |cf| switch (cf) {
+                        .retire_connection_id => |seq| self.onRetireCidAcked(seq),
+                        else => {},
+                    };
 
                     // Update stream ack_offset for ACKed stream frames
                     for (pkt.getStreamFrames()) |sf| {
@@ -1744,6 +1761,10 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
                     }
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent);
+                    for (pkt.getControlFrames()) |cf| switch (cf) {
+                        .retire_connection_id => |seq| self.onRetireCidAcked(seq),
+                        else => {},
+                    };
 
                     // Stop including HANDSHAKE_DONE once a packet containing it is ACKed
                     if (pkt.has_handshake_done) {
@@ -2206,15 +2227,30 @@ pub const Connection = struct {
                     self.peer_max_cid_seq = ncid.seq_num;
                 }
 
-                // Retire old CIDs as requested by peer
+                // RFC 9000 19.15: a CID arriving already below Retire Prior To
+                // is retired straight away, never used.
+                if (ncid.seq_num < self.active_cid_seq) {
+                    try self.retirePeerCid(ncid.seq_num);
+                    return;
+                }
+
+                // Retire only the CIDs we actually hold: the jump itself can
+                // be as large as 2^62.
                 if (ncid.retire_prior_to > self.active_cid_seq) {
-                    var seq = self.active_cid_seq;
-                    while (seq < ncid.retire_prior_to) : (seq += 1) {
-                        self.pushReliable(.{ .retire_connection_id = seq });
+                    if (self.active_cid_seq == 0 and !self.peer_cid_pool.contains(0)) {
+                        try self.retirePeerCid(0); // the handshake DCID, never pooled on this side
+                    }
+                    for (&self.peer_cid_pool.entries) |*entry| {
+                        if (entry.occupied and entry.seq_num < ncid.retire_prior_to) {
+                            try self.retirePeerCid(entry.seq_num);
+                        }
                     }
                     self.active_cid_seq = ncid.retire_prior_to;
                     self.peer_cid_pool.retirePriorTo(ncid.retire_prior_to);
                 }
+
+                // A retransmitted frame repeats a CID we already hold.
+                if (self.peer_cid_pool.contains(ncid.seq_num)) return;
 
                 // Store CID in pool for future migration use
                 self.peer_cid_pool.addPeerCid(ncid.seq_num, ncid.conn_id, ncid.stateless_reset_token);
@@ -3024,9 +3060,15 @@ pub const Connection = struct {
     /// Check if connection-level flow control needs a MAX_DATA or MAX_STREAMS update.
     fn queueFlowControlUpdates(self: *Connection) void {
         // Frames that found the queue full last time go first.
-        while (self.control_retry.items.len > 0) {
-            if (!self.pending_frames.tryPush(self.control_retry.items[0])) break;
-            _ = self.control_retry.orderedRemove(0);
+        var moved: usize = 0;
+        for (self.control_retry.items) |f| {
+            if (!self.pending_frames.tryPush(f)) break;
+            moved += 1;
+        }
+        if (moved > 0) {
+            const rest = self.control_retry.items[moved..];
+            std.mem.copyForwards(frame_mod.PendingControlFrame, self.control_retry.items[0..rest.len], rest);
+            self.control_retry.shrinkRetainingCapacity(rest.len);
         }
 
         // Garbage-collect fully-closed bidi streams so consumed count advances
@@ -3123,6 +3165,29 @@ pub const Connection = struct {
             std.log.warn("control frame {s} dropped: out of memory", .{@tagName(frame)});
     }
 
+    /// Queue RETIRE_CONNECTION_ID for a peer CID, tracking it until acked.
+    /// RFC 9000 5.1.2 lets us bound retirements in flight: past twice our
+    /// active_connection_id_limit the peer is closed with
+    /// CONNECTION_ID_LIMIT_ERROR, as quic-go and quinn do.
+    fn retirePeerCid(self: *Connection, seq: u64) error{ProtocolViolation}!void {
+        if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq) != null) return;
+        if (self.retiring_cids.items.len >= 2 * self.local_params.active_connection_id_limit) {
+            self.closeWithTransportError(@intFromEnum(TransportError.connection_id_limit_error), @intFromEnum(FrameType.new_connection_id), "too many connection IDs pending retirement");
+            return error.ProtocolViolation;
+        }
+        self.retiring_cids.append(self.allocator, seq) catch {
+            self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.new_connection_id), "out of memory");
+            return error.ProtocolViolation;
+        };
+        self.pushReliable(.{ .retire_connection_id = seq });
+    }
+
+    fn onRetireCidAcked(self: *Connection, seq: u64) void {
+        if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq)) |i| {
+            _ = self.retiring_cids.swapRemove(i);
+        }
+    }
+
     /// RFC 9000 13.3: what a lost packet's control frames become. Credit is
     /// resent at its current value, not the one lost; anything the stream
     /// no longer needs is not resent at all.
@@ -3176,7 +3241,10 @@ pub const Connection = struct {
                     }
                     continue;
                 },
-                .retire_connection_id => |seq| .{ .retire_connection_id = seq },
+                .retire_connection_id => |seq| if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq) != null)
+                    .{ .retire_connection_id = seq }
+                else
+                    continue,
                 .new_token => self.newTokenFrame() orelse continue,
             };
             self.pushReliable(frame);
@@ -6442,4 +6510,44 @@ test "a full window of unread in-order data is not mistaken for reassembly gaps"
         try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = i * payload.len, .length = payload.len, .fin = false, .data = &payload } }, .application, 0);
     }
     try std.testing.expect(conn.local_err == null);
+}
+
+test "NEW_CONNECTION_ID: a huge Retire Prior To retires only the CIDs we hold" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    var cid = [_]u8{0xab} ** 8;
+    const top: u64 = (1 << 62) - 1;
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = top, .retire_prior_to = top, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    try std.testing.expect(conn.local_err == null);
+    try std.testing.expectEqual(top, conn.active_cid_seq);
+    // Only the handshake DCID (seq 0) was ever issued to us.
+    try std.testing.expectEqualSlices(u64, &.{0}, conn.retiring_cids.items);
+    try std.testing.expectEqual(@as(usize, 0), conn.control_retry.items.len);
+    try std.testing.expectEqual(@as(u8, 1), conn.pending_frames.len);
+    try std.testing.expect(conn.peer_cid_pool.contains(top));
+}
+
+test "NEW_CONNECTION_ID: unacked retirements past twice the limit close the connection" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    var cid = [_]u8{0xab} ** 8;
+    const limit = conn.local_params.active_connection_id_limit;
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 100, .retire_prior_to = 100, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    // Late CIDs below Retire Prior To are retired on arrival; a retransmit
+    // of one is not retired twice.
+    var seq: u64 = 1;
+    while (seq < 2 * limit) : (seq += 1) {
+        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    }
+    try std.testing.expect(conn.local_err == null);
+    try std.testing.expectEqual(@as(usize, @intCast(2 * limit)), conn.retiring_cids.items.len);
+
+    // An ACK frees a slot.
+    conn.onRetireCidAcked(0);
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 50, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    try std.testing.expect(conn.local_err == null);
+
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 51, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.connection_id_limit_error)), conn.local_err.?.code);
 }
