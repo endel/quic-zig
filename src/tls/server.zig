@@ -69,7 +69,8 @@ pub const Config = struct {
     /// rotating it invalidates outstanding tickets. Tickets are bound to the
     /// SNI they were issued under.
     ticket_key: ?[16]u8 = null,
-    /// How long a ticket stays valid, in seconds (RFC 8446 caps it at 7 days).
+    /// How long a ticket stays valid, in seconds. RFC 8446 caps it at 7 days,
+    /// and a longer value is clamped to that.
     ticket_lifetime_s: u32 = 24 * 3600,
 };
 
@@ -101,6 +102,9 @@ const max_handshake_msg = 1 << 16;
 const key_update_after: u64 = 1 << 23;
 // Budget for skipping 0-RTT records we never agreed to (RFC 8446 §4.2.10).
 const early_data_skip_budget: usize = 1 << 16;
+
+/// RFC 8446 §4.6.1: a client rejects a ticket that claims to live longer.
+const max_ticket_lifetime_s: u32 = 7 * 24 * 3600;
 
 const hs_client_hello: u8 = @intFromEnum(tls.HandshakeType.client_hello);
 const hs_server_hello: u8 = @intFromEnum(tls.HandshakeType.server_hello);
@@ -829,7 +833,8 @@ pub const Conn = struct {
         self.early_data_skip = 0;
         self.state = .connected;
 
-        if (self.config.ticket_key) |key| try self.sendTicket(key);
+        // Nothing may follow our close_notify.
+        if (self.config.ticket_key) |key| if (!self.close_sent) try self.sendTicket(key);
         crypto.secureZero(u8, &self.master_secret);
     }
 
@@ -862,7 +867,7 @@ pub const Conn = struct {
         var b: Builder = .{ .list = &self.hs_out, .gpa = self.allocator };
         try b.u8_(hs_new_session_ticket);
         const msg = try b.begin(u24);
-        try b.bytes(&mem.toBytes(mem.nativeToBig(u32, self.config.ticket_lifetime_s)));
+        try b.bytes(&mem.toBytes(mem.nativeToBig(u32, self.ticketLifetime())));
         try b.bytes(&age_add);
         try b.u8_(nonce.len);
         try b.bytes(&nonce);
@@ -872,6 +877,10 @@ pub const Conn = struct {
         try b.end(u24, msg);
         try self.writeProtected(.handshake, self.hs_out.items);
         self.hs_out.clearRetainingCapacity();
+    }
+
+    fn ticketLifetime(self: *const Conn) u32 {
+        return @min(self.config.ticket_lifetime_s, max_ticket_lifetime_s);
     }
 
     const Resumption = struct { psk: Secret, index: u16 };
@@ -893,7 +902,7 @@ pub const Conn = struct {
             t = openTicket(key, identity, &plain) orelse continue;
             if (hashLen(t.suite) != hashLen(self.suite)) continue;
             const now = sys.realtimeSeconds();
-            if (now < t.issued_s or now - t.issued_s > self.config.ticket_lifetime_s) continue;
+            if (now < t.issued_s or now - t.issued_s > self.ticketLifetime()) continue;
             if (!std.ascii.eqlIgnoreCase(t.server_name, ch.server_name orelse "")) continue;
             break;
         }
@@ -1784,6 +1793,7 @@ const MiniClient = struct {
     resuming: bool = false,
     master: Secret = @splat(0),
     received: ?ClientTicket = null,
+    ticket_lifetime: u32 = 0,
     app_data: std.ArrayList(u8) = .empty,
     alert: ?tls.Alert.Description = null,
     server_closed: bool = false,
@@ -2112,7 +2122,7 @@ const MiniClient = struct {
             },
             hs_key_update => c.read_keys = c.read_keys.?.next(c.suite),
             hs_new_session_ticket => {
-                _ = try p.int(u32); // lifetime
+                c.ticket_lifetime = try p.int(u32);
                 _ = try p.int(u32); // age_add
                 const nonce = try p.vec(u8);
                 const ticket = try p.vec(u16);
@@ -2551,6 +2561,37 @@ test "0-RTT the client sends anyway is skipped, before and after HelloRetryReque
         // Once the handshake is done, the same record is an error.
         try testing.expectError(error.BadRecordMac, conn.feed(&junk));
     }
+}
+
+test "no ticket follows our close_notify" {
+    var certs: TestCerts = undefined;
+    try certs.load();
+    const config: Config = .{ .certs = &certs.entries, .ticket_key = @splat(7) };
+    var conn = Conn.init(testing.allocator, &config);
+    defer conn.deinit();
+    var client: MiniClient = .{ .gpa = testing.allocator };
+    defer client.deinit();
+    client.generateKeys();
+    try client.clientHello(&client.ch1, null);
+    try client.sendPlain(&conn, ct_handshake, client.ch1.items);
+    conn.close();
+    try client.pump(&conn);
+    try testing.expect(client.server_closed);
+    try testing.expect(client.received == null);
+}
+
+test "a ticket lifetime past seven days is clamped" {
+    var certs: TestCerts = undefined;
+    try certs.load();
+    const config: Config = .{ .certs = &certs.entries, .ticket_key = @splat(7), .ticket_lifetime_s = 30 * 24 * 3600 };
+    var conn = Conn.init(testing.allocator, &config);
+    defer conn.deinit();
+    var client: MiniClient = .{ .gpa = testing.allocator };
+    defer client.deinit();
+    try client.handshake(&conn);
+    try client.pump(&conn);
+    try testing.expect(client.received != null);
+    try testing.expectEqual(max_ticket_lifetime_s, client.ticket_lifetime);
 }
 
 test "a certificate chain larger than one record" {
