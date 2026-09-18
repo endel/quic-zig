@@ -66,6 +66,14 @@ Initial ACK, and after that it sends only 1-RTT. The runner therefore reads
 the whole trace as an unfinished handshake. The `e09f4c5` server produces the same
 pcap and the same verdict.
 
+### Rerun at `362905b` (review fixes)
+Every cell matched except two, and both flake on `4988228` as well:
+
+    zerortt      quic-go<-quic-zig   one failure at 5 060 bytes of 1-RTT against a 5 000 limit;
+                                     reruns pass 5/5 here (3.2–3.7 KB) and 5/5 on 4988228 (2.6–3.5 KB)
+    rebind-port  quic-zig<-quic-go   fails 2 of 14 here and 2 of 13 on 4988228, each time with the
+                                     first rebind landing mid-handshake (see below)
+
 ## A caution about this table
 
 The binaries under test must be cross-compiled by
