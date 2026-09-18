@@ -496,7 +496,7 @@ pub const Session = struct {
         const h3c = self.entry.h3_conn orelse return false;
         const wtc = self.entry.wt_conn orelse return true;
         if (!stream_mod.isBidi(stream_id)) return false;
-        if (h3c.excluded_bidi_streams.contains(stream_id)) return false;
+        if (h3c.excluded_streams.contains(stream_id)) return false;
         return wtc.getSession(stream_id) == null;
     }
 

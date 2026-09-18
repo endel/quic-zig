@@ -149,8 +149,9 @@ pub const H3Connection = struct {
     // Streams that have been reported as finished (avoid duplicate events)
     finished_streams: std.AutoHashMap(u64, void),
 
-    // Bidi streams excluded from H3 processing (owned by WT layer)
-    excluded_bidi_streams: std.AutoHashMap(u64, void),
+    // Streams the WebTransport layer owns, in either direction: H3 never
+    // reads them, even while their data sits unread.
+    excluded_streams: std.AutoHashMap(u64, void),
 
     // Streams that have received HEADERS (for DATA-before-HEADERS detection)
     headers_received_streams: std.AutoHashMap(u64, void),
@@ -208,7 +209,7 @@ pub const H3Connection = struct {
             .is_server = is_server,
             .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
             .finished_streams = std.AutoHashMap(u64, void).init(allocator),
-            .excluded_bidi_streams = std.AutoHashMap(u64, void).init(allocator),
+            .excluded_streams = std.AutoHashMap(u64, void).init(allocator),
             .headers_received_streams = std.AutoHashMap(u64, void).init(allocator),
         };
         // Advertise dynamic table capacity in local settings
@@ -226,7 +227,7 @@ pub const H3Connection = struct {
         }
         self.stream_bufs.deinit();
         self.finished_streams.deinit();
-        self.excluded_bidi_streams.deinit();
+        self.excluded_streams.deinit();
         self.headers_received_streams.deinit();
         self.cancelled_streams.deinit(self.allocator);
         self.writable_waits.deinit(self.allocator);
@@ -651,7 +652,7 @@ pub const H3Connection = struct {
         const disposed = self.quic_conn.streams.disposal_queue[0..self.quic_conn.streams.disposal_count];
         for (disposed) |id| {
             _ = self.finished_streams.remove(id);
-            _ = self.excluded_bidi_streams.remove(id);
+            _ = self.excluded_streams.remove(id);
             _ = self.headers_received_streams.remove(id);
             _ = self.cancelled_streams.remove(id);
             _ = self.paused_bodies.remove(id);
@@ -798,6 +799,7 @@ pub const H3Connection = struct {
             if (self.peer_control_stream_id != null and self.peer_control_stream_id.? == stream_id) continue;
             if (self.peer_qpack_enc_stream_id != null and self.peer_qpack_enc_stream_id.? == stream_id) continue;
             if (self.peer_qpack_dec_stream_id != null and self.peer_qpack_dec_stream_id.? == stream_id) continue;
+            if (self.excluded_streams.contains(stream_id)) continue;
 
             // Try to read type byte (read() transfers ownership of heap-allocated data)
             const data = recv_stream.read() orelse {
@@ -1092,7 +1094,7 @@ pub const H3Connection = struct {
             const stream = entry.value_ptr.*;
 
             // Skip streams owned by the WebTransport layer
-            if (self.excluded_bidi_streams.contains(stream_id)) continue;
+            if (self.excluded_streams.contains(stream_id)) continue;
 
             // The peer can walk away from the response after its request is
             // complete, so this is checked on finished streams too.
@@ -1416,7 +1418,7 @@ test "H3Connection: init and deinit" {
     var conn: H3Connection = undefined;
     conn.stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(testing.allocator);
     conn.finished_streams = std.AutoHashMap(u64, void).init(testing.allocator);
-    conn.excluded_bidi_streams = std.AutoHashMap(u64, void).init(testing.allocator);
+    conn.excluded_streams = std.AutoHashMap(u64, void).init(testing.allocator);
     conn.headers_received_streams = std.AutoHashMap(u64, void).init(testing.allocator);
     conn.cancelled_streams = .empty;
     conn.writable_waits = .empty;

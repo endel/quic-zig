@@ -730,7 +730,7 @@ pub const WebTransportConnection = struct {
         }
         for (bidi_to_remove[0..bidi_count]) |sid| {
             _ = self.wt_bidi_streams.remove(sid);
-            _ = self.h3.excluded_bidi_streams.remove(sid);
+            _ = self.h3.excluded_streams.remove(sid);
             // Reset the stream with WEBTRANSPORT_SESSION_GONE
             if (self.quic.streams.getStream(sid)) |s| {
                 if (!s.send.fin_sent) {
@@ -759,6 +759,7 @@ pub const WebTransportConnection = struct {
         }
         for (uni_to_remove[0..uni_count]) |sid| {
             _ = self.wt_uni_streams.remove(sid);
+            _ = self.h3.excluded_streams.remove(sid);
             // Reset send side if we opened it
             if (self.quic.streams.send_streams.get(sid)) |send_stream| {
                 if (!send_stream.fin_sent) {
@@ -1110,6 +1111,9 @@ pub const WebTransportConnection = struct {
 
                 // Register the stream (even if session not yet accepted).
                 try self.wt_uni_streams.put(stream_id, session_id);
+                // A paused stream keeps its data in QUIC, where H3 would
+                // otherwise take it for a new stream's type.
+                try self.h3.excluded_streams.put(stream_id, {});
                 if (self.getSession(session_id)) |session| session.fc.uni.peerOpened();
 
                 // Buffer remaining data after the type prefix
@@ -1176,7 +1180,7 @@ pub const WebTransportConnection = struct {
                 // Register the stream (even if session not yet accepted —
                 // the Go client may open bidi streams before CONNECT is processed).
                 try self.wt_bidi_streams.put(stream_id, session_id);
-                try self.h3.excluded_bidi_streams.put(stream_id, {});
+                try self.h3.excluded_streams.put(stream_id, {});
                 if (self.getSession(session_id)) |session| session.fc.bidi.peerOpened();
 
                 // Buffer remaining data for delivery via pollWtStreamData.
@@ -1436,7 +1440,7 @@ pub const WebTransportConnection = struct {
                     _ = self.allocateSession(req.stream_id, .connecting);
                     self.active_session_count += 1;
                     // Exclude this stream from H3 bidi processing
-                    try self.h3.excluded_bidi_streams.put(req.stream_id, {});
+                    try self.h3.excluded_streams.put(req.stream_id, {});
                     try self.adoptConnectStream(req.stream_id);
                     return .{ .connect_request = .{
                         .session_id = req.stream_id,
@@ -1458,7 +1462,7 @@ pub const WebTransportConnection = struct {
                                 if (std.mem.eql(u8, h_item.value, "200")) {
                                     session.state = .active;
                                     // Exclude CONNECT stream from H3 — WT layer owns it now
-                                    self.h3.excluded_bidi_streams.put(hdr.stream_id, {}) catch {};
+                                    self.h3.excluded_streams.put(hdr.stream_id, {}) catch {};
                                     try self.adoptConnectStream(hdr.stream_id);
                                     return .{ .session_ready = .{ .session_id = hdr.stream_id, .headers = hdr.headers } };
                                 } else {
@@ -2008,7 +2012,7 @@ test "WT integration: identifies incoming WT bidi stream" {
 
     // Should be tracked and excluded from H3
     try testing.expect(setup.wt.wt_bidi_streams.contains(4));
-    try testing.expect(setup.h3.excluded_bidi_streams.contains(4));
+    try testing.expect(setup.h3.excluded_streams.contains(4));
 }
 
 test "WT integration: identifies incoming WT uni stream" {
@@ -2036,6 +2040,33 @@ test "WT integration: identifies incoming WT uni stream" {
     }
 
     try testing.expect(setup.wt.wt_uni_streams.contains(14));
+}
+
+test "WT integration: a paused uni stream's data waits for resume, unread by H3" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    while (try setup.wt.poll()) |_| {}
+
+    var buf: [16]u8 = undefined;
+    const n = buildWtUniPrefix(&buf, session_id);
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, buf[0..n], false);
+    try testing.expect((try setup.wt.poll()).? == .uni_stream);
+    try setup.wt.pauseStream(14);
+
+    // Bytes H3 would read as a control stream and a GOAWAY.
+    const payload = [_]u8{ 0x00, 0x07, 0x01, 0x00 };
+    try rs.handleStreamFrame(n, &payload, true);
+    while (try setup.wt.poll()) |_| {}
+    try testing.expect(setup.h3.peer_control_stream_id != 14);
+    try testing.expectEqual(@as(u64, n), rs.bytes_read);
+
+    setup.wt.resumeStream(14);
+    const ev = (try setup.wt.poll()).?;
+    try testing.expectEqualSlices(u8, &payload, ev.stream_data.data);
+    try testing.expect(ev.stream_data.fin);
+    testing.allocator.free(ev.stream_data.data);
 }
 
 test "WT integration: bidi stream with trailing data buffers remainder" {
