@@ -27,6 +27,7 @@ const ranges = @import("quic/ranges.zig");
 const stream = @import("quic/stream.zig");
 const connection = @import("quic/connection.zig");
 const tls13 = @import("quic/tls13.zig");
+const tls_client = @import("tls/client.zig");
 const moq_wire = @import("moq/wire.zig");
 const moq_msg = @import("moq/message.zig");
 const moq_codes = @import("moq/message_codes.zig");
@@ -326,6 +327,17 @@ test "fuzz: tls pem parse" {
 
             var key_buf: [4096]u8 = undefined;
             _ = tls13.parsePemPrivateKey(input, &key_buf) catch {};
+        }
+    }.f, .{});
+}
+
+test "fuzz: tls client fed a server flight" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+            var client = try tls_client.Conn.init(testing.allocator, &.{ .server_name = "localhost", .alpn = &.{"http/1.1"} });
+            defer client.deinit();
+            client.feed(input) catch {};
         }
     }.f, .{});
 }
