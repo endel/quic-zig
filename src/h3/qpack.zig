@@ -219,25 +219,26 @@ fn decodeString(data: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usiz
 
     const raw = data[pos.*..][0..len];
     pos.* += len;
+    return stashString(raw, is_huffman, scratch, scratch_pos);
+}
 
-    if (is_huffman) {
-        // Decode Huffman-encoded string into scratch buffer at current position
-        var temp_buf: [4096]u8 = undefined;
-        const decoded_len = huffman.decode(raw, &temp_buf) catch return error.InvalidEncoding;
-        if (scratch_pos.* + decoded_len > scratch.len) return error.BufferTooSmall;
-        @memcpy(scratch[scratch_pos.*..][0..decoded_len], temp_buf[0..decoded_len]);
-        const result = scratch[scratch_pos.*..][0..decoded_len];
-        scratch_pos.* += decoded_len;
-        return result;
-    }
-
-    // Copy raw string to scratch buffer for lifetime safety
-    // (source data buffer may be reused/shifted by caller)
-    if (scratch_pos.* + len > scratch.len) return error.BufferTooSmall;
-    @memcpy(scratch[scratch_pos.*..][0..len], raw);
-    const result = scratch[scratch_pos.*..][0..len];
-    scratch_pos.* += len;
-    return result;
+/// Copy a string's wire bytes into `scratch` at `scratch_pos.*`, Huffman
+/// decoding them straight into the remaining space, and advance past it.
+/// The copy outlives the caller's data buffer, which may be reused.
+fn stashString(raw: []const u8, is_huffman: bool, scratch: []u8, scratch_pos: *usize) ![]const u8 {
+    const dst = scratch[scratch_pos.*..];
+    const n = if (is_huffman)
+        huffman.decode(raw, dst) catch |err| switch (err) {
+            error.OutputBufferTooSmall => return error.BufferTooSmall,
+            else => return error.InvalidEncoding,
+        }
+    else blk: {
+        if (raw.len > dst.len) return error.BufferTooSmall;
+        @memcpy(dst[0..raw.len], raw);
+        break :blk raw.len;
+    };
+    scratch_pos.* += n;
+    return dst[0..n];
 }
 
 // ── Dynamic Table (RFC 9204 §3.2) ──────────────────────────────────────
@@ -620,21 +621,7 @@ pub const QpackDecoder = struct {
                 const is_name_huffman = (first & 0x08) != 0;
                 const name_len = try decodeInteger(data, &pos, 3);
                 if (name_len > data.len - pos) return error.BufferTooShort;
-                var name: []const u8 = undefined;
-                if (is_name_huffman) {
-                    var temp_buf: [4096]u8 = undefined;
-                    const decoded_len = huffman.decode(data[pos..][0..name_len], &temp_buf) catch return error.InvalidEncoding;
-                    if (scratch_pos + decoded_len > scratch.len) return error.BufferTooSmall;
-                    @memcpy(scratch[scratch_pos..][0..decoded_len], temp_buf[0..decoded_len]);
-                    name = scratch[scratch_pos..][0..decoded_len];
-                    scratch_pos += decoded_len;
-                } else {
-                    // Copy raw name to scratch for lifetime safety
-                    if (scratch_pos + name_len > scratch.len) return error.BufferTooSmall;
-                    @memcpy(scratch[scratch_pos..][0..name_len], data[pos..][0..name_len]);
-                    name = scratch[scratch_pos..][0..name_len];
-                    scratch_pos += name_len;
-                }
+                const name = try stashString(data[pos..][0..name_len], is_name_huffman, scratch, &scratch_pos);
                 pos += name_len;
                 const value = try decodeString(data, &pos, scratch, &scratch_pos);
                 headers_buf[count] = .{ .name = name, .value = value };
@@ -724,17 +711,11 @@ pub const QpackDecoder = struct {
                 const name_len = try decodeInteger(data, &pos, 5);
                 if (name_len > data.len - pos) return error.BufferTooShort;
 
-                var name: []const u8 = undefined;
-                if (is_name_huffman) {
-                    var temp_buf: [4096]u8 = undefined;
-                    const decoded_len = huffman.decode(data[pos..][0..name_len], &temp_buf) catch return error.InvalidEncoding;
-                    if (scratch_pos + decoded_len > scratch.len) return error.BufferTooSmall;
-                    @memcpy(scratch[scratch_pos..][0..decoded_len], temp_buf[0..decoded_len]);
-                    name = scratch[scratch_pos..][0..decoded_len];
-                    scratch_pos += decoded_len;
-                } else {
-                    name = data[pos..][0..name_len];
-                }
+                const raw_name = data[pos..][0..name_len];
+                const name = if (is_name_huffman)
+                    try stashString(raw_name, true, &scratch, &scratch_pos)
+                else
+                    raw_name;
                 pos += name_len;
 
                 const value = try decodeString(data, &pos, &scratch, &scratch_pos);
@@ -866,21 +847,7 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header, scratch: []u8) !us
             const is_name_huffman = (first & 0x08) != 0;
             const name_len = try decodeInteger(data, &pos, 3);
             if (name_len > data.len - pos) return error.BufferTooShort;
-            var name: []const u8 = undefined;
-            if (is_name_huffman) {
-                var temp_buf: [4096]u8 = undefined;
-                const decoded_len = huffman.decode(data[pos..][0..name_len], &temp_buf) catch return error.InvalidEncoding;
-                if (scratch_pos + decoded_len > scratch.len) return error.BufferTooSmall;
-                @memcpy(scratch[scratch_pos..][0..decoded_len], temp_buf[0..decoded_len]);
-                name = scratch[scratch_pos..][0..decoded_len];
-                scratch_pos += decoded_len;
-            } else {
-                // Copy raw name to scratch for lifetime safety
-                if (scratch_pos + name_len > scratch.len) return error.BufferTooSmall;
-                @memcpy(scratch[scratch_pos..][0..name_len], data[pos..][0..name_len]);
-                name = scratch[scratch_pos..][0..name_len];
-                scratch_pos += name_len;
-            }
+            const name = try stashString(data[pos..][0..name_len], is_name_huffman, scratch, &scratch_pos);
             pos += name_len;
             const value = try decodeString(data, &pos, scratch, &scratch_pos);
             headers_buf[count] = .{
@@ -1570,4 +1537,41 @@ test "QpackDecoder: encoder-stream name references and Duplicate index relativel
 
     // Relative 4 is past the oldest entry.
     try testing.expectError(error.InvalidIndex, decoder.processEncoderInstruction(&[_]u8{0x04}));
+}
+
+test "QpackDecoder: Huffman strings decoding past 4 KiB fit in scratch" {
+    const cookie = "session=" ++ "a" ** 5000;
+    const name = "x-" ++ "n" ** 4200;
+    var block: [SCRATCH_SIZE]u8 = undefined;
+    var pos: usize = 2;
+    block[0] = 0x00;
+    block[1] = 0x00;
+
+    var huff: [8192]u8 = undefined;
+    // Literal with static name ref (cookie = 5), Huffman value.
+    var n = try huffman.encode(cookie, &huff);
+    try encodeInteger(&block, &pos, 5, 4, 0x50);
+    try encodeInteger(&block, &pos, n, 7, 0x80);
+    try putBytes(&block, &pos, huff[0..n]);
+    // Literal with literal name, Huffman name and plain value.
+    n = try huffman.encode(name, &huff);
+    try encodeInteger(&block, &pos, n, 3, 0x28);
+    try putBytes(&block, &pos, huff[0..n]);
+    try encodeString(&block, &pos, "v");
+
+    var out: [4]Header = undefined;
+    var decoder = QpackDecoder{};
+    try testing.expectEqual(@as(usize, 2), try decoder.decode(block[0..pos], &out, &test_scratch, 0));
+    try testing.expectEqualStrings("cookie", out[0].name);
+    try testing.expectEqualStrings(cookie, out[0].value);
+    try testing.expectEqualStrings(name, out[1].name);
+    try testing.expectEqualStrings("v", out[1].value);
+
+    try testing.expectEqual(@as(usize, 2), try decodeHeaders(block[0..pos], &out, &test_scratch));
+    try testing.expectEqualStrings(cookie, out[0].value);
+    try testing.expectEqualStrings(name, out[1].name);
+
+    // Scratch too small for the decoded value is reported as such.
+    var small: [4096]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, decoder.decode(block[0..pos], &out, &small, 0));
 }

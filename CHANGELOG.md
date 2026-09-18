@@ -55,6 +55,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   rendezvous timeout. [#34](https://github.com/endel/quic-zig/pull/34)
 - HTTP/3 header sets over 4 KiB (large cookies) failed to encode; there is no
   fixed limit now, and up to 128 headers are accepted instead of 64.
+- A Huffman-encoded header name or value that decodes past 4 KiB, such as a
+  large cookie from a browser, no longer closes the connection.
 - Peers that keep a QPACK dynamic table (Firefox, quic-go, ngtcp2) could
   decode the wrong headers from us. The QPACK encoder is now static-only:
   header blocks are larger, but always decode as sent.
