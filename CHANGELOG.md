@@ -55,8 +55,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   rendezvous timeout. [#34](https://github.com/endel/quic-zig/pull/34)
 - HTTP/3 header sets over 4 KiB (large cookies) failed to encode; there is no
   fixed limit now, and up to 128 headers are accepted instead of 64.
-- A QPACK dynamic-table entry could be added without the instruction that
-  tells the peer about it, leaving later header blocks undecodable.
+- Peers that keep a QPACK dynamic table (Firefox, quic-go, ngtcp2) could
+  decode the wrong headers from us. The QPACK encoder is now static-only:
+  header blocks are larger, but always decode as sent.
 - A malformed QPACK header block or encoder-stream instruction from a peer
   could crash the process or read out of bounds; it now closes the connection.
 - An HTTP/3 body larger than one poll's worth could stall on the event-loop

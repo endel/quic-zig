@@ -132,7 +132,7 @@ pub const H3Connection = struct {
     /// Outstanding `notifyWritable` requests; few, and re-checked every poll.
     writable_waits: std.ArrayList(WritableWait) = .empty,
 
-    // QPACK encoder/decoder with dynamic table support
+    // Static-only encoder; the decoder accepts a dynamic table.
     qpack_encoder: qpack.QpackEncoder = .{},
     qpack_decoder: qpack.QpackDecoder = .{},
 
@@ -395,8 +395,7 @@ pub const H3Connection = struct {
         return &stream.send;
     }
 
-    /// QPACK-encode `headers` into a HEADERS frame on `send`, along with any
-    /// encoder-stream instructions the encoding produced.
+    /// QPACK-encode `headers` into a HEADERS frame on `send`.
     fn writeHeadersFrame(self: *H3Connection, send: *stream_mod.SendStream, headers: []const qpack.Header) !void {
         var stack_buf: [4096]u8 = undefined;
         const need = qpack.maxEncodedLen(headers);
@@ -406,7 +405,6 @@ pub const H3Connection = struct {
         const block_len = try self.qpack_encoder.encode(headers, block_buf);
         try writeFrameHeader(send, 0x01, block_len);
         try send.writeData(block_buf[0..block_len]);
-        try self.flushEncoderInstructions();
     }
 
     fn writeDataFrame(send: *stream_mod.SendStream, data: []const u8) !void {
@@ -885,12 +883,6 @@ pub const H3Connection = struct {
                 }
                 self.peer_settings_received = true;
                 self.peer_settings = settings;
-                // Configure QPACK encoder with peer's advertised capacity
-                if (settings.qpack_max_table_capacity > 0) {
-                    self.qpack_encoder.setCapacity(@intCast(settings.qpack_max_table_capacity));
-                    // Send the Set Capacity encoder instruction
-                    try self.flushEncoderInstructions();
-                }
                 return .{ .settings = settings };
             },
             .goaway => |id| {
@@ -1320,15 +1312,6 @@ pub const H3Connection = struct {
                     }
                 }
             }
-        }
-    }
-
-    /// Send pending encoder instructions on the QPACK encoder stream.
-    fn flushEncoderInstructions(self: *H3Connection) !void {
-        const enc_stream = self.local_qpack_enc_stream orelse return;
-        const instructions = self.qpack_encoder.getInstructions();
-        if (instructions.len > 0) {
-            try enc_stream.writeData(instructions);
         }
     }
 

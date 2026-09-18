@@ -261,6 +261,7 @@ Server Push is not implemented.
   `H3_SETTINGS_ERROR` (frame.zig:49).
 - Supported identifiers:
   - `QPACK_MAX_TABLE_CAPACITY` (0x01) — advertised 4096 by default.
+    The peer's value is unused: our QPACK encoder is static-only.
   - `MAX_FIELD_SECTION_SIZE` (0x06) — optional.
   - `QPACK_BLOCKED_STREAMS` (0x07) — advertised as 0 (no blocked
     streams supported; see caveats).

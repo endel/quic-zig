@@ -361,11 +361,11 @@ Prioritization replaces its use cases.
 | 3.2.2 | Dynamic Table Capacity | ✅ Done | Set via SETTINGS, eviction on overflow |
 | 3.2.3 | Absolute and Relative Indices | ✅ Done | Absolute, relative, post-base indexing |
 | 4 | Wire Format | | |
-| 4.1 | Encoder Instructions | ✅ Done | Insert with name ref, literal name, duplicate, set capacity |
+| 4.1 | Encoder Instructions | ✅ Done | Decoded (insert with name ref, literal name, duplicate, set capacity); the static-only encoder emits none |
 | 4.2 | Decoder Instructions | ✅ Done | Header ack, stream cancellation, insert count increment |
-| 4.3 | Encoder Stream | ✅ Done | Sends insert instructions after encoding |
+| 4.3 | Encoder Stream | ✅ Done | Opened; nothing sent (static-only encoder) |
 | 4.4 | Decoder Stream | ✅ Done | Sends header ack after decoding |
-| 4.5 | Field Line Representations | ✅ Done | Static + dynamic indexed, literal-with-name-ref, literal |
+| 4.5 | Field Line Representations | ✅ Done | Decoder: all. Encoder: static indexed, static name ref, literal |
 | 5 | Configuration | ✅ Done | QPACK_MAX_TABLE_CAPACITY=4096 advertised |
 
 ### Summary — RFC 9204
@@ -379,9 +379,10 @@ Prioritization replaces its use cases.
 ### Remaining Work — RFC 9204
 
 No remaining work — all sections implemented. Optional improvements:
-- Huffman encoding in encoder instructions (currently plain only)
+- A dynamic-table encoder (the encoder is static-only: see
+  [RFC9204_QPACK.md](RFC9204_QPACK.md#caveats--known-limitations))
+- Huffman encoding in the encoder (currently plain only)
 - Stream blocking support (qpack_blocked_streams > 0)
-- Conservative insertion heuristics for large header values
 
 **Huffman table history (Apr 2026):** the RFC 7541 Appendix B table in
 `src/h3/huffman.zig` was originally incorrect for ~130 symbols (22-31,
