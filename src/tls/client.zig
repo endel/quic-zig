@@ -150,6 +150,9 @@ pub const Conn = struct {
     /// Group of the key share we sent.
     group: Group = .x25519,
     key_secret: [32]u8 = @splat(0),
+    /// Our key share; empty until generated for `group`.
+    key_public: [65]u8 = undefined,
+    key_public_len: usize = 0,
     session_id: [32]u8 = undefined,
     /// The first ClientHello, until the ServerHello names the transcript hash.
     client_hello: std.ArrayList(u8) = .empty,
@@ -550,8 +553,9 @@ pub const Conn = struct {
 
     fn sendClientHello(self: *Conn, cookie: ?[]const u8) Error!void {
         const cfg = self.config;
-        var public_buf: [65]u8 = undefined;
-        const public = try self.newKeyShare(&public_buf);
+        // RFC 8446 §4.1.2: a retry keeps the share unless the group changed.
+        if (self.key_public_len == 0) try self.newKeyShare();
+        const public = self.key_public[0..self.key_public_len];
 
         self.hs_out.clearRetainingCapacity();
         var b: Builder = .{ .list = &self.hs_out, .gpa = self.allocator };
@@ -639,8 +643,7 @@ pub const Conn = struct {
         self.hs_out.clearRetainingCapacity();
     }
 
-    /// A fresh key pair for `self.group`; returns the public share.
-    fn newKeyShare(self: *Conn, public_buf: *[65]u8) Error![]const u8 {
+    fn newKeyShare(self: *Conn) Error!void {
         var seed: [32]u8 = undefined;
         sys.randomBytes(&seed);
         defer crypto.secureZero(u8, &seed);
@@ -648,14 +651,14 @@ pub const Conn = struct {
             .x25519 => {
                 const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.InternalError;
                 self.key_secret = kp.secret_key;
-                public_buf[0..32].* = kp.public_key;
-                return public_buf[0..32];
+                self.key_public[0..32].* = kp.public_key;
+                self.key_public_len = 32;
             },
             .secp256r1 => {
                 const kp = EcdsaP256Sha256.KeyPair.generateDeterministic(seed) catch return error.InternalError;
                 self.key_secret = kp.secret_key.bytes;
-                public_buf.* = kp.public_key.toUncompressedSec1();
-                return public_buf[0..65];
+                self.key_public = kp.public_key.toUncompressedSec1();
+                self.key_public_len = 65;
             },
         }
     }
@@ -732,6 +735,7 @@ pub const Conn = struct {
                 } else return error.IllegalParameter;
                 if (g == self.group) return error.IllegalParameter;
                 self.group = g;
+                self.key_public_len = 0;
             } else if (cookie == null) {
                 // A retry that changes nothing.
                 return error.IllegalParameter;
