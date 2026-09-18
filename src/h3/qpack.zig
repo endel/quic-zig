@@ -407,7 +407,8 @@ pub const DynamicTable = struct {
     /// Get entry by post-base index.
     /// RFC 9204 §3.2.3: absolute_index = base + post_base_index
     pub fn getPostBase(self: *const DynamicTable, base: u64, post_base_idx: u64) ?DynEntry {
-        return self.get(base + post_base_idx);
+        const abs = std.math.add(u64, base, post_base_idx) catch return null;
+        return self.get(abs);
     }
 
     /// Result of a dynamic table search.
@@ -445,6 +446,12 @@ pub const DynamicTable = struct {
         return @intCast(self.capacity / ENTRY_OVERHEAD);
     }
 };
+
+/// RFC 9204 3.2.5: relative index `rel` counts back from `base`.
+fn relativeToAbsolute(base: u64, rel: u64) ?u64 {
+    if (rel >= base) return null;
+    return base - rel - 1;
+}
 
 /// Encode Required Insert Count per RFC 9204 §4.5.1.
 fn encodeRequiredInsertCount(ric: u64, max_entries: u64) u64 {
@@ -693,7 +700,8 @@ pub const QpackDecoder = struct {
         // Decode Required Insert Count
         const encoded_ric = try decodeInteger(data, &pos, 8);
 
-        // Decode Delta Base
+        // Decode Delta Base; a multi-byte RIC can use up the whole block.
+        if (pos >= data.len) return error.BufferTooShort;
         const sign_bit = (data[pos] & 0x80) != 0;
         const delta_base = try decodeInteger(data, &pos, 7);
 
@@ -704,9 +712,11 @@ pub const QpackDecoder = struct {
             const max_entries = self.dynamic.maxEntries();
             ric = try decodeRequiredInsertCount(encoded_ric, max_entries, self.dynamic.insert_count);
             if (sign_bit) {
+                // RFC 9204 4.5.1.2: Base = RIC - DeltaBase - 1 must not go negative.
+                if (delta_base >= ric) return error.InvalidBase;
                 base = ric - delta_base - 1;
             } else {
-                base = ric + delta_base;
+                base = std.math.add(u64, ric, delta_base) catch return error.InvalidBase;
             }
         }
 
@@ -729,7 +739,7 @@ pub const QpackDecoder = struct {
             } else if (first & 0xc0 == 0x80) {
                 // Indexed dynamic: 10NNNNNN (T=0, relative index from base)
                 const rel_idx = try decodeInteger(data, &pos, 6);
-                const entry = self.dynamic.getRelative(base, rel_idx) orelse return error.InvalidIndex;
+                const entry = try self.fieldRef(ric, relativeToAbsolute(base, rel_idx));
                 // Copy name/value from dynamic entry into scratch
                 const n = entry.name;
                 const v = entry.value;
@@ -757,7 +767,7 @@ pub const QpackDecoder = struct {
                     count += 1;
                 } else {
                     const rel_idx = try decodeInteger(data, &pos, 4);
-                    const entry = self.dynamic.getRelative(base, rel_idx) orelse return error.InvalidIndex;
+                    const entry = try self.fieldRef(ric, relativeToAbsolute(base, rel_idx));
                     const n = entry.name;
                     if (scratch_pos + n.len > scratch.len) return error.BufferTooSmall;
                     @memcpy(scratch[scratch_pos..][0..n.len], n);
@@ -771,7 +781,7 @@ pub const QpackDecoder = struct {
                 // Literal with literal name: 001NHNNN
                 const is_name_huffman = (first & 0x08) != 0;
                 const name_len = try decodeInteger(data, &pos, 3);
-                if (pos + name_len > data.len) return error.BufferTooShort;
+                if (name_len > data.len - pos) return error.BufferTooShort;
                 var name: []const u8 = undefined;
                 if (is_name_huffman) {
                     var temp_buf: [4096]u8 = undefined;
@@ -794,7 +804,7 @@ pub const QpackDecoder = struct {
             } else if (first & 0xf0 == 0x10) {
                 // Post-base indexed: 0001NNNN
                 const post_idx = try decodeInteger(data, &pos, 4);
-                const entry = self.dynamic.getPostBase(base, post_idx) orelse return error.InvalidIndex;
+                const entry = try self.fieldRef(ric, std.math.add(u64, base, post_idx) catch null);
                 const n = entry.name;
                 const v = entry.value;
                 if (scratch_pos + n.len + v.len > scratch.len) return error.BufferTooSmall;
@@ -809,7 +819,7 @@ pub const QpackDecoder = struct {
             } else if (first & 0xf0 == 0x00) {
                 // Literal with post-base name ref: 0000NNNN
                 const post_idx = try decodeInteger(data, &pos, 3);
-                const entry = self.dynamic.getPostBase(base, post_idx) orelse return error.InvalidIndex;
+                const entry = try self.fieldRef(ric, std.math.add(u64, base, post_idx) catch null);
                 const n = entry.name;
                 if (scratch_pos + n.len > scratch.len) return error.BufferTooSmall;
                 @memcpy(scratch[scratch_pos..][0..n.len], n);
@@ -829,6 +839,15 @@ pub const QpackDecoder = struct {
         }
 
         return count;
+    }
+
+    /// Resolve a field line's dynamic reference. RFC 9204 4.5.1: an entry at
+    /// or past the block's Required Insert Count is a decompression failure,
+    /// even if the table already holds it.
+    fn fieldRef(self: *const QpackDecoder, ric: u64, abs_idx: ?u64) !DynEntry {
+        const abs = abs_idx orelse return error.InvalidIndex;
+        if (abs >= ric) return error.InvalidIndex;
+        return self.dynamic.get(abs) orelse error.InvalidIndex;
     }
 
     /// Process encoder instructions from the encoder stream.
@@ -865,7 +884,7 @@ pub const QpackDecoder = struct {
                 // Insert with Literal Name: 01HXXXXX
                 const is_name_huffman = (first & 0x20) != 0;
                 const name_len = try decodeInteger(data, &pos, 5);
-                if (pos + name_len > data.len) return error.BufferTooShort;
+                if (name_len > data.len - pos) return error.BufferTooShort;
 
                 var name: []const u8 = undefined;
                 if (is_name_huffman) {
@@ -1008,7 +1027,7 @@ pub fn decodeHeaders(data: []const u8, headers_buf: []Header, scratch: []u8) !us
             // H bit (bit 3) indicates Huffman for name, 3-bit name length prefix
             const is_name_huffman = (first & 0x08) != 0;
             const name_len = try decodeInteger(data, &pos, 3);
-            if (pos + name_len > data.len) return error.BufferTooShort;
+            if (name_len > data.len - pos) return error.BufferTooShort;
             var name: []const u8 = undefined;
             if (is_name_huffman) {
                 var temp_buf: [4096]u8 = undefined;
@@ -1751,4 +1770,75 @@ test "QpackEncoder: an entry is inserted only along with its instruction" {
 
     try decoder.processEncoderInstruction(encoder.getInstructions());
     try testing.expectEqual(encoder.dynamic.insert_count, decoder.dynamic.insert_count);
+}
+
+// Encoder instructions for a decoder whose peer has set a 4096-byte table.
+const set_capacity_4096 = [_]u8{ 0x3f, 0xe1, 0x1f };
+
+test "QpackDecoder: a literal name length near usize max is rejected, not wrapped" {
+    // 001NHNNN with a name length of maxInt(usize): pos + len would wrap.
+    const block = [_]u8{ 0x00, 0x00, 0x27, 0xf8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 };
+    var decoder = QpackDecoder{};
+    var out: [8]Header = undefined;
+    try testing.expectError(error.BufferTooShort, decoder.decode(&block, &out, &test_scratch, 0));
+    try testing.expectError(error.BufferTooShort, decodeHeaders(&block, &out, &test_scratch));
+}
+
+test "QpackDecoder: an encoder-stream literal name length near usize max is rejected" {
+    // 01HXXXXX Insert With Literal Name, same wrapping length.
+    const instr = [_]u8{ 0x5f, 0xe0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 };
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    try decoder.processEncoderInstruction(&set_capacity_4096);
+    try testing.expectError(error.BufferTooShort, decoder.processEncoderInstruction(&instr));
+}
+
+test "QpackDecoder: a negative Delta Base reaching below zero is rejected" {
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    try decoder.processEncoderInstruction(&set_capacity_4096);
+    try decoder.processEncoderInstruction(&[_]u8{ 0x41, 'n', 0x01, 'v' });
+    var out: [8]Header = undefined;
+    // RIC 1 (encoded 2), sign set, Delta Base 1: Base = 1 - 1 - 1.
+    try testing.expectError(error.InvalidBase, decoder.decode(&[_]u8{ 0x02, 0x81, 0xd1 }, &out, &test_scratch, 0));
+    // Delta Base 0 is the smallest legal negative one: Base = 0.
+    const n = try decoder.decode(&[_]u8{ 0x02, 0x80, 0x10 }, &out, &test_scratch, 0);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualStrings("n", out[0].name);
+    try testing.expectEqualStrings("v", out[0].value);
+}
+
+test "QpackDecoder: a Delta Base or post-base index that overflows is rejected" {
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    try decoder.processEncoderInstruction(&set_capacity_4096);
+    try decoder.processEncoderInstruction(&[_]u8{ 0x41, 'n', 0x01, 'v' });
+    var out: [8]Header = undefined;
+
+    // RIC 1, positive Delta Base of maxInt(u64).
+    const big_base = [_]u8{ 0x02, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0xc0 | 17 };
+    try testing.expectError(error.InvalidBase, decoder.decode(&big_base, &out, &test_scratch, 0));
+
+    // RIC 1, Base 1, post-base index of maxInt(u64): Base + index wraps to 0.
+    const big_post = [_]u8{ 0x02, 0x00, 0x1f, 0xf0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 };
+    try testing.expectError(error.InvalidIndex, decoder.decode(&big_post, &out, &test_scratch, 0));
+}
+
+test "QpackDecoder: a reference at or past Required Insert Count is rejected" {
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    try decoder.processEncoderInstruction(&set_capacity_4096);
+    try decoder.processEncoderInstruction(&[_]u8{ 0x41, 'a', 0x01, '1' });
+    try decoder.processEncoderInstruction(&[_]u8{ 0x41, 'b', 0x01, '2' });
+    var out: [8]Header = undefined;
+    // RIC 1, Base 1, post-base index 0 = absolute 1: in the table, but not
+    // covered by the block's Required Insert Count.
+    try testing.expectError(error.InvalidIndex, decoder.decode(&[_]u8{ 0x02, 0x00, 0x10 }, &out, &test_scratch, 0));
+}
+
+test "QpackDecoder: a prefix without its Delta Base byte is rejected" {
+    var decoder = QpackDecoder{};
+    var out: [8]Header = undefined;
+    // A two-byte Required Insert Count uses up the block.
+    try testing.expectError(error.BufferTooShort, decoder.decode(&[_]u8{ 0xff, 0x01 }, &out, &test_scratch, 0));
 }

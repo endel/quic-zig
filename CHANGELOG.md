@@ -57,6 +57,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   fixed limit now, and up to 128 headers are accepted instead of 64.
 - A QPACK dynamic-table entry could be added without the instruction that
   tells the peer about it, leaving later header blocks undecodable.
+- A malformed QPACK header block or encoder-stream instruction from a peer
+  could crash the process or read out of bounds; it now closes the connection.
 - An HTTP/3 body larger than one poll's worth could stall on the event-loop
   client and server until the next packet arrived, and a response could lose
   its tail once the stream was reclaimed.
