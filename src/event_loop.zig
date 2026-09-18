@@ -560,6 +560,10 @@ pub fn Server(comptime Handler: type) type {
         /// Set while one of our callbacks runs: its own send pass covers
         /// whatever the handler queues, so no wakeup is needed.
         in_callback: bool,
+        /// A handler wrote during a callback after the send pass began, maybe
+        /// to a connection whose turn had passed — another's
+        /// onConnectionClosed writing to it, say. Wakes us once it is over.
+        written_in_pass: bool,
         /// A stopped server on a shared loop: every completion is cancelled or
         /// on its way off the loop, and nothing may re-arm.
         halted: bool,
@@ -721,6 +725,7 @@ pub fn Server(comptime Handler: type) type {
                 .wake_completion = .{},
                 .wake_armed = false,
                 .in_callback = false,
+                .written_in_pass = false,
                 .halted = false,
                 .cancel_completions = .{ .{}, .{}, .{}, .{} },
                 .sockfd = sockfd,
@@ -829,7 +834,7 @@ pub fn Server(comptime Handler: type) type {
         /// non-blocking event loop polls (edge-triggered race in kqueue/epoll).
         pub fn pollDirect(self: *Self) void {
             self.in_callback = true;
-            defer self.in_callback = false;
+            defer self.endCallback();
             _ = self.recvAllPackets();
             self.processConnections();
             self.tickAndSend();
@@ -1006,8 +1011,19 @@ pub fn Server(comptime Handler: type) type {
 
         // A zero-delay pass for writes made outside our callbacks.
         fn scheduleWake(self: *Self) void {
-            if (self.in_callback) return;
+            if (self.in_callback) {
+                self.written_in_pass = true;
+                return;
+            }
             self.armWake();
+        }
+
+        fn endCallback(self: *Self) void {
+            self.in_callback = false;
+            if (self.written_in_pass) {
+                self.written_in_pass = false;
+                self.armWake();
+            }
         }
 
         fn armWake(self: *Self) void {
@@ -1049,7 +1065,7 @@ pub fn Server(comptime Handler: type) type {
             self.processConnections();
             self.tickAndSend();
             self.conn_mgr.freeDeadEntries();
-            self.in_callback = false;
+            self.endCallback();
 
             if (self.stopping and self.allConnectionsClosed()) {
                 self.finishStop(null);
@@ -1091,7 +1107,7 @@ pub fn Server(comptime Handler: type) type {
                 // On the first iteration we always process (triggered by poll event).
                 if (iterations > 0 and !received) break;
             }
-            self.in_callback = false;
+            self.endCallback();
 
             if (self.stopping and self.allConnectionsClosed()) {
                 self.finishStop(c);
@@ -1551,6 +1567,8 @@ pub fn Server(comptime Handler: type) type {
         }
 
         fn tickAndSend(self: *Self) void {
+            // What was written before this point goes out below.
+            self.written_in_pass = false;
             var i: usize = 0;
             while (i < self.conn_mgr.entries.items.len) {
                 const entry = self.conn_mgr.entries.items[i];
@@ -4124,3 +4142,87 @@ test "e2e: a peer uni stream carries well past its 1 MiB initial window" {
     try testing.expectEqual(UNI_BODY, server_handler.bytes);
     try testing.expect(server_handler.ok);
 }
+
+/// Holds the first request's response open, then finishes it from another
+/// connection's onConnectionClosed.
+const CrossWriter = struct {
+    pub const protocol: Protocol = .h3;
+
+    held: ?Session = null,
+    held_stream: u64 = 0,
+
+    pub fn onRequest(self: *@This(), session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        if (self.held == null) {
+            session.sendResponseHeaders(stream_id, &.{.{ .name = ":status", .value = "200" }}) catch unreachable;
+            self.held = session.*;
+            self.held_stream = stream_id;
+        } else {
+            session.sendResponse(stream_id, &.{.{ .name = ":status", .value = "200" }}, "hello") catch unreachable;
+        }
+    }
+
+    pub fn onConnectionClosed(self: *@This(), session: *Session) void {
+        const h = &(self.held orelse return);
+        if (h.entry == session.entry) {
+            self.held = null;
+            return;
+        }
+        h.sendResponseData(self.held_stream, "bye") catch unreachable;
+        h.finishResponse(self.held_stream, null) catch unreachable;
+    }
+};
+
+fn statusSeen(c: *CheckingClient) bool {
+    return c.status[0] != 0;
+}
+
+fn finishedOne(c: *CheckingClient) bool {
+    return c.finished;
+}
+
+test "e2e: a write from one connection's onConnectionClosed to another goes out at once" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    const S = Server(CrossWriter);
+    const C = Client(CheckingClient);
+    var sh = CrossWriter{};
+    var server = try S.init(testing.allocator, &sh, .{ .port = 29423, .tls_config = makeTestTlsConfig(), .loop = &loop });
+    server.start();
+
+    var ha = CheckingClient{};
+    var a = try C.init(testing.allocator, &ha, .{ .port = 29423, .skip_cert_verify = true, .loop = &loop });
+    a.start();
+    try runUntil(&loop, &ha, statusSeen, 5000);
+
+    var hb = CheckingClient{};
+    var b = try C.init(testing.allocator, &hb, .{ .port = 29423, .skip_cert_verify = true, .loop = &loop });
+    b.start();
+    try runUntil(&loop, &hb, finishedOne, 5000);
+    b.stop();
+    try runUntil(&loop, &b, C.isStopped, 5000);
+    b.deinit();
+
+    const OneLeft = struct {
+        fn done(x: *S) bool {
+            return x.conn_mgr.entries.items.len == 1;
+        }
+    };
+    try runUntil(&loop, &server, OneLeft.done, 5000);
+    // Without a wakeup this waits for A's next packet: the idle timeout.
+    try runUntil(&loop, &ha, finishedOne, 150);
+    try testing.expectEqualStrings("bye", ha.body[0..ha.received]);
+
+    a.stop();
+    server.stop();
+    const Both = struct {
+        s: *S,
+        c: *C,
+        fn done(x: *const @This()) bool {
+            return x.s.isStopped() and x.c.isStopped();
+        }
+    };
+    try runUntil(&loop, &Both{ .s = &server, .c = &a }, Both.done, 5000);
+    a.deinit();
+    server.deinit();
+}
+
