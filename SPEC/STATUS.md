@@ -320,7 +320,7 @@
 | 6.2.1 | Control Streams | ✅ Done | SETTINGS sent on open |
 | 6.2.2 | Push Streams | ❌ N/A | Deprecated with Server Push |
 | 7 | HTTP Framing Layer | | |
-| 7.1 | Frame Layout | ✅ Done | Varint type + length |
+| 7.1 | Frame Layout | ✅ Done | Varint type + length. DATA is streamed as it arrives, unknown frames skipped as they arrive, HEADERS and control frames capped — nothing is buffered whole on a peer's say-so |
 | 7.2 | Frame Definitions | | |
 | 7.2.1 | DATA (0x00) | ✅ Done | |
 | 7.2.2 | HEADERS (0x01) | ✅ Done | |

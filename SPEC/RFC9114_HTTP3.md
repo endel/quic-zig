@@ -68,6 +68,15 @@ HTTP-client concern rather than an H3 protocol concern and is deferred.
 - Incoming: `poll()` returns `headers` / `data` / `finished` /
   `request_cancelled` events. Body bytes are read via `recvBody(buf)`;
   `poll()` does not advance past a stream with a pending body.
+- Incoming frames are never buffered whole. `poll()` pulls a request
+  stream's QUIC data one chunk at a time, only when its buffer can make no
+  further progress; a DATA frame is surfaced as `data` events piece by piece
+  as it arrives (`len` is what is buffered now), and unknown or unsupported
+  frames are discarded as they arrive. A HEADERS frame longer than
+  `MAX_HEADERS_FRAME` (64 KiB) is `H3_EXCESSIVE_LOAD`; a stream that ends
+  mid-frame is `H3_FRAME_ERROR`. Bytes H3 holds are marked
+  `ReceiveStream.retained`, so MAX_STREAM_DATA and MAX_DATA credit only what
+  the application has taken.
 
 ### §4.1.1 Request Cancellation — ✅ Done
 
@@ -75,7 +84,8 @@ HTTP-client concern rather than an H3 protocol concern and is deferred.
   `STOP_SENDING` with the given H3 error code.
 - `rejectRequest(stream_id)`: shortcut that uses `H3_REQUEST_REJECTED`.
 - Peer-initiated cancellation is surfaced as a `request_cancelled` event
-  (stream_id + peer error code) after any buffered frames are drained —
+  (stream_id + peer error code) after any complete buffered frames are
+  delivered (a partial one is dropped) —
   RESET_STREAM on the request, or (server) STOP_SENDING on the response,
   including after the request is complete. Reported once per stream.
 
@@ -179,8 +189,8 @@ connection open until the handler or the peer closes them.
 the stream's data and FIN (a peer reset is still reported), so its bytes stay
 unread in QUIC and MAX_STREAM_DATA stops advancing: the client is held to one
 stream window rather than the server buffering the body. Pausing mid-frame is
-allowed: the unread tail of the DATA frame is re-framed in place, so other
-streams are not blocked behind it. `resumeRequestBody` asks the event loop for
+allowed: what `recvBody` has not returned stays buffered and is surfaced
+first after the resume, and other streams are not blocked behind it. `resumeRequestBody` asks the event loop for
 another pass (`ConnEntry.repoll`), since no packet may arrive to trigger one.
 
 ## §5.3 Immediate Closure — ✅ Done
@@ -222,6 +232,10 @@ sees the stream).
 - First frame on the peer control stream must be SETTINGS; anything
   else yields `H3_MISSING_SETTINGS`. Duplicate SETTINGS yields
   `H3_FRAME_UNEXPECTED`.
+- Control-stream frames are bounded: SETTINGS and PRIORITY_UPDATE past
+  `MAX_CONTROL_FRAME` (16 KiB) are `H3_EXCESSIVE_LOAD`, GOAWAY /
+  CANCEL_PUSH / MAX_PUSH_ID longer than one varint are `H3_FRAME_ERROR`, and
+  unknown frames are discarded as they arrive.
 
 ### §6.2.2 Push Streams — ❌ N/A
 
@@ -230,8 +244,10 @@ Deferred with Server Push.
 ## §7.1 Frame Layout — ✅ Done
 
 `h3/frame.zig:parse()` reads `varint type | varint length | payload`.
-Short buffers return `error.BufferTooShort`; callers accumulate bytes
-until a full frame is available.
+Short buffers return `error.BufferTooShort`. The connection reads the
+header alone first (`parseHeader`) and decides from the type and declared
+length whether to stream, cap or skip the payload, so only bounded frames
+are ever accumulated whole.
 
 ## §7.2 Frame Definitions
 
@@ -280,7 +296,8 @@ HTTP/2 frame types `0x02, 0x06, 0x08, 0x09` on any H3 stream trigger
 `H3_FRAME_UNEXPECTED`. Unknown types (GREASE `0x1f*N+0x21`, etc.) are
 returned from `parse()` as a distinct `.unknown` variant that higher
 layers ignore while still advancing the buffer cursor — verified by the
-GREASE test in frame.zig:395.
+GREASE test in frame.zig. On request and control streams they are skipped
+incrementally from the header, whatever length they declare.
 
 ## §8 Error Handling — ✅ Done
 

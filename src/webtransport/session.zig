@@ -1169,6 +1169,7 @@ pub const WebTransportConnection = struct {
                     break :blk self.h3.stream_bufs.getPtr(stream_id).?;
                 };
                 try buf.appendSlice(self.allocator, data);
+                stream.recv.retained += data.len; // credited as H3 consumes it
             }
         }
         return null;

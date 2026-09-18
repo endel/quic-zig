@@ -305,6 +305,12 @@ pub const ReceiveStream = struct {
     receive_window: u64 = std.math.maxInt(u64),
     receive_window_size: u64 = 0,
 
+    /// Bytes a consumer has read out but still holds in a buffer of its own
+    /// (an HTTP/3 frame not yet taken by the application). Flow control
+    /// credits only what was read and then let go, so the peer is held to a
+    /// window of what the application actually took.
+    retained: u64 = 0,
+
     /// Connection-level flow control (RFC 9000 4.1): the highest offset, or
     /// final size, this stream has charged against MAX_DATA, and how much of
     /// that has been handed back as consumed or abandoned.
@@ -368,11 +374,16 @@ pub const ReceiveStream = struct {
         return data;
     }
 
+    /// Bytes the consumer has read and let go of.
+    pub fn consumed(self: *const ReceiveStream) u64 {
+        return self.bytes_read -| self.retained;
+    }
+
     /// Connection credit newly earned since the last call: what the consumer
     /// has read, or everything charged once the peer has reset the stream
     /// (its unread data will never be read).
     pub fn takeConnCredit(self: *ReceiveStream) u64 {
-        const upto = if (self.reset_err != null) self.conn_counted else @min(self.bytes_read, self.conn_counted);
+        const upto = if (self.reset_err != null) self.conn_counted else @min(self.consumed(), self.conn_counted);
         if (upto <= self.conn_credited) return 0;
         const n = upto - self.conn_credited;
         self.conn_credited = upto;
@@ -392,8 +403,8 @@ pub const ReceiveStream = struct {
 
         // Send update when consumed portion exceeds threshold
         const threshold = self.receive_window_size / STREAM_WINDOW_UPDATE_FRACTION;
-        if (self.bytes_read + threshold > self.receive_window) {
-            const new_window = self.bytes_read + self.receive_window_size;
+        if (self.consumed() + threshold > self.receive_window) {
+            const new_window = self.consumed() + self.receive_window_size;
             if (new_window > self.receive_window) {
                 self.receive_window = new_window;
                 return new_window;

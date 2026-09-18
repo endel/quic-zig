@@ -57,6 +57,8 @@ pub const H3Event = union(enum) {
     settings: h3_frame.Settings,
     headers: struct { stream_id: u64, headers: []const qpack.Header },
     /// Body data is available on this stream. Call recvBody() to read it.
+    /// A DATA frame is surfaced piecewise as it arrives, so `len` is what is
+    /// buffered now, not the frame's declared length.
     data: struct { stream_id: u64, len: usize },
     finished: u64,
     goaway: u64,
@@ -78,6 +80,31 @@ pub const H3Event = union(enum) {
 /// Maximum number of headers we'll decode from a single HEADERS frame. The
 /// decoded bytes are bounded separately by `qpack.SCRATCH_SIZE`.
 pub const MAX_HEADERS: usize = 128;
+
+/// Largest HEADERS frame we will buffer to decode. Decoded fields are capped
+/// at `qpack.SCRATCH_SIZE`; this bounds the encoded frame held meanwhile.
+pub const MAX_HEADERS_FRAME: u64 = 64 * 1024;
+
+/// Largest SETTINGS or PRIORITY_UPDATE frame accepted on the control stream.
+pub const MAX_CONTROL_FRAME: u64 = 16 * 1024;
+
+/// Where a stream's reader is inside the current frame; absent at a frame
+/// boundary.
+const FrameProgress = union(enum) {
+    /// DATA payload bytes the application has yet to take, buffered or not.
+    data: u64,
+    /// Payload bytes of an ignored frame still to discard.
+    skip: u64,
+};
+
+/// What handling the frame at the front of a buffer came to.
+const FrameStep = union(enum) {
+    event: H3Event,
+    /// Consumed something; try again.
+    progressed,
+    /// The frame is not all there yet.
+    need_more,
+};
 
 /// A `notifyWritable` request waiting on a request stream.
 const WritableWait = struct {
@@ -156,10 +183,12 @@ pub const H3Connection = struct {
     // until the body is fully read.
     pending_body: ?struct {
         stream_id: u64,
-        offset: usize, // offset into stream_bufs where payload starts
+        offset: usize, // bytes of this piece recvBody() has already returned
         remaining: usize, // bytes not yet read by recvBody()
-        frame_total: usize, // total frame size (header + payload) for final consume
     } = null,
+
+    /// Per-stream position inside a DATA or skipped frame.
+    frame_progress: std.AutoHashMapUnmanaged(u64, FrameProgress) = .empty,
 
     /// Request streams whose body the application has paused. poll() leaves
     /// their data in QUIC, so the peer is held back by the stream's flow
@@ -203,6 +232,7 @@ pub const H3Connection = struct {
         self.writable_waits.deinit(self.allocator);
         self.paused_bodies.deinit(self.allocator);
         self.response_states.deinit(self.allocator);
+        self.frame_progress.deinit(self.allocator);
     }
 
     fn qpackScratch(self: *H3Connection) ![]u8 {
@@ -649,6 +679,7 @@ pub const H3Connection = struct {
             _ = self.cancelled_streams.remove(id);
             _ = self.paused_bodies.remove(id);
             _ = self.response_states.remove(id);
+            _ = self.frame_progress.remove(id);
             if (self.stream_bufs.fetchRemove(id)) |kv| {
                 var buf = kv.value;
                 buf.deinit(self.allocator);
@@ -705,16 +736,19 @@ pub const H3Connection = struct {
         try self.paused_bodies.put(self.allocator, stream_id, {});
         const pb = self.pending_body orelse return;
         if (pb.stream_id != stream_id) return;
-        // Re-frame the unread tail as a DATA frame of its own, so poll()
-        // is free to serve other streams meanwhile.
-        const buf = self.stream_bufs.getPtr(stream_id) orelse return;
-        var hdr_buf: [16]u8 = undefined;
-        var hdr = io.fixedBufferStream(&hdr_buf);
-        try packet.writeVarInt(&hdr, @intFromEnum(h3_frame.H3FrameType.data));
-        try packet.writeVarInt(&hdr, pb.remaining);
-        h3_frame.consumeFromBuf(buf, pb.offset);
-        try buf.insertSlice(self.allocator, 0, hdr.buffered());
+        // Settle what was taken so poll() is free to serve other streams.
+        self.takeBody(stream_id, pb.offset);
         self.pending_body = null;
+    }
+
+    /// Drop `n` body bytes the application has taken, crediting the peer.
+    fn takeBody(self: *H3Connection, stream_id: u64, n: usize) void {
+        const buf = self.stream_bufs.getPtr(stream_id) orelse return;
+        const rs: ?*stream_mod.ReceiveStream = if (self.quic_conn.streams.getStream(stream_id)) |s| &s.recv else null;
+        self.consumeRequestBytes(rs, buf, n);
+        const fp = self.frame_progress.getPtr(stream_id) orelse return;
+        fp.data -= n;
+        if (fp.data == 0) _ = self.frame_progress.remove(stream_id);
     }
 
     /// Undo `pauseBody`. The buffered body is surfaced by a later poll().
@@ -728,7 +762,7 @@ pub const H3Connection = struct {
 
     /// Read body data from a stream after a `.data` event.
     /// Copies into the caller-provided buffer and returns the number of bytes read.
-    /// Call repeatedly until 0 is returned to drain the full DATA frame payload.
+    /// Call repeatedly until 0 is returned to drain the piece the event announced.
     pub fn recvBody(self: *H3Connection, buf: []u8) usize {
         const pb = self.pending_body orelse return 0;
         const stream_buf = self.stream_bufs.getPtr(pb.stream_id) orelse {
@@ -742,16 +776,13 @@ pub const H3Connection = struct {
         @memcpy(buf[0..available], stream_buf.items[pb.offset..][0..available]);
 
         if (available == pb.remaining) {
-            // Fully consumed — remove the entire frame from the stream buffer
-            self.consumeFrameFromBuf(stream_buf, pb.frame_total);
+            self.takeBody(pb.stream_id, pb.offset + available);
             self.pending_body = null;
         } else {
-            // Partial read — advance offset
             self.pending_body = .{
                 .stream_id = pb.stream_id,
                 .offset = pb.offset + available,
                 .remaining = pb.remaining - available,
-                .frame_total = pb.frame_total,
             };
         }
 
@@ -855,28 +886,74 @@ pub const H3Connection = struct {
     }
 
     /// Poll the peer's control stream for SETTINGS/GOAWAY frames.
+    ///
+    /// Reads from QUIC only when the buffer holds no complete frame, so what
+    /// it buffers is bounded by `MAX_CONTROL_FRAME` plus one QUIC chunk.
     fn pollControlStream(self: *H3Connection) !?H3Event {
         const ctrl_id = self.peer_control_stream_id orelse return null;
-
-        // Read more data from control stream (read() transfers ownership)
-        if (self.quic_conn.streams.recv_streams.get(ctrl_id)) |recv_stream| {
-            if (recv_stream.read()) |data| {
-                defer self.allocator.free(data);
-                var buf = self.stream_bufs.getPtr(ctrl_id) orelse blk: {
-                    const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-                    try self.stream_bufs.put(ctrl_id, new_buf);
-                    break :blk self.stream_bufs.getPtr(ctrl_id).?;
-                };
-                try buf.appendSlice(self.allocator, data);
+        while (true) {
+            if (self.stream_bufs.getPtr(ctrl_id)) |buf| {
+                if (self.frame_progress.getPtr(ctrl_id)) |fp| {
+                    if (self.skipBuffered(ctrl_id, fp, buf, null)) continue;
+                } else if (buf.items.len > 0) {
+                    switch (try self.parseControlFrame(ctrl_id, buf)) {
+                        .event => |ev| return ev,
+                        .progressed => continue,
+                        .need_more => {},
+                    }
+                }
             }
+            const rs = self.quic_conn.streams.recv_streams.get(ctrl_id) orelse return null;
+            if (!try self.pullChunk(ctrl_id, rs, false)) return null;
         }
+    }
 
-        // Try to parse a frame from buffered data
-        const buf = self.stream_bufs.getPtr(ctrl_id) orelse return null;
-        if (buf.items.len == 0) return null;
+    /// Handle the frame at the front of the control stream buffer.
+    fn parseControlFrame(self: *H3Connection, ctrl_id: u64, buf: *std.ArrayList(u8)) !FrameStep {
+        const hdr = h3_frame.parseHeader(buf.items) catch {
+            // RFC 9114 §7.2.8: reserved HTTP/2 frame types
+            self.closeWithError(.frame_unexpected, "HTTP/2 frame type on H3 control stream");
+            return error.H3FrameUnexpected;
+        } orelse return .need_more;
+        const frame_type = h3_frame.H3FrameType.fromInt(hdr.frame_type) orelse .unknown;
+        switch (frame_type) {
+            // RFC 9114 §7.2.1, §7.2.2
+            .data => {
+                self.closeWithError(.frame_unexpected, "DATA on control stream");
+                return error.H3FrameUnexpected;
+            },
+            .headers => {
+                self.closeWithError(.frame_unexpected, "HEADERS on control stream");
+                return error.H3FrameUnexpected;
+            },
+            else => {},
+        }
+        // RFC 9114 §6.2.1: SETTINGS must be the first frame on the control stream
+        if (!self.peer_settings_received and frame_type != .settings) {
+            self.closeWithError(.missing_settings, "non-SETTINGS first frame");
+            return error.H3MissingSettings;
+        }
+        switch (frame_type) {
+            .settings, .priority_update => if (hdr.length > MAX_CONTROL_FRAME) {
+                self.closeWithError(.excessive_load, "control frame too large");
+                return error.H3ExcessiveLoad;
+            },
+            // One varint each; anything longer is malformed (RFC 9114 §7.1).
+            .goaway, .cancel_push, .max_push_id => if (hdr.length > 8) {
+                self.closeWithError(.frame_error, "malformed frame");
+                return error.H3FrameError;
+            },
+            // Ignored frames are dropped as they arrive, never buffered whole.
+            else => {
+                h3_frame.consumeFromBuf(buf, hdr.len);
+                if (hdr.length > 0) try self.frame_progress.put(self.allocator, ctrl_id, .{ .skip = hdr.length });
+                return .progressed;
+            },
+        }
+        const total = hdr.len + @as(usize, @intCast(hdr.length));
+        if (buf.items.len < total) return .need_more;
 
-        const result = h3_frame.parse(buf.items) catch |err| {
-            if (err == error.BufferTooShort) return null;
+        const result = h3_frame.parse(buf.items[0..total]) catch |err| {
             // RFC 9114 §7: malformed frames → H3_FRAME_ERROR
             if (err == error.MalformedSettings) {
                 self.closeWithError(.frame_error, "malformed SETTINGS");
@@ -890,11 +967,6 @@ pub const H3Connection = struct {
                 self.closeWithError(.frame_error, "malformed frame");
                 return error.H3FrameError;
             }
-            // RFC 9114 §7.2.8: reserved HTTP/2 frame types
-            if (err == error.H3FrameUnexpected) {
-                self.closeWithError(.frame_unexpected, "HTTP/2 frame type on H3 control stream");
-                return error.H3FrameUnexpected;
-            }
             // RFC 9114 §7.2.4.1: reserved HTTP/2 settings
             if (err == error.H3SettingsError) {
                 self.closeWithError(.settings_error, "reserved HTTP/2 settings identifier");
@@ -902,13 +974,8 @@ pub const H3Connection = struct {
             }
             return err;
         };
-
-        // Consume the parsed frame
-        const remaining = buf.items.len - result.consumed;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, buf.items[0..remaining], buf.items[result.consumed..]);
-        }
-        buf.items.len = remaining;
+        // Handled before the buffer is compacted: payload slices point into it.
+        defer h3_frame.consumeFromBuf(buf, total);
 
         switch (result.frame) {
             .settings => |settings| {
@@ -919,14 +986,9 @@ pub const H3Connection = struct {
                 }
                 self.peer_settings_received = true;
                 self.peer_settings = settings;
-                return .{ .settings = settings };
+                return .{ .event = .{ .settings = settings } };
             },
             .goaway => |id| {
-                // RFC 9114 §7.2.4: SETTINGS must be first frame on control stream
-                if (!self.peer_settings_received) {
-                    self.closeWithError(.missing_settings, "GOAWAY before SETTINGS");
-                    return error.H3MissingSettings;
-                }
                 // RFC 9114 §5.2: successive GOAWAY IDs must not increase
                 if (self.peer_goaway_id) |prev| {
                     if (id > prev) {
@@ -935,39 +997,17 @@ pub const H3Connection = struct {
                     }
                 }
                 self.peer_goaway_id = id;
-                return .{ .goaway = id };
+                return .{ .event = .{ .goaway = id } };
             },
             .priority_update => |pu| {
-                // RFC 9114 §7.2.4: SETTINGS must be first frame on control stream
-                if (!self.peer_settings_received) {
-                    self.closeWithError(.missing_settings, "PRIORITY_UPDATE before SETTINGS");
-                    return error.H3MissingSettings;
-                }
                 const prio = priority.parse(pu.field_value);
                 if (self.quic_conn.streams.getStream(pu.stream_id)) |stream| {
                     stream.send.urgency = prio.urgency;
                     stream.send.incremental = prio.incremental;
                 }
-                return null; // Internal, don't surface as event
+                return .progressed; // Internal, don't surface as event
             },
-            // RFC 9114 §7.2.1: DATA frames on control stream are H3_FRAME_UNEXPECTED
-            .data => {
-                self.closeWithError(.frame_unexpected, "DATA on control stream");
-                return error.H3FrameUnexpected;
-            },
-            // RFC 9114 §7.2.2: HEADERS frames on control stream are H3_FRAME_UNEXPECTED
-            .headers => {
-                self.closeWithError(.frame_unexpected, "HEADERS on control stream");
-                return error.H3FrameUnexpected;
-            },
-            else => {
-                // RFC 9114 §7.2.4: unknown frame types on control stream before SETTINGS
-                if (!self.peer_settings_received) {
-                    self.closeWithError(.missing_settings, "non-SETTINGS first frame");
-                    return error.H3MissingSettings;
-                }
-                return null; // Ignore other frames on control stream
-            },
+            else => return .progressed,
         }
     }
 
@@ -1110,190 +1150,216 @@ pub const H3Connection = struct {
                 }
             }
 
-            // Take everything readable, not one chunk: returning null with data
-            // still in the stream would leave it there until the next packet.
-            // read() transfers ownership of heap-allocated data.
-            var got_data = false;
-            while (stream.recv.read()) |data| {
-                defer self.allocator.free(data);
-                got_data = true;
-                var new_buf_ptr = self.stream_bufs.getPtr(stream_id) orelse blk: {
-                    const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-                    try self.stream_bufs.put(stream_id, new_buf);
-                    break :blk self.stream_bufs.getPtr(stream_id).?;
-                };
-                try new_buf_ptr.appendSlice(self.allocator, data);
-            }
-            if (!got_data and stream.recv.finished) {
-                // Finished only once no buffered H3 data remains
-                const has_buffered = if (self.stream_bufs.getPtr(stream_id)) |b| b.items.len > 0 else false;
-                if (!has_buffered) {
-                    try self.finished_streams.put(stream_id, {});
-                    return .{ .finished = stream_id };
-                }
-            }
+            if (try self.pollRequestStream(stream_id, stream)) |ev| return ev;
+        }
 
-            // Try to parse H3 frames from buffered data (even without new recv data)
-            const buf = self.stream_bufs.getPtr(stream_id) orelse {
-                // Client: reset before a byte of response arrived, e.g. a
-                // request the server rejected. A server never surfaced it.
-                if (stream.recv.reset_err != null and !self.is_server) {
-                    const err_code = stream.recv.reset_err.?;
-                    if (try self.reportCancelled(stream_id, err_code)) |ev| return ev;
+        return null;
+    }
+
+    /// Advance one request stream to its next event.
+    ///
+    /// QUIC data is pulled a chunk at a time and only once the buffer can make
+    /// no further progress, and DATA payloads are surfaced as they arrive, so
+    /// nothing buffers a whole frame the peer declared: flow control, which
+    /// only credits what the application takes, holds the peer back instead.
+    fn pollRequestStream(self: *H3Connection, stream_id: u64, stream: *stream_mod.Stream) !?H3Event {
+        const rs = &stream.recv;
+        while (true) {
+            if (self.stream_bufs.getPtr(stream_id)) |buf| {
+                if (self.frame_progress.getPtr(stream_id)) |fp| switch (fp.*) {
+                    .data => |left| if (buf.items.len > 0) {
+                        const n: usize = @intCast(@min(left, buf.items.len));
+                        self.pending_body = .{ .stream_id = stream_id, .offset = 0, .remaining = n };
+                        return .{ .data = .{ .stream_id = stream_id, .len = n } };
+                    },
+                    .skip => if (self.skipBuffered(stream_id, fp, buf, rs)) continue,
+                } else if (buf.items.len > 0) {
+                    switch (try self.parseRequestFrame(stream_id, rs, buf)) {
+                        .event => |ev| return ev,
+                        .progressed => continue,
+                        .need_more => {},
+                    }
                 }
-                continue;
+            }
+            if (!try self.pullChunk(stream_id, rs, true)) break;
+        }
+
+        const buf = self.stream_bufs.getPtr(stream_id) orelse {
+            // Client: reset before a byte of response arrived, e.g. a
+            // request the server rejected. A server never surfaced it.
+            if (rs.reset_err != null and !self.is_server) {
+                return self.reportCancelled(stream_id, rs.reset_err.?);
+            }
+            return null;
+        };
+        // RFC 9114 §4.1.1: the peer cancelled. Everything that could be
+        // delivered has been; a partial frame never will be.
+        if (rs.reset_err) |err_code| return self.reportCancelled(stream_id, err_code);
+        if (!rs.finished) return null;
+        // RFC 9114 §7.1: a stream may not end mid-frame.
+        if (buf.items.len > 0 or self.frame_progress.contains(stream_id)) {
+            self.closeWithError(.frame_error, "request stream ended mid-frame");
+            return error.H3FrameError;
+        }
+        try self.finished_streams.put(stream_id, {});
+        return .{ .finished = stream_id };
+    }
+
+    /// Handle the frame at the front of a request stream's buffer.
+    fn parseRequestFrame(self: *H3Connection, stream_id: u64, rs: *stream_mod.ReceiveStream, buf: *std.ArrayList(u8)) !FrameStep {
+        const hdr = h3_frame.parseHeader(buf.items) catch {
+            self.closeWithError(.frame_unexpected, "HTTP/2 frame type on request stream");
+            return error.H3FrameUnexpected;
+        } orelse return .need_more;
+        switch (h3_frame.H3FrameType.fromInt(hdr.frame_type) orelse .unknown) {
+            // RFC 9114 §7.2.4: SETTINGS on bidi stream is H3_FRAME_UNEXPECTED
+            .settings, .goaway, .cancel_push, .max_push_id, .priority_update => {
+                self.closeWithError(.frame_unexpected, "control frame on request stream");
+                return error.H3FrameUnexpected;
+            },
+            .data => {
+                // RFC 9114 §4.1: DATA before HEADERS is H3_FRAME_UNEXPECTED
+                if (!self.headers_received_streams.contains(stream_id)) {
+                    self.consumeRequestBytes(rs, buf, hdr.len);
+                    self.closeWithError(.frame_unexpected, "DATA before HEADERS");
+                    return error.H3FrameUnexpected;
+                }
+                self.consumeRequestBytes(rs, buf, hdr.len);
+                if (hdr.length > 0) try self.frame_progress.put(self.allocator, stream_id, .{ .data = hdr.length });
+                return .progressed;
+            },
+            .headers => {
+                if (hdr.length > MAX_HEADERS_FRAME) {
+                    self.closeWithError(.excessive_load, "HEADERS frame too large");
+                    return error.H3ExcessiveLoad;
+                }
+                const total = hdr.len + @as(usize, @intCast(hdr.length));
+                if (buf.items.len < total) return .need_more;
+                return .{ .event = try self.handleHeadersFrame(stream_id, rs, buf, buf.items[hdr.len..total], total) };
+            },
+            // Unknown, reserved and unsupported frames are dropped as they
+            // arrive (RFC 9114 §9), never buffered whole.
+            else => {
+                self.consumeRequestBytes(rs, buf, hdr.len);
+                if (hdr.length > 0) try self.frame_progress.put(self.allocator, stream_id, .{ .skip = hdr.length });
+                return .progressed;
+            },
+        }
+    }
+
+    /// Decode a complete HEADERS frame and consume it from `buf`.
+    fn handleHeadersFrame(
+        self: *H3Connection,
+        stream_id: u64,
+        rs: *stream_mod.ReceiveStream,
+        buf: *std.ArrayList(u8),
+        qpack_data: []const u8,
+        frame_len: usize,
+    ) !H3Event {
+        var hdr_count: usize = 0;
+        const scratch = try self.qpackScratch();
+        if (self.qpack_decoder.decode(qpack_data, &self.headers_buf, scratch, stream_id)) |c| {
+            hdr_count = c;
+        } else |_| {
+            // Fallback to static-only decoder for compatibility
+            hdr_count = qpack.decodeHeaders(qpack_data, &self.headers_buf, scratch) catch {
+                // RFC 9204 §4.5.5: QPACK decompression failure
+                self.consumeRequestBytes(rs, buf, frame_len);
+                self.closeWithError(.qpack_decompression_failed, "QPACK decode failure");
+                return error.H3FrameError;
             };
+        }
+        // Decoded headers live in `scratch`, so the frame can go now.
+        self.consumeRequestBytes(rs, buf, frame_len);
+        const hdrs = self.headers_buf[0..hdr_count];
 
-            // Try to parse H3 frames from buffered data
-            while (buf.items.len > 0) {
-                const result = h3_frame.parse(buf.items) catch |err| {
-                    if (err == error.BufferTooShort) break;
-                    // RFC 9114 §7: malformed frames → H3_FRAME_ERROR
-                    if (err == error.MalformedSettings or err == error.MalformedGoaway or err == error.MalformedFrame) {
-                        stream.send.reset(@intFromEnum(H3Error.frame_error));
-                        stream.recv.stopSending(@intFromEnum(H3Error.frame_error));
-                        break;
-                    }
-                    if (err == error.H3FrameUnexpected) {
-                        self.closeWithError(.frame_unexpected, "HTTP/2 frame type on request stream");
-                        return error.H3FrameUnexpected;
-                    }
-                    if (err == error.H3SettingsError) {
-                        self.closeWithError(.settings_error, "reserved HTTP/2 settings identifier");
-                        return error.H3SettingsError;
-                    }
-                    return err;
-                };
+        // Flush decoder instructions (header ack)
+        self.flushDecoderInstructions() catch {};
 
-                // Process the frame BEFORE consuming from buffer
-                // (frame data slices point into buf.items)
-                switch (result.frame) {
-                    // RFC 9114 §7.2.4: SETTINGS on bidi stream is H3_FRAME_UNEXPECTED
-                    .settings, .goaway, .cancel_push, .max_push_id, .priority_update => {
-                        self.closeWithError(.frame_unexpected, "control frame on request stream");
-                        return error.H3FrameUnexpected;
-                    },
-                    .headers => |qpack_data| {
-                        var hdr_count: usize = 0;
-                        const scratch = try self.qpackScratch();
-                        if (self.qpack_decoder.decode(qpack_data, &self.headers_buf, scratch, stream_id)) |c| {
-                            hdr_count = c;
-                        } else |_| {
-                            // Fallback to static-only decoder for compatibility
-                            hdr_count = qpack.decodeHeaders(qpack_data, &self.headers_buf, scratch) catch {
-                                // RFC 9204 §4.5.5: QPACK decompression failure
-                                self.consumeFrameFromBuf(buf, result.consumed);
-                                self.closeWithError(.qpack_decompression_failed, "QPACK decode failure");
-                                return error.H3FrameError;
-                            };
-                        }
-                        const hdrs = self.headers_buf[0..hdr_count];
+        // RFC 9114 §4.1.2, §4.3: validate pseudo-headers
+        const valid = if (self.is_server)
+            validateRequestHeaders(hdrs)
+        else
+            validateResponseHeaders(hdrs);
+        if (!valid) {
+            self.closeWithError(.message_error, "invalid pseudo-headers");
+            return error.H3MessageError;
+        }
 
-                        // Flush decoder instructions (header ack)
-                        self.flushDecoderInstructions() catch {};
+        // Track that HEADERS was received on this stream
+        try self.headers_received_streams.put(stream_id, {});
 
-                        // RFC 9114 §4.1.2, §4.3: validate pseudo-headers
-                        const valid = if (self.is_server)
-                            validateRequestHeaders(hdrs)
-                        else
-                            validateResponseHeaders(hdrs);
-                        if (!valid) {
-                            self.consumeFrameFromBuf(buf, result.consumed);
-                            self.closeWithError(.message_error, "invalid pseudo-headers");
-                            return error.H3MessageError;
-                        }
-
-                        // Track that HEADERS was received on this stream
-                        try self.headers_received_streams.put(stream_id, {});
-
-                        // Check for Extended CONNECT (:method=CONNECT + :protocol)
-                        var method: ?[]const u8 = null;
-                        var proto: ?[]const u8 = null;
-                        var authority: []const u8 = "";
-                        var path: []const u8 = "";
-                        for (hdrs) |h_item| {
-                            if (std.mem.eql(u8, h_item.name, ":method")) method = h_item.value;
-                            if (std.mem.eql(u8, h_item.name, ":protocol")) proto = h_item.value;
-                            if (std.mem.eql(u8, h_item.name, ":authority")) authority = h_item.value;
-                            if (std.mem.eql(u8, h_item.name, ":path")) path = h_item.value;
-                            // RFC 9218: extract Priority header field
-                            if (std.mem.eql(u8, h_item.name, "priority")) {
-                                const prio = priority.parse(h_item.value);
-                                if (self.quic_conn.streams.getStream(stream_id)) |prio_stream| {
-                                    prio_stream.send.urgency = prio.urgency;
-                                    prio_stream.send.incremental = prio.incremental;
-                                }
-                            }
-                        }
-
-                        // Track highest processed client-initiated bidi stream (for GOAWAY)
-                        if (self.is_server and stream_mod.isClient(stream_id) and stream_mod.isBidi(stream_id)) {
-                            if (self.highest_processed_stream_id == null or stream_id > self.highest_processed_stream_id.?) {
-                                self.highest_processed_stream_id = stream_id;
-                            }
-                        }
-
-                        // Consume frame from buffer AFTER processing
-                        self.consumeFrameFromBuf(buf, result.consumed);
-
-                        if (method != null and std.mem.eql(u8, method.?, "CONNECT") and proto != null) {
-                            return .{ .connect_request = .{
-                                .stream_id = stream_id,
-                                .protocol = proto.?,
-                                .authority = authority,
-                                .path = path,
-                                .headers = hdrs,
-                            } };
-                        }
-
-                        return .{ .headers = .{
-                            .stream_id = stream_id,
-                            .headers = hdrs,
-                        } };
-                    },
-                    .data => |payload| {
-                        // RFC 9114 §4.1: DATA before HEADERS is H3_FRAME_UNEXPECTED
-                        if (!self.headers_received_streams.contains(stream_id)) {
-                            self.consumeFrameFromBuf(buf, result.consumed);
-                            self.closeWithError(.frame_unexpected, "DATA before HEADERS");
-                            return error.H3FrameUnexpected;
-                        }
-                        if (payload.len == 0) {
-                            self.consumeFrameFromBuf(buf, result.consumed);
-                            continue; // Skip zero-length DATA (nothing to surface)
-                        }
-                        // Don't consume from buffer — recvBody() will read
-                        // the payload and consume the full frame.
-                        const header_len = result.consumed - payload.len;
-                        self.pending_body = .{
-                            .stream_id = stream_id,
-                            .offset = header_len,
-                            .remaining = payload.len,
-                            .frame_total = result.consumed,
-                        };
-                        return .{ .data = .{
-                            .stream_id = stream_id,
-                            .len = payload.len,
-                        } };
-                    },
-                    else => {
-                        self.consumeFrameFromBuf(buf, result.consumed);
-                        continue;
-                    },
-                }
-            }
-
-            // RFC 9114 §4.1.1: detect peer cancellation after processing any buffered frames.
-            // Only report if no more H3 data is buffered (stream was truly cancelled, not just reset after completion).
-            if (stream.recv.reset_err) |err_code| {
-                const has_buffered = if (self.stream_bufs.getPtr(stream_id)) |b| b.items.len > 0 else false;
-                if (!has_buffered) {
-                    if (try self.reportCancelled(stream_id, err_code)) |ev| return ev;
+        // Check for Extended CONNECT (:method=CONNECT + :protocol)
+        var method: ?[]const u8 = null;
+        var proto: ?[]const u8 = null;
+        var authority: []const u8 = "";
+        var path: []const u8 = "";
+        for (hdrs) |h_item| {
+            if (std.mem.eql(u8, h_item.name, ":method")) method = h_item.value;
+            if (std.mem.eql(u8, h_item.name, ":protocol")) proto = h_item.value;
+            if (std.mem.eql(u8, h_item.name, ":authority")) authority = h_item.value;
+            if (std.mem.eql(u8, h_item.name, ":path")) path = h_item.value;
+            // RFC 9218: extract Priority header field
+            if (std.mem.eql(u8, h_item.name, "priority")) {
+                const prio = priority.parse(h_item.value);
+                if (self.quic_conn.streams.getStream(stream_id)) |prio_stream| {
+                    prio_stream.send.urgency = prio.urgency;
+                    prio_stream.send.incremental = prio.incremental;
                 }
             }
         }
 
-        return null;
+        // Track highest processed client-initiated bidi stream (for GOAWAY)
+        if (self.is_server and stream_mod.isClient(stream_id) and stream_mod.isBidi(stream_id)) {
+            if (self.highest_processed_stream_id == null or stream_id > self.highest_processed_stream_id.?) {
+                self.highest_processed_stream_id = stream_id;
+            }
+        }
+
+        if (method != null and std.mem.eql(u8, method.?, "CONNECT") and proto != null) {
+            return .{ .connect_request = .{
+                .stream_id = stream_id,
+                .protocol = proto.?,
+                .authority = authority,
+                .path = path,
+                .headers = hdrs,
+            } };
+        }
+
+        return .{ .headers = .{
+            .stream_id = stream_id,
+            .headers = hdrs,
+        } };
+    }
+
+    /// Move one more QUIC chunk into the stream's H3 buffer. False when QUIC
+    /// has nothing more yet. With `retain`, the bytes are credited to the
+    /// peer only as `consumeRequestBytes` lets them go.
+    fn pullChunk(self: *H3Connection, stream_id: u64, rs: *stream_mod.ReceiveStream, retain: bool) !bool {
+        const data = rs.read() orelse return false;
+        defer self.allocator.free(data);
+        const gop = try self.stream_bufs.getOrPut(stream_id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.appendSlice(self.allocator, data);
+        if (retain) rs.retained += data.len;
+        return true;
+    }
+
+    /// Drop `n` bytes from the front of a request stream's buffer and let
+    /// flow control credit them.
+    fn consumeRequestBytes(_: *H3Connection, rs: ?*stream_mod.ReceiveStream, buf: *std.ArrayList(u8), n: usize) void {
+        h3_frame.consumeFromBuf(buf, n);
+        if (rs) |r| r.retained -|= n;
+    }
+
+    /// Discard what is buffered of a skipped frame. True once it is gone.
+    fn skipBuffered(self: *H3Connection, stream_id: u64, fp: *FrameProgress, buf: *std.ArrayList(u8), rs: ?*stream_mod.ReceiveStream) bool {
+        const n: usize = @intCast(@min(fp.skip, buf.items.len));
+        self.consumeRequestBytes(rs, buf, n);
+        fp.skip -= n;
+        if (fp.skip > 0) return false;
+        _ = self.frame_progress.remove(stream_id);
+        return true;
     }
 
     /// The one `request_cancelled` a reset stream gets; null if already sent.
@@ -1302,11 +1368,6 @@ pub const H3Connection = struct {
         const gop = try self.cancelled_streams.getOrPut(self.allocator, stream_id);
         if (gop.found_existing) return null;
         return .{ .request_cancelled = .{ .stream_id = stream_id, .error_code = error_code } };
-    }
-
-    /// Consume `consumed` bytes from the front of a stream buffer.
-    fn consumeFrameFromBuf(_: *H3Connection, buf: *std.ArrayList(u8), consumed: usize) void {
-        h3_frame.consumeFromBuf(buf, consumed);
     }
 
     /// Process data from peer's QPACK encoder and decoder streams.
@@ -1374,6 +1435,7 @@ test "H3Connection: init and deinit" {
     conn.writable_waits = .empty;
     conn.paused_bodies = .empty;
     conn.response_states = .empty;
+    conn.frame_progress = .empty;
     conn.qpack_scratch_owned = false;
     conn.deinit();
 }
@@ -2814,4 +2876,155 @@ test "H3 pauseBody: a paused stream leaves its data unread in QUIC" {
     while (try h3.poll()) |_| {}
     // Nothing read, so no credit returned to the peer.
     try testing.expectEqual(@as(u64, n), stream.recv.bytes_read);
+}
+
+fn writeFrameHeaderBytes(buf: []u8, frame_type: u64, len: u64) []const u8 {
+    var fbs = io.fixedBufferStream(buf);
+    packet.writeVarInt(&fbs, frame_type) catch unreachable;
+    packet.writeVarInt(&fbs, len) catch unreachable;
+    return fbs.buffered();
+}
+
+test "H3: a huge DATA frame is surfaced as it arrives and held to the stream window" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, false);
+    const stream = quic_conn.streams.getStream(0).?;
+    var req_buf: [256]u8 = undefined;
+    var offset: u64 = buildGetRequestFrame(&req_buf);
+    const window: u64 = 64 * 1024;
+    stream.recv.receive_window = offset + window;
+    stream.recv.receive_window_size = window;
+
+    var hdr_buf: [16]u8 = undefined;
+    const hdr = writeFrameHeaderBytes(&hdr_buf, 0x00, (1 << 62) - 1);
+    try stream.recv.handleStreamFrame(offset, hdr, false);
+    offset += hdr.len;
+
+    // The first piece is surfaced without waiting for the rest of the frame.
+    const chunk = [_]u8{0x41} ** 16384;
+    try stream.recv.handleStreamFrame(offset, &chunk, false);
+    offset += chunk.len;
+    const ev = (try h3.poll()).?;
+    try testing.expect(ev == .data);
+    try testing.expectEqual(chunk.len, ev.data.len);
+
+    // Paused before taking it: nothing more is read, nothing credited.
+    try h3.pauseBody(0);
+    while (offset + chunk.len <= stream.recv.receive_window) : (offset += chunk.len) {
+        try stream.recv.handleStreamFrame(offset, &chunk, false);
+    }
+    try testing.expect(try h3.poll() == null);
+    try testing.expect(h3.stream_bufs.get(0).?.items.len <= chunk.len);
+    try testing.expect(stream.recv.getWindowUpdate() == null);
+    try testing.expectError(error.FlowControlError, stream.recv.handleStreamFrame(offset, &chunk, false));
+
+    // Resumed and drained: the window re-opens for what was taken.
+    h3.resumeBody(0);
+    var sink: [4096]u8 = undefined;
+    var taken: usize = 0;
+    while (try h3.poll()) |e| {
+        try testing.expect(e == .data);
+        while (true) {
+            const n = h3.recvBody(&sink);
+            if (n == 0) break;
+            taken += n;
+        }
+    }
+    try testing.expectEqual(@as(usize, @intCast(window - hdr.len - (window - hdr.len) % chunk.len)), taken);
+    try testing.expectEqual(stream.recv.bytes_read, stream.recv.consumed());
+    try testing.expect(stream.recv.getWindowUpdate().? > offset);
+}
+
+test "H3: a HEADERS frame past the size cap is refused before it is buffered" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var hdr_buf: [16]u8 = undefined;
+    try injectBidiStreamData(&quic_conn, 0, writeFrameHeaderBytes(&hdr_buf, 0x01, MAX_HEADERS_FRAME + 1), false);
+    try testing.expectError(error.H3ExcessiveLoad, h3.poll());
+    try testing.expectEqual(@as(u64, @intFromEnum(H3Error.excessive_load)), quic_conn.local_err.?.code);
+}
+
+test "H3: an unknown frame on a request stream is skipped as it arrives" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, false);
+    const stream = quic_conn.streams.getStream(0).?;
+    var req_buf: [256]u8 = undefined;
+    var offset: u64 = buildGetRequestFrame(&req_buf);
+
+    var hdr_buf: [16]u8 = undefined;
+    const hdr = writeFrameHeaderBytes(&hdr_buf, 0x21, 1 << 40); // reserved type
+    try stream.recv.handleStreamFrame(offset, hdr, false);
+    offset += hdr.len;
+    const chunk = [_]u8{0x42} ** 16384;
+    for (0..16) |_| {
+        try stream.recv.handleStreamFrame(offset, &chunk, false);
+        offset += chunk.len;
+        try testing.expect(try h3.poll() == null);
+        try testing.expectEqual(@as(usize, 0), h3.stream_bufs.get(0).?.items.len);
+    }
+    // Discarded bytes are credited like consumed ones.
+    try testing.expectEqual(offset, stream.recv.consumed());
+}
+
+test "H3: a request stream ending mid-frame is a frame error" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, false);
+    const stream = quic_conn.streams.getStream(0).?;
+    var req_buf: [256]u8 = undefined;
+    const offset: u64 = buildGetRequestFrame(&req_buf);
+
+    var frame_buf: [32]u8 = undefined;
+    const hdr = writeFrameHeaderBytes(&frame_buf, 0x00, 100);
+    try stream.recv.handleStreamFrame(offset, hdr, true);
+    try testing.expectError(error.H3FrameError, h3.poll());
+    try testing.expectEqual(@as(u64, @intFromEnum(H3Error.frame_error)), quic_conn.local_err.?.code);
+}
+
+test "H3 control stream: unknown frames are skipped as they arrive, oversized SETTINGS refused" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+    const rs = quic_conn.streams.recv_streams.get(2).?;
+    var offset: u64 = rs.bytes_read;
+
+    var hdr_buf: [16]u8 = undefined;
+    const hdr = writeFrameHeaderBytes(&hdr_buf, 0x21, 1 << 40);
+    try rs.handleStreamFrame(offset, hdr, false);
+    offset += hdr.len;
+    const chunk = [_]u8{0x43} ** 16384;
+    for (0..8) |_| {
+        try rs.handleStreamFrame(offset, &chunk, false);
+        offset += chunk.len;
+        try testing.expect(try h3.poll() == null);
+        try testing.expectEqual(@as(usize, 0), h3.stream_bufs.get(2).?.items.len);
+    }
+
+    var quic_conn2 = createTestQuicConn(true);
+    defer quic_conn2.deinit();
+    var h3b = H3Connection.init(testing.allocator, &quic_conn2, true);
+    defer h3b.deinit();
+    try h3b.initConnection();
+    var buf: [32]u8 = undefined;
+    buf[0] = 0x00; // control stream type
+    const settings = writeFrameHeaderBytes(buf[1..], 0x04, MAX_CONTROL_FRAME + 1);
+    try injectUniStreamData(&quic_conn2, 2, buf[0 .. 1 + settings.len], false);
+    try testing.expectError(error.H3ExcessiveLoad, h3b.poll());
+    try testing.expectEqual(@as(u64, @intFromEnum(H3Error.excessive_load)), quic_conn2.local_err.?.code);
 }
