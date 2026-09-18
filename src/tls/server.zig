@@ -341,14 +341,10 @@ pub const Conn = struct {
     /// most 16 KiB. Only valid once `handshakeComplete()`.
     pub fn write(self: *Conn, data: []const u8) Error!void {
         if (self.state != .connected or self.close_sent) return error.NotConnected;
-        if (data.len == 0) return;
-        var rest = data;
-        while (true) {
-            const n = @min(rest.len, max_plaintext);
+        var records = mem.window(u8, data, max_plaintext, max_plaintext);
+        while (records.next()) |record| {
             try self.maybeRotateWriteKeys();
-            try self.sealRecord(.application_data, rest[0..n]);
-            rest = rest[n..];
-            if (rest.len == 0) break;
+            try self.sealRecord(.application_data, record);
         }
     }
 
@@ -554,26 +550,18 @@ pub const Conn = struct {
     }
 
     fn writePlainRecords(self: *Conn, content_type: u8, data: []const u8) Error!void {
-        var rest = data;
-        while (true) {
-            const n = @min(rest.len, max_plaintext);
-            const dst = try self.reserveOutput(tls.record_header_len + n);
+        var records = mem.window(u8, data, max_plaintext, max_plaintext);
+        while (records.next()) |record| {
+            const dst = try self.reserveOutput(tls.record_header_len + record.len);
             dst[0..3].* = .{ content_type, 0x03, 0x03 };
-            mem.writeInt(u16, dst[3..5], @intCast(n), .big);
-            @memcpy(dst[tls.record_header_len..], rest[0..n]);
-            rest = rest[n..];
-            if (rest.len == 0) break;
+            mem.writeInt(u16, dst[3..5], @intCast(record.len), .big);
+            @memcpy(dst[tls.record_header_len..], record);
         }
     }
 
     fn writeProtected(self: *Conn, inner: tls.ContentType, data: []const u8) Error!void {
-        var rest = data;
-        while (true) {
-            const n = @min(rest.len, max_plaintext);
-            try self.sealRecord(inner, rest[0..n]);
-            rest = rest[n..];
-            if (rest.len == 0) break;
-        }
+        var records = mem.window(u8, data, max_plaintext, max_plaintext);
+        while (records.next()) |record| try self.sealRecord(inner, record);
     }
 
     fn reserveOutput(self: *Conn, n: usize) Error![]u8 {
@@ -1330,12 +1318,7 @@ fn openTicket(key: [16]u8, blob: []const u8, plain: *[max_ticket_len]u8) ?Ticket
 
     var p: Parser = .{ .buf = plain[0..n] };
     if ((p.int(u8) catch return null) != ticket_version) return null;
-    const suite: CipherSuite = switch (p.int(u16) catch return null) {
-        0x1301 => .aes_128_gcm_sha256,
-        0x1302 => .aes_256_gcm_sha384,
-        0x1303 => .chacha20_poly1305_sha256,
-        else => return null,
-    };
+    const suite = std.enums.fromInt(CipherSuite, p.int(u16) catch return null) orelse return null;
     const issued = p.int(i64) catch return null;
     const sni = p.vec(u8) catch return null;
     if (p.rest() != hashLen(suite)) return null;
