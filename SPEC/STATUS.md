@@ -291,6 +291,7 @@
 |----------|---------|------|--------|
 | ~~P2~~ | ~~§7.1~~ | ~~ECN IP-level marking + CE response~~ | ~~Done~~ |
 | ~~P3~~ | ~~§7.8~~ | ~~Application-limited cwnd tracking~~ | ~~Done~~ |
+| P2 | §6.2.1 | Bursty loss (~9%, Gilbert-Elliott, both directions) can outlast the connection. Once a sender is down to PTO probes, each round is two probes and one ACK, so a burst that spans them fails the round and doubles the next wait; about nine failed rounds put the next probe past the 30 s idle timeout. The backoff is the RFC's MUST, so avoiding this is a policy choice (a backoff ceiling well under the idle timeout, or an idle timeout that grows with the backoff). Reproduced on a virtual clock by `src/quic/lossy_link_test.zig` | M |
 
 ---
 
