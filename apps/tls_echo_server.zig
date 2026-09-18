@@ -45,11 +45,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const key_pem = try sys.readFileAlloc(gpa, key_path, 1 << 20);
     var key_der_buf: [4096]u8 = undefined;
     const key_der = try tls13.parsePemPrivateKey(key_pem, &key_der_buf);
-    const key = tls13.extractEcPrivateKey(key_der) catch try tls13.extractPkcs8EcPrivateKey(key_der);
+    const key = try tls13.extractPrivateKey(key_der);
 
     const entries = [_]tls_server.CertEntry{.{
         .server_names = &.{"localhost"},
-        .cert = .{ .cert_chain_der = chain, .private_key_bytes = key },
+        .cert = .{ .cert_chain_der = chain, .private_key_bytes = key.bytes, .private_key_algorithm = key.algorithm },
     }};
     var config: tls_server.Config = .{ .certs = &entries, .alpn = &.{"http/1.1"} };
     if (tickets) {

@@ -534,12 +534,19 @@ test "fuzz: qpack encode-decode round-trip" {
 // ════════════════════════════════════════════════════════
 // Target 17: DER Private Key Extraction
 //
-// Parses EC (RFC 5915) and PKCS#8 DER-encoded private
-// keys. Tests ASN.1 SEQUENCE/OCTET STRING walking,
+// Parses EC (RFC 5915), PKCS#8 and RSA (PKCS#1) DER-encoded
+// private keys. Tests ASN.1 SEQUENCE/OCTET STRING walking,
 // length byte handling, boundary checks.
 // ════════════════════════════════════════════════════════
 
 test "fuzz: der key extraction" {
+    const test_certs = @import("tls/test_certs.zig");
+    var pkcs1_buf: [2048]u8 = undefined;
+    var pkcs8_buf: [2048]u8 = undefined;
+    const seeds = [_][]const u8{
+        try tls13.parsePemPrivateKey(test_certs.test_rsa_key_pkcs1_pem, &pkcs1_buf),
+        try tls13.parsePemPrivateKey(test_certs.test_rsa_key_pem, &pkcs8_buf),
+    };
     try testing.fuzz({}, struct {
         fn f(_: void, smith: *std.testing.Smith) anyerror!void {
             const input = smith.in orelse return;
@@ -553,8 +560,15 @@ test "fuzz: der key extraction" {
             if (tls13.extractPkcs8EcPrivateKey(input)) |key| {
                 if (key.len != 32) @panic("PKCS#8 key not 32 bytes");
             } else |_| {}
+
+            // RSA: PKCS#1 directly, and wrapped in PKCS#8
+            const rsa = tls13.rsa.PrivateKey;
+            const pkcs1 = rsa.pkcs1FromPkcs8(input) catch input;
+            if (rsa.parsePkcs1(pkcs1)) |key| {
+                if (key.modulusBits() < tls13.rsa.min_bits or key.n.len > tls13.rsa.max_signature_len) @panic("RSA modulus out of range");
+            } else |_| {}
         }
-    }.f, .{});
+    }.f, .{ .corpus = &seeds });
 }
 
 // ════════════════════════════════════════════════════════
