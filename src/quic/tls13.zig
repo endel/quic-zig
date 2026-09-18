@@ -3072,6 +3072,40 @@ pub fn extractPrivateKey(der: []const u8) error{ UnsupportedKey, InvalidKey }!Pr
     return .{ .bytes = k, .algorithm = .rsa };
 }
 
+/// Whether `key` is the private half of the public key in `cert_der`, a
+/// leaf certificate. A certificate whose key is of another type does not
+/// match. Catches a key and certificate paired by mistake, which would
+/// otherwise fail every handshake.
+pub fn keyMatchesCertificate(key: PrivateKey, cert_der: []const u8) error{BadCertificate}!bool {
+    const parsed = (Certificate{ .buffer = cert_der, .index = 0 }).parse() catch return error.BadCertificate;
+    const pub_key = parsed.pubKey();
+    switch (key.algorithm) {
+        .ecdsa_p256_sha256 => {
+            if (parsed.pub_key_algo != .X9_62_id_ecPublicKey or parsed.pub_key_algo.X9_62_id_ecPublicKey != .X9_62_prime256v1) return false;
+            if (key.bytes.len != 32) return false;
+            const cert_point = P256.fromSec1(pub_key) catch return error.BadCertificate;
+            const derived = P256.basePoint.mul(key.bytes[0..32].*, .big) catch return false;
+            return derived.equivalent(cert_point);
+        },
+        .ed25519 => {
+            if (parsed.pub_key_algo != .curveEd25519 or key.bytes.len != 32) return false;
+            const kp = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(key.bytes[0..32].*) catch return false;
+            return std.mem.eql(u8, &kp.public_key.toBytes(), pub_key);
+        },
+        .rsa => {
+            if (parsed.pub_key_algo != .rsaEncryption) return false;
+            const priv = rsa.PrivateKey.parsePkcs1(key.bytes) catch return false;
+            const public = Certificate.rsa.PublicKey.parseDer(pub_key) catch return error.BadCertificate;
+            return std.mem.eql(u8, trimLeadingZeros(priv.n), trimLeadingZeros(public.modulus)) and
+                std.mem.eql(u8, trimLeadingZeros(priv.e), trimLeadingZeros(public.exponent));
+        },
+    }
+}
+
+fn trimLeadingZeros(v: []const u8) []const u8 {
+    return std.mem.trimStart(u8, v, &.{0});
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────
 
 test "TranscriptHash: basic usage" {
@@ -3992,6 +4026,34 @@ fn serverAnswer(cert: ServerCertificate, schemes: ?[5]tls.SignatureScheme) !void
             else => {},
         }
     }
+}
+
+test "keyMatchesCertificate: each key type against its own and a foreign certificate" {
+    var tc: test_certs.TestCerts = undefined;
+    try tc.load();
+    var rsa_cert: test_certs.RsaCert = undefined;
+    try rsa_cert.load(false);
+    const ec: PrivateKey = .{ .bytes = tc.entries[0].cert.private_key_bytes, .algorithm = .ecdsa_p256_sha256 };
+    const ed: PrivateKey = .{ .bytes = tc.entries[2].cert.private_key_bytes, .algorithm = .ed25519 };
+    const rsa_key: PrivateKey = .{ .bytes = rsa_cert.cert.private_key_bytes, .algorithm = .rsa };
+    const ec_cert = tc.chains[0][0];
+    const ed_cert = tc.chains[2][0];
+    const rsa_leaf = rsa_cert.chain[0];
+
+    try std.testing.expect(try keyMatchesCertificate(ec, ec_cert));
+    try std.testing.expect(try keyMatchesCertificate(ed, ed_cert));
+    try std.testing.expect(try keyMatchesCertificate(rsa_key, rsa_leaf));
+    try std.testing.expect(!try keyMatchesCertificate(ec, rsa_leaf));
+    try std.testing.expect(!try keyMatchesCertificate(ed, ec_cert));
+    try std.testing.expect(!try keyMatchesCertificate(rsa_key, ed_cert));
+
+    // Same type, another key.
+    var der: [1024]u8 = undefined;
+    const other_ec_cert = try parsePemCert(test_certs.interop_server_pem, &der);
+    try std.testing.expect(!try keyMatchesCertificate(ec, other_ec_cert));
+    var pkcs1: test_certs.RsaCert = undefined;
+    try pkcs1.load(true);
+    try std.testing.expect(try keyMatchesCertificate(.{ .bytes = pkcs1.cert.private_key_bytes, .algorithm = .rsa }, rsa_leaf));
 }
 
 test "a QUIC server fails a client that offers no scheme for its certificate" {
