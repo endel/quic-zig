@@ -1921,19 +1921,9 @@ pub const Connection = struct {
                 }
                 if (self.streams.getStream(rs.stream_id)) |s| {
                     s.recv.handleResetStream(rs.error_code, rs.final_size) catch |err| return self.rejectResetStream(err);
-                    // RFC 9000 §4.4: account for final_size in connection flow control
-                    self.conn_flow_ctrl.base.addBytesReceived(rs.final_size) catch {
-                        self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM exceeds flow control");
-                        return error.FlowControlError;
-                    };
-                    // Credit the bytes between what arrived and the final size,
-                    // so the connection window advances past a stream whose tail
-                    // will never be delivered. The bytes that did arrive were
-                    // already credited by the STREAM handler.
-                    const credited = s.recv.sorter.highestReceived();
-                    if (rs.final_size > credited) {
-                        self.conn_flow_ctrl.addBytesRead(rs.final_size - credited);
-                    }
+                    // RFC 9000 §4.5: the final size counts once; the credit
+                    // comes back when queueFlowControlUpdates harvests it.
+                    try self.chargeConnWindow(&s.recv, rs.final_size, .reset_stream);
                     // If send side is also done, stream is fully closed
                     if (s.send.fin_sent or s.send.reset_err != null) {
                         self.streams.closeStream(rs.stream_id);
@@ -1944,14 +1934,7 @@ pub const Connection = struct {
                     // we have to release that credit here or the connection
                     // stalls at the window even though the bytes never arrived.
                     s.handleResetStream(rs.error_code, rs.final_size) catch |err| return self.rejectResetStream(err);
-                    self.conn_flow_ctrl.base.addBytesReceived(rs.final_size) catch {
-                        self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM exceeds flow control");
-                        return error.FlowControlError;
-                    };
-                    const credited = s.sorter.highestReceived();
-                    if (rs.final_size > credited) {
-                        self.conn_flow_ctrl.addBytesRead(rs.final_size - credited);
-                    }
+                    try self.chargeConnWindow(s, rs.final_size, .reset_stream);
                     if (!s.closed_counted) {
                         s.closed_counted = true;
                         self.streams.closeStream(rs.stream_id);
@@ -2018,11 +2001,6 @@ pub const Connection = struct {
                     self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stream), "STREAM for locally-initiated stream not yet created");
                     return error.ProtocolViolation;
                 }
-                // RFC 9000 §4.1: STREAM frame offset exceeding flow control limit
-                if (s.offset + s.data.len > self.conn_flow_ctrl.base.receive_window) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.stream), "STREAM exceeds connection flow control limit");
-                    return error.FlowControlError;
-                }
                 // RFC 9000 §4.6: stream ID exceeding peer's MAX_STREAMS limit
                 {
                     const stream_seq = s.stream_id / 4;
@@ -2043,6 +2021,7 @@ pub const Connection = struct {
                             return;
                         },
                     };
+                    try self.chargeConnWindow(&strm.recv, s.offset + s.data.len, .stream);
                     strm.recv.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
                         error.FinalSizeError => {
                             self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
@@ -2077,6 +2056,7 @@ pub const Connection = struct {
                             return;
                         },
                     };
+                    try self.chargeConnWindow(recv_strm, s.offset + s.data.len, .stream);
                     recv_strm.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
                         error.FinalSizeError => {
                             self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
@@ -2100,10 +2080,6 @@ pub const Connection = struct {
                         self.streams.closeStream(s.stream_id);
                     }
                 }
-
-                // Update flow control
-                try self.conn_flow_ctrl.base.addBytesReceived(s.offset + s.data.len);
-                self.conn_flow_ctrl.addBytesRead(s.data.len);
             },
 
             .max_data => |max| {
@@ -3075,6 +3051,9 @@ pub const Connection = struct {
         // and MAX_STREAMS updates can fire.
         self.streams.collectClosedStreams();
 
+        // MAX_DATA grows only with what the consumer took or a reset abandoned.
+        self.conn_flow_ctrl.addBytesRead(self.streams.takeConnCredit());
+
         // Credit generators commit the new limit as they return it, so each
         // one runs only when its frame is sure to fit.
         if (self.pending_frames.hasRoomFor(1)) {
@@ -3155,6 +3134,21 @@ pub const Connection = struct {
             .stream_id = rs.stream_id,
             .error_code = rs.stop_sending_err.?,
         } });
+    }
+
+    /// RFC 9000 4.1: the connection window bounds the sum over streams of each
+    /// stream's highest offset (or final size), so only growth past what the
+    /// stream already charged counts — a retransmission charges nothing.
+    fn chargeConnWindow(self: *Connection, rs: *stream_mod.ReceiveStream, end: u64, frame_type: FrameType) error{FlowControlError}!void {
+        if (end <= rs.conn_counted) return;
+        // Data after a reset is dropped, and its final size already counted.
+        if (frame_type == .stream and rs.reset_err != null) return;
+        const fc = &self.conn_flow_ctrl.base;
+        fc.addBytesReceived(fc.highest_received + (end - rs.conn_counted)) catch {
+            self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(frame_type), "data exceeds connection flow control limit");
+            return error.FlowControlError;
+        };
+        rs.conn_counted = end;
     }
 
     /// Queue a frame the peer must eventually see, holding it back if the
@@ -5692,7 +5686,8 @@ test "RESET_STREAM on a peer uni stream releases connection flow control" {
     } }, .application, 0);
 
     // The peer counted all 100 bytes against the connection window when it
-    // sent them; without crediting the 90 that never arrived we stall short.
+    // sent them; the 10 unread and the 90 that never arrived are all credited.
+    conn.queueFlowControlUpdates();
     try std.testing.expectEqual(@as(u64, 100), conn.conn_flow_ctrl.base.highest_received);
     try std.testing.expectEqual(@as(u64, 100), conn.conn_flow_ctrl.base.bytes_read);
     try std.testing.expect(conn.conn_flow_ctrl.base.receive_window >= before);
@@ -5808,6 +5803,7 @@ test "RESET_STREAM opens a uni stream we had not heard of" {
     } }, .application, 0);
 
     try std.testing.expect(conn.streams.recv_streams.get(2) != null);
+    conn.queueFlowControlUpdates();
     try std.testing.expectEqual(@as(u64, 500), conn.conn_flow_ctrl.base.bytes_read);
     try std.testing.expectEqual(@as(u64, 1), conn.streams.consumed_uni_streams);
 }
@@ -6550,4 +6546,65 @@ test "NEW_CONNECTION_ID: unacked retirements past twice the limit close the conn
 
     try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 51, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0));
     try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.connection_id_limit_error)), conn.local_err.?.code);
+}
+
+test "connection flow control: the window bounds the sum over streams" {
+    const alloc = std.testing.allocator;
+    var conn = testConnection(alloc);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(100, 100);
+    const win = conn.conn_flow_ctrl.base.receive_window;
+    const buf = try alloc.alloc(u8, @intCast(win / 2));
+    defer alloc.free(buf);
+    @memset(buf, 'z');
+
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = buf.len, .data = buf, .fin = false } }, .application, 0);
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 4, .offset = 0, .length = buf.len, .data = buf, .fin = false } }, .application, 0);
+    // A retransmission of counted bytes charges nothing.
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = buf.len, .data = buf, .fin = false } }, .application, 0);
+    try std.testing.expectEqual(win, conn.conn_flow_ctrl.base.highest_received);
+    try std.testing.expect(conn.local_err == null);
+
+    // Each stream is well inside its own window, but the sum is not.
+    try std.testing.expectError(error.FlowControlError, conn.processFrame(&.{ .stream = .{ .stream_id = 8, .offset = 0, .length = 1, .data = buf[0..1], .fin = false } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.flow_control_error)), conn.local_err.?.code);
+}
+
+test "connection flow control: MAX_DATA is granted for data read, not data received" {
+    const alloc = std.testing.allocator;
+    var conn = testConnection(alloc);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(100, 100);
+    const win = conn.conn_flow_ctrl.base.receive_window;
+    const buf = try alloc.alloc(u8, @intCast(win));
+    defer alloc.free(buf);
+    @memset(buf, 'z');
+
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = buf.len, .data = buf, .fin = false } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(win, conn.conn_flow_ctrl.base.receive_window);
+    try std.testing.expectEqual(@as(u64, 0), conn.conn_flow_ctrl.base.bytes_read);
+
+    const rs = &conn.streams.getStream(0).?.recv;
+    while (rs.read()) |d| alloc.free(d);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(win, conn.conn_flow_ctrl.base.bytes_read);
+    try std.testing.expect(conn.conn_flow_ctrl.base.receive_window > win);
+}
+
+test "connection flow control: a repeated RESET_STREAM counts its final size once" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    var payload = "0123456789".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = payload.len, .data = &payload, .fin = false } }, .application, 0);
+    const reset: Frame = .{ .reset_stream = .{ .stream_id = 0, .error_code = 1, .final_size = 1000 } };
+    try conn.processFrame(&reset, .application, 0);
+    try conn.processFrame(&reset, .application, 0);
+    conn.queueFlowControlUpdates();
+    conn.queueFlowControlUpdates();
+
+    try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.highest_received);
+    try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.bytes_read);
 }

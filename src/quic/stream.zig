@@ -305,6 +305,12 @@ pub const ReceiveStream = struct {
     receive_window: u64 = std.math.maxInt(u64),
     receive_window_size: u64 = 0,
 
+    /// Connection-level flow control (RFC 9000 4.1): the highest offset, or
+    /// final size, this stream has charged against MAX_DATA, and how much of
+    /// that has been handed back as consumed or abandoned.
+    conn_counted: u64 = 0,
+    conn_credited: u64 = 0,
+
     pub fn init(allocator: Allocator, stream_id: u64) ReceiveStream {
         return .{
             .stream_id = stream_id,
@@ -360,6 +366,22 @@ pub const ReceiveStream = struct {
             self.finished = true;
         }
         return data;
+    }
+
+    /// Connection credit newly earned since the last call: what the consumer
+    /// has read, or everything charged once the peer has reset the stream
+    /// (its unread data will never be read).
+    pub fn takeConnCredit(self: *ReceiveStream) u64 {
+        const upto = if (self.reset_err != null) self.conn_counted else @min(self.bytes_read, self.conn_counted);
+        if (upto <= self.conn_credited) return 0;
+        const n = upto - self.conn_credited;
+        self.conn_credited = upto;
+        return n;
+    }
+
+    /// Connection credit still held by this stream, returned when it is freed.
+    fn connCreditLeft(self: *const ReceiveStream) u64 {
+        return self.conn_counted -| self.conn_credited;
     }
 
     /// Check if a MAX_STREAM_DATA update should be sent.
@@ -1062,6 +1084,9 @@ pub const StreamsMap = struct {
     /// Avoids O(n) scan on every send() when no streams are closing.
     needs_gc_scan: bool = false,
 
+    /// Connection credit held by receive streams that have since been freed.
+    freed_conn_credit: u64 = 0,
+
     pub fn init(allocator: Allocator, is_server: bool) StreamsMap {
         // Stream IDs: client bidi = 0, 4, 8, ...; server bidi = 1, 5, 9, ...
         // Client uni = 2, 6, 10, ...; server uni = 3, 7, 11, ...
@@ -1503,6 +1528,18 @@ pub const StreamsMap = struct {
         if (!ss.disposal_queued) self.send_disposal_overflow = true;
     }
 
+    /// Connection credit (RFC 9000 4.1) earned across all receive streams
+    /// since the last call: data consumed, streams reset, streams freed.
+    pub fn takeConnCredit(self: *StreamsMap) u64 {
+        var n = self.freed_conn_credit;
+        self.freed_conn_credit = 0;
+        var it = self.streams.valueIterator();
+        while (it.next()) |s| n += s.*.recv.takeConnCredit();
+        var recv_it = self.recv_streams.valueIterator();
+        while (recv_it.next()) |rs| n += rs.*.takeConnCredit();
+        return n;
+    }
+
     /// Queue a stream for removal. O(1) — called when a stream is known to be
     /// fully closed (closed_for_gc set, no pending retransmissions).
     /// Returns false when the queue is full; the caller must try again later.
@@ -1523,11 +1560,13 @@ pub const StreamsMap = struct {
         for (self.disposal_queue[0..self.disposal_count]) |id| {
             if (self.streams.fetchRemove(id)) |kv| {
                 var s = kv.value;
+                self.freed_conn_credit += s.recv.connCreditLeft();
                 s.deinit();
                 self.allocator.destroy(s);
             }
             if (self.recv_streams.fetchRemove(id)) |kv| {
                 var rs = kv.value;
+                self.freed_conn_credit += rs.connCreditLeft();
                 rs.deinit();
                 self.allocator.destroy(rs);
             }

@@ -16,7 +16,7 @@
 | 3.4 | Bidirectional Stream States | ✅ Done | Composite of send + recv states; reclaimed once fully acked — see [RFC9000_3.md](RFC9000_3.md) |
 | 3.5 | Solicited State Transitions | ✅ Done | STOP_SENDING triggers RESET_STREAM |
 | **4** | **Flow Control** | | |
-| 4.1 | Data Flow Control | ✅ Done | Connection + stream level. Each receive stream's window is enforced on STREAM and RESET_STREAM (FLOW_CONTROL_ERROR), and re-granted by MAX_STREAM_DATA as data is read, peer uni streams included. Connection-level receive accounting is weaker: see the caveat in [RFC9000_3.md](RFC9000_3.md). The send credit left is exposed to applications as `sendCapacity` / `streamSendCapacity` |
+| 4.1 | Data Flow Control | ✅ Done | Connection + stream level. Each receive stream's window is enforced on STREAM and RESET_STREAM (FLOW_CONTROL_ERROR), and re-granted by MAX_STREAM_DATA as data is read, peer uni streams included. The connection window bounds the sum of every stream's highest offset (final size on reset, counted once) and MAX_DATA is re-granted only as data is read or abandoned: see [RFC9000_3.md](RFC9000_3.md). The send credit left is exposed to applications as `sendCapacity` / `streamSendCapacity` |
 | 4.2 | Increasing Flow Control Limits | ✅ Done | Auto-tuning window (up to 6MB) |
 | 4.3 | Flow Control Performance | ✅ Done | Auto-tuning prevents stalls |
 | 4.4 | Handling Stream Cancellation | ✅ Done | RESET_STREAM/STOP_SENDING, final_size validation, conn flow ctrl accounting |
