@@ -275,6 +275,9 @@ pub const Conn = struct {
     early_data_skip: usize = 0,
     peer_closed: bool = false,
     close_sent: bool = false,
+    /// The peer asked for a KeyUpdate; one is sent before our next record,
+    /// however many requests arrive first (RFC 8446 4.6.3).
+    key_update_owed: bool = false,
     peer_alert: ?tls.Alert.Description = null,
 
     selected_alpn: ?[]const u8 = null,
@@ -590,7 +593,8 @@ pub const Conn = struct {
     }
 
     fn maybeRotateWriteKeys(self: *Conn) Error!void {
-        if (self.write_keys.?.seq < key_update_after) return;
+        if (!self.key_update_owed and self.write_keys.?.seq < key_update_after) return;
+        self.key_update_owed = false;
         try self.sendKeyUpdate(false);
     }
 
@@ -922,8 +926,9 @@ pub const Conn = struct {
         if (body.len != 1) return error.DecodeError;
         if (body[0] > 1) return error.IllegalParameter;
         self.read_keys = self.read_keys.?.next(self.suite);
-        // Once close_notify is out we may send nothing more (RFC 8446 §6.1).
-        if (body[0] == 1 and !self.close_sent) try self.sendKeyUpdate(false);
+        // Owed rather than sent now, so a peer that floods requests and never
+        // reads gets one reply per record we write, not one per request.
+        if (body[0] == 1) self.key_update_owed = true;
     }
 };
 
@@ -2321,6 +2326,28 @@ test "KeyUpdate from the client, with and without update_requested" {
 
     // update_requested must be 0 or 1.
     try testing.expectError(error.IllegalParameter, client.sendProtected(&conn, .handshake, &.{ hs_key_update, 0, 0, 1, 2 }));
+}
+
+test "repeated KeyUpdate requests are answered once, before our next record" {
+    var certs: TestCerts = undefined;
+    try certs.load();
+    const config: Config = .{ .certs = &certs.entries };
+    var conn = Conn.init(testing.allocator, &config);
+    defer conn.deinit();
+    var client: MiniClient = .{ .gpa = testing.allocator };
+    defer client.deinit();
+    try client.handshake(&conn);
+    conn.consumeOutput(conn.pendingOutput().len);
+
+    for (0..1000) |_| {
+        try client.sendProtected(&conn, .handshake, &.{ hs_key_update, 0, 0, 1, 1 });
+        client.write_keys = client.write_keys.?.next(client.suite);
+    }
+    try testing.expectEqual(@as(usize, 0), conn.pendingOutput().len);
+
+    try conn.write("reply");
+    try client.pump(&conn);
+    try testing.expectEqualStrings("reply", client.app_data.items);
 }
 
 test "KeyUpdate sharing a record with more handshake data is rejected" {
