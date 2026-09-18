@@ -564,6 +564,10 @@ pub fn Server(comptime Handler: type) type {
         /// to a connection whose turn had passed — another's
         /// onConnectionClosed writing to it, say. Wakes us once it is over.
         written_in_pass: bool,
+        /// Stream ids snapshotted per raw-QUIC poll: a handler may open or
+        /// close streams from onStreamData, which would invalidate an
+        /// iterator over the stream maps.
+        quic_poll_ids: std.ArrayList(u64),
         /// A stopped server on a shared loop: every completion is cancelled or
         /// on its way off the loop, and nothing may re-arm.
         halted: bool,
@@ -726,6 +730,7 @@ pub fn Server(comptime Handler: type) type {
                 .wake_armed = false,
                 .in_callback = false,
                 .written_in_pass = false,
+                .quic_poll_ids = .empty,
                 .halted = false,
                 .cancel_completions = .{ .{}, .{}, .{}, .{} },
                 .sockfd = sockfd,
@@ -747,6 +752,9 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // On a shared loop our completions must be off it first; see
+            // Config.loop.
+            if (self.shared_loop != null) std.debug.assert(self.isStopped());
             // Stop HTTP/1.1 server
             if (self.http1_server) |*h1| h1.deinit();
 
@@ -765,6 +773,7 @@ pub fn Server(comptime Handler: type) type {
             sys.close(self.sockfd);
             if (self.preferred) |p| sys.close(p.sockfd);
             self.conn_mgr.deinit();
+            self.quic_poll_ids.deinit(self.allocator);
             // Last: live connections hold slices into this material.
             if (self.owned_tls) |*o| o.deinit(self.allocator);
         }
@@ -1529,35 +1538,41 @@ pub fn Server(comptime Handler: type) type {
             // Poll bidirectional streams. Everything readable goes now: a
             // pass happens only on I/O, and data left behind stays unread —
             // withholding flow-control credit — until the peer sends again.
-            var stream_it = conn.streams.streams.iterator();
-            while (stream_it.next()) |kv| {
-                const stream_id = kv.key_ptr.*;
-                const stream = kv.value_ptr.*;
+            const ids = &self.quic_poll_ids;
+            ids.clearRetainingCapacity();
+            ids.ensureTotalCapacity(self.allocator, conn.streams.streams.count() + conn.streams.recv_streams.count()) catch return;
+            var key_it = conn.streams.streams.keyIterator();
+            while (key_it.next()) |k| ids.appendAssumeCapacity(k.*);
+            const bidi_count = ids.items.len;
+            var recv_key_it = conn.streams.recv_streams.keyIterator();
+            while (recv_key_it.next()) |k| ids.appendAssumeCapacity(k.*);
 
-                while (stream.recv.read()) |data| {
+            // Looked up again each time: the handler may have closed it.
+            for (ids.items[0..bidi_count]) |stream_id| {
+                while (conn.streams.streams.get(stream_id)) |stream| {
+                    const data = stream.recv.read() orelse break;
                     const fin = stream.recv.finished;
                     if (fin) entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
                     self.allocator.free(data);
                 }
+                const stream = conn.streams.streams.get(stream_id) orelse continue;
                 if (stream.recv.finished and !entry.finished_streams.contains(stream_id)) {
                     entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
                 }
             }
 
-            // Poll peer-initiated unidirectional receive streams.
-            var recv_it = conn.streams.recv_streams.iterator();
-            while (recv_it.next()) |kv| {
-                const stream_id = kv.key_ptr.*;
-                const rs = kv.value_ptr.*;
-
-                while (rs.read()) |data| {
+            // Peer-initiated unidirectional receive streams.
+            for (ids.items[bidi_count..]) |stream_id| {
+                while (conn.streams.recv_streams.get(stream_id)) |rs| {
+                    const data = rs.read() orelse break;
                     const fin = rs.finished;
                     if (fin) entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
                     self.allocator.free(data);
                 }
+                const rs = conn.streams.recv_streams.get(stream_id) orelse continue;
                 if (rs.finished and !entry.finished_streams.contains(stream_id)) {
                     entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
@@ -2213,6 +2228,8 @@ pub fn Client(comptime Handler: type) type {
 
         // For raw QUIC: track streams whose fin has been delivered via onStreamData(..., fin)
         finished_streams: std.AutoHashMap(u64, void),
+        /// See the server's `quic_poll_ids`.
+        quic_poll_ids: std.ArrayList(u64),
 
         // Config retained for protocol init
         server_name: []const u8,
@@ -2369,6 +2386,7 @@ pub fn Client(comptime Handler: type) type {
                 .protocol_initialized = false,
                 .session_id = null,
                 .finished_streams = std.AutoHashMap(u64, void).init(alloc),
+                .quic_poll_ids = .empty,
                 .server_name = config.server_name,
                 .path = config.path,
                 .connect_headers = config.connect_headers,
@@ -2380,6 +2398,8 @@ pub fn Client(comptime Handler: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // See ClientConfig.loop: stop, then run the loop until isStopped().
+            if (self.shared_loop != null) std.debug.assert(self.isStopped());
             connection_manager.destroyProtocols(self.allocator, self.wt_conn, self.h3_conn, null);
             self.wt_conn = null;
             self.h3_conn = null;
@@ -2389,6 +2409,7 @@ pub fn Client(comptime Handler: type) type {
                 self.allocator.destroy(b);
             }
             self.finished_streams.deinit();
+            self.quic_poll_ids.deinit(self.allocator);
             self.timer.deinit();
             if (self.shared_loop == null) self.own_loop.deinit();
             sys.close(self.sockfd);
@@ -2874,36 +2895,41 @@ pub fn Client(comptime Handler: type) type {
                 }
             }
 
-            // Poll bidi streams for incoming data
-            var stream_it = conn.streams.streams.iterator();
-            while (stream_it.next()) |entry| {
-                const stream_id = entry.key_ptr.*;
-                const stream = entry.value_ptr.*;
+            // Snapshot ids: see `quic_poll_ids`.
+            const ids = &self.quic_poll_ids;
+            ids.clearRetainingCapacity();
+            ids.ensureTotalCapacity(self.allocator, conn.streams.streams.count() + conn.streams.recv_streams.count()) catch return;
+            var key_it = conn.streams.streams.keyIterator();
+            while (key_it.next()) |k| ids.appendAssumeCapacity(k.*);
+            const bidi_count = ids.items.len;
+            var recv_key_it = conn.streams.recv_streams.keyIterator();
+            while (recv_key_it.next()) |k| ids.appendAssumeCapacity(k.*);
 
-                while (stream.recv.read()) |data| {
+            for (ids.items[0..bidi_count]) |stream_id| {
+                while (conn.streams.streams.get(stream_id)) |stream| {
+                    const data = stream.recv.read() orelse break;
                     const fin = stream.recv.finished;
                     if (fin) self.finished_streams.put(stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
                     self.allocator.free(data);
                 }
+                const stream = conn.streams.streams.get(stream_id) orelse continue;
                 if (stream.recv.finished and !self.finished_streams.contains(stream_id)) {
                     self.finished_streams.put(stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
                 }
             }
 
-            // Poll peer-initiated unidirectional receive streams.
-            var recv_it = conn.streams.recv_streams.iterator();
-            while (recv_it.next()) |recv_entry| {
-                const stream_id = recv_entry.key_ptr.*;
-                const rs = recv_entry.value_ptr.*;
-
-                while (rs.read()) |data| {
+            // Peer-initiated unidirectional receive streams.
+            for (ids.items[bidi_count..]) |stream_id| {
+                while (conn.streams.recv_streams.get(stream_id)) |rs| {
+                    const data = rs.read() orelse break;
                     const fin = rs.finished;
                     if (fin) self.finished_streams.put(stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
                     self.allocator.free(data);
                 }
+                const rs = conn.streams.recv_streams.get(stream_id) orelse continue;
                 if (rs.finished and !self.finished_streams.contains(stream_id)) {
                     self.finished_streams.put(stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
@@ -3358,10 +3384,15 @@ test "two clients share one loop" {
 
     // The teardown order the config documents: drain each client off the
     // loop before the loop goes away.
-    for (0..8) |_| {
-        a.tick() catch break;
-        if (a.conn.isClosed()) break;
-    }
+    b.stop();
+    const Both = struct {
+        a: *Client(H),
+        b: *Client(H),
+        fn done(x: *const @This()) bool {
+            return x.a.isStopped() and x.b.isStopped();
+        }
+    };
+    try runUntil(&loop, &Both{ .a = &a, .b = &b }, Both.done, 10_000);
 }
 
 // ─── End-to-end: Server and Client on one caller-owned loop ──────────
@@ -4226,3 +4257,52 @@ test "e2e: a write from one connection's onConnectionClosed to another goes out 
     server.deinit();
 }
 
+const FANOUT_STREAMS: u32 = 12;
+
+/// Opens streams of its own from onStreamData, growing the stream map the
+/// raw-QUIC poll is walking.
+const FanoutServer = struct {
+    pub const protocol: Protocol = .quic;
+
+    fins: u32 = 0,
+    opened: u32 = 0,
+
+    pub fn onStreamData(self: *@This(), session: *Session, _: u64, _: []const u8, fin: bool) void {
+        for (0..4) |_| {
+            const id = session.openStream() catch break;
+            session.closeQuicStream(id);
+            self.opened += 1;
+        }
+        if (fin) self.fins += 1;
+    }
+
+    fn done(self: *@This()) bool {
+        return self.fins == FANOUT_STREAMS;
+    }
+};
+
+/// Sends a byte and a FIN on each of `FANOUT_STREAMS` bidi streams.
+const FanoutClient = struct {
+    pub const protocol: Protocol = .quic;
+
+    pub fn onConnected(_: *@This(), session: *ClientSession) void {
+        for (0..FANOUT_STREAMS) |_| {
+            const id = session.openStream() catch unreachable;
+            session.writeStream(id, "x") catch unreachable;
+            session.closeQuicStream(id);
+        }
+    }
+
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+};
+
+test "e2e: a raw-QUIC handler may open streams from onStreamData" {
+    var client_handler = FanoutClient{};
+    var server_handler = FanoutServer{};
+    var e2e: E2e(FanoutServer, FanoutClient) = undefined;
+    try e2e.init(29424, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, FanoutServer.done, 10_000);
+    try testing.expect(server_handler.opened > 0);
+}
