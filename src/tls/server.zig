@@ -24,6 +24,7 @@
 const std = @import("std");
 const sys = @import("../sys.zig");
 const tls13 = @import("../quic/tls13.zig");
+const common = @import("common.zig");
 
 const crypto = std.crypto;
 const tls = crypto.tls;
@@ -38,16 +39,44 @@ pub const Certificate = tls13.ServerCertificate;
 pub const CertEntry = tls13.CertEntry;
 pub const PrivateKeyAlgorithm = tls13.PrivateKeyAlgorithm;
 
-pub const CipherSuite = enum(u16) {
-    aes_128_gcm_sha256 = 0x1301,
-    aes_256_gcm_sha384 = 0x1302,
-    chacha20_poly1305_sha256 = 0x1303,
-};
-
-pub const Group = enum(u16) {
-    secp256r1 = 0x0017,
-    x25519 = 0x001d,
-};
+pub const CipherSuite = common.CipherSuite;
+pub const Group = common.Group;
+const max_plaintext = common.max_plaintext;
+const max_handshake_msg = common.max_handshake_msg;
+const key_update_after = common.key_update_after;
+const hs_client_hello = common.hs_client_hello;
+const hs_server_hello = common.hs_server_hello;
+const hs_new_session_ticket = common.hs_new_session_ticket;
+const hs_encrypted_extensions = common.hs_encrypted_extensions;
+const hs_certificate = common.hs_certificate;
+const hs_certificate_verify = common.hs_certificate_verify;
+const hs_finished = common.hs_finished;
+const hs_key_update = common.hs_key_update;
+const hs_message_hash = common.hs_message_hash;
+const ct_ccs = common.ct_ccs;
+const ct_alert = common.ct_alert;
+const ct_handshake = common.ct_handshake;
+const ct_app_data = common.ct_app_data;
+const ext = common.ext;
+const tls13_version = common.tls13_version;
+const Suite = common.Suite;
+const hashLen = common.hashLen;
+const Secret = common.Secret;
+const Transcript = common.Transcript;
+const TrafficKeys = common.TrafficKeys;
+const Buffers = common.Buffers;
+const sealedLen = common.sealedLen;
+const sealInto = common.sealInto;
+const openWith = common.openWith;
+const HandshakeSecrets = common.HandshakeSecrets;
+const handshakeSecrets = common.handshakeSecrets;
+const appSecrets = common.appSecrets;
+const finishedMac = common.finishedMac;
+const Parser = common.Parser;
+const u16List = common.u16List;
+const containsU16 = common.containsU16;
+const alpnListContains = common.alpnListContains;
+const Builder = common.Builder;
 
 pub const Config = struct {
     /// Certificates chosen by SNI (exact name, then a one-label wildcard);
@@ -96,142 +125,11 @@ pub const Error = error{
     OutOfMemory,
 };
 
-const max_plaintext = tls.max_ciphertext_inner_record_len; // 2^14
-const max_handshake_msg = 1 << 16;
-// RFC 8446 §5.5: AES-GCM is safe for 2^24.5 records per key; rotate well before.
-const key_update_after: u64 = 1 << 23;
 // Budget for skipping 0-RTT records we never agreed to (RFC 8446 §4.2.10).
 const early_data_skip_budget: usize = 1 << 16;
 
 /// RFC 8446 §4.6.1: a client rejects a ticket that claims to live longer.
 const max_ticket_lifetime_s: u32 = 7 * 24 * 3600;
-
-const hs_client_hello: u8 = @intFromEnum(tls.HandshakeType.client_hello);
-const hs_server_hello: u8 = @intFromEnum(tls.HandshakeType.server_hello);
-const hs_new_session_ticket: u8 = @intFromEnum(tls.HandshakeType.new_session_ticket);
-const hs_encrypted_extensions: u8 = @intFromEnum(tls.HandshakeType.encrypted_extensions);
-const hs_certificate: u8 = @intFromEnum(tls.HandshakeType.certificate);
-const hs_certificate_verify: u8 = @intFromEnum(tls.HandshakeType.certificate_verify);
-const hs_finished: u8 = @intFromEnum(tls.HandshakeType.finished);
-const hs_key_update: u8 = @intFromEnum(tls.HandshakeType.key_update);
-const hs_message_hash: u8 = @intFromEnum(tls.HandshakeType.message_hash);
-
-const ct_ccs: u8 = @intFromEnum(tls.ContentType.change_cipher_spec);
-const ct_alert: u8 = @intFromEnum(tls.ContentType.alert);
-const ct_handshake: u8 = @intFromEnum(tls.ContentType.handshake);
-const ct_app_data: u8 = @intFromEnum(tls.ContentType.application_data);
-
-const ext = struct {
-    const server_name: u16 = @intFromEnum(tls.ExtensionType.server_name);
-    const supported_groups: u16 = @intFromEnum(tls.ExtensionType.supported_groups);
-    const signature_algorithms: u16 = @intFromEnum(tls.ExtensionType.signature_algorithms);
-    const alpn: u16 = @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation);
-    const pre_shared_key: u16 = @intFromEnum(tls.ExtensionType.pre_shared_key);
-    const psk_key_exchange_modes: u16 = @intFromEnum(tls.ExtensionType.psk_key_exchange_modes);
-    const early_data: u16 = @intFromEnum(tls.ExtensionType.early_data);
-    const supported_versions: u16 = @intFromEnum(tls.ExtensionType.supported_versions);
-    const cookie: u16 = @intFromEnum(tls.ExtensionType.cookie);
-    const key_share: u16 = @intFromEnum(tls.ExtensionType.key_share);
-};
-
-const tls13_version: u16 = @intFromEnum(tls.ProtocolVersion.tls_1_3);
-
-// ─── Per-suite primitives ────────────────────────────────────────────
-
-fn Suite(comptime cs: CipherSuite) type {
-    return struct {
-        const Hash = switch (cs) {
-            .aes_256_gcm_sha384 => crypto.hash.sha2.Sha384,
-            else => crypto.hash.sha2.Sha256,
-        };
-        const Hmac = crypto.auth.hmac.Hmac(Hash);
-        const Hkdf = crypto.kdf.hkdf.Hkdf(Hmac);
-        const Aead = switch (cs) {
-            .aes_128_gcm_sha256 => crypto.aead.aes_gcm.Aes128Gcm,
-            .aes_256_gcm_sha384 => crypto.aead.aes_gcm.Aes256Gcm,
-            .chacha20_poly1305_sha256 => crypto.aead.chacha_poly.ChaCha20Poly1305,
-        };
-        const hash_len = Hash.digest_length;
-
-        fn expand(secret: []const u8, label: []const u8, context: []const u8, comptime len: usize) [len]u8 {
-            return tls.hkdfExpandLabel(Hkdf, secret[0..hash_len].*, label, context, len);
-        }
-    };
-}
-
-fn hashLen(cs: CipherSuite) usize {
-    return switch (cs) {
-        inline else => |c| Suite(c).hash_len,
-    };
-}
-
-/// Big enough for any suite's hash / secret; only the first `hashLen` bytes count.
-const Secret = [48]u8;
-
-const Transcript = union(enum) {
-    sha256: crypto.hash.sha2.Sha256,
-    sha384: crypto.hash.sha2.Sha384,
-
-    fn init(cs: CipherSuite) Transcript {
-        return switch (cs) {
-            .aes_256_gcm_sha384 => .{ .sha384 = .init(.{}) },
-            else => .{ .sha256 = .init(.{}) },
-        };
-    }
-
-    fn update(t: *Transcript, bytes: []const u8) void {
-        switch (t.*) {
-            inline else => |*h| h.update(bytes),
-        }
-    }
-
-    fn peek(t: *const Transcript) Secret {
-        var out: Secret = @splat(0);
-        switch (t.*) {
-            inline else => |h| {
-                var copy = h;
-                copy.final(out[0..@TypeOf(h).digest_length]);
-            },
-        }
-        return out;
-    }
-};
-
-const TrafficKeys = struct {
-    secret: Secret,
-    key: [32]u8,
-    iv: [12]u8,
-    seq: u64 = 0,
-
-    fn derive(cs: CipherSuite, secret: Secret) TrafficKeys {
-        switch (cs) {
-            inline else => |c| {
-                const S = Suite(c);
-                var k: TrafficKeys = .{ .secret = secret, .key = @splat(0), .iv = S.expand(&secret, "iv", "", 12) };
-                k.key[0..S.Aead.key_length].* = S.expand(&secret, "key", "", S.Aead.key_length);
-                return k;
-            },
-        }
-    }
-
-    fn next(k: *const TrafficKeys, cs: CipherSuite) TrafficKeys {
-        var secret: Secret = @splat(0);
-        switch (cs) {
-            inline else => |c| {
-                const S = Suite(c);
-                secret[0..S.hash_len].* = S.expand(&k.secret, "traffic upd", "", S.hash_len);
-            },
-        }
-        return derive(cs, secret);
-    }
-
-    fn nonce(k: *const TrafficKeys) [12]u8 {
-        var n = k.iv;
-        const seq: [8]u8 = @bitCast(mem.nativeToBig(u64, k.seq));
-        for (seq, 0..) |b, i| n[4 + i] ^= b;
-        return n;
-    }
-};
 
 // ─── Connection ──────────────────────────────────────────────────────
 
@@ -241,12 +139,6 @@ const State = enum {
     wait_finished,
     connected,
     failed,
-};
-
-// Heap-allocated on first use so `Conn` itself stays small enough to embed.
-const Buffers = struct {
-    in: [tls.max_ciphertext_record_len]u8,
-    scratch: [tls.max_ciphertext_len]u8,
 };
 
 pub const Conn = struct {
@@ -955,111 +847,6 @@ fn alertFor(err: Error) ?tls.Alert.Description {
     };
 }
 
-// ─── Record protection and key schedule ──────────────────────────────
-
-fn sealedLen(cs: CipherSuite, content_len: usize) usize {
-    return switch (cs) {
-        inline else => |c| tls.record_header_len + content_len + 1 + Suite(c).Aead.tag_length,
-    };
-}
-
-/// Seals `content` as one TLSCiphertext into `dst` (exactly `sealedLen`
-/// bytes), staging the inner plaintext in `scratch`.
-fn sealInto(cs: CipherSuite, keys: *TrafficKeys, inner: tls.ContentType, content: []const u8, scratch: []u8, dst: []u8) void {
-    std.debug.assert(content.len <= max_plaintext);
-    const pt = scratch[0 .. content.len + 1];
-    @memcpy(pt[0..content.len], content);
-    pt[content.len] = @intFromEnum(inner);
-    switch (cs) {
-        inline else => |c| {
-            const A = Suite(c).Aead;
-            const hdr = dst[0..tls.record_header_len];
-            hdr.* = .{ ct_app_data, 0x03, 0x03, 0, 0 };
-            mem.writeInt(u16, hdr[3..5], @intCast(pt.len + A.tag_length), .big);
-            const body = dst[tls.record_header_len..];
-            A.encrypt(body[0..pt.len], body[pt.len..][0..A.tag_length], pt, hdr, keys.nonce(), keys.key[0..A.key_length].*);
-        },
-    }
-    keys.seq += 1;
-}
-
-/// Opens one TLSCiphertext into `out`; returns the TLSInnerPlaintext.
-fn openWith(cs: CipherSuite, keys: *TrafficKeys, record: []const u8, out: []u8) Error![]u8 {
-    if (keys.seq == std.math.maxInt(u64)) return error.UnexpectedMessage;
-    const payload = record[tls.record_header_len..];
-    const plain = switch (cs) {
-        inline else => |c| blk: {
-            const A = Suite(c).Aead;
-            if (payload.len < A.tag_length + 1) return error.BadRecordMac;
-            const n = payload.len - A.tag_length;
-            if (n > max_plaintext + 1) return error.RecordOverflow;
-            A.decrypt(
-                out[0..n],
-                payload[0..n],
-                payload[n..][0..A.tag_length].*,
-                record[0..tls.record_header_len],
-                keys.nonce(),
-                keys.key[0..A.key_length].*,
-            ) catch return error.BadRecordMac;
-            break :blk out[0..n];
-        },
-    };
-    keys.seq += 1;
-    return plain;
-}
-
-const HandshakeSecrets = struct { handshake: Secret, client: Secret, server: Secret };
-
-fn handshakeSecrets(cs: CipherSuite, psk: ?*const Secret, th: Secret, shared: []const u8) HandshakeSecrets {
-    var out: HandshakeSecrets = .{ .handshake = @splat(0), .client = @splat(0), .server = @splat(0) };
-    switch (cs) {
-        inline else => |c| {
-            const S = Suite(c);
-            const L = S.hash_len;
-            const zeros: [L]u8 = @splat(0);
-            const early = S.Hkdf.extract(&.{}, if (psk) |k| k[0..L] else &zeros);
-            const derived = S.expand(&early, "derived", &tls.emptyHash(S.Hash), L);
-            const hs = S.Hkdf.extract(&derived, shared);
-            out.handshake[0..L].* = hs;
-            out.client[0..L].* = S.expand(&hs, "c hs traffic", th[0..L], L);
-            out.server[0..L].* = S.expand(&hs, "s hs traffic", th[0..L], L);
-        },
-    }
-    return out;
-}
-
-fn appSecrets(cs: CipherSuite, handshake_secret: Secret, th: Secret) struct { client: Secret, server: Secret, master: Secret } {
-    var client: Secret = @splat(0);
-    var server: Secret = @splat(0);
-    var master_out: Secret = @splat(0);
-    switch (cs) {
-        inline else => |c| {
-            const S = Suite(c);
-            const L = S.hash_len;
-            const derived = S.expand(&handshake_secret, "derived", &tls.emptyHash(S.Hash), L);
-            const zeros: [L]u8 = @splat(0);
-            const master = S.Hkdf.extract(&derived, &zeros);
-            master_out[0..L].* = master;
-            client[0..L].* = S.expand(&master, "c ap traffic", th[0..L], L);
-            server[0..L].* = S.expand(&master, "s ap traffic", th[0..L], L);
-        },
-    }
-    return .{ .client = client, .server = server, .master = master_out };
-}
-
-/// Finished verify_data over transcript hash `th` (RFC 8446 §4.4.4).
-fn finishedMac(cs: CipherSuite, base_key: *const Secret, th: Secret) Secret {
-    var out: Secret = @splat(0);
-    switch (cs) {
-        inline else => |c| {
-            const S = Suite(c);
-            const key = S.expand(base_key, "finished", "", S.hash_len);
-            out[0..S.hash_len].* = tls.hmac(S.Hmac, th[0..S.hash_len], key);
-        },
-    }
-    return out;
-}
-
 // ─── Key exchange ────────────────────────────────────────────────────
 
 const KeyShare = struct { group: Group, key: []const u8 };
@@ -1094,27 +881,6 @@ fn keyExchange(share: KeyShare, shared: *[32]u8, public_buf: *[65]u8) Error![]co
 }
 
 // ─── ClientHello parsing ─────────────────────────────────────────────
-
-const Parser = struct {
-    buf: []const u8,
-    pos: usize = 0,
-
-    fn rest(p: *const Parser) usize {
-        return p.buf.len - p.pos;
-    }
-    fn take(p: *Parser, n: usize) Error![]const u8 {
-        if (p.rest() < n) return error.DecodeError;
-        defer p.pos += n;
-        return p.buf[p.pos..][0..n];
-    }
-    fn int(p: *Parser, comptime T: type) Error!T {
-        const n = @divExact(@typeInfo(T).int.bits, 8);
-        return mem.readInt(T, (try p.take(n))[0..n], .big);
-    }
-    fn vec(p: *Parser, comptime Len: type) Error![]const u8 {
-        return p.take(try p.int(Len));
-    }
-};
 
 const ClientHello = struct {
     session_id: []const u8,
@@ -1228,21 +994,6 @@ const ClientHello = struct {
     }
 };
 
-fn u16List(data: []const u8, comptime Len: type) Error![]const u8 {
-    var p: Parser = .{ .buf = data };
-    const list = try p.vec(Len);
-    if (p.rest() != 0 or list.len < 2 or list.len % 2 != 0) return error.DecodeError;
-    return list;
-}
-
-fn containsU16(list: []const u8, value: u16) bool {
-    var i: usize = 0;
-    while (i + 2 <= list.len) : (i += 2) {
-        if (mem.readInt(u16, list[i..][0..2], .big) == value) return true;
-    }
-    return false;
-}
-
 fn containsSlice(list: []const u16, value: u16) bool {
     return mem.indexOfScalar(u16, list, value) != null;
 }
@@ -1255,15 +1006,6 @@ fn findKeyShare(shares: []const u8, group: Group) ?KeyShare {
         if (g == @intFromEnum(group)) return .{ .group = group, .key = key };
     }
     return null;
-}
-
-fn alpnListContains(list: []const u8, proto: []const u8) bool {
-    var p: Parser = .{ .buf = list };
-    while (p.rest() > 0) {
-        const name = p.vec(u8) catch return false;
-        if (mem.eql(u8, name, proto)) return true;
-    }
-    return false;
 }
 
 // ─── Session tickets ─────────────────────────────────────────────────
@@ -1326,37 +1068,6 @@ fn openTicket(key: [16]u8, blob: []const u8, plain: *[max_ticket_len]u8) ?Ticket
 }
 
 // ─── Message builders ────────────────────────────────────────────────
-
-const Builder = struct {
-    list: *std.ArrayList(u8),
-    gpa: Allocator,
-
-    fn u8_(b: *Builder, v: u8) Error!void {
-        try b.list.append(b.gpa, v);
-    }
-    fn u16_(b: *Builder, v: u16) Error!void {
-        try b.list.appendSlice(b.gpa, &mem.toBytes(mem.nativeToBig(u16, v)));
-    }
-    fn u24_(b: *Builder, v: u24) Error!void {
-        var tmp: [3]u8 = undefined;
-        mem.writeInt(u24, &tmp, v, .big);
-        try b.list.appendSlice(b.gpa, &tmp);
-    }
-    fn bytes(b: *Builder, v: []const u8) Error!void {
-        try b.list.appendSlice(b.gpa, v);
-    }
-    /// Reserves a `Len`-sized length prefix; close it with `end`.
-    fn begin(b: *Builder, comptime Len: type) Error!usize {
-        try b.list.appendNTimes(b.gpa, 0, @divExact(@typeInfo(Len).int.bits, 8));
-        return b.list.items.len;
-    }
-    fn end(b: *Builder, comptime Len: type, start: usize) Error!void {
-        const n = @divExact(@typeInfo(Len).int.bits, 8);
-        const len = b.list.items.len - start;
-        if (len > std.math.maxInt(Len)) return error.InternalError;
-        mem.writeInt(Len, b.list.items[start - n ..][0..n], @intCast(len), .big);
-    }
-};
 
 const ServerKeyShare = struct { group: Group, key: ?[]const u8 };
 
@@ -1471,81 +1182,8 @@ fn buildCertificateVerify(b: *Builder, cert: *const Certificate, transcript_hash
 
 const testing = std.testing;
 
-// Self-signed, valid to 2056. localhost and *.example.com share one P-256 key.
-const test_ec_key_pem =
-    \\-----BEGIN EC PRIVATE KEY-----
-    \\MHcCAQEEIAKIla+65TNSSfs8RKsI9dq3KKp/WC0RUKceTUDNQYgPoAoGCCqGSM49
-    \\AwEHoUQDQgAETSp/wPgU7+juILb0Ugk7IpUQd/TAcTd69dibi8gbAY23ktARkE9C
-    \\53VIGla7Uzbu4gkotGeZg8ufOEbX4cC44w==
-    \\-----END EC PRIVATE KEY-----
-;
-const test_localhost_pem =
-    \\-----BEGIN CERTIFICATE-----
-    \\MIIBlTCCATugAwIBAgIUJ0VVpBMXbR+m2qeJVtlLPwMGrS8wCgYIKoZIzj0EAwIw
-    \\FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkxODAyMjc1MVoYDzIwNTYwOTEw
-    \\MDIyNzUxWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
-    \\PQMBBwNCAARNKn/A+BTv6O4gtvRSCTsilRB39MBxN3r12JuLyBsBjbeS0BGQT0Ln
-    \\dUgaVrtTNu7iCSi0Z5mDy584RtfhwLjjo2kwZzAdBgNVHQ4EFgQUgsQXmkDpwyyD
-    \\DE+urWAkJzlvp4gwHwYDVR0jBBgwFoAUgsQXmkDpwyyDDE+urWAkJzlvp4gwDwYD
-    \\VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
-    \\SAAwRQIhAL/ObOrd87Ioq197659prUHNDVOQ8y9LpqKlXroBCK0+AiBu5JczdLo0
-    \\paz/2uMhZZ65w/QAplKh2+e0QSDAcZreyA==
-    \\-----END CERTIFICATE-----
-;
-const test_wildcard_pem =
-    \\-----BEGIN CERTIFICATE-----
-    \\MIIBnDCCAUOgAwIBAgIUBeGIcIZGlWQDw9k8EVl0eQn+0i8wCgYIKoZIzj0EAwIw
-    \\FjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wIBcNMjYwOTE4MDIyNzUxWhgPMjA1NjA5
-    \\MTAwMjI3NTFaMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYI
-    \\KoZIzj0DAQcDQgAETSp/wPgU7+juILb0Ugk7IpUQd/TAcTd69dibi8gbAY23ktAR
-    \\kE9C53VIGla7Uzbu4gkotGeZg8ufOEbX4cC446NtMGswHQYDVR0OBBYEFILEF5pA
-    \\6cMsgwxPrq1gJCc5b6eIMB8GA1UdIwQYMBaAFILEF5pA6cMsgwxPrq1gJCc5b6eI
-    \\MA8GA1UdEwEB/wQFMAMBAf8wGAYDVR0RBBEwD4INKi5leGFtcGxlLmNvbTAKBggq
-    \\hkjOPQQDAgNHADBEAiBaUMdxsQOU9V2gfaL6EW0cblAScC1OvxJl+4P07YUxDAIg
-    \\ffw63xlHzM5X1n+gB6U2k9pqnk+IQYwD2pyylUk/I74=
-    \\-----END CERTIFICATE-----
-;
-const test_ed25519_key_pem =
-    \\-----BEGIN PRIVATE KEY-----
-    \\MC4CAQAwBQYDK2VwBCIEIC7QOG4KwXQFSsbxdpxWvVUO5ON7JPjpewzoDqKPZSoO
-    \\-----END PRIVATE KEY-----
-;
-const test_ed25519_pem =
-    \\-----BEGIN CERTIFICATE-----
-    \\MIIBTzCCAQGgAwIBAgIUElLBZ3M+v85vUwlfAtwMIFA8fvQwBQYDK2VwMBIxEDAO
-    \\BgNVBAMMB2VkLnRlc3QwIBcNMjYwOTE4MDIyNzUxWhgPMjA1NjA5MTAwMjI3NTFa
-    \\MBIxEDAOBgNVBAMMB2VkLnRlc3QwKjAFBgMrZXADIQDDb3XnRnNGl7VnUxtvlAM3
-    \\Wx++JEtaulpTtA6HsXZ5HaNnMGUwHQYDVR0OBBYEFLT9KJDLMqFxXjDiduG7N1zR
-    \\HoZTMB8GA1UdIwQYMBaAFLT9KJDLMqFxXjDiduG7N1zRHoZTMA8GA1UdEwEB/wQF
-    \\MAMBAf8wEgYDVR0RBAswCYIHZWQudGVzdDAFBgMrZXADQQCnjUP9Av1Ugtg6dE+7
-    \\VljHsDK78pyjUZWFgeuzx/aQ2obYNKv3HLka/NYNWMQNiNeEFVpfwqDhBCAUe9ia
-    \\angI
-    \\-----END CERTIFICATE-----
-;
-
-const TestCerts = struct {
-    der: [3][1024]u8,
-    chains: [3][1][]const u8,
-    key_der: [2][256]u8,
-    entries: [3]CertEntry,
-
-    /// Entry 0 (default) is localhost, 1 is *.example.com, 2 is Ed25519 ed.test.
-    fn load(self: *TestCerts) !void {
-        const pems = [3][]const u8{ test_localhost_pem, test_wildcard_pem, test_ed25519_pem };
-        for (pems, 0..) |pem, i| self.chains[i] = .{try tls13.parsePemCert(pem, &self.der[i])};
-        const ec = try tls13.extractEcPrivateKey(try tls13.parsePemPrivateKey(test_ec_key_pem, &self.key_der[0]));
-        const ed = try tls13.extractEd25519PrivateKey(try tls13.parsePemPrivateKey(test_ed25519_key_pem, &self.key_der[1]));
-        self.entries = .{
-            .{ .server_names = &.{"localhost"}, .cert = .{ .cert_chain_der = &self.chains[0], .private_key_bytes = ec } },
-            .{ .server_names = &.{"*.example.com"}, .cert = .{ .cert_chain_der = &self.chains[1], .private_key_bytes = ec } },
-            .{ .server_names = &.{"ed.test"}, .cert = .{
-                .cert_chain_der = &self.chains[2],
-                .private_key_bytes = ed,
-                .private_key_algorithm = .ed25519,
-            } },
-        };
-    }
-};
+const test_certs = @import("test_certs.zig");
+const TestCerts = test_certs.TestCerts;
 
 /// std.crypto.tls.Client wired straight to a `Conn`: whatever the client
 /// flushes is fed to the server, whatever the server queues is what the

@@ -42,7 +42,8 @@ pub const PrivateKeyAlgorithm = enum {
 
 // ─── CertificateVerify signature verification ────────────────────────
 
-fn verifyCertificateVerifySignature(
+/// Checks a CertificateVerify signature made with the leaf's public key.
+pub fn verifyCertificateVerifySignature(
     pub_key_bytes: []const u8,
     pub_key_algo: Certificate.AlgorithmCategory,
     sig_algo: u16,
@@ -55,6 +56,13 @@ fn verifyCertificateVerifySignature(
             if (pub_key_algo != .X9_62_id_ecPublicKey) return error.BadCertificateVerify;
             const pub_key = EcdsaP256Sha256.PublicKey.fromSec1(pub_key_bytes) catch return error.BadCertificateVerify;
             const sig = EcdsaP256Sha256.Signature.fromDer(sig_bytes) catch return error.BadCertificateVerify;
+            sig.verify(signed_content, pub_key) catch return error.BadCertificateVerify;
+        },
+        .ecdsa_secp384r1_sha384 => {
+            if (pub_key_algo != .X9_62_id_ecPublicKey) return error.BadCertificateVerify;
+            const P384 = crypto.sign.ecdsa.EcdsaP384Sha384;
+            const pub_key = P384.PublicKey.fromSec1(pub_key_bytes) catch return error.BadCertificateVerify;
+            const sig = P384.Signature.fromDer(sig_bytes) catch return error.BadCertificateVerify;
             sig.verify(signed_content, pub_key) catch return error.BadCertificateVerify;
         },
         .ed25519 => {
@@ -114,6 +122,19 @@ const X509Extensions = struct {
         return true;
     }
 };
+
+/// RFC 5280 constraints on a certificate that signed the one below it in a
+/// peer's chain, `depth` certificates above the leaf (1 for the leaf's
+/// issuer): basicConstraints CA:TRUE (§4.2.1.9) and keyCertSign in keyUsage
+/// (§4.2.1.3) when those extensions are present, and pathLenConstraint.
+pub fn issuerConstraintsOk(issuer_der: []const u8, depth: usize) bool {
+    const exts = parseX509Extensions(issuer_der);
+    if (exts.is_ca) |is_ca| if (!is_ca) return false;
+    if (!exts.hasKeyCertSign()) return false;
+    // `depth - 1` intermediates sit below this issuer.
+    if (exts.path_len_constraint) |max_len| if (depth > max_len + 1) return false;
+    return true;
+}
 
 /// Parse X.509 v3 extensions from a DER certificate buffer.
 /// Uses the same DER walking approach as std.crypto.Certificate.parse().
@@ -1281,21 +1302,7 @@ pub const Tls13Handshake = struct {
                 if (prev_parsed) |prev| {
                     const now_sec = sys.realtimeSeconds();
                     prev.verify(parsed, now_sec) catch return error.BadCertificate;
-
-                    // RFC 5280 §4.2.1.9: issuer cert must have basicConstraints CA:TRUE
-                    // RFC 5280 §4.2.1.3: if keyUsage present, must include keyCertSign
-                    const exts = parseX509Extensions(cert_der);
-                    if (exts.is_ca) |is_ca| {
-                        if (!is_ca) return error.BadCertificate;
-                    }
-                    if (!exts.hasKeyCertSign()) return error.BadCertificate;
-
-                    // RFC 5280 §4.2.1.9: enforce pathLenConstraint
-                    if (exts.path_len_constraint) |max_len| {
-                        // cert_index counts from leaf (0), so intermediates below
-                        // this cert is cert_index - 1 certs deep
-                        if (cert_index > max_len + 1) return error.BadCertificate;
-                    }
+                    if (!issuerConstraintsOk(cert_der, cert_index)) return error.BadCertificate;
                 }
 
                 // If this is the last cert, verify against CA bundle
