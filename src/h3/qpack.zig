@@ -222,6 +222,15 @@ fn decodeString(data: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usiz
     return stashString(raw, is_huffman, scratch, scratch_pos);
 }
 
+/// `decodeString` for an encoder-stream instruction: a string longer than
+/// the table could ever hold fails now rather than being waited for.
+fn decodeInstructionString(data: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usize) ![]const u8 {
+    var peek = pos.*;
+    const len = try decodeInteger(data, &peek, 7);
+    if (len > DynamicTable.MAX_CAPACITY) return error.EntryTooLarge;
+    return decodeString(data, pos, scratch, scratch_pos);
+}
+
 /// Copy a string's wire bytes into `scratch` at `scratch_pos.*`, Huffman
 /// decoding them straight into the remaining space, and advance past it.
 /// The copy outlives the caller's data buffer, which may be reused.
@@ -465,35 +474,85 @@ pub fn maxEncodedLen(headers: []const Header) usize {
 /// SETTINGS_QPACK_BLOCKED_STREAMS and acknowledgements. Until that exists,
 /// referencing the table at all gives peers that keep one the wrong headers.
 pub const QpackEncoder = struct {
+    /// A decoder-stream instruction cut off at the end of the last read.
+    /// Each is a single prefixed integer, so it fits.
+    pending: PendingInstruction(MAX_INTEGER_LEN) = .{},
+
     /// Encode `headers` into a header block. Returns the number of bytes
     /// written to `buf`; `maxEncodedLen(headers)` bytes always suffice.
     pub fn encode(_: *QpackEncoder, headers: []const Header, buf: []u8) !usize {
         return encodeHeaders(headers, buf);
     }
 
-    /// Process the peer decoder's instructions (RFC 9204 4.4). With nothing
-    /// ever inserted or referenced, Section Acknowledgment and Insert Count
-    /// Increment both acknowledge state we never created: 4.4.1 and 4.4.3
-    /// make that a QPACK_DECODER_STREAM_ERROR.
-    pub fn processDecoderInstruction(_: *QpackEncoder, data: []const u8) !void {
+    /// Process the peer decoder's instructions (RFC 9204 4.4), as they arrive
+    /// on the stream: an instruction split across reads is held until the
+    /// rest comes. With nothing ever inserted or referenced, Section
+    /// Acknowledgment and Insert Count Increment both acknowledge state we
+    /// never created: 4.4.1 and 4.4.3 make that a QPACK_DECODER_STREAM_ERROR.
+    pub fn processDecoderInstruction(self: *QpackEncoder, data: []const u8) !void {
+        return self.pending.feed(data, self, processDecoderInstructions);
+    }
+
+    fn processDecoderInstructions(_: *QpackEncoder, data: []const u8) !usize {
         var pos: usize = 0;
         while (pos < data.len) {
+            const start = pos;
             const first = data[pos];
-            if (first & 0x80 != 0) {
-                // Section Acknowledgment: 1XXXXXXX
-                _ = try decodeInteger(data, &pos, 7);
-                return error.QpackDecoderStreamError;
-            } else if (first & 0xc0 == 0x40) {
-                // Stream Cancellation: 01XXXXXX
-                _ = try decodeInteger(data, &pos, 6);
-            } else {
-                // Insert Count Increment: 00XXXXXX
-                _ = try decodeInteger(data, &pos, 6);
-                return error.QpackDecoderStreamError;
-            }
+            const n = if (first & 0x80 != 0) decodeInteger(data, &pos, 7) else decodeInteger(data, &pos, 6);
+            _ = n catch |err| switch (err) {
+                error.BufferTooShort => return start,
+                else => return err,
+            };
+            // Only Stream Cancellation (01XXXXXX) is valid for us; see above.
+            if (first & 0xc0 != 0x40) return error.QpackDecoderStreamError;
         }
+        return pos;
     }
 };
+
+/// Longest QPACK prefixed integer we accept: a prefix byte plus enough
+/// continuation bytes for a usize (`decodeInteger` rejects longer).
+const MAX_INTEGER_LEN: usize = 1 + (@bitSizeOf(usize) + 6) / 7;
+
+/// Holds the incomplete instruction at the end of one read of a QPACK
+/// stream, so the next read continues it. Instructions are processed only
+/// once complete, and one longer than `cap` bytes is an error.
+fn PendingInstruction(comptime cap: usize) type {
+    return struct {
+        buf: [cap]u8 = undefined,
+        len: usize = 0,
+
+        const Self = @This();
+
+        /// Run `process` over `data` (after anything held back). `process`
+        /// returns how many bytes it consumed, stopping before an instruction
+        /// it could not finish; that tail is kept for the next call.
+        fn feed(self: *Self, data: []const u8, ctx: anytype, comptime process: anytype) !void {
+            var rest = data;
+            if (self.len > 0) {
+                const held = self.len;
+                const take = @min(rest.len, cap - held);
+                @memcpy(self.buf[held..][0..take], rest[0..take]);
+                self.len += take;
+                const used = try process(ctx, self.buf[0..self.len]);
+                if (used == 0) {
+                    // Still incomplete; everything we were given is held.
+                    if (take < rest.len or self.len == cap) return error.InstructionTooLarge;
+                    return;
+                }
+                // Held bytes are a prefix of one instruction, so `used` covers them.
+                std.debug.assert(used > held);
+                self.len = 0;
+                rest = rest[used - held ..];
+            }
+            const used = try process(ctx, rest);
+            const tail = rest[used..];
+            if (tail.len >= cap) return error.InstructionTooLarge;
+            @memcpy(self.buf[0..tail.len], tail);
+            self.len = tail.len;
+        }
+    };
+}
 
 // ── QPACK Decoder (RFC 9204 §4.2) ─────────────────────────────────────
 
@@ -505,6 +564,12 @@ pub const QpackDecoder = struct {
     max_capacity: usize = 0,
     instruction_buf: [4096]u8 = undefined,
     instruction_len: usize = 0,
+    /// An encoder-stream instruction cut off at the end of the last read.
+    /// Room for an entry the size of the whole table plus its integers.
+    pending: PendingInstruction(MAX_ENCODER_INSTRUCTION) = .{},
+
+    /// Name and value together are bounded by the table (RFC 9204 3.2.1).
+    const MAX_ENCODER_INSTRUCTION = DynamicTable.MAX_CAPACITY + 2 * MAX_INTEGER_LEN;
 
     /// Set local max capacity.
     pub fn setCapacity(self: *QpackDecoder, cap: usize) void {
@@ -645,8 +710,15 @@ pub const QpackDecoder = struct {
         return self.dynamic.get(abs) orelse error.InvalidIndex;
     }
 
-    /// Process encoder instructions from the encoder stream.
+    /// Process encoder instructions from the encoder stream, as they arrive:
+    /// an instruction split across reads is held until the rest comes.
     pub fn processEncoderInstruction(self: *QpackDecoder, data: []const u8) !void {
+        return self.pending.feed(data, self, processEncoderInstructions);
+    }
+
+    /// Apply every complete instruction in `data`; returns the bytes they
+    /// span. Nothing is applied from an instruction that is cut short.
+    fn processEncoderInstructions(self: *QpackDecoder, data: []const u8) !usize {
         var pos: usize = 0;
         // Staging for one instruction's name/value: both are copied into the
         // dynamic table before the iteration ends, so nothing outlives it and
@@ -657,54 +729,58 @@ pub const QpackDecoder = struct {
 
         while (pos < data.len) {
             scratch_pos = 0;
-            const first = data[pos];
+            const start = pos;
+            self.processOneEncoderInstruction(data, &pos, &scratch, &scratch_pos) catch |err| switch (err) {
+                error.BufferTooShort => return start,
+                else => return err,
+            };
+        }
+        return pos;
+    }
 
-            if (first & 0x80 != 0) {
-                // Insert with Name Reference: 1TNNNNNN
-                const is_static = (first & 0x40) != 0;
-                const name_idx = try decodeInteger(data, &pos, 6);
-                const value = try decodeString(data, &pos, &scratch, &scratch_pos);
+    fn processOneEncoderInstruction(self: *QpackDecoder, data: []const u8, pos_ptr: *usize, scratch: []u8, scratch_pos: *usize) !void {
+        const first = data[pos_ptr.*];
+        if (first & 0x80 != 0) {
+            // Insert with Name Reference: 1TNNNNNN
+            const is_static = (first & 0x40) != 0;
+            const name_idx = try decodeInteger(data, pos_ptr, 6);
+            const value = try decodeInstructionString(data, pos_ptr, scratch, scratch_pos);
 
-                var name: []const u8 = undefined;
-                if (is_static) {
-                    if (name_idx >= static_table.len) return error.InvalidIndex;
-                    name = static_table[name_idx].name;
-                } else {
-                    // RFC 9204 4.3.2: relative to the insert count, not absolute.
-                    const entry = self.dynamic.getRelative(self.dynamic.insert_count, name_idx) orelse return error.InvalidIndex;
-                    name = entry.name;
-                }
-                try self.dynamic.insert(name, value);
-            } else if (first & 0xc0 == 0x40) {
-                // Insert with Literal Name: 01HXXXXX
-                const is_name_huffman = (first & 0x20) != 0;
-                const name_len = try decodeInteger(data, &pos, 5);
-                if (name_len > data.len - pos) return error.BufferTooShort;
-
-                const raw_name = data[pos..][0..name_len];
-                const name = if (is_name_huffman)
-                    try stashString(raw_name, true, &scratch, &scratch_pos)
-                else
-                    raw_name;
-                pos += name_len;
-
-                const value = try decodeString(data, &pos, &scratch, &scratch_pos);
-                try self.dynamic.insert(name, value);
-            } else if (first & 0xe0 == 0x00) {
-                // Duplicate: 000XXXXX — 5-bit relative index (RFC 9204 4.3.4)
-                const idx = try decodeInteger(data, &pos, 5);
-                const entry = self.dynamic.getRelative(self.dynamic.insert_count, idx) orelse return error.InvalidIndex;
-                const n = entry.name;
-                const v = entry.value;
-                try self.dynamic.insert(n, v);
-            } else if (first & 0xe0 == 0x20) {
-                // Set Dynamic Table Capacity: 001XXXXX — 5-bit capacity
-                const cap = try decodeInteger(data, &pos, 5);
-                if (cap > self.max_capacity) return error.CapacityExceeded;
-                self.dynamic.setCapacity(cap);
+            var name: []const u8 = undefined;
+            if (is_static) {
+                if (name_idx >= static_table.len) return error.InvalidIndex;
+                name = static_table[name_idx].name;
             } else {
-                pos += 1;
+                // RFC 9204 4.3.2: relative to the insert count, not absolute.
+                const entry = self.dynamic.getRelative(self.dynamic.insert_count, name_idx) orelse return error.InvalidIndex;
+                name = entry.name;
             }
+            try self.dynamic.insert(name, value);
+        } else if (first & 0xc0 == 0x40) {
+            // Insert with Literal Name: 01HXXXXX
+            const is_name_huffman = (first & 0x20) != 0;
+            const name_len = try decodeInteger(data, pos_ptr, 5);
+            if (name_len > DynamicTable.MAX_CAPACITY) return error.EntryTooLarge;
+            if (name_len > data.len - pos_ptr.*) return error.BufferTooShort;
+
+            const raw_name = data[pos_ptr.*..][0..name_len];
+            pos_ptr.* += name_len;
+            const value = try decodeInstructionString(data, pos_ptr, scratch, scratch_pos);
+            const name = if (is_name_huffman)
+                try stashString(raw_name, true, scratch, scratch_pos)
+            else
+                raw_name;
+            try self.dynamic.insert(name, value);
+        } else if (first & 0xe0 == 0x00) {
+            // Duplicate: 000XXXXX — 5-bit relative index (RFC 9204 4.3.4)
+            const idx = try decodeInteger(data, pos_ptr, 5);
+            const entry = self.dynamic.getRelative(self.dynamic.insert_count, idx) orelse return error.InvalidIndex;
+            try self.dynamic.insert(entry.name, entry.value);
+        } else {
+            // Set Dynamic Table Capacity: 001XXXXX — 5-bit capacity
+            const cap = try decodeInteger(data, pos_ptr, 5);
+            if (cap > self.max_capacity) return error.CapacityExceeded;
+            self.dynamic.setCapacity(cap);
         }
     }
 
@@ -1433,7 +1509,62 @@ test "QpackDecoder: an encoder-stream literal name length near usize max is reje
     var decoder = QpackDecoder{};
     decoder.setCapacity(4096);
     try decoder.processEncoderInstruction(&set_capacity_4096);
-    try testing.expectError(error.BufferTooShort, decoder.processEncoderInstruction(&instr));
+    try testing.expectError(error.EntryTooLarge, decoder.processEncoderInstruction(&instr));
+}
+
+test "QpackDecoder: encoder instructions split at every byte are applied once complete" {
+    // Set Capacity, Insert With Literal Name, Insert With static Name
+    // Reference (:authority) with a two-byte value length, Duplicate.
+    const long_value = "v" ** 200;
+    const stream = set_capacity_4096 ++
+        [_]u8{ 0x43, 'k', 'e', 'y', 0x05 } ++ "value".* ++
+        [_]u8{ 0xc0, 0x7f, 200 - 127 } ++ long_value.* ++
+        [_]u8{0x00};
+    // Stream offsets at which each insert completes.
+    const done_at = [_]usize{ 3 + 10, 3 + 10 + 3 + 200, stream.len };
+
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    for (0..stream.len) |i| {
+        try decoder.processEncoderInstruction(stream[i..][0..1]);
+        var want: u64 = 0;
+        for (done_at) |d| if (i + 1 >= d) {
+            want += 1;
+        };
+        try testing.expectEqual(want, decoder.dynamic.insert_count);
+    }
+    try testing.expectEqualStrings("key", decoder.dynamic.get(0).?.name);
+    try testing.expectEqualStrings("value", decoder.dynamic.get(0).?.value);
+    try testing.expectEqualStrings(":authority", decoder.dynamic.get(1).?.name);
+    try testing.expectEqualStrings(long_value, decoder.dynamic.get(1).?.value);
+    try testing.expectEqualStrings(long_value, decoder.dynamic.get(2).?.value);
+
+    // Split in two anywhere, the same table results.
+    for (1..stream.len) |cut| {
+        var d = QpackDecoder{};
+        d.setCapacity(4096);
+        try d.processEncoderInstruction(stream[0..cut]);
+        try d.processEncoderInstruction(stream[cut..]);
+        try testing.expectEqual(@as(u64, 3), d.dynamic.insert_count);
+    }
+}
+
+test "QpackDecoder: a split instruction that outgrows the table is rejected before it arrives" {
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    try decoder.processEncoderInstruction(&set_capacity_4096);
+    // Insert With Literal Name, name length 5000: two bytes in, already too large.
+    try testing.expectError(error.EntryTooLarge, decoder.processEncoderInstruction(&[_]u8{ 0x5f, 0xe9, 0x26 }));
+}
+
+test "QpackEncoder: decoder instructions split at every byte" {
+    var encoder = QpackEncoder{};
+    // Stream Cancellation for stream 200 (6-bit prefix, then 137 = 0x89 0x01).
+    for ([_]u8{ 0x7f, 0x89, 0x01 }) |b| try encoder.processDecoderInstruction(&[_]u8{b});
+    try testing.expectEqual(@as(usize, 0), encoder.pending.len);
+    // A Section Acknowledgment is still an error, once complete.
+    try encoder.processDecoderInstruction(&[_]u8{0xff});
+    try testing.expectError(error.QpackDecoderStreamError, encoder.processDecoderInstruction(&[_]u8{0x01}));
 }
 
 test "QpackDecoder: a negative Delta Base reaching below zero is rejected" {
