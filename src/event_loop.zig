@@ -1670,7 +1670,8 @@ pub fn Server(comptime Handler: type) type {
         }
 
         fn rescheduleTimer(self: *Self) void {
-            if (self.halted) return;
+            // Before start() the timer is not ours to arm: start() arms it.
+            if (self.halted or !self.started) return;
             const next_ms = self.computeNextTimeoutMs() orelse return;
 
             if (!self.timer_armed and self.timer_cancel_completion.state() != .dead) {
@@ -3005,7 +3006,8 @@ pub fn Client(comptime Handler: type) type {
         }
 
         fn rescheduleTimer(self: *Self) void {
-            if (self.halted) return;
+            // Before start() the timer is not ours to arm: start() arms it.
+            if (self.halted or !self.started) return;
             const next_ms = self.computeNextTimeoutMs() orelse return;
 
             // See the server's rescheduleTimer: never re-add the timer while a
