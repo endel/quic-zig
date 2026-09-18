@@ -50,6 +50,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   give each worker its own id in `Config.quic_lb`, and hand what
   `Config.foreign_datagram` reports to the owner's `Server.injectDatagram`.
   See QUIC-LB.md.
+- `Config.retry_threshold` makes new clients validate their address with a
+  Retry once that many connections are live, and `Server.setRequireRetry`
+  switches it on for load signals of your own.
 - `Config.stateless_reply_rate` caps Version Negotiation, stateless reset and
   CONNECTION_REFUSED replies per second, each kind separately (default 200).
 

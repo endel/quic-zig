@@ -237,6 +237,10 @@ pub const ConnectionManager = struct {
     /// When true, Initial packets without a valid token get a Retry response.
     require_retry: bool = false,
 
+    /// Also send Retry once this many connections are live, so a loaded
+    /// server spends state only on clients that proved their address.
+    retry_threshold: ?usize = null,
+
     /// When true, every new connection is answered with CONNECTION_REFUSED,
     /// as it is at `max_connections`. Set while a server drains.
     refuse_new: bool = false,
@@ -494,6 +498,9 @@ pub const ConnectionManager = struct {
     ) RecvAction {
         var fbs = io.fixedBufferStream(bytes);
         var current_entry: ?*ConnEntry = null;
+        // Out here: the new connection's transport parameters point into it
+        // until recv() below has answered the ClientHello.
+        var retry_token: ?packet.ValidatedToken = null;
 
         while (fbs.seek < bytes.len) {
             // All valid QUIC packets have the fixed bit (0x40) set.
@@ -552,47 +559,43 @@ pub const ConnectionManager = struct {
                     return self.refuse(header, out_buf);
                 }
 
-                // Initial packet — check retry requirement
-                if (self.require_retry) {
-                    if (header.token == null or header.token.?.len == 0) {
-                        // No token: send Retry
-                        var retry_scid: [8]u8 = undefined;
-                        sys.randomBytes(&retry_scid);
-
-                        var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
-                        const token_len = packet.generateRetryToken(
-                            &token_buf,
-                            header.dcid,
-                            &retry_scid,
-                            from,
-                            self.retry_token_key,
-                        ) catch return .{ .dropped = {} };
-
-                        var retry_fbs = io.fixedBufferStream(out_buf);
-                        packet.retry(header, &retry_scid, token_buf[0..token_len], &retry_fbs) catch
-                            return .{ .dropped = {} };
-                        return .{ .send_response = retry_fbs.buffered() };
-                    }
-
-                    // Has token: validate as Retry token
-                    const validated = packet.validateRetryToken(
-                        header.token.?,
-                        from,
-                        self.retry_token_key,
-                    ) catch null;
-
-                    if (validated) |vt| {
+                // A token is honoured whether or not Retry is required now:
+                // load may have dropped since we sent the Retry, and its
+                // client will insist on seeing retry_source_connection_id.
+                const token = header.token orelse &[_]u8{};
+                const need_retry = self.require_retry or
+                    (if (self.retry_threshold) |n| self.entries.items.len >= n else false);
+                if (token.len > 0) {
+                    retry_token = packet.validateRetryToken(token, from, self.retry_token_key) catch null;
+                    if (retry_token) |*vt| {
                         entry = self.acceptConnection(header, local, from, vt.getOdcid(), vt.getRetryScid()) catch
                             return .{ .dropped = {} };
-                    } else if (packet.validateNewToken(header.token.?, from, self.retry_token_key)) {
-                        // Valid NEW_TOKEN — accept without retry
+                    } else if (packet.validateNewToken(token, from, self.retry_token_key)) {
+                        // Valid NEW_TOKEN — the address is proven already
                         entry = self.acceptConnection(header, local, from, header.dcid, null) catch
                             return .{ .dropped = {} };
-                    } else {
+                    } else if (need_retry) {
                         return .{ .dropped = {} };
                     }
-                } else {
-                    // No retry required — accept directly
+                } else if (need_retry) {
+                    var retry_scid: [8]u8 = undefined;
+                    sys.randomBytes(&retry_scid);
+
+                    var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
+                    const token_len = packet.generateRetryToken(
+                        &token_buf,
+                        header.dcid,
+                        &retry_scid,
+                        from,
+                        self.retry_token_key,
+                    ) catch return .{ .dropped = {} };
+
+                    var retry_fbs = io.fixedBufferStream(out_buf);
+                    packet.retry(header, &retry_scid, token_buf[0..token_len], &retry_fbs) catch
+                        return .{ .dropped = {} };
+                    return .{ .send_response = retry_fbs.buffered() };
+                }
+                if (entry == null) {
                     entry = self.acceptConnection(header, local, from, null, null) catch
                         return .{ .dropped = {} };
                 }
@@ -1063,4 +1066,44 @@ test "an Initial is accepted locally even when its DCID decodes to another serve
     var id: [1]u8 = undefined;
     try std.testing.expect(quic_lb.extractServerId(&lbConfig(1), scid, &id));
     try std.testing.expectEqual(@as(u8, 1), id[0]);
+}
+
+test "past retry_threshold a new client gets Retry, and is served once it echoes the token" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.retry_threshold = 1;
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+
+    // Under the threshold: served straight away.
+    var buf: [1500]u8 = undefined;
+    const first = try clientInitial(alloc, &buf);
+    defer {
+        first.conn.deinit();
+        alloc.destroy(first.conn);
+    }
+    try std.testing.expect(mgr.recvDatagram(buf[0..first.len], addr, addr, 0, &out) == .processed);
+
+    // At it: Retry, and no state kept.
+    const second = try clientInitial(alloc, &buf);
+    defer {
+        second.conn.deinit();
+        alloc.destroy(second.conn);
+    }
+    const retry = switch (mgr.recvDatagram(buf[0..second.len], addr, addr, 0, &out)) {
+        .send_response => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+    second.conn.handleDatagram(@constCast(retry), .{ .to = addr, .from = addr, .datagram_size = retry.len });
+    try std.testing.expect(second.conn.retry_received);
+
+    // Load drops before the client comes back; its token still counts, so
+    // the connection is set up as a retried one.
+    mgr.removeConnection(mgr.entries.items[0]);
+    const n = try second.conn.send(&buf);
+    try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .processed);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+    try std.testing.expect(mgr.entries.items[0].conn.paths[0].is_validated);
 }

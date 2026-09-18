@@ -83,7 +83,21 @@ pub const Config = struct {
     /// Chrome and Firefox read those; Safari 26.4 reads only the draft-13 ones,
     /// which are always sent.
     wt_legacy_settings: bool = true,
+
+    /// Answer every new client with Retry (RFC 9000 8.1.2): it must echo
+    /// the token from its own address before the server keeps any state.
+    /// Costs every client a round trip; see `retry_threshold`.
     require_retry: bool = false,
+
+    /// Retry new clients only once this many connections are live, so a
+    /// loaded server gives state only to clients that proved their address
+    /// and an idle one costs nothing extra. Below it, clients still echoing
+    /// a Retry are served as such. `Server.setRequireRetry` covers load
+    /// signals of the embedder's own.
+    ///
+    /// Servers behind one port (`reuse_port`) should share `retry_token_key`,
+    /// or a token is only good at the server that issued it.
+    retry_threshold: ?usize = null,
 
     // Advanced: provide pre-built TLS and connection configs directly.
     // When tls_config is set, cert_path/key_path are ignored.
@@ -762,6 +776,7 @@ pub fn Server(comptime Handler: type) type {
                 static_reset_key,
             );
             conn_mgr.require_retry = config.require_retry;
+            conn_mgr.retry_threshold = config.retry_threshold;
             conn_mgr.max_connections = config.max_connections;
             conn_mgr.reply_limits = .init(config.stateless_reply_rate);
             conn_mgr.steer_foreign = config.foreign_datagram != null;
@@ -957,6 +972,12 @@ pub fn Server(comptime Handler: type) type {
             self.batch.flush();
             if (self.preferred) |*p| p.batch.flush();
             self.rescheduleTimer();
+        }
+
+        /// Turn `Config.require_retry` on or off, for an embedder with its own
+        /// idea of load — CPU, memory, handshakes per second. Loop thread only.
+        pub fn setRequireRetry(self: *Self, on: bool) void {
+            self.conn_mgr.require_retry = on;
         }
 
         /// Begin a graceful HTTP/3 shutdown (RFC 9114 5.2): what a server
@@ -4683,6 +4704,44 @@ test "e2e: a WebTransport client pauses a server stream the same way" {
     try runUntil(&e2e.loop, &client_handler.sink, WtSink.done, 20_000);
     try testing.expectEqual(PAUSE_BODY, client_handler.sink.bytes);
     try testing.expect(client_handler.sink.ok);
+}
+
+test "e2e: a server past retry_threshold makes a client retry, then serves it" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var server_handler = HelloServer{};
+    var server = try Server(HelloServer).init(testing.allocator, &server_handler, .{
+        .port = 29435,
+        .tls_config = makeTestTlsConfig(),
+        .retry_threshold = 0,
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+
+    var client_handler = CheckingClient{};
+    var client = try Client(CheckingClient).init(testing.allocator, &client_handler, .{
+        .port = 29435,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    defer client.deinit();
+    client.start();
+
+    try runUntil(&loop, &client_handler, CheckingClient.done, 10_000);
+    try testing.expect(client.conn.retry_received);
+    try testing.expectEqualStrings("hello", client_handler.body[0..client_handler.received]);
+
+    client.stop();
+    server.stop();
+    const Both = struct {
+        s: *Server(HelloServer),
+        c: *Client(CheckingClient),
+        fn stopped(self: *const @This()) bool {
+            return self.s.isStopped() and self.c.isStopped();
+        }
+    };
+    try runUntil(&loop, &Both{ .s = &server, .c = &client }, Both.stopped, 5000);
 }
 
 /// Server ids 1 and 2 under one QUIC-LB config, as a proxy's workers would

@@ -96,8 +96,9 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
   for every range including those past `MAX_ACK_RANGES`.
 - [ ] **R7. CID lifecycle gaps (M)** — retire-on-switch, CONNECTION_ID_LIMIT_ERROR, in-use
   guard, RETIRE validation, delayed routing removal, rotation (`connection.zig:162,2063`).
-- [~] **R8. At-capacity Initials silently dropped (S/M)** — CONNECTION_REFUSED sent statelessly
-  (`writeRefusal`), rate-limited. Still open: the Retry-under-load callback.
+- [x] **R8. At-capacity Initials silently dropped (S/M)** — CONNECTION_REFUSED sent statelessly
+  (`writeRefusal`), rate-limited. Under load, `Config.retry_threshold` (live connections) or
+  `Server.setRequireRetry` makes new clients validate their address with Retry first.
 - [x] **R9. No max cwnd cap (S)** — 10000 × MSS, NewReno and CUBIC.
 - [ ] **R10. Persistent-congestion check loose vs §7.6.2 (S)** — `ack_handler.zig:313`.
 - [ ] **R11. Control-frame order not randomized (S, low)** — `packet_packer.zig:333`.
