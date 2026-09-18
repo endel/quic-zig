@@ -3052,7 +3052,9 @@ pub const Connection = struct {
         self.streams.collectClosedStreams();
 
         // MAX_DATA grows only with what the consumer took or a reset abandoned.
-        self.conn_flow_ctrl.addBytesRead(self.streams.takeConnCredit());
+        // With every byte charged already credited, no stream has any to give.
+        const conn_fc = &self.conn_flow_ctrl.base;
+        if (conn_fc.bytes_read != conn_fc.highest_received) self.conn_flow_ctrl.addBytesRead(self.streams.takeConnCredit());
 
         // Credit generators commit the new limit as they return it, so each
         // one runs only when its frame is sure to fit.
