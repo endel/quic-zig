@@ -154,6 +154,11 @@ pub const H3Connection = struct {
         frame_total: usize, // total frame size (header + payload) for final consume
     } = null,
 
+    /// Request streams whose body the application has paused. poll() leaves
+    /// their data in QUIC, so the peer is held back by the stream's flow
+    /// control window rather than by our memory.
+    paused_bodies: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
     // Graceful shutdown state (RFC 9114 §5.2)
     shutdown_state: ShutdownState = .active,
     local_goaway_id: ?u64 = null,
@@ -189,6 +194,7 @@ pub const H3Connection = struct {
         self.headers_received_streams.deinit();
         self.cancelled_streams.deinit(self.allocator);
         self.writable_waits.deinit(self.allocator);
+        self.paused_bodies.deinit(self.allocator);
     }
 
     fn qpackScratch(self: *H3Connection) ![]u8 {
@@ -608,6 +614,7 @@ pub const H3Connection = struct {
             _ = self.excluded_bidi_streams.remove(id);
             _ = self.headers_received_streams.remove(id);
             _ = self.cancelled_streams.remove(id);
+            _ = self.paused_bodies.remove(id);
             if (self.stream_bufs.fetchRemove(id)) |kv| {
                 var buf = kv.value;
                 buf.deinit(self.allocator);
@@ -652,6 +659,37 @@ pub const H3Connection = struct {
         }
 
         return null;
+    }
+
+    /// Stop surfacing `stream_id`'s body: no `.data` or `.finished` for it
+    /// until `resumeBody`. Its bytes stay unread in QUIC, and MAX_STREAM_DATA
+    /// only grows as they are read, so the peer stalls at one window.
+    ///
+    /// Safe mid-way through a DATA frame: what `recvBody` has not returned
+    /// yet stays buffered and comes back first after the resume.
+    pub fn pauseBody(self: *H3Connection, stream_id: u64) !void {
+        try self.paused_bodies.put(self.allocator, stream_id, {});
+        const pb = self.pending_body orelse return;
+        if (pb.stream_id != stream_id) return;
+        // Re-frame the unread tail as a DATA frame of its own, so poll()
+        // is free to serve other streams meanwhile.
+        const buf = self.stream_bufs.getPtr(stream_id) orelse return;
+        var hdr_buf: [16]u8 = undefined;
+        var hdr = io.fixedBufferStream(&hdr_buf);
+        try packet.writeVarInt(&hdr, @intFromEnum(h3_frame.H3FrameType.data));
+        try packet.writeVarInt(&hdr, pb.remaining);
+        h3_frame.consumeFromBuf(buf, pb.offset);
+        try buf.insertSlice(self.allocator, 0, hdr.buffered());
+        self.pending_body = null;
+    }
+
+    /// Undo `pauseBody`. The buffered body is surfaced by a later poll().
+    pub fn resumeBody(self: *H3Connection, stream_id: u64) void {
+        _ = self.paused_bodies.remove(stream_id);
+    }
+
+    pub fn isBodyPaused(self: *const H3Connection, stream_id: u64) bool {
+        return self.paused_bodies.contains(stream_id);
     }
 
     /// Read body data from a stream after a `.data` event.
@@ -1026,8 +1064,16 @@ pub const H3Connection = struct {
             // Skip already-finished streams
             if (self.finished_streams.contains(stream_id)) continue;
 
+            // Paused: its data stays in QUIC. Only a reset is still news.
+            if (self.paused_bodies.contains(stream_id)) {
+                if (stream.recv.reset_err) |err_code| {
+                    if (try self.reportCancelled(stream_id, err_code)) |ev| return ev;
+                }
+                continue;
+            }
+
             // RFC 9114 §5.2: reject client-initiated bidi streams >= our GOAWAY ID
-            if (self.shutdown_state == .going_away_final) {
+            if (self.shutdown_state == .going_away_final or self.shutdown_state == .drain_complete) {
                 if (self.local_goaway_id) |goaway_id| {
                     if (stream_mod.isClient(stream_id) and stream_mod.isBidi(stream_id) and stream_id >= goaway_id) {
                         stream.send.reset(@intFromEnum(H3Error.request_rejected));
@@ -1060,7 +1106,15 @@ pub const H3Connection = struct {
             }
 
             // Try to parse H3 frames from buffered data (even without new recv data)
-            const buf = self.stream_bufs.getPtr(stream_id) orelse continue;
+            const buf = self.stream_bufs.getPtr(stream_id) orelse {
+                // Client: reset before a byte of response arrived, e.g. a
+                // request the server rejected. A server never surfaced it.
+                if (stream.recv.reset_err != null and !self.is_server) {
+                    const err_code = stream.recv.reset_err.?;
+                    if (try self.reportCancelled(stream_id, err_code)) |ev| return ev;
+                }
+                continue;
+            };
 
             // Try to parse H3 frames from buffered data
             while (buf.items.len > 0) {
@@ -1206,16 +1260,20 @@ pub const H3Connection = struct {
             if (stream.recv.reset_err) |err_code| {
                 const has_buffered = if (self.stream_bufs.getPtr(stream_id)) |b| b.items.len > 0 else false;
                 if (!has_buffered) {
-                    try self.finished_streams.put(stream_id, {});
-                    const gop = try self.cancelled_streams.getOrPut(self.allocator, stream_id);
-                    if (!gop.found_existing) {
-                        return .{ .request_cancelled = .{ .stream_id = stream_id, .error_code = err_code } };
-                    }
+                    if (try self.reportCancelled(stream_id, err_code)) |ev| return ev;
                 }
             }
         }
 
         return null;
+    }
+
+    /// The one `request_cancelled` a reset stream gets; null if already sent.
+    fn reportCancelled(self: *H3Connection, stream_id: u64, error_code: u64) !?H3Event {
+        try self.finished_streams.put(stream_id, {});
+        const gop = try self.cancelled_streams.getOrPut(self.allocator, stream_id);
+        if (gop.found_existing) return null;
+        return .{ .request_cancelled = .{ .stream_id = stream_id, .error_code = error_code } };
     }
 
     /// Consume `consumed` bytes from the front of a stream buffer.
@@ -1295,6 +1353,7 @@ test "H3Connection: init and deinit" {
     conn.headers_received_streams = std.AutoHashMap(u64, void).init(testing.allocator);
     conn.cancelled_streams = .empty;
     conn.writable_waits = .empty;
+    conn.paused_bodies = .empty;
     conn.qpack_scratch_owned = false;
     conn.deinit();
 }
@@ -2622,4 +2681,79 @@ test "H3 streaming: RESET_STREAM on a request is reported once" {
     const ev = (try h3.poll()).?;
     try testing.expectEqual(@as(u64, 0), ev.request_cancelled.stream_id);
     try testing.expect(try h3.poll() == null);
+}
+
+test "H3 pauseBody: mid-frame pause holds the rest, other streams go on, resume delivers it all" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var payload: [100]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast(i);
+    var frame_buf: [512]u8 = undefined;
+    var pos = buildGetRequestFrame(&frame_buf);
+    pos += buildDataFrame(frame_buf[pos..], &payload);
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..pos], true);
+
+    _ = try h3.poll(); // headers
+    try testing.expect((try h3.poll()).? == .data);
+    var got: [100]u8 = undefined;
+    try testing.expectEqual(@as(usize, 30), h3.recvBody(got[0..30]));
+
+    try h3.pauseBody(0);
+    try testing.expectEqual(@as(usize, 0), h3.recvBody(got[30..]));
+
+    // Another request is not held up behind the paused one.
+    const n = buildGetRequestFrame(&frame_buf);
+    try injectBidiStreamData(&quic_conn, 4, frame_buf[0..n], true);
+    var saw_other = false;
+    while (try h3.poll()) |ev| switch (ev) {
+        .headers => |hd| saw_other = saw_other or hd.stream_id == 4,
+        .data => |d| try testing.expect(d.stream_id != 0),
+        .finished => |sid| try testing.expect(sid != 0),
+        else => {},
+    };
+    try testing.expect(saw_other);
+
+    h3.resumeBody(0);
+    var read: usize = 30;
+    var finished = false;
+    while (try h3.poll()) |ev| switch (ev) {
+        .data => |d| if (d.stream_id == 0) {
+            read += h3.recvBody(got[read..]);
+        },
+        .finished => |sid| if (sid == 0) {
+            finished = true;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 100), read);
+    try testing.expectEqualSlices(u8, &payload, &got);
+    try testing.expect(finished);
+}
+
+test "H3 pauseBody: a paused stream leaves its data unread in QUIC" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var frame_buf: [512]u8 = undefined;
+    const n = buildGetRequestFrame(&frame_buf);
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..n], false);
+    try testing.expect((try h3.poll()).? == .headers);
+    try h3.pauseBody(0);
+
+    var payload = [_]u8{7} ** 50;
+    const d = buildDataFrame(&frame_buf, &payload);
+    const stream = quic_conn.streams.getStream(0).?;
+    try stream.recv.handleStreamFrame(n, frame_buf[0..d], false);
+    while (try h3.poll()) |_| {}
+    // Nothing read, so no credit returned to the peer.
+    try testing.expectEqual(@as(u64, n), stream.recv.bytes_read);
 }

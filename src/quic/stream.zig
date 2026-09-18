@@ -45,11 +45,24 @@ pub const FrameSorter = struct {
     pub const Chunk = struct {
         offset: u64,
         data: []const u8,
+        /// Size of the allocation behind `data` when it was grown in place;
+        /// zero when it is exactly `data`.
+        cap: usize = 0,
 
         fn end(self: Chunk) u64 {
             return self.offset + self.data.len;
         }
+
+        fn allocation(self: Chunk) []u8 {
+            return @constCast(self.data.ptr)[0..@max(self.cap, self.data.len)];
+        }
     };
+
+    /// In-order data grows the newest chunk up to this size instead of
+    /// adding one per frame. Unread in-order data — a paused consumer, a
+    /// window's worth in flight — then costs a handful of chunks rather than
+    /// one per frame, which the reassembly cap would count as holes.
+    const MAX_COALESCED: usize = 64 * 1024;
 
     allocator: Allocator,
 
@@ -77,7 +90,7 @@ pub const FrameSorter = struct {
     }
 
     pub fn deinit(self: *FrameSorter) void {
-        for (self.chunks.items) |c| self.allocator.free(c.data);
+        for (self.chunks.items) |c| self.allocator.free(c.allocation());
         self.chunks.deinit(self.allocator);
     }
 
@@ -137,6 +150,14 @@ pub const FrameSorter = struct {
         // or beyond the highest byte ever buffered. It cannot overlap an
         // existing chunk, and sorts after every one already held.
         if (effective_offset >= self.highest_buffered) {
+            if (self.chunks.items.len > 0) {
+                const last = &self.chunks.items[self.chunks.items.len - 1];
+                if (last.end() == effective_offset and last.data.len + effective_data.len <= MAX_COALESCED) {
+                    try self.growChunk(last, effective_data);
+                    self.highest_buffered = last.end();
+                    return;
+                }
+            }
             try self.reserveChunk();
             const owned = try self.allocator.dupe(u8, effective_data);
             errdefer self.allocator.free(owned);
@@ -169,13 +190,13 @@ pub const FrameSorter = struct {
             if (existing.offset < new_end and existing.end() > new_end) {
                 const suffix_start: usize = @intCast(new_end - existing.offset);
                 const owned_suffix = try self.allocator.dupe(u8, existing.data[suffix_start..]);
-                self.allocator.free(existing.data);
+                self.allocator.free(existing.allocation());
                 self.chunks.items[i] = .{ .offset = new_end, .data = owned_suffix };
                 break;
             }
 
             // Existing lies wholly inside the new data.
-            self.allocator.free(existing.data);
+            self.allocator.free(existing.allocation());
             _ = self.chunks.orderedRemove(i);
         }
 
@@ -186,6 +207,20 @@ pub const FrameSorter = struct {
 
         const end_offset = effective_offset + owned.len;
         if (end_offset > self.highest_buffered) self.highest_buffered = end_offset;
+    }
+
+    /// Append `bytes` to `c`, doubling its allocation as needed.
+    fn growChunk(self: *FrameSorter, c: *Chunk, bytes: []const u8) !void {
+        const len = c.data.len;
+        const need = len + bytes.len;
+        var buf = c.allocation();
+        if (need > buf.len) {
+            const new_cap = @min(@max(need, buf.len * 2), MAX_COALESCED);
+            buf = try self.allocator.realloc(buf, new_cap);
+        }
+        @memcpy(buf[len..need], bytes);
+        c.data = buf[0..need];
+        c.cap = buf.len;
     }
 
     /// Pop the next contiguous chunk of data from the read position.
@@ -201,14 +236,15 @@ pub const FrameSorter = struct {
         _ = self.chunks.orderedRemove(0);
         const skip: usize = @intCast(self.read_pos - first.offset);
         const readable = first.data[skip..];
-        const owned = if (skip == 0)
+        // The caller frees what we return, so it must be a whole allocation.
+        const owned = if (skip == 0 and first.cap <= first.data.len)
             first.data
         else blk: {
             const copy = self.allocator.dupe(u8, readable) catch {
-                self.allocator.free(first.data);
+                self.allocator.free(first.allocation());
                 return null;
             };
-            self.allocator.free(first.data);
+            self.allocator.free(first.allocation());
             break :blk copy;
         };
         self.read_pos += readable.len;
@@ -260,9 +296,13 @@ pub const ReceiveStream = struct {
     /// FIN must not count a second time.
     closed_counted: bool = false,
 
-    // Receive-side flow control (for generating MAX_STREAM_DATA)
+    /// Receive-side flow control. `receive_window` is the highest offset we
+    /// have allowed the peer (RFC 9000 4.1) and is enforced on every frame;
+    /// `receive_window_size` is the increment MAX_STREAM_DATA re-grants as
+    /// data is read, zero for a stream nothing configured, which never
+    /// re-grants.
     bytes_read: u64 = 0,
-    receive_window: u64 = 0,
+    receive_window: u64 = std.math.maxInt(u64),
     receive_window_size: u64 = 0,
 
     pub fn init(allocator: Allocator, stream_id: u64) ReceiveStream {
@@ -287,6 +327,7 @@ pub const ReceiveStream = struct {
 
     /// Handle an incoming STREAM frame.
     pub fn handleStreamFrame(self: *ReceiveStream, offset: u64, data: []const u8, fin: bool) !void {
+        if (offset + data.len > self.receive_window) return error.FlowControlError;
         if (self.reset_err != null) return; // Ignore data after reset
         if (fin) self.fin_received = true;
         try self.sorter.push(offset, data, fin);
@@ -301,6 +342,7 @@ pub const ReceiveStream = struct {
         }
         // RFC 9000 §4.5: final size cannot be less than data already received
         if (final_size < self.sorter.highestReceived()) return error.FinalSizeError;
+        if (final_size > self.receive_window) return error.FlowControlError;
 
         self.reset_err = error_code;
         self.sorter.fin_offset = final_size;
@@ -323,7 +365,7 @@ pub const ReceiveStream = struct {
     /// Check if a MAX_STREAM_DATA update should be sent.
     /// Returns the new window offset, or null if no update needed.
     pub fn getWindowUpdate(self: *ReceiveStream) ?u64 {
-        if (self.receive_window == 0) return null; // no flow control configured
+        if (self.receive_window_size == 0) return null; // no flow control configured
         if (self.fin_received) return null; // no point updating after FIN
 
         // Send update when consumed portion exceeds threshold
@@ -947,10 +989,12 @@ pub const StreamsMap = struct {
     peer_initial_max_stream_data_bidi_remote: u64 = std.math.maxInt(u64),
     peer_initial_max_stream_data_uni: u64 = std.math.maxInt(u64),
 
-    /// Local receive window limits (our advertised limits, for MAX_STREAM_DATA generation).
-    local_max_stream_data_bidi_local: u64 = 0,
-    local_max_stream_data_bidi_remote: u64 = 0,
-    local_max_stream_data_uni: u64 = 0,
+    /// Local receive window limits (our advertised limits, enforced on
+    /// receipt and re-granted by MAX_STREAM_DATA). `Connection` sets them from
+    /// `ConnectionConfig`; the defaults match its defaults.
+    local_max_stream_data_bidi_local: u64 = 6_291_456,
+    local_max_stream_data_bidi_remote: u64 = 6_291_456,
+    local_max_stream_data_uni: u64 = 1_048_576,
 
     /// Maximum stream IDs from peer.
     max_incoming_bidi_streams: u64 = 0,
@@ -1595,16 +1639,13 @@ test "FrameSorter: in-order data" {
     try sorter.push(0, "hello", false);
     try sorter.push(5, " world", true);
 
-    const chunk1 = sorter.pop();
-    try testing.expect(chunk1 != null);
-    try testing.expectEqualStrings("hello", chunk1.?);
-    testing.allocator.free(chunk1.?);
+    // In-order frames coalesce, so one pop returns both.
+    const chunk = sorter.pop();
+    try testing.expect(chunk != null);
+    try testing.expectEqualStrings("hello world", chunk.?);
+    testing.allocator.free(chunk.?);
 
-    const chunk2 = sorter.pop();
-    try testing.expect(chunk2 != null);
-    try testing.expectEqualStrings(" world", chunk2.?);
-    testing.allocator.free(chunk2.?);
-
+    try testing.expect(sorter.pop() == null);
     try testing.expect(sorter.isComplete());
 }
 
@@ -1637,23 +1678,15 @@ test "FrameSorter: sequential append fast path remains readable" {
     defer sorter.deinit();
 
     try sorter.push(0, "hello", false);
+    const first = sorter.pop().?;
+    try testing.expectEqualStrings("hello", first);
+    testing.allocator.free(first);
+
     try sorter.push(5, " ", false);
     try sorter.push(6, "world", true);
-
-    const chunk1 = sorter.pop();
-    try testing.expect(chunk1 != null);
-    try testing.expectEqualStrings("hello", chunk1.?);
-    testing.allocator.free(chunk1.?);
-
-    const chunk2 = sorter.pop();
-    try testing.expect(chunk2 != null);
-    try testing.expectEqualStrings(" ", chunk2.?);
-    testing.allocator.free(chunk2.?);
-
-    const chunk3 = sorter.pop();
-    try testing.expect(chunk3 != null);
-    try testing.expectEqualStrings("world", chunk3.?);
-    testing.allocator.free(chunk3.?);
+    const rest = sorter.pop().?;
+    try testing.expectEqualStrings(" world", rest);
+    testing.allocator.free(rest);
 
     try testing.expect(sorter.isComplete());
 }
@@ -1707,6 +1740,32 @@ test "FrameSorter: heavy reordering reassembles in order" {
     }
     try testing.expectEqual(n, got);
     for (out, 0..) |v, k| try testing.expectEqual(@as(u8, @intCast(k % 251)), v);
+}
+
+test "FrameSorter: unread in-order data coalesces instead of hitting the gap cap" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    // A window's worth of small in-order frames nobody reads yet.
+    const n: usize = 20 * limits.max_reassembly_chunks;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const b = [_]u8{ @intCast(i % 251), @intCast((i * 7) % 251) };
+        try sorter.push(i * 2, &b, false);
+    }
+    try testing.expect(sorter.chunks.items.len <= n * 2 / FrameSorter.MAX_COALESCED + 1);
+
+    var got: usize = 0;
+    while (sorter.pop()) |chunk| {
+        for (chunk, got..) |v, k| {
+            const idx = k / 2;
+            const want: u8 = if (k % 2 == 0) @intCast(idx % 251) else @intCast((idx * 7) % 251);
+            try testing.expectEqual(want, v);
+        }
+        got += chunk.len;
+        testing.allocator.free(chunk);
+    }
+    try testing.expectEqual(n * 2, got);
 }
 
 // RFC 9000 §21.7: bound the reassembly tracking structure.

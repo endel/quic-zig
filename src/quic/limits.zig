@@ -25,10 +25,11 @@ pub const pending_frames: usize = 128;
 /// comparably — quic-go 1000, quinn 1024, ngtcp2 4000.
 pub const max_reassembly_chunks: usize = 1000;
 
-/// Largest CRYPTO stream offset we will buffer. CRYPTO frames are not flow
-/// controlled (RFC 9000 7.5), so this is the only ceiling on pre-handshake
-/// reassembly memory; past it the peer gets CRYPTO_BUFFER_EXCEEDED. Matches
-/// `tls_handshake_in`, which is all of one peer flight we can stage anyway.
+/// How far past the consumed offset a CRYPTO stream will buffer, per
+/// encryption level. CRYPTO frames are not flow controlled (RFC 9000 7.5), so
+/// this is the only ceiling on pre-handshake reassembly memory; past it the
+/// peer gets CRYPTO_BUFFER_EXCEEDED. Matches `tls_handshake_in`, which is all
+/// of one peer flight we can stage anyway.
 pub const max_crypto_stream_offset: u64 = tls_handshake_in;
 
 /// Largest QPACK dynamic table capacity we will honour, in bytes, and the

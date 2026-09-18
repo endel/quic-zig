@@ -32,6 +32,21 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - Writes made outside a `Server` or `Client` callback — from a TCP callback on
   a shared loop, say — are sent on the next loop iteration without calling
   `flush()`.
+- `Server.drain()` shuts an HTTP/3 server down gracefully: GOAWAY on every
+  connection, new connections refused, in-flight requests allowed to finish.
+  Poll `isDrained()` against your own deadline, then call `stop()`.
+- `Session.pauseRequestBody` / `resumeRequestBody` hold back a request body
+  through flow control, so a proxy with a slow upstream no longer has to
+  buffer the whole upload.
+- Clients get an optional `onRequestCancelled` when the server resets a
+  request, including the H3_REQUEST_REJECTED that follows a GOAWAY.
+- `Config.stateless_reply_rate` caps Version Negotiation, stateless reset and
+  CONNECTION_REFUSED replies per second (default 200).
+
+### Changed
+
+- A server at `max_connections` now answers new clients with
+  CONNECTION_REFUSED instead of ignoring them until they time out.
 
 ### Fixed
 
@@ -47,6 +62,23 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   its tail once the stream was reclaimed.
 - Rescheduling a server or client timer right as it fired could corrupt
   libxev's queue when the loop is run blocking (`.once`, `.until_done`).
+- A peer can no longer send past a stream's flow-control window; it now gets
+  FLOW_CONTROL_ERROR instead of having the server buffer whatever it sends.
+- Peer-opened unidirectional streams (HTTP/3 control, WebTransport, MoQ)
+  stalled once their first 1 MiB was used, as their window was never raised.
+  A raw-QUIC server also stalled, or closed the connection, when a peer sent
+  faster than one read per loop pass.
+- Lost control frames — RESET_STREAM, STOP_SENDING, MAX_DATA,
+  MAX_STREAM_DATA, NEW_CONNECTION_ID and the like — are now resent, and a busy
+  connection no longer drops them when its queue fills. A lost window update
+  could stall a stream for good.
+- Hardening for servers on the open internet: an ACK for a packet never sent
+  or with malformed ranges closes the connection; a new connection needs a
+  full-size Initial with a DCID of at least 8 bytes; Version Negotiation is
+  sent only for full-size datagrams; a closing connection no longer answers
+  every packet with CONNECTION_CLOSE; stateless resets are not sent for small
+  packets; and CRYPTO buffering, received-packet tracking and the congestion
+  window are all bounded.
 
 ## 0.5.0
 

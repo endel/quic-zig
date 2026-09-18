@@ -227,6 +227,16 @@ pub fn main() !void {
 }
 ```
 
+`stop()` cuts off requests in flight. For an HTTP/3 server, `drain()` is the
+gentler first step: it sends GOAWAY, refuses new connections, lets in-flight
+requests finish and closes each connection once it has none left. Wait on
+`isDrained()` with a deadline of your own, then call `stop()` either way.
+
+A handler that cannot keep up with a request body — a proxy with a slow
+upstream — can `session.pauseRequestBody(stream_id)` and later
+`resumeRequestBody(stream_id)`. While paused the client is held back by flow
+control, so the server buffers at most one stream window.
+
 ### High-level API (event loop client)
 
 The client mirrors the server pattern — define a handler struct, and `Client(Handler)` manages the QUIC handshake, H3/WebTransport setup, and Extended CONNECT automatically:

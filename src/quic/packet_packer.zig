@@ -329,6 +329,10 @@ pub const PacketPacker = struct {
         // Track the largest_ack we send in this packet's ACK frame (for ACK-of-ACK pruning)
         var ack_largest_sent: ?u64 = null;
 
+        // Control frames to repeat if this packet is lost (RFC 9000 13.3).
+        var control_frames: [ack_handler.MAX_CONTROL_FRAMES_PER_PACKET]ack_handler.SentControlFrame = undefined;
+        var control_frame_count: u8 = 0;
+
         // 0-RTT packets only contain STREAM and DATAGRAM frames — skip ACK, CRYPTO, control
         if (!zero_rtt) {
             // 1. ACK frame (always first if pending)
@@ -381,7 +385,7 @@ pub const PacketPacker = struct {
                                 try writer.writeByte(0x01); // PING frame
                                 ack_eliciting = true;
                             } else {
-                                pending_frames.push(pcf);
+                                pending_frames.requeue(pcf);
                             }
                         },
                         .connection_close => {
@@ -389,11 +393,11 @@ pub const PacketPacker = struct {
                             ack_eliciting = true;
                             // Keep CONNECTION_CLOSE for higher encryption levels too
                             // (RFC 9000 §10.2.3: send at all available levels)
-                            pending_frames.push(pcf);
+                            pending_frames.requeue(pcf);
                         },
                         else => {
                             // Put it back — other control frames go in 1-RTT
-                            pending_frames.push(pcf);
+                            pending_frames.requeue(pcf);
                         },
                     }
                 }
@@ -425,12 +429,31 @@ pub const PacketPacker = struct {
                         .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni => true,
                         else => false,
                     };
-                    if (is_urgent_control or !ack_only) {
-                        try pcf.write(writer);
-                        ack_eliciting = true;
-                    } else {
+                    if (!is_urgent_control and ack_only) {
                         // Re-queue non-probing frames when congestion-limited
-                        pending_frames.push(pcf);
+                        pending_frames.requeue(pcf);
+                        continue;
+                    }
+                    // A frame this packet cannot record, or has no room for,
+                    // waits for the next one rather than going out untracked.
+                    const record = ack_handler.SentControlFrame.from(pcf);
+                    if (record != null and control_frame_count == control_frames.len) {
+                        pending_frames.requeue(pcf);
+                        continue;
+                    }
+                    var scratch: [256]u8 = undefined;
+                    var scratch_fbs = io.fixedBufferStream(&scratch);
+                    pcf.write(&scratch_fbs) catch continue;
+                    const encoded = scratch_fbs.buffered();
+                    if (fbs.seek + encoded.len + AEAD_TAG_LEN > effective_max) {
+                        pending_frames.requeue(pcf);
+                        continue;
+                    }
+                    try writer.writeAll(encoded);
+                    ack_eliciting = true;
+                    if (record) |r| {
+                        control_frames[control_frame_count] = r;
+                        control_frame_count += 1;
                     }
                 }
             }
@@ -641,6 +664,8 @@ pub const PacketPacker = struct {
         for (stream_frame_infos[0..stream_frame_info_count]) |info| {
             sent_pkt.addStreamFrame(info);
         }
+        @memcpy(sent_pkt.control_frames[0..control_frame_count], control_frames[0..control_frame_count]);
+        sent_pkt.control_frame_count = control_frame_count;
         try pkt_handler.onPacketSent(sent_pkt);
 
         return total_packet_len;
@@ -1282,4 +1307,85 @@ test "PacketPacker: stream frame info tracked in SentPacket" {
     try testing.expectEqual(@as(u64, 0), sf[0].stream_id);
     try testing.expectEqual(@as(u64, 0), sf[0].offset);
     try testing.expect(sf[0].length > 0);
+}
+
+fn packAppOnly(
+    packer: *PacketPacker,
+    pkt_handler: *ack_handler.PacketHandler,
+    crypto_mgr: *crypto_stream.CryptoStreamManager,
+    streams: *stream_mod.StreamsMap,
+    pending_frames: *frame_mod.PendingFrameQueue,
+    out_buf: []u8,
+) !usize {
+    const keys = try testClientKeys();
+    return packer.packCoalesced(out_buf, pkt_handler, crypto_mgr, streams, pending_frames, null, null, null, keys.seal, 1000, null, false);
+}
+
+test "PacketPacker: a sent packet records the control frames to repeat on loss" {
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, &[_]u8{0x01}, dcid, 0x00000001);
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    pending_frames.push(.{ .ping = {} });
+    pending_frames.push(.{ .max_stream_data = .{ .stream_id = 3, .max = 9000 } });
+    pending_frames.push(.{ .reset_stream = .{ .stream_id = 7, .error_code = 1, .final_size = 40 } });
+
+    var out_buf: [1500]u8 = undefined;
+    try testing.expect(try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out_buf) > 0);
+
+    const sent = pkt_handler.sent[2].sent_packets.values()[0];
+    const records = sent.getControlFrames();
+    // PING is never repeated, so it is not recorded.
+    try testing.expectEqual(@as(usize, 2), records.len);
+    try testing.expectEqual(@as(u64, 3), records[0].max_stream_data);
+    try testing.expectEqual(@as(u64, 40), records[1].reset_stream.final_size);
+}
+
+test "PacketPacker: control frames past one packet wait for the next" {
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, &[_]u8{0x01}, dcid, 0x00000001);
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    // More RESET_STREAMs than one packet may record, and more NEW_TOKENs
+    // than one packet can hold: none may be lost to a full packet.
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    var id: u64 = 0;
+    while (id < 10) : (id += 1) {
+        try testing.expect(pending_frames.tryPush(.{ .reset_stream = .{ .stream_id = id * 4 + 2, .error_code = 0, .final_size = 0 } }));
+    }
+    var tok: frame_mod.PendingControlFrame = .{ .new_token = .{} };
+    tok.new_token.token_len = 92;
+    var n: usize = 0;
+    while (n < 20) : (n += 1) try testing.expect(pending_frames.tryPush(tok));
+
+    var out_buf: [1500]u8 = undefined;
+    var packets: usize = 0;
+    var resets: usize = 0;
+    var tokens: usize = 0;
+    while (pending_frames.len > 0) : (packets += 1) {
+        if (packets > 30) return error.TestUnexpectedResult;
+        const written = try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out_buf);
+        try testing.expect(written > 0 and written <= packer.max_packet_size);
+    }
+    for (pkt_handler.sent[2].sent_packets.values()) |p| {
+        try testing.expect(p.control_frame_count <= ack_handler.MAX_CONTROL_FRAMES_PER_PACKET);
+        for (p.getControlFrames()) |cf| switch (cf) {
+            .reset_stream => resets += 1,
+            .new_token => tokens += 1,
+            else => {},
+        };
+    }
+    try testing.expectEqual(@as(usize, 10), resets);
+    try testing.expectEqual(@as(usize, 20), tokens);
 }

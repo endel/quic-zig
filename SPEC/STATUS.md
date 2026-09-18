@@ -6,7 +6,7 @@
 |---|---------|--------|-------|
 | **2** | **Streams** | | |
 | 2.1 | Stream Types and Identifiers | ✅ Done | Bidi + uni, client/server initiated, proper ID bits |
-| 2.2 | Sending and Receiving Data | ✅ Done | FrameSorter, SendStream, ReceiveStream. Reassembly keeps chunks sorted by offset and caps them at 1000 per sorter — see [RFC9000_21.7.md](RFC9000_21.7.md) |
+| 2.2 | Sending and Receiving Data | ✅ Done | FrameSorter, SendStream, ReceiveStream. Reassembly keeps chunks sorted by offset and caps them at 1000 per sorter; in-order data coalesces into chunks of up to 64 KiB, so unread in-order data never counts toward that cap — see [RFC9000_21.7.md](RFC9000_21.7.md) |
 | 2.3 | Stream Prioritization | ✅ Done | RFC 9218 extensible priorities: urgency (0-7), incremental, PRIORITY_UPDATE frame |
 | 2.4 | Operations on Streams | ✅ Done | Open, send, recv, close, reset |
 | **3** | **Stream States** | | |
@@ -16,7 +16,7 @@
 | 3.4 | Bidirectional Stream States | ✅ Done | Composite of send + recv states; reclaimed once fully acked — see [RFC9000_3.md](RFC9000_3.md) |
 | 3.5 | Solicited State Transitions | ✅ Done | STOP_SENDING triggers RESET_STREAM |
 | **4** | **Flow Control** | | |
-| 4.1 | Data Flow Control | ✅ Done | Connection + stream level. The send credit left is exposed to applications as `sendCapacity` / `streamSendCapacity` — see [RFC9000_3.md](RFC9000_3.md) |
+| 4.1 | Data Flow Control | ✅ Done | Connection + stream level. Each receive stream's window is enforced on STREAM and RESET_STREAM (FLOW_CONTROL_ERROR), and re-granted by MAX_STREAM_DATA as data is read, peer uni streams included. Connection-level receive accounting is weaker: see the caveat in [RFC9000_3.md](RFC9000_3.md). The send credit left is exposed to applications as `sendCapacity` / `streamSendCapacity` |
 | 4.2 | Increasing Flow Control Limits | ✅ Done | Auto-tuning window (up to 6MB) |
 | 4.3 | Flow Control Performance | ✅ Done | Auto-tuning prevents stalls |
 | 4.4 | Handling Stream Cancellation | ✅ Done | RESET_STREAM/STOP_SENDING, final_size validation, conn flow ctrl accounting |
@@ -28,11 +28,11 @@
 | 5.1.2 | Consuming and Retiring CIDs | ✅ Done | RETIRE_CONNECTION_ID, retire_prior_to |
 | 5.2 | Matching Packets to Connections | ✅ Done | CID-based routing via ConnectionManager |
 | 5.2.1 | Client Packet Handling | ✅ Done | DCID matching |
-| 5.2.2 | Server Packet Handling | ✅ Done | Multi-connection demux via CID→ConnEntry HashMap |
+| 5.2.2 | Server Packet Handling | ✅ Done | Multi-connection demux via CID→ConnEntry HashMap. A new connection needs a ≥1200-byte datagram and a ≥8-byte DCID; past `max_connections` (or while draining) the client gets CONNECTION_REFUSED in an Initial, rate-limited |
 | 5.2.3 | Simple Load Balancers | ❌ N/A | Informational; no implementation needed |
 | 5.3 | Operations on Connections | ✅ Done | Open, close, send, recv |
 | **6** | **Version Negotiation** | | |
-| 6.1 | Sending Version Negotiation Packets | ✅ Done | Server generates VN packet |
+| 6.1 | Sending Version Negotiation Packets | ✅ Done | Server generates VN packet, only for datagrams of ≥1200 bytes and within the shared stateless-reply rate limit |
 | 6.2 | Handling Version Negotiation Packets | ✅ Done | Client validates VN, detects downgrade, closes on incompatible |
 | 6.3 | Using Reserved Versions | ✅ Done | Greased 0x?a?a?a?a version in VN packets |
 | **7** | **Cryptographic and Transport Handshake** | | |
@@ -42,7 +42,7 @@
 | 7.4 | Transport Parameters | ✅ Done | All parameters encode/decode |
 | 7.4.1 | Values of Transport Parameters for 0-RTT | ✅ Done | Session ticket stores 7 params; client restores on 0-RTT; validates server doesn't reduce |
 | 7.4.2 | New Transport Parameters | ✅ Done | Unknown params skipped per spec |
-| 7.5 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager per encryption level; out-of-order CRYPTO is bounded at 16 KiB, then CRYPTO_BUFFER_EXCEEDED — see [RFC9000_21.7.md](RFC9000_21.7.md) |
+| 7.5 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager per encryption level; CRYPTO data more than 16 KiB past what TLS has consumed is CRYPTO_BUFFER_EXCEEDED — see [RFC9000_21.7.md](RFC9000_21.7.md) |
 | **8** | **Address Validation** | | |
 | 8.1 | Address Validation during Connection Establishment | ✅ Done | Anti-amplification 3:1 limit |
 | 8.1.1 | Token Construction | ✅ Done | AES-128-GCM encrypted tokens |
@@ -73,20 +73,20 @@
 | 10.1.1 | Liveness Testing | ✅ Done | PING frames |
 | 10.1.2 | Deferring Idle Timeout | ✅ Done | Reset on recv + sent ack-eliciting during handshake |
 | 10.2 | Immediate Close | ✅ Done | CONNECTION_CLOSE frame |
-| 10.2.1 | Closing Connection State | ✅ Done | Retransmits CONNECTION_CLOSE, 3×PTO drain |
+| 10.2.1 | Closing Connection State | ✅ Done | Resends CONNECTION_CLOSE on the 1st, 2nd, 4th, 8th… packet received, not on every one; 3×PTO drain |
 | 10.2.2 | Draining Connection State | ✅ Done | Proper draining state after close |
 | 10.2.3 | Immediate Close during Handshake | ✅ Done | Can close at any handshake stage |
 | 10.3 | Stateless Reset | ✅ Done | HMAC-SHA256 tokens, generation, detection |
 | 10.3.1 | Detecting a Stateless Reset | ✅ Done | Token matching on undecryptable packets |
 | 10.3.2 | Calculating a Stateless Reset Token | ✅ Done | Deterministic HMAC-SHA256 |
-| 10.3.3 | Looping | ✅ Done | Response always smaller than trigger packet |
+| 10.3.3 | Looping | ✅ Done | Response always smaller than the trigger, never sent for triggers under 43 bytes, and rate-limited server-wide with VN and CONNECTION_REFUSED |
 | **11** | **Error Handling** | | |
 | 11.1 | Connection Errors | ✅ Done | CONNECTION_CLOSE with transport error codes |
 | 11.2 | Stream Errors | ✅ Done | RESET_STREAM + STOP_SENDING |
 | **12** | **Packets and Frames** | | |
 | 12.1 | Protected Packets | ✅ Done | AEAD + header protection |
 | 12.2 | Coalescing Packets | ✅ Done | Multiple packets per UDP datagram |
-| 12.3 | Packet Numbers | ✅ Done | Per-space, monotonic, varint encoded |
+| 12.3 | Packet Numbers | ✅ Done | Per-space, monotonic, varint encoded. The application space skips a packet number at doubling intervals (§21.4); an ACK naming a skipped or never-sent number is PROTOCOL_VIOLATION |
 | 12.4 | Frames and Frame Types | ✅ Done | All 24 frame types |
 | 12.5 | Frames and Number Spaces | ✅ Done | Frame-in-wrong-space enforcement |
 | **13** | **Packetization and Reliability** | | |
@@ -94,17 +94,17 @@
 | 13.2 | Generating Acknowledgments | ✅ Done | ACK generation with delay |
 | 13.2.1 | Sending ACK Frames | ✅ Done | max_ack_delay honored |
 | 13.2.2 | Acknowledgment Frequency | ✅ Done | Ack-elicit threshold = 2 |
-| 13.2.3 | Managing ACK Ranges | ✅ Done | RangeSet with descending order |
+| 13.2.3 | Managing ACK Ranges | ✅ Done | RangeSet with descending order, capped at 64 ranges per space (oldest dropped; their gaps then read as duplicates) |
 | 13.2.4 | Limiting Ranges by Tracking ACK Frames | ✅ Done | ACK-of-ACK pruning via largest_acked in SentPacket |
 | 13.2.5 | Measuring and Reporting Host Delay | ✅ Done | ACK delay field |
 | 13.2.6 | ACK Frames and Packet Protection | ✅ Done | ACKs at correct encryption level |
 | 13.2.7 | PADDING Frames Consume Congestion Window | ✅ Done | Counted as in-flight bytes |
-| 13.3 | Retransmission of Information | ⚠️ Partial | STREAM, CRYPTO and HANDSHAKE_DONE are resent from the lost packet's record; control frames (RESET_STREAM, STOP_SENDING, MAX_*, NEW_CONNECTION_ID, …) are sent once and never again — `TODO.md` C7 |
+| 13.3 | Retransmission of Information | ✅ Done | STREAM, CRYPTO and HANDSHAKE_DONE are resent from the lost packet's record, and so are control frames: credit (MAX_*) at its current value, BLOCKED only while still blocked, RESET_STREAM rebuilt from the record, STOP_SENDING until the stream's final size is known, NEW_CONNECTION_ID while the CID is live, a fresh NEW_TOKEN. PING, PATH_* and ACK_FREQUENCY are not resent — see [RFC9000_3.md](RFC9000_3.md) |
 | 13.4 | Explicit Congestion Notification | ✅ Done | IP-level ECT(0) marking + reading via recvmsg |
 | 13.4.1 | Reporting ECN Counts | ✅ Done | ACK_ECN frames with counters |
 | 13.4.2 | ECN Validation | ✅ Done | Full validation state machine (ecn.zig) |
 | **14** | **Datagram Size** | | |
-| 14.1 | Initial Datagram Size | ✅ Done | 1200 byte minimum for Initial |
+| 14.1 | Initial Datagram Size | ✅ Done | 1200 byte minimum for Initial; a server opens no connection from a smaller datagram |
 | 14.2 | Path Maximum Transmission Unit | ✅ Done | PMTUD binary search |
 | 14.2.1 | Handling of ICMP Messages by PMTUD | ❌ N/A | Requires IP_RECVERR (Linux) / raw sockets; DPLPMTUD used instead |
 | 14.3 | DPLPMTUD | ✅ Done | Full state machine in mtu.zig |
@@ -133,7 +133,7 @@
 | 19.1 | PADDING (0x00) | ✅ Done | |
 | 19.2 | PING (0x01) | ✅ Done | |
 | 19.3 | ACK (0x02-0x03) | ✅ Done | Including ECN variant |
-| 19.3.1 | ACK Ranges | ✅ Done | Varint-encoded gap+ack ranges |
+| 19.3.1 | ACK Ranges | ✅ Done | Varint-encoded gap+ack ranges; one reaching below packet number 0 is FRAME_ENCODING_ERROR |
 | 19.3.2 | ECN Counts | ✅ Done | Three counters in ACK_ECN |
 | 19.4 | RESET_STREAM (0x04) | ✅ Done | Final size is the bytes sent, not written; uni streams included |
 | 19.5 | STOP_SENDING (0x05) | ✅ Done | Uni streams included; one naming a stream we reclaimed is ignored, not a STREAM_STATE_ERROR |
@@ -265,7 +265,7 @@
 | 6.4 | Discarding Keys and Packet State | ✅ Done | Clear PN space on key discard |
 | 7 | Congestion Control | | |
 | 7.1 | Explicit Congestion Notification | ✅ Done | IP-level ECT(0) marking + CE→congestion response |
-| 7.2 | Initial and Minimum Congestion Window | ✅ Done | 14720 bytes initial, 2×MSS min |
+| 7.2 | Initial and Minimum Congestion Window | ✅ Done | 14720 bytes initial, 2×MSS min, 10000×MSS max |
 | 7.3 | Slow Start | ✅ Done | Exponential growth |
 | 7.3.1 | Recovery | ✅ Done | Single reduction per RTT |
 | 7.3.2 | Congestion Avoidance | ✅ Done | Linear growth |
@@ -312,7 +312,7 @@
 | 4.6 | Server Push | ❌ N/A | Deprecated — Chrome removed support (RFC 9218 prioritization replaces it) |
 | 5 | Connection Closure | | |
 | 5.1 | Idle Connections | ✅ Done | Via QUIC idle timeout |
-| 5.2 | Connection Shutdown | ✅ Done | Two-phase GOAWAY, stream rejection, drain detection, shutdown_complete event |
+| 5.2 | Connection Shutdown | ✅ Done | Two-phase GOAWAY, stream rejection, drain detection, shutdown_complete event. `event_loop.Server.drain()` runs it server-wide — see [RFC9114_HTTP3.md](RFC9114_HTTP3.md) |
 | 5.3 | Immediate Closure | ✅ Done | H3 error codes in CONNECTION_CLOSE |
 | 6 | Stream Mapping and Usage | | |
 | 6.1 | Bidirectional Streams | ✅ Done | Request/response streams |

@@ -13,6 +13,8 @@ const tls13 = @import("tls13.zig");
 const h3 = @import("../h3/connection.zig");
 const h0 = @import("../h0/connection.zig");
 const wt = @import("../webtransport/session.zig");
+const crypto = @import("crypto.zig");
+const frame_mod = @import("frame.zig");
 
 /// Fixed-size CID key for use in HashMap lookups.
 pub const CidKey = struct {
@@ -68,6 +70,16 @@ pub const ConnEntry = struct {
     wake_fn: ?*const fn (ctx: *anyopaque) void = null,
     wake_ctx: ?*anyopaque = null,
 
+    /// Called when data already received became deliverable (a resumed
+    /// request body), so the owner polls again with nothing new on the
+    /// wire. Takes `wake_ctx`.
+    repoll_fn: ?*const fn (ctx: *anyopaque) void = null,
+
+    /// While a server drains: when to send the final GOAWAY. The first one
+    /// promises nothing, so it goes out at once; this one names the last
+    /// request served and waits a PTO for requests already in flight.
+    drain_final_goaway_at: ?i64 = null,
+
     // For raw QUIC protocol: track streams whose fin has been delivered to handler
     finished_streams: std.AutoHashMapUnmanaged(u64, void) = .{},
 
@@ -79,6 +91,11 @@ pub const ConnEntry = struct {
     /// Tell the owner there is data to send; see `wake_fn`.
     pub fn wake(self: *ConnEntry) void {
         if (self.wake_fn) |f| f(self.wake_ctx orelse return);
+    }
+
+    /// Ask the owner for another poll pass; see `repoll_fn`.
+    pub fn repoll(self: *ConnEntry) void {
+        if (self.repoll_fn) |f| f(self.wake_ctx orelse return);
     }
 
     fn addRegisteredCid(self: *ConnEntry, key: CidKey) void {
@@ -143,6 +160,46 @@ pub fn destroyProtocols(
     }
 }
 
+/// Smallest datagram that may open a connection or earn a Version
+/// Negotiation reply (RFC 9000 14.1, 6).
+pub const MIN_INITIAL_DATAGRAM: usize = 1200;
+
+/// Shortest client-chosen DCID on a connection's first Initial (RFC 9000 7.2).
+pub const MIN_INITIAL_DCID_LEN: usize = 8;
+
+/// Largest datagram a stateless reset is never sent for: anything this short
+/// may itself be a reset, and answering one invites a loop (RFC 9000 10.3.3).
+pub const MIN_RESET_TRIGGER: usize = 43;
+
+/// Token bucket for the replies we send without connection state — Version
+/// Negotiation, stateless reset, CONNECTION_REFUSED. Each costs a send an
+/// off-path attacker can trigger with a spoofed source, so their rate is
+/// capped server-wide rather than tied to what arrives.
+pub const ReplyLimiter = struct {
+    /// Replies allowed per second, and the burst held in reserve. Zero
+    /// disables stateless replies altogether.
+    per_second: u32 = 200,
+    tokens: u32 = 200,
+    last_refill_ns: i64 = 0,
+
+    pub fn allow(self: *ReplyLimiter, now: i64) bool {
+        if (self.per_second == 0) return false;
+        const elapsed = now - self.last_refill_ns;
+        if (elapsed > 0) {
+            const earned: u64 = @intCast(@divTrunc(@as(i128, elapsed) * @as(i128, self.per_second), std.time.ns_per_s));
+            if (earned > 0) {
+                self.tokens = @intCast(@min(@as(u64, self.tokens) + earned, self.per_second));
+                self.last_refill_ns = now;
+            }
+        } else if (elapsed < 0) {
+            self.last_refill_ns = now;
+        }
+        if (self.tokens == 0) return false;
+        self.tokens -= 1;
+        return true;
+    }
+};
+
 /// Manages multiple QUIC connections, routing packets by DCID.
 pub const ConnectionManager = struct {
     pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
@@ -164,6 +221,13 @@ pub const ConnectionManager = struct {
 
     /// When true, Initial packets without a valid token get a Retry response.
     require_retry: bool = false,
+
+    /// When true, every new connection is answered with CONNECTION_REFUSED,
+    /// as it is at `max_connections`. Set while a server drains.
+    refuse_new: bool = false,
+
+    /// Shared budget for stateless replies; see `ReplyLimiter`.
+    reply_limiter: ReplyLimiter = .{},
 
     // Deferred free queue: entries invalidated by removeConnection are held
     // here until freeDeadEntries() is called after all event processing.
@@ -386,8 +450,11 @@ pub const ConnectionManager = struct {
             var header = packet.Header.parse(&fbs, self.local_cid_len) catch break;
             const full_size = fbs.seek - pkt_start + header.remainder_len;
 
-            // Version negotiation (RFC 9000 §6)
+            // Version negotiation (RFC 9000 §6). Only for a datagram as large
+            // as a real Initial, so it cannot amplify a spoofed small one.
             if (header.version != 0 and !protocol.isSupportedVersion(header.version)) {
+                if (bytes.len < MIN_INITIAL_DATAGRAM) return .{ .dropped = {} };
+                if (!self.reply_limiter.allow(sys.nanoTimestamp())) return .{ .dropped = {} };
                 var vn_fbs = io.fixedBufferStream(out_buf);
                 packet.negotiateVersion(header, &vn_fbs) catch return .{ .dropped = {} };
                 return .{ .send_response = vn_fbs.buffered() };
@@ -399,7 +466,9 @@ pub const ConnectionManager = struct {
             if (entry == null) {
                 if (header.packet_type != .initial) {
                     // Short-header for unknown CID: stateless reset (RFC 9000 §10.3)
-                    if (header.packet_type == .one_rtt) {
+                    if (header.packet_type == .one_rtt and full_size >= MIN_RESET_TRIGGER and
+                        self.reply_limiter.allow(sys.nanoTimestamp()))
+                    {
                         // RFC 9000 §10.3.3: response SHOULD be smaller than the trigger
                         // packet to prevent loops (a reset responding to a reset).
                         // Also MUST NOT be 3x or more larger (amplification limit).
@@ -410,6 +479,17 @@ pub const ConnectionManager = struct {
                         }
                     }
                     return .{ .dropped = {} };
+                }
+
+                // RFC 9000 14.1, 7.2: a connection opens only from a full-size
+                // datagram with an unpredictable DCID. Anything less is dropped
+                // before it costs a connection's state.
+                if (bytes.len < MIN_INITIAL_DATAGRAM or header.dcid.len < MIN_INITIAL_DCID_LEN) {
+                    return .{ .dropped = {} };
+                }
+
+                if (self.refuse_new or self.entries.items.len >= self.max_connections) {
+                    return self.refuse(header, out_buf);
                 }
 
                 // Initial packet — check retry requirement
@@ -480,6 +560,15 @@ pub const ConnectionManager = struct {
         return .{ .dropped = {} };
     }
 
+    /// Answer an Initial we will not serve with CONNECTION_REFUSED (RFC 9000
+    /// 5.2.2), sealed with the Initial keys its own DCID derives, so the
+    /// client fails fast instead of retransmitting into silence.
+    fn refuse(self: *ConnectionManager, header: packet.Header, out_buf: []u8) RecvAction {
+        if (!self.reply_limiter.allow(sys.nanoTimestamp())) return .{ .dropped = {} };
+        const len = writeRefusal(header, out_buf) catch return .{ .dropped = {} };
+        return .{ .send_response = out_buf[0..len] };
+    }
+
     /// Process timeouts and remove a closed connection.
     /// Call this per-entry after app-specific polling (H3, WT, etc.).
     /// Returns true if the connection is still alive, false if it was removed
@@ -500,6 +589,38 @@ pub const ConnectionManager = struct {
         return self.entries.items.len;
     }
 };
+
+/// Write an Initial packet carrying CONNECTION_CLOSE(CONNECTION_REFUSED) in
+/// reply to the client Initial `header`. Returns its length.
+pub fn writeRefusal(header: packet.Header, out: []u8) !usize {
+    const seal = (try crypto.deriveInitialKeyMaterial(header.dcid, header.version, true))[1];
+
+    var fbs = io.fixedBufferStream(out);
+    const w = &fbs;
+    const pn_len = 1;
+    try w.writeByte(packet.encodeLongHeaderTypeBits(.initial, header.version) | (pn_len - 1));
+    try w.writeInt(u32, header.version, .big);
+    try w.writeByte(@intCast(header.scid.len));
+    try w.writeAll(header.scid);
+    try w.writeByte(@intCast(header.dcid.len));
+    try w.writeAll(header.dcid);
+    try w.writeByte(0); // token length
+
+    // CONNECTION_CLOSE (0x1c), CONNECTION_REFUSED, frame type 0, no reason.
+    const payload = [_]u8{ 0x1c, @intFromEnum(frame_mod.TransportError.connection_refused), 0x00, 0x00 };
+    const tag_len = 16;
+    const length = pn_len + payload.len + tag_len;
+    try packet.writeVarInt(w, length);
+    const pn_offset = fbs.seek;
+    try w.writeByte(0); // packet number 0
+
+    const header_len = fbs.seek;
+    if (out.len < header_len + payload.len + tag_len) return error.NoSpaceLeft;
+    const sealed = seal.encryptPayload(0, out[0..header_len], &payload, out[header_len..]);
+    const total = header_len + sealed;
+    seal.applyHeaderProtection(out[0..total], pn_offset, pn_len);
+    return total;
+}
 
 // Tests
 test "CidKey roundtrip" {
@@ -618,4 +739,162 @@ test "max_connections is configurable past 256, and every removed entry is freed
     while (mgr.entries.items.len > 0) mgr.removeConnection(mgr.entries.items[0]);
     try std.testing.expectEqual(@as(usize, 300), mgr.dead_entries.items.len);
     mgr.freeDeadEntries();
+}
+
+fn testManager(alloc: Allocator) ConnectionManager {
+    const tls_config: tls13.TlsConfig = .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &.{},
+    };
+    return ConnectionManager.init(alloc, tls_config, .{}, .{0} ** 16, .{0} ** 16);
+}
+
+/// A real client's first datagram, padded to 1200 bytes as RFC 9000 14.1 asks.
+fn clientInitial(alloc: Allocator, out: []u8) !struct { conn: *connection.Connection, len: usize } {
+    const conn = try alloc.create(connection.Connection);
+    errdefer alloc.destroy(conn);
+    try connection.connectInto(conn, alloc, "example.com", .{}, null, null);
+    const len = try conn.send(out);
+    return .{ .conn = conn, .len = len };
+}
+
+/// Hand-built long header: enough for routing, never decrypted.
+fn fakeLongHeader(buf: []u8, version: u32, dcid: []const u8) usize {
+    var fbs = io.fixedBufferStream(buf);
+    const w = &fbs;
+    w.writeByte(0xc0) catch unreachable;
+    w.writeInt(u32, version, .big) catch unreachable;
+    w.writeByte(@intCast(dcid.len)) catch unreachable;
+    w.writeAll(dcid) catch unreachable;
+    w.writeByte(0) catch unreachable; // scid
+    w.writeByte(0) catch unreachable; // token
+    packet.writeVarInt(w, 40) catch unreachable;
+    return fbs.seek + 40;
+}
+
+test "an Initial in a datagram under 1200 bytes opens no connection" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+
+    var buf = [_]u8{0} ** 1500;
+    var out: [1500]u8 = undefined;
+    const n = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &([_]u8{0x11} ** 8));
+    try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .dropped);
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+}
+
+test "an Initial with a DCID under 8 bytes opens no connection" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+
+    var buf = [_]u8{0} ** 1200;
+    var out: [1500]u8 = undefined;
+    _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &([_]u8{0x11} ** 7));
+    try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .dropped);
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+}
+
+test "Version Negotiation only answers full-size datagrams, and is rate limited" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.reply_limiter = .{ .per_second = 1, .tokens = 1 };
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const unknown: u32 = 0x1a2a3a4a;
+
+    var buf = [_]u8{0} ** 1200;
+    var out: [1500]u8 = undefined;
+    const n = fakeLongHeader(&buf, unknown, &([_]u8{0x11} ** 8));
+    try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .dropped);
+    try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .send_response);
+    // The bucket is spent; the refill needs a second to pass.
+    try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .dropped);
+}
+
+test "stateless reset answers only packets long enough not to be one" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+
+    var buf = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
+    var out: [1500]u8 = undefined;
+    try std.testing.expect(mgr.recvDatagram(buf[0 .. MIN_RESET_TRIGGER - 1], addr, addr, 0, &out) == .dropped);
+    switch (mgr.recvDatagram(&buf, addr, addr, 0, &out)) {
+        .send_response => |r| try std.testing.expect(r.len < buf.len),
+        else => return error.TestUnexpectedResult,
+    }
+
+    mgr.reply_limiter = .{ .per_second = 0 };
+    try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .dropped);
+}
+
+test "ReplyLimiter refills at its rate and caps the burst" {
+    var l: ReplyLimiter = .{ .per_second = 10, .tokens = 10 };
+    const t0: i64 = 5 * std.time.ns_per_s;
+    var granted: usize = 0;
+    while (l.allow(t0)) granted += 1;
+    try std.testing.expectEqual(@as(usize, 10), granted);
+    // 100 ms buys one more; ten seconds buys no more than the burst.
+    try std.testing.expect(l.allow(t0 + 100 * std.time.ns_per_ms));
+    try std.testing.expect(!l.allow(t0 + 100 * std.time.ns_per_ms));
+    granted = 0;
+    while (l.allow(t0 + 10 * std.time.ns_per_s)) granted += 1;
+    try std.testing.expectEqual(@as(usize, 10), granted);
+}
+
+test "a server at capacity refuses a new client with CONNECTION_REFUSED" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.max_connections = 0;
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+
+    var buf: [1500]u8 = undefined;
+    const client = try clientInitial(alloc, &buf);
+    defer {
+        client.conn.deinit();
+        alloc.destroy(client.conn);
+    }
+    try std.testing.expect(client.len >= MIN_INITIAL_DATAGRAM);
+
+    var out: [1500]u8 = undefined;
+    const reply = switch (mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out)) {
+        .send_response => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+    // Small, so a spoofed Initial cannot be turned into an amplifier.
+    try std.testing.expect(reply.len < 100);
+
+    // The client can read it: the Initial keys are its own.
+    client.conn.handleDatagram(@constCast(reply), .{ .to = addr, .from = addr, .datagram_size = reply.len });
+    try std.testing.expect(client.conn.isDraining());
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(frame_mod.TransportError.connection_refused)),
+        client.conn.local_err.?.code,
+    );
+}
+
+test "refuse_new turns away new connections while existing ones keep routing" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.refuse_new = true;
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+
+    var buf: [1500]u8 = undefined;
+    const client = try clientInitial(alloc, &buf);
+    defer {
+        client.conn.deinit();
+        alloc.destroy(client.conn);
+    }
+    var out: [1500]u8 = undefined;
+    try std.testing.expect(mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out) == .send_response);
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
 }

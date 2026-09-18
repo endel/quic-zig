@@ -145,8 +145,43 @@ Two-phase GOAWAY per the spec:
   it arrives before SETTINGS (`H3_MISSING_SETTINGS`). Otherwise recorded
   as `peer_goaway_id`; `sendRequest()` returns `H3RequestRejected` when
   the next bidi ID would reach or exceed the peer's GOAWAY ID.
-- While in `going_away_final`, bidi streams ≥ our GOAWAY ID are reset
-  with `H3_REQUEST_REJECTED` inside the bidi poll loop.
+- Once the final GOAWAY is out (`going_away_final` or `drain_complete`),
+  bidi streams ≥ our GOAWAY ID are reset with `H3_REQUEST_REJECTED` inside
+  the bidi poll loop. A client learns of that reset through a
+  `request_cancelled` event even when no response byte arrived; the
+  client event loop hands it to an optional `onRequestCancelled`.
+
+### Server-wide drain (`event_loop.Server.drain()`)
+
+What a server does on SIGTERM. `drain()`:
+
+1. Sets `ConnectionManager.refuse_new`, so every new connection is answered
+   with CONNECTION_REFUSED in an Initial.
+2. Sends phase-1 GOAWAY on every H3 connection and DRAIN_WEBTRANSPORT_SESSION
+   on every active WebTransport session. Raw-QUIC and HTTP/0.9 connections,
+   which have no graceful signal, are closed at once. A connection still
+   handshaking gets GOAWAY(0) as soon as H3 is set up.
+3. One PTO later per connection (`ConnEntry.drain_final_goaway_at`, on the
+   server's timer), sends phase 2: `completeShutdown()`.
+4. Closes each connection with H3_NO_ERROR once `isDrainComplete()` holds,
+   no request stream has unacked data, and every rejection's RESET_STREAM
+   has been queued — closing sooner would drop the tail of a response.
+
+`isDrained()` is true once every connection is closing or closed; the caller
+waits on it against its own deadline and then calls `stop()`, which is also
+the fallback when the deadline passes first. WebTransport sessions keep their
+connection open until the handler or the peer closes them.
+
+## Request-body backpressure
+
+`H3Connection.pauseBody(stream_id)` / `resumeBody`, surfaced as
+`Session.pauseRequestBody` / `resumeRequestBody`. While paused, `poll()` skips
+the stream's data and FIN (a peer reset is still reported), so its bytes stay
+unread in QUIC and MAX_STREAM_DATA stops advancing: the client is held to one
+stream window rather than the server buffering the body. Pausing mid-frame is
+allowed: the unread tail of the DATA frame is re-framed in place, so other
+streams are not blocked behind it. `resumeRequestBody` asks the event loop for
+another pass (`ConnEntry.repoll`), since no packet may arrive to trigger one.
 
 ## §5.3 Immediate Closure — ✅ Done
 

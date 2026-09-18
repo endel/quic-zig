@@ -110,8 +110,14 @@ pub const Config = struct {
     /// `tls_config` is set: its own `alpn` applies.
     alpn: ?[]const []const u8 = null,
 
-    /// Live connections past which new ones are refused.
+    /// Live connections past which new ones are refused with
+    /// CONNECTION_REFUSED.
     max_connections: usize = connection_manager.ConnectionManager.DEFAULT_MAX_CONNECTIONS,
+
+    /// Server-wide cap, per second, on replies sent without connection
+    /// state: Version Negotiation, stateless reset and CONNECTION_REFUSED.
+    /// Each is triggerable with a spoofed source address. Zero sends none.
+    stateless_reply_rate: u32 = 200,
 
     /// SO_REUSEPORT on the UDP socket(s), so several servers — one per worker
     /// thread, each on its own loop — can bind the same port and let the
@@ -197,6 +203,27 @@ pub const Session = struct {
         const h3c = self.entry.h3_conn orelse return;
         h3c.cancelRequest(stream_id, error_code);
         self.entry.wake();
+    }
+
+    /// Stop delivering `stream_id`'s request body: no more `onData` or
+    /// `onRequestEnd` for it until `resumeRequestBody`. Unlike buffering in
+    /// the handler, this pushes back on the client — the body stays unread
+    /// in QUIC and MAX_STREAM_DATA is only extended as it is read, so at
+    /// most one stream window (`ConnectionConfig.initial_max_stream_data_*`)
+    /// is held per paused request. For a proxy whose upstream is slower
+    /// than its client. Safe to call from inside `onData`.
+    pub fn pauseRequestBody(self: *Session, stream_id: u64) !void {
+        const h3c = self.entry.h3_conn orelse return error.NoH3Connection;
+        try h3c.pauseBody(stream_id);
+    }
+
+    /// Resume a body paused with `pauseRequestBody`. What arrived meanwhile
+    /// is delivered on a later loop pass, then `onRequestEnd` if the client
+    /// has finished; no packet needs to arrive for that.
+    pub fn resumeRequestBody(self: *Session, stream_id: u64) void {
+        const h3c = self.entry.h3_conn orelse return;
+        h3c.resumeBody(stream_id);
+        self.entry.repoll();
     }
 
     /// Bytes written to the stream and not yet sent — held back by flow or
@@ -522,6 +549,8 @@ pub fn Server(comptime Handler: type) type {
         timer_armed: bool,
         started: bool,
         stopping: bool,
+        /// `drain()` was called; see there.
+        draining: bool,
 
         /// Zero-delay timer that services connections written to from outside
         /// our callbacks; see `ConnEntry.wake`.
@@ -657,6 +686,7 @@ pub fn Server(comptime Handler: type) type {
             );
             conn_mgr.require_retry = config.require_retry;
             conn_mgr.max_connections = config.max_connections;
+            conn_mgr.reply_limiter = .{ .per_second = config.stateless_reply_rate, .tokens = config.stateless_reply_rate };
 
             // Init libxev
             const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
@@ -686,6 +716,7 @@ pub fn Server(comptime Handler: type) type {
                 .timer_armed = false,
                 .started = false,
                 .stopping = false,
+                .draining = false,
                 .wake_completion = .{},
                 .wake_armed = false,
                 .in_callback = false,
@@ -843,6 +874,92 @@ pub fn Server(comptime Handler: type) type {
             self.rescheduleTimer();
         }
 
+        /// Begin a graceful HTTP/3 shutdown (RFC 9114 5.2): what a server
+        /// under a process manager does on SIGTERM before it stops.
+        ///
+        /// Every HTTP/3 connection gets a GOAWAY and every WebTransport
+        /// session a DRAIN_WEBTRANSPORT_SESSION. New connections are refused
+        /// with CONNECTION_REFUSED. Requests already in flight carry on: the
+        /// first GOAWAY names no limit, and a PTO later a second one names
+        /// the last request served, after which new requests are rejected
+        /// with H3_REQUEST_REJECTED. Each connection closes with H3_NO_ERROR
+        /// once its requests have finished and the peer has acked every
+        /// response byte. WebTransport sessions end when the handler or the
+        /// peer closes them. Raw-QUIC and HTTP/0.9 connections have no
+        /// graceful signal and are closed at once.
+        ///
+        /// Poll `isDrained()`, typically against a deadline, then call
+        /// `stop()`: it closes whatever is still open, so it is also the
+        /// fallback when the deadline passes first.
+        pub fn drain(self: *Self) void {
+            if (self.draining or self.stopping) return;
+            self.draining = true;
+            self.conn_mgr.refuse_new = true;
+            const now: i64 = sys.nanoTimestamp();
+            for (self.conn_mgr.entries.items) |entry| beginDrain(entry, now);
+            self.flush();
+        }
+
+        /// True once `drain()` has left no connection with work in flight:
+        /// each has closed or is closing. `stop()` then finishes promptly.
+        pub fn isDrained(self: *Self) bool {
+            if (!self.draining) return false;
+            for (self.conn_mgr.entries.items) |entry| {
+                if (entry.conn.state != .closing and entry.conn.state != .draining and
+                    entry.conn.state != .terminated) return false;
+            }
+            return true;
+        }
+
+        fn beginDrain(entry: *ConnEntry, now: i64) void {
+            const conn = entry.conn;
+            if (conn.state == .closing or conn.state == .draining or conn.isClosed()) return;
+            switch (Handler.protocol) {
+                .h3, .webtransport => {},
+                .quic, .h0 => {
+                    conn.close(0, "server shutdown");
+                    return;
+                },
+            }
+            // Still handshaking: initProtocol sends GOAWAY(0) once it can.
+            const h3c = entry.h3_conn orelse return;
+            h3c.initiateShutdown() catch {
+                conn.close(@intFromEnum(h3.H3Error.no_error), "server shutdown");
+                return;
+            };
+            entry.drain_final_goaway_at = now + conn.pkt_handler.rtt_stats.pto();
+            if (entry.wt_conn) |wtc| {
+                for (&wtc.sessions) |*sess| {
+                    if (sess.occupied and sess.state == .active) wtc.drainSession(sess.session_id) catch {};
+                }
+            }
+        }
+
+        /// One drain step for a connection: the final GOAWAY once its time
+        /// comes, then CONNECTION_CLOSE once nothing is left in flight.
+        fn advanceDrain(entry: *ConnEntry, now: i64) void {
+            const conn = entry.conn;
+            if (conn.state == .closing or conn.state == .draining or conn.isClosed()) return;
+            const h3c = entry.h3_conn orelse return;
+            if (h3c.shutdown_state == .going_away_initial) {
+                if (now < (entry.drain_final_goaway_at orelse now)) return;
+                h3c.completeShutdown() catch return;
+                entry.drain_final_goaway_at = null;
+            }
+            const done = h3c.shutdown_state == .drain_complete or
+                (h3c.shutdown_state == .going_away_final and h3c.isDrainComplete());
+            if (!done) return;
+            // Closing drops whatever the peer has not acked yet, and the
+            // close path sends no RESET_STREAM for a request still to reject.
+            var it = conn.streams.streams.valueIterator();
+            while (it.next()) |s| {
+                const send = &s.*.send;
+                if (send.hasUnackedData()) return;
+                if (send.reset_err != null and !send.reset_stream_sent) return;
+            }
+            conn.close(@intFromEnum(h3.H3Error.no_error), "");
+        }
+
         /// Initiate graceful shutdown. All active connections receive
         /// CONNECTION_CLOSE, pending data is flushed, then the event loop exits.
         pub fn stop(self: *Self) void {
@@ -901,6 +1018,12 @@ pub fn Server(comptime Handler: type) type {
         fn wakeFromEntry(ctx: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
             self.scheduleWake();
+        }
+
+        // Unlike a write, nothing in the current pass would pick this up.
+        fn repollFromEntry(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.armWake();
         }
 
         fn onWake(
@@ -1077,6 +1200,8 @@ pub fn Server(comptime Handler: type) type {
                     _ = entry.finished_streams.remove(id);
                 }
                 conn.streams.drainDisposalQueue();
+
+                if (self.draining) advanceDrain(entry, sys.nanoTimestamp());
             }
         }
 
@@ -1150,8 +1275,18 @@ pub fn Server(comptime Handler: type) type {
             }
 
             entry.wake_fn = wakeFromEntry;
+            entry.repoll_fn = repollFromEntry;
             entry.wake_ctx = self;
             entry.h3_initialized = true;
+
+            // Finished its handshake after drain() began: it may send nothing.
+            if (self.draining) {
+                if (entry.h3_conn) |h3c| {
+                    h3c.sendGoaway(0) catch entry.conn.close(@intFromEnum(h3.H3Error.no_error), "server shutdown");
+                } else {
+                    entry.conn.close(0, "server shutdown");
+                }
+            }
         }
 
         fn pollWtEvents(self: *Self, entry: *ConnEntry) void {
@@ -1201,9 +1336,9 @@ pub fn Server(comptime Handler: type) type {
                             self.handler.onSessionClosed(&session, cls.session_id, cls.error_code, cls.reason);
                         }
                     },
-                    .session_draining => |drain| {
+                    .session_draining => |sd| {
                         if (@hasDecl(Handler, "onSessionDraining")) {
-                            self.handler.onSessionDraining(&session, drain.session_id);
+                            self.handler.onSessionDraining(&session, sd.session_id);
                         }
                     },
                     .bidi_stream => |bs| {
@@ -1374,13 +1509,15 @@ pub fn Server(comptime Handler: type) type {
                 }
             }
 
-            // Poll bidirectional streams.
+            // Poll bidirectional streams. Everything readable goes now: a
+            // pass happens only on I/O, and data left behind stays unread —
+            // withholding flow-control credit — until the peer sends again.
             var stream_it = conn.streams.streams.iterator();
             while (stream_it.next()) |kv| {
                 const stream_id = kv.key_ptr.*;
                 const stream = kv.value_ptr.*;
 
-                if (stream.recv.read()) |data| {
+                while (stream.recv.read()) |data| {
                     const fin = stream.recv.finished;
                     if (fin) entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
@@ -1398,7 +1535,7 @@ pub fn Server(comptime Handler: type) type {
                 const stream_id = kv.key_ptr.*;
                 const rs = kv.value_ptr.*;
 
-                if (rs.read()) |data| {
+                while (rs.read()) |data| {
                     const fin = rs.finished;
                     if (fin) entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
@@ -1537,6 +1674,9 @@ pub fn Server(comptime Handler: type) type {
                     if (earliest == null or deadline < earliest.?) {
                         earliest = deadline;
                     }
+                }
+                if (entry.drain_final_goaway_at) |deadline| {
+                    if (earliest == null or deadline < earliest.?) earliest = deadline;
                 }
             }
 
@@ -1956,7 +2096,7 @@ pub fn Client(comptime Handler: type) type {
             // H3
             "onHeaders",         "onData",
             "onFinished",        "onSettings",
-            "onGoaway",
+            "onGoaway",          "onRequestCancelled",
             // Raw QUIC
                      "onStreamData",
             // WebTransport
@@ -1979,7 +2119,7 @@ pub fn Client(comptime Handler: type) type {
                 if (!found) {
                     @compileError("Handler has unrecognized callback '" ++ decl.name ++
                         "'. Known client callbacks: onConnected, onPollComplete, " ++
-                        "onHeaders, onData, onFinished, onSettings, onGoaway, " ++
+                        "onHeaders, onData, onFinished, onSettings, onGoaway, onRequestCancelled, " ++
                         "onStreamData, " ++
                         "onSessionReady, onSessionRejected, onDatagram, onSessionClosed, " ++
                         "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
@@ -2687,7 +2827,14 @@ pub fn Client(comptime Handler: type) type {
                     .writable => |sid| {
                         if (@hasDecl(Handler, "onWritable")) self.handler.onWritable(&session, sid, sid);
                     },
-                    .connect_request, .shutdown_complete, .request_cancelled => {},
+                    // The server reset our request: H3_REQUEST_REJECTED says
+                    // it was never processed and may be retried elsewhere.
+                    .request_cancelled => |rc| {
+                        if (@hasDecl(Handler, "onRequestCancelled")) {
+                            self.handler.onRequestCancelled(&session, rc.stream_id, rc.error_code);
+                        }
+                    },
+                    .connect_request, .shutdown_complete => {},
                 }
             }
         }
@@ -2714,7 +2861,7 @@ pub fn Client(comptime Handler: type) type {
                 const stream_id = entry.key_ptr.*;
                 const stream = entry.value_ptr.*;
 
-                if (stream.recv.read()) |data| {
+                while (stream.recv.read()) |data| {
                     const fin = stream.recv.finished;
                     if (fin) self.finished_streams.put(stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
@@ -2732,7 +2879,7 @@ pub fn Client(comptime Handler: type) type {
                 const stream_id = recv_entry.key_ptr.*;
                 const rs = recv_entry.value_ptr.*;
 
-                if (rs.read()) |data| {
+                while (rs.read()) |data| {
                     const fin = rs.finished;
                     if (fin) self.finished_streams.put(stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
@@ -3223,11 +3370,16 @@ fn E2e(comptime ServerHandler: type, comptime ClientHandler: type) type {
 
         /// In place: both sides keep pointers into `self` once started.
         fn init(self: *Self, port: u16, sh: *ServerHandler, ch: *ClientHandler) !void {
+            return self.initWith(port, sh, ch, null);
+        }
+
+        fn initWith(self: *Self, port: u16, sh: *ServerHandler, ch: *ClientHandler, server_conn: ?connection.ConnectionConfig) !void {
             self.loop = try xev.Loop.init(.{});
             errdefer self.loop.deinit();
             self.server = try Server(ServerHandler).init(testing.allocator, sh, .{
                 .port = port,
                 .tls_config = makeTestTlsConfig(),
+                .conn_config = server_conn,
                 .loop = &self.loop,
             });
             errdefer self.server.deinit();
@@ -3666,4 +3818,300 @@ test "e2e: one client on a shared loop stops and goes while the others carry on"
         }
     };
     try runUntil(&loop, &Everything{ .server = &server, .clients = live }, Everything.stopped, 5000);
+}
+
+const DRIP_CHUNK: usize = 1000;
+const DRIP_CHUNKS: usize = 40;
+const DRIP_INTERVAL_MS: u64 = 20;
+
+/// Serves the first request slowly — one chunk per timer tick, from outside
+/// any server callback — so a drain begins with it still in flight.
+const DrippingServer = struct {
+    pub const protocol: Protocol = .h3;
+
+    loop: *xev.Loop,
+    timer: xev.Timer = .{},
+    timer_c: xev.Completion = .{},
+    session: ?Session = null,
+    stream_id: u64 = 0,
+    sent: usize = 0,
+    requests: u32 = 0,
+
+    pub fn onRequest(self: *@This(), session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        self.requests += 1;
+        if (self.session != null) return;
+        session.sendResponseHeaders(stream_id, &.{.{ .name = ":status", .value = "200" }}) catch unreachable;
+        self.session = session.*;
+        self.stream_id = stream_id;
+        self.timer.run(self.loop, &self.timer_c, DRIP_INTERVAL_MS, @This(), self, onTick);
+    }
+
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.session = null;
+    }
+
+    fn onTick(self_opt: ?*@This(), loop: *xev.Loop, c: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
+        const self = self_opt.?;
+        _ = r catch return .disarm;
+        const s = &(self.session orelse return .disarm);
+        var chunk: [DRIP_CHUNK]u8 = undefined;
+        for (&chunk, self.sent..) |*b, off| b.* = e2eBodyByte(off);
+        s.sendResponseData(self.stream_id, &chunk) catch return .disarm;
+        self.sent += chunk.len;
+        if (self.sent == DRIP_CHUNK * DRIP_CHUNKS) {
+            s.finishResponse(self.stream_id, null) catch {};
+            return .disarm;
+        }
+        self.timer.run(loop, c, DRIP_INTERVAL_MS, @This(), self, onTick);
+        return .disarm;
+    }
+
+    fn inFlight(self: *@This()) bool {
+        return self.sent > 0;
+    }
+};
+
+/// Reads the dripped response and, on the final GOAWAY, tries a second
+/// request twice: once as a client that honours GOAWAY, once as one that
+/// does not.
+const DrainedClient = struct {
+    pub const protocol: Protocol = .h3;
+
+    stream_id: ?u64 = null,
+    received: usize = 0,
+    mismatches: usize = 0,
+    finished: bool = false,
+    goaway_id: ?u64 = null,
+    refused_locally: bool = false,
+    late_stream: ?u64 = null,
+    late_reset_code: ?u64 = null,
+
+    pub fn onConnected(self: *@This(), session: *ClientSession) void {
+        self.stream_id = session.sendRequest(&get_request, null) catch null;
+    }
+
+    pub fn onHeaders(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+
+    pub fn onData(self: *@This(), session: *ClientSession, _: u64, _: usize) void {
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = session.recvBody(&buf);
+            if (n == 0) break;
+            for (buf[0..n], self.received..) |b, off| {
+                if (b != e2eBodyByte(off)) self.mismatches += 1;
+            }
+            self.received += n;
+        }
+    }
+
+    pub fn onFinished(self: *@This(), _: *ClientSession, stream_id: u64) void {
+        if (stream_id == self.stream_id) self.finished = true;
+    }
+
+    pub fn onGoaway(self: *@This(), session: *ClientSession, id: u64) void {
+        if (id > 1 << 40) return; // the first GOAWAY names no limit
+        self.goaway_id = id;
+        if (session.sendRequest(&get_request, null)) |_| {} else |_| self.refused_locally = true;
+        session.h3_conn.?.peer_goaway_id = null;
+        self.late_stream = session.sendRequest(&get_request, null) catch null;
+    }
+
+    pub fn onRequestCancelled(self: *@This(), _: *ClientSession, stream_id: u64, error_code: u64) void {
+        if (stream_id == self.late_stream) self.late_reset_code = error_code;
+    }
+};
+
+const DrainE2e = E2e(DrippingServer, DrainedClient);
+
+fn drainSettled(e2e: *DrainE2e) bool {
+    return e2e.client.handler.finished and e2e.client.handler.late_reset_code != null and e2e.server.isDrained();
+}
+
+test "e2e: drain() lets an in-flight response finish and turns new requests away" {
+    var client_handler = DrainedClient{};
+    var server_handler = DrippingServer{ .loop = undefined };
+    var e2e: DrainE2e = undefined;
+    try e2e.init(29420, &server_handler, &client_handler);
+    server_handler.loop = &e2e.loop;
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, DrippingServer.inFlight, 10_000);
+    e2e.server.drain();
+    try testing.expect(!e2e.server.isDrained());
+
+    try runUntil(&e2e.loop, &e2e, drainSettled, 10_000);
+    // The response survived the drain, whole.
+    try testing.expectEqual(DRIP_CHUNK * DRIP_CHUNKS, client_handler.received);
+    try testing.expectEqual(@as(usize, 0), client_handler.mismatches);
+    // The final GOAWAY names the first request not served: the next one.
+    try testing.expectEqual(@as(?u64, 4), client_handler.goaway_id);
+    try testing.expect(client_handler.refused_locally);
+    try testing.expectEqual(@as(?u64, @intFromEnum(H3Error.request_rejected)), client_handler.late_reset_code);
+    try testing.expectEqual(@as(u32, 1), server_handler.requests);
+}
+
+const PAUSE_WINDOW: u64 = 256 * 1024;
+const PAUSE_BODY: usize = 4 * 1024 * 1024;
+
+/// Pauses every request body on arrival; the test resumes it.
+const PausingServer = struct {
+    pub const protocol: Protocol = .h3;
+
+    session: ?Session = null,
+    stream_id: u64 = 0,
+    body_bytes: usize = 0,
+    body_ok: bool = true,
+    ended: u32 = 0,
+    bytes_at_end: usize = 0,
+    reply: [32]u8 = undefined,
+
+    pub fn onRequest(self: *@This(), session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        session.pauseRequestBody(stream_id) catch unreachable;
+        self.session = session.*;
+        self.stream_id = stream_id;
+    }
+
+    pub fn onData(self: *@This(), _: *Session, _: u64, data: []const u8) void {
+        for (data, self.body_bytes..) |b, off| {
+            if (b != e2eBodyByte(off)) self.body_ok = false;
+        }
+        self.body_bytes += data.len;
+    }
+
+    pub fn onRequestEnd(self: *@This(), session: *Session, stream_id: u64) void {
+        self.ended += 1;
+        self.bytes_at_end = self.body_bytes;
+        const text = std.fmt.bufPrint(&self.reply, "{d}", .{self.body_bytes}) catch unreachable;
+        session.sendResponse(stream_id, &.{.{ .name = ":status", .value = "200" }}, text) catch unreachable;
+    }
+
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.session = null;
+    }
+
+    fn hasRequest(self: *@This()) bool {
+        return self.session != null;
+    }
+
+    /// Request bytes held server-side: unread in QUIC plus buffered in H3.
+    fn buffered(self: *@This()) usize {
+        const s = self.session orelse return 0;
+        var total: usize = 0;
+        if (s.entry.conn.streams.getStream(self.stream_id)) |st| {
+            for (st.recv.sorter.chunks.items) |c| total += c.data.len;
+        }
+        if (s.entry.h3_conn) |h| {
+            if (h.stream_bufs.get(self.stream_id)) |b| total += b.items.len;
+        }
+        return total;
+    }
+};
+
+const PauseWatch = struct {
+    server: *PausingServer,
+    until: i64,
+    max_buffered: usize = 0,
+
+    fn sample(self: *@This()) bool {
+        self.max_buffered = @max(self.max_buffered, self.server.buffered());
+        return sys.nanoTimestamp() > self.until;
+    }
+};
+
+test "e2e: a paused request body is held back by flow control, then delivered whole" {
+    const body = try testing.allocator.alloc(u8, PAUSE_BODY);
+    defer testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = e2eBodyByte(i);
+
+    var client_handler = CheckingClient{
+        .request = &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "localhost" },
+            .{ .name = ":path", .value = "/upload" },
+        },
+        .request_body = body,
+    };
+    var server_handler = PausingServer{};
+    var e2e: E2e(PausingServer, CheckingClient) = undefined;
+    try e2e.initWith(29421, &server_handler, &client_handler, .{
+        .initial_max_stream_data_bidi_remote = PAUSE_WINDOW,
+    });
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, PausingServer.hasRequest, 10_000);
+    // Long enough for an unpaused upload of this size to finish many times.
+    var watch = PauseWatch{ .server = &server_handler, .until = sys.nanoTimestamp() + 500 * std.time.ns_per_ms };
+    try runUntil(&e2e.loop, &watch, PauseWatch.sample, 5_000);
+
+    try testing.expectEqual(@as(usize, 0), server_handler.body_bytes);
+    try testing.expect(watch.max_buffered > 0);
+    try testing.expect(watch.max_buffered <= PAUSE_WINDOW + 4096);
+    const st = server_handler.session.?.entry.conn.streams.getStream(server_handler.stream_id).?;
+    try testing.expect(st.recv.sorter.highestReceived() <= PAUSE_WINDOW);
+
+    // Resumed from outside any server callback, as a proxy would once its
+    // upstream drains.
+    server_handler.session.?.resumeRequestBody(server_handler.stream_id);
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 20_000);
+
+    try testing.expectEqual(@as(u32, 1), server_handler.ended);
+    try testing.expectEqual(PAUSE_BODY, server_handler.bytes_at_end);
+    try testing.expect(server_handler.body_ok);
+    try testing.expectEqualStrings("4194304", client_handler.body[0..client_handler.received]);
+}
+
+const UNI_BODY: usize = 3 * 1024 * 1024;
+
+/// Counts what arrives on the peer's uni streams.
+const UniSink = struct {
+    pub const protocol: Protocol = .quic;
+
+    bytes: usize = 0,
+    ok: bool = true,
+    fin: bool = false,
+
+    pub fn onStreamData(self: *@This(), _: *Session, stream_id: u64, data: []const u8, fin: bool) void {
+        if (stream_mod.isBidi(stream_id)) return;
+        for (data, self.bytes..) |b, off| {
+            if (b != e2eBodyByte(off)) self.ok = false;
+        }
+        self.bytes += data.len;
+        if (fin) self.fin = true;
+    }
+
+    fn done(self: *@This()) bool {
+        return self.fin;
+    }
+};
+
+/// Sends `UNI_BODY` bytes on one uni stream as soon as it connects.
+const UniSender = struct {
+    pub const protocol: Protocol = .quic;
+
+    body: []const u8,
+
+    pub fn onConnected(self: *@This(), session: *ClientSession) void {
+        const id = session.openQuicUniStream() catch unreachable;
+        session.writeStream(id, self.body) catch unreachable;
+        session.closeQuicStream(id);
+    }
+
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+};
+
+test "e2e: a peer uni stream carries well past its 1 MiB initial window" {
+    const body = try testing.allocator.alloc(u8, UNI_BODY);
+    defer testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = e2eBodyByte(i);
+
+    var client_handler = UniSender{ .body = body };
+    var server_handler = UniSink{};
+    var e2e: E2e(UniSink, UniSender) = undefined;
+    try e2e.init(29422, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, UniSink.done, 20_000);
+    try testing.expectEqual(UNI_BODY, server_handler.bytes);
+    try testing.expect(server_handler.ok);
 }

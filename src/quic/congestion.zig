@@ -24,6 +24,11 @@ fn initialWindow(max_datagram_size: u64) u64 {
 /// Minimum congestion window in bytes (2 * max_datagram_size per RFC 9002).
 const MIN_WINDOW_PACKETS: u64 = 2;
 
+/// Ceiling on the congestion window, in packets. Past this the window only
+/// measures how long the path has gone without loss, and a burst that size
+/// is an amplifier (quic-go uses the same bound).
+const MAX_WINDOW_PACKETS: u64 = 10_000;
+
 /// Default max datagram size.
 const DEFAULT_MAX_DATAGRAM_SIZE: u64 = 1200;
 
@@ -113,6 +118,7 @@ pub const NewReno = struct {
                 self.congestion_window += self.max_datagram_size;
             }
         }
+        self.congestion_window = @min(self.congestion_window, MAX_WINDOW_PACKETS * self.max_datagram_size);
     }
 
     /// Called on congestion event (packet loss detected).
@@ -253,11 +259,10 @@ pub const Cubic = struct {
         if (self.inSlowStart()) {
             // Slow start: increase by acked_bytes (same as NewReno)
             self.congestion_window += acked_bytes;
-            return;
+        } else {
+            self.cubicUpdate(acked_bytes);
         }
-
-        // Congestion avoidance: use CUBIC function
-        self.cubicUpdate(acked_bytes);
+        self.congestion_window = @min(self.congestion_window, MAX_WINDOW_PACKETS * self.max_datagram_size);
     }
 
     /// CUBIC window update during congestion avoidance.
@@ -732,4 +737,17 @@ test "Pacer: rate limiting after burst" {
     // Should now be rate-limited
     const delay = pacer.timeUntilSend(now);
     try testing.expect(delay > 0);
+}
+
+test "congestion window is capped at MAX_WINDOW_PACKETS" {
+    var reno = NewReno.init();
+    var cubic = Cubic.init();
+    const cap = MAX_WINDOW_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE;
+    var i: usize = 0;
+    while (i < 20_000) : (i += 1) {
+        reno.onPacketAcked(DEFAULT_MAX_DATAGRAM_SIZE, 1);
+        cubic.onPacketAcked(DEFAULT_MAX_DATAGRAM_SIZE, 1);
+    }
+    try testing.expectEqual(cap, reno.congestion_window);
+    try testing.expectEqual(cap, cubic.congestion_window);
 }
