@@ -367,8 +367,11 @@ pub const FrameSorter = struct {
         _ = self.chunks.orderedRemove(0);
         const skip: usize = @intCast(self.read_pos - first.offset);
         const readable = first.data[skip..];
-        // The caller frees what we return, so it must be a whole allocation.
-        const owned = if (skip == 0 and first.allocation().len == first.data.len)
+        // The caller frees what we return, so it must be a whole allocation;
+        // a chunk grown with room to spare is shrunk in place where it can be.
+        const whole = skip == 0 and first.head() == 0 and
+            (first.allocation().len == first.data.len or self.allocator.resize(first.allocation(), first.data.len));
+        const owned = if (whole)
             first.data
         else blk: {
             const copy = self.allocator.dupe(u8, readable) catch {
