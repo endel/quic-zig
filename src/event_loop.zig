@@ -114,9 +114,10 @@ pub const Config = struct {
     /// CONNECTION_REFUSED.
     max_connections: usize = connection_manager.ConnectionManager.DEFAULT_MAX_CONNECTIONS,
 
-    /// Server-wide cap, per second, on replies sent without connection
-    /// state: Version Negotiation, stateless reset and CONNECTION_REFUSED.
-    /// Each is triggerable with a spoofed source address. Zero sends none.
+    /// Server-wide cap, per second, on each kind of reply sent without
+    /// connection state: Version Negotiation, stateless reset and
+    /// CONNECTION_REFUSED, budgeted separately. Each is triggerable with a
+    /// spoofed source address. Zero sends none.
     stateless_reply_rate: u32 = 200,
 
     /// SO_REUSEPORT on the UDP socket(s), so several servers — one per worker
@@ -686,7 +687,7 @@ pub fn Server(comptime Handler: type) type {
             );
             conn_mgr.require_retry = config.require_retry;
             conn_mgr.max_connections = config.max_connections;
-            conn_mgr.reply_limiter = .{ .per_second = config.stateless_reply_rate, .tokens = config.stateless_reply_rate };
+            conn_mgr.reply_limits = .init(config.stateless_reply_rate);
 
             // Init libxev
             const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;

@@ -41,7 +41,7 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - Clients get an optional `onRequestCancelled` when the server resets a
   request, including the H3_REQUEST_REJECTED that follows a GOAWAY.
 - `Config.stateless_reply_rate` caps Version Negotiation, stateless reset and
-  CONNECTION_REFUSED replies per second (default 200).
+  CONNECTION_REFUSED replies per second, each kind separately (default 200).
 
 ### Changed
 

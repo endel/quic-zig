@@ -200,6 +200,21 @@ pub const ReplyLimiter = struct {
     }
 };
 
+/// One `ReplyLimiter` per kind of stateless reply, so junk that triggers one
+/// kind — spoofed short headers soliciting resets, say — cannot spend the
+/// budget that CONNECTION_REFUSED or Version Negotiation owe real clients.
+pub const ReplyLimits = struct {
+    version_negotiation: ReplyLimiter = .{},
+    stateless_reset: ReplyLimiter = .{},
+    refusal: ReplyLimiter = .{},
+
+    /// Each kind gets `per_second`, with a burst of the same size.
+    pub fn init(per_second: u32) ReplyLimits {
+        const l: ReplyLimiter = .{ .per_second = per_second, .tokens = per_second };
+        return .{ .version_negotiation = l, .stateless_reset = l, .refusal = l };
+    }
+};
+
 /// Manages multiple QUIC connections, routing packets by DCID.
 pub const ConnectionManager = struct {
     pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
@@ -226,8 +241,8 @@ pub const ConnectionManager = struct {
     /// as it is at `max_connections`. Set while a server drains.
     refuse_new: bool = false,
 
-    /// Shared budget for stateless replies; see `ReplyLimiter`.
-    reply_limiter: ReplyLimiter = .{},
+    /// Budgets for stateless replies; see `ReplyLimits`.
+    reply_limits: ReplyLimits = .{},
 
     // Deferred free queue: entries invalidated by removeConnection are held
     // here until freeDeadEntries() is called after all event processing.
@@ -454,7 +469,7 @@ pub const ConnectionManager = struct {
             // as a real Initial, so it cannot amplify a spoofed small one.
             if (header.version != 0 and !protocol.isSupportedVersion(header.version)) {
                 if (bytes.len < MIN_INITIAL_DATAGRAM) return .{ .dropped = {} };
-                if (!self.reply_limiter.allow(sys.nanoTimestamp())) return .{ .dropped = {} };
+                if (!self.reply_limits.version_negotiation.allow(sys.nanoTimestamp())) return .{ .dropped = {} };
                 var vn_fbs = io.fixedBufferStream(out_buf);
                 packet.negotiateVersion(header, &vn_fbs) catch return .{ .dropped = {} };
                 return .{ .send_response = vn_fbs.buffered() };
@@ -467,7 +482,7 @@ pub const ConnectionManager = struct {
                 if (header.packet_type != .initial) {
                     // Short-header for unknown CID: stateless reset (RFC 9000 §10.3)
                     if (header.packet_type == .one_rtt and full_size >= MIN_RESET_TRIGGER and
-                        self.reply_limiter.allow(sys.nanoTimestamp()))
+                        self.reply_limits.stateless_reset.allow(sys.nanoTimestamp()))
                     {
                         // RFC 9000 §10.3.3: response SHOULD be smaller than the trigger
                         // packet to prevent loops (a reset responding to a reset).
@@ -564,7 +579,7 @@ pub const ConnectionManager = struct {
     /// 5.2.2), sealed with the Initial keys its own DCID derives, so the
     /// client fails fast instead of retransmitting into silence.
     fn refuse(self: *ConnectionManager, header: packet.Header, out_buf: []u8) RecvAction {
-        if (!self.reply_limiter.allow(sys.nanoTimestamp())) return .{ .dropped = {} };
+        if (!self.reply_limits.refusal.allow(sys.nanoTimestamp())) return .{ .dropped = {} };
         const len = writeRefusal(header, out_buf) catch return .{ .dropped = {} };
         return .{ .send_response = out_buf[0..len] };
     }
@@ -803,7 +818,7 @@ test "Version Negotiation only answers full-size datagrams, and is rate limited"
     const alloc = std.testing.allocator;
     var mgr = testManager(alloc);
     defer mgr.deinit();
-    mgr.reply_limiter = .{ .per_second = 1, .tokens = 1 };
+    mgr.reply_limits = .init(1);
     const addr = std.mem.zeroes(posix.sockaddr.storage);
     const unknown: u32 = 0x1a2a3a4a;
 
@@ -830,7 +845,7 @@ test "stateless reset answers only packets long enough not to be one" {
         else => return error.TestUnexpectedResult,
     }
 
-    mgr.reply_limiter = .{ .per_second = 0 };
+    mgr.reply_limits = .init(0);
     try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .dropped);
 }
 
@@ -846,6 +861,28 @@ test "ReplyLimiter refills at its rate and caps the burst" {
     granted = 0;
     while (l.allow(t0 + 10 * std.time.ns_per_s)) granted += 1;
     try std.testing.expectEqual(@as(usize, 10), granted);
+}
+
+test "spoofed reset triggers do not spend the CONNECTION_REFUSED budget" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.reply_limits = .init(1);
+    mgr.max_connections = 0;
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+
+    var junk = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
+    try std.testing.expect(mgr.recvDatagram(&junk, addr, addr, 0, &out) == .send_response);
+    try std.testing.expect(mgr.recvDatagram(&junk, addr, addr, 0, &out) == .dropped);
+
+    var buf: [1500]u8 = undefined;
+    const client = try clientInitial(alloc, &buf);
+    defer {
+        client.conn.deinit();
+        alloc.destroy(client.conn);
+    }
+    try std.testing.expect(mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out) == .send_response);
 }
 
 test "a server at capacity refuses a new client with CONNECTION_REFUSED" {
