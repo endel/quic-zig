@@ -237,12 +237,24 @@ pub const ConnectionManager = struct {
     /// When true, Initial packets without a valid token get a Retry response.
     require_retry: bool = false,
 
+    /// Also send Retry once this many connections are live, so a loaded
+    /// server spends state only on clients that proved their address.
+    retry_threshold: ?usize = null,
+
     /// When true, every new connection is answered with CONNECTION_REFUSED,
     /// as it is at `max_connections`. Set while a server drains.
     refuse_new: bool = false,
 
     /// Budgets for stateless replies; see `ReplyLimits`.
     reply_limits: ReplyLimits = .{},
+
+    /// Report packets for another server as `foreign` instead of answering
+    /// them with a stateless reset. Needs `conn_config.quic_lb`: a
+    /// Handshake or 1-RTT packet whose unknown DCID decodes, under the same
+    /// config_id, to a server id other than ours belongs to a sibling server
+    /// — typically another worker thread on the same port.
+    steer_foreign: bool = false,
+    foreign_id: [15]u8 = undefined,
 
     // Deferred free queue: entries invalidated by removeConnection are held
     // here until freeDeadEntries() is called after all event processing.
@@ -439,6 +451,10 @@ pub const ConnectionManager = struct {
         send_response: []const u8,
         /// Datagram was unroutable or invalid; no action needed.
         dropped: void,
+        /// Its DCID names another server (see `steer_foreign`); nothing was
+        /// processed. The QUIC-LB server id it decoded to, valid until the
+        /// next call.
+        foreign: []const u8,
     };
 
     /// Process a raw UDP datagram: route by DCID, handle version negotiation,
@@ -454,8 +470,37 @@ pub const ConnectionManager = struct {
         ecn_val: u2,
         out_buf: []u8,
     ) RecvAction {
+        return self.route(bytes, from, local, ecn_val, out_buf, self.steer_foreign);
+    }
+
+    /// `recvDatagram` for a datagram another server already reported as
+    /// `foreign` and handed to us: never reported as foreign again, so a
+    /// DCID nobody owns cannot bounce between servers.
+    pub fn recvHandedOver(
+        self: *ConnectionManager,
+        bytes: []u8,
+        from: posix.sockaddr.storage,
+        local: posix.sockaddr.storage,
+        ecn_val: u2,
+        out_buf: []u8,
+    ) RecvAction {
+        return self.route(bytes, from, local, ecn_val, out_buf, false);
+    }
+
+    fn route(
+        self: *ConnectionManager,
+        bytes: []u8,
+        from: posix.sockaddr.storage,
+        local: posix.sockaddr.storage,
+        ecn_val: u2,
+        out_buf: []u8,
+        steer: bool,
+    ) RecvAction {
         var fbs = io.fixedBufferStream(bytes);
         var current_entry: ?*ConnEntry = null;
+        // Out here: the new connection's transport parameters point into it
+        // until recv() below has answered the ClientHello.
+        var retry_token: ?packet.ValidatedToken = null;
 
         while (fbs.seek < bytes.len) {
             // All valid QUIC packets have the fixed bit (0x40) set.
@@ -479,6 +524,13 @@ pub const ConnectionManager = struct {
             var entry = current_entry orelse self.findByDcid(header.dcid);
 
             if (entry == null) {
+                // Initials open a connection wherever they land, and 0-RTT
+                // carries the client's own DCID, which encodes nothing.
+                if (steer and current_entry == null and
+                    (header.packet_type == .one_rtt or header.packet_type == .handshake))
+                {
+                    if (self.foreignServerId(header.dcid)) |id| return .{ .foreign = id };
+                }
                 if (header.packet_type != .initial) {
                     // Short-header for unknown CID: stateless reset (RFC 9000 §10.3)
                     if (header.packet_type == .one_rtt and full_size >= MIN_RESET_TRIGGER and
@@ -507,47 +559,43 @@ pub const ConnectionManager = struct {
                     return self.refuse(header, out_buf);
                 }
 
-                // Initial packet — check retry requirement
-                if (self.require_retry) {
-                    if (header.token == null or header.token.?.len == 0) {
-                        // No token: send Retry
-                        var retry_scid: [8]u8 = undefined;
-                        sys.randomBytes(&retry_scid);
-
-                        var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
-                        const token_len = packet.generateRetryToken(
-                            &token_buf,
-                            header.dcid,
-                            &retry_scid,
-                            from,
-                            self.retry_token_key,
-                        ) catch return .{ .dropped = {} };
-
-                        var retry_fbs = io.fixedBufferStream(out_buf);
-                        packet.retry(header, &retry_scid, token_buf[0..token_len], &retry_fbs) catch
-                            return .{ .dropped = {} };
-                        return .{ .send_response = retry_fbs.buffered() };
-                    }
-
-                    // Has token: validate as Retry token
-                    const validated = packet.validateRetryToken(
-                        header.token.?,
-                        from,
-                        self.retry_token_key,
-                    ) catch null;
-
-                    if (validated) |vt| {
+                // A token is honoured whether or not Retry is required now:
+                // load may have dropped since we sent the Retry, and its
+                // client will insist on seeing retry_source_connection_id.
+                const token = header.token orelse &[_]u8{};
+                const need_retry = self.require_retry or
+                    (if (self.retry_threshold) |n| self.entries.items.len >= n else false);
+                if (token.len > 0) {
+                    retry_token = packet.validateRetryToken(token, from, self.retry_token_key) catch null;
+                    if (retry_token) |*vt| {
                         entry = self.acceptConnection(header, local, from, vt.getOdcid(), vt.getRetryScid()) catch
                             return .{ .dropped = {} };
-                    } else if (packet.validateNewToken(header.token.?, from, self.retry_token_key)) {
-                        // Valid NEW_TOKEN — accept without retry
+                    } else if (packet.validateNewToken(token, from, self.retry_token_key)) {
+                        // Valid NEW_TOKEN — the address is proven already
                         entry = self.acceptConnection(header, local, from, header.dcid, null) catch
                             return .{ .dropped = {} };
-                    } else {
+                    } else if (need_retry) {
                         return .{ .dropped = {} };
                     }
-                } else {
-                    // No retry required — accept directly
+                } else if (need_retry) {
+                    var retry_scid: [8]u8 = undefined;
+                    sys.randomBytes(&retry_scid);
+
+                    var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
+                    const token_len = packet.generateRetryToken(
+                        &token_buf,
+                        header.dcid,
+                        &retry_scid,
+                        from,
+                        self.retry_token_key,
+                    ) catch return .{ .dropped = {} };
+
+                    var retry_fbs = io.fixedBufferStream(out_buf);
+                    packet.retry(header, &retry_scid, token_buf[0..token_len], &retry_fbs) catch
+                        return .{ .dropped = {} };
+                    return .{ .send_response = retry_fbs.buffered() };
+                }
+                if (entry == null) {
                     entry = self.acceptConnection(header, local, from, null, null) catch
                         return .{ .dropped = {} };
                 }
@@ -573,6 +621,18 @@ pub const ConnectionManager = struct {
             return .{ .processed = e };
         }
         return .{ .dropped = {} };
+    }
+
+    /// The server id `dcid` encodes, if it is another server's under our
+    /// QUIC-LB config.
+    fn foreignServerId(self: *ConnectionManager, dcid: []const u8) ?[]const u8 {
+        const lb = &(self.conn_config.quic_lb orelse return null);
+        if (dcid.len != quic_lb.cidLength(lb)) return null;
+        if (quic_lb.extractConfigId(dcid[0]) != lb.config_id) return null;
+        const n: usize = lb.server_id_len;
+        if (!quic_lb.extractServerId(lb, dcid, &self.foreign_id)) return null;
+        if (std.mem.eql(u8, self.foreign_id[0..n], lb.server_id[0..n])) return null;
+        return self.foreign_id[0..n];
     }
 
     /// Answer an Initial we will not serve with CONNECTION_REFUSED (RFC 9000
@@ -934,4 +994,116 @@ test "refuse_new turns away new connections while existing ones keep routing" {
     var out: [1500]u8 = undefined;
     try std.testing.expect(mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out) == .send_response);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+}
+
+fn lbConfig(server_id: u8) quic_lb.Config {
+    var cfg: quic_lb.Config = .{ .config_id = 0, .server_id_len = 1, .nonce_len = 6 };
+    cfg.server_id[0] = server_id;
+    return cfg;
+}
+
+fn steeringManager(alloc: Allocator, server_id: u8) ConnectionManager {
+    const tls_config: tls13.TlsConfig = .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &.{},
+    };
+    var mgr = ConnectionManager.init(alloc, tls_config, .{ .quic_lb = lbConfig(server_id) }, .{0} ** 16, .{0} ** 16);
+    mgr.steer_foreign = true;
+    return mgr;
+}
+
+/// A 1-RTT packet to `dcid`, long enough to earn a stateless reset.
+fn shortPacket(buf: []u8, dcid: []const u8) []u8 {
+    buf[0] = 0x41;
+    @memcpy(buf[1 .. 1 + dcid.len], dcid);
+    @memset(buf[1 + dcid.len .. 60], 0x22);
+    return buf[0..60];
+}
+
+test "a 1-RTT packet for another QUIC-LB server id is reported, not reset" {
+    const alloc = std.testing.allocator;
+    var mgr = steeringManager(alloc, 1);
+    defer mgr.deinit();
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+    var buf: [64]u8 = undefined;
+
+    var cid: [8]u8 = undefined;
+    quic_lb.generateCid(&lbConfig(2), &cid);
+    switch (mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out)) {
+        .foreign => |id| try std.testing.expectEqualSlices(u8, &.{2}, id),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Handed over and still unknown: reset, never passed on again.
+    try std.testing.expect(mgr.recvHandedOver(shortPacket(&buf, &cid), addr, addr, 0, &out) == .send_response);
+
+    // Our own id with no connection behind it is simply gone.
+    quic_lb.generateCid(&lbConfig(1), &cid);
+    try std.testing.expect(mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out) == .send_response);
+
+    mgr.steer_foreign = false;
+    quic_lb.generateCid(&lbConfig(2), &cid);
+    try std.testing.expect(mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out) == .send_response);
+}
+
+test "an Initial is accepted locally even when its DCID decodes to another server" {
+    const alloc = std.testing.allocator;
+    var mgr = steeringManager(alloc, 1);
+    defer mgr.deinit();
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+
+    var cid: [8]u8 = undefined;
+    quic_lb.generateCid(&lbConfig(2), &cid);
+    var buf = [_]u8{0} ** 1200;
+    _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &cid);
+    try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .processed);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+    // And the connection's own CID carries our id.
+    const scid = mgr.entries.items[0].conn.scid[0..8];
+    var id: [1]u8 = undefined;
+    try std.testing.expect(quic_lb.extractServerId(&lbConfig(1), scid, &id));
+    try std.testing.expectEqual(@as(u8, 1), id[0]);
+}
+
+test "past retry_threshold a new client gets Retry, and is served once it echoes the token" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.retry_threshold = 1;
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+
+    // Under the threshold: served straight away.
+    var buf: [1500]u8 = undefined;
+    const first = try clientInitial(alloc, &buf);
+    defer {
+        first.conn.deinit();
+        alloc.destroy(first.conn);
+    }
+    try std.testing.expect(mgr.recvDatagram(buf[0..first.len], addr, addr, 0, &out) == .processed);
+
+    // At it: Retry, and no state kept.
+    const second = try clientInitial(alloc, &buf);
+    defer {
+        second.conn.deinit();
+        alloc.destroy(second.conn);
+    }
+    const retry = switch (mgr.recvDatagram(buf[0..second.len], addr, addr, 0, &out)) {
+        .send_response => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+    second.conn.handleDatagram(@constCast(retry), .{ .to = addr, .from = addr, .datagram_size = retry.len });
+    try std.testing.expect(second.conn.retry_received);
+
+    // Load drops before the client comes back; its token still counts, so
+    // the connection is set up as a retried one.
+    mgr.removeConnection(mgr.entries.items[0]);
+    const n = try second.conn.send(&buf);
+    try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .processed);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+    try std.testing.expect(mgr.entries.items[0].conn.paths[0].is_validated);
 }

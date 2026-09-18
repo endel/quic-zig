@@ -332,7 +332,9 @@ pub fn build(b: *std.Build) void {
     }
 
     // Tests
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose name contains this") orelse &.{};
     const exe_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test_all.zig"),
             .target = target,

@@ -175,7 +175,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 .send_response => |data| {
                     _ = sys.sendto(sockfd, data, 0, @ptrCast(&remote_addr), addr_size) catch {};
                 },
-                .dropped => {},
+                .dropped, .foreign => {},
             }
         }
 

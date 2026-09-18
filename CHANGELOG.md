@@ -39,8 +39,20 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - `Session.pauseRequestBody` / `resumeRequestBody` hold back a request body
   through flow control, so a proxy with a slow upstream no longer has to
   buffer the whole upload.
+- `pauseStream` / `resumeStream` on `Session` and `ClientSession` do the same
+  for WebTransport streams: `onStreamData` stops for that stream and the peer
+  is held back by its window until you resume, so a relay between two
+  sessions need not buffer for its slower side.
 - Clients get an optional `onRequestCancelled` when the server resets a
   request, including the H3_REQUEST_REJECTED that follows a GOAWAY.
+- Workers sharing a port with `reuse_port` can pass a migrated client's
+  packets to the worker that owns its connection instead of resetting it:
+  give each worker its own id in `Config.quic_lb`, and hand what
+  `Config.foreign_datagram` reports to the owner's `Server.injectDatagram`.
+  See QUIC-LB.md.
+- `Config.retry_threshold` makes new clients validate their address with a
+  Retry once that many connections are live, and `Server.setRequireRetry`
+  switches it on for load signals of your own.
 - `Config.stateless_reply_rate` caps Version Negotiation, stateless reset and
   CONNECTION_REFUSED replies per second, each kind separately (default 200).
 
@@ -69,6 +81,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - An HTTP/3 body larger than one poll's worth could stall on the event-loop
   client and server until the next packet arrived, and a response could lose
   its tail once the stream was reclaimed.
+- `stop()` on an idle server that owns its loop now ends `run()` at once,
+  instead of waiting for the next packet.
 - Rescheduling a server or client timer right as it fired could corrupt
   libxev's queue when the loop is run blocking (`.once`, `.until_done`).
 - A paused stream (WebTransport `pauseStream`, HTTP/3 `pauseRequestBody`)
