@@ -731,7 +731,12 @@ pub const Conn = struct {
 
         if (!retry) self.transcript = .init(self.suite);
         self.transcript.update(msg);
-        if (ch.early_data) self.early_data_skip = early_data_skip_budget;
+        if (retry) {
+            // RFC 8446 §4.2.10: early data ends with the HelloRetryRequest;
+            // any still to skip came before this ClientHello.
+            if (ch.early_data) return error.IllegalParameter;
+            self.early_data_skip = 0;
+        } else if (ch.early_data) self.early_data_skip = early_data_skip_budget;
 
         // ServerHello, in the clear.
         self.hs_out.clearRetainingCapacity();
@@ -2560,6 +2565,35 @@ test "0-RTT the client sends anyway is skipped, before and after HelloRetryReque
 
         // Once the handshake is done, the same record is an error.
         try testing.expectError(error.BadRecordMac, conn.feed(&junk));
+    }
+}
+
+test "early data ends with the HelloRetryRequest" {
+    var certs: TestCerts = undefined;
+    try certs.load();
+    const junk = [_]u8{ ct_app_data, 3, 3, 0, 32 } ++ [_]u8{0x5a} ** 32;
+    const config: Config = .{ .certs = &certs.entries, .groups = &.{.secp256r1} };
+    for ([_]bool{ false, true }) |offer_again| {
+        var conn = Conn.init(testing.allocator, &config);
+        defer conn.deinit();
+        var client: MiniClient = .{ .gpa = testing.allocator, .early_data = true };
+        defer client.deinit();
+        client.generateKeys();
+        try client.clientHello(&client.ch1, null);
+        try client.sendPlain(&conn, ct_handshake, client.ch1.items);
+        conn.consumeOutput(conn.pendingOutput().len);
+
+        client.early_data = offer_again;
+        var ch2: std.ArrayList(u8) = .empty;
+        defer ch2.deinit(testing.allocator);
+        try client.clientHello(&ch2, @intFromEnum(Group.secp256r1));
+        if (offer_again) {
+            try testing.expectError(error.IllegalParameter, client.sendPlain(&conn, ct_handshake, ch2.items));
+        } else {
+            try client.sendPlain(&conn, ct_handshake, ch2.items);
+            // Nothing left to skip: a record we cannot open is an error.
+            try testing.expectError(error.BadRecordMac, conn.feed(&junk));
+        }
     }
 }
 
