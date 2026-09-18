@@ -958,12 +958,18 @@ pub fn Server(comptime Handler: type) type {
         /// comes, then CONNECTION_CLOSE once nothing is left in flight.
         fn advanceDrain(entry: *ConnEntry, now: i64) void {
             const conn = entry.conn;
-            if (conn.state == .closing or conn.state == .draining or conn.isClosed()) return;
+            if (conn.state == .closing or conn.state == .draining or conn.isClosed()) {
+                entry.drain_final_goaway_at = null; // a past deadline would spin the timer
+                return;
+            }
             const h3c = entry.h3_conn orelse return;
             if (h3c.shutdown_state == .going_away_initial) {
                 if (now < (entry.drain_final_goaway_at orelse now)) return;
-                h3c.completeShutdown() catch return;
                 entry.drain_final_goaway_at = null;
+                h3c.completeShutdown() catch {
+                    conn.close(@intFromEnum(h3.H3Error.no_error), "server shutdown");
+                    return;
+                };
             }
             const done = h3c.shutdown_state == .drain_complete or
                 (h3c.shutdown_state == .going_away_final and h3c.isDrainComplete());
