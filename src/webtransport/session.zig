@@ -870,6 +870,9 @@ pub const WebTransportConnection = struct {
         var kv = self.h3.stream_bufs.fetchRemove(stream_id) orelse return;
         defer kv.value.deinit(self.allocator);
         if (kv.value.items.len == 0) return;
+        // HTTP/3 held these back from flow control until consumed; we read
+        // capsules as they come, so they are credited now.
+        if (self.quic.streams.getStream(stream_id)) |s| s.recv.retained -|= kv.value.items.len;
         const buf = try self.streamBuf(stream_id);
         try buf.insertSlice(self.allocator, 0, kv.value.items);
     }
