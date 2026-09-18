@@ -92,6 +92,14 @@ static-only encoder emits none of them.
 Insert with Name Reference (T=0) and Duplicate carry relative indexes:
 `insert_count - 1 - index`, so 0 is the newest entry.
 
+Instructions are read as a stream, not per read: one cut off at the end of
+a QUIC read is held in `QpackDecoder.pending` and applied once the rest
+arrives (`QpackEncoder.pending` does the same for decoder instructions).
+The held tail is bounded by the table capacity plus two integers; a string
+declared longer than the table fails with `EntryTooLarge` as soon as its
+length is read. A Huffman string whose encoding is longer than the table
+is rejected even if it would decode to fit.
+
 ### §4.2 Decoder Instructions — ✅ Done
 
 | Instruction | Pattern | Implementation |

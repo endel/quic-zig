@@ -68,6 +68,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   retransmitting until its own timeout, and a server drops a connection its
   client reset. `Connection.received_stateless_reset` tells the two apart from
   other closes.
+- A QPACK encoder- or decoder-stream instruction that arrived split across
+  two packets closed the connection; it is now held until the rest arrives.
 - A MoQ relay now answers a subscriber that arrived before its publisher as
   soon as the publisher sends PUBLISH, instead of leaving it to wait out its
   rendezvous timeout. [#34](https://github.com/endel/quic-zig/pull/34)
