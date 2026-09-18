@@ -69,6 +69,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - An HTTP/3 body larger than one poll's worth could stall on the event-loop
   client and server until the next packet arrived, and a response could lose
   its tail once the stream was reclaimed.
+- `stop()` on an idle server that owns its loop now ends `run()` at once,
+  instead of waiting for the next packet.
 - Rescheduling a server or client timer right as it fired could corrupt
   libxev's queue when the loop is run blocking (`.once`, `.until_done`).
 - A paused stream (WebTransport `pauseStream`, HTTP/3 `pauseRequestBody`)

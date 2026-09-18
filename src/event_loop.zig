@@ -1001,7 +1001,7 @@ pub fn Server(comptime Handler: type) type {
             // when it exits instead — the peer then holds the connection
             // until its idle timeout rather than learning we are gone.
             self.flush();
-            if (self.shared_loop != null and self.started and self.allConnectionsClosed()) self.finishStop(null);
+            if (self.started and self.allConnectionsClosed()) self.finishStop(null);
         }
 
         /// The last step of `stop()`, once every connection has closed. Our
