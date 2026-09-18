@@ -14,3 +14,6 @@ interop/browser/certs
 # put a large diff in history for something no build or test reads. The
 # durable record lives in SPEC/, CHANGELOG.md and TODO.md.
 HANDOFF.md
+
+# Package cache fetched by `zig build --fetch`; never commit it.
+zig-pkg/

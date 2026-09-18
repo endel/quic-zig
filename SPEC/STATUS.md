@@ -77,7 +77,7 @@
 | 10.2.2 | Draining Connection State | ✅ Done | Proper draining state after close |
 | 10.2.3 | Immediate Close during Handshake | ✅ Done | Can close at any handshake stage |
 | 10.3 | Stateless Reset | ✅ Done | HMAC-SHA256 tokens, generation, detection |
-| 10.3.1 | Detecting a Stateless Reset | ✅ Done | Token matching on undecryptable packets |
+| 10.3.1 | Detecting a Stateless Reset | ✅ Done | Undecryptable short header checked against peer tokens → draining; server indexes tokens for resets with a random DCID |
 | 10.3.2 | Calculating a Stateless Reset Token | ✅ Done | Deterministic HMAC-SHA256 |
 | 10.3.3 | Looping | ✅ Done | Response always smaller than the trigger, never sent for triggers under 43 bytes, and rate-limited server-wide with VN and CONNECTION_REFUSED |
 | **11** | **Error Handling** | | |
