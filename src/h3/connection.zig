@@ -1190,7 +1190,10 @@ pub const H3Connection = struct {
             if (rs.reset_err != null and !self.is_server) {
                 return self.reportCancelled(stream_id, rs.reset_err.?);
             }
-            return null;
+            // Ended before a byte of it arrived: still news to whoever waits.
+            if (!rs.finished) return null;
+            try self.finished_streams.put(stream_id, {});
+            return .{ .finished = stream_id };
         };
         // RFC 9114 §4.1.1: the peer cancelled. Everything that could be
         // delivered has been; a partial frame never will be.
@@ -2654,6 +2657,43 @@ test "H3 streaming: headers, DATA per call, trailers, then FIN" {
     );
 
     try testing.expectError(error.StreamFinished, h3.sendResponseData(0, "late"));
+}
+
+/// A client stream with a GET sent on it, for feeding it a response.
+fn testClientRequest(quic_conn: *quic_connection.Connection, h3: *H3Connection) !u64 {
+    try h3.initConnection();
+    try injectPeerControlStream(quic_conn, h3);
+    return h3.sendRequest(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    }, null);
+}
+
+/// Poll to quiescence, reading bodies out, and return the event tags seen.
+fn pollTags(h3: *H3Connection, tags: []std.meta.Tag(H3Event)) ![]std.meta.Tag(H3Event) {
+    var n: usize = 0;
+    var sink: [64]u8 = undefined;
+    while (try h3.poll()) |ev| {
+        if (ev == .data) _ = h3.recvBody(&sink);
+        if (ev == .settings) continue;
+        tags[n] = ev;
+        n += 1;
+    }
+    return tags[0..n];
+}
+
+test "H3: a response stream ended before its first byte is reported finished" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    const sid = try testClientRequest(&quic_conn, &h3);
+    try quic_conn.streams.getStream(sid).?.recv.handleStreamFrame(0, &.{}, true);
+
+    var tags: [8]std.meta.Tag(H3Event) = undefined;
+    try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{.finished}, try pollTags(&h3, &tags));
 }
 
 test "H3 streaming: response frames out of order are refused" {
