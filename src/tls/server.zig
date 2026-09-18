@@ -454,6 +454,9 @@ pub const Conn = struct {
 
     fn processRecord(self: *Conn, record: []const u8) Error!void {
         const payload = record[tls.record_header_len..];
+        // RFC 8446 §5.1: nothing comes between a handshake message's records.
+        if (self.hs_in.items.len > 0 and record[0] != ct_handshake and
+            (record[0] != ct_app_data or self.read_keys == null)) return error.UnexpectedMessage;
         switch (record[0]) {
             ct_ccs => {
                 // Middlebox compat (RFC 8446 §5): one unprotected 0x01 between
@@ -495,6 +498,7 @@ pub const Conn = struct {
                 while (end > 0 and plain[end - 1] == 0) end -= 1;
                 if (end == 0) return error.UnexpectedMessage;
                 const content = plain[0 .. end - 1];
+                if (self.hs_in.items.len > 0 and plain[end - 1] != ct_handshake) return error.UnexpectedMessage;
                 switch (plain[end - 1]) {
                     ct_handshake => {
                         if (content.len == 0) return error.UnexpectedMessage;
@@ -2626,6 +2630,20 @@ test "a ticket lifetime past seven days is clamped" {
     try client.pump(&conn);
     try testing.expect(client.received != null);
     try testing.expectEqual(max_ticket_lifetime_s, client.ticket_lifetime);
+}
+
+test "a record between a handshake message's fragments is refused" {
+    var certs: TestCerts = undefined;
+    try certs.load();
+    const config: Config = .{ .certs = &certs.entries };
+    var conn = Conn.init(testing.allocator, &config);
+    defer conn.deinit();
+    var client: MiniClient = .{ .gpa = testing.allocator };
+    defer client.deinit();
+    try client.handshake(&conn);
+    try testing.expect(conn.handshakeComplete());
+    try client.sendProtected(&conn, .handshake, &.{ hs_key_update, 0 });
+    try testing.expectError(error.UnexpectedMessage, client.sendProtected(&conn, .application_data, "hi"));
 }
 
 test "a certificate chain larger than one record" {
