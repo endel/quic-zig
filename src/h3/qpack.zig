@@ -713,8 +713,8 @@ pub const QpackDecoder = struct {
                     if (name_idx >= static_table.len) return error.InvalidIndex;
                     name = static_table[name_idx].name;
                 } else {
-                    // Dynamic table name ref — absolute index
-                    const entry = self.dynamic.get(name_idx) orelse return error.InvalidIndex;
+                    // RFC 9204 4.3.2: relative to the insert count, not absolute.
+                    const entry = self.dynamic.getRelative(self.dynamic.insert_count, name_idx) orelse return error.InvalidIndex;
                     name = entry.name;
                 }
                 try self.dynamic.insert(name, value);
@@ -740,9 +740,9 @@ pub const QpackDecoder = struct {
                 const value = try decodeString(data, &pos, &scratch, &scratch_pos);
                 try self.dynamic.insert(name, value);
             } else if (first & 0xe0 == 0x00) {
-                // Duplicate: 000XXXXX — 5-bit index
+                // Duplicate: 000XXXXX — 5-bit relative index (RFC 9204 4.3.4)
                 const idx = try decodeInteger(data, &pos, 5);
-                const entry = self.dynamic.get(idx) orelse return error.InvalidIndex;
+                const entry = self.dynamic.getRelative(self.dynamic.insert_count, idx) orelse return error.InvalidIndex;
                 const n = entry.name;
                 const v = entry.value;
                 try self.dynamic.insert(n, v);
@@ -1441,10 +1441,9 @@ test "an encoder-stream Duplicate copies an entry out of the arena it writes to"
     });
     try testing.expectEqual(@as(usize, 1), dec.dynamic.count);
 
-    // Duplicate the entry, repeatedly — each one evicts the one it copies.
-    for (0..4) |i| {
-        const idx: u8 = @intCast(i);
-        try dec.processEncoderInstruction(&[_]u8{idx});
+    // Duplicate the newest entry, repeatedly — each one evicts the one it copies.
+    for (0..4) |_| {
+        try dec.processEncoderInstruction(&[_]u8{0x00});
 
         const newest = dec.dynamic.get(dec.dynamic.insert_count - 1) orelse
             return error.TestUnexpectedResult;
@@ -1548,4 +1547,27 @@ test "QpackDecoder: a prefix without its Delta Base byte is rejected" {
     var out: [8]Header = undefined;
     // A two-byte Required Insert Count uses up the block.
     try testing.expectError(error.BufferTooShort, decoder.decode(&[_]u8{ 0xff, 0x01 }, &out, &test_scratch, 0));
+}
+
+test "QpackDecoder: encoder-stream name references and Duplicate index relatively" {
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    try decoder.processEncoderInstruction(&set_capacity_4096);
+    try decoder.processEncoderInstruction(&[_]u8{ 0x41, 'a', 0x01, '1' }); // abs 0
+    try decoder.processEncoderInstruction(&[_]u8{ 0x41, 'b', 0x01, '2' }); // abs 1
+
+    // Insert With Name Reference, dynamic, relative 1 = abs 0 ("a").
+    try decoder.processEncoderInstruction(&[_]u8{ 0x80 | 1, 0x01, '3' });
+    const named = decoder.dynamic.get(2).?;
+    try testing.expectEqualStrings("a", named.name);
+    try testing.expectEqualStrings("3", named.value);
+
+    // Duplicate relative 2 = abs 0 ("a: 1").
+    try decoder.processEncoderInstruction(&[_]u8{0x02});
+    const dup = decoder.dynamic.get(3).?;
+    try testing.expectEqualStrings("a", dup.name);
+    try testing.expectEqualStrings("1", dup.value);
+
+    // Relative 4 is past the oldest entry.
+    try testing.expectError(error.InvalidIndex, decoder.processEncoderInstruction(&[_]u8{0x04}));
 }

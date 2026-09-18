@@ -89,6 +89,9 @@ static-only encoder emits none of them.
 | Insert with Literal Name | `01Hxxxxx` |
 | Duplicate | `000xxxxx` |
 
+Insert with Name Reference (T=0) and Duplicate carry relative indexes:
+`insert_count - 1 - index`, so 0 is the newest entry.
+
 ### §4.2 Decoder Instructions — ✅ Done
 
 | Instruction | Pattern | Implementation |

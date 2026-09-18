@@ -58,6 +58,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - Peers that keep a QPACK dynamic table (Firefox, quic-go, ngtcp2) could
   decode the wrong headers from us. The QPACK encoder is now static-only:
   header blocks are larger, but always decode as sent.
+- QPACK Duplicate and dynamic Insert With Name Reference instructions from a
+  peer picked the wrong table entry, giving the wrong header or closing the
+  connection.
 - A malformed QPACK header block or encoder-stream instruction from a peer
   could crash the process or read out of bounds; it now closes the connection.
 - An HTTP/3 body larger than one poll's worth could stall on the event-loop
