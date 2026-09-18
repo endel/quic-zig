@@ -30,6 +30,7 @@ wants parity needs them.
 | `datagrams.incomingMaxAge` / `outgoingMaxAge` | `setIncomingDatagramMaxAge` / `setOutgoingDatagramMaxAge` |
 | `WebTransportSendStream.abort(code)` → RESET_STREAM | `resetStream(stream_id, code)` |
 | `readable.cancel()` → STOP_SENDING | `stopSending(stream_id, code)` |
+| `ReadableStream` backpressure (not reading) | `pauseStream(stream_id)` / `resumeStream(stream_id)` |
 | `options.protocols` / `protocol` | `WT-Available-Protocols` / `WT-Protocol` (`src/webtransport/protocol.zig`) |
 | **`WebTransportError.streamErrorCode` on an inbound abort** | **added — see below** |
 | **`options.serverCertificateHashes`** | **added — see below** |

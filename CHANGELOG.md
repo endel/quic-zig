@@ -39,6 +39,10 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - `Session.pauseRequestBody` / `resumeRequestBody` hold back a request body
   through flow control, so a proxy with a slow upstream no longer has to
   buffer the whole upload.
+- `pauseStream` / `resumeStream` on `Session` and `ClientSession` do the same
+  for WebTransport streams: `onStreamData` stops for that stream and the peer
+  is held back by its window until you resume, so a relay between two
+  sessions need not buffer for its slower side.
 - Clients get an optional `onRequestCancelled` when the server resets a
   request, including the H3_REQUEST_REJECTED that follows a GOAWAY.
 - Workers sharing a port with `reuse_port` can pass a migrated client's

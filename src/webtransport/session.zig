@@ -182,6 +182,9 @@ pub const WebTransportConnection = struct {
     // Streams that have already reported a peer RESET_STREAM / STOP_SENDING.
     reset_delivered: std.AutoHashMap(u64, ResetDelivery),
 
+    /// Streams the application paused; see `pauseStream`.
+    paused_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
     /// Outstanding `notifyWritable` requests; few, and re-checked every poll.
     writable_waits: std.ArrayList(WritableWait) = .empty,
 
@@ -225,6 +228,7 @@ pub const WebTransportConnection = struct {
         self.reset_delivered.deinit();
         self.writable_waits.deinit(self.allocator);
         self.request_body.deinit(self.allocator);
+        self.paused_streams.deinit(self.allocator);
         self.wt_bidi_streams.deinit();
         self.wt_uni_streams.deinit();
         self.pending_uni_streams.deinit();
@@ -782,11 +786,33 @@ pub const WebTransportConnection = struct {
             _ = self.wt_uni_streams.remove(id);
             _ = self.fin_delivered.remove(id);
             _ = self.reset_delivered.remove(id);
+            _ = self.paused_streams.remove(id);
             if (self.stream_bufs.fetchRemove(id)) |kv| {
                 var buf = kv.value;
                 buf.deinit(self.allocator);
             }
         }
+    }
+
+    /// Stop delivering `stream_id`'s data: no `.stream_data` for it, FIN
+    /// included, until `resumeStream`. Its bytes stay unread in QUIC, where
+    /// MAX_STREAM_DATA only grows as they are read, so the peer stalls at one
+    /// stream window. Aborts are still reported.
+    ///
+    /// The first read, which identified the stream, has already taken its
+    /// bytes from QUIC, so the peer may get one window beyond them.
+    pub fn pauseStream(self: *WebTransportConnection, stream_id: u64) !void {
+        try self.paused_streams.put(self.allocator, stream_id, {});
+    }
+
+    /// Undo `pauseStream`. What arrived meanwhile, and the FIN, is surfaced
+    /// by a later poll().
+    pub fn resumeStream(self: *WebTransportConnection, stream_id: u64) void {
+        _ = self.paused_streams.remove(stream_id);
+    }
+
+    pub fn isStreamPaused(self: *const WebTransportConnection, stream_id: u64) bool {
+        return self.paused_streams.contains(stream_id);
     }
 
     /// Poll for the next WebTransport event.
@@ -1203,6 +1229,7 @@ pub const WebTransportConnection = struct {
         var bidi_it = self.wt_bidi_streams.iterator();
         while (bidi_it.next()) |entry| {
             const stream_id = entry.key_ptr.*;
+            if (self.paused_streams.contains(stream_id)) continue;
 
             // First check WT buffer for data left over from prefix parsing
             if (self.stream_bufs.getPtr(stream_id)) |buf| {
@@ -1249,6 +1276,7 @@ pub const WebTransportConnection = struct {
         var uni_it = self.wt_uni_streams.iterator();
         while (uni_it.next()) |entry| {
             const stream_id = entry.key_ptr.*;
+            if (self.paused_streams.contains(stream_id)) continue;
 
             // First check WT buffer
             if (self.stream_bufs.getPtr(stream_id)) |buf| {

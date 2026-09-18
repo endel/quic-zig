@@ -280,6 +280,25 @@ pub const Session = struct {
 
     // --- WebTransport methods ---
 
+    /// Stop `onStreamData` for a WebTransport stream until `resumeStream`,
+    /// so a relay can hold a fast sender to the pace of a slow receiver. The
+    /// data stays unread in QUIC and the peer is held back by the stream's
+    /// flow-control window. Resets are still reported through
+    /// `onStreamReset`.
+    pub fn pauseStream(self: *Session, stream_id: u64) !void {
+        const wtc = self.entry.wt_conn orelse return error.NoWebTransportConnection;
+        try wtc.pauseStream(stream_id);
+    }
+
+    /// Resume a stream paused with `pauseStream`. What arrived meanwhile,
+    /// FIN included, is delivered on a later loop pass without waiting for
+    /// a packet. Callable from outside a server callback.
+    pub fn resumeStream(self: *Session, stream_id: u64) void {
+        const wtc = self.entry.wt_conn orelse return;
+        wtc.resumeStream(stream_id);
+        self.entry.repoll();
+    }
+
     pub fn sendStreamData(self: *Session, stream_id: u64, data: []const u8) !void {
         defer self.entry.wake();
         if (self.entry.wt_conn) |wtc| {
@@ -1989,9 +2008,16 @@ pub const ClientSession = struct {
     /// sent on the next loop iteration.
     wake_fn: ?*const fn (ctx: *anyopaque) void = null,
     wake_ctx: ?*anyopaque = null,
+    /// Asks for another poll pass even from inside a callback, for data
+    /// already received that became deliverable. Takes `wake_ctx`.
+    repoll_fn: ?*const fn (ctx: *anyopaque) void = null,
 
     fn wake(self: *ClientSession) void {
         if (self.wake_fn) |f| f(self.wake_ctx orelse return);
+    }
+
+    fn repoll(self: *ClientSession) void {
+        if (self.repoll_fn) |f| f(self.wake_ctx orelse return);
     }
 
     // --- H3 methods ---
@@ -2061,6 +2087,20 @@ pub const ClientSession = struct {
     }
 
     // --- WebTransport methods ---
+
+    /// `Session.pauseStream`, for a client: stop `onStreamData` for a
+    /// WebTransport stream and let flow control hold the server back.
+    pub fn pauseStream(self: *ClientSession, stream_id: u64) !void {
+        const wtc = self.wt_conn orelse return error.NoWebTransportConnection;
+        try wtc.pauseStream(stream_id);
+    }
+
+    /// `Session.resumeStream`, for a client.
+    pub fn resumeStream(self: *ClientSession, stream_id: u64) void {
+        const wtc = self.wt_conn orelse return;
+        wtc.resumeStream(stream_id);
+        self.repoll();
+    }
 
     pub fn sendStreamData(self: *ClientSession, stream_id: u64, data: []const u8) !void {
         defer self.wake();
@@ -2600,6 +2640,12 @@ pub fn Client(comptime Handler: type) type {
             self.scheduleWake();
         }
 
+        // Unlike a write, nothing in the current pass would pick this up.
+        fn repollFromSession(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.armWake();
+        }
+
         fn onWake(
             self_opt: ?*Self,
             _: *xev.Loop,
@@ -3119,6 +3165,7 @@ pub fn Client(comptime Handler: type) type {
                 .wt_conn = self.wt_conn,
                 .stopping = &self.stopping,
                 .wake_fn = wakeFromSession,
+                .repoll_fn = repollFromSession,
                 .wake_ctx = self,
             };
         }
@@ -3544,10 +3591,17 @@ fn E2e(comptime ServerHandler: type, comptime ClientHandler: type) type {
 
         /// In place: both sides keep pointers into `self` once started.
         fn init(self: *Self, port: u16, sh: *ServerHandler, ch: *ClientHandler) !void {
-            return self.initWith(port, sh, ch, null);
+            return self.initWith(port, sh, ch, null, null);
         }
 
-        fn initWith(self: *Self, port: u16, sh: *ServerHandler, ch: *ClientHandler, server_conn: ?connection.ConnectionConfig) !void {
+        fn initWith(
+            self: *Self,
+            port: u16,
+            sh: *ServerHandler,
+            ch: *ClientHandler,
+            server_conn: ?connection.ConnectionConfig,
+            client_conn: ?connection.ConnectionConfig,
+        ) !void {
             self.loop = try xev.Loop.init(.{});
             errdefer self.loop.deinit();
             self.server = try Server(ServerHandler).init(testing.allocator, sh, .{
@@ -3560,6 +3614,7 @@ fn E2e(comptime ServerHandler: type, comptime ClientHandler: type) type {
             self.client = try Client(ClientHandler).init(testing.allocator, ch, .{
                 .port = port,
                 .skip_cert_verify = true,
+                .conn_config = client_conn,
                 .loop = &self.loop,
             });
             self.server.start();
@@ -4218,7 +4273,7 @@ test "e2e: a paused request body is held back by flow control, then delivered wh
     var e2e: E2e(PausingServer, CheckingClient) = undefined;
     try e2e.initWith(29421, &server_handler, &client_handler, .{
         .initial_max_stream_data_bidi_remote = PAUSE_WINDOW,
-    });
+    }, null);
     defer e2e.deinit();
 
     try runUntil(&e2e.loop, &server_handler, PausingServer.hasRequest, 10_000);
@@ -4429,6 +4484,205 @@ test "e2e: a raw-QUIC handler may open streams from onStreamData" {
 
     try runUntil(&e2e.loop, &server_handler, FanoutServer.done, 10_000);
     try testing.expect(server_handler.opened > 0);
+}
+
+/// Writes `PAUSE_BODY` patterned bytes and a FIN on one WebTransport
+/// stream, as fast as the peer's credit allows. Works for either side.
+const WtPump = struct {
+    session_id: u64 = 0,
+    stream_id: ?u64 = null,
+    sent: usize = 0,
+    closed: bool = false,
+
+    /// False until the peer's stream credit allows it; retry later.
+    fn open(self: *WtPump, s: anytype, session_id: u64) bool {
+        self.session_id = session_id;
+        self.stream_id = s.openBidiStream(session_id, null) catch return false;
+        self.pump(s);
+        return true;
+    }
+
+    fn pump(self: *WtPump, s: anytype) void {
+        const sid = self.stream_id orelse return;
+        var chunk: [E2E_CHUNK]u8 = undefined;
+        while (self.sent < PAUSE_BODY) {
+            const n = @min(E2E_CHUNK, PAUSE_BODY - self.sent);
+            const cap = s.streamSendCapacity(sid) orelse return;
+            if (cap < n) {
+                s.notifyWritable(self.session_id, sid, n) catch unreachable;
+                return;
+            }
+            for (chunk[0..n], self.sent..) |*b, off| b.* = e2eBodyByte(off);
+            s.sendStreamData(sid, chunk[0..n]) catch unreachable;
+            self.sent += n;
+        }
+        if (!self.closed) {
+            self.closed = true;
+            s.closeStream(sid);
+        }
+    }
+};
+
+/// Receiving end of a `WtPump` stream: pauses it on arrival and checks
+/// what comes through once resumed.
+const WtSink = struct {
+    stream_id: ?u64 = null,
+    bytes: usize = 0,
+    ok: bool = true,
+    fin: bool = false,
+
+    fn opened(self: *WtSink, s: anytype, stream_id: u64) void {
+        s.pauseStream(stream_id) catch unreachable;
+        self.stream_id = stream_id;
+    }
+
+    fn data(self: *WtSink, stream_id: u64, bytes: []const u8, fin: bool) void {
+        if (self.stream_id != stream_id) return;
+        for (bytes, self.bytes..) |b, off| {
+            if (b != e2eBodyByte(off)) self.ok = false;
+        }
+        self.bytes += bytes.len;
+        if (fin) self.fin = true;
+    }
+
+    fn done(self: *WtSink) bool {
+        return self.fin;
+    }
+};
+
+const WtUploadClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    up: WtPump = .{},
+
+    pub fn onSessionReady(self: *@This(), session: *ClientSession, session_id: u64) void {
+        if (!self.up.open(session, session_id)) unreachable;
+    }
+    pub fn onWritable(self: *@This(), session: *ClientSession, _: u64, _: ?u64) void {
+        self.up.pump(session);
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+};
+
+const WtPausingServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    sink: WtSink = .{},
+    session: ?Session = null,
+
+    pub fn onConnectRequest(_: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+    }
+    pub fn onBidiStream(self: *@This(), session: *Session, _: u64, stream_id: u64) void {
+        self.sink.opened(session, stream_id);
+        self.session = session.*;
+    }
+    pub fn onStreamData(self: *@This(), _: *Session, stream_id: u64, data: []const u8, fin: bool) void {
+        self.sink.data(stream_id, data, fin);
+    }
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.session = null;
+    }
+};
+
+const WtDownloadServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    up: WtPump = .{},
+    accepted: ?u64 = null,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.accepted = session_id;
+    }
+    pub fn onPollComplete(self: *@This(), session: *Session) void {
+        const id = self.accepted orelse return;
+        if (self.up.open(session, id)) self.accepted = null;
+    }
+    pub fn onWritable(self: *@This(), session: *Session, _: u64, _: ?u64) void {
+        self.up.pump(session);
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+};
+
+const WtPausingClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    sink: WtSink = .{},
+
+    pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64) void {}
+    pub fn onBidiStream(self: *@This(), session: *ClientSession, _: u64, stream_id: u64) void {
+        self.sink.opened(session, stream_id);
+    }
+    pub fn onStreamData(self: *@This(), _: *ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
+        self.sink.data(stream_id, data, fin);
+    }
+};
+
+/// Runs the loop for `ms` while nothing may arrive on a paused stream.
+fn holdPaused(loop: *xev.Loop, sink: *WtSink, conn: *connection.Connection, ms: i64) !void {
+    const Watch = struct {
+        sink: *WtSink,
+        until: i64,
+        fn over(self: *@This()) bool {
+            return self.sink.bytes > 0 or sys.nanoTimestamp() > self.until;
+        }
+    };
+    var w = Watch{ .sink = sink, .until = sys.nanoTimestamp() + ms * std.time.ns_per_ms };
+    try runUntil(loop, &w, Watch.over, ms + 5_000);
+    try testing.expectEqual(@as(usize, 0), sink.bytes);
+    // One window, plus the first read that identified the stream as
+    // WebTransport — taken before the handler could pause it.
+    const st = conn.streams.getStream(sink.stream_id.?).?;
+    try testing.expect(st.recv.sorter.highestReceived() > 0);
+    try testing.expect(st.recv.sorter.highestReceived() <= 2 * PAUSE_WINDOW);
+}
+
+test "e2e: a paused WebTransport stream holds its sender back, then delivers whole" {
+    var client_handler = WtUploadClient{};
+    var server_handler = WtPausingServer{};
+    var e2e: E2e(WtPausingServer, WtUploadClient) = undefined;
+    try e2e.initWith(29433, &server_handler, &client_handler, .{
+        .initial_max_stream_data_bidi_remote = PAUSE_WINDOW,
+    }, null);
+    defer e2e.deinit();
+
+    const Opened = struct {
+        fn f(h: *WtPausingServer) bool {
+            return h.sink.stream_id != null;
+        }
+    };
+    try runUntil(&e2e.loop, &server_handler, Opened.f, 10_000);
+    try holdPaused(&e2e.loop, &server_handler.sink, server_handler.session.?.entry.conn, 500);
+    try testing.expect(client_handler.up.sent < PAUSE_BODY);
+
+    // From outside any callback, as a relay would once its other side drains.
+    server_handler.session.?.resumeStream(server_handler.sink.stream_id.?);
+    try runUntil(&e2e.loop, &server_handler.sink, WtSink.done, 20_000);
+    try testing.expectEqual(PAUSE_BODY, server_handler.sink.bytes);
+    try testing.expect(server_handler.sink.ok);
+}
+
+test "e2e: a WebTransport client pauses a server stream the same way" {
+    var client_handler = WtPausingClient{};
+    var server_handler = WtDownloadServer{};
+    var e2e: E2e(WtDownloadServer, WtPausingClient) = undefined;
+    try e2e.initWith(29434, &server_handler, &client_handler, null, .{
+        .initial_max_stream_data_bidi_remote = PAUSE_WINDOW,
+        .max_datagram_frame_size = 65536, // WebTransport needs DATAGRAM
+    });
+    defer e2e.deinit();
+
+    const Opened = struct {
+        fn f(h: *WtPausingClient) bool {
+            return h.sink.stream_id != null;
+        }
+    };
+    try runUntil(&e2e.loop, &client_handler, Opened.f, 10_000);
+    try holdPaused(&e2e.loop, &client_handler.sink, e2e.client.conn, 500);
+    try testing.expect(server_handler.up.sent < PAUSE_BODY);
+
+    var cs = e2e.client.clientSession();
+    cs.resumeStream(client_handler.sink.stream_id.?);
+    try runUntil(&e2e.loop, &client_handler.sink, WtSink.done, 20_000);
+    try testing.expectEqual(PAUSE_BODY, client_handler.sink.bytes);
+    try testing.expect(client_handler.sink.ok);
 }
 
 /// Server ids 1 and 2 under one QUIC-LB config, as a proxy's workers would
