@@ -91,6 +91,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   every packet with CONNECTION_CLOSE; stateless resets are not sent for small
   packets; and CRYPTO buffering, received-packet tracking and the congestion
   window are all bounded.
+- A client sending an oversized Retry token could crash a server that
+  requires Retry.
 
 ## 0.5.0
 

@@ -813,7 +813,8 @@ pub fn validateRetryToken(
     client_addr: posix.sockaddr.storage,
     token_key: [crypto.key_len]u8,
 ) !?ValidatedToken {
-    if (token_data.len < TOKEN_NONCE_LEN + TOKEN_TAG_LEN + 2) return null;
+    // A longer token is none of ours, and would overrun `plaintext`.
+    if (token_data.len < TOKEN_NONCE_LEN + TOKEN_TAG_LEN + 2 or token_data.len > TOKEN_MAX_LEN) return null;
 
     const nonce = token_data[0..TOKEN_NONCE_LEN].*;
     const ct_len = token_data.len - TOKEN_NONCE_LEN - TOKEN_TAG_LEN;
@@ -1173,6 +1174,17 @@ test "Retry token: wrong key rejected" {
     sys.randomBytes(&wrong_key);
     const validated = try validateRetryToken(out[0..token_len], addr, wrong_key);
     try std.testing.expect(validated == null);
+}
+
+// Retry token: a peer-chosen length past our own tokens' is rejected
+test "Retry token: oversized token rejected" {
+    var token_key: [crypto.key_len]u8 = undefined;
+    sys.randomBytes(&token_key);
+    const addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+
+    var token: [200]u8 = undefined;
+    sys.randomBytes(&token);
+    try std.testing.expect(try validateRetryToken(&token, addr, token_key) == null);
 }
 
 // Retry integrity tag verification
