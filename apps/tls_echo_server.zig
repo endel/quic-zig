@@ -107,6 +107,7 @@ fn serve(gpa: std.mem.Allocator, config: *const tls_server.Config, fd: sys.socke
             if (got == 0) break;
             const data = buf[0..got];
             if (looksLikeHttp(request.items, data)) {
+                if (request.items.len + data.len > max_request_head) return;
                 request.appendSlice(gpa, data) catch return;
                 if (std.mem.indexOf(u8, request.items, "\r\n\r\n") != null) {
                     const body = "Hello from quic-zig tls_server\n";
@@ -128,6 +129,9 @@ fn serve(gpa: std.mem.Allocator, config: *const tls_server.Config, fd: sys.socke
         }
     }
 }
+
+/// A request head that never ends is dropped rather than buffered forever.
+const max_request_head = 16 * 1024;
 
 fn looksLikeHttp(seen: []const u8, data: []const u8) bool {
     if (seen.len > 0) return true;
