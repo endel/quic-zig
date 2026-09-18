@@ -401,15 +401,7 @@ pub const DynamicTable = struct {
     /// Get entry by relative index from a given base.
     /// RFC 9204 §3.2.3: relative index = base - absolute_index - 1
     pub fn getRelative(self: *const DynamicTable, base: u64, rel_idx: u64) ?DynEntry {
-        if (rel_idx >= base) return null;
-        return self.get(base - rel_idx - 1);
-    }
-
-    /// Get entry by post-base index.
-    /// RFC 9204 §3.2.3: absolute_index = base + post_base_index
-    pub fn getPostBase(self: *const DynamicTable, base: u64, post_base_idx: u64) ?DynEntry {
-        const abs = std.math.add(u64, base, post_base_idx) catch return null;
-        return self.get(abs);
+        return self.get(relativeToAbsolute(base, rel_idx) orelse return null);
     }
 
     /// Compute MaxEntries = floor(capacity / 32).
@@ -580,16 +572,9 @@ pub const QpackDecoder = struct {
                 const rel_idx = try decodeInteger(data, &pos, 6);
                 const entry = try self.fieldRef(ric, relativeToAbsolute(base, rel_idx));
                 // Copy name/value from dynamic entry into scratch
-                const n = entry.name;
-                const v = entry.value;
-                if (scratch_pos + n.len + v.len > scratch.len) return error.BufferTooSmall;
-                @memcpy(scratch[scratch_pos..][0..n.len], n);
-                const name_slice = scratch[scratch_pos..][0..n.len];
-                scratch_pos += n.len;
-                @memcpy(scratch[scratch_pos..][0..v.len], v);
-                const value_slice = scratch[scratch_pos..][0..v.len];
-                scratch_pos += v.len;
-                headers_buf[count] = .{ .name = name_slice, .value = value_slice };
+                const name = try stashString(entry.name, false, scratch, &scratch_pos);
+                const value = try stashString(entry.value, false, scratch, &scratch_pos);
+                headers_buf[count] = .{ .name = name, .value = value };
                 count += 1;
             } else if (first & 0xc0 == 0x40) {
                 // Literal Field Line with Name Reference: 01NTNNNN (RFC 9204 §4.5.4)
@@ -607,13 +592,9 @@ pub const QpackDecoder = struct {
                 } else {
                     const rel_idx = try decodeInteger(data, &pos, 4);
                     const entry = try self.fieldRef(ric, relativeToAbsolute(base, rel_idx));
-                    const n = entry.name;
-                    if (scratch_pos + n.len > scratch.len) return error.BufferTooSmall;
-                    @memcpy(scratch[scratch_pos..][0..n.len], n);
-                    const name_slice = scratch[scratch_pos..][0..n.len];
-                    scratch_pos += n.len;
+                    const name = try stashString(entry.name, false, scratch, &scratch_pos);
                     const value = try decodeString(data, &pos, scratch, &scratch_pos);
-                    headers_buf[count] = .{ .name = name_slice, .value = value };
+                    headers_buf[count] = .{ .name = name, .value = value };
                     count += 1;
                 }
             } else if (first & 0xe0 == 0x20) {
@@ -630,28 +611,17 @@ pub const QpackDecoder = struct {
                 // Post-base indexed: 0001NNNN
                 const post_idx = try decodeInteger(data, &pos, 4);
                 const entry = try self.fieldRef(ric, std.math.add(u64, base, post_idx) catch null);
-                const n = entry.name;
-                const v = entry.value;
-                if (scratch_pos + n.len + v.len > scratch.len) return error.BufferTooSmall;
-                @memcpy(scratch[scratch_pos..][0..n.len], n);
-                const name_slice = scratch[scratch_pos..][0..n.len];
-                scratch_pos += n.len;
-                @memcpy(scratch[scratch_pos..][0..v.len], v);
-                const value_slice = scratch[scratch_pos..][0..v.len];
-                scratch_pos += v.len;
-                headers_buf[count] = .{ .name = name_slice, .value = value_slice };
+                const name = try stashString(entry.name, false, scratch, &scratch_pos);
+                const value = try stashString(entry.value, false, scratch, &scratch_pos);
+                headers_buf[count] = .{ .name = name, .value = value };
                 count += 1;
             } else if (first & 0xf0 == 0x00) {
                 // Literal with post-base name ref: 0000NNNN
                 const post_idx = try decodeInteger(data, &pos, 3);
                 const entry = try self.fieldRef(ric, std.math.add(u64, base, post_idx) catch null);
-                const n = entry.name;
-                if (scratch_pos + n.len > scratch.len) return error.BufferTooSmall;
-                @memcpy(scratch[scratch_pos..][0..n.len], n);
-                const name_slice = scratch[scratch_pos..][0..n.len];
-                scratch_pos += n.len;
+                const name = try stashString(entry.name, false, scratch, &scratch_pos);
                 const value = try decodeString(data, &pos, scratch, &scratch_pos);
-                headers_buf[count] = .{ .name = name_slice, .value = value };
+                headers_buf[count] = .{ .name = name, .value = value };
                 count += 1;
             } else {
                 pos += 1;
