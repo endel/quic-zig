@@ -352,8 +352,9 @@ Informational.
 - **Decoded header count per frame capped at `MAX_HEADERS = 128`**,
   and decoded names + values at `qpack.SCRATCH_SIZE` (16 KiB). Over-large
   header lists close the connection with QPACK_DECOMPRESSION_FAILED.
-- **Request trailers** arrive as a second `headers` event on the stream;
-  the event loop hands them to `onRequest` again.
+- **Trailers are dropped.** A HEADERS frame after the head with no
+  pseudo-headers is taken as trailers, on requests and responses alike;
+  nothing surfaces them yet.
 - **`huffman_scratch`**: qpack.zig uses a 16 KiB file-scope scratch
   buffer for decoded field values. Not safe across concurrent decoder
   instances on the same thread.

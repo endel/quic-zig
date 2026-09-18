@@ -93,6 +93,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   window are all bounded.
 - A client sending an oversized Retry token could crash a server that
   requires Retry.
+- Trailers on an HTTP/3 request or response no longer close the connection
+  with H3_MESSAGE_ERROR. They are accepted, though not yet surfaced.
 
 ## 0.5.0
 

@@ -445,6 +445,11 @@ pub const H3Connection = struct {
         send.close();
     }
 
+    fn hasPseudoHeader(headers: []const qpack.Header) bool {
+        for (headers) |h| if (h.name.len > 0 and h.name[0] == ':') return true;
+        return false;
+    }
+
     fn isInformational(headers: []const qpack.Header) bool {
         for (headers) |h| {
             if (std.mem.eql(u8, h.name, ":status")) return h.value.len == 3 and h.value[0] == '1';
@@ -1238,7 +1243,9 @@ pub const H3Connection = struct {
                 }
                 const total = hdr.len + @as(usize, @intCast(hdr.length));
                 if (buf.items.len < total) return .need_more;
-                return .{ .event = try self.handleHeadersFrame(stream_id, rs, buf, buf.items[hdr.len..total], total) };
+                const ev = try self.handleHeadersFrame(stream_id, rs, buf, buf.items[hdr.len..total], total) orelse
+                    return .progressed;
+                return .{ .event = ev };
             },
             // Unknown, reserved and unsupported frames are dropped as they
             // arrive (RFC 9114 §9), never buffered whole.
@@ -1250,7 +1257,8 @@ pub const H3Connection = struct {
         }
     }
 
-    /// Decode a complete HEADERS frame and consume it from `buf`.
+    /// Decode a complete HEADERS frame and consume it from `buf`. Null for
+    /// trailers, which nothing surfaces yet.
     fn handleHeadersFrame(
         self: *H3Connection,
         stream_id: u64,
@@ -1258,7 +1266,7 @@ pub const H3Connection = struct {
         buf: *std.ArrayList(u8),
         qpack_data: []const u8,
         frame_len: usize,
-    ) !H3Event {
+    ) !?H3Event {
         var hdr_count: usize = 0;
         const scratch = try self.qpackScratch();
         if (self.qpack_decoder.decode(qpack_data, &self.headers_buf, scratch, stream_id)) |c| {
@@ -1278,6 +1286,10 @@ pub const H3Connection = struct {
 
         // Flush decoder instructions (header ack)
         self.flushDecoderInstructions() catch {};
+
+        // RFC 9114 §4.1: a later HEADERS frame without pseudo-headers is the
+        // trailer section.
+        if (self.headers_received_streams.contains(stream_id) and !hasPseudoHeader(hdrs)) return null;
 
         // RFC 9114 §4.1.2, §4.3: validate pseudo-headers
         const valid = if (self.is_server)
@@ -2682,6 +2694,49 @@ fn pollTags(h3: *H3Connection, tags: []std.meta.Tag(H3Event)) ![]std.meta.Tag(H3
         n += 1;
     }
     return tags[0..n];
+}
+
+test "H3: response trailers are accepted, not a message error" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    const sid = try testClientRequest(&quic_conn, &h3);
+
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(@as([]u8, &buf));
+    var qb: [256]u8 = undefined;
+    var ql = try qpack.encodeHeaders(&.{.{ .name = ":status", .value = "200" }}, &qb);
+    try h3_frame.write(.{ .headers = qb[0..ql] }, &fbs);
+    try h3_frame.write(.{ .data = "hi" }, &fbs);
+    ql = try qpack.encodeHeaders(&.{.{ .name = "x-checksum", .value = "abc" }}, &qb);
+    try h3_frame.write(.{ .headers = qb[0..ql] }, &fbs);
+    try quic_conn.streams.getStream(sid).?.recv.handleStreamFrame(0, fbs.buffered(), true);
+
+    var tags: [8]std.meta.Tag(H3Event) = undefined;
+    try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{ .headers, .data, .finished }, try pollTags(&h3, &tags));
+}
+
+test "H3: request trailers are accepted, not a message error" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var buf: [512]u8 = undefined;
+    var pos = buildGetRequestFrame(&buf);
+    pos += buildDataFrame(buf[pos..], "body");
+    var qb: [256]u8 = undefined;
+    const ql = try qpack.encodeHeaders(&.{.{ .name = "grpc-status", .value = "0" }}, &qb);
+    var fbs = io.fixedBufferStream(buf[pos..]);
+    try h3_frame.write(.{ .headers = qb[0..ql] }, &fbs);
+    pos += fbs.seek;
+    try injectBidiStreamData(&quic_conn, 0, buf[0..pos], true);
+
+    var tags: [8]std.meta.Tag(H3Event) = undefined;
+    try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{ .headers, .data, .finished }, try pollTags(&h3, &tags));
 }
 
 test "H3: a response stream ended before its first byte is reported finished" {
