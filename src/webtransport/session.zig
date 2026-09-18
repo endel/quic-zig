@@ -863,6 +863,17 @@ pub const WebTransportConnection = struct {
         return null;
     }
 
+    /// Take over what HTTP/3 read past the CONNECT's HEADERS: capsules that
+    /// came in the same read — a close sent right after the 200, say — would
+    /// otherwise sit in its buffer, which it no longer looks at.
+    fn adoptConnectStream(self: *WebTransportConnection, stream_id: u64) !void {
+        var kv = self.h3.stream_bufs.fetchRemove(stream_id) orelse return;
+        defer kv.value.deinit(self.allocator);
+        if (kv.value.items.len == 0) return;
+        const buf = try self.streamBuf(stream_id);
+        try buf.insertSlice(self.allocator, 0, kv.value.items);
+    }
+
     /// The buffer holding a stream's not-yet-parsed bytes, created on first
     /// use. A session's CONNECT stream is keyed here like any other, and freed
     /// by the same disposal path.
@@ -1394,6 +1405,7 @@ pub const WebTransportConnection = struct {
                     self.active_session_count += 1;
                     // Exclude this stream from H3 bidi processing
                     try self.h3.excluded_bidi_streams.put(req.stream_id, {});
+                    try self.adoptConnectStream(req.stream_id);
                     return .{ .connect_request = .{
                         .session_id = req.stream_id,
                         .protocol = req.protocol,
@@ -1415,6 +1427,7 @@ pub const WebTransportConnection = struct {
                                     session.state = .active;
                                     // Exclude CONNECT stream from H3 — WT layer owns it now
                                     self.h3.excluded_bidi_streams.put(hdr.stream_id, {}) catch {};
+                                    try self.adoptConnectStream(hdr.stream_id);
                                     return .{ .session_ready = .{ .session_id = hdr.stream_id, .headers = hdr.headers } };
                                 } else {
                                     self.finalizeSession(session);
@@ -2119,6 +2132,34 @@ test "WT integration: client receives session_ready on 200 response" {
 
     const session = setup.wt.getSession(session_id).?;
     try testing.expectEqual(SessionState.active, session.state);
+}
+
+test "WT integration: a close arriving with the 200 is not lost" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, false);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, false);
+    defer wt.deinit();
+
+    const session_id = try wt.connect("example.com", "/wt");
+
+    // HEADERS and WT_CLOSE_SESSION in one read, as a server closing at once sends them.
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(@as([]u8, &buf));
+    fbs.seek = buildConnectResponse(&buf);
+    try h3_frame.write(.{ .close_webtransport_session = .{ .error_code = 42, .reason = "test" } }, &fbs);
+    const len = fbs.seek;
+    const stream = quic_conn.streams.getStream(session_id).?;
+    try stream.recv.handleStreamFrame(stream.recv.sorter.highestReceived(), buf[0..len], true);
+
+    _ = try pollFor(&wt, .session_ready);
+    const closed = try pollFor(&wt, .session_closed);
+    try testing.expectEqual(@as(u32, 42), closed.session_closed.error_code);
+    try testing.expectEqualStrings("test", closed.session_closed.reason);
 }
 
 test "WT integration: client receives session_rejected on non-200" {
