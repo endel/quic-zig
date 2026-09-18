@@ -264,3 +264,112 @@ test "lossy link: an upload survives periodic loss bursts in both directions" {
     const r = try runBulk(2 << 20, burst, burst, 10 * ms, 120 * std.time.ns_per_s);
     try testing.expect(r.finished);
 }
+
+const stateless_reset = @import("stateless_reset.zig");
+
+/// A connected client and server, handshake done and CIDs exchanged.
+const Pair = struct {
+    mgr: connection_manager.ConnectionManager,
+    client: *connection.Connection,
+    c_addr: posix.sockaddr.storage = addr(40000),
+    s_addr: posix.sockaddr.storage = addr(4433),
+
+    fn init(self: *Pair) !void {
+        const alloc = testing.allocator;
+        self.* = .{
+            .mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, .{1} ** 16, .{2} ** 16),
+            .client = try alloc.create(connection.Connection),
+        };
+        errdefer {
+            alloc.destroy(self.client);
+            self.mgr.deinit();
+        }
+        try connection.connectInto(self.client, alloc, "localhost", .{}, .{
+            .cert_chain_der = &.{},
+            .private_key_bytes = &.{},
+            .alpn = &client_alpn,
+            .server_name = "localhost",
+            .skip_cert_verify = true,
+        }, null);
+        self.client.paths[0].peer_addr = self.s_addr;
+        self.client.paths[0].local_addr = self.c_addr;
+
+        var i: usize = 0;
+        while (i < 50 and self.exchange()) : (i += 1) {}
+        try testing.expect(self.client.handshake_confirmed);
+        try testing.expectEqual(@as(usize, 1), self.mgr.entries.items.len);
+    }
+
+    fn deinit(self: *Pair) void {
+        self.client.deinit();
+        testing.allocator.destroy(self.client);
+        self.mgr.deinit();
+    }
+
+    /// One round of both sides sending what they have; false once quiet.
+    fn exchange(self: *Pair) bool {
+        var buf: [MAX_DGRAM]u8 = undefined;
+        var resp: [MAX_DGRAM]u8 = undefined;
+        var any = false;
+        while (true) {
+            const n = self.client.send(&buf) catch break;
+            if (n == 0) break;
+            any = true;
+            _ = self.mgr.recvDatagram(buf[0..n], self.c_addr, self.s_addr, 0, &resp);
+        }
+        for (self.mgr.entries.items) |e| while (true) {
+            const n = e.conn.send(&buf) catch break;
+            if (n == 0) break;
+            any = true;
+            self.client.handleDatagram(buf[0..n], .{ .to = self.c_addr, .from = self.s_addr, .datagram_size = n });
+        };
+        return any;
+    }
+};
+
+test "stateless reset: a client whose server lost the connection drains" {
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    var p: Pair = undefined;
+    try p.init();
+    defer p.deinit();
+
+    p.mgr.removeConnection(p.mgr.entries.items[0]);
+
+    const s = try p.client.openStream();
+    try s.send.writeData("x" ** 64);
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var resp: [MAX_DGRAM]u8 = undefined;
+    const n = try p.client.send(&buf);
+    const reset = switch (p.mgr.recvDatagram(buf[0..n], p.c_addr, p.s_addr, 0, &resp)) {
+        .send_response => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    p.client.handleDatagram(@constCast(reset), .{ .to = p.c_addr, .from = p.s_addr, .datagram_size = reset.len });
+    try testing.expect(p.client.isDraining());
+    try testing.expect(p.client.received_stateless_reset);
+    try testing.expectEqual(@as(usize, 0), try p.client.send(&buf));
+}
+
+test "stateless reset: the server drains a connection its client reset" {
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    var p: Pair = undefined;
+    try p.init();
+    defer p.deinit();
+
+    // A token the client issued in NEW_CONNECTION_ID; the reset's DCID is random.
+    const token = for (&p.client.local_cid_pool.entries) |*e| {
+        if (e.occupied and e.seq_num > 0) break e.stateless_reset_token;
+    } else return error.TestUnexpectedResult;
+    var reset: [48]u8 = undefined;
+    sys.randomBytes(&reset);
+    reset[0] = 0x40 | (reset[0] & 0x3f);
+    @memcpy(reset[reset.len - stateless_reset.TOKEN_LEN ..], &token);
+
+    var resp: [MAX_DGRAM]u8 = undefined;
+    const sconn = p.mgr.entries.items[0].conn;
+    try testing.expect(p.mgr.recvDatagram(&reset, p.c_addr, p.s_addr, 0, &resp) == .processed);
+    try testing.expect(sconn.isDraining());
+    try testing.expect(sconn.received_stateless_reset);
+}

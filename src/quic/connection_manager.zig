@@ -33,6 +33,10 @@ pub const CidKey = struct {
     }
 };
 
+/// A peer's stateless reset token under a keyed PRF: the map lookup then
+/// cannot time-leak token bytes (RFC 9000 §10.3.1).
+pub const ResetKey = [16]u8;
+
 /// Hash/equality context for CidKey in HashMap.
 pub const CidKeyContext = struct {
     pub fn hash(_: CidKeyContext, key: CidKey) u64 {
@@ -87,6 +91,11 @@ pub const ConnEntry = struct {
     // Max 8 from LocalCidPool + 1 initial client DCID = 9.
     registered_cids: [9]CidKey = .{CidKey{}} ** 9,
     registered_cid_count: u8 = 0,
+
+    // Keys this connection holds in `reset_token_map`, one per peer CID.
+    reset_keys: [8]ResetKey = undefined,
+    reset_key_count: u8 = 0,
+    reset_pool_gen: ?u32 = null,
 
     /// Tell the owner there is data to send; see `wake_fn`.
     pub fn wake(self: *ConnEntry) void {
@@ -227,6 +236,11 @@ pub const ConnectionManager = struct {
     cid_map: std.HashMap(CidKey, *ConnEntry, CidKeyContext, 80),
     entries: std.ArrayList(*ConnEntry),
 
+    /// Peer-issued stateless reset tokens, so a reset from a client that
+    /// lost state finds its connection even though its DCID is random.
+    reset_token_map: std.AutoHashMapUnmanaged(ResetKey, *ConnEntry) = .empty,
+    reset_lookup_key: [16]u8,
+
     // Server-wide shared config
     tls_config: tls13.TlsConfig,
     conn_config: connection.ConnectionConfig,
@@ -269,12 +283,18 @@ pub const ConnectionManager = struct {
         retry_token_key: [16]u8,
         static_reset_key: [16]u8,
     ) ConnectionManager {
+        var lookup_key: [16]u8 = undefined;
+        sys.randomBytes(&lookup_key);
+        // Connections must advertise tokens under the key our resets use.
+        var cc = conn_config;
+        cc.static_reset_key = static_reset_key;
         return .{
             .allocator = allocator,
             .cid_map = std.HashMap(CidKey, *ConnEntry, CidKeyContext, 80).init(allocator),
             .entries = .{ .items = &.{}, .capacity = 0 },
+            .reset_lookup_key = lookup_key,
             .tls_config = tls_config,
-            .conn_config = conn_config,
+            .conn_config = cc,
             .retry_token_key = retry_token_key,
             .static_reset_key = static_reset_key,
             .local_cid_len = if (conn_config.quic_lb) |lb| quic_lb.cidLength(&lb) else 8,
@@ -295,6 +315,44 @@ pub const ConnectionManager = struct {
         self.entries.deinit(self.allocator);
         self.dead_entries.deinit(self.allocator);
         self.cid_map.deinit();
+        self.reset_token_map.deinit(self.allocator);
+    }
+
+    fn resetKey(self: *const ConnectionManager, token: *const [16]u8) ResetKey {
+        var out: ResetKey = undefined;
+        std.crypto.auth.siphash.SipHash128(1, 3).create(&out, token, &self.reset_lookup_key);
+        return out;
+    }
+
+    /// The connection whose peer issued the reset token `datagram` ends in.
+    pub fn findByResetToken(self: *ConnectionManager, datagram: []const u8) ?*ConnEntry {
+        if (datagram.len < stateless_reset.MIN_PACKET_LEN) return null;
+        const key = self.resetKey(datagram[datagram.len - stateless_reset.TOKEN_LEN ..][0..stateless_reset.TOKEN_LEN]);
+        return self.reset_token_map.get(key);
+    }
+
+    fn dropResetKeys(self: *ConnectionManager, entry: *ConnEntry) void {
+        for (entry.reset_keys[0..entry.reset_key_count]) |k| {
+            if (self.reset_token_map.get(k)) |owner| {
+                if (owner == entry) _ = self.reset_token_map.remove(k);
+            }
+        }
+        entry.reset_key_count = 0;
+    }
+
+    /// Mirror the peer CID pool's reset tokens into `reset_token_map`.
+    fn syncResetTokens(self: *ConnectionManager, entry: *ConnEntry) void {
+        const pool = &entry.conn.peer_cid_pool;
+        if (entry.reset_pool_gen == pool.generation) return;
+        entry.reset_pool_gen = pool.generation;
+        self.dropResetKeys(entry);
+        for (&pool.entries) |*e| {
+            if (!e.occupied) continue;
+            const key = self.resetKey(&e.stateless_reset_token);
+            self.reset_token_map.put(self.allocator, key, entry) catch continue;
+            entry.reset_keys[entry.reset_key_count] = key;
+            entry.reset_key_count += 1;
+        }
     }
 
     /// Look up a connection entry by destination CID.
@@ -385,6 +443,7 @@ pub const ConnectionManager = struct {
                 }
             }
         }
+        self.syncResetTokens(entry);
     }
 
     /// Remove a terminated connection. Invalidates the entry immediately
@@ -396,6 +455,7 @@ pub const ConnectionManager = struct {
         for (entry.registered_cids[0..entry.registered_cid_count]) |key| {
             _ = self.cid_map.remove(key);
         }
+        self.dropResetKeys(entry);
 
         // Detach the transport layers so stale Session pointers are safe:
         // Session.sendDatagram/sendStreamData check `if (entry.wt_conn)` and
@@ -523,6 +583,13 @@ pub const ConnectionManager = struct {
             // Route to existing connection by DCID
             var entry = current_entry orelse self.findByDcid(header.dcid);
 
+            if (entry == null and current_entry == null and header.packet_type == .one_rtt) {
+                if (self.findByResetToken(bytes)) |e| {
+                    _ = e.conn.handleStatelessReset(bytes);
+                    return .{ .processed = e };
+                }
+            }
+
             if (entry == null) {
                 // Initials open a connection wherever they land, and 0-RTT
                 // carries the client's own DCID, which encodes nothing.
@@ -610,7 +677,10 @@ pub const ConnectionManager = struct {
             const dg_size: u64 = if (current_entry == null) bytes.len else 0;
             current_entry = e;
             const recv_info: connection.RecvInfo = .{ .to = local, .from = from, .ecn = ecn_val, .datagram_size = dg_size };
-            e.conn.recv(&header, &fbs, recv_info) catch break;
+            e.conn.recv(&header, &fbs, recv_info) catch |err| {
+                if (err == error.UndecryptablePacket and pkt_start == 0) _ = e.conn.handleStatelessReset(bytes);
+                break;
+            };
             self.syncCids(e);
 
             const next_pos = pkt_start + full_size;
