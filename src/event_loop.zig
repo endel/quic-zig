@@ -175,7 +175,9 @@ pub const Session = struct {
     }
 
     /// Response headers without ending the stream: a 1xx, or the final
-    /// response's headers ahead of a streamed body.
+    /// response's headers ahead of a streamed body. Fails with
+    /// `error.ResponseHeadersAlreadySent` after the final headers; trailers
+    /// go through `finishResponse`.
     pub fn sendResponseHeaders(self: *Session, stream_id: u64, headers: []const qpack.Header) !void {
         const h3c = self.entry.h3_conn orelse return error.NoH3Connection;
         defer self.entry.wake();
@@ -184,13 +186,15 @@ pub const Session = struct {
 
     /// One DATA frame of response body. Empty data writes nothing. Buffered
     /// in full regardless of flow control; pace with `notifyWritable`.
+    /// Fails with `error.ResponseHeadersNotSent` before the final headers.
     pub fn sendResponseData(self: *Session, stream_id: u64, data: []const u8) !void {
         const h3c = self.entry.h3_conn orelse return error.NoH3Connection;
         defer self.entry.wake();
         try h3c.sendResponseData(stream_id, data);
     }
 
-    /// End the response with optional trailers, then FIN.
+    /// End the response with optional trailers, then FIN. Fails with
+    /// `error.ResponseHeadersNotSent` before the final headers.
     pub fn finishResponse(self: *Session, stream_id: u64, trailers: ?[]const qpack.Header) !void {
         const h3c = self.entry.h3_conn orelse return error.NoH3Connection;
         defer self.entry.wake();

@@ -87,6 +87,8 @@ const WritableWait = struct {
 
 /// HTTP/3 connection state machine.
 /// Wraps a QUIC connection and manages H3 framing, control streams, and QPACK.
+const ResponseState = enum { informational, final };
+
 pub const H3Connection = struct {
     allocator: Allocator,
     quic_conn: *quic_connection.Connection,
@@ -128,6 +130,11 @@ pub const H3Connection = struct {
 
     /// Request streams already reported as `request_cancelled`.
     cancelled_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    /// How far each response has got: absent until its first HEADERS, then
+    /// informational while only 1xx has gone out, then final. Enforces the
+    /// RFC 9114 4.1 frame order on the send side.
+    response_states: std.AutoHashMapUnmanaged(u64, ResponseState) = .empty,
 
     /// Outstanding `notifyWritable` requests; few, and re-checked every poll.
     writable_waits: std.ArrayList(WritableWait) = .empty,
@@ -195,6 +202,7 @@ pub const H3Connection = struct {
         self.cancelled_streams.deinit(self.allocator);
         self.writable_waits.deinit(self.allocator);
         self.paused_bodies.deinit(self.allocator);
+        self.response_states.deinit(self.allocator);
     }
 
     fn qpackScratch(self: *H3Connection) ![]u8 {
@@ -328,6 +336,7 @@ pub const H3Connection = struct {
         };
 
         try self.writeHeadersFrame(&stream.send, &resp_headers);
+        try self.response_states.put(self.allocator, stream_id, .final);
 
         // Do NOT close the stream — session stays open
     }
@@ -345,6 +354,7 @@ pub const H3Connection = struct {
         }
 
         try self.writeHeadersFrame(&stream.send, all_headers[0 .. 1 + count]);
+        try self.response_states.put(self.allocator, stream_id, .final);
 
         // Do NOT close the stream — session stays open
     }
@@ -367,24 +377,49 @@ pub const H3Connection = struct {
     /// once per informational (1xx) response and once for the final one.
     /// Header blocks of any size are encoded; the peer's own limits decide
     /// whether it accepts them.
+    ///
+    /// Returns `error.ResponseHeadersAlreadySent` once the final (non-1xx)
+    /// headers have gone out: a later HEADERS frame is the trailers, which
+    /// `finishResponse` sends.
     pub fn sendResponseHeaders(self: *H3Connection, stream_id: u64, headers: []const qpack.Header) !void {
         const send = try self.responseStream(stream_id);
+        const gop = try self.response_states.getOrPut(self.allocator, stream_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .informational;
+        } else if (gop.value_ptr.* == .final) {
+            return error.ResponseHeadersAlreadySent;
+        }
         try self.writeHeadersFrame(send, headers);
+        if (!isInformational(headers)) gop.value_ptr.* = .final;
     }
 
     /// Write `data` as one DATA frame. Nothing is written for empty data.
     /// The bytes are buffered in full whatever the peer's flow-control credit;
     /// see `notifyWritable` to pace a large body.
+    ///
+    /// Returns `error.ResponseHeadersNotSent` before the final headers.
     pub fn sendResponseData(self: *H3Connection, stream_id: u64, data: []const u8) !void {
         const send = try self.responseStream(stream_id);
+        if (self.response_states.get(stream_id) != .final) return error.ResponseHeadersNotSent;
         try writeDataFrame(send, data);
     }
 
     /// End the response: optional trailers as a last HEADERS frame, then FIN.
+    ///
+    /// Returns `error.ResponseHeadersNotSent` before the final headers; use
+    /// `cancelRequest` to abandon a response instead.
     pub fn finishResponse(self: *H3Connection, stream_id: u64, trailers: ?[]const qpack.Header) !void {
         const send = try self.responseStream(stream_id);
+        if (self.response_states.get(stream_id) != .final) return error.ResponseHeadersNotSent;
         if (trailers) |t| try self.writeHeadersFrame(send, t);
         send.close();
+    }
+
+    fn isInformational(headers: []const qpack.Header) bool {
+        for (headers) |h| {
+            if (std.mem.eql(u8, h.name, ":status")) return h.value.len == 3 and h.value[0] == '1';
+        }
+        return false;
     }
 
     /// The send side of a request stream the response can still be written to.
@@ -613,6 +648,7 @@ pub const H3Connection = struct {
             _ = self.headers_received_streams.remove(id);
             _ = self.cancelled_streams.remove(id);
             _ = self.paused_bodies.remove(id);
+            _ = self.response_states.remove(id);
             if (self.stream_bufs.fetchRemove(id)) |kv| {
                 var buf = kv.value;
                 buf.deinit(self.allocator);
@@ -1337,6 +1373,7 @@ test "H3Connection: init and deinit" {
     conn.cancelled_streams = .empty;
     conn.writable_waits = .empty;
     conn.paused_bodies = .empty;
+    conn.response_states = .empty;
     conn.qpack_scratch_owned = false;
     conn.deinit();
 }
@@ -2557,6 +2594,42 @@ test "H3 streaming: headers, DATA per call, trailers, then FIN" {
     try testing.expectError(error.StreamFinished, h3.sendResponseData(0, "late"));
 }
 
+test "H3 streaming: response frames out of order are refused" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, true);
+
+    // DATA or FIN before any final headers would reach the peer headerless.
+    try testing.expectError(error.ResponseHeadersNotSent, h3.sendResponseData(0, "early"));
+    try testing.expectError(error.ResponseHeadersNotSent, h3.finishResponse(0, null));
+    try h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "100" }});
+    try testing.expectError(error.ResponseHeadersNotSent, h3.sendResponseData(0, "early"));
+
+    try h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "200" }});
+    try testing.expectError(
+        error.ResponseHeadersAlreadySent,
+        h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "200" }}),
+    );
+    try h3.sendResponseData(0, "body");
+    // The peer would read these as trailers carrying :status.
+    try testing.expectError(
+        error.ResponseHeadersAlreadySent,
+        h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "500" }}),
+    );
+    try h3.finishResponse(0, &.{.{ .name = "x-checksum", .value = "abc" }});
+
+    const stream = quic_conn.streams.getStream(0).?;
+    var types: [8]std.meta.Tag(h3_frame.H3Frame) = undefined;
+    const n = try writtenFrameTypes(&stream.send, &types);
+    try testing.expectEqualSlices(
+        std.meta.Tag(h3_frame.H3Frame),
+        &.{ .headers, .headers, .data, .headers },
+        types[0..n],
+    );
+}
+
 test "H3 streaming: writes to a stopped stream fail instead of vanishing" {
     var quic_conn = createTestQuicConn(true);
     defer quic_conn.deinit();
@@ -2601,8 +2674,10 @@ test "H3 streaming: notifyWritable waits for credit and a drained buffer" {
     try setupRequestStream(&quic_conn, &h3, true);
     try testing.expect((try h3.poll()).? == .finished);
 
+    try h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "200" }});
     const stream = quic_conn.streams.getStream(0).?;
-    stream.send.send_window = 1000;
+    stream.send.send_offset = stream.send.write_offset;
+    stream.send.send_window = stream.send.write_offset + 1000;
 
     try h3.sendResponseData(0, &([_]u8{0} ** 600));
     try testing.expectEqual(@as(?u64, 603), h3.streamBufferedBytes(0));

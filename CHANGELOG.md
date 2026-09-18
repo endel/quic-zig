@@ -19,7 +19,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   `isStopped()`, so one of several clients on a loop can be torn down alone.
 - HTTP/3 responses can be streamed: `sendResponseHeaders` (repeatable for 1xx),
   `sendResponseData`, `finishResponse` with optional trailers, and
-  `resetRequest` to abort. `notifyWritable` and `streamBufferedBytes` now work
+  `resetRequest` to abort. Calls out of that order return an error rather
+  than sending the peer a malformed response. `notifyWritable` and `streamBufferedBytes` now work
   on request streams, so a body can be paced against the peer.
 - New optional server callbacks: `onRequestEnd` when a request body is
   complete, `onRequestCancelled` when the peer resets the request or stops the
