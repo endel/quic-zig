@@ -2594,6 +2594,7 @@ pub const Connection = struct {
                     error.UnsupportedVersion => tls.Alert.Description.protocol_version,
                     error.NoApplicationProtocol => tls.Alert.Description.no_application_protocol,
                     error.MissingExtension => tls.Alert.Description.missing_extension,
+                    error.HandshakeFailure => tls.Alert.Description.handshake_failure,
                     else => tls.Alert.Description.internal_error,
                 });
                 self.closeWithTransportError(TransportError.cryptoError(tls_alert), @intFromEnum(FrameType.crypto), "TLS handshake failure");

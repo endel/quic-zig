@@ -708,8 +708,8 @@ pub fn Server(comptime Handler: type) type {
 
                 var key_der_buf: [4096]u8 = undefined;
                 const key_der = try tls13.parsePemPrivateKey(server_key_pem, &key_der_buf);
-                const ec_private_key_tmp = tls13.extractEcPrivateKey(key_der) catch try tls13.extractPkcs8EcPrivateKey(key_der);
-                const ec_private_key = try alloc.dupe(u8, ec_private_key_tmp);
+                const key = try tls13.extractPrivateKey(key_der);
+                const private_key = try alloc.dupe(u8, key.bytes);
 
                 const default_alpn = [_][]const u8{"h3"};
                 const alpn = try alloc.dupe([]const u8, config.alpn orelse &default_alpn);
@@ -721,13 +721,14 @@ pub fn Server(comptime Handler: type) type {
                     .cert_pem = server_cert_pem,
                     .key_pem = server_key_pem,
                     .cert_chain = cert_chain,
-                    .private_key = ec_private_key,
+                    .private_key = private_key,
                     .alpn = alpn,
                 };
 
                 break :blk .{
                     .cert_chain_der = cert_chain,
-                    .private_key_bytes = ec_private_key,
+                    .private_key_bytes = private_key,
+                    .private_key_algorithm = key.algorithm,
                     .alpn = alpn,
                     .ticket_key = ticket_key,
                 };
@@ -3967,6 +3968,58 @@ test "e2e: a WebTransport listener serves a plain GET" {
     try testing.expectEqual(@as(u32, 0), server_handler.connects);
     try testing.expectEqualStrings("200", &client_handler.status);
     try testing.expectEqualStrings("hello world", client_handler.body[0..client_handler.received]);
+}
+
+test "e2e: an RSA certificate, picked by SNI next to an EC one" {
+    const test_certs = @import("tls/test_certs.zig");
+    var ec_certs: test_certs.TestCerts = undefined;
+    try ec_certs.load();
+    var rsa_cert: test_certs.RsaCert = undefined;
+    try rsa_cert.load(false);
+    const entries = [_]tls13.CertEntry{
+        ec_certs.entries[0],
+        .{ .server_names = &.{"rsa.test"}, .cert = rsa_cert.cert },
+    };
+    // The pin stands in for the chain; CertificateVerify is still checked.
+    var pin: [32]u8 = undefined;
+    crypto.hash.sha2.Sha256.hash(rsa_cert.chain[0], &pin, .{});
+    const pins = [_][32]u8{pin};
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    const S = Server(MixedServer);
+    const C = Client(CheckingClient);
+    var sh = MixedServer{};
+    var server = try S.init(testing.allocator, &sh, .{
+        .port = 29437,
+        .tls_config = .{ .cert_chain_der = &.{}, .private_key_bytes = &.{}, .certs = &entries, .alpn = &.{"h3"} },
+        .loop = &loop,
+    });
+    server.start();
+    var ch = CheckingClient{};
+    var client = try C.init(testing.allocator, &ch, .{
+        .port = 29437,
+        .server_name = "rsa.test",
+        .ca = .{ .pinned_hashes = &pins },
+        .loop = &loop,
+    });
+    client.start();
+    try runUntil(&loop, &ch, finishedOne, 10_000);
+    try testing.expectEqualStrings("200", &ch.status);
+    try testing.expectEqualStrings("hello world", ch.body[0..ch.received]);
+
+    client.stop();
+    server.stop();
+    const Both = struct {
+        s: *S,
+        c: *C,
+        fn done(x: *const @This()) bool {
+            return x.s.isStopped() and x.c.isStopped();
+        }
+    };
+    try runUntil(&loop, &Both{ .s = &server, .c = &client }, Both.done, 5000);
+    client.deinit();
+    server.deinit();
 }
 
 test "Server: socket options, ALPN and connection cap come from Config" {

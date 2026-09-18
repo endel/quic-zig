@@ -1114,6 +1114,20 @@ test "the certificate is verified against the CA bundle, P-256 and Ed25519" {
     }
 }
 
+test "an RSA certificate verifies, with a PKCS#1 or a PKCS#8 key behind it" {
+    var bundle = try testBundle(test_certs.test_rsa_pem);
+    defer bundle.deinit(testing.allocator);
+    for ([_]bool{ true, false }) |pkcs1| {
+        var rsa_cert: test_certs.RsaCert = undefined;
+        try rsa_cert.load(pkcs1);
+        const entries = [_]tls_server.CertEntry{.{ .server_names = &.{"rsa.test"}, .cert = rsa_cert.cert }};
+        const server_config: tls_server.Config = .{ .certs = &entries };
+        var p = try Pair.init(&.{ .server_name = "rsa.test", .ca_bundle = &bundle }, &server_config);
+        defer p.deinit();
+        try expectRoundTrip(&p);
+    }
+}
+
 test "a CA-signed chain, and IP literals matched against IP SANs" {
     var der_buf: [1024]u8 = undefined;
     var key_buf: [256]u8 = undefined;

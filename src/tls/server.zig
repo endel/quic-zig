@@ -11,15 +11,16 @@
 //!   TLS_AES_256_GCM_SHA384, picked in the server's preference order.
 //! - X25519 and secp256r1 key exchange, with HelloRetryRequest when the
 //!   client's key_share has no group we accept but supported_groups does.
-//! - ECDSA P-256 / SHA-256 and Ed25519 certificates, selected by SNI.
+//! - ECDSA P-256 / SHA-256, Ed25519 and RSA (signing with RSA-PSS)
+//!   certificates, selected by SNI and the client's signature_algorithms.
 //! - ALPN, middlebox compatibility mode, KeyUpdate in both directions.
 //! - With `Config.ticket_key`: stateless session tickets and PSK-DHE
 //!   resumption (psk_dhe_ke; the key exchange still runs).
 //!
 //! Not supported, by design: TLS 1.2 and earlier, client certificates,
 //! 0-RTT (early data offered by a client is skipped), psk_ke resumption
-//! without (EC)DHE, external PSKs, RSA certificates, record size limit and
-//! other optional extensions.
+//! without (EC)DHE, external PSKs, record size limit and other optional
+//! extensions.
 
 const std = @import("std");
 const sys = @import("../sys.zig");
@@ -559,7 +560,7 @@ pub const Conn = struct {
             @memcpy(self.server_name_buf[0..name.len], name);
             self.server_name_len = @intCast(name.len);
         } else self.server_name_len = null;
-        const selection = tls13.selectCertificate(config.certs, ch.server_name) orelse return error.InternalError;
+        const selection = tls13.selectCertificateFor(config.certs, ch.server_name, ch.signature_algorithms) orelse return error.InternalError;
         const cert = &selection.entry.cert;
 
         self.selected_alpn = null;
@@ -599,13 +600,10 @@ pub const Conn = struct {
         }
         self.resumed = psk != null;
 
+        var sig_scheme: tls.SignatureScheme = undefined;
         if (psk == null) {
             const sig_algs = ch.signature_algorithms orelse return error.MissingExtension;
-            const scheme: tls.SignatureScheme = switch (cert.private_key_algorithm) {
-                .ecdsa_p256_sha256 => .ecdsa_secp256r1_sha256,
-                .ed25519 => .ed25519,
-            };
-            if (!containsU16(sig_algs, @intFromEnum(scheme))) return error.HandshakeFailure;
+            sig_scheme = tls13.signatureSchemeFor(cert.private_key_algorithm, sig_algs) orelse return error.HandshakeFailure;
         }
 
         var shared_buf: [32]u8 = undefined;
@@ -657,7 +655,7 @@ pub const Conn = struct {
 
             start = self.hs_out.items.len;
             const th_cert = self.transcript.peek();
-            try buildCertificateVerify(&b, cert, th_cert[0..hashLen(self.suite)]);
+            try buildCertificateVerify(&b, cert, sig_scheme, th_cert[0..hashLen(self.suite)]);
             self.transcript.update(self.hs_out.items[start..]);
         }
 
@@ -1140,7 +1138,7 @@ fn buildCertificate(b: *Builder, chain: []const []const u8) Error!void {
     try b.end(u24, msg);
 }
 
-fn buildCertificateVerify(b: *Builder, cert: *const Certificate, transcript_hash: []const u8) Error!void {
+fn buildCertificateVerify(b: *Builder, cert: *const Certificate, scheme: tls.SignatureScheme, transcript_hash: []const u8) Error!void {
     const context = "TLS 1.3, server CertificateVerify";
     var content: [64 + context.len + 1 + 48]u8 = undefined;
     @memset(content[0..64], 0x20);
@@ -1149,32 +1147,13 @@ fn buildCertificateVerify(b: *Builder, cert: *const Certificate, transcript_hash
     @memcpy(content[64 + context.len + 1 ..][0..transcript_hash.len], transcript_hash);
     const signed = content[0 .. 64 + context.len + 1 + transcript_hash.len];
 
-    const key = cert.private_key_bytes;
-    if (key.len != 32) return error.InternalError;
-    var noise: [32]u8 = undefined;
-    sys.randomBytes(&noise);
-
+    var sig_buf: [tls13.rsa.max_signature_len]u8 = undefined;
+    const sig = try tls13.signCertificateVerify(scheme, cert.private_key_bytes, signed, &sig_buf);
     try b.u8_(hs_certificate_verify);
     const msg = try b.begin(u24);
-    switch (cert.private_key_algorithm) {
-        .ecdsa_p256_sha256 => {
-            const sk = EcdsaP256Sha256.SecretKey.fromBytes(key[0..32].*) catch return error.InternalError;
-            const kp = EcdsaP256Sha256.KeyPair.fromSecretKey(sk) catch return error.InternalError;
-            const sig = kp.sign(signed, noise) catch return error.InternalError;
-            var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
-            const der = sig.toDer(&der_buf);
-            try b.u16_(@intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256));
-            try b.u16_(@intCast(der.len));
-            try b.bytes(der);
-        },
-        .ed25519 => {
-            const kp = Ed25519.KeyPair.generateDeterministic(key[0..32].*) catch return error.InternalError;
-            const sig = kp.sign(signed, noise) catch return error.InternalError;
-            try b.u16_(@intFromEnum(tls.SignatureScheme.ed25519));
-            try b.u16_(Ed25519.Signature.encoded_length);
-            try b.bytes(&sig.toBytes());
-        },
-    }
+    try b.u16_(@intFromEnum(scheme));
+    try b.u16_(@intCast(sig.len));
+    try b.bytes(sig);
     try b.end(u24, msg);
 }
 
@@ -1420,6 +1399,7 @@ const MiniClient = struct {
     alpn_got: std.ArrayList(u8) = .empty,
     sni_acked: bool = false,
     cv_verified: bool = false,
+    cv_scheme: ?tls.SignatureScheme = null,
     resuming: bool = false,
     master: Secret = @splat(0),
     received: ?ClientTicket = null,
@@ -1726,9 +1706,17 @@ const MiniClient = struct {
                 switch (scheme) {
                     .ecdsa_secp256r1_sha256 => try (try EcdsaP256Sha256.Signature.fromDer(sig)).verify(signed, try EcdsaP256Sha256.PublicKey.fromSec1(pk)),
                     .ed25519 => try Ed25519.Signature.fromBytes(sig[0..64].*).verify(signed, try Ed25519.PublicKey.fromBytes(pk[0..32].*)),
+                    .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => try tls13.verifyCertificateVerifySignature(
+                        pk,
+                        std.meta.activeTag(leaf.pub_key_algo),
+                        @intFromEnum(scheme),
+                        sig,
+                        signed,
+                    ),
                     else => return error.UnexpectedMessage,
                 }
                 c.cv_verified = true;
+                c.cv_scheme = scheme;
                 c.transcript.update(msg);
             },
             hs_finished => {
@@ -1903,6 +1891,79 @@ test "a client that cannot verify our key type gets handshake_failure" {
     var conn = Conn.init(testing.allocator, &config);
     defer conn.deinit();
     var client: MiniClient = .{ .gpa = testing.allocator, .sig_algs = &.{@intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha256)} };
+    defer client.deinit();
+    try testing.expectError(error.HandshakeFailure, client.handshake(&conn));
+    try expectAlert(&conn, .handshake_failure);
+}
+
+test "an RSA certificate signs with RSA-PSS, the hash taken from the client's offer" {
+    var rsa_cert: test_certs.RsaCert = undefined;
+    try rsa_cert.load(false);
+    const entries = [_]CertEntry{.{ .server_names = &.{"rsa.test"}, .cert = rsa_cert.cert }};
+    const config: Config = .{ .certs = &entries };
+    const S = tls.SignatureScheme;
+    const cases = [_]struct { []const u16, S }{
+        // Our preference, SHA-256, wins over the client's order.
+        .{ &.{ @intFromEnum(S.rsa_pss_rsae_sha512), @intFromEnum(S.rsa_pss_rsae_sha256) }, .rsa_pss_rsae_sha256 },
+        .{ &.{@intFromEnum(S.rsa_pss_rsae_sha384)}, .rsa_pss_rsae_sha384 },
+        .{ &.{ @intFromEnum(S.ecdsa_secp256r1_sha256), @intFromEnum(S.rsa_pss_rsae_sha512) }, .rsa_pss_rsae_sha512 },
+    };
+    for (cases) |c| {
+        var conn = Conn.init(testing.allocator, &config);
+        defer conn.deinit();
+        var client: MiniClient = .{ .gpa = testing.allocator, .sni = "rsa.test", .sig_algs = c[0] };
+        defer client.deinit();
+        try client.handshake(&conn);
+        try testing.expect(client.cv_verified);
+        try testing.expectEqual(c[1], client.cv_scheme.?);
+        try testing.expectEqualSlices(u8, rsa_cert.chain[0], client.leaf.items);
+    }
+    {
+        // PKCS#1 v1.5 is for certificate signatures only, and rsa_pss_pss
+        // needs an RSASSA-PSS key.
+        var conn = Conn.init(testing.allocator, &config);
+        defer conn.deinit();
+        var client: MiniClient = .{ .gpa = testing.allocator, .sni = "rsa.test", .sig_algs = &.{
+            @intFromEnum(S.rsa_pkcs1_sha256),
+            @intFromEnum(S.rsa_pss_pss_sha256),
+        } };
+        defer client.deinit();
+        try testing.expectError(error.HandshakeFailure, client.handshake(&conn));
+        try expectAlert(&conn, .handshake_failure);
+    }
+    _ = try expectStdClientRoundTrip(&config, std.math.maxInt(usize));
+}
+
+test "among certificates for one name, the client's signature_algorithms decide" {
+    var certs: TestCerts = undefined;
+    try certs.load();
+    var rsa_cert: test_certs.RsaCert = undefined;
+    try rsa_cert.load(true);
+    const entries = [_]CertEntry{
+        .{ .server_names = &.{"both.test"}, .cert = certs.entries[0].cert },
+        .{ .server_names = &.{"both.test"}, .cert = rsa_cert.cert },
+    };
+    const config: Config = .{ .certs = &entries };
+    const ecdsa = @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256);
+    const pss = @intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha256);
+    const cases = [_]struct { ?[]const u8, []const u16, []const u8 }{
+        .{ "both.test", &.{ecdsa}, certs.chains[0][0] },
+        .{ "both.test", &.{pss}, rsa_cert.chain[0] },
+        .{ "both.test", &.{ pss, ecdsa }, certs.chains[0][0] }, // entry order breaks the tie
+        .{ null, &.{pss}, rsa_cert.chain[0] },
+    };
+    for (cases) |c| {
+        var conn = Conn.init(testing.allocator, &config);
+        defer conn.deinit();
+        var client: MiniClient = .{ .gpa = testing.allocator, .sni = c[0], .sig_algs = c[1] };
+        defer client.deinit();
+        try client.handshake(&conn);
+        try testing.expect(client.cv_verified);
+        try testing.expectEqualSlices(u8, c[2], client.leaf.items);
+    }
+    var conn = Conn.init(testing.allocator, &config);
+    defer conn.deinit();
+    var client: MiniClient = .{ .gpa = testing.allocator, .sni = "both.test", .sig_algs = &.{@intFromEnum(tls.SignatureScheme.ed25519)} };
     defer client.deinit();
     try testing.expectError(error.HandshakeFailure, client.handshake(&conn));
     try expectAlert(&conn, .handshake_failure);

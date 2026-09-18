@@ -1,7 +1,7 @@
 // TLS 1.3 handshake for QUIC (RFC 8446 + RFC 9001)
 //
 // Supports TLS_AES_128_GCM_SHA256 (0x1301) only.
-// ECDSA P-256 or Ed25519 for signatures, X25519 for key exchange.
+// ECDSA P-256, Ed25519 or RSA-PSS for signatures, X25519 for key exchange.
 // X.509 certificate chain validation via std.crypto.Certificate.
 
 const std = @import("std");
@@ -13,6 +13,7 @@ const quic_crypto = @import("crypto.zig");
 const protocol = @import("protocol.zig");
 const transport_params = @import("transport_params.zig");
 const limits = @import("limits.zig");
+pub const rsa = @import("rsa.zig");
 
 const Certificate = std.crypto.Certificate;
 
@@ -38,7 +39,29 @@ pub const EncryptionLevel = quic_crypto.EncryptionLevel;
 pub const PrivateKeyAlgorithm = enum {
     ecdsa_p256_sha256,
     ed25519,
+    /// Signs with RSA-PSS (rsa_pss_rsae_*), SHA-256 unless the client offers
+    /// only SHA-384 or SHA-512.
+    rsa,
 };
+
+/// The CertificateVerify scheme for a key, from the client's
+/// signature_algorithms (the list body: big-endian u16s). Null when the
+/// client offers none that fits.
+pub fn signatureSchemeFor(alg: PrivateKeyAlgorithm, offered: []const u8) ?tls.SignatureScheme {
+    const ours: []const tls.SignatureScheme = switch (alg) {
+        .ecdsa_p256_sha256 => &.{.ecdsa_secp256r1_sha256},
+        .ed25519 => &.{.ed25519},
+        // rsa_pss_pss_* needs an RSASSA-PSS certificate; ours are rsaEncryption.
+        .rsa => &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 },
+    };
+    for (ours) |scheme| {
+        var i: usize = 0;
+        while (i + 2 <= offered.len) : (i += 2) {
+            if (std.mem.readInt(u16, offered[i..][0..2], .big) == @intFromEnum(scheme)) return scheme;
+        }
+    }
+    return null;
+}
 
 // ─── CertificateVerify signature verification ────────────────────────
 
@@ -88,14 +111,14 @@ fn verifyRsaPss(
     comptime Hash: type,
 ) !void {
     if (pub_key_algo != .rsaEncryption) return error.BadCertificateVerify;
-    const rsa = Certificate.rsa;
-    const pk_components = rsa.PublicKey.parseDer(pub_key_bytes) catch return error.BadCertificateVerify;
-    const public_key = rsa.PublicKey.fromBytes(pk_components.exponent, pk_components.modulus) catch return error.BadCertificateVerify;
+    const std_rsa = Certificate.rsa;
+    const pk_components = std_rsa.PublicKey.parseDer(pub_key_bytes) catch return error.BadCertificateVerify;
+    const public_key = std_rsa.PublicKey.fromBytes(pk_components.exponent, pk_components.modulus) catch return error.BadCertificateVerify;
 
     switch (pk_components.modulus.len) {
         inline 128, 256, 384, 512 => |modulus_len| {
             if (sig_bytes.len != modulus_len) return error.BadCertificateVerify;
-            rsa.PSSSignature.verify(modulus_len, sig_bytes[0..modulus_len].*, signed_content, public_key, Hash) catch return error.BadCertificateVerify;
+            std_rsa.PSSSignature.verify(modulus_len, sig_bytes[0..modulus_len].*, signed_content, public_key, Hash) catch return error.BadCertificateVerify;
         },
         else => return error.BadCertificateVerify,
     }
@@ -501,8 +524,8 @@ pub const SessionTicket = struct {
 pub const ServerCertificate = struct {
     /// DER-encoded certificates, leaf first.
     cert_chain_der: []const []const u8,
-    /// Raw P-256 scalar or Ed25519 seed (32 bytes), as `extractEcPrivateKey`
-    /// / `extractEd25519PrivateKey` return it.
+    /// Raw P-256 scalar or Ed25519 seed (32 bytes), or an RSA key's PKCS#1
+    /// DER, as `extractPrivateKey` returns them.
     private_key_bytes: []const u8,
     private_key_algorithm: PrivateKeyAlgorithm = .ecdsa_p256_sha256,
 };
@@ -528,29 +551,67 @@ pub const CertSelection = struct {
 /// one-label wildcard, then `entries[0]`. Returns null only when `entries` is
 /// empty.
 pub fn selectCertificate(entries: []const CertEntry, sni: ?[]const u8) ?CertSelection {
-    if (entries.len == 0) return null;
-    const raw = sni orelse return .{ .entry = &entries[0], .matched = false };
-    // A trailing dot names the same host (RFC 6066 forbids it, clients still send it).
-    const name = if (raw.len > 0 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
-    if (name.len == 0) return .{ .entry = &entries[0], .matched = false };
+    return selectCertificateFor(entries, sni, null);
+}
 
-    for (entries) |*e| {
-        for (e.server_names) |n| {
-            if (std.ascii.eqlIgnoreCase(n, name)) return .{ .entry = e, .matched = true };
+/// `selectCertificate`, preferring within each step (exact, wildcard,
+/// default) the first entry whose key can sign with one of `sig_algs`, the
+/// client's signature_algorithms list body. The default step considers every
+/// entry, so a client that cannot verify `entries[0]` gets another
+/// certificate rather than a failed handshake.
+pub fn selectCertificateFor(entries: []const CertEntry, sni: ?[]const u8, sig_algs: ?[]const u8) ?CertSelection {
+    if (entries.len == 0) return null;
+    const Pick = struct {
+        sig_algs: ?[]const u8,
+        first: ?*const CertEntry = null,
+        usable: ?*const CertEntry = null,
+
+        fn add(pick: *@This(), e: *const CertEntry) void {
+            if (pick.first == null) pick.first = e;
+            if (pick.usable != null) return;
+            const offered = pick.sig_algs orelse return;
+            if (signatureSchemeFor(e.cert.private_key_algorithm, offered) != null) pick.usable = e;
         }
-    }
-    if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
-        if (dot > 0) {
-            const parent = name[dot..]; // ".example.com"
-            for (entries) |*e| {
-                for (e.server_names) |n| {
-                    if (n.len > 2 and n[0] == '*' and n[1] == '.' and std.ascii.eqlIgnoreCase(n[1..], parent))
-                        return .{ .entry = e, .matched = true };
+
+        fn best(pick: @This()) ?*const CertEntry {
+            return pick.usable orelse pick.first;
+        }
+    };
+
+    // A trailing dot names the same host (RFC 6066 forbids it, clients still send it).
+    const raw = sni orelse "";
+    const name = if (raw.len > 0 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
+    if (name.len > 0) {
+        var exact: Pick = .{ .sig_algs = sig_algs };
+        for (entries) |*e| {
+            for (e.server_names) |n| {
+                if (std.ascii.eqlIgnoreCase(n, name)) {
+                    exact.add(e);
+                    break;
                 }
             }
         }
+        if (exact.best()) |e| return .{ .entry = e, .matched = true };
+
+        if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+            if (dot > 0) {
+                const parent = name[dot..]; // ".example.com"
+                var wildcard: Pick = .{ .sig_algs = sig_algs };
+                for (entries) |*e| {
+                    for (e.server_names) |n| {
+                        if (n.len > 2 and n[0] == '*' and n[1] == '.' and std.ascii.eqlIgnoreCase(n[1..], parent)) {
+                            wildcard.add(e);
+                            break;
+                        }
+                    }
+                }
+                if (wildcard.best()) |e| return .{ .entry = e, .matched = true };
+            }
+        }
     }
-    return .{ .entry = &entries[0], .matched = false };
+    var default: Pick = .{ .sig_algs = sig_algs };
+    for (entries) |*e| default.add(e);
+    return .{ .entry = default.best().?, .matched = false };
 }
 
 /// Parses the host_name out of a server_name extension body (RFC 6066 §3).
@@ -580,7 +641,7 @@ pub fn parseServerNameExtension(data: []const u8) error{DecodeError}!?[]const u8
 
 pub const TlsConfig = struct {
     cert_chain_der: []const []const u8, // DER-encoded certificates
-    private_key_bytes: []const u8, // Raw P-256 scalar or Ed25519 seed (32 bytes)
+    private_key_bytes: []const u8, // See ServerCertificate.private_key_bytes
     private_key_algorithm: PrivateKeyAlgorithm = .ecdsa_p256_sha256,
     /// Server only: certificates chosen by the ClientHello's SNI (see
     /// `selectCertificate`). When non-empty, this replaces `cert_chain_der` /
@@ -657,6 +718,8 @@ pub const HandshakeError = error{
     UnsupportedVersion,
     NoApplicationProtocol,
     MissingExtension,
+    /// The client offers no signature scheme our certificate can use.
+    HandshakeFailure,
     TransportParameterError,
 };
 
@@ -785,6 +848,8 @@ pub const Tls13Handshake = struct {
     /// Server: the certificate we present — the config's single one, or the
     /// `config.certs` entry the ClientHello's SNI selected.
     server_cert: ServerCertificate = undefined,
+    /// Server: the CertificateVerify scheme, picked from the ClientHello.
+    server_sig_scheme: tls.SignatureScheme = .ecdsa_secp256r1_sha256,
 
     zero_rtt_accepted: bool = false,
     pending_install_early: bool = false,
@@ -1517,6 +1582,8 @@ pub const Tls13Handshake = struct {
         pos += 2;
 
         var found_key_share = false;
+        var sni: ?[]const u8 = null;
+        var sig_algs: ?[]const u8 = null;
         var psk_ext_offset: ?usize = null; // offset into ext_data where PSK extension starts
         var psk_ext_len: usize = 0;
         var ext_pos: usize = 0;
@@ -1594,14 +1661,19 @@ pub const Tls13Handshake = struct {
                 psk_ext_len = elen;
             } else if (etype == @intFromEnum(tls.ExtensionType.early_data)) {
                 self.early_data_offered = true;
-            } else if (etype == @intFromEnum(tls.ExtensionType.server_name) and self.config.certs.len > 0) {
-                const sni = parseServerNameExtension(ext_data[ext_pos..][0..elen]) catch return error.DecodeError;
-                self.server_cert = selectCertificate(self.config.certs, sni).?.entry.cert;
+            } else if (etype == @intFromEnum(tls.ExtensionType.server_name)) {
+                sni = parseServerNameExtension(ext_data[ext_pos..][0..elen]) catch return error.DecodeError;
+            } else if (etype == @intFromEnum(tls.ExtensionType.signature_algorithms)) {
+                if (elen < 2 or @as(usize, readU16(ext_data[ext_pos..])) + 2 != elen or elen % 2 != 0) return error.DecodeError;
+                sig_algs = ext_data[ext_pos + 2 ..][0 .. elen - 2];
             }
             ext_pos += elen;
         }
 
         if (!found_key_share) return error.NoKeyShare;
+        if (self.config.certs.len > 0) {
+            self.server_cert = selectCertificateFor(self.config.certs, sni, sig_algs).?.entry.cert;
+        }
 
         // RFC 9001 §8.2: quic_transport_parameters extension MUST be present
         if (self.peer_transport_params == null) {
@@ -1617,6 +1689,13 @@ pub const Tls13Handshake = struct {
             } else {
                 std.log.info("PSK rejected, full handshake", .{});
             }
+        }
+
+        if (!self.using_psk) {
+            // RFC 8446 §4.2.3: certificate authentication needs a scheme the client offered.
+            const offered = sig_algs orelse return error.MissingExtension;
+            self.server_sig_scheme = signatureSchemeFor(self.server_cert.private_key_algorithm, offered) orelse
+                return error.HandshakeFailure;
         }
 
         // Update transcript with ClientHello
@@ -1778,12 +1857,12 @@ pub const Tls13Handshake = struct {
     fn serverBuildCertificateVerify(self: *Tls13Handshake) !Action {
         const transcript_hash = self.transcript.current();
 
-        var buf: [512]u8 = undefined;
+        var buf: [8 + rsa.max_signature_len]u8 = undefined;
         const msg = buildCertificateVerify(
             &buf,
             transcript_hash,
             self.server_cert.private_key_bytes,
-            self.server_cert.private_key_algorithm,
+            self.server_sig_scheme,
             true, // is_server
         ) catch return error.InternalError;
 
@@ -2647,11 +2726,49 @@ fn buildCertificate(buf: []u8, cert_chain: []const []const u8) ![]const u8 {
     return buf[0..pos];
 }
 
+/// Signs CertificateVerify content with `scheme`, which `signatureSchemeFor`
+/// picked for the key. Returns a slice of `out`.
+pub fn signCertificateVerify(
+    scheme: tls.SignatureScheme,
+    private_key_bytes: []const u8,
+    content: []const u8,
+    out: *[rsa.max_signature_len]u8,
+) error{InternalError}![]const u8 {
+    var noise: [32]u8 = undefined;
+    sys.randomBytes(&noise);
+    switch (scheme) {
+        .ecdsa_secp256r1_sha256 => {
+            if (private_key_bytes.len != 32) return error.InternalError;
+            const sk = EcdsaP256Sha256.SecretKey.fromBytes(private_key_bytes[0..32].*) catch return error.InternalError;
+            const kp = EcdsaP256Sha256.KeyPair.fromSecretKey(sk) catch return error.InternalError;
+            const sig = kp.sign(content, noise) catch return error.InternalError;
+            return sig.toDer(out[0..EcdsaP256Sha256.Signature.der_encoded_length_max]);
+        },
+        .ed25519 => {
+            if (private_key_bytes.len != 32) return error.InternalError;
+            const kp = Ed25519.KeyPair.generateDeterministic(private_key_bytes[0..32].*) catch return error.InternalError;
+            const sig = kp.sign(content, noise) catch return error.InternalError;
+            out[0..Ed25519.Signature.encoded_length].* = sig.toBytes();
+            return out[0..Ed25519.Signature.encoded_length];
+        },
+        inline .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => |s| {
+            const Hash = switch (s) {
+                .rsa_pss_rsae_sha256 => Sha256,
+                .rsa_pss_rsae_sha384 => Sha384,
+                else => Sha512,
+            };
+            const key = rsa.PrivateKey.parsePkcs1(private_key_bytes) catch return error.InternalError;
+            return key.signPss(Hash, content, out) catch return error.InternalError;
+        },
+        else => return error.InternalError,
+    }
+}
+
 fn buildCertificateVerify(
     buf: []u8,
     transcript_hash: [32]u8,
     private_key_bytes: []const u8,
-    private_key_algorithm: PrivateKeyAlgorithm,
+    scheme: tls.SignatureScheme,
     is_server: bool,
 ) ![]const u8 {
     // Build the content to sign:
@@ -2663,28 +2780,10 @@ fn buildCertificateVerify(
     sign_content[64 + 33] = 0x00;
     @memcpy(sign_content[64 + 34 ..][0..32], &transcript_hash);
 
-    if (private_key_bytes.len != 32) return error.InternalError;
-
-    var sig_storage: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
-    var sig_len: usize = 0;
-    const sig_algo: u16 = switch (private_key_algorithm) {
-        .ecdsa_p256_sha256 => sig_algo: {
-            const secret_key = EcdsaP256Sha256.SecretKey.fromBytes(private_key_bytes[0..32].*) catch return error.InternalError;
-            const key_pair = EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key) catch return error.InternalError;
-            const sig = key_pair.sign(&sign_content, null) catch return error.InternalError;
-            const sig_bytes = sig.toDer(&sig_storage);
-            sig_len = sig_bytes.len;
-            break :sig_algo @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256);
-        },
-        .ed25519 => sig_algo: {
-            const key_pair = Ed25519.KeyPair.generateDeterministic(private_key_bytes[0..32].*) catch return error.InternalError;
-            const sig = key_pair.sign(&sign_content, null) catch return error.InternalError;
-            const sig_bytes = sig.toBytes();
-            @memcpy(sig_storage[0..sig_bytes.len], &sig_bytes);
-            sig_len = sig_bytes.len;
-            break :sig_algo @intFromEnum(tls.SignatureScheme.ed25519);
-        },
-    };
+    var sig_storage: [rsa.max_signature_len]u8 = undefined;
+    const sig = try signCertificateVerify(scheme, private_key_bytes, &sign_content, &sig_storage);
+    const sig_algo: u16 = @intFromEnum(scheme);
+    const sig_len = sig.len;
 
     // Build message
     var pos: usize = 4; // reserve for header
@@ -2783,9 +2882,9 @@ pub fn parsePemCertChain(alloc: std.mem.Allocator, pem_data: []const u8) ![][]co
 }
 
 pub fn parsePemPrivateKey(pem_data: []const u8, out: []u8) ![]const u8 {
-    // Try EC PRIVATE KEY first, then PRIVATE KEY (PKCS#8)
     return parsePemSection(pem_data, "EC PRIVATE KEY", out) catch
-        parsePemSection(pem_data, "PRIVATE KEY", out);
+        parsePemSection(pem_data, "RSA PRIVATE KEY", out) catch
+        parsePemSection(pem_data, "PRIVATE KEY", out); // PKCS#8
 }
 
 fn parsePemSection(pem_data: []const u8, comptime label: []const u8, out: []u8) ![]const u8 {
@@ -2938,6 +3037,39 @@ pub fn extractEd25519PrivateKey(der: []const u8) ![]const u8 {
     const nested = try readDerValue(private_key, &nested_pos, 0x04);
     if (nested_pos != private_key.len or nested.len != 32) return error.DecodeError;
     return nested;
+}
+
+/// An RSA private key, PKCS#1 or PKCS#8 DER, as the PKCS#1 RSAPrivateKey
+/// that `ServerCertificate.private_key_bytes` takes (a slice of `der`).
+/// Two-prime keys of 2048 to 4096 bits; the key signs once here to prove its
+/// numbers fit together.
+pub fn extractRsaPrivateKey(der: []const u8) rsa.Error![]const u8 {
+    const pkcs1 = rsa.PrivateKey.pkcs1FromPkcs8(der) catch |err| switch (err) {
+        error.DecodeError => der, // not PKCS#8
+        else => return err,
+    };
+    const key = try rsa.PrivateKey.parsePkcs1(pkcs1);
+    try key.check();
+    return pkcs1;
+}
+
+pub const PrivateKey = struct {
+    /// A slice of the DER it was extracted from.
+    bytes: []const u8,
+    algorithm: PrivateKeyAlgorithm,
+};
+
+/// Recognizes an EC P-256 (SEC1 or PKCS#8), Ed25519 (PKCS#8) or RSA (PKCS#1
+/// or PKCS#8) private key, as `parsePemPrivateKey` decodes it.
+pub fn extractPrivateKey(der: []const u8) error{ UnsupportedKey, InvalidKey }!PrivateKey {
+    if (extractEcPrivateKey(der)) |k| return .{ .bytes = k, .algorithm = .ecdsa_p256_sha256 } else |_| {}
+    if (extractPkcs8EcPrivateKey(der)) |k| return .{ .bytes = k, .algorithm = .ecdsa_p256_sha256 } else |_| {}
+    if (extractEd25519PrivateKey(der)) |k| return .{ .bytes = k, .algorithm = .ed25519 } else |_| {}
+    const k = extractRsaPrivateKey(der) catch |err| return switch (err) {
+        error.InvalidKey => error.InvalidKey,
+        else => error.UnsupportedKey,
+    };
+    return .{ .bytes = k, .algorithm = .rsa };
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -3631,7 +3763,11 @@ fn fixtureHandshake(gpa: std.mem.Allocator, chain: []const []const u8) !bool {
 fn fixtureHandshakeWith(gpa: std.mem.Allocator, server_config: TlsConfig) !bool {
     var bundle = try fixtureBundle(gpa);
     defer bundle.deinit(gpa);
+    return verifiedHandshake(gpa, server_config, &bundle, "relay.test");
+}
 
+/// Drives a verifying client against `server_config`; false when either side fails.
+fn verifiedHandshake(gpa: std.mem.Allocator, server_config: TlsConfig, bundle: *Certificate.Bundle, server_name: []const u8) !bool {
     const tp = transport_params.TransportParams{ .initial_max_data = 1 << 20, .initial_max_streams_bidi = 10 };
     const server = try gpa.create(Tls13Handshake);
     defer gpa.destroy(server);
@@ -3643,9 +3779,9 @@ fn fixtureHandshakeWith(gpa: std.mem.Allocator, server_config: TlsConfig) !bool 
         .cert_chain_der = &.{},
         .private_key_bytes = &.{},
         .alpn = &[_][]const u8{"h3"},
-        .server_name = "relay.test",
+        .server_name = server_name,
         .skip_cert_verify = false,
-        .ca_bundle = &bundle,
+        .ca_bundle = bundle,
     }, tp);
 
     var client_done = false;
@@ -3793,4 +3929,110 @@ test "a QUIC server picks its certificate by SNI" {
         .alpn = &[_][]const u8{"h3"},
         .certs = &wrong_default,
     }));
+}
+
+const test_certs = @import("../tls/test_certs.zig");
+
+test "a QUIC handshake with an RSA certificate, from a PKCS#1 or a PKCS#8 key" {
+    const gpa = std.testing.allocator;
+    var bundle: Certificate.Bundle = .empty;
+    defer bundle.deinit(gpa);
+    var der_buf: [2048]u8 = undefined;
+    try bundle.bytes.appendSlice(gpa, try parsePemCert(test_certs.test_rsa_pem, &der_buf));
+    try bundle.parseCert(gpa, 0, sys.realtimeSeconds());
+
+    for ([_]bool{ true, false }) |pkcs1| {
+        var rsa_cert: test_certs.RsaCert = undefined;
+        try rsa_cert.load(pkcs1);
+        try std.testing.expectEqual(PrivateKeyAlgorithm.rsa, rsa_cert.cert.private_key_algorithm);
+        try std.testing.expect(try verifiedHandshake(gpa, .{
+            .cert_chain_der = rsa_cert.cert.cert_chain_der,
+            .private_key_bytes = rsa_cert.cert.private_key_bytes,
+            .private_key_algorithm = .rsa,
+            .alpn = &[_][]const u8{"h3"},
+        }, &bundle, "rsa.test"));
+    }
+}
+
+/// The server's answer to our client's ClientHello with its
+/// signature_algorithms list replaced by `schemes` (null: extension renamed away).
+fn serverAnswer(cert: ServerCertificate, schemes: ?[5]tls.SignatureScheme) !void {
+    const tp = transport_params.TransportParams{ .initial_max_data = 1 << 20 };
+    var server = Tls13Handshake.initServer(.{
+        .cert_chain_der = cert.cert_chain_der,
+        .private_key_bytes = cert.private_key_bytes,
+        .private_key_algorithm = cert.private_key_algorithm,
+        .alpn = &[_][]const u8{"h3"},
+    }, tp);
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    }, tp);
+    const ch = while (true) {
+        switch (try client.step()) {
+            .send_data => |sd| break sd.data,
+            else => {},
+        }
+    };
+    var buf: [2048]u8 = undefined;
+    const msg = buf[0..ch.len];
+    @memcpy(msg, ch);
+    const at = std.mem.indexOf(u8, msg, &.{ 0x00, 0x0d, 0x00, 0x0c, 0x00, 0x0a }).?;
+    if (schemes) |list| {
+        for (list, 0..) |scheme, i| std.mem.writeInt(u16, msg[at + 6 + 2 * i ..][0..2], @intFromEnum(scheme), .big);
+    } else {
+        msg[at + 1] = 0xfa; // an unassigned extension type
+    }
+    server.provideData(msg);
+    while (true) {
+        switch (try server.step()) {
+            .send_data => return,
+            else => {},
+        }
+    }
+}
+
+test "a QUIC server fails a client that offers no scheme for its certificate" {
+    var rsa_cert: test_certs.RsaCert = undefined;
+    try rsa_cert.load(false);
+    var ec_certs: test_certs.TestCerts = undefined;
+    try ec_certs.load();
+    const ec = ec_certs.entries[0].cert;
+
+    const no_pss: [5]tls.SignatureScheme = .{ .ecdsa_secp256r1_sha256, .ed25519, .rsa_pkcs1_sha256, .rsa_pss_pss_sha256, .ecdsa_secp384r1_sha384 };
+    const only_pss512: [5]tls.SignatureScheme = @splat(.rsa_pss_rsae_sha512);
+    try std.testing.expectError(error.HandshakeFailure, serverAnswer(rsa_cert.cert, no_pss));
+    try std.testing.expectError(error.HandshakeFailure, serverAnswer(ec, only_pss512));
+    try std.testing.expectError(error.MissingExtension, serverAnswer(rsa_cert.cert, null));
+    try serverAnswer(rsa_cert.cert, only_pss512);
+    try serverAnswer(ec, no_pss);
+}
+
+test "selectCertificateFor: a key the client can verify wins within each step" {
+    const ec: ServerCertificate = .{ .cert_chain_der = &.{}, .private_key_bytes = &.{} };
+    const rsa_key: ServerCertificate = .{ .cert_chain_der = &.{}, .private_key_bytes = &.{}, .private_key_algorithm = .rsa };
+    const entries = [_]CertEntry{
+        .{ .server_names = &.{"default.test"}, .cert = ec },
+        .{ .server_names = &.{"*.example.com"}, .cert = ec },
+        .{ .server_names = &.{"*.example.com"}, .cert = rsa_key },
+        .{ .server_names = &.{"api.example.com"}, .cert = ec },
+    };
+    const pss = [_]u8{ 0x08, 0x04 };
+    const ecdsa = [_]u8{ 0x04, 0x03 };
+    const T = struct {
+        fn pick(e: []const CertEntry, sni: ?[]const u8, offered: []const u8) struct { usize, bool } {
+            const sel = selectCertificateFor(e, sni, offered).?;
+            return .{ (@intFromPtr(sel.entry) - @intFromPtr(e.ptr)) / @sizeOf(CertEntry), sel.matched };
+        }
+    };
+    try std.testing.expectEqual(.{ 1, true }, T.pick(&entries, "www.example.com", &ecdsa));
+    try std.testing.expectEqual(.{ 2, true }, T.pick(&entries, "www.example.com", &pss));
+    // An exact match is not given up for a usable wildcard.
+    try std.testing.expectEqual(.{ 3, true }, T.pick(&entries, "api.example.com", &pss));
+    try std.testing.expectEqual(.{ 2, false }, T.pick(&entries, null, &pss));
+    try std.testing.expectEqual(.{ 0, false }, T.pick(&entries, "other.test", &.{ 0x08, 0x07 }));
+    try std.testing.expectEqual(tls.SignatureScheme.rsa_pss_rsae_sha384, signatureSchemeFor(.rsa, &.{ 0x08, 0x06, 0x08, 0x05 }).?);
+    try std.testing.expect(signatureSchemeFor(.rsa, &.{ 0x08, 0x09, 0x04, 0x01 }) == null);
 }

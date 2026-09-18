@@ -18,6 +18,10 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   certificate by SNI, and can resume sessions from tickets.
 - A QUIC server can serve several certificates and pick one by SNI, via
   `TlsConfig.certs`.
+- RSA server certificates, for QUIC and `tls_server`: 2048 to 4096-bit keys in
+  PKCS#1 or PKCS#8, signing with RSA-PSS. `tls13.extractPrivateKey` reads EC,
+  Ed25519 and RSA keys. When several certificates match a name, the server
+  picks one whose key the client can verify.
 - `Server` can join an event loop you own through `Config.loop`, next to your
   own sockets, timers and `Client`s. `stop()` then leaves the loop running, and
   `isStopped()` says when `deinit()` is safe; `Client` gained the same
@@ -63,6 +67,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Changed
 
+- A QUIC server now aborts with `missing_extension` when a ClientHello without
+  a PSK has no `signature_algorithms`, and with `handshake_failure` when it
+  offers no scheme for the certificate, instead of signing anyway.
 - A server at `max_connections` now answers new clients with
   CONNECTION_REFUSED instead of ignoring them until they time out.
 
