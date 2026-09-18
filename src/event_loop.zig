@@ -1092,6 +1092,7 @@ pub fn Server(comptime Handler: type) type {
             _: xev.File,
             r: xev.PollError!xev.PollEvent,
         ) xev.CallbackAction {
+            forgetPollResult(c);
             _ = r catch return .rearm;
             const self = self_opt orelse return .disarm;
             if (self.halted) return halted_poll_action;
@@ -1766,6 +1767,14 @@ fn openUdpSocket(config: Config, port: u16) !struct { posix.socket_t, net.Addres
 /// is already gone, so the watch must stay for it. Kqueue's cancel is a no-op
 /// for a watch whose event already fired, so that watch must leave by itself.
 const halted_poll_action: xev.CallbackAction = if (xev.backend == .epoll) .rearm else .disarm;
+
+/// Kqueue's cancel skips a watch whose result is set, taking it to be queued
+/// for its callback. Only the callback clears it, so a watch registered on an
+/// already-readable socket would otherwise outlive the cancel in `stop()`.
+/// Safe here: the loop has already handed the result to the callback.
+fn forgetPollResult(c: *xev.Completion) void {
+    if (comptime @hasField(xev.Completion, "result")) c.result = null;
+}
 
 /// Queue the removal of `target` from `loop`, unless it is already off it.
 fn cancelCompletion(loop: *xev.Loop, target: *xev.Completion, c: *xev.Completion) void {
@@ -2577,6 +2586,7 @@ pub fn Client(comptime Handler: type) type {
             _: xev.File,
             r: xev.PollError!xev.PollEvent,
         ) xev.CallbackAction {
+            forgetPollResult(c);
             _ = r catch return .rearm;
             const self = self_opt orelse return .disarm;
             if (self.halted) return halted_poll_action;
