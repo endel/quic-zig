@@ -1527,6 +1527,17 @@ pub const Connection = struct {
     }
 
     /// A fresh NEW_TOKEN for the current peer address (RFC 9000 8.1.3).
+    /// Announces one of our CIDs, with the current Retire Prior To.
+    fn newConnectionIdFrame(self: *const Connection, e: *const LocalCidEntry) frame_mod.PendingControlFrame {
+        return .{ .new_connection_id = .{
+            .seq_num = e.seq_num,
+            .retire_prior_to = self.local_cid_pool.retire_prior_to,
+            .cid_buf = e.cid_buf,
+            .cid_len = e.cid_len,
+            .stateless_reset_token = e.stateless_reset_token,
+        } };
+    }
+
     fn newTokenFrame(self: *Connection) ?frame_mod.PendingControlFrame {
         var nt_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
         const nt_len = packet.generateNewToken(
@@ -1549,6 +1560,27 @@ pub const Connection = struct {
         }
         self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM final_size mismatch");
         return error.ProtocolViolation;
+    }
+
+    /// Charge a STREAM frame to flow control and buffer it, closing the
+    /// connection for whatever the receive side refuses.
+    fn recvStreamFrame(self: *Connection, rs: *stream_mod.ReceiveStream, offset: u64, data: []const u8, fin: bool) !void {
+        try self.chargeConnWindow(rs, offset + data.len, .stream);
+        rs.handleStreamFrame(offset, data, fin) catch |err| switch (err) {
+            error.FinalSizeError => {
+                self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
+                return error.ProtocolViolation;
+            },
+            error.TooManyChunks => {
+                self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.stream), "too many reassembly gaps");
+                return error.ProtocolViolation;
+            },
+            error.FlowControlError => {
+                self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.stream), "STREAM exceeds stream flow control limit");
+                return error.FlowControlError;
+            },
+            else => return err,
+        };
     }
 
     /// Queue retransmission for stream frames that were in a lost packet.
@@ -2021,22 +2053,7 @@ pub const Connection = struct {
                             return;
                         },
                     };
-                    try self.chargeConnWindow(&strm.recv, s.offset + s.data.len, .stream);
-                    strm.recv.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
-                        error.FinalSizeError => {
-                            self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
-                            return error.ProtocolViolation;
-                        },
-                        error.TooManyChunks => {
-                            self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.stream), "too many reassembly gaps");
-                            return error.ProtocolViolation;
-                        },
-                        error.FlowControlError => {
-                            self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.stream), "STREAM exceeds stream flow control limit");
-                            return error.FlowControlError;
-                        },
-                        else => return err,
-                    };
+                    try self.recvStreamFrame(&strm.recv, s.offset, s.data, s.fin);
                     if (s.fin) self.streams.needs_gc_scan = true;
 
                     // Check if stream is fully closed (both directions done)
@@ -2056,22 +2073,7 @@ pub const Connection = struct {
                             return;
                         },
                     };
-                    try self.chargeConnWindow(recv_strm, s.offset + s.data.len, .stream);
-                    recv_strm.handleStreamFrame(s.offset, s.data, s.fin) catch |err| switch (err) {
-                        error.FinalSizeError => {
-                            self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
-                            return error.ProtocolViolation;
-                        },
-                        error.TooManyChunks => {
-                            self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.stream), "too many reassembly gaps");
-                            return error.ProtocolViolation;
-                        },
-                        error.FlowControlError => {
-                            self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.stream), "STREAM exceeds stream flow control limit");
-                            return error.FlowControlError;
-                        },
-                        else => return err,
-                    };
+                    try self.recvStreamFrame(recv_strm, s.offset, s.data, s.fin);
 
                     // For incoming uni streams, FIN means the stream is done.
                     // A retransmitted FIN must not count against MAX_STREAMS twice.
@@ -2243,13 +2245,7 @@ pub const Connection = struct {
                     else
                         self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key);
                     if (maybe_entry) |entry| {
-                        self.pushReliable(.{ .new_connection_id = .{
-                            .seq_num = entry.seq_num,
-                            .retire_prior_to = self.local_cid_pool.retire_prior_to,
-                            .cid_buf = entry.cid_buf,
-                            .cid_len = entry.cid_len,
-                            .stateless_reset_token = entry.stateless_reset_token,
-                        } });
+                        self.pushReliable(self.newConnectionIdFrame(entry));
                         std.log.info("issued replacement NEW_CONNECTION_ID seq={d}", .{entry.seq_num});
                     }
                 }
@@ -2885,13 +2881,7 @@ pub const Connection = struct {
                             else
                                 self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key);
                             if (maybe_entry) |entry| {
-                                self.pushReliable(.{ .new_connection_id = .{
-                                    .seq_num = entry.seq_num,
-                                    .retire_prior_to = self.local_cid_pool.retire_prior_to,
-                                    .cid_buf = entry.cid_buf,
-                                    .cid_len = entry.cid_len,
-                                    .stateless_reset_token = entry.stateless_reset_token,
-                                } });
+                                self.pushReliable(self.newConnectionIdFrame(entry));
                                 std.log.info("issued NEW_CONNECTION_ID seq={d}, cid_len={d}", .{ entry.seq_num, entry.cid_len });
                             } else break; // pool full
                         }
@@ -3071,27 +3061,13 @@ pub const Connection = struct {
         {
             var stream_it = self.streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| {
-                const s: *stream_mod.Stream = s_ptr.*;
-                if (!self.pending_frames.hasRoomFor(1)) break;
-                if (s.recv.getWindowUpdate()) |new_max| {
-                    self.pending_frames.push(.{ .max_stream_data = .{
-                        .stream_id = s.stream_id,
-                        .max = new_max,
-                    } });
-                }
+                if (!self.queueWindowUpdate(&s_ptr.*.recv)) break;
             }
             // Peer-initiated uni streams carry H3 control, QPACK, WT and MoQ
             // data; without this they stall once the initial window is spent.
             var recv_it = self.streams.recv_streams.valueIterator();
             while (recv_it.next()) |rs_ptr| {
-                const rs: *stream_mod.ReceiveStream = rs_ptr.*;
-                if (!self.pending_frames.hasRoomFor(1)) break;
-                if (rs.getWindowUpdate()) |new_max| {
-                    self.pending_frames.push(.{ .max_stream_data = .{
-                        .stream_id = rs.stream_id,
-                        .max = new_max,
-                    } });
-                }
+                if (!self.queueWindowUpdate(rs_ptr.*)) break;
             }
         }
 
@@ -3120,6 +3096,17 @@ pub const Connection = struct {
             var recv_it = self.streams.recv_streams.valueIterator();
             while (recv_it.next()) |rs_ptr| self.queueStopSending(rs_ptr.*);
         }
+    }
+
+    /// MAX_STREAM_DATA for window the consumer freed. False once the queue is
+    /// full: getWindowUpdate commits the limit it returns, so it runs only
+    /// when the frame is sure to fit.
+    fn queueWindowUpdate(self: *Connection, rs: *stream_mod.ReceiveStream) bool {
+        if (!self.pending_frames.hasRoomFor(1)) return false;
+        if (rs.getWindowUpdate()) |new_max| {
+            self.pending_frames.push(.{ .max_stream_data = .{ .stream_id = rs.stream_id, .max = new_max } });
+        }
+        return true;
     }
 
     fn queueStopSending(self: *Connection, rs: *stream_mod.ReceiveStream) void {
