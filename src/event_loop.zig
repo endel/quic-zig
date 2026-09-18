@@ -1327,7 +1327,8 @@ pub fn Server(comptime Handler: type) type {
                 .processed, .dropped, .foreign => {},
             }
             self.in_callback = false;
-            self.service();
+            // One pass covers every datagram handed over this loop tick.
+            self.armWake();
         }
 
         /// Pick the correct SendBatch for a connection based on its local port.
@@ -4801,8 +4802,6 @@ const SteerWorker = struct {
         _ = r catch return .rearm;
         var item: Handed = undefined;
         while (true) {
-            // Never inject under the lock: injecting reads our socket, and
-            // what arrives there may be handed to a sibling, taking its lock.
             self.lock.lock();
             if (self.count == 0) {
                 self.lock.unlock();
