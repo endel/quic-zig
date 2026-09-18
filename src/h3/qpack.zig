@@ -474,6 +474,17 @@ fn decodeRequiredInsertCount(encoded: u64, max_entries: u64, total_insert_count:
 
 // ── QPACK Encoder (RFC 9204 §4.1) ─────────────────────────────────────
 
+/// Widest encoded field section prefix: two prefixed integers.
+const PREFIX_RESERVE: usize = 20;
+
+/// An upper bound on the encoded size of `headers`, by either encoder: a
+/// literal name and value plus two worst-case integer prefixes per line.
+pub fn maxEncodedLen(headers: []const Header) usize {
+    var n: usize = PREFIX_RESERVE;
+    for (headers) |h| n += h.name.len + h.value.len + 24;
+    return n;
+}
+
 pub const QpackEncoder = struct {
     dynamic: DynamicTable = .{},
     instruction_buf: [4096]u8 = undefined,
@@ -495,35 +506,27 @@ pub const QpackEncoder = struct {
     }
 
     /// Encode headers into a QPACK header block, using dynamic table when possible.
-    /// Returns the number of bytes written to buf.
+    /// Returns the number of bytes written to buf. A buffer of
+    /// `maxEncodedLen(headers)` bytes always suffices.
     pub fn encode(self: *QpackEncoder, headers: []const Header, buf: []u8) !usize {
         if (self.dynamic.capacity == 0) {
             // No dynamic table — use static-only encoding
             return encodeHeaders(headers, buf);
         }
 
-        var pos: usize = 0;
-        if (buf.len < 2) return error.BufferTooSmall;
-
-        // We'll fill in the RIC prefix after encoding all headers
-        // For now, track whether we used any dynamic refs
-        var used_dynamic = false;
-        const ric_start = self.dynamic.insert_count;
-
-        // Reserve space for RIC + delta base (fill later)
-        const prefix_start: usize = 0;
-        pos = 2; // minimum 2 bytes for prefix, may grow
-
-        // Encode each header
-        var field_buf: [4096]u8 = undefined;
+        // Field lines go straight into `buf` past room for the widest prefix,
+        // then slide down once the prefix length is known.
+        if (buf.len < PREFIX_RESERVE) return error.BufferTooSmall;
+        const field_buf = buf[PREFIX_RESERVE..];
         var field_pos: usize = 0;
+        var used_dynamic = false;
 
         for (headers) |h| {
             // 1. Check static table first
             if (findStaticMatch(h.name, h.value)) |smatch| {
                 if (smatch.full_match) {
                     // Indexed static: 11NNNNNN
-                    try encodeInteger(&field_buf, &field_pos, smatch.index, 6, 0xc0);
+                    try encodeInteger(field_buf, &field_pos, smatch.index, 6, 0xc0);
                     continue;
                 }
 
@@ -533,15 +536,15 @@ pub const QpackEncoder = struct {
                         // Indexed dynamic: 10NNNNNN (T=0, relative index)
                         const base = self.dynamic.insert_count;
                         const rel_idx = base - dmatch.abs_index - 1;
-                        try encodeInteger(&field_buf, &field_pos, rel_idx, 6, 0x80);
+                        try encodeInteger(field_buf, &field_pos, rel_idx, 6, 0x80);
                         used_dynamic = true;
                         continue;
                     }
                 }
 
                 // Static name match — literal with static name ref + insert to dynamic
-                try encodeInteger(&field_buf, &field_pos, smatch.index, 4, 0x50);
-                try encodeString(&field_buf, &field_pos, h.value);
+                try encodeInteger(field_buf, &field_pos, smatch.index, 4, 0x50);
+                try encodeString(field_buf, &field_pos, h.value);
 
                 // Try to insert into dynamic table + emit encoder instruction
                 self.tryInsertWithStaticNameRef(smatch.index, h.value);
@@ -554,14 +557,14 @@ pub const QpackEncoder = struct {
                 if (dmatch.full_match) {
                     // Indexed dynamic: 10NNNNNN
                     const rel_idx = base - dmatch.abs_index - 1;
-                    try encodeInteger(&field_buf, &field_pos, rel_idx, 6, 0x80);
+                    try encodeInteger(field_buf, &field_pos, rel_idx, 6, 0x80);
                     used_dynamic = true;
                     continue;
                 }
                 // Dynamic name match — literal with dynamic name ref
                 const rel_idx = base - dmatch.abs_index - 1;
-                try encodeInteger(&field_buf, &field_pos, rel_idx, 4, 0x40);
-                try encodeString(&field_buf, &field_pos, h.value);
+                try encodeInteger(field_buf, &field_pos, rel_idx, 4, 0x40);
+                try encodeString(field_buf, &field_pos, h.value);
 
                 // Try to insert with literal name
                 self.tryInsertWithLiteralName(h.name, h.value);
@@ -569,22 +572,19 @@ pub const QpackEncoder = struct {
             }
 
             // 4. No match — literal with literal name
-            try encodeInteger(&field_buf, &field_pos, h.name.len, 3, 0x20);
-            try putBytes(&field_buf, &field_pos, h.name);
-            try encodeString(&field_buf, &field_pos, h.value);
+            try encodeInteger(field_buf, &field_pos, h.name.len, 3, 0x20);
+            try putBytes(field_buf, &field_pos, h.name);
+            try encodeString(field_buf, &field_pos, h.value);
 
             // Try to insert for future use
             self.tryInsertWithLiteralName(h.name, h.value);
         }
 
-        // Now build the prefix
-        _ = prefix_start;
-        var prefix_buf: [16]u8 = undefined;
+        var prefix_buf: [PREFIX_RESERVE]u8 = undefined;
         var prefix_pos: usize = 0;
 
         if (used_dynamic) {
             const ric = self.dynamic.insert_count;
-            _ = ric_start;
             const max_entries = self.dynamic.maxEntries();
             const encoded_ric = encodeRequiredInsertCount(ric, max_entries);
             try encodeInteger(&prefix_buf, &prefix_pos, encoded_ric, 8, 0x00);
@@ -597,40 +597,33 @@ pub const QpackEncoder = struct {
             prefix_pos = 2;
         }
 
-        // Copy prefix + field lines to output
-        if (prefix_pos + field_pos > buf.len) return error.BufferTooSmall;
+        std.mem.copyForwards(u8, buf[prefix_pos..][0..field_pos], field_buf[0..field_pos]);
         @memcpy(buf[0..prefix_pos], prefix_buf[0..prefix_pos]);
-        @memcpy(buf[prefix_pos..][0..field_pos], field_buf[0..field_pos]);
-        pos = prefix_pos + field_pos;
-
-        return pos;
+        return prefix_pos + field_pos;
     }
 
     /// Try to insert an entry with a static name reference.
     /// Emits "Insert with Name Reference" encoder instruction.
     fn tryInsertWithStaticNameRef(self: *QpackEncoder, static_idx: u8, value: []const u8) void {
-        self.dynamic.insert(static_table[static_idx].name, value) catch return;
-
-        // Encoder instruction: 1TNNNNNN — T=1 for static, 6-bit index
+        // Stage the instruction first: an entry the peer never hears about
+        // turns every later reference to it into a decode failure.
         var pos = self.instruction_len;
-        if (pos + 2 + value.len + 8 > self.instruction_buf.len) return;
         encodeInteger(&self.instruction_buf, &pos, static_idx, 6, 0xc0) catch return;
         encodeString(&self.instruction_buf, &pos, value) catch return;
+        self.dynamic.insert(static_table[static_idx].name, value) catch return;
         self.instruction_len = pos;
     }
 
     /// Try to insert an entry with a literal name.
     /// Emits "Insert with Literal Name" encoder instruction.
     fn tryInsertWithLiteralName(self: *QpackEncoder, name: []const u8, value: []const u8) void {
-        self.dynamic.insert(name, value) catch return;
-
-        // Encoder instruction: 01NNNNNN — 5-bit name length prefix with H=0
+        // Stage the instruction first; see tryInsertWithStaticNameRef.
         var pos = self.instruction_len;
-        if (pos + 2 + name.len + value.len + 16 > self.instruction_buf.len) return;
         // 01HXXXXX — H=0 (no Huffman), 5-bit name length
         encodeInteger(&self.instruction_buf, &pos, name.len, 5, 0x40) catch return;
         putBytes(&self.instruction_buf, &pos, name) catch return;
         encodeString(&self.instruction_buf, &pos, value) catch return;
+        self.dynamic.insert(name, value) catch return;
         self.instruction_len = pos;
     }
 
@@ -1710,4 +1703,52 @@ test "an encoder-stream Duplicate copies an entry out of the arena it writes to"
         try testing.expectEqualStrings("value", newest.value);
     }
     try testing.expectEqual(@as(u64, 5), dec.dynamic.insert_count);
+}
+
+test "QpackEncoder: header blocks past 4 KiB round-trip" {
+    var encoder = QpackEncoder{};
+    encoder.setCapacity(4096);
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+
+    var headers: [100]Header = undefined;
+    headers[0] = .{ .name = ":status", .value = "200" };
+    headers[1] = .{ .name = "cookie", .value = "a" ** 6000 };
+    headers[2] = .{ .name = "set-cookie", .value = "b" ** 3000 };
+    for (headers[3..]) |*h| h.* = .{ .name = "x-filler", .value = "some value" };
+
+    const buf = try testing.allocator.alloc(u8, maxEncodedLen(&headers));
+    defer testing.allocator.free(buf);
+    const len = try encoder.encode(&headers, buf);
+    try testing.expect(len > 9000);
+
+    try decoder.processEncoderInstruction(encoder.getInstructions());
+    var decoded: [128]Header = undefined;
+    const count = try decoder.decode(buf[0..len], &decoded, &test_scratch, 0);
+    try testing.expectEqual(headers.len, count);
+    for (headers, decoded[0..count]) |want, got| {
+        try testing.expectEqualStrings(want.name, got.name);
+        try testing.expectEqualStrings(want.value, got.value);
+    }
+}
+
+test "QpackEncoder: an entry is inserted only along with its instruction" {
+    // Three ~1.5 KB insertions overflow the 4 KB instruction buffer. An entry
+    // the peer never hears of makes any later reference to it undecodable.
+    var encoder = QpackEncoder{};
+    encoder.setCapacity(4096);
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    try decoder.processEncoderInstruction(encoder.getInstructions());
+
+    const headers = [_]Header{
+        .{ .name = "x-a", .value = "a" ** 1500 },
+        .{ .name = "x-b", .value = "b" ** 1500 },
+        .{ .name = "x-c", .value = "c" ** 1500 },
+    };
+    var buf: [8192]u8 = undefined;
+    _ = try encoder.encode(&headers, &buf);
+
+    try decoder.processEncoderInstruction(encoder.getInstructions());
+    try testing.expectEqual(encoder.dynamic.insert_count, decoder.dynamic.insert_count);
 }

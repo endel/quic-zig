@@ -122,6 +122,43 @@ pub fn main() !void {
 }
 ```
 
+### Streaming HTTP/3 responses
+
+An `.h3` server — or a `.webtransport` one, which also takes ordinary requests
+alongside Extended CONNECT — can answer a request in pieces, from any later
+callback on the same loop:
+
+```zig
+pub fn onRequest(self: *MyHandler, session: *event_loop.Session, stream_id: u64, headers: []const qpack.Header) void {
+    session.sendResponseHeaders(stream_id, &.{.{ .name = ":status", .value = "200" }}) catch return;
+    self.pending = .{ .session = session.*, .stream_id = stream_id }; // write the body later
+}
+
+// Later, e.g. from a TCP read callback on the same xev loop:
+try s.sendResponseData(stream_id, chunk);         // one DATA frame
+try s.finishResponse(stream_id, null);            // optional trailers, then FIN
+s.resetRequest(stream_id, @intFromEnum(event_loop.H3Error.internal_error)); // or abort
+```
+
+Pace a large body with `streamSendCapacity(stream_id)` and
+`streamBufferedBytes(stream_id)`, and `notifyWritable(0, stream_id, n)` to get
+`onWritable` once `n` more bytes fit and fewer than `n` wait unsent. Writes made
+outside a server callback go out on the next loop iteration by themselves;
+`server.flush()` sends them at once.
+
+Server lifecycle callbacks, all optional: `onRequest`, `onData`,
+`onRequestEnd(session, stream_id)` (request body complete),
+`onRequestCancelled(session, stream_id, error_code)` (peer RESET_STREAM or
+STOP_SENDING), and `onConnectionClosed(session)` — called once per connection,
+after which its `Session`/`ConnEntry` must not be used. `session.id()` is a
+stable per-connection key.
+
+To run beside other I/O, pass `Config.loop` (a `event_loop.Xev.Loop` you own)
+and run it yourself; on teardown call `stop()` and keep running the loop until
+`isStopped()` before `deinit()`. `Client` works the same way. `reuse_port`,
+`recv_buffer_size`, `send_buffer_size`, `max_connections` and `alpn` are on
+`Config` too.
+
 ### Serving static files over HTTPS (HTTP/1.1+TLS)
 
 The server can optionally serve static files over HTTP/1.1+TLS on the same port

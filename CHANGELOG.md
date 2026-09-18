@@ -13,12 +13,40 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   certificate by SNI, and can resume sessions from tickets.
 - A QUIC server can serve several certificates and pick one by SNI, via
   `TlsConfig.certs`.
+- `Server` can join an event loop you own through `Config.loop`, next to your
+  own sockets, timers and `Client`s. `stop()` then leaves the loop running, and
+  `isStopped()` says when `deinit()` is safe; `Client` gained the same
+  `isStopped()`, so one of several clients on a loop can be torn down alone.
+- HTTP/3 responses can be streamed: `sendResponseHeaders` (repeatable for 1xx),
+  `sendResponseData`, `finishResponse` with optional trailers, and
+  `resetRequest` to abort. `notifyWritable` and `streamBufferedBytes` now work
+  on request streams, so a body can be paced against the peer.
+- New optional server callbacks: `onRequestEnd` when a request body is
+  complete, `onRequestCancelled` when the peer resets the request or stops the
+  response, and `onConnectionClosed` once per connection before it is freed.
+  `Session.id()` gives each connection a stable key.
+- A `.webtransport` server also serves ordinary HTTP/3 requests through
+  `onRequest` / `onData` / `onRequestEnd`, so one listener can do both.
+- `Config.reuse_port`, `recv_buffer_size` / `send_buffer_size`,
+  `max_connections` (default still 256) and `alpn`.
+- Writes made outside a `Server` or `Client` callback — from a TCP callback on
+  a shared loop, say — are sent on the next loop iteration without calling
+  `flush()`.
 
 ### Fixed
 
 - A MoQ relay now answers a subscriber that arrived before its publisher as
   soon as the publisher sends PUBLISH, instead of leaving it to wait out its
   rendezvous timeout. [#34](https://github.com/endel/quic-zig/pull/34)
+- HTTP/3 header sets over 4 KiB (large cookies) failed to encode; there is no
+  fixed limit now, and up to 128 headers are accepted instead of 64.
+- A QPACK dynamic-table entry could be added without the instruction that
+  tells the peer about it, leaving later header blocks undecodable.
+- An HTTP/3 body larger than one poll's worth could stall on the event-loop
+  client and server until the next packet arrived, and a response could lose
+  its tail once the stream was reclaimed.
+- Rescheduling a server or client timer right as it fired could corrupt
+  libxev's queue when the loop is run blocking (`.once`, `.until_done`).
 
 ## 0.5.0
 

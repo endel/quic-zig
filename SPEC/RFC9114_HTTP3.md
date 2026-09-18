@@ -59,7 +59,12 @@ HTTP-client concern rather than an H3 protocol concern and is deferred.
 - Requests: `sendRequest(headers, body)` opens a bidi stream, encodes
   HEADERS via QPACK, optionally writes a DATA frame, then FINs.
 - Responses: `sendResponse(stream_id, headers, body)` writes HEADERS +
-  optional DATA + FIN on the request stream.
+  optional DATA + FIN on the request stream. Streamed form:
+  `sendResponseHeaders` (repeatable, for 1xx), `sendResponseData` (one DATA
+  frame per call; empty is a no-op), `finishResponse(stream_id, trailers)`.
+  Header blocks of any size are encoded (heap buffer past 4 KiB).
+- `notifyWritable(stream_id, n)` yields one `writable` event once `n` more
+  bytes fit the peer's credit and fewer than `n` sit unsent.
 - Incoming: `poll()` returns `headers` / `data` / `finished` /
   `request_cancelled` events. Body bytes are read via `recvBody(buf)`;
   `poll()` does not advance past a stream with a pending body.
@@ -70,7 +75,9 @@ HTTP-client concern rather than an H3 protocol concern and is deferred.
   `STOP_SENDING` with the given H3 error code.
 - `rejectRequest(stream_id)`: shortcut that uses `H3_REQUEST_REJECTED`.
 - Peer-initiated cancellation is surfaced as a `request_cancelled` event
-  (stream_id + peer error code) after any buffered frames are drained.
+  (stream_id + peer error code) after any buffered frames are drained —
+  RESET_STREAM on the request, or (server) STOP_SENDING on the response,
+  including after the request is complete. Reported once per stream.
 
 ## §4.2 HTTP Fields — ✅ Done (via QPACK)
 
@@ -289,9 +296,11 @@ Informational.
   present; header blocks that reference not-yet-inserted entries would
   need blocked-stream bookkeeping which is not implemented. This is
   only visible if a peer actually emits out-of-order header blocks.
-- **Decoded header count per frame capped at `MAX_HEADERS = 64`**
-  (connection.zig:72). Over-large header lists return
-  `error.TooManyHeaders` from QPACK and close the connection.
+- **Decoded header count per frame capped at `MAX_HEADERS = 128`**,
+  and decoded names + values at `qpack.SCRATCH_SIZE` (16 KiB). Over-large
+  header lists close the connection with QPACK_DECOMPRESSION_FAILED.
+- **Request trailers** arrive as a second `headers` event on the stream;
+  the event loop hands them to `onRequest` again.
 - **`huffman_scratch`**: qpack.zig uses a 16 KiB file-scope scratch
   buffer for decoded field values. Not safe across concurrent decoder
   instances on the same thread.

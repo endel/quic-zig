@@ -370,7 +370,7 @@ fn pollH3Server(h3c: *h3.H3Connection, alloc: std.mem.Allocator, www_dir: []cons
                         var sink: [4096]u8 = undefined;
                         while (h3c.recvBody(&sink) > 0) {}
                     },
-            .settings, .finished, .goaway, .connect_request, .shutdown_complete, .request_cancelled => {},
+            .settings, .finished, .goaway, .connect_request, .shutdown_complete, .request_cancelled, .writable => {},
         }
     }
 }

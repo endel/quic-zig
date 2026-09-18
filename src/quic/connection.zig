@@ -3896,6 +3896,14 @@ pub const Connection = struct {
         return @min(ss.sendCredit(), self.sendCapacity());
     }
 
+    /// Bytes written to the stream but not yet sent, whatever holds them back.
+    /// Null for a stream we cannot send on.
+    pub fn streamBufferedBytes(self: *const Connection, stream_id: u64) ?u64 {
+        const ss = self.streams.getSendStream(stream_id) orelse return null;
+        if (ss.reset_err != null) return 0;
+        return ss.write_offset -| ss.send_offset;
+    }
+
     pub fn isDatagramSendQueueFull(self: *const Connection) bool {
         return self.datagram_send_queue.isFull();
     }

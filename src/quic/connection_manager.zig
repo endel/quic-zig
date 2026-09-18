@@ -47,9 +47,14 @@ pub const CidKeyContext = struct {
 ///
 /// Every protocol layer is a pointer, not a value: a raw-QUIC connection
 /// would otherwise pay for the H3 and WebTransport state it never touches,
-/// and the table is sized for MAX_CONNECTIONS of them.
+/// and the table holds up to `max_connections` of them.
+///
+/// Heap-allocated, so its address is stable from `acceptConnection` until
+/// `freeDeadEntries` releases it.
 pub const ConnEntry = struct {
     conn: *connection.Connection,
+    /// Unique per manager, never reused.
+    id: u64 = 0,
     h3_conn: ?*h3.H3Connection = null,
     h3_initialized: bool = false,
     h0_conn: ?*h0.H0Connection = null,
@@ -58,6 +63,11 @@ pub const ConnEntry = struct {
     /// Type-erased handler pointer for zero-copy datagram callback.
     datagram_handler_ctx: ?*anyopaque = null,
 
+    /// Called when something queued data on this connection, so the owner can
+    /// send it without waiting for its next I/O event.
+    wake_fn: ?*const fn (ctx: *anyopaque) void = null,
+    wake_ctx: ?*anyopaque = null,
+
     // For raw QUIC protocol: track streams whose fin has been delivered to handler
     finished_streams: std.AutoHashMapUnmanaged(u64, void) = .{},
 
@@ -65,6 +75,11 @@ pub const ConnEntry = struct {
     // Max 8 from LocalCidPool + 1 initial client DCID = 9.
     registered_cids: [9]CidKey = .{CidKey{}} ** 9,
     registered_cid_count: u8 = 0,
+
+    /// Tell the owner there is data to send; see `wake_fn`.
+    pub fn wake(self: *ConnEntry) void {
+        if (self.wake_fn) |f| f(self.wake_ctx orelse return);
+    }
 
     fn addRegisteredCid(self: *ConnEntry, key: CidKey) void {
         if (self.registered_cid_count < 9) {
@@ -130,9 +145,13 @@ pub fn destroyProtocols(
 
 /// Manages multiple QUIC connections, routing packets by DCID.
 pub const ConnectionManager = struct {
-    const MAX_CONNECTIONS = 256;
+    pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
     allocator: Allocator,
+
+    /// New connections past this many live ones are refused.
+    max_connections: usize = DEFAULT_MAX_CONNECTIONS,
+    next_entry_id: u64 = 1,
     cid_map: std.HashMap(CidKey, *ConnEntry, CidKeyContext, 80),
     entries: std.ArrayList(*ConnEntry),
 
@@ -148,8 +167,9 @@ pub const ConnectionManager = struct {
 
     // Deferred free queue: entries invalidated by removeConnection are held
     // here until freeDeadEntries() is called after all event processing.
-    dead_entries_buf: [MAX_CONNECTIONS]DeadEntry = undefined,
-    dead_entry_count: usize = 0,
+    // acceptConnection reserves a slot for every entry it creates, so
+    // removeConnection can never fail to queue one.
+    dead_entries: std.ArrayList(DeadEntry) = .empty,
 
     pub fn init(
         allocator: Allocator,
@@ -182,6 +202,7 @@ pub const ConnectionManager = struct {
             self.allocator.destroy(entry);
         }
         self.entries.deinit(self.allocator);
+        self.dead_entries.deinit(self.allocator);
         self.cid_map.deinit();
     }
 
@@ -201,9 +222,14 @@ pub const ConnectionManager = struct {
         odcid: ?[]const u8,
         retry_scid: ?[]const u8,
     ) !*ConnEntry {
-        if (self.entries.items.len >= MAX_CONNECTIONS) {
+        if (self.entries.items.len >= self.max_connections) {
             return error.TooManyConnections;
         }
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        try self.dead_entries.ensureTotalCapacity(
+            self.allocator,
+            self.entries.items.len + self.dead_entries.items.len + 1,
+        );
 
         // Heap-allocate Connection, then build it in place: the by-value
         // accept() would stage all ~185 KB on the stack first.
@@ -223,20 +249,24 @@ pub const ConnectionManager = struct {
         );
 
         // Create entry
+        errdefer conn.deinit();
         const entry = try self.allocator.create(ConnEntry);
-        entry.* = .{ .conn = conn };
+        errdefer self.allocator.destroy(entry);
+        entry.* = .{ .conn = conn, .id = self.next_entry_id };
+        self.next_entry_id += 1;
 
         // Register server's SCID in the routing map
         const scid_key = CidKey.fromSlice(conn.scid[0..conn.scid_len]);
         try self.cid_map.put(scid_key, entry);
         entry.addRegisteredCid(scid_key);
+        errdefer _ = self.cid_map.remove(scid_key);
 
         // Also register the client's initial DCID so retransmitted Initials route correctly
         const client_dcid_key = CidKey.fromSlice(header.dcid);
         try self.cid_map.put(client_dcid_key, entry);
         entry.addRegisteredCid(client_dcid_key);
 
-        try self.entries.append(self.allocator, entry);
+        self.entries.appendAssumeCapacity(entry);
 
         return entry;
     }
@@ -299,23 +329,26 @@ pub const ConnectionManager = struct {
             }
         }
 
-        // Queue for deferred free (entry memory stays valid until freeDeadEntries)
-        self.dead_entries_buf[self.dead_entry_count] = dead;
-        self.dead_entry_count = @min(self.dead_entry_count + 1, self.dead_entries_buf.len);
+        // Queue for deferred free (entry memory stays valid until freeDeadEntries).
+        // Never allocates for an entry acceptConnection made; only one added
+        // by hand can hit OOM here, and freeing it now beats leaking it.
+        self.dead_entries.append(self.allocator, dead) catch self.freeDead(dead);
     }
 
     /// Free entries that were invalidated by removeConnection.
     /// Call after all event processing is complete for the current cycle.
     pub fn freeDeadEntries(self: *ConnectionManager) void {
-        for (self.dead_entries_buf[0..self.dead_entry_count]) |dead| {
-            destroyProtocols(self.allocator, dead.wt_conn, dead.h3_conn, dead.h0_conn);
-            const entry = dead.entry;
-            entry.finished_streams.deinit(self.allocator);
-            entry.conn.deinit();
-            self.allocator.destroy(entry.conn);
-            self.allocator.destroy(entry);
-        }
-        self.dead_entry_count = 0;
+        for (self.dead_entries.items) |dead| self.freeDead(dead);
+        self.dead_entries.clearRetainingCapacity();
+    }
+
+    fn freeDead(self: *ConnectionManager, dead: DeadEntry) void {
+        destroyProtocols(self.allocator, dead.wt_conn, dead.h3_conn, dead.h0_conn);
+        const entry = dead.entry;
+        entry.finished_streams.deinit(self.allocator);
+        entry.conn.deinit();
+        self.allocator.destroy(entry.conn);
+        self.allocator.destroy(entry);
     }
 
     /// Result of processing a received UDP datagram.
@@ -546,5 +579,43 @@ test "removeConnection detaches the protocol layers, freeDeadEntries frees them"
 
     // Freed only here — testing.allocator fails the test if either layer,
     // or the hash maps they own, is left behind.
+    mgr.freeDeadEntries();
+}
+
+test "max_connections is configurable past 256, and every removed entry is freed" {
+    const alloc = std.testing.allocator;
+    const tls_config: tls13.TlsConfig = .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &.{},
+    };
+    var mgr = ConnectionManager.init(alloc, tls_config, .{}, .{0} ** 16, .{0} ** 16);
+    defer mgr.deinit();
+    mgr.max_connections = 300;
+
+    const local = std.mem.zeroes(posix.sockaddr.storage);
+    var dcids: [301][8]u8 = undefined;
+    const scid = [_]u8{0xaa} ** 8;
+    for (&dcids, 0..) |*d, i| {
+        std.mem.writeInt(u64, d, i + 1, .big);
+        const header: packet.Header = .{
+            .version = protocol.SUPPORTED_VERSIONS[0],
+            .packet_type = .initial,
+            .dcid = d,
+            .scid = &scid,
+        };
+        const accepted = mgr.acceptConnection(header, local, local, null, null);
+        if (i < 300) {
+            const e = try accepted;
+            try std.testing.expect(e.id != 0);
+        } else {
+            try std.testing.expectError(error.TooManyConnections, accepted);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 300), mgr.connectionCount());
+
+    // All at once, in one cycle: more than a fixed 256-slot queue would hold.
+    while (mgr.entries.items.len > 0) mgr.removeConnection(mgr.entries.items[0]);
+    try std.testing.expectEqual(@as(usize, 300), mgr.dead_entries.items.len);
     mgr.freeDeadEntries();
 }
