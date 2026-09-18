@@ -45,25 +45,30 @@ pub const FrameSorter = struct {
     pub const Chunk = struct {
         offset: u64,
         data: []const u8,
-        /// Size of the allocation behind `data` when it was grown in place;
-        /// zero when it is exactly `data`.
-        cap: usize = 0,
+        /// The allocation behind `data` when it has room to grow at either
+        /// end; empty when it is exactly `data`.
+        buf: []u8 = &.{},
 
         fn end(self: Chunk) u64 {
             return self.offset + self.data.len;
         }
 
         fn allocation(self: Chunk) []u8 {
-            return @constCast(self.data.ptr)[0..@max(self.cap, self.data.len)];
+            return if (self.buf.len > 0) self.buf else @constCast(self.data);
+        }
+
+        /// Room in front of `data`.
+        fn head(self: Chunk) usize {
+            return @intFromPtr(self.data.ptr) - @intFromPtr(self.allocation().ptr);
         }
     };
 
     /// A piece that abuts a neighbouring chunk is merged into it up to this
     /// size instead of kept on its own. Unread contiguous data — a paused
     /// consumer, a window's worth in flight, reordered or not — then costs a
-    /// handful of chunks rather than one per frame. The ceiling bounds what a
-    /// merge copies: adjacent chunks always sum past it, so a contiguous run
-    /// of n bytes holds at most 2n / MAX_COALESCED + 1 chunks.
+    /// handful of chunks rather than one per frame: adjacent chunks always
+    /// sum past it, so a contiguous run of n bytes holds at most
+    /// 2n / MAX_COALESCED + 1 chunks.
     const MAX_COALESCED: usize = 64 * 1024;
 
     allocator: Allocator,
@@ -242,12 +247,11 @@ pub const FrameSorter = struct {
                 continue;
             }
 
-            // Existing covers our tail: keep only the part beyond us.
+            // Existing covers our tail: keep it, and only our part before it.
+            // Cutting ours costs nothing; cutting it would copy up to a whole
+            // chunk per frame.
             if (existing.offset < new_end and existing.end() > new_end) {
-                const suffix_start: usize = @intCast(new_end - existing.offset);
-                const owned_suffix = try self.allocator.dupe(u8, existing.data[suffix_start..]);
-                self.allocator.free(existing.allocation());
-                self.chunks.items[i] = .{ .offset = new_end, .data = owned_suffix };
+                effective_data = effective_data[0..@intCast(existing.offset - effective_offset)];
                 break;
             }
 
@@ -276,34 +280,35 @@ pub const FrameSorter = struct {
     /// abuts while the result stays within MAX_COALESCED. Filling a hole
     /// joins the runs on both sides, so the chunk count tracks real holes
     /// rather than the order frames happened to arrive in.
+    ///
+    /// The smaller side is copied into the larger, which grows at either end,
+    /// so a merge costs about what it adds: a hole filled a byte at a time
+    /// from the back does not recopy the chunk behind it for each byte.
     fn insertMerged(self: *FrameSorter, i: usize, offset: u64, data: []const u8) !void {
         const items = self.chunks.items;
         const end = offset + data.len;
-        const prev: ?*Chunk = if (i > 0 and items[i - 1].end() == offset) &items[i - 1] else null;
+        const prev: ?*Chunk = if (i > 0 and items[i - 1].end() == offset and
+            items[i - 1].data.len + data.len <= MAX_COALESCED) &items[i - 1] else null;
         const next: ?*Chunk = if (i < items.len and items[i].offset == end) &items[i] else null;
 
         if (prev) |p| {
-            if (p.data.len + data.len <= MAX_COALESCED) {
+            const n = next orelse return self.growChunk(p, data);
+            if (p.data.len + data.len + n.data.len > MAX_COALESCED) return self.growChunk(p, data);
+            if (p.data.len >= n.data.len) {
                 try self.growChunk(p, data);
-                if (next) |n| {
-                    if (p.data.len + n.data.len <= MAX_COALESCED) {
-                        try self.growChunk(p, n.data);
-                        self.allocator.free(n.allocation());
-                        _ = self.chunks.orderedRemove(i);
-                    }
-                }
-                return;
+                try self.growChunk(p, n.data);
+                self.allocator.free(n.allocation());
+                _ = self.chunks.orderedRemove(i);
+            } else {
+                try self.prependChunk(n, data);
+                try self.prependChunk(n, p.data);
+                self.allocator.free(p.allocation());
+                _ = self.chunks.orderedRemove(i - 1);
             }
+            return;
         }
         if (next) |n| {
-            if (data.len + n.data.len <= MAX_COALESCED) {
-                const buf = try self.allocator.alloc(u8, data.len + n.data.len);
-                @memcpy(buf[0..data.len], data);
-                @memcpy(buf[data.len..], n.data);
-                self.allocator.free(n.allocation());
-                n.* = .{ .offset = offset, .data = buf };
-                return;
-            }
+            if (data.len + n.data.len <= MAX_COALESCED) return self.prependChunk(n, data);
         }
         const owned = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(owned);
@@ -312,16 +317,40 @@ pub const FrameSorter = struct {
 
     /// Append `bytes` to `c`, doubling its allocation as needed.
     fn growChunk(self: *FrameSorter, c: *Chunk, bytes: []const u8) !void {
+        const head = c.head();
         const len = c.data.len;
-        const need = len + bytes.len;
+        const need = head + len + bytes.len;
         var buf = c.allocation();
         if (need > buf.len) {
-            const new_cap = @min(@max(need, buf.len * 2), MAX_COALESCED);
+            const new_cap = @min(@max(need, buf.len * 2), head + MAX_COALESCED);
             buf = try self.allocator.realloc(buf, new_cap);
         }
-        @memcpy(buf[len..need], bytes);
-        c.data = buf[0..need];
-        c.cap = buf.len;
+        @memcpy(buf[head + len .. need], bytes);
+        c.data = buf[head..need];
+        c.buf = buf;
+    }
+
+    /// Put `bytes` in front of `c`, doubling the room there as needed.
+    fn prependChunk(self: *FrameSorter, c: *Chunk, bytes: []const u8) !void {
+        const head = c.head();
+        const len = c.data.len;
+        var buf = c.allocation();
+        var start: usize = undefined;
+        if (bytes.len <= head) {
+            start = head - bytes.len;
+        } else {
+            const total = bytes.len + len;
+            const size = @min(2 * total, MAX_COALESCED);
+            const grown = try self.allocator.alloc(u8, size);
+            start = size - total;
+            @memcpy(grown[start + bytes.len ..][0..len], c.data);
+            self.allocator.free(buf);
+            buf = grown;
+        }
+        @memcpy(buf[start..][0..bytes.len], bytes);
+        c.offset -= bytes.len;
+        c.data = buf[start..][0 .. bytes.len + len];
+        c.buf = buf;
     }
 
     /// Pop the next contiguous chunk of data from the read position.
@@ -339,7 +368,7 @@ pub const FrameSorter = struct {
         const skip: usize = @intCast(self.read_pos - first.offset);
         const readable = first.data[skip..];
         // The caller frees what we return, so it must be a whole allocation.
-        const owned = if (skip == 0 and first.cap <= first.data.len)
+        const owned = if (skip == 0 and first.allocation().len == first.data.len)
             first.data
         else blk: {
             const copy = self.allocator.dupe(u8, readable) catch {
@@ -1907,6 +1936,48 @@ test "FrameSorter: unread in-order data coalesces instead of hitting the gap cap
         testing.allocator.free(chunk);
     }
     try testing.expectEqual(n * 2, got);
+}
+
+test "FrameSorter: filling holes from the back costs what it adds" {
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var sorter = FrameSorter.init(counting.allocator());
+    defer sorter.deinit();
+    var pattern: [FrameSorter.MAX_COALESCED]u8 = undefined;
+    for (&pattern, 0..) |*b, o| b.* = @intCast(o % 251);
+
+    // A ladder of 1-byte holes in front of a large chunk, filled back to
+    // front: each fill joins a rung to the chunk behind it.
+    const rungs: usize = 500;
+    const big = FrameSorter.MAX_COALESCED - 2 * rungs - 8;
+    try sorter.push(2 * rungs, pattern[2 * rungs ..][0..big], false);
+    for (0..rungs) |j| try sorter.push(2 * j, pattern[2 * j ..][0..1], false);
+    var j: usize = rungs;
+    while (j > 0) {
+        j -= 1;
+        try sorter.push(2 * j + 1, pattern[2 * j + 1 ..][0..1], false);
+    }
+    try testing.expectEqual(@as(usize, 0), sorter.holes());
+
+    // Then a run a byte at a time, backwards, each in front of what came before.
+    const run_start = 2 * rungs + big;
+    const n: usize = 3 * FrameSorter.MAX_COALESCED;
+    var k: usize = run_start + n;
+    while (k > run_start + 1) {
+        k -= 1;
+        try sorter.push(k, &.{@intCast(k % 251)}, false);
+    }
+    try sorter.push(run_start, &.{@intCast(run_start % 251)}, false);
+
+    // Copying the chunk for every byte would take gigabytes.
+    try testing.expect(counting.allocated_bytes < 8 * (run_start + n));
+
+    var got: usize = 0;
+    while (sorter.pop()) |chunk| {
+        for (chunk, got..) |v, o| try testing.expectEqual(@as(u8, @intCast(o % 251)), v);
+        got += chunk.len;
+        counting.allocator().free(chunk);
+    }
+    try testing.expectEqual(run_start + n, got);
 }
 
 test "FrameSorter: a paused stream under jittered reordering keeps only its real gaps" {
