@@ -71,6 +71,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   its tail once the stream was reclaimed.
 - Rescheduling a server or client timer right as it fired could corrupt
   libxev's queue when the loop is run blocking (`.once`, `.until_done`).
+- A paused stream (WebTransport `pauseStream`, HTTP/3 `pauseRequestBody`)
+  receiving over a path that reorders packets no longer has its connection
+  closed with "too many reassembly gaps".
 - A peer can no longer send past a stream's flow-control window; it now gets
   FLOW_CONTROL_ERROR instead of having the server buffer whatever it sends.
 - Peer-opened unidirectional streams (HTTP/3 control, WebTransport, MoQ)

@@ -58,10 +58,12 @@ pub const FrameSorter = struct {
         }
     };
 
-    /// In-order data grows the newest chunk up to this size instead of
-    /// adding one per frame. Unread in-order data — a paused consumer, a
-    /// window's worth in flight — then costs a handful of chunks rather than
-    /// one per frame, which the reassembly cap would count as holes.
+    /// A piece that abuts a neighbouring chunk is merged into it up to this
+    /// size instead of kept on its own. Unread contiguous data — a paused
+    /// consumer, a window's worth in flight, reordered or not — then costs a
+    /// handful of chunks rather than one per frame. The ceiling bounds what a
+    /// merge copies: adjacent chunks always sum past it, so a contiguous run
+    /// of n bytes holds at most 2n / MAX_COALESCED + 1 chunks.
     const MAX_COALESCED: usize = 64 * 1024;
 
     allocator: Allocator,
@@ -81,6 +83,11 @@ pub const FrameSorter = struct {
     /// Highest byte offset ever buffered. Maintained incrementally to avoid
     /// scanning all chunks on every push().
     highest_buffered: u64 = 0,
+
+    /// Neighbouring chunks that do not abut: the holes between them. The
+    /// reassembly cap is on holes, not chunks, since contiguous data costs
+    /// chunks too (see MAX_COALESCED).
+    breaks: usize = 0,
 
     pub fn init(allocator: Allocator) FrameSorter {
         return .{
@@ -105,10 +112,45 @@ pub const FrameSorter = struct {
         return lo;
     }
 
+    /// Holes in the buffered data: between chunks, plus the one in front of
+    /// the first chunk when it starts past `read_pos`.
+    pub fn holes(self: *const FrameSorter) usize {
+        const items = self.chunks.items;
+        return self.breaks + @intFromBool(items.len > 0 and items[0].offset > self.read_pos);
+    }
+
     /// RFC 9000 21.7: a peer that withholds every other byte pins one chunk
     /// per hole, so the tracking structure needs a ceiling of its own.
-    fn reserveChunk(self: *const FrameSorter) error{TooManyChunks}!void {
-        if (self.chunks.items.len >= limits.max_reassembly_chunks) return error.TooManyChunks;
+    fn checkHoles(self: *const FrameSorter) error{TooManyChunks}!void {
+        if (self.holes() > limits.max_reassembly_chunks) return error.TooManyChunks;
+    }
+
+    /// Chunks are non-empty, sorted, disjoint, at or past `read_pos`, and
+    /// `breaks` matches a full recount. For tests and the fuzzer.
+    pub fn isConsistent(self: *const FrameSorter) bool {
+        const items = self.chunks.items;
+        var n: usize = 0;
+        for (items, 0..) |c, k| {
+            if (c.data.len == 0 or c.offset < self.read_pos) return false;
+            if (c.end() > self.highest_buffered) return false;
+            if (k > 0) {
+                if (items[k - 1].end() > c.offset) return false;
+                if (items[k - 1].end() != c.offset) n += 1;
+            }
+        }
+        return n == self.breaks;
+    }
+
+    /// Breaks between chunks from `from` through the last chunk starting at or
+    /// before `upto`.
+    fn breaksIn(self: *const FrameSorter, from: usize, upto: u64) usize {
+        const items = self.chunks.items;
+        var n: usize = 0;
+        var m = from + 1;
+        while (m < items.len and items[m].offset <= upto) : (m += 1) {
+            if (items[m - 1].end() != items[m].offset) n += 1;
+        }
+        return n;
     }
 
     /// Return the highest byte offset buffered (or read_pos if no chunks).
@@ -150,6 +192,7 @@ pub const FrameSorter = struct {
         // or beyond the highest byte ever buffered. It cannot overlap an
         // existing chunk, and sorts after every one already held.
         if (effective_offset >= self.highest_buffered) {
+            var gap = false;
             if (self.chunks.items.len > 0) {
                 const last = &self.chunks.items[self.chunks.items.len - 1];
                 if (last.end() == effective_offset and last.data.len + effective_data.len <= MAX_COALESCED) {
@@ -157,12 +200,14 @@ pub const FrameSorter = struct {
                     self.highest_buffered = last.end();
                     return;
                 }
+                gap = last.end() != effective_offset;
             }
-            try self.reserveChunk();
+            if (gap) try self.checkHolesPlusOne();
             const owned = try self.allocator.dupe(u8, effective_data);
             errdefer self.allocator.free(owned);
             try self.chunks.append(self.allocator, .{ .offset = effective_offset, .data = owned });
             self.highest_buffered = effective_offset + owned.len;
+            if (gap) self.breaks += 1;
             return;
         }
 
@@ -170,6 +215,17 @@ pub const FrameSorter = struct {
         // chunk ending past us can overlap this data.
         const new_end = effective_offset + effective_data.len;
         var i = self.lowerBound(effective_offset);
+
+        // Everything this push can change lies between the chunk before the
+        // overlap and the first one starting past it; recount breaks there.
+        const span_lo: u64 = if (i > 0) self.chunks.items[i - 1].offset else effective_offset;
+        const span_hi: u64 = blk: {
+            var k = i;
+            while (k < self.chunks.items.len and self.chunks.items[k].offset <= new_end) k += 1;
+            break :blk if (k < self.chunks.items.len) self.chunks.items[k].offset else std.math.maxInt(u64);
+        };
+        const breaks_before = self.breaksIn(self.lowerBound(span_lo), span_hi);
+
         while (i < self.chunks.items.len and self.chunks.items[i].offset < new_end) {
             const existing = self.chunks.items[i];
 
@@ -200,13 +256,58 @@ pub const FrameSorter = struct {
             _ = self.chunks.orderedRemove(i);
         }
 
-        try self.reserveChunk();
-        const owned = try self.allocator.dupe(u8, effective_data);
-        errdefer self.allocator.free(owned);
-        try self.chunks.insert(self.allocator, i, .{ .offset = effective_offset, .data = owned });
+        const inserted = self.insertMerged(i, effective_offset, effective_data);
 
-        const end_offset = effective_offset + owned.len;
+        // Recount even on failure: a merge can fail halfway, after its first
+        // half landed.
+        const end_offset = effective_offset + effective_data.len;
         if (end_offset > self.highest_buffered) self.highest_buffered = end_offset;
+        self.breaks = self.breaks - breaks_before + self.breaksIn(self.lowerBound(span_lo), span_hi);
+        try inserted;
+        // Past the cap the data stays buffered; the error closes the connection.
+        try self.checkHoles();
+    }
+
+    fn checkHolesPlusOne(self: *const FrameSorter) error{TooManyChunks}!void {
+        if (self.holes() + 1 > limits.max_reassembly_chunks) return error.TooManyChunks;
+    }
+
+    /// Insert `data` at index `i`, merging it into whichever neighbours it
+    /// abuts while the result stays within MAX_COALESCED. Filling a hole
+    /// joins the runs on both sides, so the chunk count tracks real holes
+    /// rather than the order frames happened to arrive in.
+    fn insertMerged(self: *FrameSorter, i: usize, offset: u64, data: []const u8) !void {
+        const items = self.chunks.items;
+        const end = offset + data.len;
+        const prev: ?*Chunk = if (i > 0 and items[i - 1].end() == offset) &items[i - 1] else null;
+        const next: ?*Chunk = if (i < items.len and items[i].offset == end) &items[i] else null;
+
+        if (prev) |p| {
+            if (p.data.len + data.len <= MAX_COALESCED) {
+                try self.growChunk(p, data);
+                if (next) |n| {
+                    if (p.data.len + n.data.len <= MAX_COALESCED) {
+                        try self.growChunk(p, n.data);
+                        self.allocator.free(n.allocation());
+                        _ = self.chunks.orderedRemove(i);
+                    }
+                }
+                return;
+            }
+        }
+        if (next) |n| {
+            if (data.len + n.data.len <= MAX_COALESCED) {
+                const buf = try self.allocator.alloc(u8, data.len + n.data.len);
+                @memcpy(buf[0..data.len], data);
+                @memcpy(buf[data.len..], n.data);
+                self.allocator.free(n.allocation());
+                n.* = .{ .offset = offset, .data = buf };
+                return;
+            }
+        }
+        const owned = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(owned);
+        try self.chunks.insert(self.allocator, i, .{ .offset = offset, .data = owned });
     }
 
     /// Append `bytes` to `c`, doubling its allocation as needed.
@@ -233,6 +334,7 @@ pub const FrameSorter = struct {
         const first = self.chunks.items[0];
         if (first.offset > self.read_pos or first.end() <= self.read_pos) return null;
 
+        if (self.chunks.items.len > 1 and first.end() != self.chunks.items[1].offset) self.breaks -= 1;
         _ = self.chunks.orderedRemove(0);
         const skip: usize = @intCast(self.read_pos - first.offset);
         const readable = first.data[skip..];
@@ -1709,18 +1811,14 @@ test "FrameSorter: out-of-order data" {
     // Nothing available yet (gap at offset 0)
     try testing.expect(sorter.pop() == null);
 
-    // Receive first chunk
+    // Receive first chunk: it fills the hole and joins the run after it.
     try sorter.push(0, "hello", false);
 
-    const chunk1 = sorter.pop();
-    try testing.expect(chunk1 != null);
-    try testing.expectEqualStrings("hello", chunk1.?);
-    testing.allocator.free(chunk1.?);
-
-    const chunk2 = sorter.pop();
-    try testing.expect(chunk2 != null);
-    try testing.expectEqualStrings(" world", chunk2.?);
-    testing.allocator.free(chunk2.?);
+    const chunk = sorter.pop();
+    try testing.expect(chunk != null);
+    try testing.expectEqualStrings("hello world", chunk.?);
+    testing.allocator.free(chunk.?);
+    try testing.expect(sorter.pop() == null);
 }
 
 test "FrameSorter: sequential append fast path remains readable" {
@@ -1747,23 +1845,16 @@ test "FrameSorter: out-of-order gap still accepts sequential tail" {
 
     try sorter.push(6, "world", true);
     try sorter.push(0, "hello", false);
+    try testing.expectEqual(@as(usize, 1), sorter.holes());
     try sorter.push(5, " ", false);
+    try testing.expectEqual(@as(usize, 0), sorter.holes());
 
-    const chunk1 = sorter.pop();
-    try testing.expect(chunk1 != null);
-    try testing.expectEqualStrings("hello", chunk1.?);
-    testing.allocator.free(chunk1.?);
+    const chunk = sorter.pop();
+    try testing.expect(chunk != null);
+    try testing.expectEqualStrings("hello world", chunk.?);
+    testing.allocator.free(chunk.?);
 
-    const chunk2 = sorter.pop();
-    try testing.expect(chunk2 != null);
-    try testing.expectEqualStrings(" ", chunk2.?);
-    testing.allocator.free(chunk2.?);
-
-    const chunk3 = sorter.pop();
-    try testing.expect(chunk3 != null);
-    try testing.expectEqualStrings("world", chunk3.?);
-    testing.allocator.free(chunk3.?);
-
+    try testing.expect(sorter.pop() == null);
     try testing.expect(sorter.isComplete());
 }
 
@@ -1816,6 +1907,86 @@ test "FrameSorter: unread in-order data coalesces instead of hitting the gap cap
         testing.allocator.free(chunk);
     }
     try testing.expectEqual(n * 2, got);
+}
+
+test "FrameSorter: a paused stream under jittered reordering keeps only its real gaps" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    // Several MB of small frames nobody reads yet, each delayed by a random
+    // jitter of up to 64 frame slots, the way netem jitter reorders a flow.
+    const total: usize = 4 << 20;
+    const Piece = struct { offset: usize, len: usize, arrival: usize };
+    var frames: std.ArrayList(Piece) = .empty;
+    defer frames.deinit(testing.allocator);
+
+    var prng = std.Random.DefaultPrng.init(0x72656f72);
+    const rand = prng.random();
+    var off: usize = 0;
+    var slot: usize = 0;
+    while (off < total) : (slot += 1) {
+        const len = @min(rand.intRangeAtMost(usize, 1, 1400), total - off);
+        try frames.append(testing.allocator, .{ .offset = off, .len = len, .arrival = slot + rand.uintLessThan(usize, 64) });
+        // Some go out twice, the copy re-cut the way a retransmission may be.
+        if (rand.uintLessThan(u8, 16) == 0) {
+            const lo = off -| rand.uintLessThan(usize, 700);
+            const hi = @min(off + len + rand.uintLessThan(usize, 700), total);
+            try frames.append(testing.allocator, .{ .offset = lo, .len = hi - lo, .arrival = slot + rand.uintLessThan(usize, 128) });
+        }
+        off += len;
+    }
+    std.mem.sort(Piece, frames.items, {}, struct {
+        fn lt(_: void, a: Piece, b: Piece) bool {
+            return a.arrival < b.arrival;
+        }
+    }.lt);
+
+    var payload: [2800]u8 = undefined;
+    for (frames.items) |f| {
+        for (payload[0..f.len], f.offset..) |*b, o| b.* = @intCast(o % 251);
+        try sorter.push(f.offset, payload[0..f.len], false);
+    }
+    try testing.expectEqual(@as(usize, 0), sorter.holes());
+    try testing.expect(sorter.chunks.items.len <= 2 * total / FrameSorter.MAX_COALESCED + 1);
+
+    var got: usize = 0;
+    while (sorter.pop()) |chunk| {
+        for (chunk, got..) |v, o| try testing.expectEqual(@as(u8, @intCast(o % 251)), v);
+        got += chunk.len;
+        testing.allocator.free(chunk);
+    }
+    try testing.expectEqual(total, got);
+}
+
+test "FrameSorter: random overlaps, holes and reads match the byte stream" {
+    var prng = std.Random.DefaultPrng.init(0x686f6c65);
+    const rand = prng.random();
+    var payload: [300]u8 = undefined;
+
+    var trial: usize = 0;
+    while (trial < 400) : (trial += 1) {
+        var sorter = FrameSorter.init(testing.allocator);
+        defer sorter.deinit();
+        const span: usize = rand.intRangeAtMost(usize, 64, 4096);
+
+        var read: usize = 0;
+        var step: usize = 0;
+        while (step < 300) : (step += 1) {
+            if (rand.uintLessThan(u8, 5) == 0) {
+                if (sorter.pop()) |chunk| {
+                    for (chunk, read..) |v, o| try testing.expectEqual(@as(u8, @intCast(o % 251)), v);
+                    read += chunk.len;
+                    testing.allocator.free(chunk);
+                }
+            } else {
+                const off = rand.uintLessThan(usize, span);
+                const len = rand.intRangeAtMost(usize, 1, payload.len);
+                for (payload[0..len], off..) |*b, o| b.* = @intCast(o % 251);
+                try sorter.push(off, payload[0..len], false);
+            }
+            try testing.expect(sorter.isConsistent());
+        }
+    }
 }
 
 // RFC 9000 §21.7: bound the reassembly tracking structure.

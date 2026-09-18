@@ -216,17 +216,13 @@ test "CryptoStream: out-of-order receive" {
     try cs.handleCryptoFrame(5, "World");
     try testing.expect(cs.read() == null);
 
-    // Receive first part
+    // Receive first part: it joins the run already buffered after it.
     try cs.handleCryptoFrame(0, "Hello");
-    const data1 = cs.read();
-    try testing.expect(data1 != null);
-    try testing.expectEqualStrings("Hello", data1.?);
-    testing.allocator.free(data1.?);
-
-    const data2 = cs.read();
-    try testing.expect(data2 != null);
-    try testing.expectEqualStrings("World", data2.?);
-    testing.allocator.free(data2.?);
+    const data = cs.read();
+    try testing.expect(data != null);
+    try testing.expectEqualStrings("HelloWorld", data.?);
+    testing.allocator.free(data.?);
+    try testing.expect(cs.read() == null);
 }
 
 test "CryptoStreamManager: route to correct stream" {

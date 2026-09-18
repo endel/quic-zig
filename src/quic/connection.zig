@@ -6500,6 +6500,42 @@ test "a full window of unread in-order data is not mistaken for reassembly gaps"
     try std.testing.expect(conn.local_err == null);
 }
 
+test "a paused stream's window arriving reordered is not mistaken for reassembly gaps" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    conn.conn_flow_ctrl.base.receive_window = 16 << 20;
+
+    // 5000 frames, each delayed by up to 32 slots of jitter; none lost.
+    const n = 5000;
+    var order: [n]struct { idx: u64, arrival: u64 } = undefined;
+    var prng = std.Random.DefaultPrng.init(0x6a697474);
+    const rand = prng.random();
+    for (&order, 0..) |*o, k| o.* = .{ .idx = k, .arrival = k + rand.uintLessThan(u64, 32) };
+    std.mem.sort(@TypeOf(order[0]), &order, {}, struct {
+        fn lt(_: void, a: @TypeOf(order[0]), b: @TypeOf(order[0])) bool {
+            return a.arrival < b.arrival;
+        }
+    }.lt);
+
+    var payload: [1200]u8 = undefined;
+    for (order) |o| {
+        const offset = o.idx * payload.len;
+        for (&payload, offset..) |*b, k| b.* = @intCast(k % 251);
+        try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = offset, .length = payload.len, .fin = false, .data = &payload } }, .application, 0);
+    }
+    try std.testing.expect(conn.local_err == null);
+
+    const s = conn.streams.getStream(0).?;
+    var got: u64 = 0;
+    while (s.recv.read()) |chunk| {
+        defer std.testing.allocator.free(chunk);
+        for (chunk, got..) |v, k| try std.testing.expectEqual(@as(u8, @intCast(k % 251)), v);
+        got += chunk.len;
+    }
+    try std.testing.expectEqual(@as(u64, n * payload.len), got);
+}
+
 test "NEW_CONNECTION_ID: a huge Retire Prior To retires only the CIDs we hold" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
