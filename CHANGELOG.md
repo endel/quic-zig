@@ -5,6 +5,15 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ## Unreleased
 
+### Added
+
+- `quic.tls_server`, a sans-IO TLS 1.3 server for TLS over TCP: feed it the
+  bytes you read and send what it queues, from any event loop. It negotiates
+  AES-GCM or ChaCha20, X25519 or P-256 (with HelloRetryRequest), picks the
+  certificate by SNI, and can resume sessions from tickets.
+- A QUIC server can serve several certificates and pick one by SNI, via
+  `TlsConfig.certs`.
+
 ### Fixed
 
 - A MoQ relay now answers a subscriber that arrived before its publisher as

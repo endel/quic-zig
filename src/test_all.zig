@@ -29,6 +29,7 @@ test {
     _ = @import("h3/capsule.zig");
     _ = @import("http1/server.zig");
     _ = @import("http1/tls.zig");
+    _ = @import("tls/server.zig");
     _ = @import("webtransport/protocol.zig");
     _ = @import("moq/wire.zig");
     _ = @import("moq/message_codes.zig");

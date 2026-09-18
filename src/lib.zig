@@ -15,6 +15,7 @@ pub const stateless_reset = @import("quic/stateless_reset.zig");
 pub const h3 = @import("h3/connection.zig");
 pub const h0 = @import("h0/connection.zig");
 pub const http1 = @import("http1/server.zig");
+pub const tls_server = @import("tls/server.zig");
 pub const qpack = @import("h3/qpack.zig");
 pub const webtransport = @import("webtransport/session.zig");
 pub const webtransport_flow_control = @import("webtransport/flow_control.zig");

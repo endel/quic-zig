@@ -474,12 +474,98 @@ pub const SessionTicket = struct {
     }
 };
 
+// ─── Server certificates / SNI ───────────────────────────────────────
+
+/// A certificate chain and the private key for its leaf.
+pub const ServerCertificate = struct {
+    /// DER-encoded certificates, leaf first.
+    cert_chain_der: []const []const u8,
+    /// Raw P-256 scalar or Ed25519 seed (32 bytes), as `extractEcPrivateKey`
+    /// / `extractEd25519PrivateKey` return it.
+    private_key_bytes: []const u8,
+    private_key_algorithm: PrivateKeyAlgorithm = .ecdsa_p256_sha256,
+};
+
+/// A certificate served for a set of host names. Shared by the QUIC server
+/// (`TlsConfig.certs`) and the TCP TLS server (`tls_server.Config.certs`).
+pub const CertEntry = struct {
+    /// Host names this certificate is served for. `"*.example.com"` matches
+    /// exactly one label (`a.example.com`, not `example.com` or
+    /// `a.b.example.com`). Matching is ASCII case-insensitive.
+    server_names: []const []const u8,
+    cert: ServerCertificate,
+};
+
+pub const CertSelection = struct {
+    entry: *const CertEntry,
+    /// False when the client sent no SNI or nothing matched it, so the first
+    /// entry was used as the default.
+    matched: bool,
+};
+
+/// Picks the certificate for a ClientHello's SNI: an exact name first, then a
+/// one-label wildcard, then `entries[0]`. Returns null only when `entries` is
+/// empty.
+pub fn selectCertificate(entries: []const CertEntry, sni: ?[]const u8) ?CertSelection {
+    if (entries.len == 0) return null;
+    const raw = sni orelse return .{ .entry = &entries[0], .matched = false };
+    // A trailing dot names the same host (RFC 6066 forbids it, clients still send it).
+    const name = if (raw.len > 0 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
+    if (name.len == 0) return .{ .entry = &entries[0], .matched = false };
+
+    for (entries) |*e| {
+        for (e.server_names) |n| {
+            if (std.ascii.eqlIgnoreCase(n, name)) return .{ .entry = e, .matched = true };
+        }
+    }
+    if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+        if (dot > 0) {
+            const parent = name[dot..]; // ".example.com"
+            for (entries) |*e| {
+                for (e.server_names) |n| {
+                    if (n.len > 2 and n[0] == '*' and n[1] == '.' and std.ascii.eqlIgnoreCase(n[1..], parent))
+                        return .{ .entry = e, .matched = true };
+                }
+            }
+        }
+    }
+    return .{ .entry = &entries[0], .matched = false };
+}
+
+/// Parses the host_name out of a server_name extension body (RFC 6066 §3).
+/// Returns null for a list with no host_name entry.
+pub fn parseServerNameExtension(data: []const u8) error{DecodeError}!?[]const u8 {
+    if (data.len < 2) return error.DecodeError;
+    const list_len = readU16(data);
+    if (list_len + 2 != data.len or list_len == 0) return error.DecodeError;
+    var pos: usize = 2;
+    var host: ?[]const u8 = null;
+    while (pos < data.len) {
+        if (pos + 3 > data.len) return error.DecodeError;
+        const name_type = data[pos];
+        const len = readU16(data[pos + 1 ..]);
+        pos += 3;
+        if (pos + len > data.len) return error.DecodeError;
+        if (name_type == 0) {
+            if (host != null or len == 0) return error.DecodeError;
+            host = data[pos..][0..len];
+        }
+        pos += len;
+    }
+    return host;
+}
+
 // ─── TLS Config ──────────────────────────────────────────────────────
 
 pub const TlsConfig = struct {
     cert_chain_der: []const []const u8, // DER-encoded certificates
     private_key_bytes: []const u8, // Raw P-256 scalar or Ed25519 seed (32 bytes)
     private_key_algorithm: PrivateKeyAlgorithm = .ecdsa_p256_sha256,
+    /// Server only: certificates chosen by the ClientHello's SNI (see
+    /// `selectCertificate`). When non-empty, this replaces `cert_chain_der` /
+    /// `private_key_bytes` / `private_key_algorithm`, with `certs[0]` as the
+    /// default for a client that sends no SNI or an unknown name.
+    certs: []const CertEntry = &.{},
     alpn: []const []const u8,
     server_name: ?[]const u8 = null, // SNI (client only)
     skip_cert_verify: bool = true, // Skip X.509 chain + CertificateVerify validation
@@ -675,6 +761,10 @@ pub const Tls13Handshake = struct {
     selected_alpn: [32]u8 = .{0} ** 32,
     selected_alpn_len: usize = 0,
 
+    /// Server: the certificate we present — the config's single one, or the
+    /// `config.certs` entry the ClientHello's SNI selected.
+    server_cert: ServerCertificate = undefined,
+
     zero_rtt_accepted: bool = false,
     pending_install_early: bool = false,
     received_ticket: ?SessionTicket = null,
@@ -772,6 +862,11 @@ pub const Tls13Handshake = struct {
         self.transcript = TranscriptHash.init();
         self.key_schedule = KeySchedule.init();
         self.config = config;
+        self.server_cert = if (config.certs.len > 0) config.certs[0].cert else .{
+            .cert_chain_der = config.cert_chain_der,
+            .private_key_bytes = config.private_key_bytes,
+            .private_key_algorithm = config.private_key_algorithm,
+        };
         self.local_transport_params = local_tp;
         self.peer_transport_params = null;
         self.out_len = 0;
@@ -1492,6 +1587,9 @@ pub const Tls13Handshake = struct {
                 psk_ext_len = elen;
             } else if (etype == @intFromEnum(tls.ExtensionType.early_data)) {
                 self.early_data_offered = true;
+            } else if (etype == @intFromEnum(tls.ExtensionType.server_name) and self.config.certs.len > 0) {
+                const sni = parseServerNameExtension(ext_data[ext_pos..][0..elen]) catch return error.DecodeError;
+                self.server_cert = selectCertificate(self.config.certs, sni).?.entry.cert;
             }
             ext_pos += elen;
         }
@@ -1653,7 +1751,7 @@ pub const Tls13Handshake = struct {
     fn serverBuildCertificate(self: *Tls13Handshake) !Action {
         // Built straight into out_buf: a local of the same size would be a
         // 32 KB stack duplicate of a field we already own.
-        const msg = buildCertificate(&self.out_buf, self.config.cert_chain_der) catch return error.InternalError;
+        const msg = buildCertificate(&self.out_buf, self.server_cert.cert_chain_der) catch return error.InternalError;
         self.out_len = msg.len;
 
         self.transcript.update(msg);
@@ -1677,8 +1775,8 @@ pub const Tls13Handshake = struct {
         const msg = buildCertificateVerify(
             &buf,
             transcript_hash,
-            self.config.private_key_bytes,
-            self.config.private_key_algorithm,
+            self.server_cert.private_key_bytes,
+            self.server_cert.private_key_algorithm,
             true, // is_server
         ) catch return error.InternalError;
 
@@ -3384,8 +3482,10 @@ test "client answers a CertificateRequest with an empty Certificate" {
         0x00, // certificate_request_context: empty
         0x00, 0x1a, // extensions, 26 bytes
         0x00, 0x0d, 0x00, 0x16, 0x00, 0x14, // signature_algorithms, 10 of them
-        0x05, 0x03, 0x04, 0x03, 0x08, 0x07, 0x08, 0x06, 0x08, 0x05,
-        0x08, 0x04, 0x06, 0x01, 0x05, 0x01, 0x04, 0x01, 0x02, 0x01,
+        0x05, 0x03, 0x04, 0x03, 0x08, 0x07,
+        0x08, 0x06, 0x08, 0x05, 0x08, 0x04,
+        0x06, 0x01, 0x05, 0x01, 0x04, 0x01,
+        0x02, 0x01,
     });
 
     try std.testing.expect(try client.step() == ._continue);
@@ -3514,7 +3614,14 @@ fn fixtureHandshake(gpa: std.mem.Allocator, chain: []const []const u8) !bool {
     var key_buf: [4096]u8 = undefined;
     const key_der = try parsePemPrivateKey(fixture_leaf_key, &key_buf);
     const key_scalar = extractEcPrivateKey(key_der) catch try extractPkcs8EcPrivateKey(key_der);
+    return fixtureHandshakeWith(gpa, .{
+        .cert_chain_der = chain,
+        .private_key_bytes = key_scalar,
+        .alpn = &[_][]const u8{"h3"},
+    });
+}
 
+fn fixtureHandshakeWith(gpa: std.mem.Allocator, server_config: TlsConfig) !bool {
     var bundle = try fixtureBundle(gpa);
     defer bundle.deinit(gpa);
 
@@ -3524,11 +3631,7 @@ fn fixtureHandshake(gpa: std.mem.Allocator, chain: []const []const u8) !bool {
     const client = try gpa.create(Tls13Handshake);
     defer gpa.destroy(client);
 
-    Tls13Handshake.initServerInto(server, .{
-        .cert_chain_der = chain,
-        .private_key_bytes = key_scalar,
-        .alpn = &[_][]const u8{"h3"},
-    }, tp);
+    Tls13Handshake.initServerInto(server, server_config, tp);
     Tls13Handshake.initClientInto(client, .{
         .cert_chain_der = &.{},
         .private_key_bytes = &.{},
@@ -3593,4 +3696,82 @@ test "a server that sends only its leaf cannot be verified" {
     try std.testing.expectEqual(@as(usize, 1), chain.len);
 
     try std.testing.expect(!try fixtureHandshake(gpa, chain));
+}
+
+test "selectCertificate: exact, then one-label wildcard, then the first entry" {
+    const cert: ServerCertificate = .{ .cert_chain_der = &.{}, .private_key_bytes = &.{} };
+    const entries = [_]CertEntry{
+        .{ .server_names = &.{"default.test"}, .cert = cert },
+        .{ .server_names = &.{"*.example.com"}, .cert = cert },
+        .{ .server_names = &.{ "api.example.com", "Other.Test" }, .cert = cert },
+    };
+    const T = struct {
+        fn pick(e: []const CertEntry, sni: ?[]const u8) struct { usize, bool } {
+            const sel = selectCertificate(e, sni).?;
+            return .{ (@intFromPtr(sel.entry) - @intFromPtr(e.ptr)) / @sizeOf(CertEntry), sel.matched };
+        }
+    };
+    try std.testing.expectEqual(.{ 2, true }, T.pick(&entries, "api.example.com"));
+    try std.testing.expectEqual(.{ 2, true }, T.pick(&entries, "other.test"));
+    try std.testing.expectEqual(.{ 1, true }, T.pick(&entries, "www.EXAMPLE.com"));
+    try std.testing.expectEqual(.{ 1, true }, T.pick(&entries, "www.example.com."));
+    try std.testing.expectEqual(.{ 0, false }, T.pick(&entries, "a.b.example.com"));
+    try std.testing.expectEqual(.{ 0, false }, T.pick(&entries, "example.com"));
+    try std.testing.expectEqual(.{ 0, false }, T.pick(&entries, ".example.com"));
+    try std.testing.expectEqual(.{ 0, true }, T.pick(&entries, "default.test"));
+    try std.testing.expectEqual(.{ 0, false }, T.pick(&entries, null));
+    try std.testing.expect(selectCertificate(&.{}, "x") == null);
+}
+
+test "a QUIC server picks its certificate by SNI" {
+    const gpa = std.testing.allocator;
+
+    var pem_buf: [8192]u8 = undefined;
+    const full = try std.fmt.bufPrint(&pem_buf, "{s}\n{s}\n", .{ fixture_leaf, fixture_intermediate });
+    const chain = try parsePemCertChain(gpa, full);
+    defer {
+        for (chain) |der| gpa.free(der);
+        gpa.free(chain);
+    }
+    var key_buf: [4096]u8 = undefined;
+    const key_der = try parsePemPrivateKey(fixture_leaf_key, &key_buf);
+    const key_scalar = try extractEcPrivateKey(key_der);
+
+    // The leaf alone does not verify (see above), so only the full-chain
+    // entry lets the client, which asks for relay.test, finish.
+    const good: ServerCertificate = .{ .cert_chain_der = chain, .private_key_bytes = key_scalar };
+    const bad: ServerCertificate = .{ .cert_chain_der = chain[0..1], .private_key_bytes = key_scalar };
+
+    const by_name = [_]CertEntry{
+        .{ .server_names = &.{"other.test"}, .cert = bad },
+        .{ .server_names = &.{"*.test"}, .cert = good },
+    };
+    try std.testing.expect(try fixtureHandshakeWith(gpa, .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .certs = &by_name,
+    }));
+
+    const default_first = [_]CertEntry{
+        .{ .server_names = &.{"unrelated.example"}, .cert = good },
+        .{ .server_names = &.{"other.test"}, .cert = bad },
+    };
+    try std.testing.expect(try fixtureHandshakeWith(gpa, .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .certs = &default_first,
+    }));
+
+    const wrong_default = [_]CertEntry{
+        .{ .server_names = &.{"unrelated.example"}, .cert = bad },
+        .{ .server_names = &.{"other.test"}, .cert = good },
+    };
+    try std.testing.expect(!try fixtureHandshakeWith(gpa, .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .certs = &wrong_default,
+    }));
 }

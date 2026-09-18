@@ -136,6 +136,13 @@ pub fn build(b: *std.Build) void {
     run_quic_server.step.dependOn(b.getInstallStep());
     b.step("run-quic-server", "Run raw QUIC echo server").dependOn(&run_quic_server.step);
 
+    const exe_tls_echo = App.add(b, "tls-echo-server", "apps/tls_echo_server.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_tls_echo);
+    const run_tls_echo = b.addRunArtifact(exe_tls_echo);
+    run_tls_echo.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_tls_echo.addArgs(args);
+    b.step("run-tls-echo-server", "Run the TLS 1.3 over TCP echo / HTTP server").dependOn(&run_tls_echo.step);
+
     const exe_quic_client = App.add(b, "quic-client", "apps/quic_client.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_quic_client);
     const run_quic_client = b.addRunArtifact(exe_quic_client);
