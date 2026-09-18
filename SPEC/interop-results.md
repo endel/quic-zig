@@ -1,6 +1,6 @@
 # Interop Test Results
 
-Date: 2026-09-09  ·  quic-zig `4ca8f01`, Zig 0.16.0, `zig build -Doptimize=ReleaseSafe`
+Date: 2026-09-18  ·  quic-zig `4988228`, Zig 0.16.0, `zig build -Doptimize=ReleaseSafe`
 Peers: `martenseemann/quic-go-interop:latest`, `cloudflare/quiche-qns:latest`
 Harness: `interop/runner/matrix.sh` (quic-interop-runner + quic-network-simulator)
 
@@ -19,11 +19,11 @@ Read `A<-B` as "A is the server, B is the client".
 | multiplexing | ✅ | ✅ | ❌ | ✅ |
 | longrtt | ✅ | ✅ | ✅ | ✅ |
 | keyupdate | ✅ | ✅ | — | ✅ |
-| chacha20 | ❌ | ❌ | — | ❌ |
+| chacha20 | ✅ | ✅ | — | ✅ |
 | v2 | — | — | — | — |
 | ipv6 | ✅ | ✅ | ✅ | ✅ |
 | ecn | — | — | — | — |
-| amplificationlimit | ✅ | ✅ | ✅ | ✅ |
+| amplificationlimit | ✅ | ✅ | ❌ | ✅ |
 | rebind-port | ✅ | ✅ | ❌ | ❌ |
 | rebind-addr | ✅ | ✅ | ❌ | ❌ |
 | connectionmigration | — | ❌ | ❌ | — |
@@ -34,35 +34,37 @@ Read `A<-B` as "A is the server, B is the client".
 | transfercorruption | ✅ | ✅ | ✅ | ✅ |
 
 Totals:
-- `quic-go<-quic-zig` — 18 pass, 1 fail, 3 unsupported, of 22
-- `quic-zig<-quic-go` — 18 pass, 2 fail, 2 unsupported, of 22
-- `quic-zig<-quiche` — 12 pass, 6 fail, 4 unsupported, of 22
-- `quiche<-quic-zig` — 16 pass, 3 fail, 3 unsupported, of 22
+- `quic-go<-quic-zig` — 19 pass, 0 fail, 3 unsupported, of 22
+- `quic-zig<-quic-go` — 19 pass, 1 fail, 2 unsupported, of 22
+- `quic-zig<-quiche` — 11 pass, 7 fail, 4 unsupported, of 22
+- `quiche<-quic-zig` — 17 pass, 2 fail, 3 unsupported, of 22
 
 Legend: ✅ pass · ❌ fail · — the peer does not implement the case.
 
-## None of the remaining failures are regressions
+## Changes since the previous matrix (`4ca8f01`)
 
-Every failure above matches the previous session's matrix verdict for verdict.
-The pre-merge tree (`b6f9eb6`) was separately built as its own interop image and
-run against quiche's client for the cases that still fail; it fails all of them
-the same way:
+    chacha20            quic-go<-quic-zig   ❌ → ✅
+    chacha20            quic-zig<-quic-go   ❌ → ✅
+    chacha20            quiche<-quic-zig    ❌ → ✅
+    amplificationlimit  quic-zig<-quiche    ✅ → ❌
 
-    quic-zig-base<-quiche multiplexing          FAIL
-    quic-zig-base<-quiche handshakeloss         FAIL
-    quic-zig-base<-quiche handshakecorruption   FAIL
-    quic-zig-base<-quiche rebind-port           FAIL
-    quic-zig-base<-quiche chacha20              UNSUPPORTED
+Neither move comes from this branch. The `e09f4c5` (main) tree, built as its own
+image and run in the same session, gives the same verdict on each of these
+cells: chacha20 passes in all three directions, and amplificationlimit against
+quiche's client fails 3 runs of 3, exactly as this branch does.
 
-quiche had never been run against us before that matrix, which is why they only
-surfaced then.
+chacha20 was the open item in the previous run. It already passes at
+`e09f4c5`, and no separate fix is recorded for it.
 
-One case moved the other way in this run: `quic-go<-quic-zig
-handshakecorruption` regressed to FAIL and was fixed. Our client fired 22365
-Initial-space PTOs in ten seconds without sending anything, because a PTO with
-nothing to resend sent no probe at all — and the PTO deadline is measured from
-the last ack-eliciting packet, so it stayed expired and re-fired on every tick.
-Both directions pass now.
+### amplificationlimit against quiche — a newer quiche client, not us
+The `cloudflare/quiche-qns:latest` pulled for this run was built on 2026-09-17.
+Our server stays within the limit: it sends a 10 704-byte first flight after
+receiving 3 600 bytes, against a limit of 10 800. The check still fails, because it only stops
+counting when the client sends a datagram that *starts* with a Handshake packet.
+This quiche client never sends one. Its Finished goes out coalesced behind an
+Initial ACK, and after that it sends only 1-RTT. The runner therefore reads
+the whole trace as an unfinished handshake. The `e09f4c5` server produces the same
+pcap and the same verdict.
 
 ## A caution about this table
 
@@ -86,33 +88,6 @@ own binary against a peer client directly:
 If that handshake fails, the toolchain is the suspect, not the protocol.
 
 ## What the remaining failures are
-
-### chacha20 — open, ours to explain
-Fails in every direction it is tested. The peer never acknowledges our
-Handshake packets, so we PTO in the Handshake space until the test times out.
-It is not the key schedule and, as far as three independent checks can tell, not
-our packet protection either:
-
-- The pcap shows the ClientHello offering only `0x1303` and our ServerHello
-  selecting it.
-- Both endpoints' `keys.log` files carry byte-identical handshake traffic
-  secrets.
-- The RFC 9001 Appendix A.5 known-answer vector now runs as a unit test
-  (`crypto.zig`) and passes byte-exact: key, IV, hp key, ku, nonce, AEAD
-  ciphertext, HP sample, HP mask and the final protected packet. Our ChaCha20
-  primitives and header protection are not the cause.
-- Re-implementing RFC 9001 §5.4.4 header protection and the AEAD in Python and
-  running it over a whole capture decrypts 305 of 307 of our Handshake packets,
-  and the plaintext parses cleanly: `ACK largest=1 first_range=0`, `CRYPTO
-  off=0 len=36` (the Finished), then zero padding. Reserved bits are zero.
-
-quiche's server logs `rx pkt Handshake ... pn=0` — so it removed our header
-protection and decoded the packet number — and then "dropped invalid packet".
-quic-go's qlog gives `payload_decrypt_error` and records the dropped packet's
-header as `dcil: 0, scil: 0` where the wire carries 20 and 8. That last detail is
-the only lead: it would put the packet-number offset nine bytes early and sample
-the wrong sixteen bytes. Worth checking against a peer build with header parsing
-traced before touching our own crypto.
 
 ### connectionmigration and rebind-addr / rebind-port — environmental
 The runner's `connectionmigration` needs the *client* to migrate. quic-go's
