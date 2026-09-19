@@ -9,6 +9,9 @@
 //   curl -k --tlsv1.3 https://127.0.0.1:8443/
 //
 // --tickets enables session tickets under a per-process random key.
+// --client-ca ca.pem asks for a client certificate issued by ca.pem
+// (required; --client-optional lets clients without one in):
+//   openssl s_client -tls1_3 -connect 127.0.0.1:8443 -cert c.pem -key c.key
 
 const std = @import("std");
 const posix = std.posix;
@@ -26,6 +29,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var cert_path: []const u8 = "interop/certs/server.crt";
     var key_path: []const u8 = "interop/certs/server.key";
     var tickets = false;
+    var client_ca: ?[]const u8 = null;
+    var client_mode: tls13.ClientAuth.Mode = .required;
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
     while (args.next()) |arg| {
@@ -37,6 +42,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (args.next()) |v| key_path = v;
         } else if (std.mem.eql(u8, arg, "--tickets")) {
             tickets = true;
+        } else if (std.mem.eql(u8, arg, "--client-ca")) {
+            client_ca = args.next();
+        } else if (std.mem.eql(u8, arg, "--client-optional")) {
+            client_mode = .optional;
         }
     }
 
@@ -47,9 +56,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const key_der = try tls13.parsePemPrivateKey(key_pem, &key_der_buf);
     const key = try tls13.extractPrivateKey(key_der);
 
+    var client_auth: tls13.ClientAuth = undefined;
+    if (client_ca) |path| {
+        const bundle = try gpa.create(std.crypto.Certificate.Bundle);
+        bundle.* = try quic.ca_bundle.loadFile(gpa, path);
+        client_auth = .{ .ca_bundle = bundle, .mode = client_mode, .authorities = try tls13.certificateAuthorities(gpa, bundle) };
+    }
     const entries = [_]tls_server.CertEntry{.{
         .server_names = &.{"localhost"},
         .cert = .{ .cert_chain_der = chain, .private_key_bytes = key.bytes, .private_key_algorithm = key.algorithm },
+        .client_auth = if (client_ca != null) &client_auth else null,
     }};
     var config: tls_server.Config = .{ .certs = &entries, .alpn = &.{"http/1.1"} };
     if (tickets) {
@@ -92,8 +108,8 @@ fn serve(gpa: std.mem.Allocator, config: *const tls_server.Config, fd: sys.socke
         const fed = conn.feed(buf[0..n]);
         if (!was_complete and conn.handshakeComplete()) {
             was_complete = true;
-            log.info("handshake: suite={t} group={t} sni={?s} alpn={?s} resumed={}", .{
-                conn.cipherSuite().?, conn.keyExchangeGroup().?, conn.serverName(), conn.alpn(), conn.isResumed(),
+            log.info("handshake: suite={t} group={t} sni={?s} alpn={?s} resumed={} client_cert={}", .{
+                conn.cipherSuite().?, conn.keyExchangeGroup().?, conn.serverName(), conn.alpn(), conn.isResumed(), conn.peerCertificate() != null,
             });
         }
         fed catch |err| {
@@ -110,7 +126,7 @@ fn serve(gpa: std.mem.Allocator, config: *const tls_server.Config, fd: sys.socke
                 if (request.items.len + data.len > max_request_head) return;
                 request.appendSlice(gpa, data) catch return;
                 if (std.mem.indexOf(u8, request.items, "\r\n\r\n") != null) {
-                    const body = "Hello from quic-zig tls_server\n";
+                    const body = if (conn.peerCertificate() != null) "Hello from quic-zig tls_server, certified client\n" else "Hello from quic-zig tls_server\n";
                     const response = std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
                     conn.write(response) catch return;
                     conn.close();

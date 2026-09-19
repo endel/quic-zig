@@ -221,3 +221,163 @@ pub const RsaCert = struct {
         self.cert = .{ .cert_chain_der = &self.chain, .private_key_bytes = key.bytes, .private_key_algorithm = key.algorithm };
     }
 };
+
+// Client certificates. `client_ca_pem` issued `client_pem` (CN=alice,
+// O=Example, clientAuth), the expired one, and `client_server_only_pem`
+// (serverAuth only); `client_foreign_pem` comes from another CA. All but
+// the RSA one share `client_key_pem`. Valid to 2056 unless stated.
+pub const client_ca_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBqzCCAVGgAwIBAgIUGIMU2On6/j1ozZDG+zaQs9GdtPcwCgYIKoZIzj0EAwIw
+    \\IjEgMB4GA1UEAwwXcXVpYy16aWcgdGVzdCBjbGllbnQgQ0EwIBcNMjYwMTAxMDAw
+    \\MDAwWhgPMjA1NjAxMDEwMDAwMDBaMCIxIDAeBgNVBAMMF3F1aWMtemlnIHRlc3Qg
+    \\Y2xpZW50IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhGptHXw+7rsceme+
+    \\r7LaBGFfwCyz1SfCpxBlBSdNr98SBVJdsUjm2sqzXKMrowiN4dgsFm/8zpelwzyb
+    \\c/YUnqNjMGEwHQYDVR0OBBYEFLJiJCzGNTHs0Y02bnX71lvBjpXJMB8GA1UdIwQY
+    \\MBaAFLJiJCzGNTHs0Y02bnX71lvBjpXJMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0P
+    \\AQH/BAQDAgEGMAoGCCqGSM49BAMCA0gAMEUCIQDWK+jOEXoAtxkP5gCJkO/CTXid
+    \\IuXp95arL+XBIcbt5QIgEtgmYno7eWStzprUDDbaZAJIIK9AiOKAgchhXW9gaoo=
+    \\-----END CERTIFICATE-----
+;
+pub const client_key_pem =
+    \\-----BEGIN EC PRIVATE KEY-----
+    \\MHcCAQEEIMYqDe+qGWUMWr2cP0jGhUBaLx60kMxRk6kHuJgGRasLoAoGCCqGSM49
+    \\AwEHoUQDQgAEggJQsx8u4b5CpcBR17RVq1Mm1kMUle0ta8mfHRskWQ10HA3RfOw4
+    \\o107ubormjckR45Rmjm4Xq1WE9RneZlnCQ==
+    \\-----END EC PRIVATE KEY-----
+;
+pub const client_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBpzCCAU6gAwIBAgICEAEwCgYIKoZIzj0EAwIwIjEgMB4GA1UEAwwXcXVpYy16
+    \\aWcgdGVzdCBjbGllbnQgQ0EwIBcNMjYwMTAxMDAwMDAwWhgPMjA1NjAxMDEwMDAw
+    \\MDBaMCIxDjAMBgNVBAMMBWFsaWNlMRAwDgYDVQQKDAdFeGFtcGxlMFkwEwYHKoZI
+    \\zj0CAQYIKoZIzj0DAQcDQgAEggJQsx8u4b5CpcBR17RVq1Mm1kMUle0ta8mfHRsk
+    \\WQ10HA3RfOw4o107ubormjckR45Rmjm4Xq1WE9RneZlnCaNyMHAwCQYDVR0TBAIw
+    \\ADAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwIwHQYDVR0OBBYE
+    \\FIr+M6VRCTrBKuMsho27+ubFDIUjMB8GA1UdIwQYMBaAFLJiJCzGNTHs0Y02bnX7
+    \\1lvBjpXJMAoGCCqGSM49BAMCA0cAMEQCICE7NVcMYlLEQg9BlS2uQlV4rx2qH7LY
+    \\KObYU/veOQmkAiAbs5FLeyrqSfGOm08XkPjd0gZRf9QD1KzMj08FWOy5wA==
+    \\-----END CERTIFICATE-----
+;
+/// Valid in 2020 only.
+pub const client_expired_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBpzCCAUygAwIBAgICEAIwCgYIKoZIzj0EAwIwIjEgMB4GA1UEAwwXcXVpYy16
+    \\aWcgdGVzdCBjbGllbnQgQ0EwHhcNMjAwMTAxMDAwMDAwWhcNMjEwMTAxMDAwMDAw
+    \\WjAiMQ4wDAYDVQQDDAVhbGljZTEQMA4GA1UECgwHRXhhbXBsZTBZMBMGByqGSM49
+    \\AgEGCCqGSM49AwEHA0IABIICULMfLuG+QqXAUde0VatTJtZDFJXtLWvJnx0bJFkN
+    \\dBwN0XzsOKNdO7m6K5o3JEeOUZo5uF6tVhPUZ3mZZwmjcjBwMAkGA1UdEwQCMAAw
+    \\DgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMCMB0GA1UdDgQWBBSK
+    \\/jOlUQk6wSrjLIaNu/rmxQyFIzAfBgNVHSMEGDAWgBSyYiQsxjUx7NGNNm51+9Zb
+    \\wY6VyTAKBggqhkjOPQQDAgNJADBGAiEA+A+fLUcNqCK3nDRiEOxmi92CQcd1rW+H
+    \\wNryF59SOwsCIQC3t0t8HYqS/+B9q6t27RoeBtbpRNBwHAnnuDYUw7WkiQ==
+    \\-----END CERTIFICATE-----
+;
+pub const client_foreign_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBoTCCAUigAwIBAgICEAMwCgYIKoZIzj0EAwIwHDEaMBgGA1UEAwwRcXVpYy16
+    \\aWcgb3RoZXIgQ0EwIBcNMjYwMTAxMDAwMDAwWhgPMjA1NjAxMDEwMDAwMDBaMCIx
+    \\DjAMBgNVBAMMBWFsaWNlMRAwDgYDVQQKDAdFeGFtcGxlMFkwEwYHKoZIzj0CAQYI
+    \\KoZIzj0DAQcDQgAEggJQsx8u4b5CpcBR17RVq1Mm1kMUle0ta8mfHRskWQ10HA3R
+    \\fOw4o107ubormjckR45Rmjm4Xq1WE9RneZlnCaNyMHAwCQYDVR0TBAIwADAOBgNV
+    \\HQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwIwHQYDVR0OBBYEFIr+M6VR
+    \\CTrBKuMsho27+ubFDIUjMB8GA1UdIwQYMBaAFJOcW1e0rRsO05a8zARBYJFTUNw0
+    \\MAoGCCqGSM49BAMCA0cAMEQCIFPo+yac+H2WgGWDJOj+BPaIAsVhFMEhE2W/rAaw
+    \\bSEbAiAC/iTech3SV+pBMjVfha2sTfOJUA2zawnsEH8/EzGGJw==
+    \\-----END CERTIFICATE-----
+;
+pub const client_server_only_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBpzCCAU6gAwIBAgICEAQwCgYIKoZIzj0EAwIwIjEgMB4GA1UEAwwXcXVpYy16
+    \\aWcgdGVzdCBjbGllbnQgQ0EwIBcNMjYwMTAxMDAwMDAwWhgPMjA1NjAxMDEwMDAw
+    \\MDBaMCIxDjAMBgNVBAMMBWFsaWNlMRAwDgYDVQQKDAdFeGFtcGxlMFkwEwYHKoZI
+    \\zj0CAQYIKoZIzj0DAQcDQgAEggJQsx8u4b5CpcBR17RVq1Mm1kMUle0ta8mfHRsk
+    \\WQ10HA3RfOw4o107ubormjckR45Rmjm4Xq1WE9RneZlnCaNyMHAwCQYDVR0TBAIw
+    \\ADAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYE
+    \\FIr+M6VRCTrBKuMsho27+ubFDIUjMB8GA1UdIwQYMBaAFLJiJCzGNTHs0Y02bnX7
+    \\1lvBjpXJMAoGCCqGSM49BAMCA0cAMEQCIHl8VyEvnOpgzKkNkDLB5iG0mf0dPjqJ
+    \\mfOck2OTv4F/AiB98fyhaG9gTxTAuy8Os3poEHjwnucL3GgwWwsWX+SG5A==
+    \\-----END CERTIFICATE-----
+;
+/// PKCS#1 RSA-2048 key of `client_rsa_pem` (CN=bob).
+pub const client_rsa_key_pem =
+    \\-----BEGIN RSA PRIVATE KEY-----
+    \\MIIEowIBAAKCAQEA0vD8oPqn0z0YP3rgnetrwYPYuW9OLanPh/iFaYT+ivZEcNFd
+    \\PmGzoLm/gqku9hOWgFTVSkJYFA40GJAEWSyaCXiijWxz5axqCdiX4IWJ7j9OKq6V
+    \\CO+qG7YWY+55VuVBismaPwrBtpgJh5xMvjNUu04XJjcwkoJpEmoeBnMBDcH9wTZV
+    \\/gR2VAwvxC2KCJMxrm3rT/LQdIxcNbsmx2ohmtaet33hY8b4E6oRm58ZqppHvQVC
+    \\wzKVmpOGHAbJ699DSkJBP+XHAKd5mM1z2IU0j/EofI74hbXdFcxFhifnvFwPrF/f
+    \\sVm4L7oeZML3gOhHdCBzPTwZILXlmg16xryQKwIDAQABAoIBAADI2O9ZNoE4uu+e
+    \\YHeyprUfta0nhn47ZEChztsE5/JFjnJdJemXcQfPjp3oarCD7yZlgZEd7+ElMAfs
+    \\ZmvqBebZHcxxS2MlOgzIVvEzFdXMPzQqgkR4FPKoMP7HsSuGIkW1KnQfOY4P8RuR
+    \\GkGI0RvvFz82QagQkaS5F9M8JESHPthjjcnNhy/Jl9S/XbzRN6Y/EZ+bKzxm6CA5
+    \\R//1712Fg18+72KN2aChCjfw/BAo7FPfGuxIbyI8BS+UMUhgguLlCHFFJovSLAS0
+    \\Mk/s4CL1gVaMZlyeMLdh6hkb14Iz5c6j1NUl6zs2zF8CNuUPnWKQnFnLGuR6HOcR
+    \\sNaeOkkCgYEA7LWaLEBPrYfOyQ0c645UO4HGz0fVit9xy8Bu5L7vpAi+S/KWVlMz
+    \\YzSxaIsAuHzkoDi/sv7uvP+mTASkT7/8753JZh2wQyBUqPyp2j8XTFzEAUJluIxK
+    \\JUNnxCrYuvp3Ni6nhihYxRd8dmB6vBhXM3sSnKphCEs8i5gUUrdl648CgYEA5CHL
+    \\OPuoY+6318iLYi15NXpkfMg42bipf0YU0ST+pVm1Hms8PUovJWhS5cz6EMRhWfgH
+    \\U37Nao5j7z6+hrlhcve7mHes7uivxSRadFE0+hNYX3kOGUtqCvNKy3kk+TQBHpuN
+    \\V2z/4aI7kLfpsKejvgO2jxU7HqrN4qrhV3fd86UCgYA5n5Pihd1frxnl061goota
+    \\2SLevuv7HJ4FLdlREjIgSoiY0HtMlICD/AXcH0qTnsPBRU9Vcb4IgGupQdAGIgSf
+    \\CFhI5Z1NGgfCA5ANsyIm0sZcUB+XJ3+9RoVyOcP88JAovn7Fp/jEMg14e9AlDf/c
+    \\Zm+Hd+qbLEWW7fS0ljTXfQKBgCoNtLmnYm4xhkBH3rHVch+SlU2PVzODX/NvRs0b
+    \\BboTZFjcKbmeoDxEE+v6sio/GTcNisQwfstivjdPGK4bJESeOD2t6foMeMJdpjME
+    \\+UAUKtlGpnuxNDYajTIe/drWZFJxGEgCdtTwJAzUaka/UGbpplCP+Fr534QmPe3y
+    \\0b5lAoGBAIei8HF9Mxv7cNwTNYOWCw3RYSzlzyG+/yXfGNGJX6tKbGdw0qeW7YYV
+    \\TfBzindaZem1NRcws7eAA9EJ7oyDmXcQTrETDFdruRu8wUNeJ+UCpC1nK3OVzM36
+    \\aJobl7xaCow4hGAPaoeklBTf4miFS+4PV+PIObnAerG/mB1F26NC
+    \\-----END RSA PRIVATE KEY-----
+;
+pub const client_rsa_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIICXzCCAgWgAwIBAgICEAUwCgYIKoZIzj0EAwIwIjEgMB4GA1UEAwwXcXVpYy16
+    \\aWcgdGVzdCBjbGllbnQgQ0EwIBcNMjYwMTAxMDAwMDAwWhgPMjA1NjAxMDEwMDAw
+    \\MDBaMA4xDDAKBgNVBAMMA2JvYjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoC
+    \\ggEBANLw/KD6p9M9GD964J3ra8GD2LlvTi2pz4f4hWmE/or2RHDRXT5hs6C5v4Kp
+    \\LvYTloBU1UpCWBQONBiQBFksmgl4oo1sc+WsagnYl+CFie4/TiqulQjvqhu2FmPu
+    \\eVblQYrJmj8KwbaYCYecTL4zVLtOFyY3MJKCaRJqHgZzAQ3B/cE2Vf4EdlQML8Qt
+    \\igiTMa5t60/y0HSMXDW7JsdqIZrWnrd94WPG+BOqEZufGaqaR70FQsMylZqThhwG
+    \\yevfQ0pCQT/lxwCneZjNc9iFNI/xKHyO+IW13RXMRYYn57xcD6xf37FZuC+6HmTC
+    \\94DoR3Qgcz08GSC15ZoNesa8kCsCAwEAAaNyMHAwCQYDVR0TBAIwADAOBgNVHQ8B
+    \\Af8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwIwHQYDVR0OBBYEFK4SefAY3lko
+    \\B66Um8Lv9RWeVPt2MB8GA1UdIwQYMBaAFLJiJCzGNTHs0Y02bnX71lvBjpXJMAoG
+    \\CCqGSM49BAMCA0gAMEUCIEpukPhPP5da8qXhqhhrgVuXOaQoPdoXAX0oYhlTTqUr
+    \\AiEAso7ive8iCR7GXnxuVXaILDymZzP7wpvi4NmR/LCg27A=
+    \\-----END CERTIFICATE-----
+;
+
+/// The client certificates above, parsed, and a bundle trusting
+/// `client_ca_pem`. Keep it in place once loaded: certificates point into it.
+pub const ClientCerts = struct {
+    bundle: std.crypto.Certificate.Bundle,
+    der: [6][2048]u8,
+    chains: [6][1][]const u8,
+    key_der: [2][2048]u8,
+    ec_key: []const u8,
+    rsa_key: []const u8,
+
+    pub const Which = enum { valid, expired, foreign, server_only, rsa };
+
+    pub fn load(self: *ClientCerts, gpa: std.mem.Allocator) !void {
+        self.bundle = .empty;
+        errdefer self.bundle.deinit(gpa);
+        const ca = try tls13.parsePemCert(client_ca_pem, &self.der[5]);
+        try self.bundle.bytes.appendSlice(gpa, ca);
+        try self.bundle.parseCert(gpa, 0, @import("../sys.zig").realtimeSeconds());
+        const pems = [5][]const u8{ client_pem, client_expired_pem, client_foreign_pem, client_server_only_pem, client_rsa_pem };
+        for (pems, 0..) |pem, i| self.chains[i] = .{try tls13.parsePemCert(pem, &self.der[i])};
+        self.ec_key = (try tls13.extractPrivateKey(try tls13.parsePemPrivateKey(client_key_pem, &self.key_der[0]))).bytes;
+        self.rsa_key = (try tls13.extractPrivateKey(try tls13.parsePemPrivateKey(client_rsa_key_pem, &self.key_der[1]))).bytes;
+    }
+
+    pub fn deinit(self: *ClientCerts, gpa: std.mem.Allocator) void {
+        self.bundle.deinit(gpa);
+    }
+
+    pub fn certificate(self: *const ClientCerts, which: Which) tls13.ServerCertificate {
+        const i = @intFromEnum(which);
+        if (which == .rsa) return .{ .cert_chain_der = &self.chains[i], .private_key_bytes = self.rsa_key, .private_key_algorithm = .rsa };
+        return .{ .cert_chain_der = &self.chains[i], .private_key_bytes = self.ec_key };
+    }
+};

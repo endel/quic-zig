@@ -342,6 +342,36 @@ test "fuzz: tls client fed a server flight" {
     }.f, .{});
 }
 
+test "fuzz: client certificate messages" {
+    // A CertificateRequest body and a Certificate body carrying a real leaf.
+    const seeds = comptime [_][]const u8{
+        &.{ 0, 0, 8, 0, 13, 0, 4, 0, 2, 4, 3 },
+        &.{ 0, 0, 0, 0 },
+        &.{ 0, 0, 0, 6, 0, 0, 1, 0x30, 0, 0 },
+    };
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+            _ = tls13.parseCertificateRequest(input) catch {};
+            var chain: [tls13.max_client_chain][]const u8 = undefined;
+            const list = (tls13.parseCertificateList(input, &chain) catch return) orelse return;
+            for (list) |der| {
+                _ = tls13.clientLeafUsageOk(der);
+                // std's DER parser trusts every length; only a checked shape may reach it.
+                if (!tls13.certificateWellFormed(der)) continue;
+                const cert: std.crypto.Certificate = .{ .buffer = der, .index = 0 };
+                const p = cert.parse() catch continue;
+                _ = p.verifyHostName("localhost") catch {};
+                _ = tls13.issuerConstraintsOk(der, 1);
+                if (p.pub_key_algo == .rsaEncryption) _ = std.crypto.Certificate.rsa.PublicKey.parseDer(p.pubKey()) catch {};
+            }
+            // No anchors: every chain ends in UnknownCa or earlier.
+            const empty: std.crypto.Certificate.Bundle = .empty;
+            _ = tls13.verifyPeerChain(list, &empty, 1_800_000_000) catch {};
+        }
+    }.f, .{ .corpus = &seeds });
+}
+
 // ════════════════════════════════════════════════════════
 // Target 11: HTTP Capsule Parsing (RFC 9297 §4)
 //

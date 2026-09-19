@@ -18,10 +18,12 @@
 //!   literal), and CertificateVerify with ECDSA P-256 / P-384, Ed25519 or
 //!   RSA-PSS.
 //! - SNI, ALPN, middlebox compatibility mode, KeyUpdate in both directions.
+//! - A client certificate (`Config.client_certificate`), presented when the
+//!   server asks and its key can sign with a scheme the server offers;
+//!   otherwise a CertificateRequest gets an empty Certificate.
 //!
 //! Not supported, by design: TLS 1.2 and earlier, session resumption and
-//! 0-RTT (NewSessionTicket is ignored), client certificates (a
-//! CertificateRequest gets an empty Certificate), revocation checks.
+//! 0-RTT (NewSessionTicket is ignored), revocation checks.
 const std = @import("std");
 const sys = @import("../sys.zig");
 const tls13 = @import("../quic/tls13.zig");
@@ -82,6 +84,9 @@ pub const Config = struct {
     /// The first gets a key share in the ClientHello; the server may ask for
     /// another through HelloRetryRequest.
     groups: []const Group = &.{ .x25519, .secp256r1 },
+    /// Chain (leaf first) and key presented when the server asks for a
+    /// client certificate.
+    client_certificate: ?tls13.ServerCertificate = null,
 };
 
 pub const Error = error{
@@ -164,6 +169,8 @@ pub const Conn = struct {
     client_hs_secret: Secret = @splat(0),
     server_hs_secret: Secret = @splat(0),
     certificate_requested: bool = false,
+    /// How we sign our CertificateVerify; null sends an empty Certificate.
+    client_sig_scheme: ?tls.SignatureScheme = null,
     leaf_key_buf: [1100]u8 = undefined,
     leaf_key_len: usize = 0,
     leaf_key_algo: Certificate.AlgorithmCategory = undefined,
@@ -517,7 +524,9 @@ pub const Conn = struct {
             },
             .wait_certificate => {
                 if (kind == hs_certificate_request and !self.certificate_requested) {
+                    const offered = try tls13.parseCertificateRequest(msg[4..]);
                     self.certificate_requested = true;
+                    if (self.config.client_certificate) |c| self.client_sig_scheme = tls13.signatureSchemeFor(c.private_key_algorithm, offered);
                     self.transcript.update(msg);
                 } else if (kind == hs_certificate) {
                     try self.onCertificate(msg);
@@ -823,29 +832,16 @@ pub const Conn = struct {
     }
 
     fn verifyChain(self: *Conn, chain: []const []const u8, bundle: *const Certificate.Bundle) Error!void {
-        const now = sys.realtimeSeconds();
-        var child: ?Certificate.Parsed = null;
-        var last_err: Error = error.UnknownCa;
-        for (chain, 0..) |der, i| {
-            const cert: Certificate = .{ .buffer = der, .index = 0 };
-            const parsed = cert.parse() catch return error.BadCertificate;
-            if (child) |c| {
-                c.verify(parsed, now) catch |err| return certError(err);
-                if (!tls13.issuerConstraintsOk(der, i)) return error.BadCertificate;
-            } else {
-                try self.checkName(parsed);
-                const key = parsed.pubKey();
-                if (key.len > self.leaf_key_buf.len) return error.BadCertificate;
-                @memcpy(self.leaf_key_buf[0..key.len], key);
-                self.leaf_key_len = key.len;
-                self.leaf_key_algo = std.meta.activeTag(parsed.pub_key_algo);
-            }
-            // Anchored as soon as one link is signed by a trusted CA; what the
-            // server sent beyond it (a cross-signed root, say) is not needed.
-            if (bundle.verify(parsed, now)) |_| return else |err| last_err = certError(err);
-            child = parsed;
-        }
-        return last_err;
+        if (!tls13.certificateWellFormed(chain[0])) return error.BadCertificate;
+        const leaf_cert: Certificate = .{ .buffer = chain[0], .index = 0 };
+        const leaf = leaf_cert.parse() catch return error.BadCertificate;
+        try self.checkName(leaf);
+        _ = try tls13.verifyPeerChain(chain, bundle, sys.realtimeSeconds());
+        const key = leaf.pubKey();
+        if (key.len > self.leaf_key_buf.len) return error.BadCertificate;
+        @memcpy(self.leaf_key_buf[0..key.len], key);
+        self.leaf_key_len = key.len;
+        self.leaf_key_algo = std.meta.activeTag(leaf.pub_key_algo);
     }
 
     fn checkName(self: *Conn, leaf: Certificate.Parsed) Error!void {
@@ -917,9 +913,13 @@ pub const Conn = struct {
         self.hs_out.clearRetainingCapacity();
         var b: Builder = .{ .list = &self.hs_out, .gpa = self.allocator };
         if (self.certificate_requested) {
-            // No client certificate: an empty list, context echoed (always empty here).
-            try b.bytes(&.{ hs_certificate, 0, 0, 4, 0, 0, 0, 0 });
-            self.transcript.update(self.hs_out.items);
+            if (self.client_sig_scheme) |scheme| {
+                try self.writeClientCertificate(&b, scheme);
+            } else {
+                // No client certificate: an empty list, context echoed (always empty here).
+                try b.bytes(&.{ hs_certificate, 0, 0, 4, 0, 0, 0, 0 });
+                self.transcript.update(self.hs_out.items);
+            }
         }
         const verify_data = common.finishedMac(self.suite, &self.client_hs_secret, self.transcript.peek());
         try b.u8_(hs_finished);
@@ -943,6 +943,44 @@ pub const Conn = struct {
         }
     }
 
+    /// Our Certificate and CertificateVerify, into the transcript as built.
+    fn writeClientCertificate(self: *Conn, b: *Builder, scheme: tls.SignatureScheme) Error!void {
+        const cert = self.config.client_certificate.?;
+        var start = b.list.items.len;
+        try b.u8_(hs_certificate);
+        const msg = try b.begin(u24);
+        try b.u8_(0); // certificate_request_context
+        const list = try b.begin(u24);
+        for (cert.cert_chain_der) |der| {
+            if (der.len > std.math.maxInt(u24)) return error.InternalError;
+            try b.u24_(@intCast(der.len));
+            try b.bytes(der);
+            try b.u16_(0);
+        }
+        try b.end(u24, list);
+        try b.end(u24, msg);
+        self.transcript.update(b.list.items[start..]);
+
+        start = b.list.items.len;
+        const context = "TLS 1.3, client CertificateVerify";
+        const len = hashLen(self.suite);
+        var content: [64 + context.len + 1 + 48]u8 = undefined;
+        @memset(content[0..64], 0x20);
+        content[64..][0..context.len].* = context.*;
+        content[64 + context.len] = 0;
+        const th = self.transcript.peek();
+        @memcpy(content[64 + context.len + 1 ..][0..len], th[0..len]);
+        var sig_buf: [tls13.rsa.max_signature_len]u8 = undefined;
+        const sig = try tls13.signCertificateVerify(scheme, cert.private_key_bytes, content[0 .. 64 + context.len + 1 + len], &sig_buf);
+        try b.u8_(hs_certificate_verify);
+        const cv = try b.begin(u24);
+        try b.u16_(@intFromEnum(scheme));
+        try b.u16_(@intCast(sig.len));
+        try b.bytes(sig);
+        try b.end(u24, cv);
+        self.transcript.update(b.list.items[start..]);
+    }
+
     fn onKeyUpdate(self: *Conn, body: []const u8) Error!void {
         if (body.len != 1) return error.DecodeError;
         if (body[0] > 1) return error.IllegalParameter;
@@ -950,14 +988,6 @@ pub const Conn = struct {
         if (body[0] == 1) self.key_update_owed = true;
     }
 };
-
-fn certError(err: anyerror) Error {
-    return switch (err) {
-        error.CertificateIssuerNotFound => error.UnknownCa,
-        error.CertificateExpired, error.CertificateNotYetValid => error.CertificateExpired,
-        else => error.BadCertificate,
-    };
-}
 
 fn alertFor(err: Error) ?tls.Alert.Description {
     return switch (err) {
@@ -1362,4 +1392,155 @@ test "mutated server flights never crash the client" {
         try copyHelloState(&client, &p.client);
         client.feed(mutated[0..cut]) catch {};
     }
+}
+
+// ─── Client certificates ─────────────────────────────────────────────
+
+const ClientAuthSetup = struct {
+    certs: test_certs.TestCerts,
+    clients: test_certs.ClientCerts,
+    auth: tls13.ClientAuth,
+
+    /// `certs.entries[0]` (localhost) asks for a certificate in `mode`.
+    fn init(self: *ClientAuthSetup, mode: tls13.ClientAuth.Mode) !void {
+        try self.certs.load();
+        try self.clients.load(testing.allocator);
+        self.auth = .{ .ca_bundle = &self.clients.bundle, .mode = mode };
+        self.certs.entries[0].client_auth = &self.auth;
+    }
+
+    fn deinit(self: *ClientAuthSetup) void {
+        self.clients.deinit(testing.allocator);
+    }
+};
+
+test "a client certificate is verified and handed to the server" {
+    var s: ClientAuthSetup = undefined;
+    try s.init(.required);
+    defer s.deinit();
+    for ([_]test_certs.ClientCerts.Which{ .valid, .rsa }) |which| {
+        const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
+        const client_config: Config = .{ .server_name = "localhost", .client_certificate = s.clients.certificate(which) };
+        var p = try Pair.init(&client_config, &server_config);
+        defer p.deinit();
+        try expectRoundTrip(&p);
+        try testing.expectEqualSlices(u8, s.clients.certificate(which).cert_chain_der[0], p.server.peerCertificate().?);
+        try testing.expectEqual(&s.auth, p.server.clientAuth().?);
+    }
+}
+
+/// The server refuses the client's certificate (or its absence) with `alert`
+/// after the client, which doesn't wait for a verdict, thinks it is done.
+fn expectClientRefused(mode: tls13.ClientAuth.Mode, which: ?test_certs.ClientCerts.Which, want: anyerror, alert: tls.Alert.Description) !void {
+    var s: ClientAuthSetup = undefined;
+    try s.init(mode);
+    defer s.deinit();
+    const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
+    const client_config: Config = .{
+        .server_name = "localhost",
+        .client_certificate = if (which) |w| s.clients.certificate(w) else null,
+    };
+    var p = try Pair.init(&client_config, &server_config);
+    defer p.deinit();
+    try testing.expectError(want, p.pump());
+    try testing.expect(!p.server.handshakeComplete());
+    try testing.expectEqual(null, p.server.peerCertificate());
+    try testing.expectError(error.PeerAlert, p.client.feed(p.server.pendingOutput()));
+    try testing.expectEqual(alert, p.client.peerAlert().?);
+}
+
+test "a missing, foreign, expired or server-only client certificate is refused" {
+    try expectClientRefused(.required, null, error.CertificateRequired, .certificate_required);
+    try expectClientRefused(.required, .foreign, error.UnknownCa, .unknown_ca);
+    try expectClientRefused(.required, .expired, error.CertificateExpired, .certificate_expired);
+    try expectClientRefused(.required, .server_only, error.BadCertificate, .bad_certificate);
+    // Optional only forgives a missing certificate, never a bad one.
+    try expectClientRefused(.optional, .foreign, error.UnknownCa, .unknown_ca);
+}
+
+test "optional client auth completes without a certificate" {
+    var s: ClientAuthSetup = undefined;
+    try s.init(.optional);
+    defer s.deinit();
+    const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
+    const client_config: Config = .{ .server_name = "localhost" };
+    var p = try Pair.init(&client_config, &server_config);
+    defer p.deinit();
+    try expectRoundTrip(&p);
+    try testing.expectEqual(null, p.server.peerCertificate());
+    try testing.expectEqual(&s.auth, p.server.clientAuth().?);
+}
+
+test "client auth follows the certificate SNI picks" {
+    var s: ClientAuthSetup = undefined;
+    try s.init(.required);
+    defer s.deinit();
+    // *.example.com asks for nothing, so a client without a certificate gets in.
+    const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
+    const client_config: Config = .{ .server_name = "a.example.com" };
+    var p = try Pair.init(&client_config, &server_config);
+    defer p.deinit();
+    try expectRoundTrip(&p);
+    try testing.expectEqual(null, p.server.clientAuth());
+    try testing.expectEqual(null, p.server.peerCertificate());
+}
+
+test "no session ticket under client auth" {
+    var s: ClientAuthSetup = undefined;
+    try s.init(.required);
+    defer s.deinit();
+    for ([_]bool{ false, true }) |with_auth| {
+        if (!with_auth) s.certs.entries[0].client_auth = null;
+        defer s.certs.entries[0].client_auth = &s.auth;
+        const server_config: tls_server.Config = .{ .certs = &s.certs.entries, .ticket_key = @splat(3) };
+        const client_config: Config = .{ .server_name = "localhost", .client_certificate = s.clients.certificate(.valid) };
+        var p = try Pair.init(&client_config, &server_config);
+        defer p.deinit();
+        // ClientHello, the server's flight, then the client's.
+        for (0..2) |_| {
+            const out = p.client.pendingOutput();
+            const n = out.len;
+            try p.server.feed(out);
+            p.client.consumeOutput(n);
+            if (p.server.handshakeComplete()) break;
+            const back = p.server.pendingOutput();
+            const m = back.len;
+            try p.client.feed(back);
+            p.server.consumeOutput(m);
+        }
+        try testing.expect(p.server.handshakeComplete());
+        try testing.expectEqual(!with_auth, p.server.pendingOutput().len > 0);
+    }
+}
+
+test "the client answers a CertificateRequest it can't satisfy with an empty Certificate" {
+    var s: ClientAuthSetup = undefined;
+    try s.init(.optional);
+    defer s.deinit();
+    const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
+    // An Ed25519 key the server offers no scheme for would do the same; a
+    // client without a certificate is the common case.
+    const client_config: Config = .{ .server_name = "localhost" };
+    var p = try Pair.init(&client_config, &server_config);
+    defer p.deinit();
+    try p.pump();
+    try testing.expect(p.client.certificate_requested);
+    try testing.expectEqual(null, p.client.client_sig_scheme);
+}
+
+test "certificate_authorities lists the bundle's subjects" {
+    var s: ClientAuthSetup = undefined;
+    try s.init(.required);
+    defer s.deinit();
+    const list = try tls13.certificateAuthorities(testing.allocator, &s.clients.bundle);
+    defer testing.allocator.free(list);
+    try testing.expect(list.len > 4);
+    try testing.expectEqual(list.len - 2, std.mem.readInt(u16, list[0..2], .big));
+    s.auth.authorities = list;
+    const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
+    const client_config: Config = .{ .server_name = "localhost", .client_certificate = s.clients.certificate(.valid) };
+    var p = try Pair.init(&client_config, &server_config);
+    defer p.deinit();
+    try expectRoundTrip(&p);
+    try testing.expect(p.server.peerCertificate() != null);
 }

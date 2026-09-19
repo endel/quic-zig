@@ -228,6 +228,17 @@ pub const Session = struct {
         return self.entry.id;
     }
 
+    /// The client's verified certificate (DER leaf), when the certificate
+    /// entry SNI selected has `client_auth` and the client sent one.
+    pub fn peerCertificate(self: *const Session) ?[]const u8 {
+        return self.entry.conn.peerCertificate();
+    }
+
+    /// The client-auth policy this connection's handshake ran under.
+    pub fn clientAuth(self: *const Session) ?*const tls13.ClientAuth {
+        return self.entry.conn.clientAuth();
+    }
+
     // --- H3 methods (also for ordinary requests on a WebTransport server) ---
 
     /// A whole response: headers, `body` as one DATA frame, FIN.

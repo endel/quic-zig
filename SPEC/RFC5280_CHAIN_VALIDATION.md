@@ -48,17 +48,48 @@ const tls_config = TlsConfig{
 
 - **Certificate Revocation Lists (CRL)** — RFC 5280 §5
 - **OCSP stapling** — RFC 6960
-- **Extended Key Usage** — `id-kp-serverAuth` not checked on leaf (recommended but not required by TLS 1.3)
+- **Extended Key Usage** — `id-kp-serverAuth` not checked on a server's leaf (recommended but not required by TLS 1.3); `id-kp-clientAuth` is checked on a client's
 - **Name Constraints** — RFC 5280 §4.2.1.10
 - **Policy Constraints** — RFC 5280 §4.2.1.11
 - **Mandatory ca_bundle enforcement** — When `skip_cert_verify=false` and no `ca_bundle` is provided, the chain's self-signed root is accepted without trust anchor verification
 
 #### Client certificates
-- A server's `CertificateRequest` (RFC 8446 §4.3.2) is answered with an empty
-  `Certificate` and no `CertificateVerify` (§4.4.2). We never offer one.
-  Refusing to answer used to end the handshake, which is what made every
-  Cloudflare edge — `cdn.moq.dev` among them — unreachable.
-- We never send a `CertificateRequest` of our own.
+- A server asks for one when the certificate SNI selected has
+  `CertEntry.client_auth` (or, without `certs`, `TlsConfig.client_auth`):
+  a `CertificateRequest` (RFC 8446 §4.3.2) with an empty context, our
+  `signature_algorithms`, and `certificate_authorities` when
+  `ClientAuth.authorities` is set (`tls13.certificateAuthorities` builds it
+  from the bundle, or nothing past 8 KiB). Same for QUIC and `tls_server`.
+- The client's chain goes through `tls13.verifyPeerChain` — the same links,
+  dates and issuer constraints as a server chain, anchored in
+  `ClientAuth.ca_bundle` — and the leaf must allow client authentication:
+  `digitalSignature` in keyUsage and `clientAuth` (or anyExtendedKeyUsage) in
+  extendedKeyUsage, each when present. No name is checked; the application
+  reads the leaf from `peerCertificate()` and decides what it proves.
+- `ClientAuth.mode = .required` fails a client that sends no certificate
+  with `certificate_required`; `.optional` lets it in with no identity. A
+  certificate that does not verify fails either way (`bad_certificate`,
+  `unknown_ca`, `certificate_expired`), and a bad `CertificateVerify` with
+  `decrypt_error`.
+- Session tickets are neither issued nor accepted under a client-auth
+  policy: a ticket carries no client identity, so resuming would skip the
+  certificate. Every connection proves it afresh (and so never gets 0-RTT).
+- A client answers a `CertificateRequest` with `client_certificate` when its
+  key can sign with a scheme the server offers, and with an empty
+  `Certificate` otherwise. Refusing to answer used to end the handshake,
+  which is what made every Cloudflare edge — `cdn.moq.dev` among them —
+  unreachable.
+- Post-handshake authentication (RFC 8446 §4.6.2) is not supported; RFC 9001
+  §4.4 forbids it over QUIC anyway.
+
+#### Malformed certificates
+`std.crypto.Certificate.der.Element.parse` checks no length against its
+buffer, so a truncated or lying certificate indexes out of bounds inside
+`Certificate.parse`. Every certificate a peer sends first passes
+`tls13.certificateWellFormed`: the X.509 skeleton std walks, each element
+within its parent, extension values well-formed DER, an RSA key's
+`SEQUENCE { INTEGER, INTEGER }`. A fuzz target and a random-corruption test
+feed what it accepts to std's parser and our extension readers.
 
 ### Caveats
 
