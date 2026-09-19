@@ -195,7 +195,7 @@
 | 4.1 | Interface to TLS | ✅ Done | Action-based step() pattern |
 | 4.2 | TLS Version | ✅ Done | TLS 1.3 only |
 | 4.3 | ClientHello Size | ✅ Done | Initial packet padded to 1200 bytes (RFC 9001 requires packet padding, not CH padding) |
-| 4.4 | Peer Authentication | ✅ Done | Chain validation, hostname verify, trust anchors via `ClientConfig.ca`; answers a `CertificateRequest` with an empty certificate. The server signs with ECDSA P-256, Ed25519 or RSA-PSS, picking the scheme (and, among certificates for the same name, the certificate) from the client's `signature_algorithms`; `handshake_failure` when nothing fits. See [RFC5280_CHAIN_VALIDATION.md](RFC5280_CHAIN_VALIDATION.md) for what is still not checked |
+| 4.4 | Peer Authentication | ✅ Done | Chain validation, hostname verify, trust anchors via `ClientConfig.ca`; asks for client certificates per SNI entry (`ClientAuth`: required or optional, CA bundle, no tickets while it applies) and presents one as a client. The server signs with ECDSA P-256, Ed25519 or RSA-PSS, picking the scheme (and, among certificates for the same name, the certificate) from the client's `signature_algorithms`; `handshake_failure` when nothing fits. See [RFC5280_CHAIN_VALIDATION.md](RFC5280_CHAIN_VALIDATION.md) for what is still not checked |
 | 4.5 | Session Resumption | ✅ Done | PSK/tickets, binder, NewSessionTicket |
 | 4.6 | 0-RTT | ✅ Done | Early key install, 0-RTT packing; `early_data` answered in EncryptedExtensions only when the ClientHello offered it (RFC 8446 §4.2.10) |
 | 4.7 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager |

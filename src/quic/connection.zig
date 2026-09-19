@@ -906,6 +906,7 @@ pub const Connection = struct {
                 tls13.Tls13Handshake.initServerInto(hs, tc_versioned, local_params)
             else
                 tls13.Tls13Handshake.initClientInto(hs, tc_versioned, local_params);
+            hs.allocator = allocator;
             conn.tls13_hs = hs;
         }
 
@@ -995,6 +996,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         if (self.tls13_hs) |hs| {
+            hs.deinit();
             self.allocator.destroy(hs);
             self.tls13_hs = null;
         }
@@ -2595,6 +2597,10 @@ pub const Connection = struct {
                     error.NoApplicationProtocol => tls.Alert.Description.no_application_protocol,
                     error.MissingExtension => tls.Alert.Description.missing_extension,
                     error.HandshakeFailure => tls.Alert.Description.handshake_failure,
+                    error.UnknownCa => tls.Alert.Description.unknown_ca,
+                    error.CertificateExpired => tls.Alert.Description.certificate_expired,
+                    error.CertificateRequired => tls.Alert.Description.certificate_required,
+                    error.IllegalParameter => tls.Alert.Description.illegal_parameter,
                     else => tls.Alert.Description.internal_error,
                 });
                 self.closeWithTransportError(TransportError.cryptoError(tls_alert), @intFromEnum(FrameType.crypto), "TLS handshake failure");
@@ -4127,6 +4133,20 @@ pub const Connection = struct {
     pub fn negotiatedAlpn(self: *const Connection) []const u8 {
         const hs = self.tls13_hs orelse return "";
         return hs.negotiatedAlpn();
+    }
+
+    /// Server: the client's verified certificate (DER leaf); see
+    /// `Tls13Handshake.peerCertificate`.
+    pub fn peerCertificate(self: *const Connection) ?[]const u8 {
+        const hs = self.tls13_hs orelse return null;
+        return hs.peerCertificate();
+    }
+
+    /// Server: the client-auth policy the handshake ran under, from the
+    /// certificate entry SNI selected; null when none asked for a certificate.
+    pub fn clientAuth(self: *const Connection) ?*const tls13.ClientAuth {
+        const hs = self.tls13_hs orelse return null;
+        return hs.client_auth;
     }
 
     pub fn recvDatagram(self: *Connection, buf: []u8) ?usize {

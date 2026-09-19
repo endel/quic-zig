@@ -16,9 +16,14 @@
 //! - ALPN, middlebox compatibility mode, KeyUpdate in both directions.
 //! - With `Config.ticket_key`: stateless session tickets and PSK-DHE
 //!   resumption (psk_dhe_ke; the key exchange still runs).
+//! - Client certificates, per certificate entry (`CertEntry.client_auth`):
+//!   a CertificateRequest, the client's chain verified against the entry's
+//!   CA bundle, its CertificateVerify checked, and the leaf kept for
+//!   `peerCertificate()`. No tickets are issued or accepted under a
+//!   client-auth entry, so a resumed session can't skip the certificate.
 //!
-//! Not supported, by design: TLS 1.2 and earlier, client certificates,
-//! 0-RTT (early data offered by a client is skipped), psk_ke resumption
+//! Not supported, by design: TLS 1.2 and earlier, post-handshake client
+//! authentication, 0-RTT (early data offered by a client is skipped), psk_ke resumption
 //! without (EC)DHE, external PSKs, record size limit and other optional
 //! extensions.
 
@@ -117,6 +122,15 @@ pub const Error = error{
     RecordOverflow,
     DecryptError,
     InternalError,
+    /// The client's certificate is malformed, breaks a constraint, isn't
+    /// for client authentication, or uses an algorithm we can't check.
+    BadCertificate,
+    /// The client's chain doesn't lead to the entry's `ClientAuth.ca_bundle`.
+    UnknownCa,
+    /// A certificate in the client's chain is expired or not yet valid.
+    CertificateExpired,
+    /// `ClientAuth.mode` is `.required` and the client sent no certificate.
+    CertificateRequired,
     /// The peer sent a fatal alert; see `peerAlert()`.
     PeerAlert,
     /// An earlier `feed` already failed; the connection is dead.
@@ -137,6 +151,8 @@ const max_ticket_lifetime_s: u32 = 7 * 24 * 3600;
 const State = enum {
     wait_client_hello,
     wait_client_hello_retry,
+    wait_client_certificate,
+    wait_client_certificate_verify,
     wait_finished,
     connected,
     failed,
@@ -157,6 +173,10 @@ pub const Conn = struct {
     // Held from our Finished to the client's, for the resumption secret.
     master_secret: Secret = @splat(0),
     resumed: bool = false,
+    /// The selected certificate's client-auth policy, once the ClientHello is in.
+    client_auth: ?*const tls13.ClientAuth = null,
+    /// The client's verified leaf certificate (DER), owned.
+    peer_cert: ?[]u8 = null,
 
     bufs: ?*Buffers = null,
     in_len: usize = 0,
@@ -195,6 +215,7 @@ pub const Conn = struct {
         self.hs_out.deinit(gpa);
         self.app_in.deinit(gpa);
         self.out.deinit(gpa);
+        if (self.peer_cert) |c| gpa.free(c);
         crypto.secureZero(u8, mem.asBytes(&self.client_hs_secret));
         crypto.secureZero(u8, mem.asBytes(&self.client_app_secret));
         crypto.secureZero(u8, mem.asBytes(&self.master_secret));
@@ -300,6 +321,21 @@ pub const Conn = struct {
         return self.resumed;
     }
 
+    /// The client's certificate (DER, leaf only), verified against the
+    /// selected entry's `ClientAuth`, once the handshake completes. Null
+    /// when no certificate was asked for, or `.optional` and none was sent.
+    pub fn peerCertificate(self: *const Conn) ?[]const u8 {
+        if (self.state != .connected) return null;
+        return self.peer_cert;
+    }
+
+    /// The client-auth policy of the certificate the handshake selected,
+    /// once the ClientHello is in. Tells an application serving several
+    /// names which policy vouched for `peerCertificate()`.
+    pub fn clientAuth(self: *const Conn) ?*const tls13.ClientAuth {
+        return self.client_auth;
+    }
+
     /// The negotiated key exchange group, once the ServerHello is out.
     pub fn keyExchangeGroup(self: *const Conn) ?Group {
         return if (self.write_keys != null) self.group else null;
@@ -350,7 +386,10 @@ pub const Conn = struct {
             ct_ccs => {
                 // Middlebox compat (RFC 8446 §5): one unprotected 0x01 between
                 // the first ClientHello and the client Finished, then ignored.
-                const in_handshake = self.state == .wait_client_hello_retry or self.state == .wait_finished;
+                const in_handshake = switch (self.state) {
+                    .wait_client_hello_retry, .wait_client_certificate, .wait_client_certificate_verify, .wait_finished => true,
+                    else => false,
+                };
                 if (!in_handshake or payload.len != 1 or payload[0] != 1) return error.UnexpectedMessage;
             },
             ct_alert => {
@@ -510,19 +549,29 @@ pub const Conn = struct {
             if (self.hs_in.items.len - pos < 4 + len) break;
             const msg = self.hs_in.items[pos..][0 .. 4 + len];
             pos += 4 + len;
-            try self.handleHandshakeMessage(msg);
-            // Every message we accept changes keys or state, and RFC 8446
-            // §5.1 forbids a message sharing a record across a key change.
-            if (pos != self.hs_in.items.len) return error.UnexpectedMessage;
+            const keys_changed = try self.handleHandshakeMessage(msg);
+            // RFC 8446 §5.1: a message may not share a record across a key change.
+            if (keys_changed and pos != self.hs_in.items.len) return error.UnexpectedMessage;
         }
     }
 
-    fn handleHandshakeMessage(self: *Conn, msg: []const u8) Error!void {
+    /// True when the message changed keys, or began a new flight.
+    fn handleHandshakeMessage(self: *Conn, msg: []const u8) Error!bool {
         const kind = msg[0];
         switch (self.state) {
             .wait_client_hello, .wait_client_hello_retry => {
                 if (kind != hs_client_hello) return error.UnexpectedMessage;
                 try self.onClientHello(msg);
+            },
+            .wait_client_certificate => {
+                if (kind != hs_certificate) return error.UnexpectedMessage;
+                try self.onClientCertificate(msg);
+                return false;
+            },
+            .wait_client_certificate_verify => {
+                if (kind != hs_certificate_verify) return error.UnexpectedMessage;
+                try self.onClientCertificateVerify(msg);
+                return false;
             },
             .wait_finished => {
                 if (kind != hs_finished) return error.UnexpectedMessage;
@@ -534,6 +583,7 @@ pub const Conn = struct {
             },
             .failed => return error.ConnectionFailed,
         }
+        return true;
     }
 
     fn onClientHello(self: *Conn, msg: []const u8) Error!void {
@@ -562,6 +612,8 @@ pub const Conn = struct {
         } else self.server_name_len = null;
         const selection = tls13.selectCertificateFor(config.certs, ch.server_name, ch.signature_algorithms) orelse return error.InternalError;
         const cert = &selection.entry.cert;
+        // The selection can change across a HelloRetryRequest; this one stands.
+        self.client_auth = selection.entry.client_auth;
 
         self.selected_alpn = null;
         if (ch.alpn) |offered| {
@@ -594,10 +646,11 @@ pub const Conn = struct {
         // RFC 8446 §4.2.9: a PSK offer must say how it may be used.
         if (ch.psk_identities != null and ch.psk_modes == null) return error.MissingExtension;
         var psk: ?Resumption = null;
-        if (config.ticket_key) |key| {
+        // A ticket carries no client identity: with client auth, always a full handshake.
+        if (config.ticket_key) |key| if (self.client_auth == null) {
             if (ch.psk_identities != null and mem.indexOfScalar(u8, ch.psk_modes.?, psk_dhe_ke) != null)
                 psk = try self.acceptTicket(key, msg, ch);
-        }
+        };
         self.resumed = psk != null;
 
         var sig_scheme: tls.SignatureScheme = undefined;
@@ -648,6 +701,15 @@ pub const Conn = struct {
         try buildEncryptedExtensions(&b, self.selected_alpn, selection.matched);
         self.transcript.update(self.hs_out.items[start..]);
 
+        if (self.client_auth) |auth| {
+            start = self.hs_out.items.len;
+            const n = 4 + 1 + 2 + 6 + tls13.client_auth_signature_schemes.len + 4 + auth.authorities.len;
+            const dst = try self.hs_out.addManyAsSlice(self.allocator, n);
+            const req = tls13.buildCertificateRequest(dst, auth) catch return error.InternalError;
+            self.hs_out.shrinkRetainingCapacity(start + req.len);
+            self.transcript.update(self.hs_out.items[start..]);
+        }
+
         if (psk == null) {
             start = self.hs_out.items.len;
             try buildCertificate(&b, cert.cert_chain_der);
@@ -676,6 +738,50 @@ pub const Conn = struct {
         self.client_app_secret = app.client;
         self.master_secret = app.master;
 
+        self.state = if (self.client_auth != null) .wait_client_certificate else .wait_finished;
+    }
+
+    fn onClientCertificate(self: *Conn, msg: []const u8) Error!void {
+        const auth = self.client_auth.?;
+        var chain_buf: [tls13.max_client_chain][]const u8 = undefined;
+        const chain = (try tls13.parseCertificateList(msg[4..], &chain_buf)) orelse {
+            if (auth.mode == .required) return error.CertificateRequired;
+            self.transcript.update(msg);
+            self.state = .wait_finished;
+            return;
+        };
+        _ = try tls13.verifyPeerChain(chain, auth.ca_bundle, sys.realtimeSeconds());
+        if (!tls13.clientLeafUsageOk(chain[0])) return error.BadCertificate;
+        self.peer_cert = try self.allocator.dupe(u8, chain[0]);
+        self.transcript.update(msg);
+        self.state = .wait_client_certificate_verify;
+    }
+
+    fn onClientCertificateVerify(self: *Conn, msg: []const u8) Error!void {
+        var p: Parser = .{ .buf = msg[4..] };
+        const scheme = try p.int(u16);
+        const sig = try p.vec(u16);
+        if (p.rest() != 0) return error.DecodeError;
+        if (!containsU16(&tls13.client_auth_signature_schemes, scheme)) return error.IllegalParameter;
+        const cert: crypto.Certificate = .{ .buffer = self.peer_cert.?, .index = 0 };
+        const leaf = cert.parse() catch return error.BadCertificate;
+
+        const context = "TLS 1.3, client CertificateVerify";
+        const len = hashLen(self.suite);
+        var content: [64 + context.len + 1 + 48]u8 = undefined;
+        @memset(content[0..64], 0x20);
+        content[64..][0..context.len].* = context.*;
+        content[64 + context.len] = 0;
+        const th = self.transcript.peek();
+        @memcpy(content[64 + context.len + 1 ..][0..len], th[0..len]);
+        tls13.verifyCertificateVerifySignature(
+            leaf.pubKey(),
+            std.meta.activeTag(leaf.pub_key_algo),
+            scheme,
+            sig,
+            content[0 .. 64 + context.len + 1 + len],
+        ) catch return error.DecryptError;
+        self.transcript.update(msg);
         self.state = .wait_finished;
     }
 
@@ -721,7 +827,7 @@ pub const Conn = struct {
         self.state = .connected;
 
         // Nothing may follow our close_notify.
-        if (self.config.ticket_key) |key| if (!self.close_sent) try self.sendTicket(key);
+        if (self.config.ticket_key) |key| if (!self.close_sent and self.client_auth == null) try self.sendTicket(key);
         crypto.secureZero(u8, &self.master_secret);
     }
 
@@ -841,6 +947,10 @@ fn alertFor(err: Error) ?tls.Alert.Description {
         error.RecordOverflow => .record_overflow,
         error.DecryptError => .decrypt_error,
         error.InternalError, error.OutOfMemory => .internal_error,
+        error.BadCertificate => .bad_certificate,
+        error.UnknownCa => .unknown_ca,
+        error.CertificateExpired => .certificate_expired,
+        error.CertificateRequired => .certificate_required,
         error.PeerAlert, error.ConnectionFailed, error.NotConnected => null,
     };
 }
@@ -2462,4 +2572,26 @@ test "a bad binder is decrypt_error, a PSK without modes is missing_extension" {
         try testing.expectError(error.MissingExtension, client.handshake(&conn));
         try expectAlert(&conn, .missing_extension);
     }
+}
+
+test "a ticket is not accepted where client auth applies" {
+    var certs: TestCerts = undefined;
+    try certs.load();
+    const config: Config = .{ .certs = &certs.entries, .ticket_key = @splat(7) };
+    const ticket = try fullHandshakeForTicket(&config, .aes_128_gcm_sha256, "localhost");
+
+    var clients: test_certs.ClientCerts = undefined;
+    try clients.load(testing.allocator);
+    defer clients.deinit(testing.allocator);
+    const auth: tls13.ClientAuth = .{ .ca_bundle = &clients.bundle };
+    certs.entries[0].client_auth = &auth;
+    var conn = Conn.init(testing.allocator, &config);
+    defer conn.deinit();
+    var client: MiniClient = .{ .gpa = testing.allocator, .sni = "localhost", .offer = ticket };
+    defer client.deinit();
+    // MiniClient has no certificate to give; only the server's choice matters.
+    client.handshake(&conn) catch {};
+    try testing.expect(!conn.isResumed());
+    try testing.expectEqual(&auth, conn.clientAuth().?);
+    try testing.expect(!conn.handshakeComplete());
 }

@@ -7,11 +7,18 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Added
 
+- Client certificates (mutual TLS) for QUIC servers and `tls_server`: give a
+  certificate entry a `ClientAuth` (CA bundle, `.required` or `.optional`)
+  and clients reaching it by SNI are asked for a certificate, verified
+  against the bundle, and readable through `peerCertificate()` on the
+  connection or `Session`. No session tickets are issued or accepted under
+  it. `tls_client` and the QUIC client present `client_certificate` when a
+  server asks.
 - `quic.tls_client`, a sans-IO TLS 1.3 client for TLS over TCP, the
   counterpart of `tls_server`. It verifies the server against a CA bundle
   (chain, host name or IP address, CertificateVerify with ECDSA, Ed25519 or
   RSA-PSS), does SNI and ALPN, and holds data written before the handshake
-  finishes. No resumption, 0-RTT or client certificates.
+  finishes. No resumption or 0-RTT.
 - `quic.tls_server`, a sans-IO TLS 1.3 server for TLS over TCP: feed it the
   bytes you read and send what it queues, from any event loop. It negotiates
   AES-GCM or ChaCha20, X25519 or P-256 (with HelloRetryRequest), picks the
@@ -75,6 +82,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A peer's malformed certificate could crash the TLS and QUIC clients (an
+  out-of-bounds read in std's DER parser); certificates are now checked for
+  a well-formed structure before they are parsed.
 - A stream's send buffer now shrinks back to 64 KiB once a burst is
   acknowledged, instead of holding its peak size (megabytes for a relay writing
   ahead of a slow peer) until the stream closes.
