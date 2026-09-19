@@ -71,6 +71,9 @@ pub const FrameSorter = struct {
     /// 2n / MAX_COALESCED + 1 chunks.
     const MAX_COALESCED: usize = 64 * 1024;
 
+    /// Chunk slots a drained sorter keeps; in-order delivery never needs more.
+    const RETAINED_CHUNKS: usize = 64;
+
     allocator: Allocator,
 
     /// Buffered data chunks, sorted ascending by offset and never overlapping.
@@ -365,6 +368,11 @@ pub const FrameSorter = struct {
 
         if (self.chunks.items.len > 1 and first.end() != self.chunks.items[1].offset) self.breaks -= 1;
         _ = self.chunks.orderedRemove(0);
+        // A reordering burst can leave room for up to a thousand holes' worth
+        // of chunks; hand it back once drained.
+        if (self.chunks.items.len == 0 and self.chunks.capacity > RETAINED_CHUNKS) {
+            self.chunks.clearAndFree(self.allocator);
+        }
         const skip: usize = @intCast(self.read_pos - first.offset);
         const readable = first.data[skip..];
         // The caller frees what we return, so it must be a whole allocation;
@@ -703,6 +711,12 @@ pub const SendStream = struct {
     /// stream is reset: RFC 9000 §3.1 lets nothing follow RESET_STREAM.
     pub fn writeData(self: *SendStream, data: []const u8) !void {
         if (self.reset_err != null) return;
+        // Reuse the acked prefix before growing, so streaming that fits the
+        // current capacity never reallocates.
+        if (self.write_buffer.items.len + data.len > self.write_buffer.capacity) {
+            const prefix = self.ackedPrefix();
+            if (prefix > 0 and prefix >= self.write_buffer.items.len - prefix) self.dropPrefix(prefix);
+        }
         // Once the stream has buffered more than a few small writes, jump
         // capacity to 4 KiB in one shot. Avoids the 8→16→32→… realloc cascade
         // for streaming workloads (measured 2-5× faster on multi-write patterns)
@@ -724,27 +738,54 @@ pub const SendStream = struct {
     /// transfer holds the whole transfer.
     const COMPACT_THRESHOLD: usize = 64 * 1024;
 
-    fn compactAcked(self: *SendStream) void {
-        const buffered = self.write_buffer.items.len;
+    /// Capacity a stream keeps once a burst has drained. Past it, capacity is
+    /// handed back when the unacked bytes fall under a quarter of it, so one
+    /// burst does not pin its high-water mark for the stream's lifetime.
+    pub const RETAINED_CAPACITY: usize = 64 * 1024;
+
+    /// Buffered bytes the peer has acknowledged.
+    fn ackedPrefix(self: *const SendStream) usize {
         // Clamped: ack_offset should never pass write_offset, but the value
         // comes from a peer's ACK ranges and the subtraction below would
         // underflow rather than fail politely.
-        const prefix: usize = @intCast(@min(self.ack_offset - self.buf_base, buffered));
+        return @intCast(@min(self.ack_offset - self.buf_base, self.write_buffer.items.len));
+    }
+
+    fn compactAcked(self: *SendStream) void {
+        const prefix = self.ackedPrefix();
+        const live = self.write_buffer.items.len - prefix;
+        // Shrinking to twice the live bytes leaves a factor of two either way
+        // before the next grow or shrink, so reallocations stay amortised.
+        if (self.write_buffer.capacity > RETAINED_CAPACITY and live < self.write_buffer.capacity / 4) {
+            if (self.shrinkTo(prefix, @max(RETAINED_CAPACITY, live * 2))) return;
+        }
         if (prefix < COMPACT_THRESHOLD) return;
         // Move no more than we discard, so the copying is amortised O(1) per
         // byte. A flat threshold alone is quadratic against an application that
         // writes ahead: an 8 MB write acked in 64 KB steps memmoves ~512 MB and
         // costs two thirds of bulk throughput.
-        if (prefix < buffered - prefix) return;
+        if (prefix < live) return;
+        self.dropPrefix(prefix);
+    }
 
+    fn dropPrefix(self: *SendStream, prefix: usize) void {
         const items = self.write_buffer.items;
-        if (prefix >= buffered) {
-            self.write_buffer.clearRetainingCapacity();
-        } else {
-            std.mem.copyForwards(u8, items[0 .. buffered - prefix], items[prefix..]);
-            self.write_buffer.items.len = buffered - prefix;
-        }
+        const live = items.len - prefix;
+        std.mem.copyForwards(u8, items[0..live], items[prefix..]);
+        self.write_buffer.items.len = live;
         self.buf_base += prefix;
+    }
+
+    /// Move the bytes past `prefix` into a fresh `new_cap` allocation. False
+    /// when that allocation fails; the buffer is then left as it was.
+    fn shrinkTo(self: *SendStream, prefix: usize, new_cap: usize) bool {
+        const live = self.write_buffer.items[prefix..];
+        const mem = self.allocator.alloc(u8, new_cap) catch return false;
+        @memcpy(mem[0..live.len], live);
+        self.write_buffer.deinit(self.allocator);
+        self.write_buffer = .{ .items = mem[0..live.len], .capacity = new_cap };
+        self.buf_base += prefix;
+        return true;
     }
 
     /// The buffered bytes at `offset`, at most `max_len` of them. Empty when
@@ -3435,4 +3476,138 @@ test "SendStream: compaction survives an ack past what was written" {
 
     try testing.expectEqual(@as(usize, 0), ss.write_buffer.items.len);
     try testing.expectEqual(@as(u64, 70000), ss.buf_base);
+}
+
+/// Counts allocator calls that hand out memory and tracks the bytes held, to
+/// check what a buffer retains and how often it reallocates.
+const CountingAllocator = struct {
+    child: Allocator,
+    allocs: usize = 0,
+    live: usize = 0,
+
+    fn allocator(self: *CountingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, a, ra) orelse return null;
+        self.allocs += 1;
+        self.live += len;
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(m, a, n, ra)) return false;
+        self.allocs += 1;
+        self.live = self.live - m.len + n;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(m, a, n, ra) orelse return null;
+        self.allocs += 1;
+        self.live = self.live - m.len + n;
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, a, ra);
+        self.live -= m.len;
+    }
+};
+
+/// Writes `total` bytes in `chunk`-sized writes, sending each at once and
+/// acknowledging everything more than `in_flight` bytes behind the writer.
+fn streamThrough(ss: *SendStream, total: usize, chunk: usize, in_flight: usize) !void {
+    var buf: [1200]u8 = undefined;
+    @memset(&buf, 'w');
+    var written: usize = 0;
+    while (written < total) : (written += chunk) {
+        const at = ss.write_offset;
+        try ss.writeData(buf[0..chunk]);
+        const f = ss.popStreamFrame(chunk).?;
+        try testing.expectEqual(at, f.stream.offset);
+        if (ss.write_offset > in_flight) {
+            const upto = ss.write_offset - in_flight;
+            if (upto > ss.ack_offset) try ss.onAck(ss.ack_offset, upto - ss.ack_offset, false);
+        }
+    }
+}
+
+test "SendStream: a burst's capacity is handed back once it is acked" {
+    var ca: CountingAllocator = .{ .child = testing.allocator };
+    var ss = SendStream.init(ca.allocator(), 0);
+    defer ss.deinit();
+
+    // 4 MiB written ahead of the network, then sent and acked frame by frame.
+    const block = try testing.allocator.alloc(u8, 64 * 1024);
+    defer testing.allocator.free(block);
+    for (block, 0..) |*b, k| b.* = @truncate(k);
+    for (0..64) |_| try ss.writeData(block);
+    try testing.expect(ss.write_buffer.capacity >= 4 * 1024 * 1024);
+
+    while (ss.popStreamFrame(1200)) |f| {
+        // Shrinking must not disturb the bytes still to go.
+        try testing.expectEqual(@as(u8, @truncate(f.stream.offset)), f.stream.data[0]);
+        try ss.onAck(f.stream.offset, f.stream.length, false);
+    }
+
+    try testing.expectEqual(@as(u64, 4 * 1024 * 1024), ss.ack_offset);
+    try testing.expectEqual(SendStream.RETAINED_CAPACITY, ss.write_buffer.capacity);
+    try testing.expect(ca.live <= SendStream.RETAINED_CAPACITY + 1024);
+
+    // Still usable at the right offsets.
+    try ss.writeData("after");
+    const f = ss.popStreamFrame(100).?;
+    try testing.expectEqual(@as(u64, 4 * 1024 * 1024), f.stream.offset);
+    try testing.expectEqualStrings("after", f.stream.data);
+}
+
+test "SendStream: steady streaming within the retained capacity does not reallocate" {
+    var ca: CountingAllocator = .{ .child = testing.allocator };
+    var ss = SendStream.init(ca.allocator(), 0);
+    defer ss.deinit();
+
+    try streamThrough(&ss, 1024 * 1024, 1200, 32 * 1024);
+    const warm = ca.allocs;
+    try streamThrough(&ss, 8 * 1024 * 1024, 1200, 32 * 1024);
+    try testing.expectEqual(warm, ca.allocs);
+    try testing.expect(ss.write_buffer.capacity <= 2 * SendStream.RETAINED_CAPACITY);
+}
+
+test "SendStream: steady streaming above the retained capacity does not thrash" {
+    var ca: CountingAllocator = .{ .child = testing.allocator };
+    var ss = SendStream.init(ca.allocator(), 0);
+    defer ss.deinit();
+
+    try streamThrough(&ss, 1024 * 1024, 1200, 256 * 1024);
+    const warm = ca.allocs;
+    try streamThrough(&ss, 8 * 1024 * 1024, 1200, 256 * 1024);
+    try testing.expectEqual(warm, ca.allocs);
+}
+
+test "FrameSorter: chunk slots from a reordering burst are released once drained" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    // Every other byte first, then the rest: hundreds of chunks at once.
+    const n = 500;
+    var k: u64 = 1;
+    while (k < 2 * n) : (k += 2) try sorter.push(k, "b", false);
+    try testing.expect(sorter.chunks.capacity > FrameSorter.RETAINED_CHUNKS);
+    k = 0;
+    while (k < 2 * n) : (k += 2) try sorter.push(k, "a", false);
+    while (sorter.pop()) |d| testing.allocator.free(d);
+
+    try testing.expectEqual(@as(u64, 2 * n), sorter.read_pos);
+    try testing.expectEqual(@as(usize, 0), sorter.chunks.capacity);
 }
