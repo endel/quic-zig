@@ -6,7 +6,7 @@
 |---|---------|--------|-------|
 | **2** | **Streams** | | |
 | 2.1 | Stream Types and Identifiers | ✅ Done | Bidi + uni, client/server initiated, proper ID bits |
-| 2.2 | Sending and Receiving Data | ✅ Done | FrameSorter, SendStream, ReceiveStream. Reassembly keeps chunks sorted by offset and caps holes at 1000 per sorter; abutting pieces merge into chunks of up to 64 KiB, so unread contiguous data, reordered or not, never counts toward that cap — see [RFC9000_21.7.md](RFC9000_21.7.md) |
+| 2.2 | Sending and Receiving Data | ✅ Done | FrameSorter, SendStream, ReceiveStream. Reassembly keeps chunks sorted by offset and caps holes at 1000 per sorter; abutting pieces merge into chunks of up to 64 KiB, so unread contiguous data, reordered or not, never counts toward that cap — see [RFC9000_21.7.md](RFC9000_21.7.md). Send buffers drop acknowledged bytes and shrink back to 64 KiB after a burst — see [RFC9000_3.md](RFC9000_3.md) |
 | 2.3 | Stream Prioritization | ✅ Done | RFC 9218 extensible priorities: urgency (0-7), incremental, PRIORITY_UPDATE frame |
 | 2.4 | Operations on Streams | ✅ Done | Open, send, recv, close, reset |
 | **3** | **Stream States** | | |

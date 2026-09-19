@@ -75,6 +75,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A stream's send buffer now shrinks back to 64 KiB once a burst is
+  acknowledged, instead of holding its peak size (megabytes for a relay writing
+  ahead of a slow peer) until the stream closes.
 - On macOS/BSD, a busy event loop could log "invalid state in submission queue"
   and lose or double-queue a socket event. libxev now comes from the
   [endel/libxev](https://github.com/endel/libxev/tree/kqueue-fixes) fork,

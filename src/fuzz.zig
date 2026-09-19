@@ -636,6 +636,69 @@ test "fuzz: frame sorter" {
     }.f, .{});
 }
 
+/// Stream byte at `offset`, so any frame can be checked without a copy.
+fn sendPattern(offset: u64) u8 {
+    return @truncate(offset *% 131 ^ (offset >> 9));
+}
+
+test "SendStream survives randomized writes, acks and losses" {
+    var prng = std.Random.DefaultPrng.init(0x73656e64);
+    const rand = prng.random();
+    var block: [300 * 1024]u8 = undefined;
+
+    for (0..40) |_| {
+        var ss = stream.SendStream.init(testing.allocator, 0);
+        defer ss.deinit();
+        var sent: [256]struct { off: u64, len: u64 } = undefined;
+        var n_sent: usize = 0;
+
+        for (0..3000) |_| {
+            switch (rand.uintLessThan(u8, 10)) {
+                0 => {
+                    // Mostly small writes, sometimes a burst past the retained capacity.
+                    const len = if (rand.uintLessThan(u8, 20) == 0)
+                        rand.uintLessThan(usize, block.len)
+                    else
+                        rand.uintLessThan(usize, 4096);
+                    for (block[0..len], 0..) |*b, k| b.* = sendPattern(ss.write_offset + k);
+                    try ss.writeData(block[0..len]);
+                },
+                1, 2, 3, 4 => {
+                    if (n_sent == sent.len) continue;
+                    const f = ss.popStreamFrame(1 + rand.uintLessThan(u64, 1500)) orelse continue;
+                    for (f.stream.data, 0..) |b, k| try testing.expectEqual(sendPattern(f.stream.offset + k), b);
+                    if (f.stream.length == 0) continue;
+                    sent[n_sent] = .{ .off = f.stream.offset, .len = f.stream.length };
+                    n_sent += 1;
+                },
+                5, 6, 7, 8 => {
+                    if (n_sent == 0) continue;
+                    const k = rand.uintLessThan(usize, n_sent);
+                    try ss.onAck(sent[k].off, sent[k].len, false);
+                    sent[k] = sent[n_sent - 1];
+                    n_sent -= 1;
+                },
+                else => {
+                    if (n_sent == 0) continue;
+                    const k = rand.uintLessThan(usize, n_sent);
+                    ss.queueRetransmit(sent[k].off, sent[k].len, false);
+                    sent[k] = sent[n_sent - 1];
+                    n_sent -= 1;
+                },
+            }
+        }
+
+        // Deliver the rest in order; a drained stream keeps only the floor.
+        for (sent[0..n_sent]) |r| try ss.onAck(r.off, r.len, false);
+        while (ss.popStreamFrame(1200)) |f| {
+            for (f.stream.data, 0..) |b, k| try testing.expectEqual(sendPattern(f.stream.offset + k), b);
+            try ss.onAck(f.stream.offset, f.stream.length, false);
+        }
+        try testing.expectEqual(ss.write_offset, ss.ack_offset);
+        try testing.expect(ss.write_buffer.capacity <= stream.SendStream.RETAINED_CAPACITY);
+    }
+}
+
 // ════════════════════════════════════════════════════════
 // Target 19: QUIC Frame Round-Trip
 //
