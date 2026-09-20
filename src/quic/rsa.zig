@@ -1,14 +1,19 @@
 //! RSA private keys and RSASSA-PSS signing (RFC 8017), for TLS 1.3
 //! CertificateVerify with the rsa_pss_rsae_* schemes (RFC 8446 §4.2.3).
 //!
-//! Signing runs on `std.crypto.ff`, whose modular exponentiation is constant
-//! time in the exponent, and uses the CRT. Each signature is checked against
-//! the public exponent before it is returned, so a fault in one CRT half
-//! cannot hand out a signature that factors the modulus (Boneh-DeMillo-Lipton).
+//! The two CRT exponentiations, which are almost the whole cost of a signature,
+//! run on `mont.zig`. The cheap remainder — reducing the message into each
+//! prime's range, recombining the halves, and the self-check — stays on
+//! `std.crypto.ff`. Both are constant time in the exponent.
+//!
+//! Each signature is checked against the public exponent before it is returned,
+//! so a fault in one CRT half cannot hand out a signature that factors the
+//! modulus (Boneh-DeMillo-Lipton).
 
 const std = @import("std");
 const sys = @import("../sys.zig");
 const ff = std.crypto.ff;
+const mont = @import("mont.zig");
 const mem = std.mem;
 
 pub const min_bits = 2048;
@@ -19,6 +24,11 @@ pub const max_signature_len = max_bits / 8;
 const Modulus = ff.Modulus(max_bits);
 const PrimeModulus = ff.Modulus(max_bits / 2);
 const max_prime_len = max_bits / 16;
+
+comptime {
+    // mont.zig sizes its limb arrays for one CRT half.
+    std.debug.assert(mont.max_bits >= max_bits / 2);
+}
 
 // 1.2.840.113549.1.1.1
 const rsa_encryption_oid = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
@@ -150,8 +160,23 @@ pub const PrivateKey = struct {
         // Pad the exponents to the prime's length so their size leaks nothing.
         var exp_buf: [max_prime_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &exp_buf);
-        const m1 = p.powWithEncodedExponent(p.reduce(m_wide), try padded(&exp_buf, self.dp, self.p.len), .big) catch return error.InvalidKey;
-        const m2 = q.powWithEncodedExponent(q.reduce(m_wide), try padded(&exp_buf, self.dq, self.q.len), .big) catch return error.InvalidKey;
+        var base_buf: [PrimeModulus.Fe.encoded_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &base_buf);
+        var half_buf: [max_prime_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &half_buf);
+
+        // ff reduces the message into each prime's range; mont.zig raises it.
+        const mp = mont.Modulus.fromBytes(self.p) catch return error.InvalidKey;
+        p.reduce(m_wide).toBytes(&base_buf, .big) catch return error.InvalidKey;
+        mp.pow(&base_buf, try padded(&exp_buf, self.dp, self.p.len), half_buf[0..self.p.len]) catch
+            return error.InvalidKey;
+        const m1 = PrimeModulus.Fe.fromBytes(p, half_buf[0..self.p.len], .big) catch return error.InvalidKey;
+
+        const mq = mont.Modulus.fromBytes(self.q) catch return error.InvalidKey;
+        q.reduce(m_wide).toBytes(&base_buf, .big) catch return error.InvalidKey;
+        mq.pow(&base_buf, try padded(&exp_buf, self.dq, self.q.len), half_buf[0..self.q.len]) catch
+            return error.InvalidKey;
+        const m2 = PrimeModulus.Fe.fromBytes(q, half_buf[0..self.q.len], .big) catch return error.InvalidKey;
 
         // h = qinv * (m1 - m2) mod p; s = m2 + h * q, which is below n.
         var bytes: [PrimeModulus.Fe.encoded_bytes]u8 = undefined;

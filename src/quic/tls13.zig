@@ -3301,7 +3301,10 @@ pub fn signCertificateVerify(
         .ecdsa_secp256r1_sha256 => {
             if (private_key_bytes.len != 32) return error.InternalError;
             const sk = EcdsaP256Sha256.SecretKey.fromBytes(private_key_bytes[0..32].*) catch return error.InternalError;
-            const kp = EcdsaP256Sha256.KeyPair.fromSecretKey(sk) catch return error.InternalError;
+            // Not `fromSecretKey`: that multiplies the base point to recover a
+            // public key, which signing never reads, and it costs as much as the
+            // signature itself.
+            const kp = EcdsaP256Sha256.KeyPair{ .secret_key = sk, .public_key = undefined };
             const sig = kp.sign(content, noise) catch return error.InternalError;
             return sig.toDer(out[0..EcdsaP256Sha256.Signature.der_encoded_length_max]);
         },
