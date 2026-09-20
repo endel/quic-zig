@@ -302,6 +302,12 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args_b| run_bench.addArgs(args_b);
     b.step("run-bench", "Run benchmark client").dependOn(&run_bench.step);
 
+    // Crypto microbench — the primitives a handshake spends its time in.
+    const exe_bench_crypto = App.add(b, "bench-crypto", "tools/bench_crypto.zig", target, optimize, need_libc, lib_mod);
+    const run_bench_crypto = b.addRunArtifact(exe_bench_crypto);
+    if (b.args) |args_c| run_bench_crypto.addArgs(args_c);
+    b.step("bench-crypto", "Benchmark the handshake's crypto primitives").dependOn(&run_bench_crypto.step);
+
     // Codec microbench — pure CPU (parse/serialize loops), no sockets.
     // Used to track perf of the fixedBufferStream shim vs. std.Io native.
     const exe_bench_codec = App.add(b, "bench-codec", "apps/bench_codec.zig", target, optimize, need_libc, lib_mod);

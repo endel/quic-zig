@@ -2,7 +2,7 @@
 // Compare with tools/bench_crypto.go for apples-to-apples Zig vs Go comparison.
 //
 // Usage:
-//   zig build-exe -OReleaseFast tools/bench_crypto.zig && ./bench_crypto
+//   zig build bench-crypto
 //
 // Operations benchmarked (in order of handshake hot-path impact):
 //   1. ECDSA P-256 Sign        (CertificateVerify, server per-handshake)
@@ -13,10 +13,17 @@
 //   6. HKDF-SHA256 extract      (Key derivation, per-handshake)
 //   7. HKDF-SHA256 expand       (Key derivation, multiple per-handshake)
 //   8. AES-128-ECB (HP mask)    (Header protection, every packet)
+//   9. 1024-bit modexp          (One of RSA's two CRT halves, per signature),
+//                               both through std.crypto.ff and through
+//                               src/quic/mont.zig, which is what RSA now uses
+//  10. ECDSA P-256 Sign, with and without deriving the public key first
 
 const std = @import("std");
 const crypto = std.crypto;
-const time = std.time;
+const quic = @import("quic");
+const sys = quic.sys;
+const mont = quic.mont;
+const ff = std.crypto.ff;
 
 const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 const X25519 = crypto.dh.X25519;
@@ -31,12 +38,12 @@ fn benchNs(comptime f: anytype, args: anytype, iterations: u32) f64 {
         _ = @call(.auto, f, args);
     }
 
-    const start = time.nanoTimestamp();
+    const start = sys.nanoTimestamp();
     var i: u32 = 0;
     while (i < iterations) : (i += 1) {
         _ = @call(.auto, f, args);
     }
-    const elapsed = time.nanoTimestamp() - start;
+    const elapsed = sys.nanoTimestamp() - start;
     return @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(iterations));
 }
 
@@ -51,6 +58,34 @@ fn ecdsaSign(key_pair: EcdsaP256Sha256.KeyPair, msg: *const [130]u8) EcdsaP256Sh
 fn ecdsaVerify(sig: EcdsaP256Sha256.Signature, msg: *const [130]u8, pub_key: EcdsaP256Sha256.PublicKey) bool {
     sig.verify(msg, pub_key) catch return false;
     return true;
+}
+
+// ── RSA's CRT half, both ways ──
+
+fn ffModexp(m: *const [128]u8, base: *const [128]u8, exp: *const [128]u8, out: *[128]u8) void {
+    const M = ff.Modulus(1024);
+    const fm = M.fromBytes(m, .big) catch unreachable;
+    const fe = M.Fe.fromBytes(fm, base, .big) catch unreachable;
+    const r = fm.powWithEncodedExponent(fe, exp, .big) catch unreachable;
+    r.toBytes(out, .big) catch unreachable;
+}
+
+fn montModexp(m: *const [128]u8, base: *const [128]u8, exp: *const [128]u8, out: *[128]u8) void {
+    const mm = mont.Modulus.fromBytes(m) catch unreachable;
+    mm.pow(base, exp, out) catch unreachable;
+}
+
+// ── ECDSA P-256 Sign, with and without the redundant public-key derivation ──
+
+fn ecdsaSignNoPublicKey(sk: *const EcdsaP256Sha256.SecretKey, msg: *const [130]u8) EcdsaP256Sha256.Signature {
+    // The signer reads only the secret key, so the public half need not exist.
+    const kp = EcdsaP256Sha256.KeyPair{ .secret_key = sk.*, .public_key = undefined };
+    return kp.sign(msg, null) catch unreachable;
+}
+
+fn ecdsaSignDerivingPublicKey(sk: *const EcdsaP256Sha256.SecretKey, msg: *const [130]u8) EcdsaP256Sha256.Signature {
+    const kp = EcdsaP256Sha256.KeyPair.fromSecretKey(sk.*) catch unreachable;
+    return kp.sign(msg, null) catch unreachable;
 }
 
 // ── X25519 ──
@@ -116,10 +151,12 @@ pub fn main() !void {
 
     // Setup keys
     var rng_buf: [128]u8 = undefined;
-    crypto.random.bytes(&rng_buf);
+    sys.randomBytes(&rng_buf);
 
     // ECDSA P-256
-    const ecdsa_kp = EcdsaP256Sha256.KeyPair.generate();
+    var ecdsa_seed: [EcdsaP256Sha256.KeyPair.seed_length]u8 = undefined;
+    sys.randomBytes(&ecdsa_seed);
+    const ecdsa_kp = EcdsaP256Sha256.KeyPair.generateDeterministic(ecdsa_seed) catch unreachable;
     var sign_content: [130]u8 = undefined;
     @memset(sign_content[0..64], 0x20);
     @memcpy(sign_content[64..97], "TLS 1.3, server CertificateVerify");
@@ -131,7 +168,7 @@ pub fn main() !void {
     // X25519
     var x25519_secret: [32]u8 = undefined;
     var x25519_public: [32]u8 = undefined;
-    crypto.random.bytes(&x25519_secret);
+    sys.randomBytes(&x25519_secret);
     x25519_public = X25519.recoverPublicKey(x25519_secret) catch unreachable;
 
     // AES-128-GCM
@@ -141,25 +178,25 @@ pub fn main() !void {
     var ciphertext: [1200]u8 = undefined;
     var aes_tag: [16]u8 = undefined;
     var ad: [20]u8 = undefined;
-    crypto.random.bytes(&aes_key);
-    crypto.random.bytes(&aes_nonce);
-    crypto.random.bytes(&plaintext);
-    crypto.random.bytes(&ad);
+    sys.randomBytes(&aes_key);
+    sys.randomBytes(&aes_nonce);
+    sys.randomBytes(&plaintext);
+    sys.randomBytes(&ad);
     Aes128Gcm.encrypt(&ciphertext, &aes_tag, &plaintext, &ad, aes_nonce, aes_key);
 
     // HKDF
     var hkdf_salt: [32]u8 = undefined;
     var hkdf_ikm: [32]u8 = undefined;
     var hkdf_info: [50]u8 = undefined;
-    crypto.random.bytes(&hkdf_salt);
-    crypto.random.bytes(&hkdf_ikm);
-    crypto.random.bytes(&hkdf_info);
+    sys.randomBytes(&hkdf_salt);
+    sys.randomBytes(&hkdf_ikm);
+    sys.randomBytes(&hkdf_info);
     const prk = HkdfSha256.extract(&hkdf_salt, &hkdf_ikm);
 
     // AES-128-ECB
     const aes_ctx = Aes128.initEnc(aes_key);
     var hp_sample: [16]u8 = undefined;
-    crypto.random.bytes(&hp_sample);
+    sys.randomBytes(&hp_sample);
 
     // ── Run benchmarks ──
 
@@ -181,6 +218,25 @@ pub fn main() !void {
     const expand_ns = benchNs(hkdfExpand, .{ &prk, &hkdf_info }, N_HKDF);
     const hp_ns = benchNs(aesEcbEncrypt, .{ aes_ctx, &hp_sample }, N_HP);
 
+    // ── RSA's CRT half: the old modexp against the new one ──
+    // A random odd 1024-bit modulus stands in for a prime: the work depends on
+    // the width, not on primality.
+    var rsa_m: [128]u8 = undefined;
+    sys.randomBytes(&rsa_m);
+    rsa_m[0] |= 0x80;
+    rsa_m[127] |= 1;
+    var rsa_base: [128]u8 = undefined;
+    sys.randomBytes(&rsa_base);
+    rsa_base[0] &= 0x7f;
+    var rsa_exp: [128]u8 = undefined;
+    sys.randomBytes(&rsa_exp);
+    var rsa_out: [128]u8 = undefined;
+    const ff_ns = benchNs(ffModexp, .{ &rsa_m, &rsa_base, &rsa_exp, &rsa_out }, 50);
+    const mont_ns = benchNs(montModexp, .{ &rsa_m, &rsa_base, &rsa_exp, &rsa_out }, 50);
+
+    const sign_only_ns = benchNs(ecdsaSignNoPublicKey, .{ &ecdsa_kp.secret_key, &sign_content }, N_SIGN);
+    const sign_derive_ns = benchNs(ecdsaSignDerivingPublicKey, .{ &ecdsa_kp.secret_key, &sign_content }, N_SIGN);
+
     std.debug.print("  {s:<28} {s:>10}  {s:>10}\n", .{ "Operation", "ns/op", "ops/sec" });
     std.debug.print("  ────────────────────────── ──────────  ──────────\n", .{});
 
@@ -193,6 +249,10 @@ pub fn main() !void {
         .{ .name = "HKDF-SHA256 extract", .ns = extract_ns },
         .{ .name = "HKDF-SHA256 expand", .ns = expand_ns },
         .{ .name = "AES-128-ECB (HP mask)", .ns = hp_ns },
+        .{ .name = "1024-bit modexp (std.ff)", .ns = ff_ns },
+        .{ .name = "1024-bit modexp (mont)", .ns = mont_ns },
+        .{ .name = "ECDSA sign, key prepared", .ns = sign_only_ns },
+        .{ .name = "ECDSA sign, deriving pubkey", .ns = sign_derive_ns },
     };
 
     for (ops) |op| {

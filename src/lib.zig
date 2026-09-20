@@ -8,6 +8,7 @@ pub const connection = @import("quic/connection.zig");
 pub const connection_manager = @import("quic/connection_manager.zig");
 pub const crypto = @import("quic/crypto.zig");
 pub const tls13 = @import("quic/tls13.zig");
+pub const mont = @import("quic/mont.zig");
 pub const ca_bundle = @import("quic/ca_bundle.zig");
 pub const ecn_socket = @import("quic/ecn_socket.zig");
 pub const transport_params = @import("quic/transport_params.zig");
