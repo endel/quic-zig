@@ -14,6 +14,7 @@ test {
     _ = @import("quic/crypto_stream.zig");
     _ = @import("quic/packet_packer.zig");
     _ = @import("quic/tls13.zig");
+    _ = @import("quic/rsa.zig");
     _ = @import("quic/mtu.zig");
     _ = @import("quic/stateless_reset.zig");
     _ = @import("quic/connection_manager.zig");
@@ -31,6 +32,7 @@ test {
     _ = @import("http1/server.zig");
     _ = @import("http1/tls.zig");
     _ = @import("tls/server.zig");
+    _ = @import("tls/client.zig");
     _ = @import("webtransport/protocol.zig");
     _ = @import("moq/wire.zig");
     _ = @import("moq/message_codes.zig");

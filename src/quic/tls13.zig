@@ -1,7 +1,7 @@
 // TLS 1.3 handshake for QUIC (RFC 8446 + RFC 9001)
 //
 // Supports TLS_AES_128_GCM_SHA256 (0x1301) only.
-// ECDSA P-256 or Ed25519 for signatures, X25519 for key exchange.
+// ECDSA P-256, Ed25519 or RSA-PSS for signatures, X25519 for key exchange.
 // X.509 certificate chain validation via std.crypto.Certificate.
 
 const std = @import("std");
@@ -13,6 +13,7 @@ const quic_crypto = @import("crypto.zig");
 const protocol = @import("protocol.zig");
 const transport_params = @import("transport_params.zig");
 const limits = @import("limits.zig");
+pub const rsa = @import("rsa.zig");
 
 const Certificate = std.crypto.Certificate;
 
@@ -38,11 +39,34 @@ pub const EncryptionLevel = quic_crypto.EncryptionLevel;
 pub const PrivateKeyAlgorithm = enum {
     ecdsa_p256_sha256,
     ed25519,
+    /// Signs with RSA-PSS (rsa_pss_rsae_*), SHA-256 unless the client offers
+    /// only SHA-384 or SHA-512.
+    rsa,
 };
+
+/// The CertificateVerify scheme for a key, from the client's
+/// signature_algorithms (the list body: big-endian u16s). Null when the
+/// client offers none that fits.
+pub fn signatureSchemeFor(alg: PrivateKeyAlgorithm, offered: []const u8) ?tls.SignatureScheme {
+    const ours: []const tls.SignatureScheme = switch (alg) {
+        .ecdsa_p256_sha256 => &.{.ecdsa_secp256r1_sha256},
+        .ed25519 => &.{.ed25519},
+        // rsa_pss_pss_* needs an RSASSA-PSS certificate; ours are rsaEncryption.
+        .rsa => &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 },
+    };
+    for (ours) |scheme| {
+        var i: usize = 0;
+        while (i + 2 <= offered.len) : (i += 2) {
+            if (std.mem.readInt(u16, offered[i..][0..2], .big) == @intFromEnum(scheme)) return scheme;
+        }
+    }
+    return null;
+}
 
 // ─── CertificateVerify signature verification ────────────────────────
 
-fn verifyCertificateVerifySignature(
+/// Checks a CertificateVerify signature made with the leaf's public key.
+pub fn verifyCertificateVerifySignature(
     pub_key_bytes: []const u8,
     pub_key_algo: Certificate.AlgorithmCategory,
     sig_algo: u16,
@@ -55,6 +79,13 @@ fn verifyCertificateVerifySignature(
             if (pub_key_algo != .X9_62_id_ecPublicKey) return error.BadCertificateVerify;
             const pub_key = EcdsaP256Sha256.PublicKey.fromSec1(pub_key_bytes) catch return error.BadCertificateVerify;
             const sig = EcdsaP256Sha256.Signature.fromDer(sig_bytes) catch return error.BadCertificateVerify;
+            sig.verify(signed_content, pub_key) catch return error.BadCertificateVerify;
+        },
+        .ecdsa_secp384r1_sha384 => {
+            if (pub_key_algo != .X9_62_id_ecPublicKey) return error.BadCertificateVerify;
+            const P384 = crypto.sign.ecdsa.EcdsaP384Sha384;
+            const pub_key = P384.PublicKey.fromSec1(pub_key_bytes) catch return error.BadCertificateVerify;
+            const sig = P384.Signature.fromDer(sig_bytes) catch return error.BadCertificateVerify;
             sig.verify(signed_content, pub_key) catch return error.BadCertificateVerify;
         },
         .ed25519 => {
@@ -80,17 +111,170 @@ fn verifyRsaPss(
     comptime Hash: type,
 ) !void {
     if (pub_key_algo != .rsaEncryption) return error.BadCertificateVerify;
-    const rsa = Certificate.rsa;
-    const pk_components = rsa.PublicKey.parseDer(pub_key_bytes) catch return error.BadCertificateVerify;
-    const public_key = rsa.PublicKey.fromBytes(pk_components.exponent, pk_components.modulus) catch return error.BadCertificateVerify;
+    const std_rsa = Certificate.rsa;
+    const pk_components = std_rsa.PublicKey.parseDer(pub_key_bytes) catch return error.BadCertificateVerify;
+    const public_key = std_rsa.PublicKey.fromBytes(pk_components.exponent, pk_components.modulus) catch return error.BadCertificateVerify;
 
     switch (pk_components.modulus.len) {
         inline 128, 256, 384, 512 => |modulus_len| {
             if (sig_bytes.len != modulus_len) return error.BadCertificateVerify;
-            rsa.PSSSignature.verify(modulus_len, sig_bytes[0..modulus_len].*, signed_content, public_key, Hash) catch return error.BadCertificateVerify;
+            std_rsa.PSSSignature.verify(modulus_len, sig_bytes[0..modulus_len].*, signed_content, public_key, Hash) catch return error.BadCertificateVerify;
         },
         else => return error.BadCertificateVerify,
     }
+}
+
+// ─── Certificate structure check ─────────────────────────────────────
+
+/// Whether a peer's DER certificate has the X.509 shape std's parser and
+/// our extension walkers assume, every length within bounds. std's
+/// `der.Element.parse` checks none, so a truncated or lying certificate
+/// would index out of bounds; run this on every certificate a peer sends
+/// before `Certificate.parse`.
+pub fn certificateWellFormed(b: []const u8) bool {
+    const cert = readTlv(b, 0, b.len) orelse return false;
+    if (cert.tag != 0x30 or cert.end != b.len) return false;
+    if (!tlvsWellFormed(b, cert.start, cert.end, 0)) return false;
+    var top: [4]Tlv = undefined;
+    if (tlvChildren(b, cert, &top) != 3) return false;
+    const tbs = top[0];
+    if (tbs.tag != 0x30 or !algorithmIdOk(b, top[1])) return false;
+    if (top[2].tag != 0x03 or top[2].end == top[2].start) return false;
+
+    var f: [10]Tlv = undefined;
+    const n = tlvChildren(b, tbs, &f);
+    if (n > f.len) return false;
+    var i: usize = 0;
+    if (n > 0 and f[0].tag == 0xa0) {
+        var v: [2]Tlv = undefined;
+        if (tlvChildren(b, f[0], &v) != 1 or v[0].tag != 0x02) return false;
+        i = 1;
+    }
+    if (n < i + 6) return false;
+    if (f[i].tag != 0x02) return false; // serialNumber
+    if (!algorithmIdOk(b, f[i + 1])) return false;
+    if (!nameOk(b, f[i + 2])) return false; // issuer
+    var validity: [3]Tlv = undefined;
+    if (f[i + 3].tag != 0x30 or tlvChildren(b, f[i + 3], &validity) != 2) return false;
+    for (validity[0..2]) |t| if (t.tag != 0x17 and t.tag != 0x18) return false;
+    if (!nameOk(b, f[i + 4])) return false; // subject
+    if (!subjectPublicKeyInfoOk(b, f[i + 5])) return false;
+    for (f[i + 6 .. n]) |t| switch (t.tag) {
+        0x81, 0xa1, 0x82, 0xa2 => {}, // unique identifiers
+        0xa3 => if (!extensionsOk(b, t)) return false,
+        else => return false,
+    };
+    return true;
+}
+
+const Tlv = struct { tag: u8, start: usize, end: usize };
+
+/// One element at `pos`, its contents within `limit`. Single-byte tags only,
+/// as std reads them; definite lengths of up to four bytes.
+fn readTlv(b: []const u8, pos: usize, limit: usize) ?Tlv {
+    if (pos >= limit or limit - pos < 2) return null;
+    const tag = b[pos];
+    if (tag & 0x1f == 0x1f) return null;
+    const first = b[pos + 1];
+    var i = pos + 2;
+    var len: usize = first;
+    if (first >= 0x80) {
+        const n: usize = first & 0x7f;
+        if (n == 0 or n > 4 or n > limit - i) return null;
+        len = 0;
+        for (b[i..][0..n]) |x| len = (len << 8) | x;
+        i += n;
+    }
+    if (len > limit - i) return null;
+    return .{ .tag = tag, .start = i, .end = i + len };
+}
+
+/// The range is a sequence of elements, constructed ones recursively so.
+fn tlvsWellFormed(b: []const u8, start: usize, end: usize, depth: u8) bool {
+    if (depth > 16) return false;
+    var pos = start;
+    while (pos < end) {
+        const t = readTlv(b, pos, end) orelse return false;
+        if (t.tag & 0x20 != 0 and !tlvsWellFormed(b, t.start, t.end, depth + 1)) return false;
+        pos = t.end;
+    }
+    return true;
+}
+
+/// Children of a well-formed element, up to `out.len`; a count above
+/// `out.len` means there were more.
+fn tlvChildren(b: []const u8, parent: Tlv, out: []Tlv) usize {
+    var n: usize = 0;
+    var pos = parent.start;
+    while (pos < parent.end) : (n += 1) {
+        const t = readTlv(b, pos, parent.end) orelse return out.len + 1;
+        if (n == out.len) return out.len + 1;
+        out[n] = t;
+        pos = t.end;
+    }
+    return n;
+}
+
+fn algorithmIdOk(b: []const u8, t: Tlv) bool {
+    var k: [3]Tlv = undefined;
+    const n = tlvChildren(b, t, &k);
+    return t.tag == 0x30 and n >= 1 and n <= 2 and k[0].tag == 0x06;
+}
+
+fn nameOk(b: []const u8, t: Tlv) bool {
+    if (t.tag != 0x30) return false;
+    var pos = t.start;
+    while (pos < t.end) {
+        const rdn = readTlv(b, pos, t.end).?;
+        pos = rdn.end;
+        if (rdn.tag != 0x31 or rdn.start == rdn.end) return false;
+        var apos = rdn.start;
+        while (apos < rdn.end) {
+            const atv = readTlv(b, apos, rdn.end).?;
+            apos = atv.end;
+            var kv: [3]Tlv = undefined;
+            if (atv.tag != 0x30 or tlvChildren(b, atv, &kv) != 2 or kv[0].tag != 0x06) return false;
+        }
+    }
+    return true;
+}
+
+fn subjectPublicKeyInfoOk(b: []const u8, t: Tlv) bool {
+    var k: [3]Tlv = undefined;
+    if (t.tag != 0x30 or tlvChildren(b, t, &k) != 2) return false;
+    if (!algorithmIdOk(b, k[0])) return false;
+    if (k[1].tag != 0x03 or k[1].end == k[1].start) return false;
+    var alg: [3]Tlv = undefined;
+    _ = tlvChildren(b, k[0], &alg);
+    const oid = b[alg[0].start..alg[0].end];
+    const rsa_encryption = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
+    const rsassa_pss = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A };
+    if (!std.mem.eql(u8, oid, &rsa_encryption) and !std.mem.eql(u8, oid, &rsassa_pss)) return true;
+    // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+    const key = b[k[1].start + 1 .. k[1].end];
+    const seq = readTlv(key, 0, key.len) orelse return false;
+    if (seq.tag != 0x30 or seq.end != key.len or !tlvsWellFormed(key, seq.start, seq.end, 0)) return false;
+    var ints: [3]Tlv = undefined;
+    return tlvChildren(key, seq, &ints) == 2 and ints[0].tag == 0x02 and ints[1].tag == 0x02;
+}
+
+fn extensionsOk(b: []const u8, t: Tlv) bool {
+    var outer: [2]Tlv = undefined;
+    if (tlvChildren(b, t, &outer) != 1 or outer[0].tag != 0x30) return false;
+    var pos = outer[0].start;
+    while (pos < outer[0].end) {
+        const ext = readTlv(b, pos, outer[0].end).?;
+        pos = ext.end;
+        var k: [4]Tlv = undefined;
+        const n = tlvChildren(b, ext, &k);
+        if (ext.tag != 0x30 or n < 2 or n > 3 or k[0].tag != 0x06) return false;
+        if (n == 3 and (k[1].tag != 0x01 or k[1].end - k[1].start != 1)) return false;
+        const value = k[n - 1];
+        if (value.tag != 0x04) return false;
+        // Extension values are DER themselves, and get walked like it.
+        if (!tlvsWellFormed(b, value.start, value.end, 0)) return false;
+    }
+    return true;
 }
 
 // ─── X.509 extension parsing for chain validation (RFC 5280) ─────────
@@ -102,6 +286,10 @@ const X509Extensions = struct {
     path_len_constraint: ?u32 = null,
     /// keyUsage bit field (RFC 5280 §4.2.1.3), MSB-first
     key_usage: ?u16 = null,
+    /// extendedKeyUsage is present (RFC 5280 §4.2.1.12) ...
+    eku_present: bool = false,
+    /// ... and lists id-kp-clientAuth or anyExtendedKeyUsage.
+    eku_client_auth: bool = false,
 
     /// Check if the keyCertSign bit is set.
     /// RFC 5280: keyCertSign is bit 5 in the KeyUsage BIT STRING.
@@ -114,6 +302,254 @@ const X509Extensions = struct {
         return true;
     }
 };
+
+/// RFC 5280 constraints on a certificate that signed the one below it in a
+/// peer's chain, `depth` certificates above the leaf (1 for the leaf's
+/// issuer): basicConstraints CA:TRUE (§4.2.1.9) and keyCertSign in keyUsage
+/// (§4.2.1.3) when those extensions are present, and pathLenConstraint.
+pub fn issuerConstraintsOk(issuer_der: []const u8, depth: usize) bool {
+    const exts = parseX509Extensions(issuer_der);
+    if (exts.is_ca) |is_ca| if (!is_ca) return false;
+    if (!exts.hasKeyCertSign()) return false;
+    // `depth - 1` intermediates sit below this issuer.
+    if (exts.path_len_constraint) |max_len| if (depth > max_len + 1) return false;
+    return true;
+}
+
+// ─── Client certificates (RFC 8446 §4.3.2, §4.4.2) ───────────────────
+
+/// A server's policy for client certificates: the CertificateRequest it
+/// sends and how it judges the answer. Shared by the QUIC server
+/// (`TlsConfig.client_auth`, `CertEntry.client_auth`) and `tls_server`.
+///
+/// A certificate that fails to verify always fails the handshake (with
+/// bad_certificate, unknown_ca or certificate_expired); `mode` only decides
+/// what happens when the client sends none. Session tickets are neither
+/// issued nor accepted while a policy is in force, so every connection
+/// proves its certificate afresh.
+pub const ClientAuth = struct {
+    /// Trust anchors a client certificate has to chain to.
+    ca_bundle: *const Certificate.Bundle,
+    mode: Mode = .required,
+    /// Body of the certificate_authorities extension sent with the
+    /// CertificateRequest, so a client holding several certificates picks
+    /// one of ours; build it with `certificateAuthorities`. Empty sends none.
+    authorities: []const u8 = &.{},
+
+    pub const Mode = enum {
+        /// No certificate: the handshake fails with certificate_required.
+        required,
+        /// No certificate: the handshake completes without a client identity.
+        optional,
+    };
+};
+
+/// Signature schemes a client may sign its CertificateVerify with, as the
+/// signature_algorithms body of our CertificateRequest. The rsa_pkcs1
+/// entries cover certificate signatures only (RFC 8446 §4.2.3);
+/// `verifyCertificateVerifySignature` refuses them for CertificateVerify.
+pub const client_auth_signature_schemes = blk: {
+    const schemes = [_]tls.SignatureScheme{
+        .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384, .ed25519,
+        .rsa_pss_rsae_sha256,    .rsa_pss_rsae_sha384,    .rsa_pss_rsae_sha512,
+        .rsa_pkcs1_sha256,       .rsa_pkcs1_sha384,       .rsa_pkcs1_sha512,
+    };
+    var out: [schemes.len * 2]u8 = undefined;
+    for (schemes, 0..) |s, i| std.mem.writeInt(u16, out[i * 2 ..][0..2], @intFromEnum(s), .big);
+    break :blk out;
+};
+
+/// Longest certificate_authorities body `certificateAuthorities` builds; a
+/// larger bundle (a system store) sends none rather than a flight that
+/// dwarfs the rest of the handshake.
+pub const max_authorities_len = 8 * 1024;
+
+/// The certificate_authorities extension body for `bundle`: the subject of
+/// every certificate in it, as DER Names (RFC 8446 §4.2.4). Empty when they
+/// don't fit in `max_authorities_len`. Caller owns the result.
+pub fn certificateAuthorities(gpa: std.mem.Allocator, bundle: *const Certificate.Bundle) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, &.{ 0, 0 });
+    var it = bundle.map.keyIterator();
+    while (it.next()) |subject| {
+        const contents = bundle.bytes.items[subject.start..subject.end];
+        // The map keys the Name's contents; a DistinguishedName is the whole SEQUENCE.
+        var header: [6]u8 = undefined;
+        const h = derHeader(0x30, contents.len, &header);
+        const name_len = h.len + contents.len;
+        if (out.items.len + 2 + name_len > max_authorities_len) {
+            out.clearRetainingCapacity();
+            return out.toOwnedSlice(gpa);
+        }
+        var len_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_buf, @intCast(name_len), .big);
+        try out.appendSlice(gpa, &len_buf);
+        try out.appendSlice(gpa, h);
+        try out.appendSlice(gpa, contents);
+    }
+    if (out.items.len == 2) {
+        out.clearRetainingCapacity();
+        return out.toOwnedSlice(gpa);
+    }
+    std.mem.writeInt(u16, out.items[0..2], @intCast(out.items.len - 2), .big);
+    return out.toOwnedSlice(gpa);
+}
+
+fn derHeader(tag: u8, len: usize, buf: *[6]u8) []const u8 {
+    buf[0] = tag;
+    if (len < 0x80) {
+        buf[1] = @intCast(len);
+        return buf[0..2];
+    }
+    var n: u8 = 0;
+    var v = len;
+    while (v > 0) : (v >>= 8) n += 1;
+    buf[1] = 0x80 | n;
+    var i: u8 = 0;
+    while (i < n) : (i += 1) buf[2 + i] = @truncate(len >> @intCast(8 * (n - 1 - i)));
+    return buf[0 .. 2 + n];
+}
+
+/// A CertificateRequest (RFC 8446 §4.3.2) with an empty context, offering
+/// `client_auth_signature_schemes`. Returns a slice of `buf`.
+pub fn buildCertificateRequest(buf: []u8, auth: *const ClientAuth) error{BufferTooSmall}![]const u8 {
+    const sig = client_auth_signature_schemes;
+    var exts_len: usize = 4 + 2 + sig.len;
+    if (auth.authorities.len > 0) exts_len += 4 + auth.authorities.len;
+    const total = 4 + 1 + 2 + exts_len;
+    if (buf.len < total or total - 4 > std.math.maxInt(u24)) return error.BufferTooSmall;
+    buf[0] = @intFromEnum(tls.HandshakeType.certificate_request);
+    std.mem.writeInt(u24, buf[1..4], @intCast(total - 4), .big);
+    buf[4] = 0; // certificate_request_context
+    writeU16(buf[5..], @intCast(exts_len));
+    var pos: usize = 7;
+    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.signature_algorithms), 2 + sig.len);
+    writeU16(buf[pos..], sig.len);
+    pos += 2;
+    @memcpy(buf[pos..][0..sig.len], &sig);
+    pos += sig.len;
+    if (auth.authorities.len > 0) {
+        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.certificate_authorities), auth.authorities.len);
+        @memcpy(buf[pos..][0..auth.authorities.len], auth.authorities);
+        pos += auth.authorities.len;
+    }
+    return buf[0..pos];
+}
+
+/// The signature_algorithms list body from a CertificateRequest's body (the
+/// message without its 4-byte header); `DecodeError` on a malformed one.
+/// RFC 8446 §4.3.2 makes the extension mandatory.
+pub fn parseCertificateRequest(body: []const u8) error{ DecodeError, MissingExtension, IllegalParameter }![]const u8 {
+    if (body.len < 1) return error.DecodeError;
+    const ctx_len = body[0];
+    // Only post-handshake auth may carry a context, and we never do that.
+    if (ctx_len != 0) return error.IllegalParameter;
+    if (body.len < 3) return error.DecodeError;
+    const exts_len = readU16(body[1..]);
+    if (3 + @as(usize, exts_len) != body.len) return error.DecodeError;
+    var pos: usize = 3;
+    var sig_algs: ?[]const u8 = null;
+    while (pos < body.len) {
+        if (pos + 4 > body.len) return error.DecodeError;
+        const kind = readU16(body[pos..]);
+        const len = readU16(body[pos + 2 ..]);
+        pos += 4;
+        if (pos + len > body.len) return error.DecodeError;
+        const data = body[pos..][0..len];
+        pos += len;
+        if (kind == @intFromEnum(tls.ExtensionType.signature_algorithms)) {
+            if (sig_algs != null) return error.IllegalParameter;
+            if (data.len < 2 or readU16(data) + 2 != data.len or data.len % 2 != 0) return error.DecodeError;
+            sig_algs = data[2..];
+        }
+    }
+    return sig_algs orelse error.MissingExtension;
+}
+
+pub const ChainError = error{
+    /// Malformed, breaks a constraint, or uses an algorithm we can't check.
+    BadCertificate,
+    /// Doesn't lead to a certificate in the trust anchors.
+    UnknownCa,
+    /// A certificate in the chain is expired or not yet valid.
+    CertificateExpired,
+};
+
+/// Verifies a peer's chain (leaf first) against `bundle`: each link's
+/// signature and validity, CA:TRUE / keyCertSign / pathLenConstraint on each
+/// issuer the peer sent. Anchored as soon as one link is signed by a trusted
+/// CA; certificates the peer sent beyond it (a cross-signed root, say) are
+/// not needed. Returns the parsed leaf, whose slices point into `chain[0]`.
+/// Names are not checked: the caller knows what the leaf must be for.
+pub fn verifyPeerChain(chain: []const []const u8, bundle: *const Certificate.Bundle, now_s: i64) ChainError!Certificate.Parsed {
+    if (chain.len == 0) return error.BadCertificate;
+    var leaf: Certificate.Parsed = undefined;
+    var child: ?Certificate.Parsed = null;
+    var last_err: ChainError = error.UnknownCa;
+    for (chain, 0..) |der, i| {
+        if (!certificateWellFormed(der)) return error.BadCertificate;
+        const cert: Certificate = .{ .buffer = der, .index = 0 };
+        const parsed = cert.parse() catch return error.BadCertificate;
+        if (child) |c| {
+            c.verify(parsed, now_s) catch |err| return chainError(err);
+            if (!issuerConstraintsOk(der, i)) return error.BadCertificate;
+        } else leaf = parsed;
+        if (bundle.verify(parsed, now_s)) |_| return leaf else |err| last_err = chainError(err);
+        child = parsed;
+    }
+    return last_err;
+}
+
+pub fn chainError(err: anyerror) ChainError {
+    return switch (err) {
+        error.CertificateIssuerNotFound => error.UnknownCa,
+        error.CertificateExpired, error.CertificateNotYetValid => error.CertificateExpired,
+        else => error.BadCertificate,
+    };
+}
+
+/// A client certificate's leaf may be used for TLS client authentication:
+/// digitalSignature in keyUsage and clientAuth (or anyExtendedKeyUsage) in
+/// extendedKeyUsage, each when the extension is present (RFC 5280 §4.2.1.3,
+/// §4.2.1.12). Keeps a server certificate from the same CA out.
+pub fn clientLeafUsageOk(leaf_der: []const u8) bool {
+    if (!certificateWellFormed(leaf_der)) return false;
+    const exts = parseX509Extensions(leaf_der);
+    if (exts.key_usage) |ku| if (ku & 0x8000 == 0) return false;
+    if (exts.eku_present and !exts.eku_client_auth) return false;
+    return true;
+}
+
+/// The leaf of a Certificate message body (RFC 8446 §4.4.2) and up to
+/// `out.len` certificates, leaf first, in `out`. Null for an empty list.
+/// The context must be empty: we never send one.
+pub fn parseCertificateList(body: []const u8, out: [][]const u8) error{ DecodeError, IllegalParameter, BadCertificate }!?[]const []const u8 {
+    if (body.len < 4) return error.DecodeError;
+    if (body[0] != 0) return error.IllegalParameter;
+    const list_len = std.mem.readInt(u24, body[1..4], .big);
+    if (4 + @as(usize, list_len) != body.len) return error.DecodeError;
+    var pos: usize = 4;
+    var n: usize = 0;
+    while (pos < body.len) {
+        if (pos + 3 > body.len) return error.DecodeError;
+        const len = std.mem.readInt(u24, body[pos..][0..3], .big);
+        pos += 3;
+        if (len == 0 or pos + len + 2 > body.len) return error.DecodeError;
+        if (n == out.len) return error.BadCertificate;
+        out[n] = body[pos..][0..len];
+        n += 1;
+        pos += len;
+        const ext_len = readU16(body[pos..]);
+        pos += 2;
+        if (pos + ext_len > body.len) return error.DecodeError;
+        pos += ext_len;
+    }
+    return if (n == 0) null else out[0..n];
+}
+
+/// Longest client chain we walk, leaf included.
+pub const max_client_chain = 10;
 
 /// Parse X.509 v3 extensions from a DER certificate buffer.
 /// Uses the same DER walking approach as std.crypto.Certificate.parse().
@@ -200,6 +636,11 @@ fn parseX509Extensions(cert_der: []const u8) X509Extensions {
                     if (oid_bytes.len == 3 and oid_bytes[0] == 0x55 and oid_bytes[1] == 0x1D and oid_bytes[2] == 0x0F) {
                         parseKeyUsage(cert_der, value_elem, &result);
                     }
+
+                    // extendedKeyUsage: OID 2.5.29.37
+                    if (std.mem.eql(u8, oid_bytes, &.{ 0x55, 0x1D, 0x25 })) {
+                        parseExtendedKeyUsage(cert_der, value_elem, &result);
+                    }
                 }
                 break;
             }
@@ -238,6 +679,23 @@ fn parseBasicConstraints(cert_der: []const u8, octet_elem: Certificate.der.Eleme
     } else {
         // No BOOLEAN means CA:FALSE (default is FALSE per RFC 5280)
         result.is_ca = false;
+    }
+}
+
+fn parseExtendedKeyUsage(cert_der: []const u8, octet_elem: Certificate.der.Element, result: *X509Extensions) void {
+    const der = Certificate.der;
+    result.eku_present = true;
+    const seq = der.Element.parse(cert_der, octet_elem.slice.start) catch return;
+    if (seq.identifier.tag != .sequence) return;
+    var i = seq.slice.start;
+    while (i < seq.slice.end) {
+        const oid = der.Element.parse(cert_der, i) catch return;
+        i = oid.slice.end;
+        if (oid.identifier.tag != .object_identifier) continue;
+        const b = cert_der[oid.slice.start..oid.slice.end];
+        const client_auth = [_]u8{ 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02 }; // 1.3.6.1.5.5.7.3.2
+        const any_usage = [_]u8{ 0x55, 0x1D, 0x25, 0x00 }; // 2.5.29.37.0
+        if (std.mem.eql(u8, b, &client_auth) or std.mem.eql(u8, b, &any_usage)) result.eku_client_auth = true;
     }
 }
 
@@ -480,8 +938,8 @@ pub const SessionTicket = struct {
 pub const ServerCertificate = struct {
     /// DER-encoded certificates, leaf first.
     cert_chain_der: []const []const u8,
-    /// Raw P-256 scalar or Ed25519 seed (32 bytes), as `extractEcPrivateKey`
-    /// / `extractEd25519PrivateKey` return it.
+    /// Raw P-256 scalar or Ed25519 seed (32 bytes), or an RSA key's PKCS#1
+    /// DER, as `extractPrivateKey` returns them.
     private_key_bytes: []const u8,
     private_key_algorithm: PrivateKeyAlgorithm = .ecdsa_p256_sha256,
 };
@@ -494,6 +952,8 @@ pub const CertEntry = struct {
     /// `a.b.example.com`). Matching is ASCII case-insensitive.
     server_names: []const []const u8,
     cert: ServerCertificate,
+    /// Ask clients that reach this certificate for one of their own.
+    client_auth: ?*const ClientAuth = null,
 };
 
 pub const CertSelection = struct {
@@ -507,29 +967,67 @@ pub const CertSelection = struct {
 /// one-label wildcard, then `entries[0]`. Returns null only when `entries` is
 /// empty.
 pub fn selectCertificate(entries: []const CertEntry, sni: ?[]const u8) ?CertSelection {
-    if (entries.len == 0) return null;
-    const raw = sni orelse return .{ .entry = &entries[0], .matched = false };
-    // A trailing dot names the same host (RFC 6066 forbids it, clients still send it).
-    const name = if (raw.len > 0 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
-    if (name.len == 0) return .{ .entry = &entries[0], .matched = false };
+    return selectCertificateFor(entries, sni, null);
+}
 
-    for (entries) |*e| {
-        for (e.server_names) |n| {
-            if (std.ascii.eqlIgnoreCase(n, name)) return .{ .entry = e, .matched = true };
+/// `selectCertificate`, preferring within each step (exact, wildcard,
+/// default) the first entry whose key can sign with one of `sig_algs`, the
+/// client's signature_algorithms list body. The default step considers every
+/// entry, so a client that cannot verify `entries[0]` gets another
+/// certificate rather than a failed handshake.
+pub fn selectCertificateFor(entries: []const CertEntry, sni: ?[]const u8, sig_algs: ?[]const u8) ?CertSelection {
+    if (entries.len == 0) return null;
+    const Pick = struct {
+        sig_algs: ?[]const u8,
+        first: ?*const CertEntry = null,
+        usable: ?*const CertEntry = null,
+
+        fn add(pick: *@This(), e: *const CertEntry) void {
+            if (pick.first == null) pick.first = e;
+            if (pick.usable != null) return;
+            const offered = pick.sig_algs orelse return;
+            if (signatureSchemeFor(e.cert.private_key_algorithm, offered) != null) pick.usable = e;
         }
-    }
-    if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
-        if (dot > 0) {
-            const parent = name[dot..]; // ".example.com"
-            for (entries) |*e| {
-                for (e.server_names) |n| {
-                    if (n.len > 2 and n[0] == '*' and n[1] == '.' and std.ascii.eqlIgnoreCase(n[1..], parent))
-                        return .{ .entry = e, .matched = true };
+
+        fn best(pick: @This()) ?*const CertEntry {
+            return pick.usable orelse pick.first;
+        }
+    };
+
+    // A trailing dot names the same host (RFC 6066 forbids it, clients still send it).
+    const raw = sni orelse "";
+    const name = if (raw.len > 0 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
+    if (name.len > 0) {
+        var exact: Pick = .{ .sig_algs = sig_algs };
+        for (entries) |*e| {
+            for (e.server_names) |n| {
+                if (std.ascii.eqlIgnoreCase(n, name)) {
+                    exact.add(e);
+                    break;
                 }
             }
         }
+        if (exact.best()) |e| return .{ .entry = e, .matched = true };
+
+        if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+            if (dot > 0) {
+                const parent = name[dot..]; // ".example.com"
+                var wildcard: Pick = .{ .sig_algs = sig_algs };
+                for (entries) |*e| {
+                    for (e.server_names) |n| {
+                        if (n.len > 2 and n[0] == '*' and n[1] == '.' and std.ascii.eqlIgnoreCase(n[1..], parent)) {
+                            wildcard.add(e);
+                            break;
+                        }
+                    }
+                }
+                if (wildcard.best()) |e| return .{ .entry = e, .matched = true };
+            }
+        }
     }
-    return .{ .entry = &entries[0], .matched = false };
+    var default: Pick = .{ .sig_algs = sig_algs };
+    for (entries) |*e| default.add(e);
+    return .{ .entry = default.best().?, .matched = false };
 }
 
 /// Parses the host_name out of a server_name extension body (RFC 6066 §3).
@@ -559,7 +1057,7 @@ pub fn parseServerNameExtension(data: []const u8) error{DecodeError}!?[]const u8
 
 pub const TlsConfig = struct {
     cert_chain_der: []const []const u8, // DER-encoded certificates
-    private_key_bytes: []const u8, // Raw P-256 scalar or Ed25519 seed (32 bytes)
+    private_key_bytes: []const u8, // See ServerCertificate.private_key_bytes
     private_key_algorithm: PrivateKeyAlgorithm = .ecdsa_p256_sha256,
     /// Server only: certificates chosen by the ClientHello's SNI (see
     /// `selectCertificate`). When non-empty, this replaces `cert_chain_der` /
@@ -567,6 +1065,12 @@ pub const TlsConfig = struct {
     /// default for a client that sends no SNI or an unknown name.
     certs: []const CertEntry = &.{},
     alpn: []const []const u8,
+    /// Server only: ask for a client certificate. With `certs`, the
+    /// selected entry's `client_auth` applies instead.
+    client_auth: ?*const ClientAuth = null,
+    /// Client only: presented when the server asks for a certificate;
+    /// without one the client answers with an empty Certificate.
+    client_certificate: ?ServerCertificate = null,
     server_name: ?[]const u8 = null, // SNI (client only)
     skip_cert_verify: bool = true, // Skip X.509 chain + CertificateVerify validation
     /// SHA-256 fingerprints of acceptable leaf certificates — the
@@ -636,7 +1140,16 @@ pub const HandshakeError = error{
     UnsupportedVersion,
     NoApplicationProtocol,
     MissingExtension,
+    /// The client offers no signature scheme our certificate can use.
+    HandshakeFailure,
     TransportParameterError,
+    /// The client's chain doesn't lead to `ClientAuth.ca_bundle`.
+    UnknownCa,
+    /// A certificate in the client's chain is expired or not yet valid.
+    CertificateExpired,
+    /// `ClientAuth.mode` is `.required` and the client sent no certificate.
+    CertificateRequired,
+    IllegalParameter,
 };
 
 pub const Action = union(enum) {
@@ -673,9 +1186,12 @@ const HandshakeState = enum {
     server_wait_client_hello,
     server_send_server_hello,
     server_send_encrypted_extensions,
+    server_send_certificate_request,
     server_send_certificate,
     server_send_certificate_verify,
     server_send_finished,
+    server_wait_client_certificate,
+    server_wait_client_certificate_verify,
     server_wait_client_finished,
     server_send_ticket,
 
@@ -746,10 +1262,23 @@ pub const Tls13Handshake = struct {
     // PSK / 0-RTT fields
     using_psk: bool = false,
 
-    /// Client: the server asked for a client certificate. We have none, and
-    /// RFC 8446 4.4.2 says the answer is still a Certificate message — an
-    /// empty one — which has to be in the transcript before Finished.
+    /// Client: the server asked for a client certificate. Without one to
+    /// offer, RFC 8446 4.4.2 says the answer is still a Certificate message
+    /// — an empty one — which has to be in the transcript before Finished.
     certificate_requested: bool = false,
+    /// Client: how we sign our CertificateVerify; null sends an empty
+    /// Certificate.
+    client_sig_scheme: ?tls.SignatureScheme = null,
+
+    /// Server: the client-auth policy in force, from the selected
+    /// certificate entry or `config.client_auth`.
+    client_auth: ?*const ClientAuth = null,
+    /// Server: the client's verified leaf certificate (DER), owned by
+    /// `allocator`.
+    peer_cert: ?[]u8 = null,
+    /// Holds `peer_cert`; the connection sets it. Without it a client-auth
+    /// handshake fails with internal_error.
+    allocator: ?std.mem.Allocator = null,
 
     /// Server: the ClientHello carried the early_data extension. RFC 8446
     /// 4.2.10 only lets EncryptedExtensions answer an extension the client
@@ -764,6 +1293,8 @@ pub const Tls13Handshake = struct {
     /// Server: the certificate we present — the config's single one, or the
     /// `config.certs` entry the ClientHello's SNI selected.
     server_cert: ServerCertificate = undefined,
+    /// Server: the CertificateVerify scheme, picked from the ClientHello.
+    server_sig_scheme: tls.SignatureScheme = .ecdsa_secp256r1_sha256,
 
     zero_rtt_accepted: bool = false,
     pending_install_early: bool = false,
@@ -808,6 +1339,10 @@ pub const Tls13Handshake = struct {
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
         self.certificate_requested = false;
+        self.client_sig_scheme = null;
+        self.client_auth = null;
+        self.peer_cert = null;
+        self.allocator = null;
         self.early_data_offered = false;
         self.selected_alpn_len = 0;
         self.zero_rtt_accepted = false;
@@ -881,6 +1416,10 @@ pub const Tls13Handshake = struct {
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
         self.certificate_requested = false;
+        self.client_sig_scheme = null;
+        self.client_auth = null;
+        self.peer_cert = null;
+        self.allocator = null;
         self.early_data_offered = false;
         self.selected_alpn_len = 0;
         self.zero_rtt_accepted = false;
@@ -997,9 +1536,12 @@ pub const Tls13Handshake = struct {
             .server_wait_client_hello => return self.serverProcessClientHello(),
             .server_send_server_hello => return self.serverBuildServerHello(),
             .server_send_encrypted_extensions => return self.serverBuildEncryptedExtensions(),
+            .server_send_certificate_request => return self.serverBuildCertificateRequest(),
             .server_send_certificate => return self.serverBuildCertificate(),
             .server_send_certificate_verify => return self.serverBuildCertificateVerify(),
             .server_send_finished => return self.serverBuildFinished(),
+            .server_wait_client_certificate => return self.serverProcessClientCertificate(),
+            .server_wait_client_certificate_verify => return self.serverProcessClientCertificateVerify(),
             .server_wait_client_finished => return self.serverProcessClientFinished(),
             .server_send_ticket => return self.serverSendTicket(),
 
@@ -1022,6 +1564,20 @@ pub const Tls13Handshake = struct {
 
     pub fn isComplete(self: *const Tls13Handshake) bool {
         return self.state == .connected;
+    }
+
+    /// Frees what the handshake allocated. The struct itself is the caller's.
+    pub fn deinit(self: *Tls13Handshake) void {
+        if (self.peer_cert) |c| if (self.allocator) |a| a.free(c);
+        self.peer_cert = null;
+    }
+
+    /// Server: the client's certificate (DER, leaf only), verified against
+    /// the `ClientAuth` in force, once the handshake completes. Null when
+    /// none was asked for, or `.optional` and none was sent.
+    pub fn peerCertificate(self: *const Tls13Handshake) ?[]const u8 {
+        if (self.state != .connected) return null;
+        return self.peer_cert;
     }
 
     // ─── Client states ───────────────────────────────────────────────
@@ -1199,7 +1755,14 @@ pub const Tls13Handshake = struct {
         // edge does — `cdn.moq.dev` failed at this message — and refusing it
         // ends the handshake over a request we are allowed to decline.
         if (msg[0] == @intFromEnum(tls.HandshakeType.certificate_request)) {
+            if (self.certificate_requested) return error.UnexpectedMessage;
+            const offered = parseCertificateRequest(msg[4..]) catch |err| return switch (err) {
+                error.MissingExtension => error.MissingExtension,
+                error.IllegalParameter => error.IllegalParameter,
+                error.DecodeError => error.DecodeError,
+            };
             self.certificate_requested = true;
+            if (self.config.client_certificate) |c| self.client_sig_scheme = signatureSchemeFor(c.private_key_algorithm, offered);
             self.transcript.update(msg);
             return ._continue;
         }
@@ -1241,6 +1804,7 @@ pub const Tls13Handshake = struct {
                 // Pinned by leaf fingerprint: only the leaf is examined, and
                 // only to lift the public key CertificateVerify needs.
                 if (cert_index == 0) {
+                    if (!certificateWellFormed(cert_der)) return error.BadCertificate;
                     const cert: Certificate = .{ .buffer = cert_der, .index = 0 };
                     const parsed = cert.parse() catch return error.BadCertificate;
                     const pub_key = parsed.pubKey();
@@ -1259,6 +1823,7 @@ pub const Tls13Handshake = struct {
                     if (!matched) return error.BadCertificate;
                 }
             } else if (!self.config.skip_cert_verify) {
+                if (!certificateWellFormed(cert_der)) return error.BadCertificate;
                 const cert: Certificate = .{ .buffer = cert_der, .index = 0 };
                 const parsed = cert.parse() catch return error.BadCertificate;
 
@@ -1281,21 +1846,7 @@ pub const Tls13Handshake = struct {
                 if (prev_parsed) |prev| {
                     const now_sec = sys.realtimeSeconds();
                     prev.verify(parsed, now_sec) catch return error.BadCertificate;
-
-                    // RFC 5280 §4.2.1.9: issuer cert must have basicConstraints CA:TRUE
-                    // RFC 5280 §4.2.1.3: if keyUsage present, must include keyCertSign
-                    const exts = parseX509Extensions(cert_der);
-                    if (exts.is_ca) |is_ca| {
-                        if (!is_ca) return error.BadCertificate;
-                    }
-                    if (!exts.hasKeyCertSign()) return error.BadCertificate;
-
-                    // RFC 5280 §4.2.1.9: enforce pathLenConstraint
-                    if (exts.path_len_constraint) |max_len| {
-                        // cert_index counts from leaf (0), so intermediates below
-                        // this cert is cert_index - 1 certs deep
-                        if (cert_index > max_len + 1) return error.BadCertificate;
-                    }
+                    if (!issuerConstraintsOk(cert_der, cert_index)) return error.BadCertificate;
                 }
 
                 // If this is the last cert, verify against CA bundle
@@ -1399,12 +1950,21 @@ pub const Tls13Handshake = struct {
     fn clientSendFinished(self: *Tls13Handshake) !Action {
         var pos: usize = 0;
 
-        // RFC 8446 4.4.2: having been asked, the client answers even with
-        // nothing to offer — an empty certificate_list, and no
-        // CertificateVerify to go with it. The context is zero length:
-        // 4.3.2 only allows a non-empty one for post-handshake auth, which
-        // RFC 9001 4.4 forbids over QUIC anyway.
-        if (self.certificate_requested) {
+        // RFC 8446 4.4.2: having been asked, the client answers with its
+        // certificate, or even with nothing to offer — an empty
+        // certificate_list, and no CertificateVerify to go with it. The
+        // context is zero length: 4.3.2 only allows a non-empty one for
+        // post-handshake auth, which RFC 9001 4.4 forbids over QUIC anyway.
+        if (!self.certificate_requested) {} else if (self.client_sig_scheme) |scheme| {
+            const cert = self.config.client_certificate.?;
+            const cert_msg = buildCertificate(self.out_buf[pos..], cert.cert_chain_der) catch return error.InternalError;
+            self.transcript.update(cert_msg);
+            pos += cert_msg.len;
+            if (self.out_buf.len - pos < 8 + rsa.max_signature_len + 36) return error.InternalError;
+            const cv = buildCertificateVerify(self.out_buf[pos..], self.transcript.current(), cert.private_key_bytes, scheme, false) catch return error.InternalError;
+            self.transcript.update(cv);
+            pos += cv.len;
+        } else {
             const empty_cert = [_]u8{
                 @intFromEnum(tls.HandshakeType.certificate),
                 0, 0, 4, // length
@@ -1510,6 +2070,8 @@ pub const Tls13Handshake = struct {
         pos += 2;
 
         var found_key_share = false;
+        var sni: ?[]const u8 = null;
+        var sig_algs: ?[]const u8 = null;
         var psk_ext_offset: ?usize = null; // offset into ext_data where PSK extension starts
         var psk_ext_len: usize = 0;
         var ext_pos: usize = 0;
@@ -1587,22 +2149,32 @@ pub const Tls13Handshake = struct {
                 psk_ext_len = elen;
             } else if (etype == @intFromEnum(tls.ExtensionType.early_data)) {
                 self.early_data_offered = true;
-            } else if (etype == @intFromEnum(tls.ExtensionType.server_name) and self.config.certs.len > 0) {
-                const sni = parseServerNameExtension(ext_data[ext_pos..][0..elen]) catch return error.DecodeError;
-                self.server_cert = selectCertificate(self.config.certs, sni).?.entry.cert;
+            } else if (etype == @intFromEnum(tls.ExtensionType.server_name)) {
+                sni = parseServerNameExtension(ext_data[ext_pos..][0..elen]) catch return error.DecodeError;
+            } else if (etype == @intFromEnum(tls.ExtensionType.signature_algorithms)) {
+                if (elen < 2 or @as(usize, readU16(ext_data[ext_pos..])) + 2 != elen or elen % 2 != 0) return error.DecodeError;
+                sig_algs = ext_data[ext_pos + 2 ..][0 .. elen - 2];
             }
             ext_pos += elen;
         }
 
         if (!found_key_share) return error.NoKeyShare;
+        self.client_auth = self.config.client_auth;
+        if (self.config.certs.len > 0) {
+            const entry = selectCertificateFor(self.config.certs, sni, sig_algs).?.entry;
+            self.server_cert = entry.cert;
+            self.client_auth = entry.client_auth;
+        }
+        if (self.client_auth != null and self.allocator == null) return error.InternalError;
 
         // RFC 9001 §8.2: quic_transport_parameters extension MUST be present
         if (self.peer_transport_params == null) {
             return error.MissingExtension;
         }
 
-        // Try to process PSK extension if present and we have a ticket key
-        if (psk_ext_offset != null and self.config.ticket_key != null) {
+        // Try to process PSK extension if present and we have a ticket key.
+        // A ticket carries no client identity: with client auth, always a full handshake.
+        if (psk_ext_offset != null and self.config.ticket_key != null and self.client_auth == null) {
             std.log.info("PSK extension found, attempting PSK processing", .{});
             self.tryProcessPsk(msg, body, pos, ext_data, psk_ext_offset.?, psk_ext_len);
             if (self.using_psk) {
@@ -1610,6 +2182,13 @@ pub const Tls13Handshake = struct {
             } else {
                 std.log.info("PSK rejected, full handshake", .{});
             }
+        }
+
+        if (!self.using_psk) {
+            // RFC 8446 §4.2.3: certificate authentication needs a scheme the client offered.
+            const offered = sig_algs orelse return error.MissingExtension;
+            self.server_sig_scheme = signatureSchemeFor(self.server_cert.private_key_algorithm, offered) orelse
+                return error.HandshakeFailure;
         }
 
         // Update transcript with ClientHello
@@ -1739,9 +2318,22 @@ pub const Tls13Handshake = struct {
         // If PSK was accepted, skip certificate and certificate_verify
         if (self.using_psk) {
             self.state = .server_send_finished;
+        } else if (self.client_auth != null) {
+            self.state = .server_send_certificate_request;
         } else {
             self.state = .server_send_certificate;
         }
+        return Action{ .send_data = .{
+            .level = .handshake,
+            .data = self.out_buf[0..self.out_len],
+        } };
+    }
+
+    fn serverBuildCertificateRequest(self: *Tls13Handshake) !Action {
+        const msg = buildCertificateRequest(&self.out_buf, self.client_auth.?) catch return error.InternalError;
+        self.out_len = msg.len;
+        self.transcript.update(msg);
+        self.state = .server_send_certificate;
         return Action{ .send_data = .{
             .level = .handshake,
             .data = self.out_buf[0..self.out_len],
@@ -1771,12 +2363,12 @@ pub const Tls13Handshake = struct {
     fn serverBuildCertificateVerify(self: *Tls13Handshake) !Action {
         const transcript_hash = self.transcript.current();
 
-        var buf: [512]u8 = undefined;
+        var buf: [8 + rsa.max_signature_len]u8 = undefined;
         const msg = buildCertificateVerify(
             &buf,
             transcript_hash,
             self.server_cert.private_key_bytes,
-            self.server_cert.private_key_algorithm,
+            self.server_sig_scheme,
             true, // is_server
         ) catch return error.InternalError;
 
@@ -1822,7 +2414,7 @@ pub const Tls13Handshake = struct {
         @memcpy(self.out_buf[0..36], &msg);
         self.out_len = 36;
 
-        self.state = .server_wait_client_finished;
+        self.state = if (self.client_auth != null) .server_wait_client_certificate else .server_wait_client_finished;
         return Action{ .send_data = .{
             .level = .handshake,
             .data = self.out_buf[0..self.out_len],
@@ -1852,13 +2444,68 @@ pub const Tls13Handshake = struct {
         self.transcript.update(msg);
 
         // If we have a ticket key, send a NewSessionTicket before completing
-        if (self.config.ticket_key != null) {
+        if (self.config.ticket_key != null and self.client_auth == null) {
             self.state = .server_send_ticket;
             return ._continue;
         }
 
         self.state = .connected;
         return .complete;
+    }
+
+    fn serverProcessClientCertificate(self: *Tls13Handshake) !Action {
+        const msg = self.readHandshakeMsg() orelse return .wait_for_data;
+        if (msg[0] != @intFromEnum(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
+        const auth = self.client_auth.?;
+        var chain_buf: [max_client_chain][]const u8 = undefined;
+        const chain = (try parseCertificateList(msg[4..], &chain_buf)) orelse {
+            if (auth.mode == .required) return error.CertificateRequired;
+            self.transcript.update(msg);
+            self.state = .server_wait_client_finished;
+            return ._continue;
+        };
+        _ = try verifyPeerChain(chain, auth.ca_bundle, sys.realtimeSeconds());
+        if (!clientLeafUsageOk(chain[0])) return error.BadCertificate;
+        const gpa = self.allocator orelse return error.InternalError;
+        self.peer_cert = gpa.dupe(u8, chain[0]) catch return error.InternalError;
+        self.transcript.update(msg);
+        self.state = .server_wait_client_certificate_verify;
+        return ._continue;
+    }
+
+    fn serverProcessClientCertificateVerify(self: *Tls13Handshake) !Action {
+        const msg = self.readHandshakeMsg() orelse return .wait_for_data;
+        if (msg[0] != @intFromEnum(tls.HandshakeType.certificate_verify)) return error.UnexpectedMessage;
+        const body = msg[4..];
+        if (body.len < 4) return error.DecodeError;
+        const scheme = readU16(body);
+        const sig_len = readU16(body[2..]);
+        if (body.len != 4 + @as(usize, sig_len)) return error.DecodeError;
+        var offered = false;
+        var i: usize = 0;
+        while (i < client_auth_signature_schemes.len) : (i += 2) {
+            if (readU16(client_auth_signature_schemes[i..]) == scheme) offered = true;
+        }
+        if (!offered) return error.IllegalParameter;
+
+        const cert: Certificate = .{ .buffer = self.peer_cert.?, .index = 0 };
+        const leaf = cert.parse() catch return error.BadCertificate;
+        const label = "TLS 1.3, client CertificateVerify";
+        var content: [64 + label.len + 1 + 32]u8 = undefined;
+        @memset(content[0..64], 0x20);
+        @memcpy(content[64..][0..label.len], label);
+        content[64 + label.len] = 0x00;
+        content[64 + label.len + 1 ..][0..32].* = self.transcript.current();
+        verifyCertificateVerifySignature(
+            leaf.pubKey(),
+            std.meta.activeTag(leaf.pub_key_algo),
+            scheme,
+            body[4..],
+            &content,
+        ) catch return error.BadCertificateVerify;
+        self.transcript.update(msg);
+        self.state = .server_wait_client_finished;
+        return ._continue;
     }
 
     // ─── Server: Send NewSessionTicket ──────────────────────────────
@@ -2640,11 +3287,52 @@ fn buildCertificate(buf: []u8, cert_chain: []const []const u8) ![]const u8 {
     return buf[0..pos];
 }
 
+/// Signs CertificateVerify content with `scheme`, which `signatureSchemeFor`
+/// picked for the key. Returns a slice of `out`.
+pub fn signCertificateVerify(
+    scheme: tls.SignatureScheme,
+    private_key_bytes: []const u8,
+    content: []const u8,
+    out: *[rsa.max_signature_len]u8,
+) error{InternalError}![]const u8 {
+    var noise: [32]u8 = undefined;
+    sys.randomBytes(&noise);
+    switch (scheme) {
+        .ecdsa_secp256r1_sha256 => {
+            if (private_key_bytes.len != 32) return error.InternalError;
+            const sk = EcdsaP256Sha256.SecretKey.fromBytes(private_key_bytes[0..32].*) catch return error.InternalError;
+            // Not `fromSecretKey`: that multiplies the base point to recover a
+            // public key, which signing never reads, and it costs as much as the
+            // signature itself.
+            const kp = EcdsaP256Sha256.KeyPair{ .secret_key = sk, .public_key = undefined };
+            const sig = kp.sign(content, noise) catch return error.InternalError;
+            return sig.toDer(out[0..EcdsaP256Sha256.Signature.der_encoded_length_max]);
+        },
+        .ed25519 => {
+            if (private_key_bytes.len != 32) return error.InternalError;
+            const kp = Ed25519.KeyPair.generateDeterministic(private_key_bytes[0..32].*) catch return error.InternalError;
+            const sig = kp.sign(content, noise) catch return error.InternalError;
+            out[0..Ed25519.Signature.encoded_length].* = sig.toBytes();
+            return out[0..Ed25519.Signature.encoded_length];
+        },
+        inline .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => |s| {
+            const Hash = switch (s) {
+                .rsa_pss_rsae_sha256 => Sha256,
+                .rsa_pss_rsae_sha384 => Sha384,
+                else => Sha512,
+            };
+            const key = rsa.PrivateKey.parsePkcs1(private_key_bytes) catch return error.InternalError;
+            return key.signPss(Hash, content, out) catch return error.InternalError;
+        },
+        else => return error.InternalError,
+    }
+}
+
 fn buildCertificateVerify(
     buf: []u8,
     transcript_hash: [32]u8,
     private_key_bytes: []const u8,
-    private_key_algorithm: PrivateKeyAlgorithm,
+    scheme: tls.SignatureScheme,
     is_server: bool,
 ) ![]const u8 {
     // Build the content to sign:
@@ -2656,28 +3344,10 @@ fn buildCertificateVerify(
     sign_content[64 + 33] = 0x00;
     @memcpy(sign_content[64 + 34 ..][0..32], &transcript_hash);
 
-    if (private_key_bytes.len != 32) return error.InternalError;
-
-    var sig_storage: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
-    var sig_len: usize = 0;
-    const sig_algo: u16 = switch (private_key_algorithm) {
-        .ecdsa_p256_sha256 => sig_algo: {
-            const secret_key = EcdsaP256Sha256.SecretKey.fromBytes(private_key_bytes[0..32].*) catch return error.InternalError;
-            const key_pair = EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key) catch return error.InternalError;
-            const sig = key_pair.sign(&sign_content, null) catch return error.InternalError;
-            const sig_bytes = sig.toDer(&sig_storage);
-            sig_len = sig_bytes.len;
-            break :sig_algo @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256);
-        },
-        .ed25519 => sig_algo: {
-            const key_pair = Ed25519.KeyPair.generateDeterministic(private_key_bytes[0..32].*) catch return error.InternalError;
-            const sig = key_pair.sign(&sign_content, null) catch return error.InternalError;
-            const sig_bytes = sig.toBytes();
-            @memcpy(sig_storage[0..sig_bytes.len], &sig_bytes);
-            sig_len = sig_bytes.len;
-            break :sig_algo @intFromEnum(tls.SignatureScheme.ed25519);
-        },
-    };
+    var sig_storage: [rsa.max_signature_len]u8 = undefined;
+    const sig = try signCertificateVerify(scheme, private_key_bytes, &sign_content, &sig_storage);
+    const sig_algo: u16 = @intFromEnum(scheme);
+    const sig_len = sig.len;
 
     // Build message
     var pos: usize = 4; // reserve for header
@@ -2776,9 +3446,9 @@ pub fn parsePemCertChain(alloc: std.mem.Allocator, pem_data: []const u8) ![][]co
 }
 
 pub fn parsePemPrivateKey(pem_data: []const u8, out: []u8) ![]const u8 {
-    // Try EC PRIVATE KEY first, then PRIVATE KEY (PKCS#8)
     return parsePemSection(pem_data, "EC PRIVATE KEY", out) catch
-        parsePemSection(pem_data, "PRIVATE KEY", out);
+        parsePemSection(pem_data, "RSA PRIVATE KEY", out) catch
+        parsePemSection(pem_data, "PRIVATE KEY", out); // PKCS#8
 }
 
 fn parsePemSection(pem_data: []const u8, comptime label: []const u8, out: []u8) ![]const u8 {
@@ -2931,6 +3601,73 @@ pub fn extractEd25519PrivateKey(der: []const u8) ![]const u8 {
     const nested = try readDerValue(private_key, &nested_pos, 0x04);
     if (nested_pos != private_key.len or nested.len != 32) return error.DecodeError;
     return nested;
+}
+
+/// An RSA private key, PKCS#1 or PKCS#8 DER, as the PKCS#1 RSAPrivateKey
+/// that `ServerCertificate.private_key_bytes` takes (a slice of `der`).
+/// Two-prime keys of 2048 to 4096 bits; the key signs once here to prove its
+/// numbers fit together.
+pub fn extractRsaPrivateKey(der: []const u8) rsa.Error![]const u8 {
+    const pkcs1 = rsa.PrivateKey.pkcs1FromPkcs8(der) catch |err| switch (err) {
+        error.DecodeError => der, // not PKCS#8
+        else => return err,
+    };
+    const key = try rsa.PrivateKey.parsePkcs1(pkcs1);
+    try key.check();
+    return pkcs1;
+}
+
+pub const PrivateKey = struct {
+    /// A slice of the DER it was extracted from.
+    bytes: []const u8,
+    algorithm: PrivateKeyAlgorithm,
+};
+
+/// Recognizes an EC P-256 (SEC1 or PKCS#8), Ed25519 (PKCS#8) or RSA (PKCS#1
+/// or PKCS#8) private key, as `parsePemPrivateKey` decodes it.
+pub fn extractPrivateKey(der: []const u8) error{ UnsupportedKey, InvalidKey }!PrivateKey {
+    if (extractEcPrivateKey(der)) |k| return .{ .bytes = k, .algorithm = .ecdsa_p256_sha256 } else |_| {}
+    if (extractPkcs8EcPrivateKey(der)) |k| return .{ .bytes = k, .algorithm = .ecdsa_p256_sha256 } else |_| {}
+    if (extractEd25519PrivateKey(der)) |k| return .{ .bytes = k, .algorithm = .ed25519 } else |_| {}
+    const k = extractRsaPrivateKey(der) catch |err| return switch (err) {
+        error.InvalidKey => error.InvalidKey,
+        else => error.UnsupportedKey,
+    };
+    return .{ .bytes = k, .algorithm = .rsa };
+}
+
+/// Whether `key` is the private half of the public key in `cert_der`, a
+/// leaf certificate. A certificate whose key is of another type does not
+/// match. Catches a key and certificate paired by mistake, which would
+/// otherwise fail every handshake.
+pub fn keyMatchesCertificate(key: PrivateKey, cert_der: []const u8) error{BadCertificate}!bool {
+    const parsed = (Certificate{ .buffer = cert_der, .index = 0 }).parse() catch return error.BadCertificate;
+    const pub_key = parsed.pubKey();
+    switch (key.algorithm) {
+        .ecdsa_p256_sha256 => {
+            if (parsed.pub_key_algo != .X9_62_id_ecPublicKey or parsed.pub_key_algo.X9_62_id_ecPublicKey != .X9_62_prime256v1) return false;
+            if (key.bytes.len != 32) return false;
+            const cert_point = P256.fromSec1(pub_key) catch return error.BadCertificate;
+            const derived = P256.basePoint.mul(key.bytes[0..32].*, .big) catch return false;
+            return derived.equivalent(cert_point);
+        },
+        .ed25519 => {
+            if (parsed.pub_key_algo != .curveEd25519 or key.bytes.len != 32) return false;
+            const kp = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(key.bytes[0..32].*) catch return false;
+            return std.mem.eql(u8, &kp.public_key.toBytes(), pub_key);
+        },
+        .rsa => {
+            if (parsed.pub_key_algo != .rsaEncryption) return false;
+            const priv = rsa.PrivateKey.parsePkcs1(key.bytes) catch return false;
+            const public = Certificate.rsa.PublicKey.parseDer(pub_key) catch return error.BadCertificate;
+            return std.mem.eql(u8, trimLeadingZeros(priv.n), trimLeadingZeros(public.modulus)) and
+                std.mem.eql(u8, trimLeadingZeros(priv.e), trimLeadingZeros(public.exponent));
+        },
+    }
+}
+
+fn trimLeadingZeros(v: []const u8) []const u8 {
+    return std.mem.trimStart(u8, v, &.{0});
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -3624,7 +4361,11 @@ fn fixtureHandshake(gpa: std.mem.Allocator, chain: []const []const u8) !bool {
 fn fixtureHandshakeWith(gpa: std.mem.Allocator, server_config: TlsConfig) !bool {
     var bundle = try fixtureBundle(gpa);
     defer bundle.deinit(gpa);
+    return verifiedHandshake(gpa, server_config, &bundle, "relay.test");
+}
 
+/// Drives a verifying client against `server_config`; false when either side fails.
+fn verifiedHandshake(gpa: std.mem.Allocator, server_config: TlsConfig, bundle: *Certificate.Bundle, server_name: []const u8) !bool {
     const tp = transport_params.TransportParams{ .initial_max_data = 1 << 20, .initial_max_streams_bidi = 10 };
     const server = try gpa.create(Tls13Handshake);
     defer gpa.destroy(server);
@@ -3636,9 +4377,9 @@ fn fixtureHandshakeWith(gpa: std.mem.Allocator, server_config: TlsConfig) !bool 
         .cert_chain_der = &.{},
         .private_key_bytes = &.{},
         .alpn = &[_][]const u8{"h3"},
-        .server_name = "relay.test",
+        .server_name = server_name,
         .skip_cert_verify = false,
-        .ca_bundle = &bundle,
+        .ca_bundle = bundle,
     }, tp);
 
     var client_done = false;
@@ -3786,4 +4527,289 @@ test "a QUIC server picks its certificate by SNI" {
         .alpn = &[_][]const u8{"h3"},
         .certs = &wrong_default,
     }));
+}
+
+const test_certs = @import("../tls/test_certs.zig");
+
+test "a QUIC handshake with an RSA certificate, from a PKCS#1 or a PKCS#8 key" {
+    const gpa = std.testing.allocator;
+    var bundle: Certificate.Bundle = .empty;
+    defer bundle.deinit(gpa);
+    var der_buf: [2048]u8 = undefined;
+    try bundle.bytes.appendSlice(gpa, try parsePemCert(test_certs.test_rsa_pem, &der_buf));
+    try bundle.parseCert(gpa, 0, sys.realtimeSeconds());
+
+    for ([_]bool{ true, false }) |pkcs1| {
+        var rsa_cert: test_certs.RsaCert = undefined;
+        try rsa_cert.load(pkcs1);
+        try std.testing.expectEqual(PrivateKeyAlgorithm.rsa, rsa_cert.cert.private_key_algorithm);
+        try std.testing.expect(try verifiedHandshake(gpa, .{
+            .cert_chain_der = rsa_cert.cert.cert_chain_der,
+            .private_key_bytes = rsa_cert.cert.private_key_bytes,
+            .private_key_algorithm = .rsa,
+            .alpn = &[_][]const u8{"h3"},
+        }, &bundle, "rsa.test"));
+    }
+}
+
+/// The server's answer to our client's ClientHello with its
+/// signature_algorithms list replaced by `schemes` (null: extension renamed away).
+fn serverAnswer(cert: ServerCertificate, schemes: ?[5]tls.SignatureScheme) !void {
+    const tp = transport_params.TransportParams{ .initial_max_data = 1 << 20 };
+    var server = Tls13Handshake.initServer(.{
+        .cert_chain_der = cert.cert_chain_der,
+        .private_key_bytes = cert.private_key_bytes,
+        .private_key_algorithm = cert.private_key_algorithm,
+        .alpn = &[_][]const u8{"h3"},
+    }, tp);
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    }, tp);
+    const ch = while (true) {
+        switch (try client.step()) {
+            .send_data => |sd| break sd.data,
+            else => {},
+        }
+    };
+    var buf: [2048]u8 = undefined;
+    const msg = buf[0..ch.len];
+    @memcpy(msg, ch);
+    const at = std.mem.indexOf(u8, msg, &.{ 0x00, 0x0d, 0x00, 0x0c, 0x00, 0x0a }).?;
+    if (schemes) |list| {
+        for (list, 0..) |scheme, i| std.mem.writeInt(u16, msg[at + 6 + 2 * i ..][0..2], @intFromEnum(scheme), .big);
+    } else {
+        msg[at + 1] = 0xfa; // an unassigned extension type
+    }
+    server.provideData(msg);
+    while (true) {
+        switch (try server.step()) {
+            .send_data => return,
+            else => {},
+        }
+    }
+}
+
+test "keyMatchesCertificate: each key type against its own and a foreign certificate" {
+    var tc: test_certs.TestCerts = undefined;
+    try tc.load();
+    var rsa_cert: test_certs.RsaCert = undefined;
+    try rsa_cert.load(false);
+    const ec: PrivateKey = .{ .bytes = tc.entries[0].cert.private_key_bytes, .algorithm = .ecdsa_p256_sha256 };
+    const ed: PrivateKey = .{ .bytes = tc.entries[2].cert.private_key_bytes, .algorithm = .ed25519 };
+    const rsa_key: PrivateKey = .{ .bytes = rsa_cert.cert.private_key_bytes, .algorithm = .rsa };
+    const ec_cert = tc.chains[0][0];
+    const ed_cert = tc.chains[2][0];
+    const rsa_leaf = rsa_cert.chain[0];
+
+    try std.testing.expect(try keyMatchesCertificate(ec, ec_cert));
+    try std.testing.expect(try keyMatchesCertificate(ed, ed_cert));
+    try std.testing.expect(try keyMatchesCertificate(rsa_key, rsa_leaf));
+    try std.testing.expect(!try keyMatchesCertificate(ec, rsa_leaf));
+    try std.testing.expect(!try keyMatchesCertificate(ed, ec_cert));
+    try std.testing.expect(!try keyMatchesCertificate(rsa_key, ed_cert));
+
+    // Same type, another key.
+    var der: [1024]u8 = undefined;
+    const other_ec_cert = try parsePemCert(test_certs.interop_server_pem, &der);
+    try std.testing.expect(!try keyMatchesCertificate(ec, other_ec_cert));
+    var pkcs1: test_certs.RsaCert = undefined;
+    try pkcs1.load(true);
+    try std.testing.expect(try keyMatchesCertificate(.{ .bytes = pkcs1.cert.private_key_bytes, .algorithm = .rsa }, rsa_leaf));
+}
+
+test "a QUIC server fails a client that offers no scheme for its certificate" {
+    var rsa_cert: test_certs.RsaCert = undefined;
+    try rsa_cert.load(false);
+    var ec_certs: test_certs.TestCerts = undefined;
+    try ec_certs.load();
+    const ec = ec_certs.entries[0].cert;
+
+    const no_pss: [5]tls.SignatureScheme = .{ .ecdsa_secp256r1_sha256, .ed25519, .rsa_pkcs1_sha256, .rsa_pss_pss_sha256, .ecdsa_secp384r1_sha384 };
+    const only_pss512: [5]tls.SignatureScheme = @splat(.rsa_pss_rsae_sha512);
+    try std.testing.expectError(error.HandshakeFailure, serverAnswer(rsa_cert.cert, no_pss));
+    try std.testing.expectError(error.HandshakeFailure, serverAnswer(ec, only_pss512));
+    try std.testing.expectError(error.MissingExtension, serverAnswer(rsa_cert.cert, null));
+    try serverAnswer(rsa_cert.cert, only_pss512);
+    try serverAnswer(ec, no_pss);
+}
+
+test "selectCertificateFor: a key the client can verify wins within each step" {
+    const ec: ServerCertificate = .{ .cert_chain_der = &.{}, .private_key_bytes = &.{} };
+    const rsa_key: ServerCertificate = .{ .cert_chain_der = &.{}, .private_key_bytes = &.{}, .private_key_algorithm = .rsa };
+    const entries = [_]CertEntry{
+        .{ .server_names = &.{"default.test"}, .cert = ec },
+        .{ .server_names = &.{"*.example.com"}, .cert = ec },
+        .{ .server_names = &.{"*.example.com"}, .cert = rsa_key },
+        .{ .server_names = &.{"api.example.com"}, .cert = ec },
+    };
+    const pss = [_]u8{ 0x08, 0x04 };
+    const ecdsa = [_]u8{ 0x04, 0x03 };
+    const T = struct {
+        fn pick(e: []const CertEntry, sni: ?[]const u8, offered: []const u8) struct { usize, bool } {
+            const sel = selectCertificateFor(e, sni, offered).?;
+            return .{ (@intFromPtr(sel.entry) - @intFromPtr(e.ptr)) / @sizeOf(CertEntry), sel.matched };
+        }
+    };
+    try std.testing.expectEqual(.{ 1, true }, T.pick(&entries, "www.example.com", &ecdsa));
+    try std.testing.expectEqual(.{ 2, true }, T.pick(&entries, "www.example.com", &pss));
+    // An exact match is not given up for a usable wildcard.
+    try std.testing.expectEqual(.{ 3, true }, T.pick(&entries, "api.example.com", &pss));
+    try std.testing.expectEqual(.{ 2, false }, T.pick(&entries, null, &pss));
+    try std.testing.expectEqual(.{ 0, false }, T.pick(&entries, "other.test", &.{ 0x08, 0x07 }));
+    try std.testing.expectEqual(tls.SignatureScheme.rsa_pss_rsae_sha384, signatureSchemeFor(.rsa, &.{ 0x08, 0x06, 0x08, 0x05 }).?);
+    try std.testing.expect(signatureSchemeFor(.rsa, &.{ 0x08, 0x09, 0x04, 0x01 }) == null);
+}
+
+/// A QUIC handshake between a server under `server_config` (given an
+/// allocator, as a Connection does) and a client presenting `client_cert`.
+/// Returns the server's error if it refuses, and on success the server's
+/// view of the client certificate.
+fn clientAuthHandshake(gpa: std.mem.Allocator, server_config: TlsConfig, client_cert: ?ServerCertificate, peer_out: *?[]const u8, peer_buf: []u8) !void {
+    const tp = transport_params.TransportParams{ .initial_max_data = 1 << 20, .initial_max_streams_bidi = 10 };
+    const server = try gpa.create(Tls13Handshake);
+    defer gpa.destroy(server);
+    const client = try gpa.create(Tls13Handshake);
+    defer gpa.destroy(client);
+    Tls13Handshake.initServerInto(server, server_config, tp);
+    server.allocator = gpa;
+    defer server.deinit();
+    Tls13Handshake.initClientInto(client, .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+        .client_certificate = client_cert,
+    }, tp);
+
+    var client_done = false;
+    var server_done = false;
+    var i: usize = 0;
+    while ((!client_done or !server_done) and i < 100) : (i += 1) {
+        if (!client_done) switch (try client.step()) {
+            .send_data => |sd| server.provideData(sd.data),
+            .complete => client_done = true,
+            else => {},
+        };
+        if (!server_done) switch (try server.step()) {
+            .send_data => client.provideData(server.out_buf[0..server.out_len]),
+            .complete => server_done = true,
+            else => {},
+        };
+    }
+    try std.testing.expect(client_done and server_done);
+    try std.testing.expectEqual(server_config.certs[0].client_auth, server.client_auth);
+    try std.testing.expect(!server.using_psk);
+    peer_out.* = null;
+    if (server.peerCertificate()) |c| {
+        @memcpy(peer_buf[0..c.len], c);
+        peer_out.* = peer_buf[0..c.len];
+    }
+}
+
+test "QUIC client certificates: required, optional, refused" {
+    const gpa = std.testing.allocator;
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    var clients: test_certs.ClientCerts = undefined;
+    try clients.load(gpa);
+    defer clients.deinit(gpa);
+    var auth: ClientAuth = .{ .ca_bundle = &clients.bundle };
+    certs.entries[0].client_auth = &auth;
+    const config: TlsConfig = .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .certs = &certs.entries,
+        .alpn = &[_][]const u8{"h3"},
+        .ticket_key = @splat(9),
+    };
+    var peer: ?[]const u8 = null;
+    var buf: [2048]u8 = undefined;
+
+    for ([_]test_certs.ClientCerts.Which{ .valid, .rsa }) |which| {
+        try clientAuthHandshake(gpa, config, clients.certificate(which), &peer, &buf);
+        try std.testing.expectEqualSlices(u8, clients.certificate(which).cert_chain_der[0], peer.?);
+    }
+    try std.testing.expectError(error.CertificateRequired, clientAuthHandshake(gpa, config, null, &peer, &buf));
+    try std.testing.expectError(error.UnknownCa, clientAuthHandshake(gpa, config, clients.certificate(.foreign), &peer, &buf));
+    try std.testing.expectError(error.CertificateExpired, clientAuthHandshake(gpa, config, clients.certificate(.expired), &peer, &buf));
+    try std.testing.expectError(error.BadCertificate, clientAuthHandshake(gpa, config, clients.certificate(.server_only), &peer, &buf));
+
+    auth.mode = .optional;
+    try clientAuthHandshake(gpa, config, null, &peer, &buf);
+    try std.testing.expectEqual(null, peer);
+    try std.testing.expectError(error.UnknownCa, clientAuthHandshake(gpa, config, clients.certificate(.foreign), &peer, &buf));
+}
+
+test "parseCertificateRequest and parseCertificateList reject malformed input" {
+    var clients: test_certs.ClientCerts = undefined;
+    try clients.load(std.testing.allocator);
+    defer clients.deinit(std.testing.allocator);
+    const auth: ClientAuth = .{ .ca_bundle = &clients.bundle, .authorities = &.{ 0, 3, 0, 1, 0x30 } };
+    var buf: [256]u8 = undefined;
+    const req = try buildCertificateRequest(&buf, &auth);
+    try std.testing.expectEqualSlices(u8, &client_auth_signature_schemes, try parseCertificateRequest(req[4..]));
+    // Every truncation fails cleanly.
+    for (0..req.len - 4) |n| {
+        if (parseCertificateRequest(req[4..][0..n])) |_| return error.TestUnexpectedResult else |_| {}
+    }
+    try std.testing.expectError(error.IllegalParameter, parseCertificateRequest(&.{ 1, 0, 0, 0 }));
+    try std.testing.expectError(error.MissingExtension, parseCertificateRequest(&.{ 0, 0, 0 }));
+
+    var chain: [2][]const u8 = undefined;
+    try std.testing.expectEqual(null, try parseCertificateList(&.{ 0, 0, 0, 0 }, &chain));
+    try std.testing.expectError(error.IllegalParameter, parseCertificateList(&.{ 1, 0, 0, 0 }, &chain));
+    try std.testing.expectError(error.DecodeError, parseCertificateList(&.{ 0, 0, 0, 5, 0, 0, 1, 0xaa, 0 }, &chain));
+    const one = [_]u8{ 0, 0, 0, 6, 0, 0, 1, 0xaa, 0, 0 };
+    try std.testing.expectEqual(@as(usize, 1), (try parseCertificateList(&one, &chain)).?.len);
+    const three = [_]u8{ 0, 0, 0, 18, 0, 0, 1, 0xaa, 0, 0, 0, 0, 1, 0xbb, 0, 0, 0, 0, 1, 0xcc, 0, 0 };
+    try std.testing.expectError(error.BadCertificate, parseCertificateList(&three, &chain));
+}
+
+/// Anything `certificateWellFormed` passes must be safe to walk with std's
+/// parser and our extension readers.
+fn walkAccepted(der: []const u8) void {
+    if (!certificateWellFormed(der)) return;
+    const c: Certificate = .{ .buffer = der, .index = 0 };
+    const p = c.parse() catch return;
+    _ = p.verifyHostName("localhost") catch {};
+    if (p.pub_key_algo == .rsaEncryption) _ = Certificate.rsa.PublicKey.parseDer(p.pubKey()) catch {};
+    _ = clientLeafUsageOk(der);
+    _ = issuerConstraintsOk(der, 1);
+}
+
+test "certificateWellFormed: random corruption never crashes the parsers behind it" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const r = prng.random();
+    var buf: [2048]u8 = undefined;
+    const pems = [_][]const u8{ test_certs.client_pem, test_certs.client_rsa_pem, test_certs.test_rsa_pem };
+    for (pems) |pem| {
+        const der = try parsePemCert(pem, &buf);
+        var copy: [2048]u8 = undefined;
+        for (0..5000) |_| {
+            @memcpy(copy[0..der.len], der);
+            for (0..r.intRangeAtMost(usize, 1, 4)) |_| copy[r.uintLessThan(usize, der.len)] = r.int(u8);
+            walkAccepted(copy[0..r.intRangeAtMost(usize, der.len / 2, der.len)]);
+            walkAccepted(copy[0..der.len]);
+        }
+    }
+}
+
+test "certificateWellFormed: real certificates pass, every truncation and a lying length fail" {
+    var buf: [2048]u8 = undefined;
+    const pems = [_][]const u8{ test_certs.client_pem, test_certs.client_rsa_pem, test_certs.test_localhost_pem, test_certs.test_ed25519_pem, test_certs.test_rsa_pem, test_certs.interop_server_pem };
+    for (pems) |pem| {
+        const der = try parsePemCert(pem, &buf);
+        try std.testing.expect(certificateWellFormed(der));
+        for (0..der.len) |n| try std.testing.expect(!certificateWellFormed(der[0..n]));
+        // Each length byte bumped: never a crash, whatever the verdict.
+        var copy: [2048]u8 = undefined;
+        for (0..der.len) |i| {
+            @memcpy(copy[0..der.len], der);
+            copy[i] +%= 1;
+            walkAccepted(copy[0..der.len]);
+        }
+    }
 }

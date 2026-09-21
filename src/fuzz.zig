@@ -27,6 +27,7 @@ const ranges = @import("quic/ranges.zig");
 const stream = @import("quic/stream.zig");
 const connection = @import("quic/connection.zig");
 const tls13 = @import("quic/tls13.zig");
+const tls_client = @import("tls/client.zig");
 const moq_wire = @import("moq/wire.zig");
 const moq_msg = @import("moq/message.zig");
 const moq_codes = @import("moq/message_codes.zig");
@@ -330,6 +331,47 @@ test "fuzz: tls pem parse" {
     }.f, .{});
 }
 
+test "fuzz: tls client fed a server flight" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+            var client = try tls_client.Conn.init(testing.allocator, &.{ .server_name = "localhost", .alpn = &.{"http/1.1"} });
+            defer client.deinit();
+            client.feed(input) catch {};
+        }
+    }.f, .{});
+}
+
+test "fuzz: client certificate messages" {
+    // A CertificateRequest body and a Certificate body carrying a real leaf.
+    const seeds = comptime [_][]const u8{
+        &.{ 0, 0, 8, 0, 13, 0, 4, 0, 2, 4, 3 },
+        &.{ 0, 0, 0, 0 },
+        &.{ 0, 0, 0, 6, 0, 0, 1, 0x30, 0, 0 },
+    };
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+            _ = tls13.parseCertificateRequest(input) catch {};
+            var chain: [tls13.max_client_chain][]const u8 = undefined;
+            const list = (tls13.parseCertificateList(input, &chain) catch return) orelse return;
+            for (list) |der| {
+                _ = tls13.clientLeafUsageOk(der);
+                // std's DER parser trusts every length; only a checked shape may reach it.
+                if (!tls13.certificateWellFormed(der)) continue;
+                const cert: std.crypto.Certificate = .{ .buffer = der, .index = 0 };
+                const p = cert.parse() catch continue;
+                _ = p.verifyHostName("localhost") catch {};
+                _ = tls13.issuerConstraintsOk(der, 1);
+                if (p.pub_key_algo == .rsaEncryption) _ = std.crypto.Certificate.rsa.PublicKey.parseDer(p.pubKey()) catch {};
+            }
+            // No anchors: every chain ends in UnknownCa or earlier.
+            const empty: std.crypto.Certificate.Bundle = .empty;
+            _ = tls13.verifyPeerChain(list, &empty, 1_800_000_000) catch {};
+        }
+    }.f, .{ .corpus = &seeds });
+}
+
 // ════════════════════════════════════════════════════════
 // Target 11: HTTP Capsule Parsing (RFC 9297 §4)
 //
@@ -522,12 +564,19 @@ test "fuzz: qpack encode-decode round-trip" {
 // ════════════════════════════════════════════════════════
 // Target 17: DER Private Key Extraction
 //
-// Parses EC (RFC 5915) and PKCS#8 DER-encoded private
-// keys. Tests ASN.1 SEQUENCE/OCTET STRING walking,
+// Parses EC (RFC 5915), PKCS#8 and RSA (PKCS#1) DER-encoded
+// private keys. Tests ASN.1 SEQUENCE/OCTET STRING walking,
 // length byte handling, boundary checks.
 // ════════════════════════════════════════════════════════
 
 test "fuzz: der key extraction" {
+    const test_certs = @import("tls/test_certs.zig");
+    var pkcs1_buf: [2048]u8 = undefined;
+    var pkcs8_buf: [2048]u8 = undefined;
+    const seeds = [_][]const u8{
+        try tls13.parsePemPrivateKey(test_certs.test_rsa_key_pkcs1_pem, &pkcs1_buf),
+        try tls13.parsePemPrivateKey(test_certs.test_rsa_key_pem, &pkcs8_buf),
+    };
     try testing.fuzz({}, struct {
         fn f(_: void, smith: *std.testing.Smith) anyerror!void {
             const input = smith.in orelse return;
@@ -541,8 +590,15 @@ test "fuzz: der key extraction" {
             if (tls13.extractPkcs8EcPrivateKey(input)) |key| {
                 if (key.len != 32) @panic("PKCS#8 key not 32 bytes");
             } else |_| {}
+
+            // RSA: PKCS#1 directly, and wrapped in PKCS#8
+            const rsa = tls13.rsa.PrivateKey;
+            const pkcs1 = rsa.pkcs1FromPkcs8(input) catch input;
+            if (rsa.parsePkcs1(pkcs1)) |key| {
+                if (key.modulusBits() < tls13.rsa.min_bits or key.n.len > tls13.rsa.max_signature_len) @panic("RSA modulus out of range");
+            } else |_| {}
         }
-    }.f, .{});
+    }.f, .{ .corpus = &seeds });
 }
 
 // ════════════════════════════════════════════════════════
@@ -608,6 +664,69 @@ test "fuzz: frame sorter" {
             }
         }
     }.f, .{});
+}
+
+/// Stream byte at `offset`, so any frame can be checked without a copy.
+fn sendPattern(offset: u64) u8 {
+    return @truncate(offset *% 131 ^ (offset >> 9));
+}
+
+test "SendStream survives randomized writes, acks and losses" {
+    var prng = std.Random.DefaultPrng.init(0x73656e64);
+    const rand = prng.random();
+    var block: [300 * 1024]u8 = undefined;
+
+    for (0..40) |_| {
+        var ss = stream.SendStream.init(testing.allocator, 0);
+        defer ss.deinit();
+        var sent: [256]struct { off: u64, len: u64 } = undefined;
+        var n_sent: usize = 0;
+
+        for (0..3000) |_| {
+            switch (rand.uintLessThan(u8, 10)) {
+                0 => {
+                    // Mostly small writes, sometimes a burst past the retained capacity.
+                    const len = if (rand.uintLessThan(u8, 20) == 0)
+                        rand.uintLessThan(usize, block.len)
+                    else
+                        rand.uintLessThan(usize, 4096);
+                    for (block[0..len], 0..) |*b, k| b.* = sendPattern(ss.write_offset + k);
+                    try ss.writeData(block[0..len]);
+                },
+                1, 2, 3, 4 => {
+                    if (n_sent == sent.len) continue;
+                    const f = ss.popStreamFrame(1 + rand.uintLessThan(u64, 1500)) orelse continue;
+                    for (f.stream.data, 0..) |b, k| try testing.expectEqual(sendPattern(f.stream.offset + k), b);
+                    if (f.stream.length == 0) continue;
+                    sent[n_sent] = .{ .off = f.stream.offset, .len = f.stream.length };
+                    n_sent += 1;
+                },
+                5, 6, 7, 8 => {
+                    if (n_sent == 0) continue;
+                    const k = rand.uintLessThan(usize, n_sent);
+                    try ss.onAck(sent[k].off, sent[k].len, false);
+                    sent[k] = sent[n_sent - 1];
+                    n_sent -= 1;
+                },
+                else => {
+                    if (n_sent == 0) continue;
+                    const k = rand.uintLessThan(usize, n_sent);
+                    ss.queueRetransmit(sent[k].off, sent[k].len, false);
+                    sent[k] = sent[n_sent - 1];
+                    n_sent -= 1;
+                },
+            }
+        }
+
+        // Deliver the rest in order; a drained stream keeps only the floor.
+        for (sent[0..n_sent]) |r| try ss.onAck(r.off, r.len, false);
+        while (ss.popStreamFrame(1200)) |f| {
+            for (f.stream.data, 0..) |b, k| try testing.expectEqual(sendPattern(f.stream.offset + k), b);
+            try ss.onAck(f.stream.offset, f.stream.length, false);
+        }
+        try testing.expectEqual(ss.write_offset, ss.ack_offset);
+        try testing.expect(ss.write_buffer.capacity <= stream.SendStream.RETAINED_CAPACITY);
+    }
 }
 
 // ════════════════════════════════════════════════════════

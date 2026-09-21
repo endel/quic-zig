@@ -917,8 +917,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const cert_chain = try tls13.parsePemCertChain(alloc, server_cert_pem);
     var key_der_buf: [4096]u8 = undefined;
     const key_der = try tls13.parsePemPrivateKey(server_key_pem, &key_der_buf);
-    const ec_key = tls13.extractEcPrivateKey(key_der) catch try tls13.extractPkcs8EcPrivateKey(key_der);
-    const key_owned = try alloc.dupe(u8, ec_key);
+    const key = try tls13.extractPrivateKey(key_der);
+    const key_owned = try alloc.dupe(u8, key.bytes);
 
     // Advertise every draft we implement and let the peer choose; the TLS
     // layer records which one matched and each client is served at that
@@ -970,6 +970,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .tls_config = .{
             .cert_chain_der = cert_chain,
             .private_key_bytes = key_owned,
+            .private_key_algorithm = key.algorithm,
             .alpn = alpn,
             .ticket_key = ticket_key,
         },

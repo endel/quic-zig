@@ -6,7 +6,7 @@
 |---|---------|--------|-------|
 | **2** | **Streams** | | |
 | 2.1 | Stream Types and Identifiers | ✅ Done | Bidi + uni, client/server initiated, proper ID bits |
-| 2.2 | Sending and Receiving Data | ✅ Done | FrameSorter, SendStream, ReceiveStream. Reassembly keeps chunks sorted by offset and caps holes at 1000 per sorter; abutting pieces merge into chunks of up to 64 KiB, so unread contiguous data, reordered or not, never counts toward that cap — see [RFC9000_21.7.md](RFC9000_21.7.md) |
+| 2.2 | Sending and Receiving Data | ✅ Done | FrameSorter, SendStream, ReceiveStream. Reassembly keeps chunks sorted by offset and caps holes at 1000 per sorter; abutting pieces merge into chunks of up to 64 KiB, so unread contiguous data, reordered or not, never counts toward that cap — see [RFC9000_21.7.md](RFC9000_21.7.md). Send buffers drop acknowledged bytes and shrink back to 64 KiB after a burst — see [RFC9000_3.md](RFC9000_3.md) |
 | 2.3 | Stream Prioritization | ✅ Done | RFC 9218 extensible priorities: urgency (0-7), incremental, PRIORITY_UPDATE frame |
 | 2.4 | Operations on Streams | ✅ Done | Open, send, recv, close, reset |
 | **3** | **Stream States** | | |
@@ -77,7 +77,7 @@
 | 10.2.2 | Draining Connection State | ✅ Done | Proper draining state after close |
 | 10.2.3 | Immediate Close during Handshake | ✅ Done | Can close at any handshake stage |
 | 10.3 | Stateless Reset | ✅ Done | HMAC-SHA256 tokens, generation, detection |
-| 10.3.1 | Detecting a Stateless Reset | ✅ Done | Token matching on undecryptable packets |
+| 10.3.1 | Detecting a Stateless Reset | ✅ Done | Undecryptable short header checked against peer tokens → draining; server indexes tokens for resets with a random DCID |
 | 10.3.2 | Calculating a Stateless Reset Token | ✅ Done | Deterministic HMAC-SHA256 |
 | 10.3.3 | Looping | ✅ Done | Response always smaller than the trigger, never sent for triggers under 43 bytes, and rate-limited server-wide with VN and CONNECTION_REFUSED |
 | **11** | **Error Handling** | | |
@@ -195,7 +195,7 @@
 | 4.1 | Interface to TLS | ✅ Done | Action-based step() pattern |
 | 4.2 | TLS Version | ✅ Done | TLS 1.3 only |
 | 4.3 | ClientHello Size | ✅ Done | Initial packet padded to 1200 bytes (RFC 9001 requires packet padding, not CH padding) |
-| 4.4 | Peer Authentication | ✅ Done | Chain validation, hostname verify, trust anchors via `ClientConfig.ca`; answers a `CertificateRequest` with an empty certificate. See [RFC5280_CHAIN_VALIDATION.md](RFC5280_CHAIN_VALIDATION.md) for what is still not checked |
+| 4.4 | Peer Authentication | ✅ Done | Chain validation, hostname verify, trust anchors via `ClientConfig.ca`; asks for client certificates per SNI entry (`ClientAuth`: required or optional, CA bundle, no tickets while it applies) and presents one as a client. The server signs with ECDSA P-256, Ed25519 or RSA-PSS, picking the scheme (and, among certificates for the same name, the certificate) from the client's `signature_algorithms`; `handshake_failure` when nothing fits. See [RFC5280_CHAIN_VALIDATION.md](RFC5280_CHAIN_VALIDATION.md) for what is still not checked |
 | 4.5 | Session Resumption | ✅ Done | PSK/tickets, binder, NewSessionTicket |
 | 4.6 | 0-RTT | ✅ Done | Early key install, 0-RTT packing; `early_data` answered in EncryptedExtensions only when the ClientHello offered it (RFC 8446 §4.2.10) |
 | 4.7 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager |

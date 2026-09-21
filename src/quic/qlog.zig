@@ -8,6 +8,7 @@ const sys = @import("../sys.zig");
 const frame_mod = @import("frame.zig");
 const Frame = frame_mod.Frame;
 const packet = @import("packet.zig");
+const ack_handler = @import("ack_handler.zig");
 
 pub const QlogWriter = struct {
     file: sys.File,
@@ -188,6 +189,60 @@ pub const QlogWriter = struct {
     }
 
     // ── Frame serialization helpers ──────────────────────────────────────
+
+    /// The frames a sent packet carried, as the contents of a qlog `frames`
+    /// array. Read back from the record the loss detector keeps, which holds
+    /// everything that would have to be resent: stream data, crypto, datagrams
+    /// and control frames. ACKs are not resent and so are not recorded, so a
+    /// sent packet's ACK does not appear here.
+    /// The frames a sent packet carried, as recorded for retransmission. Names
+    /// match `serializeFrame` so both events read alike.
+    pub fn serializeSentFrames(pkt: *const ack_handler.SentPacket, out: []u8) usize {
+        var w: Writer = .{ .out = out };
+        for (pkt.getStreamFrames()) |sf| {
+            w.frame("\"stream\",\"stream_id\":{d},\"offset\":{d},\"length\":{d}{s}", .{
+                sf.stream_id,                        sf.offset, sf.length,
+                if (sf.fin) ",\"fin\":true" else "",
+            });
+        }
+        if (pkt.has_crypto_data) w.frame("\"crypto\"", .{});
+        if (pkt.has_handshake_done) w.frame("\"handshake_done\"", .{});
+        if (pkt.has_datagram) w.frame("\"datagram\"", .{});
+        for (pkt.getControlFrames()) |cf| switch (cf) {
+            .max_data, .new_token => w.frame("\"{s}\"", .{@tagName(cf)}),
+            .max_stream_data => |id| w.frame("\"max_stream_data\",\"stream_id\":{d}", .{id}),
+            .max_streams_bidi => w.frame("\"max_streams\",\"stream_type\":\"bidirectional\"", .{}),
+            .max_streams_uni => w.frame("\"max_streams\",\"stream_type\":\"unidirectional\"", .{}),
+            .data_blocked => |l| w.frame("\"data_blocked\",\"limit\":{d}", .{l}),
+            .stream_data_blocked => |b| w.frame("\"stream_data_blocked\",\"stream_id\":{d},\"limit\":{d}", .{ b.stream_id, b.limit }),
+            .streams_blocked_bidi => |l| w.frame("\"streams_blocked\",\"stream_type\":\"bidirectional\",\"limit\":{d}", .{l}),
+            .streams_blocked_uni => |l| w.frame("\"streams_blocked\",\"stream_type\":\"unidirectional\",\"limit\":{d}", .{l}),
+            .reset_stream => |r| w.frame("\"reset_stream\",\"stream_id\":{d},\"error_code\":{d},\"final_size\":{d}", .{ r.stream_id, r.error_code, r.final_size }),
+            .stop_sending => |ss| w.frame("\"stop_sending\",\"stream_id\":{d},\"error_code\":{d}", .{ ss.stream_id, ss.error_code }),
+            .new_connection_id => |seq| w.frame("\"new_connection_id\",\"sequence_number\":{d}", .{seq}),
+            .retire_connection_id => |seq| w.frame("\"retire_connection_id\",\"sequence_number\":{d}", .{seq}),
+        };
+        return w.pos;
+    }
+
+    /// Appends JSON objects to a fixed buffer, dropping whatever does not fit:
+    /// a trace is for reading, not for feeding something that needs every byte.
+    const Writer = struct {
+        out: []u8,
+        pos: usize = 0,
+
+        /// One frame object. `fmt` supplies the quoted type name and any fields.
+        fn frame(self: *Writer, comptime fmt: []const u8, args: anytype) void {
+            if (self.pos != 0) self.print(",", .{});
+            self.print("{{\"frame_type\":" ++ fmt ++ "}}", args);
+        }
+
+        fn print(self: *Writer, comptime fmt: []const u8, args: anytype) void {
+            const rest = self.out[@min(self.pos, self.out.len)..];
+            const wrote = std.fmt.bufPrint(rest, fmt, args) catch return;
+            self.pos += wrote.len;
+        }
+    };
 
     pub fn serializeFrames(frames: []const Frame, out: []u8) usize {
         var pos: usize = 0;

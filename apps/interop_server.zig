@@ -179,8 +179,7 @@ pub fn main(_: std.process.Init.Minimal) !void {
 
     var key_der_buf: [4096]u8 = undefined;
     const key_der = try tls13.parsePemPrivateKey(key_pem, &key_der_buf);
-    const ec_private_key = tls13.extractEcPrivateKey(key_der) catch
-        try tls13.extractPkcs8EcPrivateKey(key_der);
+    const key = try tls13.extractPrivateKey(key_der);
 
     const use_h3 = (testcase == .http3);
     const alpn = try alloc.alloc([]const u8, 1);
@@ -199,7 +198,8 @@ pub fn main(_: std.process.Init.Minimal) !void {
 
     const tls_config: tls13.TlsConfig = .{
         .cert_chain_der = cert_chain,
-        .private_key_bytes = ec_private_key,
+        .private_key_bytes = key.bytes,
+        .private_key_algorithm = key.algorithm,
         .alpn = alpn,
         .ticket_key = ticket_key,
         .keylog_file = keylog_file,

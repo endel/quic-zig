@@ -11,19 +11,26 @@
 //!   TLS_AES_256_GCM_SHA384, picked in the server's preference order.
 //! - X25519 and secp256r1 key exchange, with HelloRetryRequest when the
 //!   client's key_share has no group we accept but supported_groups does.
-//! - ECDSA P-256 / SHA-256 and Ed25519 certificates, selected by SNI.
+//! - ECDSA P-256 / SHA-256, Ed25519 and RSA (signing with RSA-PSS)
+//!   certificates, selected by SNI and the client's signature_algorithms.
 //! - ALPN, middlebox compatibility mode, KeyUpdate in both directions.
 //! - With `Config.ticket_key`: stateless session tickets and PSK-DHE
 //!   resumption (psk_dhe_ke; the key exchange still runs).
+//! - Client certificates, per certificate entry (`CertEntry.client_auth`):
+//!   a CertificateRequest, the client's chain verified against the entry's
+//!   CA bundle, its CertificateVerify checked, and the leaf kept for
+//!   `peerCertificate()`. No tickets are issued or accepted under a
+//!   client-auth entry, so a resumed session can't skip the certificate.
 //!
-//! Not supported, by design: TLS 1.2 and earlier, client certificates,
-//! 0-RTT (early data offered by a client is skipped), psk_ke resumption
-//! without (EC)DHE, external PSKs, RSA certificates, record size limit and
-//! other optional extensions.
+//! Not supported, by design: TLS 1.2 and earlier, post-handshake client
+//! authentication, 0-RTT (early data offered by a client is skipped), psk_ke resumption
+//! without (EC)DHE, external PSKs, record size limit and other optional
+//! extensions.
 
 const std = @import("std");
 const sys = @import("../sys.zig");
 const tls13 = @import("../quic/tls13.zig");
+const common = @import("common.zig");
 
 const crypto = std.crypto;
 const tls = crypto.tls;
@@ -38,16 +45,44 @@ pub const Certificate = tls13.ServerCertificate;
 pub const CertEntry = tls13.CertEntry;
 pub const PrivateKeyAlgorithm = tls13.PrivateKeyAlgorithm;
 
-pub const CipherSuite = enum(u16) {
-    aes_128_gcm_sha256 = 0x1301,
-    aes_256_gcm_sha384 = 0x1302,
-    chacha20_poly1305_sha256 = 0x1303,
-};
-
-pub const Group = enum(u16) {
-    secp256r1 = 0x0017,
-    x25519 = 0x001d,
-};
+pub const CipherSuite = common.CipherSuite;
+pub const Group = common.Group;
+const max_plaintext = common.max_plaintext;
+const max_handshake_msg = common.max_handshake_msg;
+const key_update_after = common.key_update_after;
+const hs_client_hello = common.hs_client_hello;
+const hs_server_hello = common.hs_server_hello;
+const hs_new_session_ticket = common.hs_new_session_ticket;
+const hs_encrypted_extensions = common.hs_encrypted_extensions;
+const hs_certificate = common.hs_certificate;
+const hs_certificate_verify = common.hs_certificate_verify;
+const hs_finished = common.hs_finished;
+const hs_key_update = common.hs_key_update;
+const hs_message_hash = common.hs_message_hash;
+const ct_ccs = common.ct_ccs;
+const ct_alert = common.ct_alert;
+const ct_handshake = common.ct_handshake;
+const ct_app_data = common.ct_app_data;
+const ext = common.ext;
+const tls13_version = common.tls13_version;
+const Suite = common.Suite;
+const hashLen = common.hashLen;
+const Secret = common.Secret;
+const Transcript = common.Transcript;
+const TrafficKeys = common.TrafficKeys;
+const Buffers = common.Buffers;
+const sealedLen = common.sealedLen;
+const sealInto = common.sealInto;
+const openWith = common.openWith;
+const HandshakeSecrets = common.HandshakeSecrets;
+const handshakeSecrets = common.handshakeSecrets;
+const appSecrets = common.appSecrets;
+const finishedMac = common.finishedMac;
+const Parser = common.Parser;
+const u16List = common.u16List;
+const containsU16 = common.containsU16;
+const alpnListContains = common.alpnListContains;
+const Builder = common.Builder;
 
 pub const Config = struct {
     /// Certificates chosen by SNI (exact name, then a one-label wildcard);
@@ -87,6 +122,15 @@ pub const Error = error{
     RecordOverflow,
     DecryptError,
     InternalError,
+    /// The client's certificate is malformed, breaks a constraint, isn't
+    /// for client authentication, or uses an algorithm we can't check.
+    BadCertificate,
+    /// The client's chain doesn't lead to the entry's `ClientAuth.ca_bundle`.
+    UnknownCa,
+    /// A certificate in the client's chain is expired or not yet valid.
+    CertificateExpired,
+    /// `ClientAuth.mode` is `.required` and the client sent no certificate.
+    CertificateRequired,
     /// The peer sent a fatal alert; see `peerAlert()`.
     PeerAlert,
     /// An earlier `feed` already failed; the connection is dead.
@@ -96,157 +140,22 @@ pub const Error = error{
     OutOfMemory,
 };
 
-const max_plaintext = tls.max_ciphertext_inner_record_len; // 2^14
-const max_handshake_msg = 1 << 16;
-// RFC 8446 §5.5: AES-GCM is safe for 2^24.5 records per key; rotate well before.
-const key_update_after: u64 = 1 << 23;
 // Budget for skipping 0-RTT records we never agreed to (RFC 8446 §4.2.10).
 const early_data_skip_budget: usize = 1 << 16;
 
 /// RFC 8446 §4.6.1: a client rejects a ticket that claims to live longer.
 const max_ticket_lifetime_s: u32 = 7 * 24 * 3600;
 
-const hs_client_hello: u8 = @intFromEnum(tls.HandshakeType.client_hello);
-const hs_server_hello: u8 = @intFromEnum(tls.HandshakeType.server_hello);
-const hs_new_session_ticket: u8 = @intFromEnum(tls.HandshakeType.new_session_ticket);
-const hs_encrypted_extensions: u8 = @intFromEnum(tls.HandshakeType.encrypted_extensions);
-const hs_certificate: u8 = @intFromEnum(tls.HandshakeType.certificate);
-const hs_certificate_verify: u8 = @intFromEnum(tls.HandshakeType.certificate_verify);
-const hs_finished: u8 = @intFromEnum(tls.HandshakeType.finished);
-const hs_key_update: u8 = @intFromEnum(tls.HandshakeType.key_update);
-const hs_message_hash: u8 = @intFromEnum(tls.HandshakeType.message_hash);
-
-const ct_ccs: u8 = @intFromEnum(tls.ContentType.change_cipher_spec);
-const ct_alert: u8 = @intFromEnum(tls.ContentType.alert);
-const ct_handshake: u8 = @intFromEnum(tls.ContentType.handshake);
-const ct_app_data: u8 = @intFromEnum(tls.ContentType.application_data);
-
-const ext = struct {
-    const server_name: u16 = @intFromEnum(tls.ExtensionType.server_name);
-    const supported_groups: u16 = @intFromEnum(tls.ExtensionType.supported_groups);
-    const signature_algorithms: u16 = @intFromEnum(tls.ExtensionType.signature_algorithms);
-    const alpn: u16 = @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation);
-    const pre_shared_key: u16 = @intFromEnum(tls.ExtensionType.pre_shared_key);
-    const psk_key_exchange_modes: u16 = @intFromEnum(tls.ExtensionType.psk_key_exchange_modes);
-    const early_data: u16 = @intFromEnum(tls.ExtensionType.early_data);
-    const supported_versions: u16 = @intFromEnum(tls.ExtensionType.supported_versions);
-    const cookie: u16 = @intFromEnum(tls.ExtensionType.cookie);
-    const key_share: u16 = @intFromEnum(tls.ExtensionType.key_share);
-};
-
-const tls13_version: u16 = @intFromEnum(tls.ProtocolVersion.tls_1_3);
-
-// ─── Per-suite primitives ────────────────────────────────────────────
-
-fn Suite(comptime cs: CipherSuite) type {
-    return struct {
-        const Hash = switch (cs) {
-            .aes_256_gcm_sha384 => crypto.hash.sha2.Sha384,
-            else => crypto.hash.sha2.Sha256,
-        };
-        const Hmac = crypto.auth.hmac.Hmac(Hash);
-        const Hkdf = crypto.kdf.hkdf.Hkdf(Hmac);
-        const Aead = switch (cs) {
-            .aes_128_gcm_sha256 => crypto.aead.aes_gcm.Aes128Gcm,
-            .aes_256_gcm_sha384 => crypto.aead.aes_gcm.Aes256Gcm,
-            .chacha20_poly1305_sha256 => crypto.aead.chacha_poly.ChaCha20Poly1305,
-        };
-        const hash_len = Hash.digest_length;
-
-        fn expand(secret: []const u8, label: []const u8, context: []const u8, comptime len: usize) [len]u8 {
-            return tls.hkdfExpandLabel(Hkdf, secret[0..hash_len].*, label, context, len);
-        }
-    };
-}
-
-fn hashLen(cs: CipherSuite) usize {
-    return switch (cs) {
-        inline else => |c| Suite(c).hash_len,
-    };
-}
-
-/// Big enough for any suite's hash / secret; only the first `hashLen` bytes count.
-const Secret = [48]u8;
-
-const Transcript = union(enum) {
-    sha256: crypto.hash.sha2.Sha256,
-    sha384: crypto.hash.sha2.Sha384,
-
-    fn init(cs: CipherSuite) Transcript {
-        return switch (cs) {
-            .aes_256_gcm_sha384 => .{ .sha384 = .init(.{}) },
-            else => .{ .sha256 = .init(.{}) },
-        };
-    }
-
-    fn update(t: *Transcript, bytes: []const u8) void {
-        switch (t.*) {
-            inline else => |*h| h.update(bytes),
-        }
-    }
-
-    fn peek(t: *const Transcript) Secret {
-        var out: Secret = @splat(0);
-        switch (t.*) {
-            inline else => |h| {
-                var copy = h;
-                copy.final(out[0..@TypeOf(h).digest_length]);
-            },
-        }
-        return out;
-    }
-};
-
-const TrafficKeys = struct {
-    secret: Secret,
-    key: [32]u8,
-    iv: [12]u8,
-    seq: u64 = 0,
-
-    fn derive(cs: CipherSuite, secret: Secret) TrafficKeys {
-        switch (cs) {
-            inline else => |c| {
-                const S = Suite(c);
-                var k: TrafficKeys = .{ .secret = secret, .key = @splat(0), .iv = S.expand(&secret, "iv", "", 12) };
-                k.key[0..S.Aead.key_length].* = S.expand(&secret, "key", "", S.Aead.key_length);
-                return k;
-            },
-        }
-    }
-
-    fn next(k: *const TrafficKeys, cs: CipherSuite) TrafficKeys {
-        var secret: Secret = @splat(0);
-        switch (cs) {
-            inline else => |c| {
-                const S = Suite(c);
-                secret[0..S.hash_len].* = S.expand(&k.secret, "traffic upd", "", S.hash_len);
-            },
-        }
-        return derive(cs, secret);
-    }
-
-    fn nonce(k: *const TrafficKeys) [12]u8 {
-        var n = k.iv;
-        const seq: [8]u8 = @bitCast(mem.nativeToBig(u64, k.seq));
-        for (seq, 0..) |b, i| n[4 + i] ^= b;
-        return n;
-    }
-};
-
 // ─── Connection ──────────────────────────────────────────────────────
 
 const State = enum {
     wait_client_hello,
     wait_client_hello_retry,
+    wait_client_certificate,
+    wait_client_certificate_verify,
     wait_finished,
     connected,
     failed,
-};
-
-// Heap-allocated on first use so `Conn` itself stays small enough to embed.
-const Buffers = struct {
-    in: [tls.max_ciphertext_record_len]u8,
-    scratch: [tls.max_ciphertext_len]u8,
 };
 
 pub const Conn = struct {
@@ -264,6 +173,10 @@ pub const Conn = struct {
     // Held from our Finished to the client's, for the resumption secret.
     master_secret: Secret = @splat(0),
     resumed: bool = false,
+    /// The selected certificate's client-auth policy, once the ClientHello is in.
+    client_auth: ?*const tls13.ClientAuth = null,
+    /// The client's verified leaf certificate (DER), owned.
+    peer_cert: ?[]u8 = null,
 
     bufs: ?*Buffers = null,
     in_len: usize = 0,
@@ -302,6 +215,7 @@ pub const Conn = struct {
         self.hs_out.deinit(gpa);
         self.app_in.deinit(gpa);
         self.out.deinit(gpa);
+        if (self.peer_cert) |c| gpa.free(c);
         crypto.secureZero(u8, mem.asBytes(&self.client_hs_secret));
         crypto.secureZero(u8, mem.asBytes(&self.client_app_secret));
         crypto.secureZero(u8, mem.asBytes(&self.master_secret));
@@ -407,6 +321,21 @@ pub const Conn = struct {
         return self.resumed;
     }
 
+    /// The client's certificate (DER, leaf only), verified against the
+    /// selected entry's `ClientAuth`, once the handshake completes. Null
+    /// when no certificate was asked for, or `.optional` and none was sent.
+    pub fn peerCertificate(self: *const Conn) ?[]const u8 {
+        if (self.state != .connected) return null;
+        return self.peer_cert;
+    }
+
+    /// The client-auth policy of the certificate the handshake selected,
+    /// once the ClientHello is in. Tells an application serving several
+    /// names which policy vouched for `peerCertificate()`.
+    pub fn clientAuth(self: *const Conn) ?*const tls13.ClientAuth {
+        return self.client_auth;
+    }
+
     /// The negotiated key exchange group, once the ServerHello is out.
     pub fn keyExchangeGroup(self: *const Conn) ?Group {
         return if (self.write_keys != null) self.group else null;
@@ -457,7 +386,10 @@ pub const Conn = struct {
             ct_ccs => {
                 // Middlebox compat (RFC 8446 §5): one unprotected 0x01 between
                 // the first ClientHello and the client Finished, then ignored.
-                const in_handshake = self.state == .wait_client_hello_retry or self.state == .wait_finished;
+                const in_handshake = switch (self.state) {
+                    .wait_client_hello_retry, .wait_client_certificate, .wait_client_certificate_verify, .wait_finished => true,
+                    else => false,
+                };
                 if (!in_handshake or payload.len != 1 or payload[0] != 1) return error.UnexpectedMessage;
             },
             ct_alert => {
@@ -617,19 +549,29 @@ pub const Conn = struct {
             if (self.hs_in.items.len - pos < 4 + len) break;
             const msg = self.hs_in.items[pos..][0 .. 4 + len];
             pos += 4 + len;
-            try self.handleHandshakeMessage(msg);
-            // Every message we accept changes keys or state, and RFC 8446
-            // §5.1 forbids a message sharing a record across a key change.
-            if (pos != self.hs_in.items.len) return error.UnexpectedMessage;
+            const keys_changed = try self.handleHandshakeMessage(msg);
+            // RFC 8446 §5.1: a message may not share a record across a key change.
+            if (keys_changed and pos != self.hs_in.items.len) return error.UnexpectedMessage;
         }
     }
 
-    fn handleHandshakeMessage(self: *Conn, msg: []const u8) Error!void {
+    /// True when the message changed keys, or began a new flight.
+    fn handleHandshakeMessage(self: *Conn, msg: []const u8) Error!bool {
         const kind = msg[0];
         switch (self.state) {
             .wait_client_hello, .wait_client_hello_retry => {
                 if (kind != hs_client_hello) return error.UnexpectedMessage;
                 try self.onClientHello(msg);
+            },
+            .wait_client_certificate => {
+                if (kind != hs_certificate) return error.UnexpectedMessage;
+                try self.onClientCertificate(msg);
+                return false;
+            },
+            .wait_client_certificate_verify => {
+                if (kind != hs_certificate_verify) return error.UnexpectedMessage;
+                try self.onClientCertificateVerify(msg);
+                return false;
             },
             .wait_finished => {
                 if (kind != hs_finished) return error.UnexpectedMessage;
@@ -641,6 +583,7 @@ pub const Conn = struct {
             },
             .failed => return error.ConnectionFailed,
         }
+        return true;
     }
 
     fn onClientHello(self: *Conn, msg: []const u8) Error!void {
@@ -667,8 +610,10 @@ pub const Conn = struct {
             @memcpy(self.server_name_buf[0..name.len], name);
             self.server_name_len = @intCast(name.len);
         } else self.server_name_len = null;
-        const selection = tls13.selectCertificate(config.certs, ch.server_name) orelse return error.InternalError;
+        const selection = tls13.selectCertificateFor(config.certs, ch.server_name, ch.signature_algorithms) orelse return error.InternalError;
         const cert = &selection.entry.cert;
+        // The selection can change across a HelloRetryRequest; this one stands.
+        self.client_auth = selection.entry.client_auth;
 
         self.selected_alpn = null;
         if (ch.alpn) |offered| {
@@ -701,19 +646,17 @@ pub const Conn = struct {
         // RFC 8446 §4.2.9: a PSK offer must say how it may be used.
         if (ch.psk_identities != null and ch.psk_modes == null) return error.MissingExtension;
         var psk: ?Resumption = null;
-        if (config.ticket_key) |key| {
+        // A ticket carries no client identity: with client auth, always a full handshake.
+        if (config.ticket_key) |key| if (self.client_auth == null) {
             if (ch.psk_identities != null and mem.indexOfScalar(u8, ch.psk_modes.?, psk_dhe_ke) != null)
                 psk = try self.acceptTicket(key, msg, ch);
-        }
+        };
         self.resumed = psk != null;
 
+        var sig_scheme: tls.SignatureScheme = undefined;
         if (psk == null) {
             const sig_algs = ch.signature_algorithms orelse return error.MissingExtension;
-            const scheme: tls.SignatureScheme = switch (cert.private_key_algorithm) {
-                .ecdsa_p256_sha256 => .ecdsa_secp256r1_sha256,
-                .ed25519 => .ed25519,
-            };
-            if (!containsU16(sig_algs, @intFromEnum(scheme))) return error.HandshakeFailure;
+            sig_scheme = tls13.signatureSchemeFor(cert.private_key_algorithm, sig_algs) orelse return error.HandshakeFailure;
         }
 
         var shared_buf: [32]u8 = undefined;
@@ -758,6 +701,15 @@ pub const Conn = struct {
         try buildEncryptedExtensions(&b, self.selected_alpn, selection.matched);
         self.transcript.update(self.hs_out.items[start..]);
 
+        if (self.client_auth) |auth| {
+            start = self.hs_out.items.len;
+            const n = 4 + 1 + 2 + 6 + tls13.client_auth_signature_schemes.len + 4 + auth.authorities.len;
+            const dst = try self.hs_out.addManyAsSlice(self.allocator, n);
+            const req = tls13.buildCertificateRequest(dst, auth) catch return error.InternalError;
+            self.hs_out.shrinkRetainingCapacity(start + req.len);
+            self.transcript.update(self.hs_out.items[start..]);
+        }
+
         if (psk == null) {
             start = self.hs_out.items.len;
             try buildCertificate(&b, cert.cert_chain_der);
@@ -765,7 +717,7 @@ pub const Conn = struct {
 
             start = self.hs_out.items.len;
             const th_cert = self.transcript.peek();
-            try buildCertificateVerify(&b, cert, th_cert[0..hashLen(self.suite)]);
+            try buildCertificateVerify(&b, cert, sig_scheme, th_cert[0..hashLen(self.suite)]);
             self.transcript.update(self.hs_out.items[start..]);
         }
 
@@ -786,6 +738,50 @@ pub const Conn = struct {
         self.client_app_secret = app.client;
         self.master_secret = app.master;
 
+        self.state = if (self.client_auth != null) .wait_client_certificate else .wait_finished;
+    }
+
+    fn onClientCertificate(self: *Conn, msg: []const u8) Error!void {
+        const auth = self.client_auth.?;
+        var chain_buf: [tls13.max_client_chain][]const u8 = undefined;
+        const chain = (try tls13.parseCertificateList(msg[4..], &chain_buf)) orelse {
+            if (auth.mode == .required) return error.CertificateRequired;
+            self.transcript.update(msg);
+            self.state = .wait_finished;
+            return;
+        };
+        _ = try tls13.verifyPeerChain(chain, auth.ca_bundle, sys.realtimeSeconds());
+        if (!tls13.clientLeafUsageOk(chain[0])) return error.BadCertificate;
+        self.peer_cert = try self.allocator.dupe(u8, chain[0]);
+        self.transcript.update(msg);
+        self.state = .wait_client_certificate_verify;
+    }
+
+    fn onClientCertificateVerify(self: *Conn, msg: []const u8) Error!void {
+        var p: Parser = .{ .buf = msg[4..] };
+        const scheme = try p.int(u16);
+        const sig = try p.vec(u16);
+        if (p.rest() != 0) return error.DecodeError;
+        if (!containsU16(&tls13.client_auth_signature_schemes, scheme)) return error.IllegalParameter;
+        const cert: crypto.Certificate = .{ .buffer = self.peer_cert.?, .index = 0 };
+        const leaf = cert.parse() catch return error.BadCertificate;
+
+        const context = "TLS 1.3, client CertificateVerify";
+        const len = hashLen(self.suite);
+        var content: [64 + context.len + 1 + 48]u8 = undefined;
+        @memset(content[0..64], 0x20);
+        content[64..][0..context.len].* = context.*;
+        content[64 + context.len] = 0;
+        const th = self.transcript.peek();
+        @memcpy(content[64 + context.len + 1 ..][0..len], th[0..len]);
+        tls13.verifyCertificateVerifySignature(
+            leaf.pubKey(),
+            std.meta.activeTag(leaf.pub_key_algo),
+            scheme,
+            sig,
+            content[0 .. 64 + context.len + 1 + len],
+        ) catch return error.DecryptError;
+        self.transcript.update(msg);
         self.state = .wait_finished;
     }
 
@@ -831,7 +827,7 @@ pub const Conn = struct {
         self.state = .connected;
 
         // Nothing may follow our close_notify.
-        if (self.config.ticket_key) |key| if (!self.close_sent) try self.sendTicket(key);
+        if (self.config.ticket_key) |key| if (!self.close_sent and self.client_auth == null) try self.sendTicket(key);
         crypto.secureZero(u8, &self.master_secret);
     }
 
@@ -951,113 +947,12 @@ fn alertFor(err: Error) ?tls.Alert.Description {
         error.RecordOverflow => .record_overflow,
         error.DecryptError => .decrypt_error,
         error.InternalError, error.OutOfMemory => .internal_error,
+        error.BadCertificate => .bad_certificate,
+        error.UnknownCa => .unknown_ca,
+        error.CertificateExpired => .certificate_expired,
+        error.CertificateRequired => .certificate_required,
         error.PeerAlert, error.ConnectionFailed, error.NotConnected => null,
     };
-}
-
-// ─── Record protection and key schedule ──────────────────────────────
-
-fn sealedLen(cs: CipherSuite, content_len: usize) usize {
-    return switch (cs) {
-        inline else => |c| tls.record_header_len + content_len + 1 + Suite(c).Aead.tag_length,
-    };
-}
-
-/// Seals `content` as one TLSCiphertext into `dst` (exactly `sealedLen`
-/// bytes), staging the inner plaintext in `scratch`.
-fn sealInto(cs: CipherSuite, keys: *TrafficKeys, inner: tls.ContentType, content: []const u8, scratch: []u8, dst: []u8) void {
-    std.debug.assert(content.len <= max_plaintext);
-    const pt = scratch[0 .. content.len + 1];
-    @memcpy(pt[0..content.len], content);
-    pt[content.len] = @intFromEnum(inner);
-    switch (cs) {
-        inline else => |c| {
-            const A = Suite(c).Aead;
-            const hdr = dst[0..tls.record_header_len];
-            hdr.* = .{ ct_app_data, 0x03, 0x03, 0, 0 };
-            mem.writeInt(u16, hdr[3..5], @intCast(pt.len + A.tag_length), .big);
-            const body = dst[tls.record_header_len..];
-            A.encrypt(body[0..pt.len], body[pt.len..][0..A.tag_length], pt, hdr, keys.nonce(), keys.key[0..A.key_length].*);
-        },
-    }
-    keys.seq += 1;
-}
-
-/// Opens one TLSCiphertext into `out`; returns the TLSInnerPlaintext.
-fn openWith(cs: CipherSuite, keys: *TrafficKeys, record: []const u8, out: []u8) Error![]u8 {
-    if (keys.seq == std.math.maxInt(u64)) return error.UnexpectedMessage;
-    const payload = record[tls.record_header_len..];
-    const plain = switch (cs) {
-        inline else => |c| blk: {
-            const A = Suite(c).Aead;
-            if (payload.len < A.tag_length + 1) return error.BadRecordMac;
-            const n = payload.len - A.tag_length;
-            if (n > max_plaintext + 1) return error.RecordOverflow;
-            A.decrypt(
-                out[0..n],
-                payload[0..n],
-                payload[n..][0..A.tag_length].*,
-                record[0..tls.record_header_len],
-                keys.nonce(),
-                keys.key[0..A.key_length].*,
-            ) catch return error.BadRecordMac;
-            break :blk out[0..n];
-        },
-    };
-    keys.seq += 1;
-    return plain;
-}
-
-const HandshakeSecrets = struct { handshake: Secret, client: Secret, server: Secret };
-
-fn handshakeSecrets(cs: CipherSuite, psk: ?*const Secret, th: Secret, shared: []const u8) HandshakeSecrets {
-    var out: HandshakeSecrets = .{ .handshake = @splat(0), .client = @splat(0), .server = @splat(0) };
-    switch (cs) {
-        inline else => |c| {
-            const S = Suite(c);
-            const L = S.hash_len;
-            const zeros: [L]u8 = @splat(0);
-            const early = S.Hkdf.extract(&.{}, if (psk) |k| k[0..L] else &zeros);
-            const derived = S.expand(&early, "derived", &tls.emptyHash(S.Hash), L);
-            const hs = S.Hkdf.extract(&derived, shared);
-            out.handshake[0..L].* = hs;
-            out.client[0..L].* = S.expand(&hs, "c hs traffic", th[0..L], L);
-            out.server[0..L].* = S.expand(&hs, "s hs traffic", th[0..L], L);
-        },
-    }
-    return out;
-}
-
-fn appSecrets(cs: CipherSuite, handshake_secret: Secret, th: Secret) struct { client: Secret, server: Secret, master: Secret } {
-    var client: Secret = @splat(0);
-    var server: Secret = @splat(0);
-    var master_out: Secret = @splat(0);
-    switch (cs) {
-        inline else => |c| {
-            const S = Suite(c);
-            const L = S.hash_len;
-            const derived = S.expand(&handshake_secret, "derived", &tls.emptyHash(S.Hash), L);
-            const zeros: [L]u8 = @splat(0);
-            const master = S.Hkdf.extract(&derived, &zeros);
-            master_out[0..L].* = master;
-            client[0..L].* = S.expand(&master, "c ap traffic", th[0..L], L);
-            server[0..L].* = S.expand(&master, "s ap traffic", th[0..L], L);
-        },
-    }
-    return .{ .client = client, .server = server, .master = master_out };
-}
-
-/// Finished verify_data over transcript hash `th` (RFC 8446 §4.4.4).
-fn finishedMac(cs: CipherSuite, base_key: *const Secret, th: Secret) Secret {
-    var out: Secret = @splat(0);
-    switch (cs) {
-        inline else => |c| {
-            const S = Suite(c);
-            const key = S.expand(base_key, "finished", "", S.hash_len);
-            out[0..S.hash_len].* = tls.hmac(S.Hmac, th[0..S.hash_len], key);
-        },
-    }
-    return out;
 }
 
 // ─── Key exchange ────────────────────────────────────────────────────
@@ -1094,27 +989,6 @@ fn keyExchange(share: KeyShare, shared: *[32]u8, public_buf: *[65]u8) Error![]co
 }
 
 // ─── ClientHello parsing ─────────────────────────────────────────────
-
-const Parser = struct {
-    buf: []const u8,
-    pos: usize = 0,
-
-    fn rest(p: *const Parser) usize {
-        return p.buf.len - p.pos;
-    }
-    fn take(p: *Parser, n: usize) Error![]const u8 {
-        if (p.rest() < n) return error.DecodeError;
-        defer p.pos += n;
-        return p.buf[p.pos..][0..n];
-    }
-    fn int(p: *Parser, comptime T: type) Error!T {
-        const n = @divExact(@typeInfo(T).int.bits, 8);
-        return mem.readInt(T, (try p.take(n))[0..n], .big);
-    }
-    fn vec(p: *Parser, comptime Len: type) Error![]const u8 {
-        return p.take(try p.int(Len));
-    }
-};
 
 const ClientHello = struct {
     session_id: []const u8,
@@ -1228,21 +1102,6 @@ const ClientHello = struct {
     }
 };
 
-fn u16List(data: []const u8, comptime Len: type) Error![]const u8 {
-    var p: Parser = .{ .buf = data };
-    const list = try p.vec(Len);
-    if (p.rest() != 0 or list.len < 2 or list.len % 2 != 0) return error.DecodeError;
-    return list;
-}
-
-fn containsU16(list: []const u8, value: u16) bool {
-    var i: usize = 0;
-    while (i + 2 <= list.len) : (i += 2) {
-        if (mem.readInt(u16, list[i..][0..2], .big) == value) return true;
-    }
-    return false;
-}
-
 fn containsSlice(list: []const u16, value: u16) bool {
     return mem.indexOfScalar(u16, list, value) != null;
 }
@@ -1255,15 +1114,6 @@ fn findKeyShare(shares: []const u8, group: Group) ?KeyShare {
         if (g == @intFromEnum(group)) return .{ .group = group, .key = key };
     }
     return null;
-}
-
-fn alpnListContains(list: []const u8, proto: []const u8) bool {
-    var p: Parser = .{ .buf = list };
-    while (p.rest() > 0) {
-        const name = p.vec(u8) catch return false;
-        if (mem.eql(u8, name, proto)) return true;
-    }
-    return false;
 }
 
 // ─── Session tickets ─────────────────────────────────────────────────
@@ -1326,37 +1176,6 @@ fn openTicket(key: [16]u8, blob: []const u8, plain: *[max_ticket_len]u8) ?Ticket
 }
 
 // ─── Message builders ────────────────────────────────────────────────
-
-const Builder = struct {
-    list: *std.ArrayList(u8),
-    gpa: Allocator,
-
-    fn u8_(b: *Builder, v: u8) Error!void {
-        try b.list.append(b.gpa, v);
-    }
-    fn u16_(b: *Builder, v: u16) Error!void {
-        try b.list.appendSlice(b.gpa, &mem.toBytes(mem.nativeToBig(u16, v)));
-    }
-    fn u24_(b: *Builder, v: u24) Error!void {
-        var tmp: [3]u8 = undefined;
-        mem.writeInt(u24, &tmp, v, .big);
-        try b.list.appendSlice(b.gpa, &tmp);
-    }
-    fn bytes(b: *Builder, v: []const u8) Error!void {
-        try b.list.appendSlice(b.gpa, v);
-    }
-    /// Reserves a `Len`-sized length prefix; close it with `end`.
-    fn begin(b: *Builder, comptime Len: type) Error!usize {
-        try b.list.appendNTimes(b.gpa, 0, @divExact(@typeInfo(Len).int.bits, 8));
-        return b.list.items.len;
-    }
-    fn end(b: *Builder, comptime Len: type, start: usize) Error!void {
-        const n = @divExact(@typeInfo(Len).int.bits, 8);
-        const len = b.list.items.len - start;
-        if (len > std.math.maxInt(Len)) return error.InternalError;
-        mem.writeInt(Len, b.list.items[start - n ..][0..n], @intCast(len), .big);
-    }
-};
 
 const ServerKeyShare = struct { group: Group, key: ?[]const u8 };
 
@@ -1429,7 +1248,7 @@ fn buildCertificate(b: *Builder, chain: []const []const u8) Error!void {
     try b.end(u24, msg);
 }
 
-fn buildCertificateVerify(b: *Builder, cert: *const Certificate, transcript_hash: []const u8) Error!void {
+fn buildCertificateVerify(b: *Builder, cert: *const Certificate, scheme: tls.SignatureScheme, transcript_hash: []const u8) Error!void {
     const context = "TLS 1.3, server CertificateVerify";
     var content: [64 + context.len + 1 + 48]u8 = undefined;
     @memset(content[0..64], 0x20);
@@ -1438,32 +1257,13 @@ fn buildCertificateVerify(b: *Builder, cert: *const Certificate, transcript_hash
     @memcpy(content[64 + context.len + 1 ..][0..transcript_hash.len], transcript_hash);
     const signed = content[0 .. 64 + context.len + 1 + transcript_hash.len];
 
-    const key = cert.private_key_bytes;
-    if (key.len != 32) return error.InternalError;
-    var noise: [32]u8 = undefined;
-    sys.randomBytes(&noise);
-
+    var sig_buf: [tls13.rsa.max_signature_len]u8 = undefined;
+    const sig = try tls13.signCertificateVerify(scheme, cert.private_key_bytes, signed, &sig_buf);
     try b.u8_(hs_certificate_verify);
     const msg = try b.begin(u24);
-    switch (cert.private_key_algorithm) {
-        .ecdsa_p256_sha256 => {
-            const sk = EcdsaP256Sha256.SecretKey.fromBytes(key[0..32].*) catch return error.InternalError;
-            const kp = EcdsaP256Sha256.KeyPair.fromSecretKey(sk) catch return error.InternalError;
-            const sig = kp.sign(signed, noise) catch return error.InternalError;
-            var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
-            const der = sig.toDer(&der_buf);
-            try b.u16_(@intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256));
-            try b.u16_(@intCast(der.len));
-            try b.bytes(der);
-        },
-        .ed25519 => {
-            const kp = Ed25519.KeyPair.generateDeterministic(key[0..32].*) catch return error.InternalError;
-            const sig = kp.sign(signed, noise) catch return error.InternalError;
-            try b.u16_(@intFromEnum(tls.SignatureScheme.ed25519));
-            try b.u16_(Ed25519.Signature.encoded_length);
-            try b.bytes(&sig.toBytes());
-        },
-    }
+    try b.u16_(@intFromEnum(scheme));
+    try b.u16_(@intCast(sig.len));
+    try b.bytes(sig);
     try b.end(u24, msg);
 }
 
@@ -1471,81 +1271,8 @@ fn buildCertificateVerify(b: *Builder, cert: *const Certificate, transcript_hash
 
 const testing = std.testing;
 
-// Self-signed, valid to 2056. localhost and *.example.com share one P-256 key.
-const test_ec_key_pem =
-    \\-----BEGIN EC PRIVATE KEY-----
-    \\MHcCAQEEIAKIla+65TNSSfs8RKsI9dq3KKp/WC0RUKceTUDNQYgPoAoGCCqGSM49
-    \\AwEHoUQDQgAETSp/wPgU7+juILb0Ugk7IpUQd/TAcTd69dibi8gbAY23ktARkE9C
-    \\53VIGla7Uzbu4gkotGeZg8ufOEbX4cC44w==
-    \\-----END EC PRIVATE KEY-----
-;
-const test_localhost_pem =
-    \\-----BEGIN CERTIFICATE-----
-    \\MIIBlTCCATugAwIBAgIUJ0VVpBMXbR+m2qeJVtlLPwMGrS8wCgYIKoZIzj0EAwIw
-    \\FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkxODAyMjc1MVoYDzIwNTYwOTEw
-    \\MDIyNzUxWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
-    \\PQMBBwNCAARNKn/A+BTv6O4gtvRSCTsilRB39MBxN3r12JuLyBsBjbeS0BGQT0Ln
-    \\dUgaVrtTNu7iCSi0Z5mDy584RtfhwLjjo2kwZzAdBgNVHQ4EFgQUgsQXmkDpwyyD
-    \\DE+urWAkJzlvp4gwHwYDVR0jBBgwFoAUgsQXmkDpwyyDDE+urWAkJzlvp4gwDwYD
-    \\VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
-    \\SAAwRQIhAL/ObOrd87Ioq197659prUHNDVOQ8y9LpqKlXroBCK0+AiBu5JczdLo0
-    \\paz/2uMhZZ65w/QAplKh2+e0QSDAcZreyA==
-    \\-----END CERTIFICATE-----
-;
-const test_wildcard_pem =
-    \\-----BEGIN CERTIFICATE-----
-    \\MIIBnDCCAUOgAwIBAgIUBeGIcIZGlWQDw9k8EVl0eQn+0i8wCgYIKoZIzj0EAwIw
-    \\FjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wIBcNMjYwOTE4MDIyNzUxWhgPMjA1NjA5
-    \\MTAwMjI3NTFaMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYI
-    \\KoZIzj0DAQcDQgAETSp/wPgU7+juILb0Ugk7IpUQd/TAcTd69dibi8gbAY23ktAR
-    \\kE9C53VIGla7Uzbu4gkotGeZg8ufOEbX4cC446NtMGswHQYDVR0OBBYEFILEF5pA
-    \\6cMsgwxPrq1gJCc5b6eIMB8GA1UdIwQYMBaAFILEF5pA6cMsgwxPrq1gJCc5b6eI
-    \\MA8GA1UdEwEB/wQFMAMBAf8wGAYDVR0RBBEwD4INKi5leGFtcGxlLmNvbTAKBggq
-    \\hkjOPQQDAgNHADBEAiBaUMdxsQOU9V2gfaL6EW0cblAScC1OvxJl+4P07YUxDAIg
-    \\ffw63xlHzM5X1n+gB6U2k9pqnk+IQYwD2pyylUk/I74=
-    \\-----END CERTIFICATE-----
-;
-const test_ed25519_key_pem =
-    \\-----BEGIN PRIVATE KEY-----
-    \\MC4CAQAwBQYDK2VwBCIEIC7QOG4KwXQFSsbxdpxWvVUO5ON7JPjpewzoDqKPZSoO
-    \\-----END PRIVATE KEY-----
-;
-const test_ed25519_pem =
-    \\-----BEGIN CERTIFICATE-----
-    \\MIIBTzCCAQGgAwIBAgIUElLBZ3M+v85vUwlfAtwMIFA8fvQwBQYDK2VwMBIxEDAO
-    \\BgNVBAMMB2VkLnRlc3QwIBcNMjYwOTE4MDIyNzUxWhgPMjA1NjA5MTAwMjI3NTFa
-    \\MBIxEDAOBgNVBAMMB2VkLnRlc3QwKjAFBgMrZXADIQDDb3XnRnNGl7VnUxtvlAM3
-    \\Wx++JEtaulpTtA6HsXZ5HaNnMGUwHQYDVR0OBBYEFLT9KJDLMqFxXjDiduG7N1zR
-    \\HoZTMB8GA1UdIwQYMBaAFLT9KJDLMqFxXjDiduG7N1zRHoZTMA8GA1UdEwEB/wQF
-    \\MAMBAf8wEgYDVR0RBAswCYIHZWQudGVzdDAFBgMrZXADQQCnjUP9Av1Ugtg6dE+7
-    \\VljHsDK78pyjUZWFgeuzx/aQ2obYNKv3HLka/NYNWMQNiNeEFVpfwqDhBCAUe9ia
-    \\angI
-    \\-----END CERTIFICATE-----
-;
-
-const TestCerts = struct {
-    der: [3][1024]u8,
-    chains: [3][1][]const u8,
-    key_der: [2][256]u8,
-    entries: [3]CertEntry,
-
-    /// Entry 0 (default) is localhost, 1 is *.example.com, 2 is Ed25519 ed.test.
-    fn load(self: *TestCerts) !void {
-        const pems = [3][]const u8{ test_localhost_pem, test_wildcard_pem, test_ed25519_pem };
-        for (pems, 0..) |pem, i| self.chains[i] = .{try tls13.parsePemCert(pem, &self.der[i])};
-        const ec = try tls13.extractEcPrivateKey(try tls13.parsePemPrivateKey(test_ec_key_pem, &self.key_der[0]));
-        const ed = try tls13.extractEd25519PrivateKey(try tls13.parsePemPrivateKey(test_ed25519_key_pem, &self.key_der[1]));
-        self.entries = .{
-            .{ .server_names = &.{"localhost"}, .cert = .{ .cert_chain_der = &self.chains[0], .private_key_bytes = ec } },
-            .{ .server_names = &.{"*.example.com"}, .cert = .{ .cert_chain_der = &self.chains[1], .private_key_bytes = ec } },
-            .{ .server_names = &.{"ed.test"}, .cert = .{
-                .cert_chain_der = &self.chains[2],
-                .private_key_bytes = ed,
-                .private_key_algorithm = .ed25519,
-            } },
-        };
-    }
-};
+const test_certs = @import("test_certs.zig");
+const TestCerts = test_certs.TestCerts;
 
 /// std.crypto.tls.Client wired straight to a `Conn`: whatever the client
 /// flushes is fed to the server, whatever the server queues is what the
@@ -1782,6 +1509,7 @@ const MiniClient = struct {
     alpn_got: std.ArrayList(u8) = .empty,
     sni_acked: bool = false,
     cv_verified: bool = false,
+    cv_scheme: ?tls.SignatureScheme = null,
     resuming: bool = false,
     master: Secret = @splat(0),
     received: ?ClientTicket = null,
@@ -2088,9 +1816,17 @@ const MiniClient = struct {
                 switch (scheme) {
                     .ecdsa_secp256r1_sha256 => try (try EcdsaP256Sha256.Signature.fromDer(sig)).verify(signed, try EcdsaP256Sha256.PublicKey.fromSec1(pk)),
                     .ed25519 => try Ed25519.Signature.fromBytes(sig[0..64].*).verify(signed, try Ed25519.PublicKey.fromBytes(pk[0..32].*)),
+                    .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => try tls13.verifyCertificateVerifySignature(
+                        pk,
+                        std.meta.activeTag(leaf.pub_key_algo),
+                        @intFromEnum(scheme),
+                        sig,
+                        signed,
+                    ),
                     else => return error.UnexpectedMessage,
                 }
                 c.cv_verified = true;
+                c.cv_scheme = scheme;
                 c.transcript.update(msg);
             },
             hs_finished => {
@@ -2265,6 +2001,79 @@ test "a client that cannot verify our key type gets handshake_failure" {
     var conn = Conn.init(testing.allocator, &config);
     defer conn.deinit();
     var client: MiniClient = .{ .gpa = testing.allocator, .sig_algs = &.{@intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha256)} };
+    defer client.deinit();
+    try testing.expectError(error.HandshakeFailure, client.handshake(&conn));
+    try expectAlert(&conn, .handshake_failure);
+}
+
+test "an RSA certificate signs with RSA-PSS, the hash taken from the client's offer" {
+    var rsa_cert: test_certs.RsaCert = undefined;
+    try rsa_cert.load(false);
+    const entries = [_]CertEntry{.{ .server_names = &.{"rsa.test"}, .cert = rsa_cert.cert }};
+    const config: Config = .{ .certs = &entries };
+    const S = tls.SignatureScheme;
+    const cases = [_]struct { []const u16, S }{
+        // Our preference, SHA-256, wins over the client's order.
+        .{ &.{ @intFromEnum(S.rsa_pss_rsae_sha512), @intFromEnum(S.rsa_pss_rsae_sha256) }, .rsa_pss_rsae_sha256 },
+        .{ &.{@intFromEnum(S.rsa_pss_rsae_sha384)}, .rsa_pss_rsae_sha384 },
+        .{ &.{ @intFromEnum(S.ecdsa_secp256r1_sha256), @intFromEnum(S.rsa_pss_rsae_sha512) }, .rsa_pss_rsae_sha512 },
+    };
+    for (cases) |c| {
+        var conn = Conn.init(testing.allocator, &config);
+        defer conn.deinit();
+        var client: MiniClient = .{ .gpa = testing.allocator, .sni = "rsa.test", .sig_algs = c[0] };
+        defer client.deinit();
+        try client.handshake(&conn);
+        try testing.expect(client.cv_verified);
+        try testing.expectEqual(c[1], client.cv_scheme.?);
+        try testing.expectEqualSlices(u8, rsa_cert.chain[0], client.leaf.items);
+    }
+    {
+        // PKCS#1 v1.5 is for certificate signatures only, and rsa_pss_pss
+        // needs an RSASSA-PSS key.
+        var conn = Conn.init(testing.allocator, &config);
+        defer conn.deinit();
+        var client: MiniClient = .{ .gpa = testing.allocator, .sni = "rsa.test", .sig_algs = &.{
+            @intFromEnum(S.rsa_pkcs1_sha256),
+            @intFromEnum(S.rsa_pss_pss_sha256),
+        } };
+        defer client.deinit();
+        try testing.expectError(error.HandshakeFailure, client.handshake(&conn));
+        try expectAlert(&conn, .handshake_failure);
+    }
+    _ = try expectStdClientRoundTrip(&config, std.math.maxInt(usize));
+}
+
+test "among certificates for one name, the client's signature_algorithms decide" {
+    var certs: TestCerts = undefined;
+    try certs.load();
+    var rsa_cert: test_certs.RsaCert = undefined;
+    try rsa_cert.load(true);
+    const entries = [_]CertEntry{
+        .{ .server_names = &.{"both.test"}, .cert = certs.entries[0].cert },
+        .{ .server_names = &.{"both.test"}, .cert = rsa_cert.cert },
+    };
+    const config: Config = .{ .certs = &entries };
+    const ecdsa = @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256);
+    const pss = @intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha256);
+    const cases = [_]struct { ?[]const u8, []const u16, []const u8 }{
+        .{ "both.test", &.{ecdsa}, certs.chains[0][0] },
+        .{ "both.test", &.{pss}, rsa_cert.chain[0] },
+        .{ "both.test", &.{ pss, ecdsa }, certs.chains[0][0] }, // entry order breaks the tie
+        .{ null, &.{pss}, rsa_cert.chain[0] },
+    };
+    for (cases) |c| {
+        var conn = Conn.init(testing.allocator, &config);
+        defer conn.deinit();
+        var client: MiniClient = .{ .gpa = testing.allocator, .sni = c[0], .sig_algs = c[1] };
+        defer client.deinit();
+        try client.handshake(&conn);
+        try testing.expect(client.cv_verified);
+        try testing.expectEqualSlices(u8, c[2], client.leaf.items);
+    }
+    var conn = Conn.init(testing.allocator, &config);
+    defer conn.deinit();
+    var client: MiniClient = .{ .gpa = testing.allocator, .sni = "both.test", .sig_algs = &.{@intFromEnum(tls.SignatureScheme.ed25519)} };
     defer client.deinit();
     try testing.expectError(error.HandshakeFailure, client.handshake(&conn));
     try expectAlert(&conn, .handshake_failure);
@@ -2763,4 +2572,26 @@ test "a bad binder is decrypt_error, a PSK without modes is missing_extension" {
         try testing.expectError(error.MissingExtension, client.handshake(&conn));
         try expectAlert(&conn, .missing_extension);
     }
+}
+
+test "a ticket is not accepted where client auth applies" {
+    var certs: TestCerts = undefined;
+    try certs.load();
+    const config: Config = .{ .certs = &certs.entries, .ticket_key = @splat(7) };
+    const ticket = try fullHandshakeForTicket(&config, .aes_128_gcm_sha256, "localhost");
+
+    var clients: test_certs.ClientCerts = undefined;
+    try clients.load(testing.allocator);
+    defer clients.deinit(testing.allocator);
+    const auth: tls13.ClientAuth = .{ .ca_bundle = &clients.bundle };
+    certs.entries[0].client_auth = &auth;
+    var conn = Conn.init(testing.allocator, &config);
+    defer conn.deinit();
+    var client: MiniClient = .{ .gpa = testing.allocator, .sni = "localhost", .offer = ticket };
+    defer client.deinit();
+    // MiniClient has no certificate to give; only the server's choice matters.
+    client.handshake(&conn) catch {};
+    try testing.expect(!conn.isResumed());
+    try testing.expectEqual(&auth, conn.clientAuth().?);
+    try testing.expect(!conn.handshakeComplete());
 }

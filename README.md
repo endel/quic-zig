@@ -12,7 +12,7 @@ and goals of this project!
 ## Features
 
 - **QUIC v1 & v2** (RFC 9000 / RFC 9369) — handshake, streams, flow control, connection migration, PMTUD, ECN
-- **TLS 1.3** (RFC 8446 / RFC 9001) — ECDSA P-256 + RSA PSS, X25519, AES-128-GCM + ChaCha20, session resumption, 0-RTT
+- **TLS 1.3** (RFC 8446 / RFC 9001) — ECDSA P-256, Ed25519 and RSA-PSS certificates, X25519, AES-128-GCM + ChaCha20, session resumption, 0-RTT
 - **Loss Detection & Congestion Control** (RFC 9002) — CUBIC, PTO, token bucket pacer
 - **HTTP/3** (RFC 9114) — QPACK static table, request/response, priority scheduling (RFC 9218)
 - **WebTransport** (draft-ietf-webtrans-http3) — bidi/uni streams, datagrams, Extended CONNECT, browser support

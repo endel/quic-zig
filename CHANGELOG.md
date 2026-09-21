@@ -7,12 +7,28 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Added
 
+- Client certificates (mutual TLS) for QUIC servers and `tls_server`: give a
+  certificate entry a `ClientAuth` (CA bundle, `.required` or `.optional`)
+  and clients reaching it by SNI are asked for a certificate, verified
+  against the bundle, and readable through `peerCertificate()` on the
+  connection or `Session`. No session tickets are issued or accepted under
+  it. `tls_client` and the QUIC client present `client_certificate` when a
+  server asks.
+- `quic.tls_client`, a sans-IO TLS 1.3 client for TLS over TCP, the
+  counterpart of `tls_server`. It verifies the server against a CA bundle
+  (chain, host name or IP address, CertificateVerify with ECDSA, Ed25519 or
+  RSA-PSS), does SNI and ALPN, and holds data written before the handshake
+  finishes. No resumption or 0-RTT.
 - `quic.tls_server`, a sans-IO TLS 1.3 server for TLS over TCP: feed it the
   bytes you read and send what it queues, from any event loop. It negotiates
   AES-GCM or ChaCha20, X25519 or P-256 (with HelloRetryRequest), picks the
   certificate by SNI, and can resume sessions from tickets.
 - A QUIC server can serve several certificates and pick one by SNI, via
   `TlsConfig.certs`.
+- RSA server certificates, for QUIC and `tls_server`: 2048 to 4096-bit keys in
+  PKCS#1 or PKCS#8, signing with RSA-PSS. `tls13.extractPrivateKey` reads EC,
+  Ed25519 and RSA keys. When several certificates match a name, the server
+  picks one whose key the client can verify.
 - `Server` can join an event loop you own through `Config.loop`, next to your
   own sockets, timers and `Client`s. `stop()` then leaves the loop running, and
   `isStopped()` says when `deinit()` is safe; `Client` gained the same
@@ -58,11 +74,38 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Changed
 
+- A QUIC server now aborts with `missing_extension` when a ClientHello without
+  a PSK has no `signature_algorithms`, and with `handshake_failure` when it
+  offers no scheme for the certificate, instead of signing anyway.
 - A server at `max_connections` now answers new clients with
   CONNECTION_REFUSED instead of ignoring them until they time out.
 
 ### Fixed
 
+- A peer's malformed certificate could crash the TLS and QUIC clients (an
+  out-of-bounds read in std's DER parser); certificates are now checked for
+  a well-formed structure before they are parsed.
+- A stream's send buffer now shrinks back to 64 KiB once a burst is
+  acknowledged, instead of holding its peak size (megabytes for a relay writing
+  ahead of a slow peer) until the stream closes.
+- On macOS/BSD, a busy event loop could log "invalid state in submission queue"
+  and lose or double-queue a socket event. libxev now comes from the
+  [endel/libxev](https://github.com/endel/libxev/tree/kqueue-fixes) fork,
+  which carries the kqueue fix.
+- On macOS/BSD, a non-blocking loop tick (`.no_wait`) no longer leaves a
+  disarmed socket registered with kqueue, where it could fire again for a freed
+  completion.
+- Stateless resets now work in both directions: a client whose server lost the
+  connection (after an idle timeout or restart) stops sending and closes instead of
+  retransmitting until its own timeout, and a server drops a connection its
+  client reset. `Connection.received_stateless_reset` tells the two apart from
+  other closes.
+- A QPACK encoder- or decoder-stream instruction that arrived split across
+  two packets closed the connection; it is now held until the rest arrives.
+- A request or response body whose last packet overtook an earlier one could
+  lose the earlier data: the stream was freed once both FINs had crossed, and
+  the retransmission was then discarded. It now stays open until every byte
+  has arrived.
 - A MoQ relay now answers a subscriber that arrived before its publisher as
   soon as the publisher sends PUBLISH, instead of leaving it to wait out its
   rendezvous timeout. [#34](https://github.com/endel/quic-zig/pull/34)

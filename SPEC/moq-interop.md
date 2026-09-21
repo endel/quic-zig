@@ -186,12 +186,9 @@ miss only `rendezvous-timeout`, and `moqt://cdn.moq.dev` does not speak IETF
 draft-18 at all. Full table and the conformance question that accounts for
 every remaining failure: [`moq-interop-results.md`](moq-interop-results.md).
 
-**The relay needs an ECDSA P-256 key.** Our TLS signs with ECDSA P-256 or
-Ed25519 and has no RSA signing path, so an RSA `priv.key` fails at startup
-with `error: DecodeError` and nothing pairs. Both the SEC1 and PKCS#8
-encodings are read. The runner generates P-256 — deliberately, so browsers
-can pin the certificate by hash — so this costs nothing there; it is a trap
-only when mounting certificates of your own.
+**Relay keys.** Our TLS signs with ECDSA P-256, Ed25519 or RSA-PSS (RSA keys
+of 2048 to 4096 bits, PKCS#1 or PKCS#8). The runner generates P-256
+deliberately: browsers pin a certificate by hash only when it is ECDSA.
 
 Both drafts are implemented, so `draft_versions` would be
 `["draft-17", "draft-18"]`. draft-18 is the runner's `current_target` and
