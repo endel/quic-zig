@@ -966,27 +966,15 @@ pub fn Server(comptime Handler: type) type {
                 const batch = self.batchForConn(conn);
                 var send_count: usize = 0;
                 while (send_count < 1000) : (send_count += 1) {
-                    const bytes_written = conn.send(&self.out_buf) catch break;
+                    const bytes_written = conn.send(batch.reserve()) catch break;
                     if (bytes_written == 0) break;
                     const send_addr = conn.peerAddress();
-
-                    if (send_count == 0 and batch.count == 0) {
-                        ecn_socket.sendDirect(
-                            batch.sockfd,
-                            self.out_buf[0..bytes_written],
-                            send_addr,
-                            connection.sockaddrLen(send_addr),
-                            conn.getEcnMark(),
-                            &batch.current_ecn,
-                        );
-                    } else {
-                        batch.add(
-                            self.out_buf[0..bytes_written],
-                            @ptrCast(send_addr),
-                            connection.sockaddrLen(send_addr),
-                            conn.getEcnMark(),
-                        );
-                    }
+                    batch.commit(
+                        bytes_written,
+                        @ptrCast(send_addr),
+                        connection.sockaddrLen(send_addr),
+                        conn.getEcnMark(),
+                    );
                 }
             }
             self.batch.flush();
@@ -1786,27 +1774,15 @@ pub fn Server(comptime Handler: type) type {
                 const max_burst_packets = 1000;
                 var send_count: usize = 0;
                 while (send_count < max_burst_packets) : (send_count += 1) {
-                    const bytes_written = conn.send(&self.out_buf) catch break;
+                    const bytes_written = conn.send(batch.reserve()) catch break;
                     if (bytes_written == 0) break;
                     const send_addr = conn.peerAddress();
-
-                    if (send_count == 0 and batch.count == 0) {
-                        ecn_socket.sendDirect(
-                            batch.sockfd,
-                            self.out_buf[0..bytes_written],
-                            send_addr,
-                            connection.sockaddrLen(send_addr),
-                            conn.getEcnMark(),
-                            &batch.current_ecn,
-                        );
-                    } else {
-                        batch.add(
-                            self.out_buf[0..bytes_written],
-                            @ptrCast(send_addr),
-                            connection.sockaddrLen(send_addr),
-                            conn.getEcnMark(),
-                        );
-                    }
+                    batch.commit(
+                        bytes_written,
+                        @ptrCast(send_addr),
+                        connection.sockaddrLen(send_addr),
+                        conn.getEcnMark(),
+                    );
                 }
 
                 i += 1;
@@ -2404,7 +2380,6 @@ pub fn Client(comptime Handler: type) type {
         local_addr: posix.sockaddr.storage,
         batch: ecn_socket.SendBatch,
         recv_buf: [MAX_RECV_DATAGRAM]u8,
-        out_buf: [1500]u8,
 
         /// Shared by every H3Connection on this loop — one 16 KB buffer for
         /// the whole server rather than one per connection. Safe because a
@@ -2576,7 +2551,6 @@ pub fn Client(comptime Handler: type) type {
                 .batch = ecn_socket.SendBatch.init(sockfd),
                 .recv_buf = undefined,
                 .qpack_scratch = undefined,
-                .out_buf = undefined,
                 .conn = conn_ptr,
                 .remote_addr = remote_addr,
                 .h3_conn = null,
@@ -2744,10 +2718,10 @@ pub fn Client(comptime Handler: type) type {
                 &self.remote_addr;
             var send_count: usize = 0;
             while (send_count < 1000) : (send_count += 1) {
-                const bytes_written = conn.send(&self.out_buf) catch break;
+                const bytes_written = conn.send(self.batch.reserve()) catch break;
                 if (bytes_written == 0) break;
-                self.batch.add(
-                    self.out_buf[0..bytes_written],
+                self.batch.commit(
+                    bytes_written,
                     @ptrCast(send_addr),
                     connection.sockaddrLen(send_addr),
                     conn.getEcnMark(),
@@ -3159,10 +3133,10 @@ pub fn Client(comptime Handler: type) type {
             const max_burst_packets = 1000;
             var send_count: usize = 0;
             while (send_count < max_burst_packets) : (send_count += 1) {
-                const bytes_written = conn.send(&self.out_buf) catch break;
+                const bytes_written = conn.send(self.batch.reserve()) catch break;
                 if (bytes_written == 0) break;
-                self.batch.add(
-                    self.out_buf[0..bytes_written],
+                self.batch.commit(
+                    bytes_written,
                     @ptrCast(send_addr),
                     connection.sockaddrLen(send_addr),
                     conn.getEcnMark(),

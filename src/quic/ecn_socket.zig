@@ -5,6 +5,8 @@ const posix = std.posix;
 const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
+const is_linux = builtin.os.tag == .linux;
+const linux = if (is_linux) std.os.linux else void;
 
 // Platform-specific constants for ECN socket options (IPv4).
 const IPPROTO_IP: u32 = 0;
@@ -206,9 +208,19 @@ pub fn mapV4ToV6(storage: *posix.sockaddr.storage) void {
 }
 
 /// Batch sender that collects outgoing packets and flushes them together.
-/// Reduces syscall overhead by batching sendto calls and caching ECN marks.
+///
+/// On Linux a run of same-sized packets to one address leaves as a single
+/// `sendmsg` carrying `UDP_SEGMENT`, so the kernel does the splitting: one
+/// syscall and one skb for up to 64 datagrams, which is what nginx's `quic_gso`
+/// buys. Where that is unavailable the run still goes out in one `sendmmsg`.
+/// Other platforms send one `sendmsg` per packet.
 pub const SendBatch = struct {
     const MAX_BATCH: usize = 64;
+    /// GSO needs every segment but the last to be the same size, and the whole
+    /// thing to fit one datagram's length field.
+    const max_gso_bytes: usize = 65535;
+    /// Room for one packet, and the size of a `reserve` slot.
+    pub const max_packet: usize = 1500;
 
     sockfd: posix.socket_t,
     count: usize = 0,
@@ -222,14 +234,35 @@ pub const SendBatch = struct {
     ecn_marks: [MAX_BATCH]u2 = undefined,
 
     // Contiguous buffer holding all packet data
-    data_buf: [MAX_BATCH * 1500]u8 = undefined,
+    data_buf: [MAX_BATCH * max_packet]u8 = undefined,
     data_len: usize = 0,
+    /// Cleared for the socket's life once the kernel refuses a segmented send.
+    gso: bool = is_linux,
 
     pub fn init(sockfd: posix.socket_t) SendBatch {
         return .{ .sockfd = sockfd };
     }
 
-    /// Add a packet to the batch. Flushes automatically when full.
+    /// Where the next packet should be written, so that packing it needs no
+    /// copy: the batch sends from this buffer. Followed by `commit`.
+    pub fn reserve(self: *SendBatch) *[max_packet]u8 {
+        if (self.count >= MAX_BATCH or self.data_len + max_packet > self.data_buf.len) self.flush();
+        return self.data_buf[self.data_len..][0..max_packet];
+    }
+
+    /// Record the packet just written into `reserve`'s slot.
+    pub fn commit(self: *SendBatch, len: usize, addr: *const posix.sockaddr, addr_len: posix.socklen_t, ecn: u2) void {
+        const idx = self.count;
+        self.offsets[idx] = @intCast(self.data_len);
+        self.lengths[idx] = @intCast(len);
+        self.data_len += len;
+        self.addrs[idx] = @as(*const posix.sockaddr.storage, @ptrCast(@alignCast(addr))).*;
+        self.addr_lens[idx] = addr_len;
+        self.ecn_marks[idx] = ecn;
+        self.count += 1;
+    }
+
+    /// Add a packet the caller already holds elsewhere. Flushes when full.
     pub fn add(self: *SendBatch, data: []const u8, addr: *const posix.sockaddr, addr_len: posix.socklen_t, ecn: u2) void {
         if (self.count >= MAX_BATCH or self.data_len + data.len > self.data_buf.len) {
             self.flush();
@@ -245,22 +278,44 @@ pub const SendBatch = struct {
         self.count += 1;
     }
 
-    /// Send all queued packets via sendmsg (matches quic-go's approach).
-    /// Uses sendmsg instead of sendto for more reliable delivery on macOS loopback.
+    /// Send everything queued, in as few syscalls as the platform allows.
     pub fn flush(self: *SendBatch) void {
-        if (self.count == 0) return;
-
-        for (0..self.count) |i| {
-            // Only call setsockopt when ECN mark changes (saves 2 syscalls per packet)
-            if (self.ecn_marks[i] != self.current_ecn) {
-                self.current_ecn = self.ecn_marks[i];
+        defer {
+            self.count = 0;
+            self.data_len = 0;
+        }
+        // Packets that share a destination and an ECN mark go out together:
+        // changing the mark is a setsockopt, and a segmented send carries one
+        // address. A connection's burst is one run, which is the case that pays.
+        var start: usize = 0;
+        while (start < self.count) {
+            var end = start + 1;
+            while (end < self.count and
+                self.ecn_marks[end] == self.ecn_marks[start] and
+                self.sameAddr(start, end)) : (end += 1)
+            {}
+            if (self.ecn_marks[start] != self.current_ecn) {
+                self.current_ecn = self.ecn_marks[start];
                 setEcnMark(self.sockfd, self.current_ecn) catch {};
             }
+            self.sendRun(start, end);
+            start = end;
+        }
+    }
+
+    fn sameAddr(self: *const SendBatch, a: usize, b: usize) bool {
+        if (self.addr_lens[a] != self.addr_lens[b]) return false;
+        const bytes_a = std.mem.asBytes(&self.addrs[a]);
+        const bytes_b = std.mem.asBytes(&self.addrs[b]);
+        return std.mem.eql(u8, bytes_a[0..self.addr_lens[a]], bytes_b[0..self.addr_lens[b]]);
+    }
+
+    /// One `sendmsg` per packet: correct everywhere, and the fallback for the
+    /// paths below.
+    fn sendEach(self: *SendBatch, from: usize, to: usize) void {
+        for (from..to) |i| {
             const data = self.data_buf[self.offsets[i]..][0..self.lengths[i]];
-            var iov = [1]posix.iovec_const{.{
-                .base = data.ptr,
-                .len = data.len,
-            }};
+            var iov = [1]posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
             const msg = std.c.msghdr_const{
                 .name = @ptrCast(&self.addrs[i]),
                 .namelen = self.addr_lens[i],
@@ -272,34 +327,99 @@ pub const SendBatch = struct {
             };
             _ = std.c.sendmsg(self.sockfd, &msg, 0);
         }
+    }
 
-        self.count = 0;
-        self.data_len = 0;
+    fn sendRun(self: *SendBatch, from: usize, to: usize) void {
+        if (!is_linux or to - from == 1) return self.sendEach(from, to);
+        if (self.gso and self.sendSegmented(from, to)) return;
+        self.sendMany(from, to);
+    }
+
+    /// The whole run as one datagram plus a segment size, where its shape allows
+    /// it. False when it does not, or when the kernel turned it down.
+    fn sendSegmented(self: *SendBatch, from: usize, to: usize) bool {
+        const seg = self.lengths[from];
+        var total: usize = 0;
+        for (from..to) |i| {
+            // Every segment but the last is exactly `seg`, and none exceeds it.
+            if (self.lengths[i] != seg and i != to - 1) return false;
+            if (self.lengths[i] > seg) return false;
+            total += self.lengths[i];
+        }
+        if (total > max_gso_bytes) return false;
+
+        var control: [cmsgSpace(@sizeOf(u16))]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        const cmsg: *linux.cmsghdr = @ptrCast(&control);
+        cmsg.* = .{
+            .len = cmsgLen(@sizeOf(u16)),
+            .level = linux.IPPROTO.UDP,
+            .type = linux.UDP.SEGMENT,
+        };
+        const seg16: u16 = @intCast(seg);
+        @memcpy(control[cmsgLen(0)..][0..@sizeOf(u16)], std.mem.asBytes(&seg16));
+
+        var iov = [1]posix.iovec_const{.{
+            .base = self.data_buf[self.offsets[from]..].ptr,
+            .len = total,
+        }};
+        const msg = std.c.msghdr_const{
+            .name = @ptrCast(&self.addrs[from]),
+            .namelen = self.addr_lens[from],
+            .iov = &iov,
+            .iovlen = 1,
+            .control = &control,
+            .controllen = @intCast(control.len),
+            .flags = 0,
+        };
+        const rc = std.c.sendmsg(self.sockfd, &msg, 0);
+        if (rc >= 0) return true;
+        // A kernel or socket without UDP_SEGMENT will keep saying so, so stop
+        // asking. Any other failure is this send's problem, not the feature's.
+        switch (posix.errno(rc)) {
+            .INVAL, .NOPROTOOPT, .OPNOTSUPP => self.gso = false,
+            else => {},
+        }
+        return false;
+    }
+
+    /// The run in one `sendmmsg`.
+    fn sendMany(self: *SendBatch, from: usize, to: usize) void {
+        var iovs: [MAX_BATCH]posix.iovec_const = undefined;
+        var msgs: [MAX_BATCH]linux.mmsghdr = undefined;
+        const n = to - from;
+        for (0..n) |k| {
+            const i = from + k;
+            iovs[k] = .{ .base = self.data_buf[self.offsets[i]..].ptr, .len = self.lengths[i] };
+            msgs[k] = .{
+                .hdr = .{
+                    .name = @ptrCast(&self.addrs[i]),
+                    .namelen = self.addr_lens[i],
+                    .iov = @ptrCast(&iovs[k]),
+                    .iovlen = 1,
+                    .control = null,
+                    .controllen = 0,
+                    .flags = 0,
+                },
+                .len = 0,
+            };
+        }
+        // Partial sends are normal: keep going from where it stopped.
+        var sent: usize = 0;
+        while (sent < n) {
+            const rc = std.c.sendmmsg(self.sockfd, msgs[sent..].ptr, @intCast(n - sent), 0);
+            if (rc <= 0) return self.sendEach(from + sent, to);
+            sent += @intCast(rc);
+        }
     }
 };
 
-/// Send a single packet directly from the caller's buffer (zero-copy send path).
-/// Avoids the batch memcpy overhead for single-packet sends — the common case
-/// for latency-sensitive echo/datagram workloads.
-pub fn sendDirect(sockfd: posix.socket_t, data: []const u8, addr: *const posix.sockaddr.storage, addr_len: posix.socklen_t, ecn: u2, current_ecn: *u2) void {
-    if (ecn != current_ecn.*) {
-        current_ecn.* = ecn;
-        setEcnMark(sockfd, ecn) catch {};
-    }
-    var iov = [1]posix.iovec_const{.{
-        .base = data.ptr,
-        .len = data.len,
-    }};
-    const msg = std.c.msghdr_const{
-        .name = @ptrCast(addr),
-        .namelen = addr_len,
-        .iov = &iov,
-        .iovlen = 1,
-        .control = null,
-        .controllen = 0,
-        .flags = 0,
-    };
-    _ = std.c.sendmsg(sockfd, &msg, 0);
+/// Bytes a control message of `len` payload occupies, header included.
+fn cmsgLen(len: usize) usize {
+    return std.mem.alignForward(usize, @sizeOf(linux.cmsghdr), @alignOf(usize)) + len;
+}
+
+fn cmsgSpace(len: usize) usize {
+    return std.mem.alignForward(usize, cmsgLen(len), @alignOf(usize));
 }
 
 // Tests — ECN ancillary data tests only run on POSIX platforms.
