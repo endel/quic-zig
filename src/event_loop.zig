@@ -1734,6 +1734,9 @@ pub fn Server(comptime Handler: type) type {
         fn tickAndSend(self: *Self) void {
             // What was written before this point goes out below.
             self.written_in_pass = false;
+            // One clock read for the pass: a deadline check does not need a
+            // fresher now than this, and reading it per connection showed up.
+            const pass_now_ns: i64 = sys.nanoTimestamp();
             var i: usize = 0;
             while (i < self.conn_mgr.entries.items.len) {
                 const entry = self.conn_mgr.entries.items[i];
@@ -1743,7 +1746,10 @@ pub fn Server(comptime Handler: type) type {
                 // we only fire the earliest space per tick, requiring separate timer
                 // events for each space. Under burst loss, coalescing all PTO fires
                 // sends more diverse packets in one burst.
-                {
+                // Only when a deadline has actually passed. onTimeout does
+                // nothing otherwise, but reaching it costs a call and a clock
+                // read for every connection on every pass.
+                if (entry.conn.nextTimeoutNs()) |first| if (first <= pass_now_ns) {
                     var timeout_iter: usize = 0;
                     while (timeout_iter < 8) : (timeout_iter += 1) {
                         entry.conn.onTimeout() catch {};
@@ -1754,7 +1760,7 @@ pub fn Server(comptime Handler: type) type {
                         const now_ns: i64 = sys.nanoTimestamp();
                         if (next.? > now_ns) break;
                     }
-                }
+                };
                 if (entry.conn.isClosed()) {
                     // Fire onSessionClosed BEFORE removeConnection invalidates
                     // the entry, so the handler can mark clients as disconnected.
@@ -2320,13 +2326,14 @@ pub fn Client(comptime Handler: type) type {
             "onFinished",        "onSettings",
             "onGoaway",          "onRequestCancelled",
             // Raw QUIC
-                     "onStreamData",
+            "onStreamData",
             // WebTransport
-            "onSessionReady",    "onSessionRejected",
-            "onDatagram",        "onSessionClosed",
-            "onSessionDraining", "onBidiStream",
-            "onUniStream",       "onStreamReset",
-            "onStopSending",     "onWritable",
+                 "onSessionReady",
+            "onSessionRejected", "onDatagram",
+            "onSessionClosed",   "onSessionDraining",
+            "onBidiStream",      "onUniStream",
+            "onStreamReset",     "onStopSending",
+            "onWritable",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
