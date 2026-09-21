@@ -53,11 +53,6 @@ pub const Modulus = struct {
         return self;
     }
 
-    /// Bytes needed to hold a residue: the modulus length, rounded up.
-    pub fn byteLength(self: *const Modulus) usize {
-        return self.len * 8;
-    }
-
     /// out = base^exp mod m, both big-endian magnitudes. `out` is written
     /// right-aligned and zero-padded, so its length fixes the encoding. The
     /// exponent's encoded length sets the work done, so pad it to hide the
@@ -68,7 +63,8 @@ pub const Modulus = struct {
         defer std.crypto.secureZero(u64, &b);
         // A base at or above the modulus would leave the table outside the
         // residue class; callers reduce first, so this is a contract check.
-        if (limbsUsed(&b) > self.len or cmp(&b, &self.limbs, self.len) >= 0) return error.InvalidModulus;
+        var scratch: Limbs = undefined;
+        if (limbsUsed(&b) > self.len or sub(&scratch, &b, &self.limbs, self.len) == 0) return error.InvalidModulus;
 
         // base * R mod m, by doubling: it avoids needing R^2 mod m at all.
         var table: [table_len]Limbs = undefined;
@@ -84,13 +80,9 @@ pub const Modulus = struct {
 
         var acc = table[0];
         defer std.crypto.secureZero(u64, &acc);
-        var first = true;
         for (exp) |byte| {
             for ([2]u3{ 4, 0 }) |shift| {
-                if (!first) {
-                    for (0..window_bits) |_| acc = self.mul(&acc, &acc);
-                }
-                first = false;
+                for (0..window_bits) |_| acc = self.mul(&acc, &acc);
                 const w: u64 = (byte >> shift) & (table_len - 1);
                 var chosen: Limbs = @splat(0);
                 for (&table, 0..) |*t, i| cmov(&chosen, t, eq(i, w), self.len);
@@ -115,7 +107,7 @@ pub const Modulus = struct {
             carry = top;
         }
         // Subtract when the shift overflowed, or the result reached the modulus.
-        var t: Limbs = @splat(0);
+        var t: Limbs = undefined;
         const borrow = sub(&t, x, &self.limbs, self.len);
         cmov(x, &t, carry | (1 - borrow), self.len);
     }
@@ -134,7 +126,7 @@ pub const Modulus = struct {
     }
 
     fn mulLen(self: *const Modulus, a: *const Limbs, b: *const Limbs, comptime fixed: ?usize) Limbs {
-        const len = if (fixed) |f| f else self.len;
+        const len = fixed orelse self.len;
         // One limb of headroom above the modulus, plus one for the carry out.
         var t: [max_limbs + 2]u64 = @splat(0);
         defer std.crypto.secureZero(u64, &t);
@@ -184,22 +176,6 @@ fn sub(dst: *Limbs, a: *const Limbs, b: *const Limbs, len: usize) u64 {
         borrow = @intCast((d >> 64) & 1);
     }
     return borrow;
-}
-
-/// -1, 0 or 1, in constant time for a fixed length.
-fn cmp(a: *const Limbs, b: *const Limbs, len: usize) i2 {
-    var gt: u64 = 0;
-    var lt: u64 = 0;
-    for (0..len) |i| {
-        const x = a.*[len - 1 - i];
-        const y = b.*[len - 1 - i];
-        const decided = gt | lt;
-        gt |= @intFromBool(x > y) & (1 -% decided);
-        lt |= @intFromBool(x < y) & (1 -% decided);
-    }
-    if (gt != 0) return 1;
-    if (lt != 0) return -1;
-    return 0;
 }
 
 /// dst = src where `take` is 1, unchanged where it is 0.

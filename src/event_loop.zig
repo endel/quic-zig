@@ -589,12 +589,12 @@ pub fn Server(comptime Handler: type) type {
         }
 
         const known = [_][]const u8{
-            "onConnectRequest", "onSessionReady",  "onStreamData",
-            "onDatagram",       "onSessionClosed", "onSessionDraining",
-            "onBidiStream",     "onUniStream",     "onStreamReset",
-            "onStopSending",    "onPollComplete",  "onRequest",
-            "onData",           "onH0Request",     "onH0Data",
-            "onH0Finished",     "onWritable",      "onRequestEnd",
+            "onConnectRequest",   "onSessionReady",     "onStreamData",
+            "onDatagram",         "onSessionClosed",    "onSessionDraining",
+            "onBidiStream",       "onUniStream",        "onStreamReset",
+            "onStopSending",      "onPollComplete",     "onRequest",
+            "onData",             "onH0Request",        "onH0Data",
+            "onH0Finished",       "onWritable",         "onRequestEnd",
             "onRequestCancelled", "onConnectionClosed",
         };
 
@@ -1746,10 +1746,13 @@ pub fn Server(comptime Handler: type) type {
                 // we only fire the earliest space per tick, requiring separate timer
                 // events for each space. Under burst loss, coalescing all PTO fires
                 // sends more diverse packets in one burst.
-                // Only when a deadline has actually passed. onTimeout does
-                // nothing otherwise, but reaching it costs a call and a clock
-                // read for every connection on every pass.
-                if (entry.conn.nextTimeoutNs()) |first| if (first <= pass_now_ns) {
+                // Only when a deadline has actually passed, or the connection is
+                // waiting to close once its streams drain: `close_when_idle` has
+                // no deadline of its own and relies on being looked at each pass.
+                // Otherwise onTimeout does nothing, and reaching it costs a call
+                // and a clock read for every connection on every pass.
+                const due = if (entry.conn.nextTimeoutNs()) |first| first <= pass_now_ns else false;
+                if (due or entry.conn.close_when_idle) {
                     var timeout_iter: usize = 0;
                     while (timeout_iter < 8) : (timeout_iter += 1) {
                         entry.conn.onTimeout() catch {};
@@ -1760,7 +1763,7 @@ pub fn Server(comptime Handler: type) type {
                         const now_ns: i64 = sys.nanoTimestamp();
                         if (next.? > now_ns) break;
                     }
-                };
+                }
                 if (entry.conn.isClosed()) {
                     // Fire onSessionClosed BEFORE removeConnection invalidates
                     // the entry, so the handler can mark clients as disconnected.
