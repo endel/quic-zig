@@ -3419,7 +3419,12 @@ pub const Connection = struct {
                 else
                     @intFromEnum(ack_handler.EncLevel.initial);
                 const pn = self.pkt_handler.next_pn[enc_idx] -| 1;
-                ql.packetSent(now, pkt_type_str, pn, bytes_written, "");
+                var frames_buf: [2048]u8 = undefined;
+                var frames_len: usize = 0;
+                if (self.pkt_handler.sent[enc_idx].sent_packets.getPtr(pn)) |rec| {
+                    frames_len = qlog.QlogWriter.serializeSentFrames(rec, &frames_buf);
+                }
+                ql.packetSent(now, pkt_type_str, pn, bytes_written, frames_buf[0..frames_len]);
             }
 
             self.pto_probe_pending -|= 1;
