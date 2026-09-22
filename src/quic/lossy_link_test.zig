@@ -9,6 +9,7 @@ const sys = @import("../sys.zig");
 const connection = @import("connection.zig");
 const connection_manager = @import("connection_manager.zig");
 const tls13 = @import("tls13.zig");
+const mtu = @import("mtu.zig");
 
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
@@ -108,6 +109,9 @@ const Result = struct {
     closed: bool,
     /// Longest stretch of virtual time in which the server read nothing new.
     max_stall_ns: i64,
+    /// Datagram size each side ended up using.
+    client_mtu: u16,
+    server_mtu: u16,
 };
 
 /// Client uploads `total` bytes on one bidi stream; the server reads as it
@@ -241,6 +245,8 @@ fn runBulk(total: usize, c2s_loss: Link.Loss, s2c_loss: Link.Loss, one_way_ns: i
         .s2c_sent = s2c.sent,
         .closed = closed,
         .max_stall_ns = @max(max_stall, now - last_progress),
+        .client_mtu = client.mtu_discoverer.current_mtu,
+        .server_mtu = if (mgr.entries.items.len > 0) mgr.entries.items[0].conn.mtu_discoverer.current_mtu else 0,
     };
 }
 
@@ -250,6 +256,16 @@ test "lossy link: a clean 4 MiB upload finishes within a second" {
     const r = try runBulk(4 << 20, .none, .none, 10 * ms, 60 * std.time.ns_per_s);
     try testing.expect(r.finished);
     try testing.expect(r.elapsed_ns < std.time.ns_per_s);
+}
+
+test "lossy link: a busy connection still finds the path MTU" {
+    // The probe used to sit below the pacer, where the only way to reach it was
+    // a pass with nothing to send and no pacing due — which a connection
+    // carrying data back to back never gets. Every datagram stayed at 1200.
+    const r = try runBulk(4 << 20, .none, .none, 10 * ms, 60 * std.time.ns_per_s);
+    try testing.expect(r.finished);
+    try testing.expect(r.client_mtu > mtu.BASE_PLPMTU);
+    try testing.expect(r.server_mtu > mtu.BASE_PLPMTU);
 }
 
 test "lossy link: an upload survives bursty loss on the data path" {

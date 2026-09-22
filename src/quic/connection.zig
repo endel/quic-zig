@@ -3240,6 +3240,15 @@ pub const Connection = struct {
     }
 
     /// Build and send outgoing packets.
+    /// The 1-RTT seal, once there is one to use. A server holds it back until
+    /// the handshake is confirmed: a 1-RTT PING before then draws a 1-RTT ACK
+    /// instead of the Handshake Finished it still needs retransmitted.
+    fn appSeal(self: *Connection) ?quic_crypto.Seal {
+        if (self.is_server and !self.handshake_confirmed) return null;
+        if (self.key_update) |*ku| return ku.current_seal;
+        return self.pkt_num_spaces[2].crypto_seal;
+    }
+
     pub fn send(self: *Connection, out_buf: []u8) !usize {
         // Draining/terminated: do not send anything
         if (self.state == .draining or self.state == .terminated) return 0;
@@ -3310,6 +3319,40 @@ pub const Connection = struct {
             return try self.sendAckOnly(out_buf, now);
         }
 
+        // PMTUD: a probe is its own datagram, and goes above the pacer. Below it
+        // the only way here is a pass that has nothing to send and is not paced,
+        // which a connection carrying requests back to back never gets: routez
+        // sent no probe at all over 128 connections and stayed at 1200 bytes.
+        // At most one probe per 5×RTT (200 ms floor), so the data it delays is
+        // one datagram that rarely exists.
+        self.mtu_discoverer.checkRaiseTimer(now);
+        if (self.appSeal()) |seal| {
+            const srtt = self.pkt_handler.rtt_stats.smoothedRttOrDefault();
+            if (self.mtu_discoverer.shouldProbe(now, srtt)) {
+                const probe_size: usize = self.mtu_discoverer.nextProbeSize();
+                if (out_buf.len >= probe_size) {
+                    const result = try self.packer.packMtuProbe(
+                        out_buf,
+                        probe_size,
+                        &self.pkt_handler,
+                        seal,
+                        now,
+                    );
+                    if (result.bytes_written > 0) {
+                        self.mtu_discoverer.onProbeSent(result.pn, @intCast(probe_size), now);
+                        self.paths[self.active_path_idx].bytes_sent += result.bytes_written;
+                        self.total_packets_sent += 1;
+                        // This path returns before the packing below, which is
+                        // where every other packet is traced.
+                        if (self.qlog_writer) |*ql| {
+                            ql.packetSent(now, "1RTT", result.pn, result.bytes_written, "{\"frame_type\":\"ping\"}");
+                        }
+                        return result.bytes_written;
+                    }
+                }
+            }
+        }
+
         // Check if pacer allows sending
         // Exception: PTO probes bypass pacing (RFC 9002 §6.2.4)
         // Note: ACK-only path above bypasses pacer per RFC 9002 §7.7
@@ -3358,16 +3401,7 @@ pub const Connection = struct {
         // Packet number space indices: 0=Initial, 1=Handshake, 2=Application
         const initial_seal = self.pkt_num_spaces[0].crypto_seal;
         const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
-        // Use KeyUpdateManager seal for 1-RTT if available.
-        // Server: don't send 1-RTT data until the handshake is complete.
-        // Sending 1-RTT PINGs during the handshake causes the peer to respond
-        // with 1-RTT ACKs instead of retransmitting the Handshake Finished.
-        const app_seal: ?quic_crypto.Seal = if (self.is_server and !self.handshake_confirmed)
-            null
-        else if (self.key_update) |*ku|
-            ku.current_seal
-        else
-            self.pkt_num_spaces[2].crypto_seal;
+        const app_seal = self.appSeal();
 
         // 0-RTT seal (client only, before handshake completes)
         const early_seal = if (!self.handshake_confirmed) self.early_data_seal else null;
@@ -3473,33 +3507,6 @@ pub const Connection = struct {
                 self.ecn_validator.onPacketSent();
             }
         }
-
-        // PMTUD: send a probe if it's time (separate datagram from regular data)
-        if (app_seal != null and bytes_written == 0) {
-            const srtt = self.pkt_handler.rtt_stats.smoothedRttOrDefault();
-            if (self.mtu_discoverer.shouldProbe(now, srtt)) {
-                const probe_size: usize = self.mtu_discoverer.nextProbeSize();
-                if (out_buf.len >= probe_size) {
-                    const result = try self.packer.packMtuProbe(
-                        out_buf,
-                        probe_size,
-                        &self.pkt_handler,
-                        app_seal.?,
-                        now,
-                    );
-                    if (result.bytes_written > 0) {
-                        self.mtu_discoverer.onProbeSent(result.pn, @intCast(probe_size), now);
-                        self.paths[self.active_path_idx].bytes_sent += result.bytes_written;
-                        self.total_packets_sent += 1;
-                        std.log.info("PMTUD: sent probe size={d} pn={d}", .{ probe_size, result.pn });
-                        return result.bytes_written;
-                    }
-                }
-            }
-        }
-
-        // Check PMTUD raise timer
-        self.mtu_discoverer.checkRaiseTimer(now);
 
         return bytes_written;
     }
