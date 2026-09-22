@@ -66,7 +66,14 @@ const CMSG_HDR_SIZE = @sizeOf(CmsgHdr);
 
 // Aligned cmsg buffer size (header + 4 bytes data, padded to alignment).
 const CMSG_SPACE = (CMSG_HDR_SIZE + 4 + @alignOf(CmsgHdr) - 1) & ~@as(usize, @alignOf(CmsgHdr) - 1);
-const CMSG_BUF_SIZE = CMSG_SPACE * 2; // room for at least 2 cmsgs
+// A receive timestamp is a timespec, wider than the 4-byte TOS cmsgs.
+const CMSG_SPACE_TS = (CMSG_HDR_SIZE + 16 + @alignOf(CmsgHdr) - 1) & ~@as(usize, @alignOf(CmsgHdr) - 1);
+const CMSG_BUF_SIZE = CMSG_SPACE * 2 + CMSG_SPACE_TS;
+
+// SO_TIMESTAMPNS: the kernel stamps each datagram as it is queued, which is the
+// only way to see how long one waited for the loop to come and read it.
+const SO_TIMESTAMPNS: u32 = 35; // Linux
+const SOL_SOCKET_LEVEL: i32 = 1; // Linux
 
 /// Raw setsockopt that doesn't panic on EINVAL (needed for trying IPv6 opts on IPv4 sockets).
 fn rawSetsockopt(sockfd: posix.socket_t, level: i32, optname: u32, optval: []const u8) void {
@@ -83,6 +90,16 @@ pub fn enableEcnRecv(sockfd: posix.socket_t) !void {
     rawSetsockopt(sockfd, IPPROTO_IP, IP_RECVTOS, val_bytes);
     // Enable for IPv6 (may fail on IPv4-only sockets — that's OK)
     rawSetsockopt(sockfd, @intCast(posix.IPPROTO.IPV6), IPV6_RECVTCLASS, val_bytes);
+}
+
+/// Ask the kernel to stamp incoming datagrams with their arrival time, so a
+/// receive queue can be told apart from a slow answer. Linux only, and only
+/// worth turning on for a diagnostic run: it adds a cmsg to every recvmsg.
+pub fn enableRxTimestamps(sockfd: posix.socket_t) void {
+    if (comptime builtin.os.tag != .linux) return;
+    const val: u32 = 1;
+    const rc = std.c.setsockopt(sockfd, SOL_SOCKET_LEVEL, @intCast(SO_TIMESTAMPNS), std.mem.asBytes(&val).ptr, 4);
+    if (rc != 0) std.debug.print("rx timestamps: setsockopt failed rc={d}\n", .{rc});
 }
 
 /// Set the ECN codepoint for outgoing packets (low 2 bits of IP TOS).
@@ -105,6 +122,9 @@ pub const RecvResult = struct {
     /// out loud: a truncated QUIC packet fails AEAD authentication, so it
     /// otherwise surfaces as a decryption failure rather than a short read.
     truncated: bool = false,
+    /// When the kernel queued this datagram, 0 unless `enableRxTimestamps`
+    /// was called on the socket. Diagnostic only.
+    kernel_ns: i64 = 0,
 };
 
 /// Receive a UDP datagram and extract the ECN codepoint from ancillary data.
@@ -158,8 +178,9 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
     const bytes_read: usize = @intCast(rc);
     addr_len = msg.namelen;
 
-    // Parse cmsg for IP_TOS
+    // Parse cmsg for IP_TOS, and for the arrival stamp when it was asked for.
     var ecn: u2 = 0;
+    var kernel_ns: i64 = 0;
     var offset: usize = 0;
     while (offset + CMSG_HDR_SIZE <= msg.controllen) {
         const hdr: *const CmsgHdr = @ptrCast(@alignCast(&cmsg_buf[offset]));
@@ -173,7 +194,14 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
             data_len >= 1 and data_offset < CMSG_BUF_SIZE)
         {
             ecn = @truncate(cmsg_buf[data_offset] & 0x03);
-            break;
+        } else if (builtin.os.tag == .linux and
+            hdr.cmsg_level == SOL_SOCKET_LEVEL and
+            hdr.cmsg_type == @as(i32, @intCast(SO_TIMESTAMPNS)) and
+            data_len >= 16 and data_offset + 16 <= CMSG_BUF_SIZE)
+        {
+            const ts: *align(1) const extern struct { sec: i64, nsec: i64 } =
+                @ptrCast(&cmsg_buf[data_offset]);
+            kernel_ns = ts.sec * std.time.ns_per_s + ts.nsec;
         }
         // Advance to next cmsg (aligned)
         const total = (CMSG_HDR_SIZE + data_len + @alignOf(CmsgHdr) - 1) & ~@as(usize, @alignOf(CmsgHdr) - 1);
@@ -187,6 +215,7 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
         .addr_len = addr_len,
         .ecn = ecn,
         .truncated = msg.flags & @as(i32, @intCast(posix.MSG.TRUNC)) != 0,
+        .kernel_ns = kernel_ns,
     };
 }
 

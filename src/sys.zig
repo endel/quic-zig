@@ -472,6 +472,15 @@ pub fn realtimeSeconds() i64 {
 pub var test_clock: if (builtin.is_test) ?i64 else void = if (builtin.is_test) null else {};
 
 /// Monotonic clock timestamp in nanoseconds (replaces `std.time.nanoTimestamp`).
+/// Wall-clock nanoseconds. Only for comparing against something the kernel
+/// stamped on the same clock, such as SO_TIMESTAMPNS: it can step, so it is
+/// never the clock for a deadline.
+pub fn realtimeNs() i64 {
+    var ts: timespec = undefined;
+    if (c.clock_gettime(posix.CLOCK.REALTIME, &ts) != 0) return 0;
+    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
+}
+
 pub fn nanoTimestamp() i64 {
     if (builtin.is_test) if (test_clock) |t| return t;
     switch (builtin.os.tag) {

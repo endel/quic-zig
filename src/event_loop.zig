@@ -676,6 +676,10 @@ pub fn Server(comptime Handler: type) type {
         batch: ecn_socket.SendBatch,
         recv_buf: [MAX_RECV_DATAGRAM]u8,
         out_buf: [1500]u8,
+        /// How long datagrams waited in the kernel before the loop read them.
+        /// Only filled when the socket was stamped (a qlog run); reported and
+        /// cleared once a second.
+        rx_wait: RxWait = .{},
 
         /// Shared by every H3Connection on this loop — one 16 KB buffer for
         /// the whole server rather than one per connection. Safe because a
@@ -773,6 +777,11 @@ pub fn Server(comptime Handler: type) type {
 
             const sockfd, const local_addr = if (config.socket) |fd| .{ fd, try boundAddress(fd) } else try openUdpSocket(config, config.port);
             errdefer if (config.socket == null) sys.close(sockfd);
+
+            // A qlog run is a diagnostic run: stamp arrivals too, so the time a
+            // datagram spent queued can be told apart from the time spent
+            // answering it. Costs a cmsg per recvmsg, so it is not on otherwise.
+            if (conn_config.qlog_dir != null) ecn_socket.enableRxTimestamps(sockfd);
 
             // Optional second socket for preferred_address (connectionmigration)
             const preferred: ?PreferredSocket = if (config.preferred_port) |pp| blk: {
@@ -1270,6 +1279,13 @@ pub fn Server(comptime Handler: type) type {
                     break;
                 };
                 received = true;
+                if (recv_result.kernel_ns != 0) {
+                    // SO_TIMESTAMPNS stamps the wall clock, so the comparison
+                    // has to be made on it rather than on the monotonic one.
+                    const now_ns: i64 = sys.realtimeNs();
+                    self.rx_wait.record(now_ns - recv_result.kernel_ns);
+                    self.rx_wait.maybeReport(now_ns);
+                }
                 if (recv_result.truncated) {
                     std.log.warn("datagram truncated at {d} bytes — raise MAX_RECV_DATAGRAM", .{recv_result.bytes_read});
                 }
@@ -1904,6 +1920,43 @@ fn openUdpSocket(config: Config, port: u16) !struct { posix.socket_t, net.Addres
     ecn_socket.enableEcnRecv(fd) catch {};
     return .{ fd, addr };
 }
+
+/// Receive-queue delay, summarised rather than kept per datagram: the question
+/// it answers is whether a request waited to be read at all, not which one did.
+const RxWait = struct {
+    count: u64 = 0,
+    sum_ns: u64 = 0,
+    max_ns: u64 = 0,
+    over_1ms: u64 = 0,
+    report_at: i64 = 0,
+
+    fn record(self: *RxWait, wait_ns: i64) void {
+        if (wait_ns < 0) return; // clocks disagree; nothing to learn from it
+        const w: u64 = @intCast(wait_ns);
+        self.count += 1;
+        self.sum_ns += w;
+        if (w > self.max_ns) self.max_ns = w;
+        if (w > std.time.ns_per_ms) self.over_1ms += 1;
+    }
+
+    fn maybeReport(self: *RxWait, now: i64) void {
+        if (self.count == 0) return;
+        if (self.report_at == 0) {
+            self.report_at = now + std.time.ns_per_s;
+            return;
+        }
+        if (now < self.report_at) return;
+        // Straight to stderr: this is a diagnostic run's output, and a
+        // dependency's std.log does not reach the host's log writer.
+        std.debug.print("rx wait: n={d} mean={d}us max={d}us over_1ms={d}\n", .{
+            self.count,
+            self.sum_ns / self.count / std.time.ns_per_us,
+            self.max_ns / std.time.ns_per_us,
+            self.over_1ms,
+        });
+        self.* = .{ .report_at = now + std.time.ns_per_s };
+    }
+};
 
 /// What a socket watch returns once its server has halted, with a cancel for
 /// it queued. Epoll's cancel removes the fd unconditionally and panics if it
