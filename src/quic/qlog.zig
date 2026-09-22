@@ -199,6 +199,10 @@ pub const QlogWriter = struct {
     /// match `serializeFrame` so both events read alike.
     pub fn serializeSentFrames(pkt: *const ack_handler.SentPacket, out: []u8) usize {
         var w: Writer = .{ .out = out };
+        // The sent record keeps only the largest acknowledged number, not the
+        // ranges, so the trace shows when the peer's packets were acked and
+        // up to where, not which gaps were left.
+        if (pkt.largest_acked) |la| w.frame("\"ack\",\"acked_ranges\":[[{d}]]", .{la});
         for (pkt.getStreamFrames()) |sf| {
             w.frame("\"stream\",\"stream_id\":{d},\"offset\":{d},\"length\":{d}{s}", .{
                 sf.stream_id,                        sf.offset, sf.length,
