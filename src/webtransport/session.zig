@@ -1428,6 +1428,13 @@ pub const WebTransportConnection = struct {
         return self.streamSendCapacity(stream_id);
     }
 
+    /// The extended CONNECT tokens that open a session: draft-13's
+    /// `webtransport`, and the `webtransport-h3` that later drafts renamed it
+    /// to (picoquic and moq5 send the latter by default).
+    fn isWebTransportProtocol(token: []const u8) bool {
+        return std.mem.eql(u8, token, "webtransport") or std.mem.eql(u8, token, "webtransport-h3");
+    }
+
     /// Poll H3 events and translate to WT events.
     fn pollH3Events(self: *WebTransportConnection) !?WtEvent {
         const event = try self.h3.poll();
@@ -1435,7 +1442,7 @@ pub const WebTransportConnection = struct {
 
         switch (event.?) {
             .connect_request => |req| {
-                if (std.mem.eql(u8, req.protocol, "webtransport")) {
+                if (isWebTransportProtocol(req.protocol)) {
                     // Register as a connecting session
                     _ = self.allocateSession(req.stream_id, .connecting);
                     self.active_session_count += 1;
@@ -1636,9 +1643,13 @@ fn injectPeerControlStream(quic_conn: *quic_connection.Connection, h3: *h3_conn.
 
 // Build a QPACK-encoded Extended CONNECT request
 fn buildConnectRequest(buf: []u8, path: []const u8) usize {
+    return buildConnectRequestFor(buf, path, "webtransport");
+}
+
+fn buildConnectRequestFor(buf: []u8, path: []const u8, token: []const u8) usize {
     const headers = [_]qpack.Header{
         .{ .name = ":method", .value = "CONNECT" },
-        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":protocol", .value = token },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":path", .value = path },
         .{ .name = ":authority", .value = "example.com" },
@@ -2185,6 +2196,26 @@ test "WT integration: server receives connect_request from H3" {
         },
         else => return error.UnexpectedEvent,
     }
+}
+
+test "WT integration: webtransport-h3 opens a session too" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, true);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, true);
+    defer wt.deinit();
+
+    var req_buf: [512]u8 = undefined;
+    const req_len = buildConnectRequestFor(&req_buf, "/moq", "webtransport-h3");
+    const stream = try quic_conn.streams.getOrCreateStream(0);
+    try stream.recv.handleStreamFrame(0, req_buf[0..req_len], false);
+
+    const ev = (try wt.poll()) orelse return error.NoEvent;
+    try testing.expectEqualStrings("webtransport-h3", ev.connect_request.protocol);
 }
 
 test "WT integration: client receives session_ready on 200 response" {
