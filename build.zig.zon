@@ -2,10 +2,11 @@
     .name = .quic,
     .version = "0.5.0",
     .dependencies = .{
-        // mitchellh/libxev a82a04e plus kqueue fixes: our rearm fix and #224 (kqueue-fixes).
+        // endel/libxev tag quic-zig-2026-09-23: upstream plus the PRs in its
+        // fork/patches. See "libxev" in CLAUDE.md before changing this.
         .libxev = .{
-            .url = "https://github.com/endel/libxev/archive/6f8278bd7f0ac5c5df354d10f84dafd246426d20.tar.gz",
-            .hash = "libxev-0.0.0-86vtc4VeFABKuCGmSHkRPb--zCgmFTgUlhOjBRu4bmob",
+            .url = "https://github.com/endel/libxev/archive/0329dc2d5e5840d5e54e19f5702de4e770b569b0.tar.gz",
+            .hash = "libxev-0.0.0-86vtc2uMFADpKHEeWw2kNuTuLB3h1ddV5Tzz2rKg4VrS",
         },
     },
     .fingerprint = 0xc079525234abfc4c,
