@@ -1735,7 +1735,10 @@ pub const Tls13Handshake = struct {
         if (msg[0] != @intFromEnum(tls.HandshakeType.encrypted_extensions)) return error.UnexpectedMessage;
 
         // Parse EncryptedExtensions to extract transport params + ALPN + early_data
-        self.parseEncryptedExtensions(msg[4..]) catch {};
+        self.parseEncryptedExtensions(msg[4..]) catch |e| switch (e) {
+            error.TransportParameterError => {}, // reported as missing below
+            else => return e,
+        };
 
         // RFC 9001 §8.2: quic_transport_parameters extension MUST be present
         if (self.peer_transport_params == null) {
@@ -2298,9 +2301,11 @@ pub const Tls13Handshake = struct {
 
     fn serverBuildEncryptedExtensions(self: *Tls13Handshake) !Action {
         var buf: [1024]u8 = undefined;
+        // RFC 7301 §3.1: exactly the one protocol selected, never our list.
+        const selected = [_][]const u8{self.selected_alpn[0..self.selected_alpn_len]};
         const msg = buildEncryptedExtensionsFromEncoded(
             &buf,
-            self.config.alpn,
+            if (self.selected_alpn_len > 0) &selected else &.{},
             self.tp_encoded[0..self.tp_encoded_len],
             self.zero_rtt_accepted, // early_data only answers a client that asked
         ) catch return error.InternalError;
@@ -2863,6 +2868,17 @@ pub const Tls13Handshake = struct {
             } else if (etype == @intFromEnum(tls.ExtensionType.early_data)) {
                 // Server accepted early data (0-RTT)
                 self.zero_rtt_accepted = true;
+            } else if (etype == @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation)) {
+                // RFC 7301 §3.1: exactly one protocol, and one we offered.
+                const d = ext_data[ext_pos..][0..elen];
+                if (d.len < 3 or readU16(d) != d.len - 2 or @as(usize, d[2]) + 3 != d.len) return error.DecodeError;
+                const proto = d[3..];
+                for (self.config.alpn) |ours| {
+                    if (std.mem.eql(u8, ours, proto)) break;
+                } else return error.IllegalParameter;
+                if (proto.len > self.selected_alpn.len) return error.IllegalParameter;
+                @memcpy(self.selected_alpn[0..proto.len], proto);
+                self.selected_alpn_len = proto.len;
             }
             ext_pos += elen;
         }
@@ -3824,8 +3840,46 @@ test "loopback handshake: client and server complete" {
 
     var server = Tls13Handshake.initServer(server_config, server_tp);
     var client = Tls13Handshake.initClient(client_config, client_tp);
+    try driveLoopback(&client, &server);
 
-    // Drive the handshake to completion
+    // Verify both sides derived the same application secrets
+    try std.testing.expectEqualSlices(
+        u8,
+        &client.key_schedule.client_app_traffic_secret,
+        &server.key_schedule.client_app_traffic_secret,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &client.key_schedule.server_app_traffic_secret,
+        &server.key_schedule.server_app_traffic_secret,
+    );
+}
+
+test "loopback handshake: the server answers with the one ALPN it chose" {
+    const server_key_pair = EcdsaP256Sha256.KeyPair.generate(std.testing.io);
+    const secret_key_bytes = server_key_pair.secret_key.toBytes();
+    const fake_cert = server_key_pair.public_key.toUncompressedSec1();
+    const tp = transport_params.TransportParams{ .initial_max_data = 1048576 };
+
+    // Echoing the whole list made quic-go fail the handshake with decode_error.
+    var server = Tls13Handshake.initServer(.{
+        .cert_chain_der = &[_][]const u8{&fake_cert},
+        .private_key_bytes = &secret_key_bytes,
+        .alpn = &[_][]const u8{ "h3", "moqt-18", "moqt-17" },
+    }, tp);
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{ "moqt-17", "moqt-18" },
+        .server_name = "localhost",
+    }, tp);
+    try driveLoopback(&client, &server);
+    // The client's order wins; both sides must agree on it.
+    try std.testing.expectEqualStrings("moqt-17", server.negotiatedAlpn());
+    try std.testing.expectEqualStrings("moqt-17", client.negotiatedAlpn());
+}
+
+fn driveLoopback(client: *Tls13Handshake, server: *Tls13Handshake) !void {
     var client_done = false;
     var server_done = false;
     var iterations: usize = 0;
@@ -3873,18 +3927,6 @@ test "loopback handshake: client and server complete" {
     try std.testing.expect(server_done);
     try std.testing.expect(client.isComplete());
     try std.testing.expect(server.isComplete());
-
-    // Verify both sides derived the same application secrets
-    try std.testing.expectEqualSlices(
-        u8,
-        &client.key_schedule.client_app_traffic_secret,
-        &server.key_schedule.client_app_traffic_secret,
-    );
-    try std.testing.expectEqualSlices(
-        u8,
-        &client.key_schedule.server_app_traffic_secret,
-        &server.key_schedule.server_app_traffic_secret,
-    );
 }
 
 // PSK binder computation test
