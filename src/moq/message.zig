@@ -256,6 +256,15 @@ fn findParam(params: []const Param, t: u64) ?ParamValue {
 
 // Subscription Filter (§5.1.2) — the SUBSCRIPTION_FILTER parameter's value.
 
+/// Departures from the draft a caller may choose to tolerate. The default
+/// is the draft.
+pub const DecodeOptions = struct {
+    /// Read an undefined Subscription Filter type as this instead of the
+    /// PROTOCOL_VIOLATION §5.1.2 requires. For a relay that would rather
+    /// serve moxygen's private LargestGroup (250) than close on it.
+    unknown_filter_as: ?track.FilterType = null,
+};
+
 pub const Filter = struct {
     type: track.FilterType = .latest_object,
     /// Present for AbsoluteStart and AbsoluteRange.
@@ -275,9 +284,15 @@ pub const Filter = struct {
     }
 
     fn decode(bytes: []const u8) !Filter {
+        return decodeWith(bytes, .{});
+    }
+
+    fn decodeWith(bytes: []const u8, opts: DecodeOptions) !Filter {
         var fbs = io.fixedBufferStream(bytes);
         const raw = try wire.readVarInt(&fbs);
-        var f = Filter{ .type = track.FilterType.fromInt(raw) orelse return Error.ProtocolViolation };
+        const ft = track.FilterType.fromInt(raw) orelse
+            return if (opts.unknown_filter_as) |t| .{ .type = t } else Error.ProtocolViolation;
+        var f = Filter{ .type = ft };
         switch (f.type) {
             .next_group_start, .latest_object => {},
             .absolute_start, .absolute_range => {
@@ -379,7 +394,7 @@ pub const Subscribe = struct {
         return out[0..n];
     }
 
-    fn applyParams(self: *Subscribe, params: []const Param) !void {
+    fn applyParams(self: *Subscribe, params: []const Param, opts: DecodeOptions) !void {
         self.forward = null;
         self.subscriber_priority = null;
         self.filter = null;
@@ -391,7 +406,7 @@ pub const Subscribe = struct {
                 else => return Error.ProtocolViolation,
             },
             ParamType.SUBSCRIBER_PRIORITY => self.subscriber_priority = p.value.uint8,
-            ParamType.SUBSCRIPTION_FILTER => self.filter = try Filter.decode(p.value.bytes),
+            ParamType.SUBSCRIPTION_FILTER => self.filter = try Filter.decodeWith(p.value.bytes, opts),
             ParamType.GROUP_ORDER => self.group_order = track.GroupOrder.fromInt(p.value.uint8) orelse
                 return Error.ProtocolViolation,
             else => {},
@@ -421,7 +436,7 @@ pub fn writeSubscribe(writer: anytype, s: Subscribe, draft: version.Draft) !void
     return writeSubscribeLike(writer, codes.MSG_SUBSCRIBE, s, draft);
 }
 
-fn decodeSubscribeLike(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft) !Subscribe {
+fn decodeSubscribeLike(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft, opts: DecodeOptions) !Subscribe {
     var fbs = io.fixedBufferStream(payload);
     var s = Subscribe{
         .request_id = try wire.readVarInt(&fbs),
@@ -433,13 +448,17 @@ fn decodeSubscribeLike(payload: []const u8, ns_buf: *NamespaceBuf, draft: versio
         .track_name = try wire.readVarBytesZc(&fbs),
     };
     var params: [MAX_PARAMS]Param = undefined;
-    try s.applyParams(try readParams(&fbs, &params));
+    try s.applyParams(try readParams(&fbs, &params), opts);
     return s;
 }
 
 /// See the NamespaceBuf contract: `ns_buf` must outlive the result.
 pub fn decodeSubscribe(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft) !Subscribe {
-    return decodeSubscribeLike(payload, ns_buf, draft);
+    return decodeSubscribeLike(payload, ns_buf, draft, .{});
+}
+
+pub fn decodeSubscribeWith(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft, opts: DecodeOptions) !Subscribe {
+    return decodeSubscribeLike(payload, ns_buf, draft, opts);
 }
 
 // SUBSCRIBE_OK (0x04, §9.9) ------------------------------------------------
@@ -853,7 +872,7 @@ pub fn writeTrackStatus(writer: anytype, t: TrackStatus, draft: version.Draft) !
 
 /// See the NamespaceBuf contract: `ns_buf` must outlive the result.
 pub fn decodeTrackStatus(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Draft) !TrackStatus {
-    return decodeSubscribeLike(payload, ns_buf, draft);
+    return decodeSubscribeLike(payload, ns_buf, draft, .{});
 }
 
 // PUBLISH_NAMESPACE (0x06, §9.17) ------------------------------------------
@@ -1523,6 +1542,10 @@ test "an undefined Subscription Filter type is a protocol violation, not a reque
     const sub = try decodeSubscribe(&ok, &ns_buf, .draft_18);
     try testing.expectEqualStrings("no-such-track", sub.track_name);
     try testing.expectEqual(track.FilterType.latest_object, sub.filter.?.type);
+
+    // A caller that opts in reads it as the filter it names.
+    const lenient = try decodeSubscribeWith(&payload, &ns_buf, .draft_18, .{ .unknown_filter_as = .latest_object });
+    try testing.expectEqual(track.FilterType.latest_object, lenient.filter.?.type);
 }
 
 test "reading a draft-18 message as draft-17 does not quietly succeed" {
