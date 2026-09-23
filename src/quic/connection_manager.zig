@@ -63,6 +63,9 @@ pub const ConnEntry = struct {
     id: u64 = 0,
     h3_conn: ?*h3.H3Connection = null,
     h3_initialized: bool = false,
+    /// A `raw_quic` WebTransport server's connection that negotiated a
+    /// non-h3 ALPN: served as plain QUIC streams, with no H3 layer.
+    raw_quic: bool = false,
     h0_conn: ?*h0.H0Connection = null,
     wt_conn: ?*wt.WebTransportConnection = null,
 

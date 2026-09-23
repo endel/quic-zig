@@ -558,6 +558,36 @@ pub const Session = struct {
         return stream.stream_id;
     }
 
+    pub fn openQuicUniStream(self: *Session) !u64 {
+        const ss = try self.entry.conn.openUniStream();
+        return ss.stream_id;
+    }
+
+    pub fn resetQuicStream(self: *Session, stream_id: u64, error_code: u64) void {
+        defer self.entry.wake();
+        if (self.entry.conn.streams.getStream(stream_id)) |stream| {
+            stream.send.reset(error_code);
+        } else if (self.entry.conn.streams.send_streams.get(stream_id)) |ss| {
+            ss.reset(error_code);
+        }
+    }
+
+    /// A QUIC DATAGRAM with no WebTransport session prefix.
+    pub fn sendQuicDatagram(self: *Session, data: []const u8) !void {
+        defer self.entry.wake();
+        try self.entry.conn.sendDatagram(data);
+    }
+
+    /// True for a connection a `raw_quic` WebTransport server is serving as
+    /// plain QUIC, because it negotiated something other than h3.
+    pub fn isRawQuic(self: *const Session) bool {
+        return self.entry.raw_quic;
+    }
+
+    pub fn alpn(self: *const Session) []const u8 {
+        return self.entry.conn.negotiatedAlpn();
+    }
+
     // --- H0 methods ---
 
     pub fn serveFile(self: *Session, stream_id: u64, root_dir: []const u8, path: []const u8) !void {
@@ -583,6 +613,10 @@ pub const Session = struct {
 };
 
 pub fn Server(comptime Handler: type) type {
+    // A WebTransport handler may also take native-QUIC protocols on the same
+    // port (MoQT's `moqt-NN` beside `h3`): each connection's ALPN picks.
+    const serves_raw_quic = Handler.protocol == .webtransport and
+        @hasDecl(Handler, "raw_quic") and Handler.raw_quic;
     comptime {
         if (!@hasDecl(Handler, "protocol")) {
             @compileError("Handler must declare 'pub const protocol: event_loop.Protocol'");
@@ -595,7 +629,7 @@ pub fn Server(comptime Handler: type) type {
             "onStopSending",      "onPollComplete",     "onRequest",
             "onData",             "onH0Request",        "onH0Data",
             "onH0Finished",       "onWritable",         "onRequestEnd",
-            "onRequestCancelled", "onConnectionClosed",
+            "onRequestCancelled", "onConnectionClosed", "onQuicConnected",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -614,9 +648,13 @@ pub fn Server(comptime Handler: type) type {
                         "onSessionReady, onStreamData, onDatagram, onSessionClosed, " ++
                         "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
                         "onStopSending, onWritable, onPollComplete, onConnectionClosed, " ++
-                        "onH0Request, onH0Data, onH0Finished");
+                        "onQuicConnected, onH0Request, onH0Data, onH0Finished");
                 }
             }
+        }
+
+        if (@hasDecl(Handler, "onQuicConnected") and !serves_raw_quic) {
+            @compileError("onQuicConnected needs protocol = .webtransport and raw_quic = true");
         }
 
         if (@hasDecl(Handler, "onStreamData")) {
@@ -1038,7 +1076,10 @@ pub fn Server(comptime Handler: type) type {
             const conn = entry.conn;
             if (conn.state == .closing or conn.state == .draining or conn.isClosed()) return;
             switch (Handler.protocol) {
-                .h3, .webtransport => {},
+                .h3, .webtransport => if (entry.raw_quic) {
+                    conn.close(0, "server shutdown");
+                    return;
+                },
                 .quic, .h0 => {
                     conn.close(0, "server shutdown");
                     return;
@@ -1378,7 +1419,7 @@ pub fn Server(comptime Handler: type) type {
 
                 // Poll events and dispatch to handler
                 switch (Handler.protocol) {
-                    .webtransport => self.pollWtEvents(entry),
+                    .webtransport => if (entry.raw_quic) self.pollQuicEvents(entry) else self.pollWtEvents(entry),
                     .h3 => self.pollH3Events(entry),
                     .h0 => self.pollH0Events(entry),
                     .quic => self.pollQuicEvents(entry),
@@ -1423,7 +1464,9 @@ pub fn Server(comptime Handler: type) type {
         }
 
         fn initProtocol(self: *Self, entry: *ConnEntry) void {
-            switch (Handler.protocol) {
+            if (serves_raw_quic and !std.mem.eql(u8, entry.conn.negotiatedAlpn(), "h3")) {
+                entry.raw_quic = true;
+            } else switch (Handler.protocol) {
                 .webtransport => {
                     const h3c = self.allocator.create(h3.H3Connection) catch return;
                     h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
@@ -1474,6 +1517,11 @@ pub fn Server(comptime Handler: type) type {
             entry.repoll_fn = repollFromEntry;
             entry.wake_ctx = self;
             entry.h3_initialized = true;
+
+            if (serves_raw_quic and entry.raw_quic and @hasDecl(Handler, "onQuicConnected")) {
+                var session = Session{ .entry = entry };
+                self.handler.onQuicConnected(&session);
+            }
 
             // Finished its handshake after drain() began: it may send nothing.
             if (self.draining) {
