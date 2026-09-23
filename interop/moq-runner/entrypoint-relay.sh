@@ -20,4 +20,4 @@ fi
 
 mkdir -p "${MOQT_MLOG_DIR:-/mlog}" 2>/dev/null || true
 
-exec /app/moq-relay-wt --port "$PORT" --cert "$CERT" --key "$KEY" "$@"
+exec /app/moq-relay --port "$PORT" --cert "$CERT" --key "$KEY" "$@"

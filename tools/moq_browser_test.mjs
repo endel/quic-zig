@@ -37,7 +37,7 @@ const cleanup = () => procs.forEach((p) => { try { p.kill('SIGKILL'); } catch {}
 try {
   ensureCert();
 
-  const server = spawn('zig-out/bin/moq-browser-server', ['--port', String(PORT)],
+  const server = spawn('zig-out/bin/moq-relay', ['--port', String(PORT)],
     { stdio: ['ignore', 'pipe', 'pipe'] });
   procs.push(server);
 

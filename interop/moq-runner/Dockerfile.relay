@@ -2,18 +2,17 @@
 # Packages the binary interop/moq-runner/build_image.sh has already
 # cross-compiled — do not `docker build` this directory directly.
 #
-# The WebTransport relay rather than the raw-QUIC one: the runner's compose
-# file dials https://relay:4443, and its URL scheme is what selects the
-# transport.
+# One relay for both transports: the runner dials https://relay:4443, but
+# several clients use native QUIC (moqt-NN ALPN) on that port regardless.
 FROM debian:bookworm-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates iproute2 \
  && rm -rf /var/lib/apt/lists/*
 
-COPY bin/moq-browser-server /app/moq-relay-wt
+COPY bin/moq-relay /app/moq-relay
 COPY entrypoint-relay.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh /app/moq-relay-wt && mkdir -p /mlog /certs
+RUN chmod +x /app/entrypoint.sh /app/moq-relay && mkdir -p /mlog /certs
 
 RUN useradd -r -u 1000 -g nogroup moq
 USER moq

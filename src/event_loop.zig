@@ -1778,8 +1778,13 @@ pub fn Server(comptime Handler: type) type {
                     entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
                 }
+                // Raw QUIC has no session: 0 stands in, as for datagrams.
+                if (rs.reset_err) |code| if (!entry.finished_streams.contains(stream_id)) {
+                    entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
+                    if (@hasDecl(Handler, "onStreamReset")) self.handler.onStreamReset(&session, 0, stream_id, @truncate(code));
+                };
                 // A peer's uni stream has no send side left to wait on.
-                if (rs.finished and !stream_mod.isBidi(stream_id)) conn.streams.releaseRecvStream(stream_id);
+                if ((rs.finished or rs.reset_err != null) and !stream_mod.isBidi(stream_id)) conn.streams.releaseRecvStream(stream_id);
             }
         }
 

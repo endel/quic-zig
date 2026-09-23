@@ -87,7 +87,7 @@ done
 echo
 echo "=== MoQ over WebTransport ==="
 WT_PORT=4467
-start "$TMP/wt-relay.log" zig-out/bin/moq-browser-server --port "$WT_PORT"
+start "$TMP/wt-relay.log" zig-out/bin/moq-relay --port "$WT_PORT"
 for draft in 17 18; do
   zig-out/bin/moq-test-client --relay "https://127.0.0.1:$WT_PORT/moq" \
       --draft "$draft" --tls-disable-verify > "$TMP/wt-tap-$draft.txt" 2>&1
