@@ -301,9 +301,14 @@ fn Peer(comptime proto: event_loop.Protocol) type {
         /// Must run before the connection is created: a stream event can
         /// reach onStreamData ahead of the ready callback, and the session's
         /// stream table has to be initialised by then.
-        pub fn prepare(self: *Self) void {
+        pub fn prepare(self: *Self, target: *const Target) void {
             self.sess = Sess.init(self);
             self.sess.implementation = "quic-zig/moq-test-client";
+            self.sess.draft = self.draft;
+            if (!is_wt) {
+                self.sess.path = target.locator.path;
+                self.sess.authority = target.authoritySlice();
+            }
         }
 
         fn startSession(self: *Self) void {
@@ -391,6 +396,17 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             self.note("{s} request on stream {d}", .{ @tagName(self.role), self.request_sid.? });
         }
 
+        /// Cancels a still-open announcement or subscription, so a relay that
+        /// is slow to notice the close does not carry it into the next test.
+        pub fn withdraw(self: *Self, cs: *event_loop.ClientSession) void {
+            const sid = self.request_sid orelse return;
+            if (self.cancelled or self.failed) return;
+            self.cur = cs;
+            defer self.cur = null;
+            self.sess.cancelRequest(sid, moq_session.ResetCode.CANCELLED);
+            self.cancelled = true;
+        }
+
     };
 }
 
@@ -409,9 +425,15 @@ const Target = struct {
     /// One draft per run. The runner has no way to ask for a version, so
     /// this is a flag rather than something it controls.
     draft: moq_version.Draft = moq_version.DEFAULT,
+    /// `host:port`, for the raw-QUIC SETUP's AUTHORITY.
+    authority: [280]u8 = undefined,
+    authority_len: usize = 0,
 
     fn addressSlice(self: *const Target) []const u8 {
         return self.address[0..self.address_len];
+    }
+    fn authoritySlice(self: *const Target) []const u8 {
+        return self.authority[0..self.authority_len];
     }
 };
 
@@ -474,6 +496,8 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             }
             fn deinit(self: *Leg) void {
                 if (self.client) |*c| {
+                    var cs = c.clientSession();
+                    self.peer.withdraw(&cs);
                     c.stop();
                     for (0..20) |_| c.tick() catch break;
                     c.deinit();
@@ -551,7 +575,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             for (legs[0..leg_count]) |*l| {
                 l.peer.verbose = target.verbose;
                 l.peer.draft = target.draft;
-                l.peer.prepare();
+                l.peer.prepare(target);
             }
             defer for (legs[0..leg_count]) |*l| l.deinit();
 
@@ -833,6 +857,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .verbose = verbose,
         .draft = draft,
     };
+    if (std.fmt.bufPrint(&target.authority, "{s}:{d}", .{ target.locator.host, target.locator.port })) |a| {
+        target.authority_len = a.len;
+    } else |_| {}
     resolve(&target) catch |e| {
         out("TAP version 14\n", .{});
         out("Bail out! cannot resolve {s}: {t}\n", .{ target.locator.host, e });

@@ -111,6 +111,10 @@ pub fn Session(comptime Transport: type) type {
         transport: Transport,
         draft: version.Draft = version.DEFAULT,
         implementation: []const u8 = "quic-zig/moq",
+        /// §9.3.1 PATH and AUTHORITY: only for raw QUIC, where no request
+        /// URI carries them. Over WebTransport the CONNECT already did.
+        path: ?[]const u8 = null,
+        authority: ?[]const u8 = null,
 
         control_out: ?u64 = null,
         control_in: ?u64 = null,
@@ -164,7 +168,11 @@ pub fn Session(comptime Transport: type) type {
 
             var buf: [512]u8 = undefined;
             var fbs = io.fixedBufferStream(&buf);
-            try msg.writeSetup(&fbs, .{ .implementation = self.implementation });
+            try msg.writeSetup(&fbs, .{
+                .implementation = self.implementation,
+                .path = self.path,
+                .authority = self.authority,
+            });
             try self.transport.write(sid, buf[0..fbs.seek]);
             self.setup_sent = true;
         }
@@ -344,6 +352,20 @@ test "SETUP goes out on a uni control stream" {
     try testing.expectEqual(codes.MSG_SETUP, parsed.env.type);
     const opts = try msg.decodeSetupPayload(parsed.env.payload);
     try testing.expectEqualStrings("quic-zig/moq", opts.implementation.?);
+    try testing.expectEqual(@as(?[]const u8, null), opts.path);
+}
+
+test "raw-QUIC SETUP carries PATH and AUTHORITY" {
+    var t = FakeTransport{};
+    var s = TestSession.init(&t);
+    s.path = "/anon";
+    s.authority = "cdn.moq.dev:443";
+    try s.sendSetup();
+
+    const parsed = try msg.parseEnvelope(t.written[0..t.written_len]);
+    const opts = try msg.decodeSetupPayload(parsed.env.payload);
+    try testing.expectEqualStrings("/anon", opts.path.?);
+    try testing.expectEqualStrings("cdn.moq.dev:443", opts.authority.?);
 }
 
 test "peer SETUP completes the handshake" {
