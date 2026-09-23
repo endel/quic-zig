@@ -66,6 +66,18 @@ Initial ACK, and after that it sends only 1-RTT. The runner therefore reads
 the whole trace as an unfinished handshake. The `e09f4c5` server produces the same
 pcap and the same verdict.
 
+### Rerun at `0b19aaf` (MoQ relay: one port for h3 and moqt-NN)
+Every cell matched except one, which now passes:
+
+    handshakeloss  quic-zig<-quiche  ❌ → ✅
+
+amplificationlimit against quiche still fails, 5 of 5 on this tree and 5 of 5
+each on `4bbf895` and `4d0c1d5`, all at ~16.4 KB before the runner gives up
+waiting for a Handshake-first datagram — the quiche client described above.
+This tree changed ALPN in EncryptedExtensions (one protocol, not the list),
+ACK_FREQUENCY framing and when a client moves off its handshake DCID; none of
+it moved a verdict.
+
 ### Rerun at `362905b` (review fixes)
 Every cell matched except two, and both flake on `4988228` as well:
 
