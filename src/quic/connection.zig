@@ -740,6 +740,8 @@ pub const Connection = struct {
     got_peer_conn_id: bool = false,
     peer_max_cid_seq: u64 = 0,
     active_cid_seq: u64 = 0,
+    /// Sequence number of the peer CID we send to; 0 is the handshake DCID.
+    dcid_seq: u64 = 0,
     local_err: ?ConnectionError = null,
     /// The peer ended the connection with a stateless reset (RFC 9000 §10.3).
     received_stateless_reset: bool = false,
@@ -2242,17 +2244,15 @@ pub const Connection = struct {
                 }
 
                 // A retransmitted frame repeats a CID we already hold.
-                if (self.peer_cid_pool.contains(ncid.seq_num)) return;
-
-                // Store CID in pool for future migration use
-                self.peer_cid_pool.addPeerCid(ncid.seq_num, ncid.conn_id, ncid.stateless_reset_token);
-                std.log.info("stored peer CID in pool from NEW_CONNECTION_ID seq={d}, pool_size={d}", .{ ncid.seq_num, self.peer_cid_pool.count() });
-
-                // Update DCID if this is a new active CID
-                if (ncid.seq_num >= self.active_cid_seq) {
-                    self.packer.updateDcid(ncid.conn_id);
-                    std.log.info("updated DCID from NEW_CONNECTION_ID seq={d}", .{ncid.seq_num});
+                if (!self.peer_cid_pool.contains(ncid.seq_num)) {
+                    self.peer_cid_pool.addPeerCid(ncid.seq_num, ncid.conn_id, ncid.stateless_reset_token);
+                    std.log.info("stored peer CID in pool from NEW_CONNECTION_ID seq={d}, pool_size={d}", .{ ncid.seq_num, self.peer_cid_pool.count() });
                 }
+
+                // §5.1.2: keep the DCID in use until Retire Prior To takes it.
+                // Switching early moved our Handshake Finished onto a CID
+                // imquic does not route long headers by, so it never arrived.
+                if (self.dcid_seq < self.active_cid_seq) self.replaceRetiredDcid();
             },
 
             .retire_connection_id => |rcid| {
@@ -2507,13 +2507,21 @@ pub const Connection = struct {
                 return fbs.seek + @as(usize, @intCast(len));
             },
             0x1e => return fbs.seek, // handshake_done
+            0x1f => return fbs.seek, // immediate_ack
+            0xaf => {
+                // ack_frequency: four varints
+                for (0..4) |_| _ = packet.readVarInt(reader) catch return fbs.seek;
+                return fbs.seek;
+            },
             0x30 => return buf.len, // datagram without length - rest of packet
             0x31 => {
                 // datagram with length
                 const len = packet.readVarInt(reader) catch return fbs.seek;
                 return fbs.seek + @as(usize, @intCast(len));
             },
-            else => return buf.len, // unknown - consume rest
+            // Frame.parse has already rejected unknown types; reaching here
+            // means a type it knows was left out above.
+            else => unreachable,
         }
     }
 
@@ -2872,7 +2880,7 @@ pub const Connection = struct {
 
                                     // Update packer DCID to preferred CID
                                     if (self.peer_cid_pool.consumeUnused()) |entry| {
-                                        self.packer.updateDcid(entry.getCid());
+                                        self.useDcid(entry);
                                         std.log.info("preferred_address: using CID seq={d}", .{entry.seq_num});
                                     }
 
@@ -3601,7 +3609,7 @@ pub const Connection = struct {
 
         // Try to consume a fresh CID for the new path
         if (self.peer_cid_pool.consumeUnused()) |entry| {
-            self.packer.updateDcid(entry.getCid());
+            self.useDcid(entry);
             std.log.info("migration: switched to new peer CID seq={d}", .{entry.seq_num});
         }
 
@@ -4450,17 +4458,30 @@ pub const Connection = struct {
     /// Consumes a fresh DCID from the peer CID pool and queues PATH_CHALLENGE.
     /// The caller is responsible for actually sending from a new local address.
     /// Returns true if migration was initiated, false if no unused CID is available.
+    /// Moves off a DCID the peer retired, onto the lowest CID it still allows.
+    fn replaceRetiredDcid(self: *Connection) void {
+        var best: ?*ConnectionIdEntry = null;
+        for (&self.peer_cid_pool.entries) |*e| {
+            if (!e.occupied or e.seq_num < self.active_cid_seq) continue;
+            if (best == null or e.seq_num < best.?.seq_num) best = e;
+        }
+        const entry = best orelse return; // replacement not here yet
+        entry.in_use = true;
+        self.useDcid(entry);
+        std.log.info("updated DCID to seq={d}, the previous one was retired", .{entry.seq_num});
+    }
+
+    fn useDcid(self: *Connection, entry: *const ConnectionIdEntry) void {
+        const cid = entry.getCid();
+        self.packer.updateDcid(cid);
+        self.dcid_len = @intCast(cid.len);
+        @memcpy(self.dcid[0..cid.len], cid);
+        self.dcid_seq = entry.seq_num;
+    }
+
     pub fn initiateClientMigration(self: *Connection) bool {
         const entry = self.peer_cid_pool.consumeUnused() orelse return false;
-        const new_cid = entry.getCid();
-
-        // Update DCID in packer (affects outgoing packet headers)
-        self.packer.updateDcid(new_cid);
-
-        // Keep self.dcid in sync
-        self.dcid_len = @intCast(new_cid.len);
-        @memcpy(self.dcid[0..new_cid.len], new_cid);
-
+        self.useDcid(entry);
         std.log.info("client migration: switched to new DCID seq={d}", .{entry.seq_num});
         return true;
     }
@@ -6674,6 +6695,43 @@ test "a paused stream's window arriving reordered is not mistaken for reassembly
         got += chunk.len;
     }
     try std.testing.expectEqual(@as(u64, n * payload.len), got);
+}
+
+test "frameSize stops at the end of ACK_FREQUENCY and IMMEDIATE_ACK" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    // picoquic packs HANDSHAKE_DONE and stream data behind ACK_FREQUENCY;
+    // measuring to the end of the packet dropped them.
+    const frames = [_]Frame{
+        .{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = 1000, .reordering_threshold = 0 } },
+        .immediate_ack,
+    };
+    for (frames) |f| {
+        var buf: [64]u8 = undefined;
+        var fbs = io.fixedBufferStream(&buf);
+        try f.write(&fbs);
+        const len = fbs.seek;
+        buf[len] = 0x1e; // HANDSHAKE_DONE follows
+        try std.testing.expectEqual(len, conn.frameSize(f, buf[0 .. len + 1]));
+    }
+}
+
+test "NEW_CONNECTION_ID: a new CID does not replace the DCID in use" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    var before: [20]u8 = undefined;
+    const before_len = conn.packer.dcid_len;
+    @memcpy(before[0..before_len], conn.packer.dcid_buf[0..before_len]);
+    var cid = [_]u8{0xcd} ** 8;
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    try std.testing.expectEqualSlices(u8, before[0..before_len], conn.packer.dcid_buf[0..conn.packer.dcid_len]);
+    try std.testing.expectEqual(@as(u64, 0), conn.dcid_seq);
+
+    // Retiring seq 0 is what moves us.
+    var cid2 = [_]u8{0xef} ** 8;
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 2, .retire_prior_to = 1, .conn_id = &cid2, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    try std.testing.expectEqualSlices(u8, &cid, conn.packer.dcid_buf[0..conn.packer.dcid_len]);
+    try std.testing.expectEqual(@as(u64, 1), conn.dcid_seq);
 }
 
 test "NEW_CONNECTION_ID: a huge Retire Prior To retires only the CIDs we hold" {
