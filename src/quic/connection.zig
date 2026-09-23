@@ -3326,9 +3326,9 @@ pub const Connection = struct {
         // At most one probe per 5×RTT (200 ms floor), so the data it delays is
         // one datagram that rarely exists.
         self.mtu_discoverer.checkRaiseTimer(now);
-        if (self.appSeal()) |seal| {
-            const srtt = self.pkt_handler.rtt_stats.smoothedRttOrDefault();
-            if (self.mtu_discoverer.shouldProbe(now, srtt)) {
+        // shouldProbe first: it is almost always false, and appSeal copies the seal.
+        if (self.mtu_discoverer.shouldProbe(now, self.pkt_handler.rtt_stats.smoothedRttOrDefault())) {
+            if (self.appSeal()) |seal| {
                 const probe_size: usize = self.mtu_discoverer.nextProbeSize();
                 if (out_buf.len >= probe_size) {
                     const result = try self.packer.packMtuProbe(
