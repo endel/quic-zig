@@ -42,3 +42,31 @@ if that is not 0.16 it answers from the wrong stdlib rather than erroring.
 
 `src/sys.zig` is the library's syscall seam and documents which 0.16 homes each
 helper corresponds to.
+
+## libxev
+
+libxev comes from our fork, [endel/libxev](https://github.com/endel/libxev),
+pinned in `build.zig.zon` to a `quic-zig-YYYY-MM-DD` tag of its `quic-zig`
+branch. The fork exists to carry fixes while upstream reviews them; the goal is
+to pin upstream mitchellh/libxev again. Its `FORK.md` has the full rules and
+tooling (clone: `~/Projects/libxev`, remotes `origin` = upstream, `endel` =
+fork). The ones that matter from here:
+
+- **Every change to libxev is an upstream PR.** Its own branch, cut from
+  upstream `main`, opened as a PR on mitchellh/libxev. Nothing is carried that
+  is not proposed upstream. Never patch the library inside this repo.
+- **libxev's own tests must pass**: `fork/check.sh <branch>` runs what upstream
+  CI runs (tests on macOS and Linux, examples and benchmarks, every CI target),
+  on the change's branch alone before the PR opens, and on `quic-zig` before the
+  pin moves. A fix comes with a test that fails without it.
+- **The `quic-zig` branch is generated, never edited.** Add the branch to
+  `fork/patches`, then `fork/rebuild.sh` and `fork/check.sh quic-zig-next`,
+  then promote, tag, push, and repin here with `zig fetch` for the hash.
+- **Nothing a pin names is deleted.** GitHub serves the pinned tarball by
+  commit; retire a fork branch or tag only once no pushed quic-zig references
+  it.
+- **When a PR merges upstream**, drop it from `fork/patches`, rebuild, check,
+  repin. When the list is empty, pin upstream.
+
+Changing the pin changes routez too, which gets libxev only through here: run
+its e2e suite (`tests/e2e/run.sh`, macOS and Linux) before pushing a new pin.
