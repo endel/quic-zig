@@ -7,7 +7,7 @@ advertises both and serves each peer at the one it picked. Everything
 below is draft-17 unless it says otherwise; where the two differ,
 `src/moq/version.zig`'s `Rules` table is the single place that says so.
 
-Status: **working end-to-end**. Wire layer complete. Raw-QUIC + WebTransport relays operational. Live browser video demo verified with multiple simultaneous subscribers.
+Status: **working end-to-end**. Wire layer complete. One relay serves native QUIC and WebTransport on the same port. Live browser video demo verified with multiple simultaneous subscribers.
 
 Reference: `draft-ietf-moq-transport-17` (expires 2026-09). Cross-checked against `moq-rs` (kixelated/moq-rs) `main`, which implements draft-14/15/16/17 concurrently.
 
@@ -17,11 +17,10 @@ Reference: `draft-ietf-moq-transport-17` (expires 2026-09). Cross-checked agains
 | --- | --- |
 | `moq-server` | Raw-QUIC MoQ publisher (synthetic clock track) |
 | `moq-client` | Raw-QUIC MoQ subscriber + `--mode publish` |
-| `moq-relay` | Raw-QUIC MoQ relay with pub/sub fanout and synthetic origin |
-| `moq-browser-server` | WebTransport MoQ relay for browsers, shared TLS cert with HTTP/1.1 static file server |
+| `moq-relay` | MoQ relay over WebTransport (`h3`) and native QUIC (`moqt-18`/`moqt-17`) on one port, chosen per connection by ALPN; also serves the browser demos over HTTP/1.1 |
 | `moq-test-client` | moq-interop-runner test client; TAP 14 output. See [moq-interop.md](moq-interop.md) |
 
-Browser pages (served by `moq-browser-server`):
+Browser pages (served by `moq-relay`):
 - `interop/browser/moq.html` — clock-tick subscribe demo
 - `interop/browser/moq_video.html` — live webcam capture → VP8 encode → MoQ publish → relay fanout → MoQ subscribe → VP8 decode → canvas render
 
@@ -188,8 +187,7 @@ Invalid datagram types: `0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F` (STATUS
 | Object framing (`src/moq/object.zig`) | subgroup headers (all id-modes and priority variants), datagram objects, fetch stream headers |
 | Session (`src/moq/session.zig`) | SETUP + request-stream state machine, generic over the transport; reassembles split messages and drains coalesced ones |
 | Publisher / Subscriber | `moq-client` subscribes or `--mode publish`; `moq-server` publishes |
-| Relay (`moq-relay`, raw QUIC) | pub/sub fanout with alias remapping, namespace registry, rendezvous timeouts, PUBLISH_DONE on publisher loss |
-| Relay (`moq-browser-server`, WebTransport) | the same, plus a per-track group cache and WT application-protocol negotiation |
+| Relay (`moq-relay`) | both transports on one port; pub/sub fanout with alias remapping, SUBSCRIBE routed to the namespace's publisher and answered once it answers, namespace discovery, rendezvous timeouts, datagrams, FORWARD and REQUEST_UPDATE, PUBLISH_DONE on publisher loss, a per-track group cache, withdrawal by request-stream reset |
 | Browser | `interop/browser/moq.html` and `moq_video.html`, driven end to end by `tools/moq_browser_test.mjs` |
 | Interop test client | `moq-test-client`, 7 cases, TAP 14, containerised |
 | Datagram objects | done — `moq-client --mode publish --datagrams`, relayed with alias remapping |
@@ -209,8 +207,7 @@ not once the earlier cases have run. See
 
 | Scenario | Result |
 | --- | --- |
-| `moq-test-client` → our raw-QUIC relay, both drafts | 7/7 each |
-| `moq-test-client` → our WebTransport relay, both drafts | 7/7 each |
+| `moq-test-client` → our relay, raw QUIC and WebTransport, both drafts | 7/7 each |
 | `moq-test-client` → moq-relay v0.14.16, raw QUIC, both drafts | 5/7 each |
 | `moq-test-client` → moq-relay v0.14.16, WebTransport, both drafts | 5/7 each |
 | `moq-test-client` → `cdn.moq.dev` | reachable; it speaks moq-lite, not this dialect |
@@ -270,7 +267,7 @@ draft-19 and draft-20 also exist, and -19 reverted some of the above
 
 ## Video demo architecture
 
-The browser-to-browser live video demo (`moq_video.html` + `moq-browser-server`) uses:
+The browser-to-browser live video demo (`moq_video.html` + `moq-relay`) uses:
 
 - **Capture**: `getUserMedia({ video: 640x360@30fps })` + `MediaStreamTrackProcessor`
 - **Encode**: WebCodecs `VideoEncoder` with VP8 @ 1 Mbps, `latencyMode: 'realtime'`, keyframe every 30 frames (≈1 s)
@@ -285,5 +282,7 @@ The one-stream-per-group design is what allowed scaling past ~1000 frames per su
 - No AUTHORIZATION_TOKEN policy engine — wire-level decode only.
 - VP8 video is in the demo app only; MoQ core treats object payloads as opaque bytes (as the spec intends: the media codec is not part of MoQ).
 - moq-lite is implemented separately — see [DRAFT_LCURLEY_MOQ_LITE_05.md](DRAFT_LCURLEY_MOQ_LITE_05.md). It is a different wire format, not a profile of this one.
-- FETCH request/response flow is codec-only. Namespace discovery is wired up in the raw-QUIC relay.
+- FETCH request/response flow is codec-only.
+- The relay reads moxygen's private SUBSCRIBE filter type 250 (LargestGroup) as Largest Object rather than closing the session; the codec's default is still the PROTOCOL_VIOLATION §5.1.2 asks for.
+- The relay's own upstream subscription is not told FORWARD=0 when no subscriber wants objects; they are dropped at the relay instead.
 - The earlier note that moq-rs interop was blocked by their auth config is stale: `demo/relay/localhost.toml` sets `auth.public = ""`, and with it the interop client reaches 5/7 against them.

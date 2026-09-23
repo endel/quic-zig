@@ -361,8 +361,7 @@ Produces binaries in `zig-out/bin/`:
 | `wt-browser-server` | WebTransport server for browser clients (0.0.0.0:4433) |
 | `moq-server` | MoQ Transport publisher over raw QUIC (ALPN `moqt-18`/`moqt-17`) |
 | `moq-client` | MoQ Transport client over raw QUIC — subscribe or `--mode publish` |
-| `moq-relay` | MoQ Transport relay over raw QUIC (pub/sub fanout, synthetic origin) |
-| `moq-browser-server` | MoQ Transport relay over WebTransport for browser clients |
+| `moq-relay` | MoQ Transport relay, WebTransport and raw QUIC on one port; serves the browser demos |
 | `moq-test-client` | MoQ interop-runner test client (TAP 14) |
 | `moq-lite` | moq-lite client: `publish`, `subscribe`, `announce`, `serve` |
 | `moq-lite-relay` | moq-lite relay over WebTransport |
@@ -496,7 +495,7 @@ Two Chrome/Brave tabs — one publishing from webcam, the other (or many others)
 
 ```bash
 cd interop/browser && ./generate-cert.sh   # once, short-lived ECDSA cert
-zig build run-moq-browser-server           # Zig WT relay on :4433
+zig build run-moq-relay                    # Zig MoQ relay on :4433
 # Open https://127.0.0.1:4433/moq_video.html in two tabs.
 # Paste the cert SHA-256 hash from the server's startup banner.
 # Tab A: "Start Publishing (camera)"   Tab B: "Start Subscribing"

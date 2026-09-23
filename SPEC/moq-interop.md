@@ -100,13 +100,13 @@ working around them.
 
 `MOQT_ROLE=relay`, `MOQT_PORT=4443`, certs at `/certs/cert.pem` and
 `/certs/priv.key`, logs under `/mlog`, `EXPOSE 4443/udp`, running as uid
-1000. The compose file defaults `RELAY_URL=https://relay:4443`, so a relay
-entry has to speak WebTransport: the image ships
-`apps/moq_browser_server.zig`, not the raw-QUIC `apps/moq_relay.zig`.
+1000. The compose file defaults `RELAY_URL=https://relay:4443`, but several
+clients dial native QUIC at that port whatever the scheme says, so
+`apps/moq_relay.zig` serves both: ALPN `h3` is WebTransport, `moqt-18` and
+`moqt-17` native QUIC.
 
-A relay entry may override that URL, and two clients need it to —
-imquic's and moqlivemock's dial raw QUIC whatever the scheme says. Serving
-both ALPNs on the one port is what would collect them; see
+Two clients (moqtopus, xquic-draft-18) refuse an `https://` URL outright and
+need a relay entry registered with `moqt://relay:4443`. See
 [`moq-interop-results.md`](moq-interop-results.md).
 
 ## URL schemes
@@ -172,12 +172,10 @@ private image.
 The images pass 7/7 against each other over a compose-style network, with
 certificates generated exactly the way the runner's `generate-certs.sh` does.
 
-As a relay, against third-party clients: moq-rs 9/9, moq-dev-rs 6/6, moxygen
-5/6. Four bugs our own client could not see, three of them ours and fixed; the
-fourth is moxygen's non-spec subscription filter
-([moxygen#225](https://github.com/facebookexperimental/moxygen/issues/225)),
-which the reference relay refuses in the same way we do. Two further clients
-score 0 because they dial raw QUIC at a WebTransport relay. Full write-up:
+As a relay, every registered draft-18 client passes all it runs (23 Sep
+2026), moq-test-client's eighteen included. moxygen's non-spec subscription
+filter ([moxygen#225](https://github.com/facebookexperimental/moxygen/issues/225))
+is read as Largest Object rather than refused. Full write-up:
 [`moq-interop-results.md`](moq-interop-results.md).
 
 Against the registry's eight public relays, through the runner's own harness:

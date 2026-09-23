@@ -525,7 +525,7 @@ https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/
 
 | § | Section | Status | Notes |
 |---|---------|--------|-------|
-| — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize, send after handshake |
+| — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize, send after handshake; frames packed after it in a packet are read too (picoquic puts HANDSHAKE_DONE there) |
 | — | IMMEDIATE_ACK frame (0x1f) | ✅ Done | Parse, serialize, triggers immediate ACK |
 | — | min_ack_delay transport parameter (0xff04de1b) | ✅ Done | Advertised by both client and server |
 | — | Dynamic ACK thresholds | ✅ Done | ack_eliciting_threshold, max_ack_delay, reordering_threshold |
@@ -580,12 +580,15 @@ details, and [moq-interop.md](moq-interop.md) for the interop runner.
 | Session state machine, shared by every app | ✅ Done |
 | Subscribe / publish flows (raw QUIC) | ✅ Done |
 | Relay: fanout, namespace registry, rendezvous timeouts, PUBLISH_DONE | ✅ Done |
+| Relay: WebTransport and native QUIC on one port, chosen by ALPN | ✅ Done |
+| Relay: SUBSCRIBE routed to the namespace's publisher; FORWARD, REQUEST_UPDATE; withdrawal by reset | ✅ Done |
 | WebTransport browser client/server + protocol negotiation | ✅ Done |
 | Interop test client (7 cases, TAP 14, containerised) | ✅ Done |
 | Datagram objects, relayed with alias remapping | ✅ Done |
 | FETCH request/response runtime | ⚠ Codec only |
 | draft-18, alongside draft-17 | ✅ Done — chosen by ALPN, per peer |
-| Interop: both relays, both drafts | ✅ 7/7 each |
+| Interop: our relay, both transports, both drafts | ✅ 7/7 each |
+| Interop: our relay against every registered draft-18 client | ✅ all pass (23 Sep 2026) |
 | Interop: moq-relay v0.14.16 (both transports, both drafts) | ⚠ 6/7 — their non-standard error code |
 | Interop: cdn.moq.dev | ✅ moq-lite over both transports, verified against the system trust store |
 

@@ -28,6 +28,46 @@ Test cases and their pass criteria are the moq-interop-runner's:
 
 <!-- Everything below is written by hand; the generator keeps it. -->
 
+## Our relay against every registered client (2026-09-23)
+
+Through the runner's own harness (`make test RELAY_IMAGE=… CLIENT_IMAGE=…`),
+with the relay image built from this tree. The nightly of 23 Sep had six of
+these at 0: the image spoke only `h3`, and they dial `moqt-18`.
+
+| Client | Before | Now |
+|---|---|---|
+| moq-rs-draft-18 (englishm's moq-test-client) | 15/18 | 18/18 |
+| moqlivemock | 0/6 | 6/6 |
+| imquic | 0/1 | 6/6 |
+| moq5 | 0/6 | 6/6 |
+| aiomoqt | 0/6 | 6/6 |
+| moxygen, moqx | 5/6 | 6/6 |
+| moq-playa, moq-dev-rs | 5/6, 4/6 | 6/6 |
+| moq-dev-js, stitcher-moq | 6/6 | 6/6 |
+| moqtopus, xquic-draft-18, with `RELAY_URL=moqt://relay:4443` | 0 | 6/6 |
+
+moqtopus and xquic-draft-18 refuse an `https://` URL, so they only reach us
+through a relay entry registered with `moqt://relay:4443`, as
+`aiomoqt-relay-quic` is.
+
+What it took, besides serving both ALPNs on the one port:
+
+- EncryptedExtensions listed every ALPN we accept instead of the one chosen;
+  quic-go refused that with `decode_error`.
+- `:protocol=webtransport-h3`, which picoquic-based clients send, was not
+  recognised as a WebTransport CONNECT.
+- A SUBSCRIBE under an announced namespace was answered by the relay itself;
+  it now goes to the namespace's publisher and is answered once that answers.
+- Datagrams were dropped, FORWARD=0 was ignored, and a publisher that had
+  withdrawn, or whose connection was closing, was still routed to.
+- moxygen's private SUBSCRIBE filter 250 closed the session; the relay now
+  reads it as Largest Object.
+
+A certificate trap when reproducing this on macOS: the runner's
+`generate-certs.sh` run with the system LibreSSL writes the EC key with
+explicit curve parameters, which Go rejects ("x509: invalid ECDSA
+parameters"). Run it with OpenSSL 3 on `PATH`.
+
 ## Against the registry's public relays (2026-09-11)
 
 Run through the runner's own harness, not ours, with the published image:
@@ -51,9 +91,10 @@ verified the relay's certificate (`TLS_DISABLE_VERIFY=false`).
 standalone re-runs at 2.0-2.4 s against a 3 s budget, so it is flaky under
 container contention rather than broken.
 
-‡ `moqt://cdn.moq.dev:443/anon` never answers SETUP — that endpoint serves
-moq-lite, not IETF draft-18, though the registry lists it under draft-18.
-The same relay over WebTransport negotiates draft-18 and reaches 6/7.
+‡ `moqt://cdn.moq.dev:443/anon` never answered SETUP because our client sent
+no PATH: over native QUIC the SETUP's PATH parameter is the only place the
+`/anon` in the URL reaches the relay. With it (23 Sep 2026) the endpoint
+negotiates draft-18 and reaches 6/7, the same as WebTransport.
 
 ### Every remaining failure is one test case
 
