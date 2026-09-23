@@ -238,11 +238,12 @@ pub fn mapV4ToV6(storage: *posix.sockaddr.storage) void {
 
 /// Batch sender that collects outgoing packets and flushes them together.
 ///
-/// On Linux a run of same-sized packets to one address leaves as a single
-/// `sendmsg` carrying `UDP_SEGMENT`, so the kernel does the splitting: one
-/// syscall and one skb for up to 64 datagrams, which is what nginx's `quic_gso`
-/// buys. Where that is unavailable the run still goes out in one `sendmmsg`.
-/// Other platforms send one `sendmsg` per packet.
+/// On Linux a run of packets to one address leaves in one `sendmmsg`, and each
+/// stretch of it GSO can take (same-sized packets, then at most one shorter) is
+/// a single message carrying `UDP_SEGMENT`, so the kernel does the splitting:
+/// one skb for the stretch, which is what nginx's `quic_gso` buys. Where
+/// UDP_SEGMENT is unavailable every packet is its own message. Other platforms
+/// send one `sendmsg` per packet.
 pub const SendBatch = struct {
     const MAX_BATCH: usize = 64;
     /// GSO needs every segment but the last to be the same size, and the whole
@@ -360,55 +361,85 @@ pub const SendBatch = struct {
 
     fn sendRun(self: *SendBatch, from: usize, to: usize) void {
         if (!is_linux or to - from == 1) return self.sendEach(from, to);
-        if (self.gso and self.sendSegmented(from, to)) return;
-        self.sendMany(from, to);
+        if (!self.gso) return self.sendMany(from, to);
+        // GSO takes equal-sized packets and one shorter last, so a whole run
+        // qualified only when every packet in it did: one ACK or short packet
+        // anywhere sent the lot one skb per datagram, 85% of sends on the 10 KB
+        // HTTP/3 row. Each qualifying stretch is now one message carrying its
+        // own UDP_SEGMENT, beside plain messages for the packets between them,
+        // all in one sendmmsg: splitting into separate syscalls cost more than
+        // it saved where the stretches are short.
+        var iovs: [MAX_BATCH]posix.iovec_const = undefined;
+        var msgs: [MAX_BATCH]linux.mmsghdr = undefined;
+        var controls: [MAX_BATCH][cmsgSpace(@sizeOf(u16))]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+        var starts: [MAX_BATCH]usize = undefined; // first packet of each message
+        var n: usize = 0;
+        var i = from;
+        while (i < to) : (n += 1) {
+            var end = self.segmentEnd(i, to);
+            if (end - i < 2) end = i + 1;
+            const last = end - 1;
+            const bytes = self.offsets[last] + self.lengths[last] - self.offsets[i];
+            iovs[n] = .{ .base = self.data_buf[self.offsets[i]..].ptr, .len = bytes };
+            msgs[n] = .{
+                .hdr = .{
+                    .name = @ptrCast(&self.addrs[i]),
+                    .namelen = self.addr_lens[i],
+                    .iov = @ptrCast(&iovs[n]),
+                    .iovlen = 1,
+                    .control = null,
+                    .controllen = 0,
+                    .flags = 0,
+                },
+                .len = 0,
+            };
+            if (end - i >= 2) {
+                const control = &controls[n];
+                const cmsg: *linux.cmsghdr = @ptrCast(control);
+                cmsg.* = .{
+                    .len = cmsgLen(@sizeOf(u16)),
+                    .level = linux.IPPROTO.UDP,
+                    .type = linux.UDP.SEGMENT,
+                };
+                const seg16: u16 = @intCast(self.lengths[i]);
+                @memcpy(control[cmsgLen(0)..][0..@sizeOf(u16)], std.mem.asBytes(&seg16));
+                msgs[n].hdr.control = control;
+                msgs[n].hdr.controllen = @intCast(control.len);
+            }
+            starts[n] = i;
+            i = end;
+        }
+        // Partial sends are normal: keep going from where it stopped.
+        var sent: usize = 0;
+        while (sent < n) {
+            const rc = std.c.sendmmsg(self.sockfd, msgs[sent..].ptr, @intCast(n - sent), 0);
+            if (rc > 0) {
+                sent += @intCast(rc);
+                continue;
+            }
+            // A kernel or socket without UDP_SEGMENT will keep saying so, so
+            // stop asking. Either way, what is left goes out a packet at a time.
+            switch (posix.errno(rc)) {
+                .INVAL, .NOPROTOOPT, .OPNOTSUPP => self.gso = false,
+                else => {},
+            }
+            return self.sendMany(starts[sent], to);
+        }
     }
 
-    /// The whole run as one datagram plus a segment size, where its shape allows
-    /// it. False when it does not, or when the kernel turned it down.
-    fn sendSegmented(self: *SendBatch, from: usize, to: usize) bool {
+    /// Where a GSO send starting at `from` has to stop: packets the size of
+    /// the first, then at most one shorter, within the length limit.
+    fn segmentEnd(self: *const SendBatch, from: usize, to: usize) usize {
         const seg = self.lengths[from];
-        var total: usize = 0;
-        for (from..to) |i| {
-            // Every segment but the last is exactly `seg`, and none exceeds it.
-            if (self.lengths[i] != seg and i != to - 1) return false;
-            if (self.lengths[i] > seg) return false;
-            total += self.lengths[i];
+        var total: usize = seg;
+        var i = from + 1;
+        while (i < to) : (i += 1) {
+            const len = self.lengths[i];
+            if (len > seg or total + len > max_gso_bytes) break;
+            total += len;
+            if (len < seg) return i + 1;
         }
-        if (total > max_gso_bytes) return false;
-
-        var control: [cmsgSpace(@sizeOf(u16))]u8 align(@alignOf(linux.cmsghdr)) = undefined;
-        const cmsg: *linux.cmsghdr = @ptrCast(&control);
-        cmsg.* = .{
-            .len = cmsgLen(@sizeOf(u16)),
-            .level = linux.IPPROTO.UDP,
-            .type = linux.UDP.SEGMENT,
-        };
-        const seg16: u16 = @intCast(seg);
-        @memcpy(control[cmsgLen(0)..][0..@sizeOf(u16)], std.mem.asBytes(&seg16));
-
-        var iov = [1]posix.iovec_const{.{
-            .base = self.data_buf[self.offsets[from]..].ptr,
-            .len = total,
-        }};
-        const msg = std.c.msghdr_const{
-            .name = @ptrCast(&self.addrs[from]),
-            .namelen = self.addr_lens[from],
-            .iov = &iov,
-            .iovlen = 1,
-            .control = &control,
-            .controllen = @intCast(control.len),
-            .flags = 0,
-        };
-        const rc = std.c.sendmsg(self.sockfd, &msg, 0);
-        if (rc >= 0) return true;
-        // A kernel or socket without UDP_SEGMENT will keep saying so, so stop
-        // asking. Any other failure is this send's problem, not the feature's.
-        switch (posix.errno(rc)) {
-            .INVAL, .NOPROTOOPT, .OPNOTSUPP => self.gso = false,
-            else => {},
-        }
-        return false;
+        return i;
     }
 
     /// The run in one `sendmmsg`.
@@ -489,4 +520,65 @@ test "recvmsgEcn returns WouldBlock on empty socket" {
     var buf: [1500]u8 = undefined;
     const result = recvmsgEcn(sockfd, &buf);
     try std.testing.expectError(error.WouldBlock, result);
+}
+
+test "SendBatch.segmentEnd: equal packets and one shorter last" {
+    var b = SendBatch.init(0);
+    const cases = [_]struct { lens: []const u32, from: usize, want: usize }{
+        // All the same size: the whole run.
+        .{ .lens = &.{ 1436, 1436, 1436 }, .from = 0, .want = 3 },
+        // A shorter one ends it, as the last segment.
+        .{ .lens = &.{ 1436, 1436, 60, 1436 }, .from = 0, .want = 3 },
+        // A larger one ends it before.
+        .{ .lens = &.{ 60, 1436, 1436 }, .from = 0, .want = 1 },
+        .{ .lens = &.{ 60, 1436, 1436 }, .from = 1, .want = 3 },
+    };
+    for (cases) |c| {
+        for (c.lens, 0..) |l, i| b.lengths[i] = l;
+        try std.testing.expectEqual(c.want, b.segmentEnd(c.from, c.lens.len));
+    }
+    // The datagram's 16-bit length caps it: 45 x 1436 fits, 46 does not.
+    for (0..50) |i| b.lengths[i] = 1436;
+    try std.testing.expectEqual(@as(usize, 45), b.segmentEnd(0, 50));
+}
+
+test "SendBatch: a run with odd packets in it arrives whole and in order" {
+    if (comptime !is_linux) return error.SkipZigTest;
+    const rx = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(rx);
+    const any = try net.Address.parseIp4("127.0.0.1", 0);
+    try sys.bind(rx, &any.any, any.getOsSockLen());
+    var to: posix.sockaddr.storage = undefined;
+    var to_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(rx, @ptrCast(&to), &to_len));
+
+    const tx = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(tx);
+    var batch = SendBatch.init(tx);
+
+    // Two segmentable stretches around an ACK-sized packet, and a short tail.
+    const sizes = [_]usize{ 1200, 1200, 1200, 60, 1200, 1200, 700, 1200 };
+    for (sizes, 0..) |len, i| {
+        const slot = batch.reserve();
+        @memset(slot[0..len], @intCast(i));
+        batch.commit(len, @ptrCast(&to), to_len, 0);
+    }
+    batch.flush();
+
+    var buf: [1500]u8 = undefined;
+    var got: usize = 0;
+    var tries: usize = 0;
+    while (got < sizes.len and tries < 1000) : (tries += 1) {
+        const r = recvmsgEcn(rx, &buf) catch |err| switch (err) {
+            error.WouldBlock => {
+                sys.sleepNs(std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expectEqual(sizes[got], r.bytes_read);
+        try std.testing.expectEqual(@as(u8, @intCast(got)), buf[0]);
+        got += 1;
+    }
+    try std.testing.expectEqual(sizes.len, got);
 }
