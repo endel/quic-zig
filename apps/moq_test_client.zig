@@ -217,6 +217,15 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             }
         }
 
+        pub fn stopSending(self: *Self, stream_id: u64, code: u64) void {
+            const cs = self.cur orelse return;
+            if (is_wt) {
+                cs.stopSending(stream_id, @truncate(code));
+            } else if (cs.conn.streams.getStream(stream_id)) |s| {
+                s.recv.stopSending(code);
+            }
+        }
+
         // --- event_loop callbacks ---
 
         pub fn onConnected(self: *Self, cs: *event_loop.ClientSession) void {
@@ -498,6 +507,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                 if (self.client) |*c| {
                     var cs = c.clientSession();
                     self.peer.withdraw(&cs);
+                    c.flush(); // the withdrawal goes out ahead of CONNECTION_CLOSE
                     c.stop();
                     for (0..20) |_| c.tick() catch break;
                     c.deinit();

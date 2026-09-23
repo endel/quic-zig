@@ -183,6 +183,12 @@ const Link = struct {
     fn reset(self: *Link, stream_id: u64, code: u64) void {
         if (self.raw) self.s.resetQuicStream(stream_id, code) else self.s.resetStream(stream_id, @truncate(code));
     }
+    fn stopSending(self: *Link, stream_id: u64, code: u64) void {
+        if (self.raw) {
+            if (self.s.entry.conn.streams.getStream(stream_id)) |st| st.recv.stopSending(code);
+            self.s.entry.wake();
+        } else self.s.stopSending(stream_id, @truncate(code));
+    }
     fn datagram(self: *Link, bytes: []const u8) !void {
         return if (self.raw) self.s.sendQuicDatagram(bytes) else self.s.sendDatagram(self.wt_session_id, bytes);
     }
@@ -1007,6 +1013,7 @@ const RelayHandler = struct {
             if (self.link(owner)) |l_| {
                 var l = l_;
                 l.reset(sid, 0x1);
+                l.stopSending(sid, 0x1);
             }
             self.clients[owner].clearSlot(sid);
         }

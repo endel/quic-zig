@@ -14,6 +14,7 @@
 //     write(stream_id: u64, data: []const u8) !void
 //     finish(stream_id: u64) void          // FIN the send side
 //     reset(stream_id: u64, code: u64) void // RESET_STREAM
+//     stopSending(stream_id: u64, code: u64) void // STOP_SENDING
 //
 // Buffering: a control message can arrive split across reads, and a peer
 // may coalesce several into one. Bytes are accumulated per stream and every
@@ -91,6 +92,11 @@ const StreamState = struct {
     kind: StreamKind = .request,
     buf: [STREAM_BUF_SIZE]u8 = undefined,
     len: usize = 0,
+    /// Bytes already turned into events. Dropped at the start of the next
+    /// `onStreamData`, not at once: those events still point into `buf`.
+    parsed: usize = 0,
+    /// FIN seen; the slot is freed on the next call, for the same reason.
+    release_pending: bool = false,
 
     fn append(self: *StreamState, bytes: []const u8) void {
         const n = @min(bytes.len, self.buf.len - self.len);
@@ -153,7 +159,7 @@ pub fn Session(comptime Transport: type) type {
         }
 
         pub fn kindOf(self: *Self, id: u64) ?StreamKind {
-            if (self.slot(id)) |s| return s.kind;
+            if (self.slot(id)) |s| if (!s.release_pending) return s.kind;
             return null;
         }
 
@@ -187,10 +193,12 @@ pub fn Session(comptime Transport: type) type {
             return sid;
         }
 
-        /// Withdraws a request by resetting its stream. draft-18 makes this
-        /// the way a namespace is un-published; draft-17 already allows it.
+        /// Withdraws a request by terminating both directions of its stream
+        /// (draft-18 §3.3.2). draft-18 makes this the way a namespace is
+        /// un-published; draft-17 already allows it.
         pub fn cancelRequest(self: *Self, stream_id: u64, code: u64) void {
             self.transport.reset(stream_id, code);
+            self.transport.stopSending(stream_id, code);
             self.release(stream_id);
         }
 
@@ -212,6 +220,7 @@ pub fn Session(comptime Transport: type) type {
             out: []Event,
         ) !usize {
             var n: usize = 0;
+            self.settle();
 
             if (data.len > 0) {
                 const s = self.claim(stream_id, .request) orelse return Error.TooManyStreams;
@@ -222,12 +231,9 @@ pub fn Session(comptime Transport: type) type {
                 if (s.len == s.buf.len) return Error.StreamStalled;
 
                 while (n < out.len) {
-                    const parsed = msg.parseEnvelope(s.buf[0..s.len]) catch break;
-                    const ev = self.classify(stream_id, s, parsed.env) catch {
-                        s.consume(parsed.consumed);
-                        continue;
-                    };
-                    s.consume(parsed.consumed);
+                    const parsed = msg.parseEnvelope(s.buf[s.parsed..s.len]) catch break;
+                    s.parsed += parsed.consumed;
+                    const ev = self.classify(stream_id, s, parsed.env) catch continue;
                     if (ev) |e| {
                         out[n] = e;
                         n += 1;
@@ -240,9 +246,22 @@ pub fn Session(comptime Transport: type) type {
                     out[n] = .{ .stream_finished = .{ .stream_id = stream_id } };
                     n += 1;
                 }
-                self.release(stream_id);
+                if (self.slot(stream_id)) |s| s.release_pending = true;
             }
             return n;
+        }
+
+        /// Frees what the previous call's events were still borrowing.
+        fn settle(self: *Self) void {
+            for (&self.streams) |*s| {
+                if (s.id == NO_STREAM) continue;
+                if (s.release_pending) {
+                    s.* = .{};
+                } else if (s.parsed > 0) {
+                    s.consume(s.parsed);
+                    s.parsed = 0;
+                }
+            }
         }
 
         fn classify(self: *Self, stream_id: u64, s: *StreamState, env: msg.Envelope) !?Event {
@@ -313,6 +332,7 @@ const FakeTransport = struct {
     written: [8192]u8 = undefined,
     written_len: usize = 0,
     last_reset: ?struct { id: u64, code: u64 } = null,
+    last_stop_sending: ?struct { id: u64, code: u64 } = null,
     finished: [16]u64 = undefined,
     finished_len: usize = 0,
 
@@ -334,6 +354,9 @@ const FakeTransport = struct {
     }
     fn reset(self: *FakeTransport, id: u64, code: u64) void {
         self.last_reset = .{ .id = id, .code = code };
+    }
+    fn stopSending(self: *FakeTransport, id: u64, code: u64) void {
+        self.last_stop_sending = .{ .id = id, .code = code };
     }
 };
 
@@ -405,6 +428,29 @@ test "a message split across reads is reassembled" {
     try testing.expectEqualStrings("nope", events[0].request_error.err.reason);
 }
 
+test "an event's strings survive the messages and FIN read with it" {
+    var t = FakeTransport{};
+    var s = TestSession.init(&t);
+
+    // imquic sends REQUEST_ERROR and FIN together; compacting the buffer
+    // after each message left the reason pointing at what came next.
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try msg.writeRequestError(&fbs, .{ .error_code = 0, .reason = "Namespace already published" });
+    try msg.writeGoaway(&fbs, .{ .new_uri = "https://elsewhere/moq" });
+
+    var events: [8]Event = undefined;
+    const n = try s.onStreamData(0, buf[0..fbs.seek], true, &events);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualStrings("Namespace already published", events[0].request_error.err.reason);
+    try testing.expectEqualStrings("https://elsewhere/moq", events[1].goaway.goaway.new_uri);
+    try testing.expectEqual(@as(u64, 0), events[2].stream_finished.stream_id);
+
+    // The next call frees the finished stream's slot.
+    _ = try s.onStreamData(4, &.{}, false, &events);
+    try testing.expectEqual(@as(?StreamKind, null), s.kindOf(0));
+}
+
 test "coalesced messages all come out of one read" {
     var t = FakeTransport{};
     var s = TestSession.init(&t);
@@ -443,13 +489,14 @@ test "a request opens a bidi stream and FIN releases it" {
     try testing.expectEqual(@as(?StreamKind, null), s.kindOf(sid));
 }
 
-test "cancelling a request resets its stream" {
+test "cancelling a request terminates both directions of its stream" {
     var t = FakeTransport{};
     var s = TestSession.init(&t);
     const sid = try s.sendRequest(&.{});
     s.cancelRequest(sid, ResetCode.CANCELLED);
     try testing.expectEqual(sid, t.last_reset.?.id);
     try testing.expectEqual(ResetCode.CANCELLED, t.last_reset.?.code);
+    try testing.expectEqual(sid, t.last_stop_sending.?.id);
     try testing.expectEqual(@as(?StreamKind, null), s.kindOf(sid));
 }
 
