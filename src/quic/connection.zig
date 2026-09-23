@@ -671,6 +671,8 @@ pub const Connection = struct {
 
     // Path MTU Discovery (DPLPMTUD, RFC 8899)
     mtu_discoverer: mtu_mod.MtuDiscoverer = .{},
+    /// The last MAX_STREAM_DATA scan stopped early on a full frame queue.
+    window_scan_pending: bool = false,
 
     // HANDSHAKE_DONE delivery tracking (server only)
     // True from handshake completion until the client ACKs a packet carrying HANDSHAKE_DONE.
@@ -3061,7 +3063,11 @@ pub const Connection = struct {
         // MAX_DATA grows only with what the consumer took or a reset abandoned.
         // With every byte charged already credited, no stream has any to give.
         const conn_fc = &self.conn_flow_ctrl.base;
-        if (conn_fc.bytes_read != conn_fc.highest_received) self.conn_flow_ctrl.addBytesRead(self.streams.takeConnCredit());
+        var credit: u64 = 0;
+        if (conn_fc.bytes_read != conn_fc.highest_received) {
+            credit = self.streams.takeConnCredit();
+            self.conn_flow_ctrl.addBytesRead(credit);
+        }
 
         // Credit generators commit the new limit as they return it, so each
         // one runs only when its frame is sure to fit.
@@ -3082,17 +3088,29 @@ pub const Connection = struct {
             }
         }
 
-        // MAX_STREAM_DATA: update peer's send window as we consume stream data
-        {
+        // MAX_STREAM_DATA: update peer's send window as we consume stream data.
+        // A stream's update only comes due when its consumer reads, which is
+        // what `credit` just measured, so with none there is nothing to find:
+        // skipping the walk saves one of this function's per-datagram scans of
+        // every stream. When `takeConnCredit` was not called at all, every
+        // received byte was credited already and no stream can read more.
+        if (credit > 0 or self.window_scan_pending) scan: {
+            self.window_scan_pending = false;
             var stream_it = self.streams.streams.valueIterator();
             while (stream_it.next()) |s_ptr| {
-                if (!self.queueWindowUpdate(&s_ptr.*.recv)) break;
+                if (!self.queueWindowUpdate(&s_ptr.*.recv)) {
+                    self.window_scan_pending = true;
+                    break :scan;
+                }
             }
             // Peer-initiated uni streams carry H3 control, QPACK, WT and MoQ
             // data; without this they stall once the initial window is spent.
             var recv_it = self.streams.recv_streams.valueIterator();
             while (recv_it.next()) |rs_ptr| {
-                if (!self.queueWindowUpdate(rs_ptr.*)) break;
+                if (!self.queueWindowUpdate(rs_ptr.*)) {
+                    self.window_scan_pending = true;
+                    break :scan;
+                }
             }
         }
 

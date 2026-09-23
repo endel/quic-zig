@@ -258,6 +258,13 @@ test "lossy link: a clean 4 MiB upload finishes within a second" {
     try testing.expect(r.elapsed_ns < std.time.ns_per_s);
 }
 
+test "lossy link: an upload past the stream window gets MAX_STREAM_DATA" {
+    // 16 MiB against the 6 MiB initial stream window: without the server
+    // re-granting credit as it reads, the upload stalls and never finishes.
+    const r = try runBulk(16 << 20, .none, .none, 10 * ms, 60 * std.time.ns_per_s);
+    try testing.expect(r.finished);
+}
+
 test "lossy link: a busy connection still finds the path MTU" {
     // The probe used to sit below the pacer, where the only way to reach it was
     // a pass with nothing to send and no pacing due — which a connection
