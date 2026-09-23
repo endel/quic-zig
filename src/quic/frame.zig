@@ -195,16 +195,24 @@ pub const Frame = union(FrameType) {
     /// A frame body cannot extend past the datagram it was decoded from.
     /// Wire lengths are u64 varints, so this is also where they narrow to
     /// usize (RFC 9000 12.4: a violation is FRAME_ENCODING_ERROR).
-    fn body(bytes: []u8, seek: usize, len: u64) ![]u8 {
-        if (len > bytes.len - seek) return error.FrameEncodingError;
-        return bytes[seek..][0..@intCast(len)];
+    fn body(bytes: []u8, seek: *usize, len: u64) ![]u8 {
+        if (len > bytes.len - seek.*) return error.FrameEncodingError;
+        defer seek.* += @intCast(len);
+        return bytes[seek.*..][0..@intCast(len)];
     }
 
-    /// Parse a single frame from a byte buffer. Returns the frame and advances
-    /// the stream position.
+    /// Parse a single frame from a byte buffer.
     pub fn parse(bytes: []u8) !Frame {
+        var size: usize = undefined;
+        return parseSized(bytes, &size);
+    }
+
+    /// Parse a single frame, and set `size` to the bytes it took up, so the
+    /// next frame starts at `bytes[size..]`.
+    pub fn parseSized(bytes: []u8, size: *usize) !Frame {
         var stream = io.fixedBufferStream(bytes);
         var reader = &stream;
+        defer size.* = stream.seek;
 
         const frame_type = try packet.readVarInt(reader);
 
@@ -323,7 +331,7 @@ pub const Frame = union(FrameType) {
                 return .{
                     .crypto = .{
                         .offset = offset,
-                        .data = try body(bytes, stream.seek, length),
+                        .data = try body(bytes, &stream.seek, length),
                     },
                 };
             },
@@ -332,7 +340,7 @@ pub const Frame = union(FrameType) {
             0x07 => {
                 const len = try packet.readVarInt(reader);
                 return .{
-                    .new_token = try body(bytes, stream.seek, len),
+                    .new_token = try body(bytes, &stream.seek, len),
                 };
             },
 
@@ -355,7 +363,7 @@ pub const Frame = union(FrameType) {
                     .offset = offset,
                     .length = data_length,
                     .fin = has_fin,
-                    .data = try body(bytes, stream.seek, data_length),
+                    .data = try body(bytes, &stream.seek, data_length),
                 } };
             },
 
@@ -420,10 +428,7 @@ pub const Frame = union(FrameType) {
                                 return error.FrameEncodingError;
                             }
 
-                            const conn_id = try body(bytes, stream.seek, conn_id_len);
-                            try stream.seekBy(conn_id_len);
-
-                            break :blk conn_id;
+                            break :blk try body(bytes, &stream.seek, conn_id_len);
                         },
                         .stateless_reset_token = (try reader.takeArray(16)).*,
                     },
@@ -454,7 +459,7 @@ pub const Frame = union(FrameType) {
                     .frame_type = try packet.readVarInt(reader),
                     .reason = blk: {
                         const len = try packet.readVarInt(reader);
-                        break :blk try body(bytes, stream.seek, len);
+                        break :blk try body(bytes, &stream.seek, len);
                     },
                 },
             },
@@ -465,7 +470,7 @@ pub const Frame = union(FrameType) {
                     .error_code = try packet.readVarInt(reader),
                     .reason = blk: {
                         const len = try packet.readVarInt(reader);
-                        break :blk try body(bytes, stream.seek, len);
+                        break :blk try body(bytes, &stream.seek, len);
                     },
                 },
             },
@@ -478,14 +483,14 @@ pub const Frame = union(FrameType) {
 
             // datagram without length (0x30) — data is rest of packet
             0x30 => .{ .datagram = .{
-                .data = bytes[stream.seek..],
+                .data = try body(bytes, &stream.seek, bytes.len - stream.seek),
             } },
 
             // datagram with length (0x31) — varint length prefix
             0x31 => blk: {
                 const length = try packet.readVarInt(reader);
                 break :blk .{ .datagram_with_length = .{
-                    .data = try body(bytes, stream.seek, length),
+                    .data = try body(bytes, &stream.seek, length),
                 } };
             },
 
@@ -1013,6 +1018,29 @@ pub const PendingFrameQueue = struct {
 };
 
 // Tests
+
+test "parseSized ends each frame where the next one starts" {
+    // picoquic packs HANDSHAKE_DONE and stream data behind ACK_FREQUENCY.
+    const frames = [_]Frame{
+        .{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = 1000, .reordering_threshold = 0 } },
+        .immediate_ack,
+        .{ .crypto = .{ .offset = 7, .data = @constCast("hello") } },
+        .{ .stream = .{ .stream_id = 4, .offset = 9, .length = 3, .fin = true, .data = @constCast("abc") } },
+        .{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = @constCast(&[_]u8{0xcd} ** 8), .stateless_reset_token = .{0} ** 16 } },
+        .{ .connection_close = .{ .error_code = 1, .frame_type = 0, .reason = @constCast("bye") } },
+        .{ .datagram_with_length = .{ .data = @constCast("dg") } },
+    };
+    for (frames) |f| {
+        var buf: [96]u8 = undefined;
+        var fbs = io.fixedBufferStream(&buf);
+        try f.write(&fbs);
+        const len = fbs.seek;
+        buf[len] = 0x1e; // HANDSHAKE_DONE follows
+        var size: usize = undefined;
+        _ = try Frame.parseSized(buf[0 .. len + 1], &size);
+        try std.testing.expectEqual(len, size);
+    }
+}
 
 test "parse padding frame" {
     {

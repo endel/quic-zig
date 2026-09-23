@@ -1161,7 +1161,8 @@ pub const Connection = struct {
                 remaining = remaining[1..];
                 continue;
             }
-            const frame = Frame.parse(remaining) catch break;
+            var frame_len: usize = undefined;
+            const frame = Frame.parseSized(remaining, &frame_len) catch break;
             // Enforce frame-in-correct-space (RFC 9000 §12.5)
             if (!frame.isAllowedIn(.zero_rtt)) {
                 self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.crypto), "frame not allowed in 0-RTT");
@@ -1169,9 +1170,7 @@ pub const Connection = struct {
             }
             if (frame.isAckEliciting()) ack_eliciting = true;
             try self.processFrame(&frame, .application, now);
-            const consumed = self.frameSize(frame, remaining);
-            if (consumed == 0) break;
-            remaining = remaining[consumed..];
+            remaining = remaining[frame_len..];
         }
         try self.pkt_handler.onPacketReceived(.application, header.packet_number, ack_eliciting, now, info.ecn);
         if (header.packet_number + 1 > self.pkt_num_spaces[2].next_packet_number) {
@@ -1434,7 +1433,8 @@ pub const Connection = struct {
                 continue;
             }
 
-            const frame = Frame.parse(remaining) catch |err| {
+            var frame_len: usize = undefined;
+            const frame = Frame.parseSized(remaining, &frame_len) catch |err| {
                 std.log.err("Failed to parse frame: {}", .{err});
                 // RFC 9000 §12.4: frame encoding errors
                 if (err == error.FrameEncodingError) {
@@ -1469,11 +1469,7 @@ pub const Connection = struct {
 
             try self.processFrame(&frame, epoch, now);
 
-            // Advance past this frame. For frames that contain data slices,
-            // figure out where they end in the buffer.
-            const consumed = self.frameSize(frame, remaining);
-            if (consumed == 0) break; // safety: avoid infinite loop
-            remaining = remaining[consumed..];
+            remaining = remaining[frame_len..];
         }
 
         // QLOG: packet_received
@@ -2379,149 +2375,6 @@ pub const Connection = struct {
                 // draft-ietf-quic-ack-frequency: force immediate ACK
                 self.pkt_handler.recv[2].triggerImmediateAck();
             },
-        }
-    }
-
-    /// Calculate how many bytes a parsed frame occupies in the raw buffer.
-    fn frameSize(self: *const Connection, frame: Frame, buf: []const u8) usize {
-        _ = self;
-        _ = frame;
-        // Create a temporary stream to measure how far parsing advances
-        var fbs = io.fixedBufferStream(@constCast(buf));
-        const reader = &fbs;
-        const frame_type = packet.readVarInt(reader) catch return 1;
-
-        switch (frame_type) {
-            0x00 => {
-                // Padding - already skipped in caller, just 1 byte
-                return 1;
-            },
-            0x01 => return fbs.seek, // ping: just the type byte
-            0x02, 0x03 => {
-                // ACK/ACK_ECN
-                _ = packet.readVarInt(reader) catch return fbs.seek; // largest_ack
-                _ = packet.readVarInt(reader) catch return fbs.seek; // ack_delay
-                const range_count = packet.readVarInt(reader) catch return fbs.seek;
-                _ = packet.readVarInt(reader) catch return fbs.seek; // first_ack_range
-                var i: u64 = 0;
-                while (i < range_count) : (i += 1) {
-                    _ = packet.readVarInt(reader) catch return fbs.seek;
-                    _ = packet.readVarInt(reader) catch return fbs.seek;
-                }
-                if (frame_type == 0x03) {
-                    _ = packet.readVarInt(reader) catch return fbs.seek; // ect0
-                    _ = packet.readVarInt(reader) catch return fbs.seek; // ect1
-                    _ = packet.readVarInt(reader) catch return fbs.seek; // ce
-                }
-                return fbs.seek;
-            },
-            0x04 => {
-                // reset_stream
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek;
-            },
-            0x05 => {
-                // stop_sending
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek;
-            },
-            0x06 => {
-                // crypto
-                _ = packet.readVarInt(reader) catch return fbs.seek; // offset
-                const length = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek + @as(usize, @intCast(length));
-            },
-            0x07 => {
-                // new_token
-                const len = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek + @as(usize, @intCast(len));
-            },
-            0x08...0x0f => {
-                // stream
-                const type_byte: u8 = @intCast(frame_type);
-                _ = packet.readVarInt(reader) catch return fbs.seek; // stream_id
-                if ((type_byte & 0x04) != 0) {
-                    _ = packet.readVarInt(reader) catch return fbs.seek; // offset
-                }
-                if ((type_byte & 0x02) != 0) {
-                    const data_len = packet.readVarInt(reader) catch return fbs.seek;
-                    return fbs.seek + @as(usize, @intCast(data_len));
-                } else {
-                    // No length field - rest of packet is data
-                    return buf.len;
-                }
-            },
-            0x10 => {
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek;
-            },
-            0x11 => {
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek;
-            },
-            0x12, 0x13, 0x14 => {
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek;
-            },
-            0x15 => {
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek;
-            },
-            0x16, 0x17 => {
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek;
-            },
-            0x18 => {
-                // new_connection_id
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                const cid_len = reader.takeByte() catch return fbs.seek;
-                fbs.seekBy(cid_len) catch return fbs.seek;
-                fbs.seekBy(16) catch return fbs.seek; // stateless reset token
-                return fbs.seek;
-            },
-            0x19 => {
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek;
-            },
-            0x1a, 0x1b => {
-                fbs.seekBy(8) catch return fbs.seek;
-                return fbs.seek;
-            },
-            0x1c => {
-                // connection_close
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                const len = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek + @as(usize, @intCast(len));
-            },
-            0x1d => {
-                // application_close
-                _ = packet.readVarInt(reader) catch return fbs.seek;
-                const len = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek + @as(usize, @intCast(len));
-            },
-            0x1e => return fbs.seek, // handshake_done
-            0x1f => return fbs.seek, // immediate_ack
-            0xaf => {
-                // ack_frequency: four varints
-                for (0..4) |_| _ = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek;
-            },
-            0x30 => return buf.len, // datagram without length - rest of packet
-            0x31 => {
-                // datagram with length
-                const len = packet.readVarInt(reader) catch return fbs.seek;
-                return fbs.seek + @as(usize, @intCast(len));
-            },
-            // Frame.parse has already rejected unknown types; reaching here
-            // means a type it knows was left out above.
-            else => unreachable,
         }
     }
 
@@ -6695,25 +6548,6 @@ test "a paused stream's window arriving reordered is not mistaken for reassembly
         got += chunk.len;
     }
     try std.testing.expectEqual(@as(u64, n * payload.len), got);
-}
-
-test "frameSize stops at the end of ACK_FREQUENCY and IMMEDIATE_ACK" {
-    var conn = testConnection(std.testing.allocator);
-    defer conn.deinit();
-    // picoquic packs HANDSHAKE_DONE and stream data behind ACK_FREQUENCY;
-    // measuring to the end of the packet dropped them.
-    const frames = [_]Frame{
-        .{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = 1000, .reordering_threshold = 0 } },
-        .immediate_ack,
-    };
-    for (frames) |f| {
-        var buf: [64]u8 = undefined;
-        var fbs = io.fixedBufferStream(&buf);
-        try f.write(&fbs);
-        const len = fbs.seek;
-        buf[len] = 0x1e; // HANDSHAKE_DONE follows
-        try std.testing.expectEqual(len, conn.frameSize(f, buf[0 .. len + 1]));
-    }
 }
 
 test "NEW_CONNECTION_ID: a new CID does not replace the DCID in use" {
