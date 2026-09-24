@@ -868,7 +868,7 @@ pub const KeySchedule = struct {
             .hp_key = quic_crypto.deriveHpKeyPaddedV(traffic_secret, cipher.hpKeyLen(), version),
             .cipher_suite = cipher,
         };
-        open.prepareHpCtx();
+        open.prepareCtx();
         return open;
     }
 
@@ -881,7 +881,7 @@ pub const KeySchedule = struct {
             .hp_key = quic_crypto.deriveHpKeyPaddedV(traffic_secret, cipher.hpKeyLen(), version),
             .cipher_suite = cipher,
         };
-        seal.prepareHpCtx();
+        seal.prepareCtx();
         return seal;
     }
 

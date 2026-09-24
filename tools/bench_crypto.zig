@@ -9,7 +9,8 @@
 //   2. ECDSA P-256 Verify      (CertificateVerify, client per-handshake)
 //   3. X25519 scalarmult        (Key exchange, both sides per-handshake)
 //   4. AES-128-GCM encrypt      (Every outgoing packet)
-//   5. AES-128-GCM decrypt      (Every incoming packet)
+//   5. AES-128-GCM decrypt      (Every incoming packet), both through std
+//      and through src/quic/aes_gcm.zig, which is what packets now use
 //   6. HKDF-SHA256 extract      (Key derivation, per-handshake)
 //   7. HKDF-SHA256 expand       (Key derivation, multiple per-handshake)
 //   8. AES-128-ECB (HP mask)    (Header protection, every packet)
@@ -121,6 +122,31 @@ fn aesGcmDecrypt(
     return true;
 }
 
+// ── AES-128-GCM with the per-key work cached (what packet protection uses) ──
+
+fn aesGcmCtxEncrypt(
+    ctx: *const quic.aes_gcm.Ctx,
+    nonce: *const [12]u8,
+    plaintext: *const [1200]u8,
+    ad: *const [20]u8,
+    out: *[1200]u8,
+    tag: *[16]u8,
+) void {
+    ctx.encrypt(out, tag, plaintext, ad, nonce.*);
+}
+
+fn aesGcmCtxDecrypt(
+    ctx: *const quic.aes_gcm.Ctx,
+    nonce: *const [12]u8,
+    ciphertext: *const [1200]u8,
+    ad: *const [20]u8,
+    tag: *const [16]u8,
+    out: *[1200]u8,
+) bool {
+    ctx.decrypt(out, ciphertext, tag.*, ad, nonce.*) catch return false;
+    return true;
+}
+
 // ── HKDF Extract ──
 
 fn hkdfExtract(salt: *const [32]u8, ikm: *const [32]u8) [32]u8 {
@@ -214,6 +240,9 @@ pub fn main() !void {
     const x25519_ns = benchNs(x25519Scalarmult, .{ &x25519_secret, &x25519_public }, N_X25519);
     const enc_ns = benchNs(aesGcmEncrypt, .{ &aes_key, &aes_nonce, &plaintext, &ad, &ciphertext, &aes_tag }, N_AES);
     const dec_ns = benchNs(aesGcmDecrypt, .{ &aes_key, &aes_nonce, &ciphertext, &ad, &aes_tag, &dec_out }, N_AES);
+    const gcm_ctx = quic.aes_gcm.Ctx.init(aes_key);
+    const ctx_enc_ns = benchNs(aesGcmCtxEncrypt, .{ &gcm_ctx, &aes_nonce, &plaintext, &ad, &ciphertext, &aes_tag }, N_AES);
+    const ctx_dec_ns = benchNs(aesGcmCtxDecrypt, .{ &gcm_ctx, &aes_nonce, &ciphertext, &ad, &aes_tag, &dec_out }, N_AES);
     const extract_ns = benchNs(hkdfExtract, .{ &hkdf_salt, &hkdf_ikm }, N_HKDF);
     const expand_ns = benchNs(hkdfExpand, .{ &prk, &hkdf_info }, N_HKDF);
     const hp_ns = benchNs(aesEcbEncrypt, .{ aes_ctx, &hp_sample }, N_HP);
@@ -246,6 +275,8 @@ pub fn main() !void {
         .{ .name = "X25519 scalarmult", .ns = x25519_ns },
         .{ .name = "AES-128-GCM encrypt (1200B)", .ns = enc_ns },
         .{ .name = "AES-128-GCM decrypt (1200B)", .ns = dec_ns },
+        .{ .name = "  cached ctx, encrypt", .ns = ctx_enc_ns },
+        .{ .name = "  cached ctx, decrypt", .ns = ctx_dec_ns },
         .{ .name = "HKDF-SHA256 extract", .ns = extract_ns },
         .{ .name = "HKDF-SHA256 expand", .ns = expand_ns },
         .{ .name = "AES-128-ECB (HP mask)", .ns = hp_ns },

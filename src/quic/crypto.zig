@@ -12,6 +12,7 @@ const Aes128 = crypto.core.aes.Aes128;
 const Aes256 = crypto.core.aes.Aes256;
 const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
 const ChaCha20IETF = crypto.stream.chacha.ChaCha20IETF;
+const aes_gcm = @import("aes_gcm.zig");
 
 // RFC 9001 §5.2: QUIC v1 initial salt
 const INITIAL_SALT_V1 = [_]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a };
@@ -79,14 +80,19 @@ pub const Open = struct {
     nonce: [nonce_len]u8,
     cipher_suite: CipherSuite = .aes_128_gcm_sha256,
     /// Pre-expanded AES-128 round keys for header protection (AES suites only).
-    /// Populated by prepareHpCtx() at construction; copied with the struct.
+    /// Populated by prepareCtx() at construction; copied with the struct.
     hp_aes_ctx: ?Aes128HpCtx = null,
+    /// Packet protection with the key schedule and GHASH powers done once
+    /// (AES suites only). Populated by prepareCtx(); without it every packet
+    /// falls back to std's one-shot Aes128Gcm.
+    aead_ctx: ?aes_gcm.Ctx = null,
 
-    /// Pre-compute the AES-128 HP context. Safe to call multiple times.
-    /// Must be called after hp_key + cipher_suite are set.
-    pub fn prepareHpCtx(self: *Open) void {
+    /// Pre-compute the AES-128 HP and AEAD contexts. Safe to call multiple
+    /// times. Must be called after key, hp_key and cipher_suite are set.
+    pub fn prepareCtx(self: *Open) void {
         if (self.cipher_suite == .aes_128_gcm_sha256) {
             self.hp_aes_ctx = Aes128.initEnc(self.hp_key[0..16].*);
+            self.aead_ctx = aes_gcm.Ctx.init(self.key[0..16].*);
         }
     }
 
@@ -101,7 +107,7 @@ pub const Open = struct {
     }
 
     pub fn decryptPayload(
-        self: *Open,
+        self: *const Open,
         packet_number: u64,
         associated_data: []const u8,
         payload: []u8,
@@ -124,7 +130,11 @@ pub const Open = struct {
 
         switch (self.cipher_suite) {
             .aes_128_gcm_sha256 => {
-                Aes128Gcm.decrypt(bytes, bytes, tag, associated_data, aead_nonce, self.key[0..16].*) catch |err| {
+                const result = if (self.aead_ctx) |*ctx|
+                    ctx.decrypt(bytes, bytes, tag, associated_data, aead_nonce)
+                else
+                    Aes128Gcm.decrypt(bytes, bytes, tag, associated_data, aead_nonce, self.key[0..16].*);
+                result catch |err| {
                     std.log.debug("AES-128-GCM decryption failed: {any}", .{err});
                     return err;
                 };
@@ -147,14 +157,19 @@ pub const Seal = struct {
     nonce: [nonce_len]u8,
     cipher_suite: CipherSuite = .aes_128_gcm_sha256,
     /// Pre-expanded AES-128 round keys for header protection (AES suites only).
-    /// Populated by prepareHpCtx() at construction; copied with the struct.
+    /// Populated by prepareCtx() at construction; copied with the struct.
     hp_aes_ctx: ?Aes128HpCtx = null,
+    /// Packet protection with the key schedule and GHASH powers done once
+    /// (AES suites only). Populated by prepareCtx(); without it every packet
+    /// falls back to std's one-shot Aes128Gcm.
+    aead_ctx: ?aes_gcm.Ctx = null,
 
-    /// Pre-compute the AES-128 HP context. Safe to call multiple times.
-    /// Must be called after hp_key + cipher_suite are set.
-    pub fn prepareHpCtx(self: *Seal) void {
+    /// Pre-compute the AES-128 HP and AEAD contexts. Safe to call multiple
+    /// times. Must be called after key, hp_key and cipher_suite are set.
+    pub fn prepareCtx(self: *Seal) void {
         if (self.cipher_suite == .aes_128_gcm_sha256) {
             self.hp_aes_ctx = Aes128.initEnc(self.hp_key[0..16].*);
+            self.aead_ctx = aes_gcm.Ctx.init(self.key[0..16].*);
         }
     }
 
@@ -212,7 +227,10 @@ pub const Seal = struct {
         var tag: [tag_len]u8 = undefined;
         switch (self.cipher_suite) {
             .aes_128_gcm_sha256 => {
-                Aes128Gcm.encrypt(out[0..plaintext.len], &tag, plaintext, associated_data, aead_nonce, self.key[0..16].*);
+                if (self.aead_ctx) |*ctx|
+                    ctx.encrypt(out[0..plaintext.len], &tag, plaintext, associated_data, aead_nonce)
+                else
+                    Aes128Gcm.encrypt(out[0..plaintext.len], &tag, plaintext, associated_data, aead_nonce, self.key[0..16].*);
             },
             .chacha20_poly1305_sha256 => {
                 ChaCha20Poly1305.encrypt(out[0..plaintext.len], &tag, plaintext, associated_data, aead_nonce, self.key);
@@ -405,8 +423,8 @@ pub fn deriveInitialKeyMaterial(
         open = .{ .key = server_key, .hp_key = server_hp_key, .nonce = server_iv };
         seal = .{ .key = client_key, .hp_key = client_hp_key, .nonce = client_iv };
     }
-    open.prepareHpCtx();
-    seal.prepareHpCtx();
+    open.prepareCtx();
+    seal.prepareCtx();
     return .{ open, seal };
 }
 
@@ -700,10 +718,10 @@ pub const KeyUpdateManager = struct {
             .recv_secret = recv_secret,
             .send_secret = send_secret,
         };
-        ku.current_open.prepareHpCtx();
-        ku.current_seal.prepareHpCtx();
-        ku.next_open.prepareHpCtx();
-        ku.next_seal.prepareHpCtx();
+        ku.current_open.prepareCtx();
+        ku.current_seal.prepareCtx();
+        ku.next_open.prepareCtx();
+        ku.next_seal.prepareCtx();
         if (cipher_suite == .aes_128_gcm_sha256) {
             ku.hp_open_ctx = Aes128.initEnc(recv_hp[0..16].*);
             ku.hp_seal_ctx = Aes128.initEnc(send_hp[0..16].*);
@@ -737,15 +755,15 @@ pub const KeyUpdateManager = struct {
             .hp_key = self.hp_open,
             .nonce = hkdfExpandLabel(next_recv_secret, label_iv, "", nonce_len),
             .cipher_suite = self.cipher_suite,
-            .hp_aes_ctx = self.hp_open_ctx,
         };
         self.next_seal = .{
             .key = deriveKeyPaddedL(next_send_secret, kl, label_key),
             .hp_key = self.hp_seal,
             .nonce = hkdfExpandLabel(next_send_secret, label_iv, "", nonce_len),
             .cipher_suite = self.cipher_suite,
-            .hp_aes_ctx = self.hp_seal_ctx,
         };
+        self.next_open.prepareCtx();
+        self.next_seal.prepareCtx();
 
         // Toggle key phase
         self.key_phase = !self.key_phase;
@@ -1269,7 +1287,7 @@ test "RFC 9001 A.5: ChaCha20-Poly1305 short header packet" {
     try std.testing.expectEqualSlices(u8, &expected_nonce, &makeNonce(iv, pn));
 
     var seal = Seal{ .key = key, .hp_key = hp, .nonce = iv, .cipher_suite = .chacha20_poly1305_sha256 };
-    seal.prepareHpCtx();
+    seal.prepareCtx();
 
     var header: [4]u8 = undefined;
     _ = try std.fmt.hexToBytes(&header, "4200bff4");

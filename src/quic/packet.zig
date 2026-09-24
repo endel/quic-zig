@@ -335,7 +335,7 @@ fn splitProtected(header: *const Header, fbs: anytype, first_byte: u8, ad_buf: [
     };
 }
 
-pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
+pub fn decrypt(header: *Header, fbs: anytype, space: *const PacketNumSpace) ![]u8 {
     // We need at least 4 bytes for packet number + 16 for sample
     if (fbs.seek + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
         std.log.debug("Not enough data for packet number + sample: pos={d}, buffer.len={d}", .{ fbs.seek, fbs.buffer.len });
@@ -345,7 +345,7 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
     var first_byte = fbs.buffer[header.packet_start];
 
     // unprotect header
-    var aead = space.crypto_open.?;
+    const aead = &space.crypto_open.?;
 
     // RFC 9001 Section 5.4.2: Sample is taken 4 bytes after START of packet number field
     const sample_offset = fbs.seek + 4;
@@ -426,7 +426,7 @@ pub fn decrypt(header: *Header, fbs: anytype, space: PacketNumSpace) ![]u8 {
 /// Decrypt a 1-RTT packet using the KeyUpdateManager for key phase handling.
 /// Uses the (unchanging) HP key for header unprotection, then selects the
 /// appropriate AEAD keys based on the key phase bit (RFC 9001 Section 6).
-pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *PacketNumSpace, ku: *crypto.KeyUpdateManager) ![]u8 {
+pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *const PacketNumSpace, ku: *crypto.KeyUpdateManager) ![]u8 {
     if (fbs.seek + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
         return error.InvalidPacket;
     }

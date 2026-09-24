@@ -7,6 +7,7 @@ pub const frame = @import("quic/frame.zig");
 pub const connection = @import("quic/connection.zig");
 pub const connection_manager = @import("quic/connection_manager.zig");
 pub const crypto = @import("quic/crypto.zig");
+pub const aes_gcm = @import("quic/aes_gcm.zig");
 pub const tls13 = @import("quic/tls13.zig");
 pub const mont = @import("quic/mont.zig");
 pub const ca_bundle = @import("quic/ca_bundle.zig");

@@ -1133,7 +1133,7 @@ pub const Connection = struct {
         var space = self.pkt_num_spaces[2];
         const saved_open = space.crypto_open;
         space.crypto_open = self.early_data_open.?;
-        const payload = packet.decrypt(header, fbs, space) catch |err| {
+        const payload = packet.decrypt(header, fbs, &space) catch |err| {
             std.log.err("can't decrypt 0-RTT packet. {any}", .{err});
             space.crypto_open = saved_open;
             return error.InvalidPacket;
@@ -1292,7 +1292,7 @@ pub const Connection = struct {
 
         const enc_level = epochToEncLevel(epoch);
         const space_idx = @intFromEnum(enc_level);
-        var space = self.pkt_num_spaces[space_idx];
+        const space = &self.pkt_num_spaces[space_idx];
         const has_keys = space.crypto_open != null and space.crypto_seal != null;
         std.log.debug("recv: using space {d} ({s}), has_keys={}", .{ space_idx, @tagName(enc_level), has_keys });
 
@@ -1309,7 +1309,7 @@ pub const Connection = struct {
         if (epoch == .application and self.key_update != null) {
             // Decrypt using KeyUpdateManager: first do header unprotection with the
             // (unchanging) HP key, then select the right AEAD key based on key phase
-            payload = packet.decryptWithKeyUpdate(header, fbs, &space, &self.key_update.?) catch {
+            payload = packet.decryptWithKeyUpdate(header, fbs, space, &self.key_update.?) catch {
                 // Dropped (RFC 9001 §6.3); the error lets the caller test for a stateless reset.
                 return error.UndecryptablePacket;
             };
@@ -3121,10 +3121,14 @@ pub const Connection = struct {
     /// The 1-RTT seal, once there is one to use. A server holds it back until
     /// the handshake is confirmed: a 1-RTT PING before then draws a 1-RTT ACK
     /// instead of the Handshake Finished it still needs retransmitted.
-    fn appSeal(self: *Connection) ?quic_crypto.Seal {
+    fn appSeal(self: *Connection) ?*const quic_crypto.Seal {
         if (self.is_server and !self.handshake_confirmed) return null;
-        if (self.key_update) |*ku| return ku.current_seal;
-        return self.pkt_num_spaces[2].crypto_seal;
+        if (self.key_update) |*ku| return &ku.current_seal;
+        return self.levelSeal(2);
+    }
+
+    fn levelSeal(self: *Connection, space_idx: usize) ?*const quic_crypto.Seal {
+        return if (self.pkt_num_spaces[space_idx].crypto_seal) |*s| s else null;
     }
 
     pub fn send(self: *Connection, out_buf: []u8) !usize {
@@ -3149,12 +3153,12 @@ pub const Connection = struct {
             }
 
             // First time: build close packet at best available encryption level
-            const app_seal: ?quic_crypto.Seal = if (self.key_update) |*ku|
-                ku.current_seal
+            const app_seal: ?*const quic_crypto.Seal = if (self.key_update) |*ku|
+                &ku.current_seal
             else
-                self.pkt_num_spaces[2].crypto_seal;
-            const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
-            const initial_seal = self.pkt_num_spaces[0].crypto_seal;
+                self.levelSeal(2);
+            const handshake_seal = self.levelSeal(1);
+            const initial_seal = self.levelSeal(0);
 
             // Try 1-RTT, then Handshake, then Initial
             const seal = app_seal orelse handshake_seal orelse initial_seal;
@@ -3204,7 +3208,7 @@ pub const Connection = struct {
         // At most one probe per 5×RTT (200 ms floor), so the data it delays is
         // one datagram that rarely exists.
         self.mtu_discoverer.checkRaiseTimer(now);
-        // shouldProbe first: it is almost always false, and appSeal copies the seal.
+        // shouldProbe first: it is almost always false.
         if (self.mtu_discoverer.shouldProbe(now, self.pkt_handler.rtt_stats.smoothedRttOrDefault())) {
             if (self.appSeal()) |seal| {
                 const probe_size: usize = self.mtu_discoverer.nextProbeSize();
@@ -3277,12 +3281,12 @@ pub const Connection = struct {
 
         // Build coalesced packet with available encryption levels
         // Packet number space indices: 0=Initial, 1=Handshake, 2=Application
-        const initial_seal = self.pkt_num_spaces[0].crypto_seal;
-        const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
+        const initial_seal = self.levelSeal(0);
+        const handshake_seal = self.levelSeal(1);
         const app_seal = self.appSeal();
 
         // 0-RTT seal (client only, before handshake completes)
-        const early_seal = if (!self.handshake_confirmed) self.early_data_seal else null;
+        const early_seal: ?*const quic_crypto.Seal = if (self.handshake_confirmed) null else if (self.early_data_seal) |*s| s else null;
 
         const dq: ?*DatagramQueue = if (self.datagrams_enabled and !self.datagram_send_queue.isEmpty())
             &self.datagram_send_queue
@@ -3410,14 +3414,9 @@ pub const Connection = struct {
         }
 
         // Gather seals at all encryption levels
-        const initial_seal = self.pkt_num_spaces[0].crypto_seal;
-        const handshake_seal = self.pkt_num_spaces[1].crypto_seal;
-        const app_seal: ?quic_crypto.Seal = if (self.is_server and !self.handshake_confirmed)
-            null
-        else if (self.key_update) |*ku|
-            ku.current_seal
-        else
-            self.pkt_num_spaces[2].crypto_seal;
+        const initial_seal = self.levelSeal(0);
+        const handshake_seal = self.levelSeal(1);
+        const app_seal = self.appSeal();
 
         const bytes_written = try self.packer.packCoalesced(
             send_buf,

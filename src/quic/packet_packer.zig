@@ -124,10 +124,10 @@ pub const PacketPacker = struct {
         crypto_mgr: *crypto_stream.CryptoStreamManager,
         streams: *stream_mod.StreamsMap,
         pending_frames: *frame_mod.PendingFrameQueue,
-        initial_seal: ?crypto_mod.Seal,
-        early_seal: ?crypto_mod.Seal,
-        handshake_seal: ?crypto_mod.Seal,
-        app_seal: ?crypto_mod.Seal,
+        initial_seal: ?*const crypto_mod.Seal,
+        early_seal: ?*const crypto_mod.Seal,
+        handshake_seal: ?*const crypto_mod.Seal,
+        app_seal: ?*const crypto_mod.Seal,
         now: i64,
         datagram_queue: ?*conn_mod.DatagramQueue,
         ack_only: bool,
@@ -245,7 +245,7 @@ pub const PacketPacker = struct {
         crypto_mgr: *crypto_stream.CryptoStreamManager,
         streams: *stream_mod.StreamsMap,
         pending_frames: *frame_mod.PendingFrameQueue,
-        seal: crypto_mod.Seal,
+        seal: *const crypto_mod.Seal,
         now: i64,
         pad_target: usize, // 0 = no padding, >0 = target packet size for this packet
         datagram_queue: ?*conn_mod.DatagramQueue,
@@ -680,7 +680,7 @@ pub const PacketPacker = struct {
         buf: []u8,
         target_size: usize,
         pkt_handler: *ack_handler.PacketHandler,
-        seal: crypto_mod.Seal,
+        seal: *const crypto_mod.Seal,
         now: i64,
     ) !struct { bytes_written: usize, pn: u64 } {
         if (buf.len < target_size or target_size < 64) return .{ .bytes_written = 0, .pn = 0 };
@@ -818,7 +818,7 @@ test "PacketPacker: pack Initial with CRYPTO data" {
         &crypto_mgr,
         &streams,
         &pending_frames,
-        keys.seal, // initial_seal
+        &keys.seal, // initial_seal
         null, // early_seal
         null, // handshake_seal
         null, // app_seal
@@ -874,7 +874,7 @@ test "PacketPacker: pack 1-RTT with stream data" {
         null, // no initial
         null, // no early
         null, // no handshake
-        keys.seal, // app_seal
+        &keys.seal, // app_seal
         1000,
         null,
         false,
@@ -917,7 +917,7 @@ test "PacketPacker: no data produces no packet" {
         &crypto_mgr,
         &streams,
         &pending_frames,
-        keys.seal, // initial_seal
+        &keys.seal, // initial_seal
         null,
         null,
         null,
@@ -968,7 +968,7 @@ test "PacketPacker: ack_only skips stream data but sends receiver credit" {
         null,
         null,
         null,
-        keys.seal, // app_seal
+        &keys.seal, // app_seal
         1000,
         null,
         true, // ack_only = true
@@ -1014,7 +1014,7 @@ test "PacketPacker: ack_only does not force sub-threshold ACKs" {
         null,
         null,
         null,
-        keys.seal,
+        &keys.seal,
         1000,
         null,
         true,
@@ -1053,9 +1053,9 @@ test "PacketPacker: coalesced Initial + Handshake" {
         &crypto_mgr,
         &streams,
         &pending_frames,
-        keys.seal, // initial_seal
+        &keys.seal, // initial_seal
         null, // no early
-        keys.seal, // handshake_seal (reuse same keys for test)
+        &keys.seal, // handshake_seal (reuse same keys for test)
         null, // no app
         1000,
         null,
@@ -1098,7 +1098,7 @@ test "PacketPacker: HANDSHAKE_DONE frame packed in 1-RTT" {
         null,
         null,
         null,
-        keys.seal, // app_seal
+        &keys.seal, // app_seal
         1000,
         null,
         false,
@@ -1153,7 +1153,7 @@ test "PacketPacker: ecn_mark propagates to SentPacket" {
         null,
         null,
         null,
-        keys.seal,
+        &keys.seal,
         1000,
         null,
         false,
@@ -1196,13 +1196,13 @@ test "PacketPacker: key_phase bit in short header" {
     // Pack with key_phase = false
     packer.key_phase = false;
     var out1: [1500]u8 = undefined;
-    _ = try packer.packCoalesced(&out1, &pkt_handler, &crypto_mgr, &streams, &pending_frames, null, null, null, keys.seal, 1000, null, false);
+    _ = try packer.packCoalesced(&out1, &pkt_handler, &crypto_mgr, &streams, &pending_frames, null, null, null, &keys.seal, 1000, null, false);
 
     // Write more data and pack with key_phase = true
     try s.send.writeData("more data");
     packer.key_phase = true;
     var out2: [1500]u8 = undefined;
-    _ = try packer.packCoalesced(&out2, &pkt_handler, &crypto_mgr, &streams, &pending_frames, null, null, null, keys.seal, 1000, null, false);
+    _ = try packer.packCoalesced(&out2, &pkt_handler, &crypto_mgr, &streams, &pending_frames, null, null, null, &keys.seal, 1000, null, false);
 
     // After header protection is applied, the key_phase bit is masked.
     // But the two packets should differ (different key phase + different content).
@@ -1243,7 +1243,7 @@ test "PacketPacker: pending control frames in 1-RTT" {
         null,
         null,
         null,
-        keys.seal,
+        &keys.seal,
         1000,
         null,
         false,
@@ -1294,7 +1294,7 @@ test "PacketPacker: stream frame info tracked in SentPacket" {
         null,
         null,
         null,
-        keys.seal,
+        &keys.seal,
         1000,
         null,
         false,
@@ -1320,7 +1320,7 @@ fn packAppOnly(
     out_buf: []u8,
 ) !usize {
     const keys = try testClientKeys();
-    return packer.packCoalesced(out_buf, pkt_handler, crypto_mgr, streams, pending_frames, null, null, null, keys.seal, 1000, null, false);
+    return packer.packCoalesced(out_buf, pkt_handler, crypto_mgr, streams, pending_frames, null, null, null, &keys.seal, 1000, null, false);
 }
 
 test "PacketPacker: a sent packet records the control frames to repeat on loss" {
