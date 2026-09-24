@@ -1560,8 +1560,13 @@ pub const StreamsMap = struct {
     ///   Tier 2: streams without send_order — RFC 9218 urgency-based scheduling.
     /// Returns the count of streams written to `out`.
     pub fn getScheduledStreams(self: *StreamsMap, out: *[MAX_SCHEDULABLE]*Stream) usize {
-        // Tier 1: collect streams with send_order set
+        // One walk fills both tiers: send_order streams (tier 1), and the
+        // RFC 9218 urgency selection among the rest (tier 2).
         var ordered_count: usize = 0;
+        var min_urgency: u3 = 7;
+        var urgency_count: usize = 0;
+        var found_non_incremental = false;
+        var urgency_buf: [MAX_SCHEDULABLE]*Stream = undefined;
         var it = self.streams.valueIterator();
         while (it.next()) |sp| {
             const s = sp.*;
@@ -1575,24 +1580,8 @@ pub const StreamsMap = struct {
                 if (ordered_count >= MAX_SCHEDULABLE) continue;
                 out[ordered_count] = s;
                 ordered_count += 1;
+                continue;
             }
-        }
-        // Sort tier 1 descending by send_order (higher first)
-        if (ordered_count > 1) {
-            sortStreamsBySendOrder(out[0..ordered_count]);
-        }
-
-        // Tier 2: streams without send_order — RFC 9218 urgency scheduling
-        var min_urgency: u3 = 7;
-        var urgency_count: usize = 0;
-        var found_non_incremental = false;
-        var urgency_buf: [MAX_SCHEDULABLE]*Stream = undefined;
-        var it2 = self.streams.valueIterator();
-        while (it2.next()) |sp| {
-            const s = sp.*;
-            // See tier 1: hasData() is authoritative, closed_for_gc alone can't suppress.
-            if (!s.send.hasData()) continue;
-            if (s.send.send_order != null) continue; // already in tier 1
 
             if (s.send.urgency < min_urgency) {
                 min_urgency = s.send.urgency;
@@ -1614,6 +1603,10 @@ pub const StreamsMap = struct {
                 urgency_buf[urgency_count] = s;
                 urgency_count += 1;
             }
+        }
+        // Sort tier 1 descending by send_order (higher first)
+        if (ordered_count > 1) {
+            sortStreamsBySendOrder(out[0..ordered_count]);
         }
 
         // Rotate tier 2 incremental streams for fairness

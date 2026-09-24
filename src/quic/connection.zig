@@ -2974,8 +2974,12 @@ pub const Connection = struct {
         }
 
         {
+            // One walk of the bidi streams for both directions' frames.
             var stream_it = self.streams.streams.valueIterator();
-            while (stream_it.next()) |s_ptr| self.queueSendSideFrames(&s_ptr.*.send);
+            while (stream_it.next()) |s_ptr| {
+                self.queueSendSideFrames(&s_ptr.*.send);
+                self.queueStopSending(&s_ptr.*.recv);
+            }
             var uni_it = self.streams.send_streams.valueIterator();
             while (uni_it.next()) |ss_ptr| {
                 self.queueSendSideFrames(ss_ptr.*);
@@ -2984,12 +2988,8 @@ pub const Connection = struct {
             }
         }
 
-        // STOP_SENDING: send for streams requesting peer to stop
+        // STOP_SENDING for the peer's uni streams (bidi ones went above).
         {
-            var stream_it = self.streams.streams.valueIterator();
-            while (stream_it.next()) |s_ptr| {
-                self.queueStopSending(&s_ptr.*.recv);
-            }
             var recv_it = self.streams.recv_streams.valueIterator();
             while (recv_it.next()) |rs_ptr| self.queueStopSending(rs_ptr.*);
         }
