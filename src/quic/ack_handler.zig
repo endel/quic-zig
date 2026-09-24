@@ -210,6 +210,17 @@ pub const AckResult = struct {
         self.lost.clearRetainingCapacity();
         self.persistent_congestion = false;
     }
+
+    /// Keep room for a typical ACK; free what a burst of them grew.
+    pub fn trim(self: *AckResult, allocator: Allocator) void {
+        const keep = 64;
+        inline for (.{ &self.acked, &self.lost }) |list| {
+            if (list.items.capacity > keep) {
+                list.deinit(allocator);
+                list.* = .{};
+            }
+        }
+    }
 };
 
 /// Tracks sent packets and handles loss detection for a single packet number space.
@@ -1148,4 +1159,18 @@ test "NewReno: app_limited suppresses cwnd growth" {
     cc.app_limited = false;
     cc.onPacketAcked(1200, 300);
     try testing.expect(cc.congestion_window > after_ack);
+}
+
+test "AckResult.trim keeps a typical ACK's room and frees a burst's" {
+    var result: AckResult = .{};
+    defer result.deinit(testing.allocator);
+    const pkt: SentPacket = .{ .pn = 0, .time_sent = 0, .size = 1200, .ack_eliciting = true, .in_flight = true, .enc_level = .application };
+    for (0..8) |_| try result.acked.append(testing.allocator, pkt);
+    result.trim(testing.allocator);
+    try testing.expect(result.acked.items.capacity >= 8);
+
+    for (0..1000) |_| try result.lost.append(testing.allocator, pkt);
+    result.trim(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), result.lost.items.capacity);
+    try testing.expect(result.acked.items.capacity >= 8);
 }

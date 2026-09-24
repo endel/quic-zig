@@ -618,6 +618,8 @@ pub const Connection = struct {
 
     // New subsystems
     pkt_handler: ack_handler.PacketHandler = undefined,
+    /// Reused by every ACK frame: a fresh one regrew its lists each time.
+    ack_result: ack_handler.AckResult = .{},
     cc: congestion.Cubic = congestion.Cubic.init(),
     pacer: congestion.Pacer = congestion.Pacer.init(),
     conn_flow_ctrl: flow_control.ConnectionFlowController = undefined,
@@ -1011,6 +1013,7 @@ pub const Connection = struct {
             self.qlog_writer = null;
         }
         self.pkt_handler.deinit();
+        self.ack_result.deinit(self.allocator);
         self.streams.deinit();
         self.crypto_streams.deinit();
         self.datagram_recv_queue.deinitQueue();
@@ -1640,8 +1643,7 @@ pub const Connection = struct {
                 // making it appear app-limited even when the sender filled cwnd.
                 self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
 
-                var ack_result: ack_handler.AckResult = .{};
-                defer ack_result.deinit(self.allocator);
+                defer self.ack_result.trim(self.allocator);
                 try self.pkt_handler.onAckReceived(
                     enc_level,
                     ack.largest_ack,
@@ -1650,9 +1652,9 @@ pub const Connection = struct {
                     ack.ack_ranges[0..ack.ack_range_count],
                     ack.first_ack_range,
                     now,
-                    &ack_result,
+                    &self.ack_result,
                 );
-                const result = &ack_result;
+                const result = &self.ack_result;
 
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
@@ -1783,8 +1785,7 @@ pub const Connection = struct {
                 // RFC 9002 §7.8: snapshot app_limited BEFORE processing ACKs
                 self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
 
-                var ack_result: ack_handler.AckResult = .{};
-                defer ack_result.deinit(self.allocator);
+                defer self.ack_result.trim(self.allocator);
                 try self.pkt_handler.onAckReceived(
                     enc_level,
                     ack.largest_ack,
@@ -1793,9 +1794,9 @@ pub const Connection = struct {
                     ack.ack_ranges[0..ack.ack_range_count],
                     ack.first_ack_range,
                     now,
-                    &ack_result,
+                    &self.ack_result,
                 );
-                const result = &ack_result;
+                const result = &self.ack_result;
 
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
