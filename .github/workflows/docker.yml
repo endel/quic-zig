@@ -36,7 +36,7 @@ jobs:
       # are relative to the staging dir, as in interop/runner/build_image.sh.
       - name: Cross-compile interop binaries
         run: |
-          zig build interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -j1 --prefix "$PWD/stage"
+          zig build interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3+aes+pclmul -j1 --prefix "$PWD/stage"
           cp interop/runner/run_endpoint.sh stage/run_endpoint.sh
 
       - name: Build and push the QUIC interop image
@@ -55,7 +55,7 @@ jobs:
       # Dockerfiles COPY out of bin/, which is where --prefix puts them.
       - name: Cross-compile the MoQ interop binaries
         run: |
-          zig build moq-interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -j1 --prefix "$PWD/moq-stage"
+          zig build moq-interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3+aes+pclmul -j1 --prefix "$PWD/moq-stage"
           cp interop/moq-runner/entrypoint-client.sh moq-stage/entrypoint-client.sh
           cp interop/moq-runner/entrypoint-relay.sh moq-stage/entrypoint-relay.sh
 

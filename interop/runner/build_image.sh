@@ -21,7 +21,7 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 echo "=== Cross-compiling interop binaries for x86_64-linux ==="
-zig build interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -j1 --prefix "$STAGE"
+zig build interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3+aes+pclmul -j1 --prefix "$STAGE"
 
 echo "=== Packaging $TAG ==="
 cp interop/runner/run_endpoint.sh "$STAGE/run_endpoint.sh"

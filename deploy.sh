@@ -27,12 +27,14 @@ DEPLOY_HOST=${DEPLOY_HOST:-root@137.184.1.19}
 SERVICE=${SERVICE:-wt-echo}
 REMOTE_BIN=${REMOTE_BIN:-/opt/quic-zig/zig-out/bin/wt-echo-server}
 TARGET=${TARGET:-x86_64-linux-gnu}
+# Baseline x86_64 has no AES-NI/PCLMUL: std falls back to software AES-GCM, ~35× slower.
+CPU=${CPU:-x86_64_v3+aes+pclmul}
 ZIG=${ZIG:-zig}
 
 cd "$(dirname "$0")"
 
-echo "=== build (target=$TARGET, mode=ReleaseFast) ==="
-"$ZIG" build -Dtarget="$TARGET" -Doptimize=ReleaseFast
+echo "=== build (target=$TARGET, cpu=$CPU, mode=ReleaseFast) ==="
+"$ZIG" build -Dtarget="$TARGET" -Dcpu="$CPU" -Doptimize=ReleaseFast
 local_bin="zig-out/bin/wt-echo-server"
 ls -lh "$local_bin"
 

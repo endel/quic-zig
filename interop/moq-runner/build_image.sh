@@ -14,7 +14,7 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 echo "=== Cross-compiling for x86_64-linux ==="
-zig build moq-interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -j1 --prefix "$STAGE"
+zig build moq-interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3+aes+pclmul -j1 --prefix "$STAGE"
 
 cp interop/moq-runner/entrypoint-client.sh "$STAGE/entrypoint-client.sh"
 cp interop/moq-runner/entrypoint-relay.sh "$STAGE/entrypoint-relay.sh"
