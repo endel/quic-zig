@@ -1114,7 +1114,7 @@ test "PacketPacker: HANDSHAKE_DONE frame packed in 1-RTT" {
     const app_idx = @intFromEnum(ack_handler.EncLevel.application);
     try testing.expectEqual(@as(usize, 1), pkt_handler.sent[app_idx].sent_packets.count());
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
-    const pkt = it.next().?.value_ptr;
+    const pkt = it.next().?.value_ptr.*;
     try testing.expect(pkt.ack_eliciting);
     try testing.expect(pkt.has_handshake_done);
 }
@@ -1165,7 +1165,7 @@ test "PacketPacker: ecn_mark propagates to SentPacket" {
     // Check the sent packet has ecn_marked set
     const app_idx = @intFromEnum(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
-    const pkt = it.next().?.value_ptr;
+    const pkt = it.next().?.value_ptr.*;
     try testing.expect(pkt.ecn_marked);
     try testing.expect(pkt.ack_eliciting);
 }
@@ -1258,7 +1258,7 @@ test "PacketPacker: pending control frames in 1-RTT" {
     // Sent packet should be ack-eliciting
     const app_idx = @intFromEnum(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
-    const pkt = it.next().?.value_ptr;
+    const pkt = it.next().?.value_ptr.*;
     try testing.expect(pkt.ack_eliciting);
 }
 
@@ -1304,7 +1304,7 @@ test "PacketPacker: stream frame info tracked in SentPacket" {
     // Verify stream frame info was recorded in SentPacket
     const app_idx = @intFromEnum(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
-    const pkt = it.next().?.value_ptr;
+    const pkt = it.next().?.value_ptr.*;
     const sf = pkt.getStreamFrames();
     try testing.expect(sf.len > 0);
     try testing.expectEqual(@as(u64, 0), sf[0].stream_id);

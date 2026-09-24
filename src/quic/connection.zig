@@ -1012,8 +1012,8 @@ pub const Connection = struct {
             ql.deinit();
             self.qlog_writer = null;
         }
+        self.ack_result.deinit(self.allocator); // its packets are pkt_handler's
         self.pkt_handler.deinit();
-        self.ack_result.deinit(self.allocator);
         self.streams.deinit();
         self.crypto_streams.deinit();
         self.datagram_recv_queue.deinitQueue();
@@ -1643,7 +1643,7 @@ pub const Connection = struct {
                 // making it appear app-limited even when the sender filled cwnd.
                 self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
 
-                defer self.ack_result.trim(self.allocator);
+                defer self.ack_result.release(self.allocator);
                 try self.pkt_handler.onAckReceived(
                     enc_level,
                     ack.largest_ack,
@@ -1730,8 +1730,8 @@ pub const Connection = struct {
                     }
 
                     // Queue stream data retransmission for lost packets
-                    self.queueStreamRetransmissions(&pkt);
-                    self.requeueLostControlFrames(&pkt);
+                    self.queueStreamRetransmissions(pkt);
+                    self.requeueLostControlFrames(pkt);
 
                     // Queue CRYPTO frame retransmission for lost packets (RFC 9002 §6.2)
                     if (pkt.has_crypto_data) {
@@ -1785,7 +1785,7 @@ pub const Connection = struct {
                 // RFC 9002 §7.8: snapshot app_limited BEFORE processing ACKs
                 self.cc.app_limited = self.pkt_handler.bytes_in_flight < self.cc.sendWindow();
 
-                defer self.ack_result.trim(self.allocator);
+                defer self.ack_result.release(self.allocator);
                 try self.pkt_handler.onAckReceived(
                     enc_level,
                     ack.largest_ack,
@@ -1873,8 +1873,8 @@ pub const Connection = struct {
                     }
 
                     // Queue stream data retransmission for lost packets
-                    self.queueStreamRetransmissions(&pkt);
-                    self.requeueLostControlFrames(&pkt);
+                    self.queueStreamRetransmissions(pkt);
+                    self.requeueLostControlFrames(pkt);
 
                     // Queue CRYPTO frame retransmission for lost packets (RFC 9002 §6.2)
                     if (pkt.has_crypto_data) {
@@ -2577,7 +2577,7 @@ pub const Connection = struct {
                         const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
                         var pkt_it = app_tracker.sent_packets.iterator();
                         while (pkt_it.next()) |entry| {
-                            const pkt = entry.value_ptr;
+                            const pkt = entry.value_ptr.*;
                             if (pkt.getStreamFrames().len > 0) {
                                 self.queueStreamRetransmissions(pkt);
                             }
@@ -3331,7 +3331,7 @@ pub const Connection = struct {
                 const pn = self.pkt_handler.next_pn[enc_idx] -| 1;
                 var frames_buf: [2048]u8 = undefined;
                 var frames_len: usize = 0;
-                if (self.pkt_handler.sent[enc_idx].sent_packets.getPtr(pn)) |rec| {
+                if (self.pkt_handler.sent[enc_idx].sent_packets.get(pn)) |rec| {
                     frames_len = qlog.QlogWriter.serializeSentFrames(rec, &frames_buf);
                 }
                 ql.packetSent(now, pkt_type_str, pn, bytes_written, frames_buf[0..frames_len]);
@@ -3583,8 +3583,8 @@ pub const Connection = struct {
                         earliest_lost_sent_time_lt = pkt.time_sent;
                     }
                 }
-                self.queueStreamRetransmissions(&pkt);
-                self.requeueLostControlFrames(&pkt);
+                self.queueStreamRetransmissions(pkt);
+                self.requeueLostControlFrames(pkt);
                 if (pkt.has_crypto_data) {
                     self.queueCryptoRetransmission(pkt.enc_level);
                 }
@@ -3707,7 +3707,7 @@ pub const Connection = struct {
                     const app_tracker2 = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
                     var pkt_it2 = app_tracker2.sent_packets.iterator();
                     while (pkt_it2.next()) |entry| {
-                        if (entry.value_ptr.in_flight and entry.value_ptr.getStreamFrames().len > 0) {
+                        if (entry.value_ptr.*.in_flight and entry.value_ptr.*.getStreamFrames().len > 0) {
                             has_stream_in_flight = true;
                             break;
                         }
