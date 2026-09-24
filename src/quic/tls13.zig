@@ -3481,6 +3481,7 @@ fn parsePemSection(pem_data: []const u8, comptime label: []const u8, out: []u8) 
     var clean_len: usize = 0;
     for (base64_data) |c| {
         if (c != '\n' and c != '\r' and c != ' ' and c != '\t') {
+            if (clean_len >= clean.len) return error.DecodeError;
             clean[clean_len] = c;
             clean_len += 1;
         }
@@ -3687,6 +3688,17 @@ fn trimLeadingZeros(v: []const u8) []const u8 {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
+
+test "parsePemCert: rejects a section larger than the scratch buffer" {
+    const begin = "-----BEGIN CERTIFICATE-----\n";
+    const end = "\n-----END CERTIFICATE-----\n";
+    var pem: [begin.len + 9000 + end.len]u8 = undefined;
+    @memcpy(pem[0..begin.len], begin);
+    @memset(pem[begin.len..][0..9000], 'A');
+    @memcpy(pem[begin.len + 9000 ..], end);
+    var out: [16384]u8 = undefined;
+    try std.testing.expectError(error.DecodeError, parsePemCert(&pem, &out));
+}
 
 test "TranscriptHash: basic usage" {
     var th = TranscriptHash.init();
