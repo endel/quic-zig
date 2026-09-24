@@ -7,6 +7,7 @@
 //! line for line, over the tuned GHASH in `ghash.zig` and 0.16's CTR loop.
 //! Zig master's CTR (after 0.16) encrypts a whole parallel batch for the
 //! tail and XORs it bytewise: 161 → 215 ns at 1200 B, 9 → 38 ns at 64 B.
+//! See DECISIONS/zig_std_divergences.md.
 
 const std = @import("std");
 const crypto = std.crypto;

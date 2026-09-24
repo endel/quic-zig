@@ -3,6 +3,7 @@
 //! aggregation above ~1340 bytes, so every QUIC packet took the 4-way path;
 //! 8-way cuts GHASH over a 1200-byte packet by ~39% on arm64 and x86_64.
 //! Delete this file once a Zig release carries the lower threshold.
+//! See DECISIONS/zig_std_divergences.md.
 
 const std = @import("std");
 const builtin = @import("builtin");

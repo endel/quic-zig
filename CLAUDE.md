@@ -43,6 +43,20 @@ if that is not 0.16 it answers from the wrong stdlib rather than erroring.
 `src/sys.zig` is the library's syscall seam and documents which 0.16 homes each
 helper corresponds to.
 
+## Upstream contributions to Zig
+
+The Zig project does not accept AI-assisted contributions. Never open, draft
+or propose a pull request, issue or comment on ziglang/zig, and don't prepare
+patches meant for them.
+
+Where we copy, replace or work around std code (vendored crypto, API gaps,
+std bugs), record it in
+[DECISIONS/zig_std_divergences.md](DECISIONS/zig_std_divergences.md): what std
+does, what we do instead, the numbers, and the state of Zig master. That page is
+the material a maintainer of this repo can take upstream themselves. Keep it
+current whenever a divergence is added, changed or dropped, and re-check it on
+every Zig upgrade.
+
 ## libxev
 
 libxev comes from our fork, [endel/libxev](https://github.com/endel/libxev),
