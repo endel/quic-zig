@@ -2072,15 +2072,8 @@ pub const Connection = struct {
                     try self.recvStreamFrame(&strm.recv, s.offset, s.data, s.fin);
                     if (s.fin) self.streams.needs_gc_scan = true;
 
-                    // Closed once both directions are done; with the FIN ahead
-                    // of a hole, that is when the frame filling it lands.
-                    if (strm.recv.fin_received and strm.recv.allReceived() and
-                        (strm.send.fin_sent or strm.send.reset_err != null) and !strm.closed_for_gc)
-                    {
-                        strm.closed_for_gc = true;
-                        self.streams.closeStream(s.stream_id);
-                        self.streams.disposeIfSettled(strm);
-                    }
+                    // With the FIN ahead of a hole, the frame filling it closes.
+                    self.streams.closeIfDone(strm);
                 } else {
                     // Unidirectional stream — route to recv_streams
                     const recv_strm = self.streams.getOrCreateRecvStream(s.stream_id) catch |err| switch (err) {

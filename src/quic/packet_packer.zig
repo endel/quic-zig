@@ -489,6 +489,7 @@ pub const PacketPacker = struct {
                 if (s.send.popStreamFrame(max_stream_data)) |stream_frame| {
                     try stream_frame.write(writer);
                     ack_eliciting = true;
+                    if (stream_frame.stream.fin) streams.closeIfDone(s);
                     // Only count NEW data against connection flow control (not retransmissions)
                     const new_bytes = s.send.send_offset - prev_send_offset;
                     if (new_bytes > 0) {
@@ -1321,6 +1322,35 @@ fn packAppOnly(
 ) !usize {
     const keys = try testClientKeys();
     return packer.packCoalesced(out_buf, pkt_handler, crypto_mgr, streams, pending_frames, null, null, null, &keys.seal, 1000, null, false);
+}
+
+test "PacketPacker: packing our FIN closes a stream whose peer finished first" {
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, true, &[_]u8{0x01}, dcid, 0x00000001);
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, true);
+    defer streams.deinit();
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+
+    // The request arrives whole; the response is not written yet.
+    const s = try streams.getOrCreateStream(0);
+    try s.recv.handleStreamFrame(0, "GET /", true);
+    streams.collectClosedStreams();
+    try testing.expect(!s.closed_for_gc);
+    try testing.expect(!streams.needs_gc_scan); // no scan left armed to notice later
+
+    try s.send.writeData("200 OK");
+    s.send.close();
+    var out: [1500]u8 = undefined;
+    _ = try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out);
+    try testing.expect(s.send.fin_sent);
+    try testing.expect(s.closed_for_gc);
+    try testing.expectEqual(@as(u64, 1), streams.consumed_bidi_streams);
 }
 
 test "PacketPacker: a sent packet records the control frames to repeat on loss" {

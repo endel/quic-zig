@@ -1681,12 +1681,13 @@ pub const StreamsMap = struct {
     /// Scan bidi streams for ones that are fully closed (both FIN sent and FIN received)
     /// and call closeStream for each. This ensures consumed_*_streams advances even when
     /// the close was never triggered by a received STREAM/RESET_STREAM frame.
+    /// Backstop for closeIfDone and the ACK-time disposal, which drop what
+    /// the disposal queue cannot hold. Runs only when armed: a scan per
+    /// packet was 2% of CPU on a server with responses always in flight.
     pub fn collectClosedStreams(self: *StreamsMap) void {
-        if (!self.needs_gc_scan) return; // No FIN events since last scan
+        if (!self.needs_gc_scan) return;
+        self.needs_gc_scan = false;
 
-        // Mark fully-closed streams for consumed counting, and reclaim any whose
-        // send side has settled since the last scan.
-        var found_pending = false;
         var it = self.streams.iterator();
         while (it.next()) |kv| {
             const s = kv.value_ptr.*;
@@ -1694,18 +1695,20 @@ pub const StreamsMap = struct {
                 s.closed_for_gc = true;
                 self.closeStream(s.stream_id);
             }
-            // Backstop for the ACK-time path: that one reclaims in O(1) but
-            // drops entries once the queue is full, and a stream can settle
-            // without any further ACK arriving to trigger the check.
             self.disposeIfSettled(s);
-            // Keep scanning only for streams a future scan could still act on.
-            // One that is settled but could not be enqueued is covered by
-            // `disposal_overflow` instead, so a caller that never drains does
-            // not leave us scanning the whole map on every send.
-            if (!s.disposal_queued and !s.isDisposable()) found_pending = true;
         }
-        // Stop scanning once every remaining stream is on its way out.
-        self.needs_gc_scan = found_pending;
+    }
+
+    /// Close a bidi stream once both directions are done, and reclaim it if
+    /// that also settles it. Called wherever either direction finishes: the
+    /// peer's last byte arriving, or our FIN going out.
+    pub fn closeIfDone(self: *StreamsMap, s: *Stream) void {
+        if (s.closed_for_gc) return;
+        if (!s.recv.fin_received or !s.recv.allReceived()) return;
+        if (!s.send.fin_sent and s.send.reset_err == null) return;
+        s.closed_for_gc = true;
+        self.closeStream(s.stream_id);
+        self.disposeIfSettled(s);
     }
 
     pub fn closeStream(self: *StreamsMap, stream_id: u64) void {
@@ -2989,7 +2992,7 @@ test "collectClosedStreams: marks a stream once both FINs have crossed" {
     try testing.expectEqual(@as(u64, 0), sm.consumed_bidi_streams);
 }
 
-test "collectClosedStreams: a FIN ahead of a hole keeps the stream until the hole fills" {
+test "closeIfDone: a FIN ahead of a hole keeps the stream until the hole fills" {
     var sm = StreamsMap.init(testing.allocator, true);
     defer sm.deinit();
     sm.setMaxStreams(10, 10);
@@ -3008,7 +3011,7 @@ test "collectClosedStreams: a FIN ahead of a hole keeps the stream until the hol
 
     try s.recv.handleStreamFrame(0, "hello", false);
     try testing.expect(s.recv.allReceived());
-    sm.collectClosedStreams();
+    sm.closeIfDone(s); // what the connection does with the frame filling it
     try testing.expect(s.closed_for_gc);
     try testing.expectEqual(@as(u64, 1), sm.consumed_bidi_streams);
 
