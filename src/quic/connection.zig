@@ -1158,7 +1158,7 @@ pub const Connection = struct {
         var ack_eliciting = false;
         while (remaining.len > 0) {
             if (remaining[0] == 0x00) {
-                remaining = remaining[1..];
+                remaining = remaining[frame_mod.paddingLen(remaining)..];
                 continue;
             }
             var frame_len: usize = undefined;
@@ -1427,9 +1427,8 @@ pub const Connection = struct {
         var qlog_frame_count: usize = 0;
 
         while (remaining.len > 0) {
-            // Skip padding
             if (remaining[0] == 0x00) {
-                remaining = remaining[1..];
+                remaining = remaining[frame_mod.paddingLen(remaining)..];
                 continue;
             }
 

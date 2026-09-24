@@ -3,6 +3,20 @@ const io = @import("../io_compat.zig");
 
 const packet = @import("packet.zig");
 
+/// Length of the run of PADDING (zero) bytes at the start of `bytes`.
+/// Padded Initials and PMTU probes carry ~1000 of them, so it scans a vector
+/// at a time.
+pub fn paddingLen(bytes: []const u8) usize {
+    const V = std.simd.suggestVectorLength(u8) orelse 16;
+    var i: usize = 0;
+    while (i + V <= bytes.len) : (i += V) {
+        const v: @Vector(V, u8) = bytes[i..][0..V].*;
+        if (@reduce(.Or, v) != 0) break;
+    }
+    while (i < bytes.len and bytes[i] == 0) i += 1;
+    return i;
+}
+
 pub const FrameError = error{
     FrameEncodingError,
 };
@@ -220,15 +234,8 @@ pub const Frame = union(FrameType) {
             // padding
             0x00 => .{
                 .padding = blk: {
-                    var len: usize = 1;
-
-                    while (stream.seek < bytes.len) {
-                        if (try reader.takeByte() != 0x00) {
-                            break;
-                        }
-                        len += 1;
-                    }
-
+                    const len = paddingLen(bytes);
+                    stream.seek = len;
                     break :blk len;
                 },
             },
@@ -1052,10 +1059,13 @@ test "parse padding frame" {
     }
     {
         var bytes = [_]u8{ 0x00, 0x00, 0x01 };
-        switch (try Frame.parse(&bytes)) {
+        var size: usize = undefined;
+        switch (try Frame.parseSized(&bytes, &size)) {
             FrameType.padding => |padding| try std.testing.expect(2 == padding),
             else => unreachable,
         }
+        // The PING that follows is the next frame, not part of the padding.
+        try std.testing.expectEqual(2, size);
     }
     {
         var bytes = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
@@ -1063,6 +1073,17 @@ test "parse padding frame" {
             FrameType.padding => |padding| try std.testing.expect(10 == padding),
             else => unreachable,
         }
+    }
+}
+
+test "paddingLen: runs across and inside vector-sized blocks" {
+    var buf: [200]u8 = @splat(0);
+    try std.testing.expectEqual(200, paddingLen(&buf));
+    try std.testing.expectEqual(0, paddingLen(&.{}));
+    for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 150, 199 }) |at| {
+        buf[at] = 0x01;
+        try std.testing.expectEqual(at, paddingLen(&buf));
+        buf[at] = 0x00;
     }
 }
 
