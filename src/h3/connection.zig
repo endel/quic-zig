@@ -990,8 +990,46 @@ pub const H3Connection = struct {
         }
     }
 
+    /// RFC 9114 §4.1.2: invalid characters in a field name or value make the
+    /// message malformed. The byte ranges are RFC 9113 §8.2.1's: a name is
+    /// visible lowercase ASCII, and a value carries no NUL, CR or LF.
+    /// Pseudo-header names are matched exactly by the callers.
+    fn fieldsValid(headers: []const qpack.Header) bool {
+        for (headers) |h| {
+            const pseudo = h.name.len > 0 and h.name[0] == ':';
+            if (!pseudo and (h.name.len == 0 or anyByte(h.name, badNameBytes))) return false;
+            if (anyByte(h.value, badValueBytes)) return false;
+        }
+        return true;
+    }
+
+    fn anyByte(bytes: []const u8, comptime bad: anytype) bool {
+        const V = std.simd.suggestVectorLength(u8) orelse 16;
+        var i: usize = 0;
+        while (i + V <= bytes.len) : (i += V) {
+            if (bad(V, bytes[i..][0..V].*)) return true;
+        }
+        for (bytes[i..]) |c| {
+            if (bad(1, .{c})) return true;
+        }
+        return false;
+    }
+
+    fn badNameBytes(comptime V: usize, c: @Vector(V, u8)) bool {
+        const invisible = c -% @as(@Vector(V, u8), @splat(0x21)) > @as(@Vector(V, u8), @splat(0x7e - 0x21));
+        const upper = c -% @as(@Vector(V, u8), @splat('A')) < @as(@Vector(V, u8), @splat(26));
+        return @reduce(.Or, invisible) or @reduce(.Or, upper);
+    }
+
+    fn badValueBytes(comptime V: usize, c: @Vector(V, u8)) bool {
+        return @reduce(.Or, c == @as(@Vector(V, u8), @splat(0))) or
+            @reduce(.Or, c == @as(@Vector(V, u8), @splat('\r'))) or
+            @reduce(.Or, c == @as(@Vector(V, u8), @splat('\n')));
+    }
+
     /// Validate request pseudo-headers per RFC 9114 §4.1.2, §4.3.
     fn validateRequestHeaders(headers: []const qpack.Header) bool {
+        if (!fieldsValid(headers)) return false;
         var method_count: u8 = 0;
         var scheme_count: u8 = 0;
         var path_count: u8 = 0;
@@ -1027,10 +1065,6 @@ pub const H3Connection = struct {
                 }
             } else {
                 pseudo_done = true;
-                // Header names must be lowercase
-                for (h.name) |c| {
-                    if (c >= 'A' and c <= 'Z') return false;
-                }
                 if (std.mem.eql(u8, h.name, "host")) has_host = true;
                 // te header: only "trailers" allowed
                 if (std.mem.eql(u8, h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) {
@@ -1061,6 +1095,7 @@ pub const H3Connection = struct {
 
     /// Validate response pseudo-headers per RFC 9114 §4.1, §4.3.
     fn validateResponseHeaders(headers: []const qpack.Header) bool {
+        if (!fieldsValid(headers)) return false;
         var status_count: u8 = 0;
         var pseudo_done = false;
 
@@ -1074,9 +1109,6 @@ pub const H3Connection = struct {
                 }
             } else {
                 pseudo_done = true;
-                for (h.name) |c| {
-                    if (c >= 'A' and c <= 'Z') return false;
-                }
             }
         }
 
@@ -1263,7 +1295,13 @@ pub const H3Connection = struct {
 
         // RFC 9114 §4.1: a later HEADERS frame without pseudo-headers is the
         // trailer section.
-        if (self.headers_received_streams.contains(stream_id) and !hasPseudoHeader(hdrs)) return null;
+        if (self.headers_received_streams.contains(stream_id) and !hasPseudoHeader(hdrs)) {
+            if (!fieldsValid(hdrs)) {
+                self.closeWithError(.message_error, "invalid trailer field");
+                return error.H3MessageError;
+            }
+            return null;
+        }
 
         // RFC 9114 §4.1.2, §4.3: validate pseudo-headers
         const valid = if (self.is_server)
@@ -1522,6 +1560,32 @@ test "ShutdownState: state transitions" {
 }
 
 // RFC 9114 §4.1.2, §4.3: Header validation tests
+
+test "fieldsValid: rejects invalid name and value bytes at any offset" {
+    const long = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz0123456789-_";
+    try testing.expect(H3Connection.fieldsValid(&.{.{ .name = long, .value = long }}));
+    // obs-text (0x80+) and interior spaces/tabs are legal in values
+    try testing.expect(H3Connection.fieldsValid(&.{.{ .name = "x", .value = "caf\xc3\xa9 a\tb" }}));
+    try testing.expect(!H3Connection.fieldsValid(&.{.{ .name = "", .value = "v" }}));
+
+    for ([_]u8{ 0x00, ' ', 'A', 'Z', 0x7f, 0x80, 0xff }) |bad| {
+        for ([_]usize{ 0, 15, 16, 31, 32, 63 }) |at| {
+            var name: [64]u8 = long.*;
+            name[at] = bad;
+            try testing.expect(!H3Connection.fieldsValid(&.{.{ .name = &name, .value = "v" }}));
+        }
+    }
+    for ([_]u8{ 0x00, '\r', '\n' }) |bad| {
+        for ([_]usize{ 0, 15, 16, 31, 32, 63 }) |at| {
+            var value: [64]u8 = long.*;
+            value[at] = bad;
+            try testing.expect(!H3Connection.fieldsValid(&.{.{ .name = "x", .value = &value }}));
+        }
+    }
+    // pseudo-header values are checked as well: CRLF in :path is request smuggling
+    try testing.expect(!H3Connection.fieldsValid(&.{.{ .name = ":path", .value = "/a\r\nx: y" }}));
+}
+
 
 test "validateRequestHeaders: valid GET" {
     const hdrs = [_]qpack.Header{

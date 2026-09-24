@@ -93,6 +93,16 @@ HTTP-client concern rather than an H3 protocol concern and is deferred.
 
 See [RFC9204_QPACK.md](RFC9204_QPACK.md).
 
+Field characters (§4.1.2) are checked by `fieldsValid` on every header
+and trailer section, using RFC 9113 §8.2.1's ranges. A name must be visible
+lowercase ASCII (no 0x00–0x20, `A`–`Z` or 0x7f–0xff). A value must not
+contain NUL, CR or LF, and that includes pseudo-header values. A violation
+closes the connection with `H3_MESSAGE_ERROR`.
+
+Caveats:
+- Leading or trailing whitespace in values is accepted.
+- Connection-specific fields other than `te` are not rejected.
+
 ## §4.3 HTTP Control Data — ✅ Done
 
 Pseudo-header validation lives in `validateRequestHeaders` and
