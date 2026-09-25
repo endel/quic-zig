@@ -240,15 +240,28 @@ pub const Conn = struct {
 
     /// Copies out decrypted application data; returns 0 when none is buffered.
     pub fn read(self: *Conn, buf: []u8) usize {
-        const avail = self.app_in.items[self.app_in_pos..];
+        const avail = self.unread();
         const n = @min(avail.len, buf.len);
         @memcpy(buf[0..n], avail[0..n]);
+        self.consume(n);
+        return n;
+    }
+
+    /// Decrypted application data not yet consumed, for a caller that parses
+    /// it where it lies instead of copying it out with `read`. The caller may
+    /// modify it. Valid until the next `feed`, `read` or `consume`.
+    pub fn unread(self: *Conn) []u8 {
+        return self.app_in.items[self.app_in_pos..];
+    }
+
+    /// Marks the first `n` bytes of `unread()` as consumed.
+    pub fn consume(self: *Conn, n: usize) void {
+        std.debug.assert(n <= self.app_in.items.len - self.app_in_pos);
         self.app_in_pos += n;
         if (self.app_in_pos == self.app_in.items.len) {
             self.app_in.clearRetainingCapacity();
             self.app_in_pos = 0;
         }
-        return n;
     }
 
     /// Encrypts application data into the output queue, in records of at

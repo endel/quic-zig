@@ -15,7 +15,7 @@ contributions" in `CLAUDE.md`.
 
 - **Baseline:** Zig 0.16.0, the version this repo builds against.
 - **Master:** each section says what Codeberg `ziglang/zig` master showed on
-  24 Sep 2026.
+  24 Sep 2026, or the date it gives.
 - **Benchmark hardware:** arm64 figures are native runs on an Apple M-series
   core. x86_64 figures ran under Rosetta in Docker Desktop. They are good for
   comparing one variant with another, not as absolute numbers. Confirm them on
@@ -31,6 +31,7 @@ contributions" in `CLAUDE.md`.
 | 6 | DER element parsing bounds | `src/quic/tls13.zig` `certificateWellFormed` | guard in front of std | yes: robustness bug |
 | 7 | `std.net.Address` | `src/sockaddr.zig` | adapted copy of 0.15.2 code | no: migration choice |
 | 8 | Fixed-buffer reader/writer | `src/io_compat.zig` | kept our own stream | maybe: codegen observation |
+| 9 | `std.http.Server.WebSocket` | `src/http1/websocket.zig` | replacement: sans-IO codec | maybe: API scope |
 
 Not a std divergence, but related: std picks the AES and GHASH
 implementation at **compile time** from the target's CPU features.
@@ -251,6 +252,33 @@ change, measure `Frame.parse`, not the primitive.
 
 This is an optimizer observation, not a std bug. It would need a minimal
 reproduction before it is worth mentioning upstream.
+
+## 9. `std.http.Server.WebSocket` isn't used
+
+**std 0.16** has a server-side WebSocket in `std/http/Server.zig`:
+`Request.respondWebSocket` writes the 101, and `WebSocket` reads and writes
+frames over a blocking `std.Io.Reader` / `Writer`. Its
+`readSmallMessage`:
+
+- rejects any fragmented message (`!fin` returns `MessageOversize`), and
+  rejects a continuation frame outright;
+- returns a Close frame as `error.ConnectionClose`, and skips pongs;
+- needs the whole frame to fit in the reader's buffer;
+- doesn't check RSV bits, UTF-8 in text frames, or close codes.
+
+**Ours:** `src/http1/websocket.zig` is a sans-IO codec that the HTTP/1.1
+listener drives from its libxev read callbacks. It adds fragmentation
+with control frames in between, a bound on message size, fail-fast UTF-8
+checking across fragments, close-code validation, and a vector unmask. The
+Autobahn testsuite passes it with no failures (`SPEC/RFC6455_WEBSOCKET.md`).
+The handshake uses std's `Sha1` and `base64`, like std's own.
+
+std's version is sized for the blocking `std.http.Server`, so this is a
+question of scope, not a bug. The Autobahn gaps above are specific enough
+to raise if std ever wants its WebSocket to be conformant.
+
+**Master** (Codeberg `5b9147ed59`, 25 Sep 2026): the same design. Only the
+unmask loop changed (`[4]u8` chunks instead of an `align(1) u32` slice).
 
 ---
 

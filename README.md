@@ -17,7 +17,7 @@ and goals of this project!
 - **HTTP/3** (RFC 9114) — QPACK static table, request/response, priority scheduling (RFC 9218)
 - **WebTransport** (draft-ietf-webtrans-http3) — bidi/uni streams, datagrams, Extended CONNECT, browser support
 - **Media over QUIC** (draft-ietf-moq-transport-17) — wire layer, pub/sub, multi-subscriber relay with alias remapping, live browser video demo (WebCodecs VP8)
-- **HTTP/1.1+TLS** — static file server on TCP, same cert as QUIC, Alt-Svc for HTTP/3 upgrade
+- **HTTP/1.1 + WebSocket** (RFC 6455) — TCP listener on the QUIC server's event loop: static files and WebSockets beside WebTransport, TLS 1.3 with the QUIC certificates, Alt-Svc for HTTP/3
 
 ## The Story
 
@@ -155,18 +155,42 @@ stable per-connection key.
 
 To run beside other I/O, pass `Config.loop` (a `event_loop.Xev.Loop` you own)
 and run it yourself; on teardown call `stop()` and keep running the loop until
-`isStopped()` before `deinit()`. `Client` works the same way. `reuse_port`,
-`recv_buffer_size`, `send_buffer_size`, `max_connections` and `alpn` are on
-`Config` too.
+`isStopped()` before `deinit()`. `Client` works the same way. A timer of your
+own on a server's loop (`server.eventLoop()`) should stop re-arming once
+`server.isStopping()` is true. `reuse_port`, `recv_buffer_size`,
+`send_buffer_size`, `max_connections` and `alpn` are on `Config` too.
 
-### Serving static files over HTTPS (HTTP/1.1+TLS)
+### HTTP/1.1 listener: static files and WebSockets
 
-The server can optionally serve static files over HTTP/1.1+TLS on the same port
-alongside QUIC. TCP and UDP are separate namespaces, so the same port works for
-both. The same TLS certificate is shared. An `Alt-Svc` header is automatically
-included to advertise HTTP/3 to browsers.
+`Config.http1` adds a TCP listener to the server, on the same port as QUIC
+by default (TCP and UDP don't clash) and on the **same event loop**. It
+serves static files and WebSockets (RFC 6455) with the QUIC certificates,
+and advertises HTTP/3 through `Alt-Svc`. A handler's WebSocket callbacks run
+on the loop's thread like its WebTransport ones, so one handler can serve
+both transports without locks: WebSocket as the fallback for browsers or
+networks where WebTransport isn't available.
 
 ```zig
+const MyHandler = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+
+    // ...WebTransport callbacks as above...
+
+    pub fn onWsUpgrade(_: *MyHandler, req: *event_loop.WsRequest, path: []const u8) void {
+        if (!std.mem.startsWith(u8, path, "/game")) return req.reject(404);
+        const ws = req.accept(.{}) catch return; // 101; `ws` can send right away
+        ws.send("welcome") catch {};
+    }
+
+    pub fn onWsMessage(_: *MyHandler, ws: *event_loop.WsConn, data: []const u8) void {
+        ws.send(data) catch {}; // echo; fragments arrive reassembled
+    }
+
+    // Once per accepted WebSocket: the peer's code, 1006 if the connection
+    // dropped, 1001 on stop(). `ws` is gone after this returns.
+    pub fn onWsClose(_: *MyHandler, _: *event_loop.WsConn, _: u16, _: []const u8) void {}
+};
+
 var server = try event_loop.Server(MyHandler).init(alloc, &handler, .{
     .port = 4433,
     .cert_path = "cert.pem",
@@ -175,21 +199,51 @@ var server = try event_loop.Server(MyHandler).init(alloc, &handler, .{
 });
 ```
 
-This is particularly useful for browser WebTransport — the browser loads the
-HTML/JS page over HTTPS, then upgrades to WebTransport over QUIC:
+- `onWsUpgrade` gets the request target, query string included. Read
+  request headers with `req.header("origin")`. Call `req.accept(.{
+  .protocol, .headers })` or `req.reject(status)`; a request left undecided
+  gets 403.
+- `onWsMessage` may take a fourth parameter, `kind: event_loop.WsMessageKind`,
+  to tell text from binary.
+- A `*WsConn` is valid until `onWsClose` returns. It has:
+  - `id()`, which comes from the counter behind `Session.id()`, so one map
+    can key both transports;
+  - `send` and `sendText`, which work from any callback on the loop,
+    WebTransport ones included;
+  - `close(code, reason)`;
+  - `bufferedAmount()`;
+  - `peerAddress()`.
+- `send` fails with `error.SendBufferFull` instead of queueing past
+  `max_send_buffer`.
+- `onWsClose` never fires from inside a `WsConn` method.
 
 | Transport | Port | Protocol |
 |-----------|------|----------|
 | UDP | 4433 | QUIC / H3 / WebTransport (TLS 1.3) |
-| TCP | 4433 | HTTP/1.1 static files (TLS 1.3) |
+| TCP | 4433 | HTTP/1.1 static files + WebSocket (TLS 1.3, or plain) |
 
 `Http1Config` options:
 
 | Field | Default | Description |
 |---|---|---|
-| `static_dir` | *(required)* | Directory to serve files from |
+| `static_dir` | `null` | Directory GET/HEAD serve from; without one, only WebSockets (other requests get 404) |
 | `port` | same as QUIC | TCP port override |
-| `alt_svc` | `true` | Send `Alt-Svc: h3=":port"` header |
+| `alt_svc` | `true` | Send `Alt-Svc: h3=":port"` |
+| `tls` | `true` | `false` serves plain `http://` / `ws://`: for localhost, where a browser can't pin a certificate hash for WebSocket as it can for WebTransport, or behind a TLS-terminating proxy |
+| `max_connections` | `4096` | Open TCP connections past which new ones are closed |
+| `handshake_timeout_ms` | `10000` | TLS handshake plus the first request head |
+| `keepalive_timeout_ms` | `15000` | Idle time between requests |
+| `websocket.max_message_size` | 1 MiB | Larger messages close with 1009 |
+| `websocket.max_send_buffer` | 4 MiB | Bytes `send` may leave queued for a slow peer |
+| `websocket.ping_interval_ms` | `30000` | Ping after this much silence; drop (1006) after twice it. `0` disables |
+
+`drain()` stops new TCP connections and lets requests in flight finish;
+WebSockets stay open, as WebTransport sessions do. `stop()` sends every
+WebSocket a Close with 1001. `zig build run-ws-echo-server -- --plain`
+echoes both transports from one handler. Against the Autobahn testsuite it
+scores 298 OK and 3 informational out of 301, with nothing failed or
+non-strict. `./tools/autobahn.sh` reruns it, and CI runs it too; see
+[`SPEC/RFC6455_WEBSOCKET.md`](SPEC/RFC6455_WEBSOCKET.md).
 
 ### Graceful shutdown
 
@@ -359,6 +413,7 @@ Produces binaries in `zig-out/bin/`:
 | `wt-server` | WebTransport echo server |
 | `wt-client` | WebTransport client |
 | `wt-browser-server` | WebTransport server for browser clients (0.0.0.0:4433) |
+| `ws-echo-server` | WebSocket and WebTransport echo from one handler (`--plain` for ws://) |
 | `moq-server` | MoQ Transport publisher over raw QUIC (ALPN `moqt-18`/`moqt-17`) |
 | `moq-client` | MoQ Transport client over raw QUIC — subscribe or `--mode publish` |
 | `moq-relay` | MoQ Transport relay, WebTransport and raw QUIC on one port; serves the browser demos |

@@ -469,6 +469,27 @@ against the W3C spec: `SPEC/webtransport_w3c_api.md`.
 
 ---
 
+## RFC 6455 — The WebSocket Protocol (server, over HTTP/1.1)
+
+| § | Section | Status | Notes |
+|---|---------|--------|-------|
+| 4.2 | Server opening handshake | ✅ Done | Request checks, Sec-WebSocket-Accept, subprotocol selection, 426 for other versions |
+| 5.1–5.3 | Framing and masking | ✅ Done | Unmasked client frames, RSV bits and reserved opcodes → 1002 |
+| 5.4 | Fragmentation | ✅ Done | Bounded by `max_message_size` (1009), control frames interleaved |
+| 5.5 | Control frames | ✅ Done | Ping → pong, close handshake both ways |
+| 5.6 | Data frames | ✅ Done | Text checked as UTF-8 (1007) as it arrives, within a frame and across fragments |
+| 7 | Closing | ✅ Done | Close codes validated; 1006 on a dropped connection; idle ping and timeout |
+| 9 / RFC 7692 | permessage-deflate | ❌ Missing | Not negotiated; browsers carry on without it |
+| RFC 8441 / 9220 | WebSockets over HTTP/2 or HTTP/3 | ❌ Missing | HTTP/1.1 only |
+
+### Summary — RFC 6455: 6 done, 2 missing
+
+Autobahn fuzzingclient, `ws://` and `wss://`, macOS and Linux: 298 OK, 3
+INFORMATIONAL, 0 NON-STRICT, 0 FAILED of 301 cases (`tools/autobahn.sh`, run
+in CI). Details, API and caveats: [RFC6455_WEBSOCKET.md](RFC6455_WEBSOCKET.md).
+
+---
+
 ## RFC 9369 — QUIC Version 2
 
 | § | Section | Status | Notes |
@@ -562,6 +583,7 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | RFC 9368 (Version Neg) | 3 | 0 | 0 | 100% |
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
 | WebTransport | 20 | 1 | 2 | 87% |
+| RFC 6455 (WebSocket, server) | 6 | 0 | 2 | 75% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
 | MoQ Transport (draft-17, -18) | 15 | 1 | 0 | see below |
 | moq-lite (draft-05) | 6 | 2 | 1 | see below |

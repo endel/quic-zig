@@ -28,6 +28,8 @@ const stream = @import("quic/stream.zig");
 const connection = @import("quic/connection.zig");
 const tls13 = @import("quic/tls13.zig");
 const tls_client = @import("tls/client.zig");
+const http1_parser = @import("http1/parser.zig");
+const websocket = @import("http1/websocket.zig");
 const moq_wire = @import("moq/wire.zig");
 const moq_msg = @import("moq/message.zig");
 const moq_codes = @import("moq/message_codes.zig");
@@ -370,6 +372,188 @@ test "fuzz: client certificate messages" {
             _ = tls13.verifyPeerChain(list, &empty, 1_800_000_000) catch {};
         }
     }.f, .{ .corpus = &seeds });
+}
+
+test "fuzz: http/1.1 request head" {
+    const seeds = comptime [_][]const u8{
+        "GET /ws?x=1 HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+    };
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+            var hb: [100]http1_parser.Header = undefined;
+            const p = (http1_parser.parseRequest(input, &hb, .{}) catch return) orelse return;
+            try testing.expect(p.len <= input.len);
+            if (websocket.isUpgrade(&p.head)) {
+                const key = websocket.checkUpgrade(&p.head) catch return;
+                _ = websocket.acceptKey(key);
+            }
+        }
+    }.f, .{ .corpus = &seeds });
+}
+
+test "fuzz: websocket frame decoder" {
+    // Masked frames: a fragmented text message, a ping, a close.
+    const seeds = comptime [_][]const u8{
+        &.{ 0x01, 0x81, 1, 2, 3, 4, 'H' ^ 1, 0x80, 0x81, 1, 2, 3, 4, 'i' ^ 1 },
+        &.{ 0x89, 0x80, 0, 0, 0, 0 },
+        &.{ 0x88, 0x82, 0, 0, 0, 0, 0x03, 0xe8 },
+    };
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+            // The decoder unmasks in place.
+            const buf = try testing.allocator.dupe(u8, input);
+            defer testing.allocator.free(buf);
+            var d = websocket.Decoder.init(4096);
+            defer d.deinit(testing.allocator);
+            var pos: usize = 0;
+            while (pos < buf.len) {
+                const step = d.decode(testing.allocator, buf[pos..]) catch return;
+                if (step.consumed == 0) return;
+                try testing.expect(step.consumed <= buf.len - pos);
+                pos += step.consumed;
+                if (step.event) |ev| switch (ev) {
+                    .message => |m| {
+                        try testing.expect(m.data.len <= 4096);
+                        if (m.kind == .text) try testing.expect(std.unicode.utf8ValidateSlice(m.data));
+                    },
+                    .ping, .pong => |p| try testing.expect(p.len <= 125),
+                    .close => |c| if (c.code) |code| try testing.expect(websocket.isValidCloseCode(code)),
+                };
+            }
+        }
+    }.f, .{ .corpus = &seeds });
+}
+
+/// Masked client frames — a fragmented text message around a ping, a binary
+/// message, a close — for the sweep below to corrupt.
+fn seedWebSocketFrames(buf: []u8, rand: std.Random) usize {
+    const Piece = struct { op: websocket.Opcode, fin: bool, payload: []const u8 };
+    const pieces = [_]Piece{
+        .{ .op = .text, .fin = false, .payload = "Hé" },
+        .{ .op = .ping, .fin = true, .payload = "p" },
+        .{ .op = .continuation, .fin = true, .payload = "llo, wörld" },
+        .{ .op = .binary, .fin = true, .payload = &.{ 0, 1, 2, 3, 250 } },
+        .{ .op = .close, .fin = true, .payload = &.{ 0x03, 0xe8, 'o', 'k' } },
+    };
+    var pos: usize = 0;
+    for (pieces) |p| {
+        var hdr: [10]u8 = undefined;
+        const h = websocket.writeFrameHeader(&hdr, p.op, p.fin, p.payload.len);
+        if (pos + h.len + 4 + p.payload.len > buf.len) break;
+        @memcpy(buf[pos..][0..h.len], h);
+        buf[pos + 1] |= 0x80;
+        var key: [4]u8 = undefined;
+        rand.bytes(&key);
+        @memcpy(buf[pos + h.len ..][0..4], &key);
+        const body = buf[pos + h.len + 4 ..][0..p.payload.len];
+        @memcpy(body, p.payload);
+        websocket.unmask(body, key);
+        pos += h.len + 4 + p.payload.len;
+    }
+    return pos;
+}
+
+const WsOutcome = struct { events: usize = 0, digest: u64 = 0, err: ?anyerror = null };
+
+/// Decodes `buf` as frames that arrive all at once, or in random pieces
+/// when `rand` is given, checking each event and summing them up.
+fn wsDecodeAll(buf: []u8, rand: ?std.Random) !WsOutcome {
+    var d = websocket.Decoder.init(64);
+    defer d.deinit(testing.allocator);
+    var out: WsOutcome = .{};
+    var h = std.hash.Wyhash.init(0);
+    var pos: usize = 0;
+    var avail: usize = if (rand) |r| @min(buf.len, 1 + r.uintLessThan(usize, 16)) else buf.len;
+    while (pos < buf.len) {
+        const step = d.decode(testing.allocator, buf[pos..avail]) catch |err| {
+            out.err = err;
+            break;
+        };
+        if (step.consumed == 0) {
+            if (avail == buf.len) break;
+            avail = @min(buf.len, avail + 1 + rand.?.uintLessThan(usize, 16));
+            continue;
+        }
+        try testing.expect(step.consumed <= avail - pos);
+        pos += step.consumed;
+        const ev = step.event orelse continue;
+        out.events += 1;
+        h.update(@tagName(ev));
+        switch (ev) {
+            .message => |m| {
+                try testing.expect(m.data.len <= 64);
+                if (m.kind == .text) try testing.expect(std.unicode.utf8ValidateSlice(m.data));
+                h.update(@tagName(m.kind));
+                h.update(m.data);
+            },
+            .ping, .pong => |p| {
+                try testing.expect(p.len <= 125);
+                h.update(p);
+            },
+            .close => |c| {
+                if (c.code) |code| try testing.expect(websocket.isValidCloseCode(code));
+                try testing.expect(std.unicode.utf8ValidateSlice(c.reason));
+                h.update(c.reason);
+            },
+        }
+    }
+    out.digest = h.final();
+    return out;
+}
+
+// Like the MoQ sweep below: testing.fuzz only ever sees its seeds here.
+test "websocket decoder and request heads survive a randomized sweep" {
+    var prng = std.Random.DefaultPrng.init(0x77730d0a);
+    const rand = prng.random();
+    var buf: [512]u8 = undefined;
+
+    for (0..SWEEP_ITERATIONS) |i| {
+        var len = 1 + rand.uintLessThan(usize, buf.len - 1);
+        rand.bytes(buf[0..len]);
+        if (i % 2 == 0) {
+            len = seedWebSocketFrames(&buf, rand);
+            corrupt(buf[0..len], rand);
+        }
+        // The decoder unmasks in place: the second pass gets its own copy.
+        var copy: [512]u8 = undefined;
+        @memcpy(copy[0..len], buf[0..len]);
+        const whole = try wsDecodeAll(buf[0..len], null);
+        const pieces = try wsDecodeAll(copy[0..len], rand);
+        // Arriving in pieces may only fail sooner (fail-fast UTF-8, on a
+        // frame the whole input doesn't finish); otherwise it's the same.
+        if (whole.err) |err| try testing.expectEqual(@as(?anyerror, err), pieces.err);
+        if (pieces.err == null) {
+            try testing.expectEqual(whole.events, pieces.events);
+            try testing.expectEqual(whole.digest, pieces.digest);
+        }
+    }
+
+    const heads = [_][]const u8{
+        "GET /ws?x=1 HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        "POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello",
+    };
+    for (0..SWEEP_ITERATIONS) |i| {
+        const seed = heads[i % heads.len];
+        @memcpy(buf[0..seed.len], seed);
+        corrupt(buf[0..seed.len], rand);
+        const len = seed.len - rand.uintLessThan(usize, 8);
+        var hb: [16]http1_parser.Header = undefined;
+        const p = (http1_parser.parseRequest(buf[0..len], &hb, .{}) catch continue) orelse continue;
+        try testing.expect(p.len <= len);
+        for (p.head.headers) |h| {
+            try testing.expect(http1_parser.isToken(h.name));
+            try testing.expect(http1_parser.isFieldValue(h.value));
+        }
+        if (websocket.isUpgrade(&p.head)) {
+            if (websocket.checkUpgrade(&p.head)) |key| _ = websocket.acceptKey(key) else |_| {}
+        }
+    }
 }
 
 // ════════════════════════════════════════════════════════

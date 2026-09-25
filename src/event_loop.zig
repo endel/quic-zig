@@ -2,14 +2,15 @@ const std = @import("std");
 const posix = std.posix;
 const builtin = @import("builtin");
 const log = std.log.scoped(.event_loop);
-const xev_mod = @import("xev");
 const sys = @import("sys.zig");
 const net = @import("sockaddr.zig");
 const io_compat = @import("io_compat.zig");
 
-// Default backend: epoll on Linux, kqueue on macOS.
-// io_uring init fails in some containers used by the interop runner.
-const xev = if (builtin.os.tag == .linux) xev_mod.Epoll else xev_mod;
+const xev_backend = @import("xev_backend.zig");
+const xev = xev_backend.xev;
+const halted_poll_action = xev_backend.halted_poll_action;
+const forgetPollResult = xev_backend.forgetPollResult;
+const cancelCompletion = xev_backend.cancelCompletion;
 
 /// The libxev backend this build selected. A caller sharing one loop across
 /// several clients has to create it from here: on Linux this is `Epoll`, not
@@ -40,7 +41,17 @@ pub const Protocol = enum { quic, h3, h0, webtransport };
 /// HTTP/3 error codes, for `Session.resetRequest` and `onRequestCancelled`.
 pub const H3Error = h3.H3Error;
 
-pub const Http1Config = http1.Http1Config;
+pub const Http1Config = http1.Config;
+pub const Http1WebSocketConfig = http1.WebSocketConfig;
+
+/// A WebSocket upgrade request, handed to `onWsUpgrade`; see `http1.WsRequest`.
+pub const WsRequest = http1.WsRequest;
+/// An open WebSocket; see `http1.WsConn`.
+pub const WsConn = http1.WsConn;
+pub const WsAcceptOptions = http1.WsAcceptOptions;
+pub const WsSendError = http1.WsSendError;
+pub const WsMessageKind = http1.WsMessageKind;
+pub const WsCloseCode = http1.WsCloseCode;
 
 /// The largest datagram we can receive whole. It has to be whatever we tell
 /// peers they may send — a longer one is truncated by recvmsg and then fails
@@ -122,9 +133,12 @@ pub const Config = struct {
     // migrating to the server's preferred address can reach us.
     preferred_port: ?u16 = null,
 
-    /// Enable HTTP/1.1 static file server on TCP alongside QUIC on UDP.
-    /// Uses the same port (TCP and UDP are separate namespaces) by default.
-    /// Serves files from static_dir and advertises HTTP/3 via Alt-Svc header.
+    /// An HTTP/1.1 listener on TCP beside QUIC on UDP, on the same port by
+    /// default (TCP and UDP are separate namespaces) and the same loop:
+    /// static files from `static_dir`, WebSockets through the handler's
+    /// `onWsUpgrade` / `onWsMessage` / `onWsClose`, TLS with the QUIC
+    /// certificates, and Alt-Svc advertising HTTP/3. Required when the
+    /// handler declares `onWsUpgrade`.
     http1: ?Http1Config = null,
 
     /// ALPN protocols offered in the handshake when the server loads its
@@ -630,6 +644,7 @@ pub fn Server(comptime Handler: type) type {
             "onData",             "onH0Request",        "onH0Data",
             "onH0Finished",       "onWritable",         "onRequestEnd",
             "onRequestCancelled", "onConnectionClosed", "onQuicConnected",
+            "onWsUpgrade",        "onWsMessage",        "onWsClose",
         };
 
         for (@typeInfo(Handler).@"struct".decls) |decl| {
@@ -648,7 +663,8 @@ pub fn Server(comptime Handler: type) type {
                         "onSessionReady, onStreamData, onDatagram, onSessionClosed, " ++
                         "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
                         "onStopSending, onWritable, onPollComplete, onConnectionClosed, " ++
-                        "onQuicConnected, onH0Request, onH0Data, onH0Finished");
+                        "onQuicConnected, onH0Request, onH0Data, onH0Finished, " ++
+                        "onWsUpgrade, onWsMessage, onWsClose");
                 }
             }
         }
@@ -663,6 +679,23 @@ pub fn Server(comptime Handler: type) type {
                 @compileError("onStreamData must have 4 params (self, session, stream_id, data) " ++
                     "or 5 params (self, session, stream_id, data, fin)");
             }
+        }
+
+        if ((@hasDecl(Handler, "onWsMessage") or @hasDecl(Handler, "onWsClose")) and !@hasDecl(Handler, "onWsUpgrade")) {
+            @compileError("onWsMessage and onWsClose need onWsUpgrade, which accepts the WebSockets they serve");
+        }
+        if (@hasDecl(Handler, "onWsUpgrade") and @typeInfo(@TypeOf(Handler.onWsUpgrade)).@"fn".params.len != 3) {
+            @compileError("onWsUpgrade must have 3 params (self, req: *WsRequest, path)");
+        }
+        if (@hasDecl(Handler, "onWsMessage")) {
+            const n = @typeInfo(@TypeOf(Handler.onWsMessage)).@"fn".params.len;
+            if (n != 3 and n != 4) {
+                @compileError("onWsMessage must have 3 params (self, ws: *WsConn, data) " ++
+                    "or 4 params (self, ws, data, kind: WsMessageKind)");
+            }
+        }
+        if (@hasDecl(Handler, "onWsClose") and @typeInfo(@TypeOf(Handler.onWsClose)).@"fn".params.len != 4) {
+            @compileError("onWsClose must have 4 params (self, ws: *WsConn, code: u16, reason)");
         }
     }
 
@@ -734,8 +767,8 @@ pub fn Server(comptime Handler: type) type {
 
         preferred: ?PreferredSocket,
 
-        /// Optional HTTP/1.1 static file server (runs on a separate thread).
-        http1_server: ?http1.Http1Server,
+        /// Optional HTTP/1.1 listener on the same loop; see `Config.http1`.
+        http1_server: ?http1.Server,
 
         foreign_hook: ?ForeignDatagramHook,
 
@@ -757,6 +790,8 @@ pub fn Server(comptime Handler: type) type {
         };
 
         pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: Config) !Self {
+            if (@hasDecl(Handler, "onWsUpgrade") and config.http1 == null) return error.WebSocketNeedsHttp1;
+
             // Determine TLS config: use advanced or build from cert/key paths
             var owned_tls: ?OwnedTlsMaterial = null;
             const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
@@ -853,11 +888,21 @@ pub fn Server(comptime Handler: type) type {
             const file_handle = xev.File.initFd(sockfd);
             const timer_handle = try xev.Timer.init();
 
-            // Optional HTTP/1.1 static file server
-            const http1_server: ?http1.Http1Server = if (config.http1) |h1cfg|
-                try http1.Http1Server.init(config.address, h1cfg, config.port, .{
-                    .cert_chain_der = tls_config.cert_chain_der,
-                    .private_key_bytes = tls_config.private_key_bytes,
+            const http1_server: ?http1.Server = if (config.http1) |h1cfg|
+                try http1.Server.init(alloc, h1cfg, .{
+                    .address = config.address,
+                    .ipv6 = config.ipv6,
+                    .quic_port = config.port,
+                    .reuse_port = config.reuse_port,
+                    .certs = .{
+                        .entries = tls_config.certs,
+                        .single = .{
+                            .cert_chain_der = tls_config.cert_chain_der,
+                            .private_key_bytes = tls_config.private_key_bytes,
+                            .private_key_algorithm = tls_config.private_key_algorithm,
+                        },
+                        .client_auth = tls_config.client_auth,
+                    },
                 })
             else
                 null;
@@ -907,7 +952,6 @@ pub fn Server(comptime Handler: type) type {
             // On a shared loop our completions must be off it first; see
             // Config.loop.
             if (self.shared_loop != null) std.debug.assert(self.isStopped());
-            // Stop HTTP/1.1 server
             if (self.http1_server) |*h1| h1.deinit();
 
             // Whatever is still live goes now; the handler hears about each
@@ -944,10 +988,10 @@ pub fn Server(comptime Handler: type) type {
             if (self.preferred) |*p| {
                 p.file.poll(loop, &p.poll_completion, .read, Self, self, onReadable);
             }
-            // Start HTTP/1.1 server thread if configured
             if (self.http1_server) |*h1| {
-                h1.start() catch |err| {
-                    log.err("Failed to start HTTP/1.1 server: {any}", .{err});
+                // WebSocket ids share the QUIC connection counter.
+                h1.start(loop, http1.handlersFor(Handler, self.handler), &self.conn_mgr.next_entry_id) catch |err| {
+                    log.err("Failed to start HTTP/1.1 listener: {any}", .{err});
                 };
             }
             // Arm initial timer (1ms to kick things off)
@@ -973,6 +1017,14 @@ pub fn Server(comptime Handler: type) type {
             try self.eventLoop().run(.no_wait);
         }
 
+        /// True from the moment `stop()` is called, on either kind of loop.
+        /// A caller's own completion on the server's loop — a room tick,
+        /// say — should stop re-arming then: a shared loop can't run dry
+        /// while it does.
+        pub fn isStopping(self: *const Self) bool {
+            return self.stopping;
+        }
+
         /// On a shared loop: true once `stop()` has finished and none of the
         /// server's completions remain on the loop, so `deinit()` is safe.
         pub fn isStopped(self: *Self) bool {
@@ -987,6 +1039,7 @@ pub fn Server(comptime Handler: type) type {
             for (pending) |c| if (c.state() != .dead) return false;
             if (self.preferred) |*p| if (p.poll_completion.state() != .dead) return false;
             for (&self.cancel_completions) |*c| if (c.state() != .dead) return false;
+            if (self.http1_server) |*h1| if (!h1.isStopped()) return false;
             return true;
         }
 
@@ -1056,6 +1109,7 @@ pub fn Server(comptime Handler: type) type {
             if (self.draining or self.stopping) return;
             self.draining = true;
             self.conn_mgr.refuse_new = true;
+            if (self.http1_server) |*h1| h1.drain();
             const now: i64 = sys.nanoTimestamp();
             for (self.conn_mgr.entries.items) |entry| beginDrain(entry, now);
             self.flush();
@@ -1065,6 +1119,7 @@ pub fn Server(comptime Handler: type) type {
         /// each has closed or is closing. `stop()` then finishes promptly.
         pub fn isDrained(self: *Self) bool {
             if (!self.draining) return false;
+            if (self.http1_server) |*h1| if (!h1.isDrained()) return false;
             for (self.conn_mgr.entries.items) |entry| {
                 if (entry.conn.state != .closing and entry.conn.state != .draining and
                     entry.conn.state != .terminated) return false;
@@ -1134,6 +1189,7 @@ pub fn Server(comptime Handler: type) type {
         /// CONNECTION_CLOSE, pending data is flushed, then the event loop exits.
         pub fn stop(self: *Self) void {
             self.stopping = true;
+            if (self.http1_server) |*h1| h1.stop();
             self.conn_mgr.refuse_new = true; // or arrivals keep stop() from finishing
             for (self.conn_mgr.entries.items) |entry| {
                 const conn = entry.conn;
@@ -2010,27 +2066,6 @@ const RxWait = struct {
         self.* = .{ .report_at = now + std.time.ns_per_s };
     }
 };
-
-/// What a socket watch returns once its server has halted, with a cancel for
-/// it queued. Epoll's cancel removes the fd unconditionally and panics if it
-/// is already gone, so the watch must stay for it. Kqueue's cancel is a no-op
-/// for a watch whose event already fired, so that watch must leave by itself.
-const halted_poll_action: xev.CallbackAction = if (xev.backend == .epoll) .rearm else .disarm;
-
-/// Kqueue's cancel skips a watch whose result is set, taking it to be queued
-/// for its callback. Only the callback clears it, so a watch registered on an
-/// already-readable socket would otherwise outlive the cancel in `stop()`.
-/// Safe here: the loop has already handed the result to the callback.
-fn forgetPollResult(c: *xev.Completion) void {
-    if (comptime @hasField(xev.Completion, "result")) c.result = null;
-}
-
-/// Queue the removal of `target` from `loop`, unless it is already off it.
-fn cancelCompletion(loop: *xev.Loop, target: *xev.Completion, c: *xev.Completion) void {
-    if (target.state() == .dead) return;
-    c.* = .{ .op = .{ .cancel = .{ .c = target } } };
-    loop.add(c);
-}
 
 // ---------------------------------------------------------------------------
 // Client
