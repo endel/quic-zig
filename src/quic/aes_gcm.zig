@@ -3,17 +3,34 @@
 //! H and recomputes H's powers for GHASH. A packet protection key encrypts
 //! millions of packets, so `Ctx` does that at key installation.
 //!
-//! The per-message steps are std's `AesGcm.encrypt`/`decrypt` (Zig 0.16.0)
-//! line for line, over the tuned GHASH in `ghash.zig` and 0.16's CTR loop.
-//! Zig master's CTR (after 0.16) encrypts a whole parallel batch for the
-//! tail and XORs it bytewise: 161 → 215 ns at 1200 B, 9 → 38 ns at 64 B.
+//! The per-message steps follow std's `AesGcm.encrypt`/`decrypt` (Zig
+//! 0.16.0), including checking the tag before decrypting.
+//!
+//! With hardware AES, CTR runs 8 blocks at a time with the round keys held in
+//! registers, and the tail as one batch of exactly the blocks left, with the
+//! tag mask as one more lane. On arm64 each round is `aese` with the round key
+//! plus `aesmc`, a pair the core fuses. std's armcrypto rounds are `aese` with
+//! a zero key, `aesmc`, then an `eor` of the round key, with operands limited
+//! to v0-v15, so 6+ blocks and 11 round keys don't fit and keys get reloaded.
+//! GHASH is `ghash.zig`. Without hardware AES, CTR is std's.
 //! See DECISIONS/zig_std_divergences.md.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const crypto = std.crypto;
 const mem = std.mem;
 const Aes128 = crypto.core.aes.Aes128;
+const Block = crypto.core.aes.Block;
 const Ghash = @import("ghash.zig").Ghash;
+
+/// AES-NI or ARMv8 crypto: both store a block as this vector.
+const fast = crypto.core.aes.has_hardware_support and builtin.zig_backend != .stage2_c and
+    builtin.cpu.arch.endian() == .little;
+const V = @Vector(2, u64);
+/// Blocks per CTR step. 8 in flight plus 11 round keys fit arm64's 32 vector
+/// registers.
+const wide = 8;
+const RoundKeys = [Aes128.rounds + 1]Block;
 
 pub const tag_length = 16;
 pub const nonce_length = 12;
@@ -37,24 +54,8 @@ pub const Ctx = struct {
         std.debug.assert(c.len == m.len);
         std.debug.assert(m.len <= 16 * ((1 << 32) - 2));
 
-        var t: [16]u8 = undefined;
-        var j: [16]u8 = undefined;
-        j[0..nonce_length].* = npub;
-        mem.writeInt(u32, j[nonce_length..][0..4], 1, .big);
-        self.aes.encrypt(&t, &j);
-
-        var mac = self.mac;
-        mac.update(ad);
-        mac.pad();
-
-        mem.writeInt(u32, j[nonce_length..][0..4], 2, .big);
-        ctr(self.aes, c, m, j);
-        mac.update(c[0..m.len]);
-        mac.pad();
-
-        mac.update(&lengthBlock(ad.len, m.len));
-        mac.final(tag);
-        for (t, 0..) |x, i| tag[i] ^= x;
+        const t = self.ctr(true, c, m, npub);
+        tag.* = self.ghashTag(ad, c[0..m.len], t);
     }
 
     /// `m` and `c` may be the same buffer. Contents of `m` are undefined if
@@ -62,23 +63,7 @@ pub const Ctx = struct {
     pub fn decrypt(self: *const Ctx, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8) crypto.errors.AuthenticationError!void {
         std.debug.assert(c.len == m.len);
 
-        var t: [16]u8 = undefined;
-        var j: [16]u8 = undefined;
-        j[0..nonce_length].* = npub;
-        mem.writeInt(u32, j[nonce_length..][0..4], 1, .big);
-        self.aes.encrypt(&t, &j);
-
-        var mac = self.mac;
-        mac.update(ad);
-        mac.pad();
-        mac.update(c);
-        mac.pad();
-
-        mac.update(&lengthBlock(ad.len, m.len));
-        var computed_tag: [tag_length]u8 = undefined;
-        mac.final(&computed_tag);
-        for (t, 0..) |x, i| computed_tag[i] ^= x;
-
+        var computed_tag = self.ghashTag(ad, c, self.counterBlock(npub, 1));
         const verify = crypto.timing_safe.eql([tag_length]u8, computed_tag, tag);
         if (!verify) {
             crypto.secureZero(u8, &computed_tag);
@@ -86,44 +71,127 @@ pub const Ctx = struct {
             return error.AuthenticationFailed;
         }
 
-        mem.writeInt(u32, j[nonce_length..][0..4], 2, .big);
-        ctr(self.aes, m, c, j);
+        _ = self.ctr(false, m, c, npub);
     }
 
-    /// std.crypto.core.modes.ctr from Zig 0.16.0, whole block as a big-endian
-    /// counter, with the batch increment made wrapping as master has it.
-    fn ctr(aes: anytype, dst: []u8, src: []const u8, iv: [16]u8) void {
-        std.debug.assert(dst.len >= src.len);
-        const block_length = 16;
-        const parallel_count = @TypeOf(aes).block.parallel.optimal_parallel_blocks;
-        const wide_block_length = parallel_count * block_length;
+    /// GHASH(ad, c) XOR `mask`: the tag.
+    fn ghashTag(self: *const Ctx, ad: []const u8, c: []const u8, mask: [16]u8) [16]u8 {
+        var s: [16]u8 = undefined;
+        var mac = self.mac;
+        mac.update(ad);
+        mac.pad();
+        mac.update(c);
+        mac.pad();
+        mac.update(&lengthBlock(ad.len, c.len));
+        mac.final(&s);
+        for (&s, mask) |*x, y| x.* ^= y;
+        return s;
+    }
 
-        var counter_block = iv;
+    /// E(K, npub || BE32(n)).
+    fn counterBlock(self: *const Ctx, npub: [nonce_length]u8, n: u32) [16]u8 {
+        var out: [16]u8 = undefined;
+        if (fast) {
+            const rk = self.aes.key_schedule.round_keys;
+            out = @bitCast(encryptBlocks(1, &rk, counters(1, counterBase(npub), n))[0]);
+        } else {
+            var j: [16]u8 = undefined;
+            j[0..nonce_length].* = npub;
+            mem.writeInt(u32, j[nonce_length..][0..4], n, .big);
+            self.aes.encrypt(&out, &j);
+        }
+        return out;
+    }
+
+    /// GCM's CTR: counter blocks npub || BE32(2), BE32(3), ... `dst` and
+    /// `src` may be the same buffer. With `mask`, also returns E(K, npub ||
+    /// BE32(1)), the tag mask; otherwise the result is undefined.
+    fn ctr(self: *const Ctx, comptime mask: bool, dst: []u8, src: []const u8, npub: [nonce_length]u8) [16]u8 {
+        std.debug.assert(dst.len >= src.len);
+        if (fast) return ctrFast(mask, &self.aes.key_schedule.round_keys, dst, src, npub);
+        var j: [16]u8 = undefined;
+        j[0..nonce_length].* = npub;
+        mem.writeInt(u32, j[nonce_length..][0..4], 2, .big);
+        crypto.core.modes.ctr(@TypeOf(self.aes), self.aes, dst, src, j, .big);
+        return if (mask) self.counterBlock(npub, 1) else undefined;
+    }
+
+    fn ctrFast(comptime mask: bool, round_keys: *const RoundKeys, dst: []u8, src: []const u8, npub: [nonce_length]u8) [16]u8 {
+        const rk = round_keys.*; // a local, so stores to dst can't alias it
+        const base = counterBase(npub);
+        var n: u32 = 2;
         var i: usize = 0;
-        var cnt_val = mem.readInt(u128, &counter_block, .big);
-        if (src.len >= wide_block_length) {
-            var counters: [wide_block_length]u8 = undefined;
-            while (i + wide_block_length <= src.len) : (i += wide_block_length) {
-                inline for (0..parallel_count) |k| {
-                    mem.writeInt(u128, counters[k * block_length ..][0..block_length], cnt_val +% k, .big);
+        while (i + 16 * wide <= src.len) : (i += 16 * wide) {
+            const ks = encryptBlocks(wide, &rk, counters(wide, base, n));
+            n +%= wide;
+            inline for (0..wide) |b| xorBlock(dst[i + 16 * b ..][0..16], src[i + 16 * b ..][0..16], ks[b]);
+        }
+        // The rest in one batch, the mask riding along as its last lane.
+        switch ((src.len - i + 15) / 16) {
+            inline 0...wide => |k| {
+                const lanes = k + @intFromBool(mask);
+                if (lanes == 0) return undefined;
+                var ctrs: [lanes]V = undefined;
+                ctrs[0..k].* = counters(k, base, n);
+                if (mask) ctrs[k] = counters(1, base, 1)[0];
+                const ks = encryptBlocks(lanes, &rk, ctrs);
+                if (k > 0) {
+                    inline for (0..k - 1) |b| xorBlock(dst[i + 16 * b ..][0..16], src[i + 16 * b ..][0..16], ks[b]);
+                    const last = i + 16 * (k - 1);
+                    const r = src.len - last;
+                    var buf: [16]u8 = @splat(0);
+                    @memcpy(buf[0..r], src[last..]);
+                    xorBlock(&buf, &buf, ks[k - 1]);
+                    @memcpy(dst[last..][0..r], buf[0..r]);
                 }
-                cnt_val +%= parallel_count;
-                aes.xorWide(parallel_count, dst[i..][0..wide_block_length], src[i..][0..wide_block_length], counters);
+                return if (mask) @bitCast(ks[k]) else undefined;
+            },
+            else => unreachable,
+        }
+    }
+
+    inline fn xorBlock(dst: *[16]u8, src: *const [16]u8, ks: V) void {
+        dst.* = @bitCast(@as(V, @bitCast(src.*)) ^ ks);
+    }
+
+    /// npub || 00000000, so a counter is OR-ed into the top half of lane 1.
+    inline fn counterBase(npub: [nonce_length]u8) V {
+        return @bitCast(npub ++ [_]u8{0} ** 4);
+    }
+
+    inline fn counters(comptime k: usize, base: V, n: u32) [k]V {
+        var out: [k]V = undefined;
+        inline for (0..k) |b| out[b] = base | V{ 0, @as(u64, @byteSwap(n +% @as(u32, b))) << 32 };
+        return out;
+    }
+
+    /// AES-128 over `k` blocks, round by round so the blocks' rounds overlap.
+    inline fn encryptBlocks(comptime k: usize, rk: *const RoundKeys, in: [k]V) [k]V {
+        var s = in;
+        if (builtin.cpu.arch == .aarch64) {
+            inline for (0..Aes128.rounds - 1) |r| {
+                inline for (0..k) |b| s[b] = asm (
+                    \\ aese  %[s].16b, %[rk].16b
+                    \\ aesmc %[s].16b, %[s].16b
+                    : [s] "=w" (-> V),
+                    : [_] "0" (s[b]),
+                      [rk] "w" (rk[r].repr),
+                );
             }
-            mem.writeInt(u128, &counter_block, cnt_val, .big);
+            inline for (0..k) |b| s[b] = asm (
+                \\ aese %[s].16b, %[rk].16b
+                : [s] "=w" (-> V),
+                : [_] "0" (s[b]),
+                  [rk] "w" (rk[Aes128.rounds - 1].repr),
+            ) ^ rk[Aes128.rounds].repr;
+        } else {
+            inline for (0..k) |b| s[b] ^= rk[0].repr;
+            inline for (1..Aes128.rounds) |r| {
+                inline for (0..k) |b| s[b] = (Block{ .repr = s[b] }).encrypt(rk[r]).repr;
+            }
+            inline for (0..k) |b| s[b] = (Block{ .repr = s[b] }).encryptLast(rk[Aes128.rounds]).repr;
         }
-        while (i + block_length <= src.len) : (i += block_length) {
-            aes.xor(dst[i..][0..block_length], src[i..][0..block_length], counter_block);
-            cnt_val +%= 1;
-            mem.writeInt(u128, &counter_block, cnt_val, .big);
-        }
-        if (i < src.len) {
-            var pad: [block_length]u8 = @splat(0);
-            const rest = src[i..];
-            @memcpy(pad[0..rest.len], rest);
-            aes.xor(&pad, &pad, counter_block);
-            @memcpy(dst[i..][0..rest.len], pad[0..rest.len]);
-        }
+        return s;
     }
 
     fn lengthBlock(ad_len: usize, m_len: usize) [16]u8 {
