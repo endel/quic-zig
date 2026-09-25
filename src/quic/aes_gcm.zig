@@ -12,7 +12,8 @@
 //! plus `aesmc`, a pair the core fuses. std's armcrypto rounds are `aese` with
 //! a zero key, `aesmc`, then an `eor` of the round key, with operands limited
 //! to v0-v15, so 6+ blocks and 11 round keys don't fit and keys get reloaded.
-//! GHASH is `ghash.zig`. Without hardware AES, CTR is std's.
+//! On arm64 GHASH also runs in vector registers (see `vec_ghash`). Elsewhere
+//! GHASH is `ghash.zig`, and without hardware AES, CTR is std's.
 //! See DECISIONS/zig_std_divergences.md.
 
 const std = @import("std");
@@ -32,6 +33,96 @@ const V = @Vector(2, u64);
 const wide = 8;
 const RoundKeys = [Aes128.rounds + 1]Block;
 
+/// arm64: GHASH in vector registers. `ghash.zig` does its arithmetic on u128,
+/// which LLVM keeps in general registers, so every multiply moves operands
+/// across and back. Same multiply and reduction, on vectors.
+const vec_ghash = fast and builtin.cpu.arch == .aarch64 and builtin.mode != .ReleaseSmall;
+/// Powers of H that `Ghash.init` computes: H, H^2, ... H^16.
+const pc_count = @typeInfo(@FieldType(Ghash, "hx")).array.len;
+/// Byte order of GHASH's big-endian 128-bit integers.
+const reversed: [16]i32 = blk: {
+    var r: [16]i32 = undefined;
+    for (&r, 0..) |*x, i| x.* = 15 - @as(i32, @intCast(i));
+    break :blk r;
+};
+
+inline fn loadBlock(b: *const [16]u8) V {
+    return @bitCast(@shuffle(u8, @as(@Vector(16, u8), b.*), undefined, reversed));
+}
+
+inline fn pmullLo(x: V, y: V) V {
+    return asm ("pmull %[o].1q, %[x].1d, %[y].1d"
+        : [o] "=w" (-> V),
+        : [x] "w" (x),
+          [y] "w" (y),
+    );
+}
+
+inline fn pmullHi(x: V, y: V) V {
+    return asm ("pmull2 %[o].1q, %[x].2d, %[y].2d"
+        : [o] "=w" (-> V),
+        : [x] "w" (x),
+          [y] "w" (y),
+    );
+}
+
+inline fn swapHalves(x: V) V {
+    return @shuffle(u64, x, undefined, [2]i32{ 1, 0 });
+}
+
+/// (acc ^ b[0])·H^k ^ b[1]·H^(k-1) ^ ... ^ b[k-1]·H, reduced once. The
+/// schoolbook product and `reduce` of `ghash.zig`.
+inline fn ghashBatch(comptime k: usize, hx: *const [pc_count]V, acc: V, b: [k]V) V {
+    var lo: V = @splat(0);
+    var hi: V = @splat(0);
+    var mid: V = @splat(0);
+    inline for (0..k) |j| {
+        const x = if (j == 0) b[0] ^ acc else b[j];
+        const h = hx[k - 1 - j];
+        lo ^= pmullLo(x, h);
+        hi ^= pmullHi(x, h);
+        const xs = swapHalves(x);
+        mid ^= pmullLo(xs, h) ^ pmullHi(xs, h);
+    }
+    const zero: V = @splat(0);
+    hi ^= @shuffle(u64, mid, zero, [2]i32{ 1, -1 }); // mid >> 64
+    lo ^= @shuffle(u64, mid, zero, [2]i32{ -1, 0 }); // mid << 64
+    const p64: V = .{ 0xc200000000000000, 0 };
+    const r = swapHalves(lo) ^ pmullLo(lo, p64);
+    return swapHalves(r) ^ pmullLo(r, p64) ^ hi;
+}
+
+/// GHASH `msg` into `acc`, its last block zero-padded. `extra`, when given,
+/// is one more block hashed in the same final batch.
+fn ghashBlocks(hx: *const [pc_count]V, acc0: V, msg: []const u8, extra: ?V) V {
+    var acc = acc0;
+    var i: usize = 0;
+    while (i + 16 * wide <= msg.len) : (i += 16 * wide) {
+        var b: [wide]V = undefined;
+        inline for (0..wide) |j| b[j] = loadBlock(msg[i + 16 * j ..][0..16]);
+        acc = ghashBatch(wide, hx, acc, b);
+    }
+    switch ((msg.len - i + 15) / 16) {
+        inline 0...wide => |k| {
+            var b: [k + 1]V = undefined;
+            if (k > 0) {
+                inline for (0..k - 1) |j| b[j] = loadBlock(msg[i + 16 * j ..][0..16]);
+                const last = i + 16 * (k - 1);
+                var buf: [16]u8 = @splat(0);
+                @memcpy(buf[0 .. msg.len - last], msg[last..]);
+                b[k - 1] = loadBlock(&buf);
+            }
+            if (extra) |e| {
+                b[k] = e;
+                return ghashBatch(k + 1, hx, acc, b);
+            }
+            if (k == 0) return acc;
+            return ghashBatch(k, hx, acc, b[0..k].*);
+        },
+        else => unreachable,
+    }
+}
+
 pub const tag_length = 16;
 pub const nonce_length = 12;
 pub const key_length = 16;
@@ -39,7 +130,8 @@ pub const key_length = 16;
 pub const Ctx = struct {
     aes: @TypeOf(Aes128.initEnc(@as([key_length]u8, undefined))),
     h: [16]u8,
-    /// GHASH keyed with H, all powers precomputed; copied per message.
+    /// GHASH keyed with H, all powers precomputed. The arm64 path only reads
+    /// the powers; elsewhere this is copied per message.
     mac: Ghash,
 
     pub fn init(key: [key_length]u8) Ctx {
@@ -77,13 +169,20 @@ pub const Ctx = struct {
     /// GHASH(ad, c) XOR `mask`: the tag.
     fn ghashTag(self: *const Ctx, ad: []const u8, c: []const u8, mask: [16]u8) [16]u8 {
         var s: [16]u8 = undefined;
-        var mac = self.mac;
-        mac.update(ad);
-        mac.pad();
-        mac.update(c);
-        mac.pad();
-        mac.update(&lengthBlock(ad.len, c.len));
-        mac.final(&s);
+        if (vec_ghash) {
+            const hx: *const [pc_count]V = @ptrCast(&self.mac.hx);
+            const len_block = loadBlock(&lengthBlock(ad.len, c.len));
+            const acc = ghashBlocks(hx, ghashBlocks(hx, @splat(0), ad, null), c, len_block);
+            s = @bitCast(@shuffle(u8, @as(@Vector(16, u8), @bitCast(acc)), undefined, reversed));
+        } else {
+            var mac = self.mac;
+            mac.update(ad);
+            mac.pad();
+            mac.update(c);
+            mac.pad();
+            mac.update(&lengthBlock(ad.len, c.len));
+            mac.final(&s);
+        }
         for (&s, mask) |*x, y| x.* ^= y;
         return s;
     }

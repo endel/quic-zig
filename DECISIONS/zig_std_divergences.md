@@ -31,6 +31,7 @@ contributions" in `CLAUDE.md`.
 | 6 | DER element parsing bounds | `src/quic/tls13.zig` `certificateWellFormed` | guard in front of std | yes: robustness bug |
 | 7 | `std.net.Address` | `src/sockaddr.zig` | adapted copy of 0.15.2 code | no: migration choice |
 | 8 | Fixed-buffer reader/writer | `src/io_compat.zig` | kept our own stream | maybe: codegen observation |
+| 9 | GHASH on arm64 | `src/quic/aes_gcm.zig` (`ghashBlocks`) | GHASH in vector registers | yes: codegen |
 
 Not a std divergence, but related: std picks the AES and GHASH
 implementation at **compile time** from the target's CPU features.
@@ -74,6 +75,9 @@ reason). Native x86 data across a few microarchitectures would settle it.
 **Master (24 Sep 2026):** still `agg_8_threshold = 84`. The only changes
 since 0.16 are syntax: `.ReleaseSmall` became `.small`, and `@splat`.
 
+On arm64, packets no longer go through this file: see item 9. It still
+serves x86_64, and arm64 builds in ReleaseSmall.
+
 ## 2. std's AEAD API has no keyed context
 
 **std** (`lib/std/crypto/aes_gcm.zig`): `encrypt` and `decrypt` take the raw
@@ -84,20 +88,26 @@ millions of messages, so this work repeats for nothing.
 
 **Ours:** `src/quic/aes_gcm.zig` `Ctx` does that work once, in `init(key)`,
 when the key is installed (`Open`/`Seal.prepareCtx()` in `crypto.zig`). The
-per-message code is std's `encrypt`/`decrypt` line for line, starting from a
-copy of the prepared GHASH state. The copy is about 300 bytes; we hold all
-16 powers because that is what `Ghash.init` computes.
+per-message code follows std's `encrypt`/`decrypt`, over its own CTR (item
+3) and, on arm64, its own GHASH (item 9), which reads the prepared powers of
+H in place. Elsewhere each message starts from a copy of the prepared GHASH
+state, about 300 bytes. We hold all 16 powers because that is what
+`Ghash.init` computes.
 
 **Numbers** (`zig build bench-crypto -Doptimize=ReleaseFast`, 1200 B
-packets, arm64). These include item 1:
+packets, native arm64, called out of line as packets do). These include
+items 3 and 9:
 
 | | std `Aes128Gcm` | `aes_gcm.Ctx` |
 |---|---|---|
-| encrypt | 607 ns | 455 ns |
-| decrypt | 664 ns | 487 ns |
+| encrypt | 624–664 ns | 237 ns |
+| decrypt | 694–749 ns | 239–249 ns |
 
-Caching alone, without item 1, was worth 2–10%. Most of the gain is the
-GHASH threshold.
+Caching alone was worth 2–10%. Most of the gain is items 3 and 9. The
+figures this section first gave (455 and 487 ns) came from calls inlined into
+the timing loop, which kept the round keys in registers across iterations.
+Out of line, that version measured 486–528 ns natively, and in routez's
+Linux build it was slower than std.
 
 **Cost:** `Open`/`Seal` grew from about 288 to 784 bytes. We now pass them by
 pointer through the packer and the receive path, which used to copy them per
@@ -270,6 +280,37 @@ change, measure `Frame.parse`, not the primitive.
 
 This is an optimizer observation, not a std bug. It would need a minimal
 reproduction before it is worth mentioning upstream.
+
+## 9. GHASH on arm64 runs in general-purpose registers
+
+**std** (`lib/std/crypto/ghash_polyval.zig`, and our copy in
+`src/quic/ghash.zig`): the state and every intermediate are `u128`. On arm64
+LLVM keeps `u128` in pairs of general-purpose registers. Each carryless
+multiply is an asm block on vectors, so every one of them moves its operands
+into vector registers and its result back out. Byte reversal runs as `rev`
+on general registers. In `update` in a ReleaseFast arm64 build, 205 of 826
+instructions move data between the two register files, against 122
+`pmull`s, and some values spill to the stack.
+
+**Ours** (`aes_gcm.zig` `ghashBlocks`, arm64 with the `aes` feature, not
+ReleaseSmall): the same schoolbook product and the same reduction as std,
+on `@Vector(2, u64)`. Blocks are byte-reversed with a vector shuffle.
+Batches of 8 blocks, the tail as one batch, and the length block rides in
+the message's last batch, so each of AD and message costs one reduction. It
+reads the powers of H that `Ghash.init` already computed, so `Ctx` layout
+doesn't change.
+
+**Numbers** (`bench-crypto`, as in item 2, with item 3 in both columns):
+
+| | seal | open |
+|---|---|---|
+| `ghash.zig` | 403–433 ns | 409–472 ns |
+| `ghashBlocks` | 237 ns | 239–249 ns |
+
+**Upstream-shaped report:** a codegen observation more than a bug. On
+arm64, `ghash_polyval.zig` would do better with its state and accumulators
+as vectors. x86_64 likely has the same shape, with `u128` in general
+registers around `pclmulqdq`, but that has not been measured.
 
 ---
 
