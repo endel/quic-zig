@@ -37,3 +37,29 @@ jobs:
       # local — see SPEC/webtransport_conformance.md.
       - name: WebTransport conformance (Zig client)
         run: ./tools/wt_conformance.sh --zig-only
+
+  # RFC 6455 conformance: the Autobahn fuzzing client against ws-echo-server,
+  # plain and over TLS. Linux runners share the host network with the
+  # container, so this avoids the proxy that makes Docker Desktop runs flaky.
+  autobahn:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Autobahn (ws://)
+        run: RESULTS_DIR=autobahn/ws ./tools/autobahn.sh
+
+      - name: Autobahn (wss://)
+        run: RESULTS_DIR=autobahn/wss ./tools/autobahn.sh --tls
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: autobahn-reports
+          path: |
+            autobahn/*/reports
+            autobahn/*/*.log
