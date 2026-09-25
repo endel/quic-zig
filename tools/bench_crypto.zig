@@ -96,8 +96,10 @@ fn x25519Scalarmult(secret: *const [32]u8, public: *const [32]u8) [32]u8 {
 }
 
 // ── AES-128-GCM Encrypt ──
+// The AES-GCM calls are noinline: inlined into the timing loop, the round
+// keys stay in registers across iterations, which a packet never gets.
 
-fn aesGcmEncrypt(
+noinline fn aesGcmEncrypt(
     key: *const [16]u8,
     nonce: *const [12]u8,
     plaintext: *const [1200]u8,
@@ -110,7 +112,7 @@ fn aesGcmEncrypt(
 
 // ── AES-128-GCM Decrypt ──
 
-fn aesGcmDecrypt(
+noinline fn aesGcmDecrypt(
     key: *const [16]u8,
     nonce: *const [12]u8,
     ciphertext: *const [1200]u8,
@@ -124,7 +126,7 @@ fn aesGcmDecrypt(
 
 // ── AES-128-GCM with the per-key work cached (what packet protection uses) ──
 
-fn aesGcmCtxEncrypt(
+noinline fn aesGcmCtxEncrypt(
     ctx: *const quic.aes_gcm.Ctx,
     nonce: *const [12]u8,
     plaintext: *const [1200]u8,
@@ -135,7 +137,7 @@ fn aesGcmCtxEncrypt(
     ctx.encrypt(out, tag, plaintext, ad, nonce.*);
 }
 
-fn aesGcmCtxDecrypt(
+noinline fn aesGcmCtxDecrypt(
     ctx: *const quic.aes_gcm.Ctx,
     nonce: *const [12]u8,
     ciphertext: *const [1200]u8,
