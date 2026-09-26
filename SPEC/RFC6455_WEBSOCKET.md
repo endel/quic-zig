@@ -99,7 +99,10 @@ config table.
   it (RFC 6455 §10.2).
 - **Request bodies are refused.** The listener serves GET and HEAD for
   static files. A request with a body gets 400, and other methods get 405.
-- **Server only.** There is no WebSocket client.
+- **The client side is a codec.** `Decoder` with `.role = .client`,
+  `writeMaskedFrameHeader`, `clientKey`, `writeUpgradeRequest` and
+  `checkUpgradeResponse` cover a client's frames and handshake. The caller
+  owns the TCP and TLS I/O.
 
 ## Replacing the blocking HTTP/1.1 server
 

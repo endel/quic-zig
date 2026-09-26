@@ -1,15 +1,19 @@
-//! The WebSocket protocol (RFC 6455), server side, sans-IO.
+//! The WebSocket protocol (RFC 6455), sans-IO, for both ends.
 //!
-//! - Handshake: `isUpgrade`, `checkUpgrade` and `acceptKey` turn an HTTP/1.1
-//!   upgrade request into the values a 101 response needs.
-//! - `Decoder` takes the bytes a client sent and yields whole messages and
+//! - Server handshake: `isUpgrade`, `checkUpgrade` and `acceptKey` turn an
+//!   HTTP/1.1 upgrade request into the values a 101 response needs.
+//! - Client handshake: `clientKey`, `writeUpgradeRequest` and
+//!   `checkUpgradeResponse` open a connection; the caller owns the TCP and
+//!   TLS I/O.
+//! - `Decoder` takes the bytes the peer sent and yields whole messages and
 //!   control frames: it unmasks, reassembles fragments, bounds message size,
-//!   checks text is UTF-8 and close frames are well formed.
+//!   checks text is UTF-8 and close frames are well formed. It decodes a
+//!   client's masked frames by default, a server's with `.role = .client`.
 //! - `writeFrameHeader` / `closePayload` build server frames, which are never
-//!   masked.
+//!   masked; `writeMaskedFrameHeader` and `mask` build client frames.
 //!
 //! Extensions (permessage-deflate) are not negotiated, so every RSV bit a
-//! client sets is a protocol error.
+//! peer sets is a protocol error.
 
 const std = @import("std");
 const parser = @import("parser.zig");
@@ -32,6 +36,9 @@ pub const Opcode = enum(u4) {
 };
 
 pub const MessageKind = enum { binary, text };
+
+/// Which end of the connection this is. Only a client masks its frames.
+pub const Role = enum { server, client };
 
 /// Status codes (RFC 6455 §7.4.1). 1005 and 1006 are never sent: they stand
 /// for "no code in the Close frame" and "no Close frame at all".
@@ -122,6 +129,59 @@ pub fn protocolOffered(head: *const parser.RequestHead, protocol: []const u8) bo
     return false;
 }
 
+/// Sec-WebSocket-Key for a client: base64 of a 16-byte nonce, which §4.1
+/// wants picked at random for each connection.
+pub fn clientKey(nonce: [16]u8) [24]u8 {
+    var out: [24]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&out, &nonce);
+    return out;
+}
+
+/// Writes a client's opening handshake (§4.1), offering no subprotocol or
+/// extension. Keep `key` to check the answer with `checkUpgradeResponse`.
+pub fn writeUpgradeRequest(w: *std.Io.Writer, host: []const u8, path: []const u8, key: []const u8) std.Io.Writer.Error!void {
+    try w.print("GET {s} HTTP/1.1\r\nHost: {s}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: 13\r\n\r\n", .{ path, host, key });
+}
+
+pub const UpgradeResponse = union(enum) {
+    accepted,
+    /// The server answered with this status instead of 101.
+    rejected: u16,
+};
+
+/// Checks the server's answer to `writeUpgradeRequest` (§4.1). `head` is the
+/// response up to its blank line (`parser.findHeadEnd`). A 101 that doesn't
+/// switch to WebSocket, answers another key, or picks a subprotocol or
+/// extension the request didn't offer is a `BadResponse`.
+pub fn checkUpgradeResponse(head: []const u8, key: []const u8) error{BadResponse}!UpgradeResponse {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    // "HTTP/1.1 101 Switching Protocols"
+    const status_line = lines.next() orelse return error.BadResponse;
+    if (status_line.len < 12 or !std.mem.startsWith(u8, status_line, "HTTP/1.") or status_line[8] != ' ')
+        return error.BadResponse;
+    const status = std.fmt.parseInt(u16, status_line[9..12], 10) catch return error.BadResponse;
+    if (status != 101) return .{ .rejected = status };
+
+    var buf: [32]parser.Header = undefined;
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadResponse;
+        if (n == buf.len) return error.BadResponse;
+        buf[n] = .{ .name = line[0..colon], .value = std.mem.trim(u8, line[colon + 1 ..], " \t") };
+        n += 1;
+    }
+    const headers = buf[0..n];
+    if (!parser.headerHasToken(headers, "upgrade", "websocket")) return error.BadResponse;
+    if (!parser.headerHasToken(headers, "connection", "upgrade")) return error.BadResponse;
+    const accept = parser.getHeader(headers, "sec-websocket-accept") orelse return error.BadResponse;
+    if (!std.mem.eql(u8, accept, &acceptKey(key))) return error.BadResponse;
+    if (parser.getHeader(headers, "sec-websocket-protocol") != null) return error.BadResponse;
+    if (parser.getHeader(headers, "sec-websocket-extensions") != null) return error.BadResponse;
+    return .accepted;
+}
+
 // ─── Frames ──────────────────────────────────────────────────────────
 
 pub const Error = error{
@@ -153,11 +213,11 @@ pub const Frame = struct {
 
 pub const ParsedFrame = struct { frame: Frame, len: usize };
 
-/// A client frame's header, masking key included.
+/// A frame's header, with its masking key if the frame is masked.
 pub const Header = struct {
     fin: bool,
     opcode: Opcode,
-    key: [4]u8,
+    key: ?[4]u8,
     /// Where the payload starts: the header's length.
     payload_start: usize,
     payload_len: usize,
@@ -171,13 +231,18 @@ pub fn parseFrame(buf: []u8, max_payload: usize) Error!?ParsedFrame {
     const h = try parseHeader(buf, max_payload) orelse return null;
     if (buf.len - h.payload_start < h.payload_len) return null;
     const payload = buf[h.payload_start..][0..h.payload_len];
-    unmask(payload, h.key);
+    unmask(payload, h.key.?);
     return .{ .frame = .{ .fin = h.fin, .opcode = h.opcode, .payload = payload }, .len = h.payload_start + h.payload_len };
 }
 
 /// The header of the client frame at the start of `buf`, checked as
 /// `parseFrame` describes; null until all of it has arrived.
 pub fn parseHeader(buf: []const u8, max_payload: usize) Error!?Header {
+    return parseHeaderAs(.server, buf, max_payload);
+}
+
+/// `parseHeader` for a frame received by `role`.
+fn parseHeaderAs(role: Role, buf: []const u8, max_payload: usize) Error!?Header {
     if (buf.len < 2) return null;
     const b0 = buf[0];
     const b1 = buf[1];
@@ -188,8 +253,10 @@ pub fn parseHeader(buf: []const u8, max_payload: usize) Error!?Header {
         _ => return error.ProtocolError,
     }
     const fin = b0 & 0x80 != 0;
-    // §5.1: a server closes on an unmasked client frame.
-    if (b1 & 0x80 == 0) return error.ProtocolError;
+    // §5.1: a server closes on an unmasked client frame, a client on a
+    // masked server frame.
+    const masked = b1 & 0x80 != 0;
+    if (masked != (role == .server)) return error.ProtocolError;
 
     var pos: usize = 2;
     const len7: u7 = @truncate(b1);
@@ -215,6 +282,7 @@ pub fn parseHeader(buf: []const u8, max_payload: usize) Error!?Header {
         return error.MessageTooBig;
     }
 
+    if (!masked) return .{ .fin = fin, .opcode = opcode, .key = null, .payload_start = pos, .payload_len = @intCast(len) };
     if (buf.len < pos + 4) return null;
     return .{
         .fin = fin,
@@ -239,6 +307,9 @@ pub fn unmask(data: []u8, key: [4]u8) void {
     for (data[i..], 0..) |*b, j| b.* ^= key[j & 3];
 }
 
+/// Masks a client frame's payload in place with its key: the same XOR.
+pub const mask = unmask;
+
 /// Writes the header of an unmasked server frame; returns its bytes.
 pub fn writeFrameHeader(buf: *[10]u8, opcode: Opcode, fin: bool, len: usize) []const u8 {
     buf[0] = @as(u8, if (fin) 0x80 else 0) | @as(u8, @intFromEnum(opcode));
@@ -254,6 +325,15 @@ pub fn writeFrameHeader(buf: *[10]u8, opcode: Opcode, fin: bool, len: usize) []c
     buf[1] = 127;
     std.mem.writeInt(u64, buf[2..10], len, .big);
     return buf[0..10];
+}
+
+/// Writes the header of a client frame masked with `key`; returns its bytes.
+/// Mask the payload with the same key (`mask`).
+pub fn writeMaskedFrameHeader(buf: *[14]u8, opcode: Opcode, fin: bool, len: usize, key: [4]u8) []const u8 {
+    const h = writeFrameHeader(buf[0..10], opcode, fin, len);
+    buf[1] |= 0x80;
+    buf[h.len..][0..4].* = key;
+    return buf[0 .. h.len + 4];
 }
 
 /// A Close frame's payload: the code, then as much of `reason` as fits in
@@ -283,7 +363,7 @@ pub const Step = struct {
     event: ?Event,
 };
 
-/// Turns client frames into messages. Holds the fragments of a message
+/// Turns the peer's frames into messages. Holds the fragments of a message
 /// in progress; control frames may arrive between them (§5.4).
 ///
 /// Text is checked as it arrives (§8.1 "fail fast"): across fragments, and
@@ -291,6 +371,8 @@ pub const Step = struct {
 /// can continue with fails at once rather than when the message ends.
 pub const Decoder = struct {
     max_message_size: usize,
+    /// The end decoding: a server takes masked frames, a client unmasked.
+    role: Role = .server,
     /// Kind of the fragmented message in progress, if one is.
     fragment_kind: ?MessageKind = null,
     fragments: std.ArrayList(u8) = .empty,
@@ -323,14 +405,14 @@ pub const Decoder = struct {
             }
         }
         const room = self.max_message_size - self.fragments.items.len;
-        const h = try parseHeader(buf, room) orelse return .{ .consumed = 0, .event = null };
+        const h = try parseHeaderAs(self.role, buf, room) orelse return .{ .consumed = 0, .event = null };
         const avail = buf[h.payload_start..];
         if (avail.len < h.payload_len) {
             try self.checkArriving(h, avail);
             return .{ .consumed = 0, .event = null };
         }
         const payload = avail[0..h.payload_len];
-        unmask(payload, h.key);
+        if (h.key) |key| unmask(payload, key);
         const checked = self.partial;
         self.partial = 0;
         const f: Frame = .{ .fin = h.fin, .opcode = h.opcode, .payload = payload };
@@ -352,11 +434,16 @@ pub const Decoder = struct {
     fn checkArriving(self: *Decoder, h: Header, avail: []const u8) Error!void {
         if (!try self.carriesText(h.opcode)) return;
         if (h.opcode == .text and self.partial == 0) self.utf8 = .{};
+        const key = h.key orelse {
+            if (!self.utf8.feed(avail[self.partial..])) return error.InvalidPayload;
+            self.partial = avail.len;
+            return;
+        };
         var tmp: [256]u8 = undefined;
         var off = self.partial;
         while (off < avail.len) {
             const n = @min(tmp.len, avail.len - off);
-            for (tmp[0..n], avail[off..][0..n], off..) |*d, b, j| d.* = b ^ h.key[j & 3];
+            for (tmp[0..n], avail[off..][0..n], off..) |*d, b, j| d.* = b ^ key[j & 3];
             if (!self.utf8.feed(tmp[0..n])) return error.InvalidPayload;
             off += n;
         }
@@ -775,4 +862,100 @@ test "close payload cuts the reason at a code point" {
     const out = closePayload(&p, 1000, reason);
     try testing.expectEqual(@as(usize, 2 + 122), out.len);
     try testing.expect(std.unicode.utf8ValidateSlice(out[2..]));
+}
+
+/// An unmasked server frame, as a client receives it.
+fn serverFrame(buf: []u8, opcode: Opcode, fin: bool, payload: []const u8) []u8 {
+    var hdr: [10]u8 = undefined;
+    const h = writeFrameHeader(&hdr, opcode, fin, payload.len);
+    @memcpy(buf[0..h.len], h);
+    @memcpy(buf[h.len..][0..payload.len], payload);
+    return buf[0 .. h.len + payload.len];
+}
+
+test "client decoder: unmasked server frames, fragments and pings" {
+    var d: Decoder = .{ .max_message_size = 1024, .role = .client };
+    defer d.deinit(testing.allocator);
+    var buf: [256]u8 = undefined;
+    var n: usize = 0;
+    n += serverFrame(buf[n..], .binary, false, &.{ 1, 2 }).len;
+    n += serverFrame(buf[n..], .ping, true, "p").len;
+    n += serverFrame(buf[n..], .continuation, true, &.{3}).len;
+    n += serverFrame(buf[n..], .text, true, "κόσμε").len;
+
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+    var copies: std.ArrayList([]u8) = .empty;
+    defer {
+        for (copies.items) |c| testing.allocator.free(c);
+        copies.deinit(testing.allocator);
+    }
+    try decodeAll(&d, buf[0..n], &events, &copies);
+    try testing.expectEqual(@as(usize, 3), events.items.len);
+    try testing.expectEqualStrings("p", events.items[0].ping);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, events.items[1].message.data);
+    try testing.expectEqualStrings("κόσμε", events.items[2].message.data);
+
+    // Bad text in an unmasked frame still fails before the frame is whole.
+    var e: Decoder = .{ .max_message_size = 1024, .role = .client };
+    defer e.deinit(testing.allocator);
+    const bad = serverFrame(&buf, .text, true, "ok\xed\xa0\x80");
+    try testing.expectError(error.InvalidPayload, e.decode(testing.allocator, bad[0 .. bad.len - 1]));
+}
+
+test "client decoder: a masked server frame is a protocol error" {
+    var d: Decoder = .{ .max_message_size = 1024, .role = .client };
+    defer d.deinit(testing.allocator);
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.ProtocolError, d.decode(testing.allocator, clientFrame(&buf, .binary, true, "x")));
+}
+
+test "masked frames decode on the server side" {
+    var buf: [0x10000 + 16]u8 = undefined;
+    var payload: [0x10000]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 13);
+    const key = [4]u8{ 0x9e, 0x01, 0x42, 0xd7 };
+    for ([_]usize{ 0, 1, 125, 126, 0xffff, 0x10000 }) |n| {
+        var hdr: [14]u8 = undefined;
+        const h = writeMaskedFrameHeader(&hdr, .binary, true, n, key);
+        @memcpy(buf[0..h.len], h);
+        @memcpy(buf[h.len..][0..n], payload[0..n]);
+        mask(buf[h.len..][0..n], key);
+
+        var d = Decoder.init(1 << 20);
+        defer d.deinit(testing.allocator);
+        const step = try d.decode(testing.allocator, buf[0 .. h.len + n]);
+        try testing.expectEqual(h.len + n, step.consumed);
+        try testing.expectEqualSlices(u8, payload[0..n], step.event.?.message.data);
+    }
+}
+
+test "client handshake: request and response checks" {
+    const key = clientKey("the sample nonce".*);
+    try testing.expectEqualStrings("dGhlIHNhbXBsZSBub25jZQ==", &key);
+
+    var req: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&req);
+    try writeUpgradeRequest(&w, "example.com", "/chat?x=1", &key);
+    var hb: [16]parser.Header = undefined;
+    const p = (try parser.parseRequest(w.buffered(), &hb, .{})).?;
+    try testing.expect(isUpgrade(&p.head));
+    try testing.expectEqualStrings(&key, try checkUpgrade(&p.head));
+
+    const ok = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+    try testing.expectEqual(UpgradeResponse.accepted, try checkUpgradeResponse(ok, &key));
+    try testing.expectError(error.BadResponse, checkUpgradeResponse(ok, "c2hvcnQ="));
+
+    const no_upgrade = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+    try testing.expectError(error.BadResponse, checkUpgradeResponse(no_upgrade, &key));
+
+    const unoffered = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+    try testing.expectError(error.BadResponse, checkUpgradeResponse(unoffered, &key));
+
+    try testing.expectEqual(UpgradeResponse{ .rejected = 404 }, try checkUpgradeResponse("HTTP/1.1 404 Not Found\r\n\r\n", &key));
+    try testing.expectEqual(UpgradeResponse{ .rejected = 503 }, try checkUpgradeResponse("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", &key));
+    try testing.expectError(error.BadResponse, checkUpgradeResponse("SSH-2.0-OpenSSH\r\n\r\n", &key));
 }
