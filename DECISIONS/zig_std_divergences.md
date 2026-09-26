@@ -32,6 +32,7 @@ contributions" in `CLAUDE.md`.
 | 7 | `std.net.Address` | `src/sockaddr.zig` | adapted copy of 0.15.2 code | no: migration choice |
 | 8 | Fixed-buffer reader/writer | `src/io_compat.zig` | kept our own stream | maybe: codegen observation |
 | 9 | GHASH on arm64 | `src/quic/aes_gcm.zig` (`ghashBlocks`) | GHASH in vector registers | yes: codegen |
+| 10 | Master compiles AES-GCM slower | `src/quic/aes_gcm.zig` (`xorBlock`) | explicit unaligned vector loads | yes: codegen regression |
 
 Not a std divergence, but related: std picks the AES and GHASH
 implementation at **compile time** from the target's CPU features.
@@ -137,12 +138,10 @@ use (`Aes128.initEnc`, `Ghash.init`); the AEAD wrappers are where that stops.
   build compiled it out of line (two callers), and h3-static lost 27% (see
   routez's `TODO/h3-per-request-latency.md`, 25 Sep 2026).
 
-**Master** (commit `e339566922`, "crypto.mode.ctr: make the counter wrap,
-even in parallel updates", 29 May 2026) keeps the round form and changes the
-tail: whatever is left after the full batches, even one byte, gets a full
-`encryptWide(parallel_count)` into a keystream buffer that is XORed in one
-byte at a time. 64 B went from 9 to 38 ns on arm64, 1200 B from 161 to
-215 ns.
+**Master** (0.17.0-dev.2294, 24 Sep 2026): the same round form and the same
+tail loop as 0.16; the batch counter now wraps (`+%=`). An earlier version of
+this note described a master commit (`e339566922`) that batched the tail;
+master at dev.2294 does not do that.
 
 **Ours** (`aes_gcm.zig` `ctrFast`, when `crypto.core.aes.has_hardware_support`):
 - 8 blocks per step with the round keys copied to a local, so they stay in
@@ -313,6 +312,27 @@ as vectors. x86_64 likely has the same shape, with `u128` in general
 registers around `pclmulqdq`, but that has not been measured.
 
 ---
+
+## 10. Zig master compiles AES-GCM slower on arm64
+
+Measured 26 Sep 2026 with 0.17.0-dev.2294+71403f299 (LLVM 22.1.8) against
+0.16.0 (LLVM 21.1), same M1 Pro, 1200 B seal out of line:
+
+| | 0.16.0 | master |
+|---|---|---|
+| std `Aes128Gcm` | 569 ns | 723 ns (+27%) |
+| `aes_gcm.Ctx` before `a34c55a` | 219 ns | 336 ns (+53%) |
+| `aes_gcm.Ctx` | 216 ns | 217 ns |
+
+The cause in our code: `@as(V, @bitCast(src.*))` on a `*const [16]u8`
+compiled to sixteen `ldrb` and a chain of shifts and `orr`s instead of one
+`ldr q`, doubling CTR. An `align(1)` vector pointer is one load on both
+compilers (`xorBlock`). std's slowdown is probably the same pattern in
+`Block.fromBytes`/`xorBytes`; not confirmed. Master also names this CPU
+`apple_a14` where 0.16 says `apple_m1`, which made no difference here.
+
+**Upstream-shaped report:** a codegen regression on aarch64: a bitcast of an
+unaligned `[16]u8` load to a 128-bit vector is lowered byte by byte.
 
 ## Verifying the copies still match std
 
