@@ -632,17 +632,17 @@ pub fn Server(comptime Handler: type) type {
             "onRequestCancelled", "onConnectionClosed", "onQuicConnected",
         };
 
-        for (@typeInfo(Handler).@"struct".decls) |decl| {
-            if (decl.name.len >= 2 and decl.name[0] == 'o' and decl.name[1] == 'n') {
+        for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
+            if (decl_name.len >= 2 and decl_name[0] == 'o' and decl_name[1] == 'n') {
                 var found = false;
                 for (known) |k| {
-                    if (std.mem.eql(u8, decl.name, k)) {
+                    if (std.mem.eql(u8, decl_name, k)) {
                         found = true;
                         break;
                     }
                 }
                 if (!found) {
-                    @compileError("Handler has unrecognized callback '" ++ decl.name ++
+                    @compileError("Handler has unrecognized callback '" ++ decl_name ++
                         "'. Known callbacks: onRequest, onData, onRequestEnd, " ++
                         "onRequestCancelled, onConnectRequest, " ++
                         "onSessionReady, onStreamData, onDatagram, onSessionClosed, " ++
@@ -658,7 +658,7 @@ pub fn Server(comptime Handler: type) type {
         }
 
         if (@hasDecl(Handler, "onStreamData")) {
-            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params;
+            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types;
             if (params.len != 4 and params.len != 5) {
                 @compileError("onStreamData must have 4 params (self, session, stream_id, data) " ++
                     "or 5 params (self, session, stream_id, data, fin)");
@@ -1641,7 +1641,7 @@ pub fn Server(comptime Handler: type) type {
         fn dispatchStreamData(self: *Self, session: *Session, stream_id: u64, data: []const u8, fin: bool) void {
             if (!@hasDecl(Handler, "onStreamData")) return;
 
-            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params.len == 5) {
+            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types.len == 5) {
                 self.handler.onStreamData(session, stream_id, data, fin);
             } else if (data.len > 0) {
                 self.handler.onStreamData(session, stream_id, data);
@@ -1653,7 +1653,7 @@ pub fn Server(comptime Handler: type) type {
         fn dispatchConnectRequest(self: *Self, session: *Session, session_id: u64, path: []const u8, headers: []const qpack.Header) void {
             if (!@hasDecl(Handler, "onConnectRequest")) return;
 
-            if (comptime @typeInfo(@TypeOf(Handler.onConnectRequest)).@"fn".params.len == 5) {
+            if (comptime @typeInfo(@TypeOf(Handler.onConnectRequest)).@"fn".param_types.len == 5) {
                 self.handler.onConnectRequest(session, session_id, path, headers);
             } else {
                 self.handler.onConnectRequest(session, session_id, path);
@@ -1663,7 +1663,7 @@ pub fn Server(comptime Handler: type) type {
         fn dispatchSessionReady(self: *Self, session: *Session, session_id: u64, headers: []const qpack.Header) void {
             if (!@hasDecl(Handler, "onSessionReady")) return;
 
-            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".params.len == 4) {
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".param_types.len == 4) {
                 self.handler.onSessionReady(session, session_id, headers);
             } else {
                 self.handler.onSessionReady(session, session_id);
@@ -2421,17 +2421,17 @@ pub fn Client(comptime Handler: type) type {
             "onWritable",
         };
 
-        for (@typeInfo(Handler).@"struct".decls) |decl| {
-            if (decl.name.len >= 2 and decl.name[0] == 'o' and decl.name[1] == 'n') {
+        for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
+            if (decl_name.len >= 2 and decl_name[0] == 'o' and decl_name[1] == 'n') {
                 var found = false;
                 for (known) |k| {
-                    if (std.mem.eql(u8, decl.name, k)) {
+                    if (std.mem.eql(u8, decl_name, k)) {
                         found = true;
                         break;
                     }
                 }
                 if (!found) {
-                    @compileError("Handler has unrecognized callback '" ++ decl.name ++
+                    @compileError("Handler has unrecognized callback '" ++ decl_name ++
                         "'. Known client callbacks: onConnected, onPollComplete, " ++
                         "onHeaders, onData, onFinished, onSettings, onGoaway, onRequestCancelled, " ++
                         "onStreamData, " ++
@@ -2443,7 +2443,7 @@ pub fn Client(comptime Handler: type) type {
         }
 
         if (@hasDecl(Handler, "onStreamData")) {
-            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params;
+            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types;
             if (params.len != 4 and params.len != 5) {
                 @compileError("onStreamData must have 4 params (self, session, stream_id, data) " ++
                     "or 5 params (self, session, stream_id, data, fin)");
@@ -3089,7 +3089,7 @@ pub fn Client(comptime Handler: type) type {
         fn dispatchSessionReady(self: *Self, session: *ClientSession, session_id: u64, headers: []const qpack.Header) void {
             if (!@hasDecl(Handler, "onSessionReady")) return;
 
-            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".params.len == 4) {
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".param_types.len == 4) {
                 self.handler.onSessionReady(session, session_id, headers);
             } else {
                 self.handler.onSessionReady(session, session_id);
@@ -3099,7 +3099,7 @@ pub fn Client(comptime Handler: type) type {
         fn dispatchStreamData(self: *Self, session: *ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
             if (!@hasDecl(Handler, "onStreamData")) return;
 
-            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params.len == 5) {
+            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types.len == 5) {
                 self.handler.onStreamData(session, stream_id, data, fin);
             } else if (data.len > 0) {
                 self.handler.onStreamData(session, stream_id, data);
@@ -4933,7 +4933,7 @@ test "e2e: a server past retry_threshold makes a client retry, then serves it" {
 /// Server ids 1 and 2 under one QUIC-LB config, as a proxy's workers would
 /// share it.
 fn steerLbConfig(server_id: u8) quic_lb.Config {
-    var cfg: quic_lb.Config = .{ .config_id = 1, .server_id_len = 1, .nonce_len = 7, .key = [_]u8{0x5a} ** 16 };
+    var cfg: quic_lb.Config = .{ .config_id = 1, .server_id_len = 1, .nonce_len = 7, .key = @as([16]u8, @splat(0x5a)) };
     cfg.server_id[0] = server_id;
     return cfg;
 }

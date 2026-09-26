@@ -150,7 +150,7 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
         },
     };
 
-    var cmsg_buf: [CMSG_BUF_SIZE]u8 align(@alignOf(CmsgHdr)) = .{0} ** CMSG_BUF_SIZE;
+    var cmsg_buf: [CMSG_BUF_SIZE]u8 align(@alignOf(CmsgHdr)) = @splat(0);
     var from_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
     var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
 

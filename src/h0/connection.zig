@@ -173,7 +173,7 @@ pub const H0Connection = struct {
                 // Server: accumulate request data and look for \r\n
                 const buf_entry = try self.stream_bufs.getOrPut(stream_id);
                 if (!buf_entry.found_existing) {
-                    buf_entry.value_ptr.* = .{ .items = &.{}, .capacity = 0 };
+                    buf_entry.value_ptr.* = .empty;
                 }
                 try buf_entry.value_ptr.appendSlice(self.allocator, data);
 

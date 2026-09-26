@@ -439,7 +439,7 @@ const WptHandler = struct {
     }
 
     const FIREHOSE_INTERVAL_NS: i64 = 8 * std.time.ns_per_ms; // server.py's ~2 MiB/s at 16 KiB
-    const firehose_chunk = [_]u8{'x'} ** 65536;
+    const firehose_chunk = @as([65536]u8, @splat('x'));
 
     fn pumpFirehoses(self: *WptHandler, session: *event_loop.Session) void {
         const wtc = session.entry.wt_conn orelse return;

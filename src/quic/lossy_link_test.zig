@@ -124,7 +124,7 @@ fn runBulk(total: usize, c2s_loss: Link.Loss, s2c_loss: Link.Loss, one_way_ns: i
     defer sys.test_clock = null;
     var now = start;
 
-    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{ .qlog_dir = qlog_dir }, .{1} ** 16, .{2} ** 16);
+    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{ .qlog_dir = qlog_dir }, @splat(1), @splat(2));
     defer mgr.deinit();
 
     const client = try alloc.create(connection.Connection);
@@ -300,7 +300,7 @@ const Pair = struct {
     fn init(self: *Pair) !void {
         const alloc = testing.allocator;
         self.* = .{
-            .mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, .{1} ** 16, .{2} ** 16),
+            .mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, @splat(1), @splat(2)),
             .client = try alloc.create(connection.Connection),
         };
         errdefer {
@@ -360,7 +360,7 @@ test "stateless reset: a client whose server lost the connection drains" {
     p.mgr.removeConnection(p.mgr.entries.items[0]);
 
     const s = try p.client.openStream();
-    try s.send.writeData("x" ** 64);
+    try s.send.writeData(&@as([64]u8, @splat('x')));
     var buf: [MAX_DGRAM]u8 = undefined;
     var resp: [MAX_DGRAM]u8 = undefined;
     const n = try p.client.send(&buf);

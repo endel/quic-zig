@@ -35,13 +35,13 @@ pub const ParamId = enum(u64) {
 
 /// Server's Preferred Address (RFC 9000 §9.6, §18.2).
 pub const PreferredAddress = struct {
-    ipv4_addr: [4]u8 = .{0} ** 4,
+    ipv4_addr: [4]u8 = @splat(0),
     ipv4_port: u16 = 0,
-    ipv6_addr: [16]u8 = .{0} ** 16,
+    ipv6_addr: [16]u8 = @splat(0),
     ipv6_port: u16 = 0,
-    cid_buf: [20]u8 = .{0} ** 20,
+    cid_buf: [20]u8 = @splat(0),
     cid_len: u8 = 0,
-    stateless_reset_token: [16]u8 = .{0} ** 16,
+    stateless_reset_token: [16]u8 = @splat(0),
 
     pub fn hasIpv4(self: *const PreferredAddress) bool {
         return self.ipv4_port != 0;
@@ -103,7 +103,7 @@ pub const TransportParams = struct {
     /// chosen_version: the version used for this connection.
     /// available_versions: list of all supported versions (up to 8).
     version_info_chosen: ?u32 = null,
-    version_info_available: [8]u32 = .{0} ** 8,
+    version_info_available: [8]u32 = @splat(0),
     version_info_available_count: u8 = 0,
 
     /// Check if a version is listed in the peer's available versions.

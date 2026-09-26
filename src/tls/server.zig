@@ -1544,7 +1544,7 @@ const MiniClient = struct {
         sys.randomBytes(&random);
         try b.bytes(&random);
         try b.u8_(32);
-        try b.bytes(&([_]u8{0xab} ** 32));
+        try b.bytes(&(@as([32]u8, @splat(0xab))));
         const cs = try b.begin(u16);
         for (c.suites) |s| try b.u16_(@intFromEnum(s));
         try b.end(u16, cs);
@@ -1586,7 +1586,7 @@ const MiniClient = struct {
                 try b.bytes(&c.p256.public_key.toUncompressedSec1());
             } else {
                 try b.u16_(97);
-                try b.bytes(&([_]u8{4} ** 97));
+                try b.bytes(&(@as([97]u8, @splat(4))));
             }
         }
         try b.end(u16, ks_list);
@@ -2342,7 +2342,7 @@ test "a ClientHello split across records, coalesced in one feed" {
 test "0-RTT the client sends anyway is skipped, before and after HelloRetryRequest" {
     var certs: TestCerts = undefined;
     try certs.load();
-    const junk = [_]u8{ ct_app_data, 3, 3, 0, 32 } ++ [_]u8{0x5a} ** 32;
+    const junk = [_]u8{ ct_app_data, 3, 3, 0, 32 } ++ @as([32]u8, @splat(0x5a));
     for ([_]bool{ false, true }) |hrr| {
         const config: Config = .{ .certs = &certs.entries, .groups = if (hrr) &.{.secp256r1} else &.{.x25519} };
         var conn = Conn.init(testing.allocator, &config);
@@ -2367,7 +2367,7 @@ test "0-RTT the client sends anyway is skipped, before and after HelloRetryReque
 test "early data ends with the HelloRetryRequest" {
     var certs: TestCerts = undefined;
     try certs.load();
-    const junk = [_]u8{ ct_app_data, 3, 3, 0, 32 } ++ [_]u8{0x5a} ** 32;
+    const junk = [_]u8{ ct_app_data, 3, 3, 0, 32 } ++ @as([32]u8, @splat(0x5a));
     const config: Config = .{ .certs = &certs.entries, .groups = &.{.secp256r1} };
     for ([_]bool{ false, true }) |offer_again| {
         var conn = Conn.init(testing.allocator, &config);

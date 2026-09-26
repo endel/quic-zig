@@ -75,8 +75,8 @@ pub const EncryptionLevel = enum(u8) {
 };
 
 pub const Open = struct {
-    key: [max_key_len]u8 = .{0} ** max_key_len,
-    hp_key: [max_key_len]u8 = .{0} ** max_key_len,
+    key: [max_key_len]u8 = @splat(0),
+    hp_key: [max_key_len]u8 = @splat(0),
     nonce: [nonce_len]u8,
     cipher_suite: CipherSuite = .aes_128_gcm_sha256,
     /// Pre-expanded AES-128 round keys for header protection (AES suites only).
@@ -152,8 +152,8 @@ pub const Open = struct {
 };
 
 pub const Seal = struct {
-    key: [max_key_len]u8 = .{0} ** max_key_len,
-    hp_key: [max_key_len]u8 = .{0} ** max_key_len,
+    key: [max_key_len]u8 = @splat(0),
+    hp_key: [max_key_len]u8 = @splat(0),
     nonce: [nonce_len]u8,
     cipher_suite: CipherSuite = .aes_128_gcm_sha256,
     /// Pre-expanded AES-128 round keys for header protection (AES suites only).
@@ -246,7 +246,7 @@ pub const Seal = struct {
 /// RFC 9001 Section 5.3.
 fn makeNonce(iv: [nonce_len]u8, packet_number: u64) [nonce_len]u8 {
     var n = iv;
-    var pn_bytes: [nonce_len]u8 = .{0} ** nonce_len;
+    var pn_bytes: [nonce_len]u8 = @splat(0);
     std.mem.writeInt(u64, pn_bytes[4..nonce_len], packet_number, .big);
     for (0..nonce_len) |i| {
         n[i] ^= pn_bytes[i];
@@ -269,7 +269,7 @@ pub fn computeHpMask(sample: *const [SAMPLE_LEN]u8, hp_key: [max_key_len]u8, cip
             // RFC 9001 §5.4.4: counter=sample[0..4] LE, nonce=sample[4..16]
             const counter = std.mem.readInt(u32, sample[0..4], .little);
             const nonce: [12]u8 = sample[4..16].*;
-            var zeros: [MASK_LEN]u8 = .{0} ** MASK_LEN;
+            var zeros: [MASK_LEN]u8 = @splat(0);
             var mask: [MASK_LEN]u8 = undefined;
             ChaCha20IETF.xor(&mask, &zeros, counter, hp_key, nonce);
             return mask;
@@ -379,7 +379,7 @@ pub fn deriveInitialKeyMaterial(
     cid: []const u8,
     version: u32,
     comptime is_server: bool,
-) !std.meta.Tuple(&.{ Open, Seal }) {
+) !struct { Open, Seal } {
     if (!protocol.isSupportedVersion(version)) {
         std.log.debug("unsupported QUIC version: 0x{x:0>8}", .{version});
         return error.InvalidVersion;
@@ -399,9 +399,9 @@ pub fn deriveInitialKeyMaterial(
     const client_key_16 = hkdfExpandLabel(secret, label_key, "", key_len);
     const client_iv = hkdfExpandLabel(secret, label_iv, "", nonce_len);
     const client_hp_16 = hkdfExpandLabel(secret, label_hp, "", key_len);
-    var client_key: [max_key_len]u8 = .{0} ** max_key_len;
+    var client_key: [max_key_len]u8 = @splat(0);
     @memcpy(client_key[0..key_len], &client_key_16);
-    var client_hp_key: [max_key_len]u8 = .{0} ** max_key_len;
+    var client_hp_key: [max_key_len]u8 = @splat(0);
     @memcpy(client_hp_key[0..key_len], &client_hp_16);
 
     // Server
@@ -409,9 +409,9 @@ pub fn deriveInitialKeyMaterial(
     const server_key_16 = hkdfExpandLabel(secret, label_key, "", key_len);
     const server_iv = hkdfExpandLabel(secret, label_iv, "", nonce_len);
     const server_hp_16 = hkdfExpandLabel(secret, label_hp, "", key_len);
-    var server_key: [max_key_len]u8 = .{0} ** max_key_len;
+    var server_key: [max_key_len]u8 = @splat(0);
     @memcpy(server_key[0..key_len], &server_key_16);
-    var server_hp_key: [max_key_len]u8 = .{0} ** max_key_len;
+    var server_hp_key: [max_key_len]u8 = @splat(0);
     @memcpy(server_hp_key[0..key_len], &server_hp_16);
 
     var open: Open = undefined;
@@ -434,7 +434,7 @@ test "decryptPayload rejects a payload shorter than its tag" {
     var open = keys[0];
 
     // The payload length is the peer's Length varint minus the packet number.
-    var short = [_]u8{0} ** 8;
+    var short = @as([8]u8, @splat(0));
     try std.testing.expectError(error.AuthenticationFailed, open.decryptPayload(0, &.{}, &short));
 }
 
@@ -594,7 +594,7 @@ pub fn deriveKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_ke
 
 // Derive key with an explicit label string (runtime).
 fn deriveKeyPaddedL(secret: [32]u8, actual_len: usize, label: []const u8) [max_key_len]u8 {
-    var result: [max_key_len]u8 = .{0} ** max_key_len;
+    var result: [max_key_len]u8 = @splat(0);
     if (actual_len == 32) {
         result = hkdfExpandLabel(secret, label, "", 32);
     } else {
@@ -849,10 +849,10 @@ test "deriveNextTrafficSecret produces different secret" {
 }
 
 test "KeyUpdateManager: init and basic operations" {
-    const recv_secret = [_]u8{0xAA} ** 32;
-    const send_secret = [_]u8{0xBB} ** 32;
-    const recv_hp = [_]u8{0xCC} ** max_key_len;
-    const send_hp = [_]u8{0xDD} ** max_key_len;
+    const recv_secret = @as([32]u8, @splat(0xAA));
+    const send_secret = @as([32]u8, @splat(0xBB));
+    const recv_hp = @as([max_key_len]u8, @splat(0xCC));
+    const send_hp = @as([max_key_len]u8, @splat(0xDD));
 
     var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
 
@@ -877,10 +877,10 @@ test "KeyUpdateManager: init and basic operations" {
 }
 
 test "KeyUpdateManager: roll keys" {
-    const recv_secret = [_]u8{0xAA} ** 32;
-    const send_secret = [_]u8{0xBB} ** 32;
-    const recv_hp = [_]u8{0xCC} ** max_key_len;
-    const send_hp = [_]u8{0xDD} ** max_key_len;
+    const recv_secret = @as([32]u8, @splat(0xAA));
+    const send_secret = @as([32]u8, @splat(0xBB));
+    const recv_hp = @as([max_key_len]u8, @splat(0xCC));
+    const send_hp = @as([max_key_len]u8, @splat(0xDD));
 
     var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
     const orig_open_key = mgr.current_open.key;
@@ -916,10 +916,10 @@ test "KeyUpdateManager: roll keys" {
 }
 
 test "KeyUpdateManager: prev key expiry" {
-    const recv_secret = [_]u8{0xAA} ** 32;
-    const send_secret = [_]u8{0xBB} ** 32;
-    const recv_hp = [_]u8{0xCC} ** max_key_len;
-    const send_hp = [_]u8{0xDD} ** max_key_len;
+    const recv_secret = @as([32]u8, @splat(0xAA));
+    const send_secret = @as([32]u8, @splat(0xBB));
+    const recv_hp = @as([max_key_len]u8, @splat(0xCC));
+    const send_hp = @as([max_key_len]u8, @splat(0xDD));
 
     var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
 
@@ -939,10 +939,10 @@ test "KeyUpdateManager: prev key expiry" {
 
 test "KeyUpdateManager: encrypt/decrypt roundtrip across key update" {
     // Simulate two sides: client and server with swapped secrets
-    const client_recv = [_]u8{0x11} ** 32; // = server_send
-    const client_send = [_]u8{0x22} ** 32; // = server_recv
-    const hp_a = [_]u8{0x33} ** max_key_len;
-    const hp_b = [_]u8{0x44} ** max_key_len;
+    const client_recv = @as([32]u8, @splat(0x11)); // = server_send
+    const client_send = @as([32]u8, @splat(0x22)); // = server_recv
+    const hp_a = @as([max_key_len]u8, @splat(0x33));
+    const hp_b = @as([max_key_len]u8, @splat(0x44));
 
     var client = KeyUpdateManager.init(client_recv, client_send, hp_a, hp_b);
     var server = KeyUpdateManager.init(client_send, client_recv, hp_b, hp_a);
@@ -1054,7 +1054,7 @@ test "encodePacketNumber" {
 }
 
 test "hkdfExpandLabel" {
-    const early_secret = HkdfSha256.extract(&.{}, &[_]u8{0} ** 32);
+    const early_secret = HkdfSha256.extract(&.{}, &@as([32]u8, @splat(0)));
     var empty_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("", &empty_hash, .{});
     const derived_secret = hkdfExpandLabel(early_secret, "derived", &empty_hash, 32);

@@ -151,7 +151,7 @@ pub fn Session(comptime Transport: type) type {
         setup_received: bool = false,
         peer_setup: msg.Setup = .{},
 
-        streams: [MAX_STREAMS]StreamState = [_]StreamState{.{}} ** MAX_STREAMS,
+        streams: [MAX_STREAMS]StreamState = @splat(.{}),
         hop_buf: [msg.MAX_HOPS]u64 = undefined,
         next_subscribe_id: u64 = 0,
 

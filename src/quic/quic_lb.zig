@@ -10,7 +10,7 @@ const Aes128 = crypto.core.aes.Aes128;
 /// QUIC-LB configuration for CID encoding.
 pub const Config = struct {
     config_id: u3, // 0-6, identifies which config
-    server_id: [15]u8 = .{0} ** 15,
+    server_id: [15]u8 = @splat(0),
     server_id_len: u4, // 1-15
     nonce_len: u5, // 4-18
     key: ?[16]u8 = null, // null = plaintext, set = encrypted
@@ -204,7 +204,7 @@ pub fn feistelDecrypt(key: [16]u8, data: []u8, total_len: u8) void {
 
 /// Build the 16-byte AES input block: [half_data | zero_padding | total_len | round]
 fn expandBlock(half: []const u8, half_len: u8, total_len: u8, round: u8) [16]u8 {
-    var block: [16]u8 = .{0} ** 16;
+    var block: [16]u8 = @splat(0);
     @memcpy(block[0..half_len], half[0..half_len]);
     // Positions 14 and 15 hold total_len and round number
     block[14] = total_len;

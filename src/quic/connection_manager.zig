@@ -18,7 +18,7 @@ const frame_mod = @import("frame.zig");
 
 /// Fixed-size CID key for use in HashMap lookups.
 pub const CidKey = struct {
-    buf: [20]u8 = .{0} ** 20,
+    buf: [20]u8 = @splat(0),
     len: u8 = 0,
 
     pub fn fromSlice(s: []const u8) CidKey {
@@ -92,7 +92,7 @@ pub const ConnEntry = struct {
 
     // Track which CIDs are registered in the routing map for this connection.
     // Max 8 from LocalCidPool + 1 initial client DCID = 9.
-    registered_cids: [9]CidKey = .{CidKey{}} ** 9,
+    registered_cids: [9]CidKey = @splat(CidKey{}),
     registered_cid_count: u8 = 0,
 
     // Keys this connection holds in `reset_token_map`, one per peer CID.
@@ -294,7 +294,7 @@ pub const ConnectionManager = struct {
         return .{
             .allocator = allocator,
             .cid_map = std.HashMap(CidKey, *ConnEntry, CidKeyContext, 80).init(allocator),
-            .entries = .{ .items = &.{}, .capacity = 0 },
+            .entries = .empty,
             .reset_lookup_key = lookup_key,
             .tls_config = tls_config,
             .conn_config = cc,
@@ -820,7 +820,7 @@ test "removeConnection detaches the protocol layers, freeDeadEntries frees them"
         .private_key_bytes = &.{},
         .alpn = &.{},
     };
-    var mgr = ConnectionManager.init(alloc, tls_config, .{}, .{0} ** 16, .{0} ** 16);
+    var mgr = ConnectionManager.init(alloc, tls_config, .{}, @splat(0), @splat(0));
     defer mgr.deinit();
 
     const conn = try alloc.create(connection.Connection);
@@ -858,13 +858,13 @@ test "max_connections is configurable past 256, and every removed entry is freed
         .private_key_bytes = &.{},
         .alpn = &.{},
     };
-    var mgr = ConnectionManager.init(alloc, tls_config, .{}, .{0} ** 16, .{0} ** 16);
+    var mgr = ConnectionManager.init(alloc, tls_config, .{}, @splat(0), @splat(0));
     defer mgr.deinit();
     mgr.max_connections = 300;
 
     const local = std.mem.zeroes(posix.sockaddr.storage);
     var dcids: [301][8]u8 = undefined;
-    const scid = [_]u8{0xaa} ** 8;
+    const scid = @as([8]u8, @splat(0xaa));
     for (&dcids, 0..) |*d, i| {
         std.mem.writeInt(u64, d, i + 1, .big);
         const header: packet.Header = .{
@@ -895,7 +895,7 @@ fn testManager(alloc: Allocator) ConnectionManager {
         .private_key_bytes = &.{},
         .alpn = &.{},
     };
-    return ConnectionManager.init(alloc, tls_config, .{}, .{0} ** 16, .{0} ** 16);
+    return ConnectionManager.init(alloc, tls_config, .{}, @splat(0), @splat(0));
 }
 
 /// A real client's first datagram, padded to 1200 bytes as RFC 9000 14.1 asks.
@@ -927,9 +927,9 @@ test "an Initial in a datagram under 1200 bytes opens no connection" {
     defer mgr.deinit();
     const addr = std.mem.zeroes(posix.sockaddr.storage);
 
-    var buf = [_]u8{0} ** 1500;
+    var buf = @as([1500]u8, @splat(0));
     var out: [1500]u8 = undefined;
-    const n = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &([_]u8{0x11} ** 8));
+    const n = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &(@as([8]u8, @splat(0x11))));
     try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .dropped);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
 }
@@ -940,9 +940,9 @@ test "an Initial with a DCID under 8 bytes opens no connection" {
     defer mgr.deinit();
     const addr = std.mem.zeroes(posix.sockaddr.storage);
 
-    var buf = [_]u8{0} ** 1200;
+    var buf = @as([1200]u8, @splat(0));
     var out: [1500]u8 = undefined;
-    _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &([_]u8{0x11} ** 7));
+    _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &(@as([7]u8, @splat(0x11))));
     try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .dropped);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
 }
@@ -955,9 +955,9 @@ test "Version Negotiation only answers full-size datagrams, and is rate limited"
     const addr = std.mem.zeroes(posix.sockaddr.storage);
     const unknown: u32 = 0x1a2a3a4a;
 
-    var buf = [_]u8{0} ** 1200;
+    var buf = @as([1200]u8, @splat(0));
     var out: [1500]u8 = undefined;
-    const n = fakeLongHeader(&buf, unknown, &([_]u8{0x11} ** 8));
+    const n = fakeLongHeader(&buf, unknown, &(@as([8]u8, @splat(0x11))));
     try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .dropped);
     try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .send_response);
     // The bucket is spent; the refill needs a second to pass.
@@ -970,7 +970,7 @@ test "stateless reset answers only packets long enough not to be one" {
     defer mgr.deinit();
     const addr = std.mem.zeroes(posix.sockaddr.storage);
 
-    var buf = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
+    var buf = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
     var out: [1500]u8 = undefined;
     try std.testing.expect(mgr.recvDatagram(buf[0 .. MIN_RESET_TRIGGER - 1], addr, addr, 0, &out) == .dropped);
     switch (mgr.recvDatagram(&buf, addr, addr, 0, &out)) {
@@ -1005,7 +1005,7 @@ test "spoofed reset triggers do not spend the CONNECTION_REFUSED budget" {
     const addr = std.mem.zeroes(posix.sockaddr.storage);
     var out: [1500]u8 = undefined;
 
-    var junk = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
+    var junk = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
     try std.testing.expect(mgr.recvDatagram(&junk, addr, addr, 0, &out) == .send_response);
     try std.testing.expect(mgr.recvDatagram(&junk, addr, addr, 0, &out) == .dropped);
 
@@ -1081,7 +1081,7 @@ fn steeringManager(alloc: Allocator, server_id: u8) ConnectionManager {
         .private_key_bytes = &.{},
         .alpn = &.{},
     };
-    var mgr = ConnectionManager.init(alloc, tls_config, .{ .quic_lb = lbConfig(server_id) }, .{0} ** 16, .{0} ** 16);
+    var mgr = ConnectionManager.init(alloc, tls_config, .{ .quic_lb = lbConfig(server_id) }, @splat(0), @splat(0));
     mgr.steer_foreign = true;
     return mgr;
 }
@@ -1130,7 +1130,7 @@ test "an Initial is accepted locally even when its DCID decodes to another serve
 
     var cid: [8]u8 = undefined;
     quic_lb.generateCid(&lbConfig(2), &cid);
-    var buf = [_]u8{0} ** 1200;
+    var buf = @as([1200]u8, @splat(0));
     _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &cid);
     try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .processed);
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());

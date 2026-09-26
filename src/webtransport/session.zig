@@ -152,7 +152,7 @@ pub const WebTransportConnection = struct {
     h3: *h3_conn.H3Connection,
     quic: *quic_connection.Connection,
     is_server: bool,
-    sessions: [MAX_SESSIONS]Session = .{Session{}} ** MAX_SESSIONS,
+    sessions: [MAX_SESSIONS]Session = @splat(Session{}),
     active_session_count: u32 = 0,
 
     // Track which bidi/uni streams belong to WT sessions
@@ -909,7 +909,7 @@ pub const WebTransportConnection = struct {
     /// by the same disposal path.
     fn streamBuf(self: *WebTransportConnection, stream_id: u64) !*std.ArrayList(u8) {
         const gop = try self.stream_bufs.getOrPut(stream_id);
-        if (!gop.found_existing) gop.value_ptr.* = .{ .items = &.{}, .capacity = 0 };
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
         return gop.value_ptr;
     }
 
@@ -1197,7 +1197,7 @@ pub const WebTransportConnection = struct {
             } else {
                 // Not a WT stream — buffer for H3 to handle
                 var buf = self.h3.stream_bufs.getPtr(stream_id) orelse blk: {
-                    const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                    const new_buf = std.ArrayList(u8).empty;
                     try self.h3.stream_bufs.put(stream_id, new_buf);
                     break :blk self.h3.stream_bufs.getPtr(stream_id).?;
                 };
@@ -1580,8 +1580,8 @@ const packet_packer = @import("../quic/packet_packer.zig");
 const protocol = @import("../quic/protocol.zig");
 
 fn createTestQuicConn(is_server: bool) quic_connection.Connection {
-    const dcid = "testdcid" ++ ([_]u8{0} ** 12);
-    const scid = "testscid" ++ ([_]u8{0} ** 12);
+    const dcid = "testdcid" ++ (@as([12]u8, @splat(0)));
+    const scid = "testscid" ++ (@as([12]u8, @splat(0)));
 
     var conn = quic_connection.Connection{
         .allocator = testing.allocator,
@@ -3118,7 +3118,7 @@ test "WT backpressure: sendCapacity follows MAX_DATA, and a session wait fires w
     try testing.expectEqual(@as(u64, 100), setup.wt.sendCapacity(session_id));
 
     const stream_id = try setup.wt.openUniStream(session_id, null);
-    try setup.wt.sendStreamData(stream_id, &([_]u8{'x'} ** 200));
+    try setup.wt.sendStreamData(stream_id, &(@as([200]u8, @splat('x'))));
     try testing.expectEqual(@as(u64, 0), setup.wt.sendCapacity(session_id));
     try testing.expectEqual(@as(?u64, 0), setup.wt.streamSendCapacity(stream_id));
 

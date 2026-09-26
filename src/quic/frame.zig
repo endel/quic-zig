@@ -800,7 +800,7 @@ pub const PendingControlFrame = union(enum) {
         limit: u64,
     },
     new_token: struct {
-        token_buf: [92]u8 = .{0} ** 92,
+        token_buf: [92]u8 = @splat(0),
         token_len: u8 = 0,
     },
     reset_stream: struct {
@@ -1033,7 +1033,7 @@ test "parseSized ends each frame where the next one starts" {
         .immediate_ack,
         .{ .crypto = .{ .offset = 7, .data = @constCast("hello") } },
         .{ .stream = .{ .stream_id = 4, .offset = 9, .length = 3, .fin = true, .data = @constCast("abc") } },
-        .{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = @constCast(&[_]u8{0xcd} ** 8), .stateless_reset_token = .{0} ** 16 } },
+        .{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = @constCast(&@as([8]u8, @splat(0xcd))), .stateless_reset_token = @splat(0) } },
         .{ .connection_close = .{ .error_code = 1, .frame_type = 0, .reason = @constCast("bye") } },
         .{ .datagram_with_length = .{ .data = @constCast("dg") } },
     };

@@ -55,7 +55,7 @@ pub fn isStatelessReset(data: []const u8, tokens: []const [TOKEN_LEN]u8) bool {
 
 // Token determinism: same key + CID produces same token
 test "computeToken deterministic" {
-    const key = [_]u8{0x01} ** 16;
+    const key = @as([16]u8, @splat(0x01));
     const cid = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
 
     const t1 = computeToken(key, &cid);
@@ -65,7 +65,7 @@ test "computeToken deterministic" {
 
 // Different CIDs produce different tokens
 test "computeToken different CIDs" {
-    const key = [_]u8{0x01} ** 16;
+    const key = @as([16]u8, @splat(0x01));
     const cid1 = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     const cid2 = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDE };
 
@@ -76,7 +76,7 @@ test "computeToken different CIDs" {
 
 // Generate + detect roundtrip
 test "generatePacket and isStatelessReset roundtrip" {
-    const key = [_]u8{0x42} ** 16;
+    const key = @as([16]u8, @splat(0x42));
     const cid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
 
     var buf: [64]u8 = undefined;
@@ -95,21 +95,21 @@ test "generatePacket and isStatelessReset roundtrip" {
 
 // Wrong token not detected
 test "isStatelessReset wrong token" {
-    const key = [_]u8{0x42} ** 16;
+    const key = @as([16]u8, @splat(0x42));
     const cid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
 
     var buf: [64]u8 = undefined;
     const size = generatePacket(&buf, 64, key, &cid);
 
     // Try with a different token
-    const wrong_token = [_]u8{0xFF} ** TOKEN_LEN;
+    const wrong_token = @as([TOKEN_LEN]u8, @splat(0xFF));
     const tokens = [_][TOKEN_LEN]u8{wrong_token};
     try std.testing.expect(!isStatelessReset(buf[0..size], &tokens));
 }
 
 // Minimum size enforcement
 test "isStatelessReset minimum size" {
-    const token = [_]u8{0xAA} ** TOKEN_LEN;
+    const token = @as([TOKEN_LEN]u8, @splat(0xAA));
     const tokens = [_][TOKEN_LEN]u8{token};
 
     // 20 bytes is too small (need at least 21)
@@ -125,7 +125,7 @@ test "isStatelessReset minimum size" {
 
 // generatePacket too small
 test "generatePacket too small" {
-    const key = [_]u8{0x01} ** 16;
+    const key = @as([16]u8, @splat(0x01));
     const cid = [_]u8{0x01};
 
     var buf: [64]u8 = undefined;

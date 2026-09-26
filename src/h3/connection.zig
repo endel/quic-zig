@@ -835,7 +835,7 @@ pub const H3Connection = struct {
                 self.peer_control_stream_id = stream_id;
                 // If there's remaining data, buffer it for SETTINGS parsing
                 if (remaining.len > 0) {
-                    var buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                    var buf = std.ArrayList(u8).empty;
                     try buf.appendSlice(self.allocator, remaining);
                     try self.stream_bufs.put(stream_id, buf);
                 }
@@ -1844,8 +1844,8 @@ const protocol = @import("../quic/protocol.zig");
 // Create a minimal QUIC Connection suitable for H3 tests.
 // The `is_server` flag determines stream ID assignment (server bidi starts at 1, client at 0).
 fn createTestQuicConn(is_server: bool) quic_connection.Connection {
-    const dcid = "testdcid" ++ ([_]u8{0} ** 12);
-    const scid = "testscid" ++ ([_]u8{0} ** 12);
+    const dcid = "testdcid" ++ (@as([12]u8, @splat(0)));
+    const scid = "testscid" ++ (@as([12]u8, @splat(0)));
 
     var conn = quic_connection.Connection{
         .allocator = testing.allocator,
@@ -2844,7 +2844,7 @@ test "H3 streaming: header sets past 4 KiB are encoded" {
     defer h3.deinit();
     try setupRequestStream(&quic_conn, &h3, true);
 
-    const cookie = "c" ** 6000;
+    const cookie = &@as([6000]u8, @splat('c'));
     var headers: [MAX_HEADERS]qpack.Header = undefined;
     headers[0] = .{ .name = ":status", .value = "200" };
     headers[1] = .{ .name = "set-cookie", .value = cookie };
@@ -2874,7 +2874,7 @@ test "H3 streaming: notifyWritable waits for credit and a drained buffer" {
     stream.send.send_offset = stream.send.write_offset;
     stream.send.send_window = stream.send.write_offset + 1000;
 
-    try h3.sendResponseData(0, &([_]u8{0} ** 600));
+    try h3.sendResponseData(0, &(@as([600]u8, @splat(0))));
     try testing.expectEqual(@as(?u64, 603), h3.streamBufferedBytes(0));
 
     // 397 bytes of credit left and 603 unsent: 300 does not fit behind them.
@@ -3002,7 +3002,7 @@ test "H3 pauseBody: a paused stream leaves its data unread in QUIC" {
     try testing.expect((try h3.poll()).? == .headers);
     try h3.pauseBody(0);
 
-    var payload = [_]u8{7} ** 50;
+    var payload = @as([50]u8, @splat(7));
     const d = buildDataFrame(&frame_buf, &payload);
     const stream = quic_conn.streams.getStream(0).?;
     try stream.recv.handleStreamFrame(n, frame_buf[0..d], false);
@@ -3037,7 +3037,7 @@ test "H3: a huge DATA frame is surfaced as it arrives and held to the stream win
     offset += hdr.len;
 
     // The first piece is surfaced without waiting for the rest of the frame.
-    const chunk = [_]u8{0x41} ** 16384;
+    const chunk = @as([16384]u8, @splat(0x41));
     try stream.recv.handleStreamFrame(offset, &chunk, false);
     offset += chunk.len;
     const ev = (try h3.poll()).?;
@@ -3099,7 +3099,7 @@ test "H3: an unknown frame on a request stream is skipped as it arrives" {
     const hdr = writeFrameHeaderBytes(&hdr_buf, 0x21, 1 << 40); // reserved type
     try stream.recv.handleStreamFrame(offset, hdr, false);
     offset += hdr.len;
-    const chunk = [_]u8{0x42} ** 16384;
+    const chunk = @as([16384]u8, @splat(0x42));
     for (0..16) |_| {
         try stream.recv.handleStreamFrame(offset, &chunk, false);
         offset += chunk.len;
@@ -3141,7 +3141,7 @@ test "H3 control stream: unknown frames are skipped as they arrive, oversized SE
     const hdr = writeFrameHeaderBytes(&hdr_buf, 0x21, 1 << 40);
     try rs.handleStreamFrame(offset, hdr, false);
     offset += hdr.len;
-    const chunk = [_]u8{0x43} ** 16384;
+    const chunk = @as([16384]u8, @splat(0x43));
     for (0..8) |_| {
         try rs.handleStreamFrame(offset, &chunk, false);
         offset += chunk.len;

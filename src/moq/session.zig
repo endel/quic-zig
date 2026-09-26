@@ -127,7 +127,7 @@ pub fn Session(comptime Transport: type) type {
         setup_sent: bool = false,
         setup_received: bool = false,
 
-        streams: [MAX_STREAMS]StreamState = [_]StreamState{.{}} ** MAX_STREAMS,
+        streams: [MAX_STREAMS]StreamState = @splat(.{}),
 
         // Namespace tuples decoded out of incoming messages alias this, so
         // it lives as long as the session rather than as long as a call.
@@ -539,7 +539,7 @@ test "a stream that never yields a message is not buffered forever" {
 
     // A subgroup header is not an envelope and never will be. Rather than
     // growing until the buffer is full and then silently stalling, say so.
-    const junk = [_]u8{0xff} ** 512;
+    const junk = @as([512]u8, @splat(0xff));
     var events: [4]Event = undefined;
     var pushed: usize = 0;
     while (pushed < STREAM_BUF_SIZE) : (pushed += junk.len) {

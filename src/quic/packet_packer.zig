@@ -50,11 +50,11 @@ pub const PacketPacker = struct {
     is_server: bool,
 
     /// Source connection ID (owned buffer to avoid dangling slices).
-    scid_buf: [20]u8 = .{0} ** 20,
+    scid_buf: [20]u8 = @splat(0),
     scid_len: u8 = 0,
 
     /// Destination connection ID (owned buffer to avoid dangling slices).
-    dcid_buf: [20]u8 = .{0} ** 20,
+    dcid_buf: [20]u8 = @splat(0),
     dcid_len: u8 = 0,
 
     /// QUIC version.

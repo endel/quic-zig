@@ -26,7 +26,7 @@ const MAX_CLIENTS: usize = 4096;
 
 /// Mapping: server_id (hex) → backend address
 const ServerMapping = struct {
-    server_id: [15]u8 = .{0} ** 15,
+    server_id: [15]u8 = @splat(0),
     server_id_len: u4 = 0,
     addr: net.Address,
 };
@@ -35,7 +35,7 @@ const ServerMapping = struct {
 /// We store the client's SCID (which becomes the server's DCID in responses)
 const ClientMapping = struct {
     /// Client's SCID (the DCID the server will use when responding)
-    cid: [20]u8 = .{0} ** 20,
+    cid: [20]u8 = @splat(0),
     cid_len: u8 = 0,
     client_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage),
     backend_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage),
@@ -198,7 +198,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.log.info("QUIC-LB: listening on port {d}", .{config.listen_addr.getPort()});
 
     // Client mappings for return traffic
-    var client_mappings: [MAX_CLIENTS]ClientMapping = .{ClientMapping{}} ** MAX_CLIENTS;
+    var client_mappings: [MAX_CLIENTS]ClientMapping = @splat(ClientMapping{});
 
     var next_rr: usize = 0; // round-robin index for Initial packets
     var recv_buf: [MAX_PACKET_SIZE]u8 = undefined;

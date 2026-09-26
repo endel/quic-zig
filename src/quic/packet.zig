@@ -791,9 +791,9 @@ pub fn generateRetryToken(
 }
 
 pub const ValidatedToken = struct {
-    odcid_buf: [20]u8 = .{0} ** 20,
+    odcid_buf: [20]u8 = @splat(0),
     odcid_len: u8 = 0,
-    retry_scid_buf: [20]u8 = .{0} ** 20,
+    retry_scid_buf: [20]u8 = @splat(0),
     retry_scid_len: u8 = 0,
 
     pub fn getOdcid(self: *const ValidatedToken) []const u8 {
@@ -1302,7 +1302,7 @@ test "Header.parse rejects a long header with the fixed bit clear" {
 }
 
 test "splitProtected rejects lengths the datagram cannot back" {
-    var buf = [_]u8{0} ** 64;
+    var buf = @as([64]u8, @splat(0));
     var fbs = io.fixedBufferStream(&buf);
     fbs.seek = 10;
 

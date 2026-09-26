@@ -16,7 +16,7 @@ const mem = std.mem;
 
 pub fn FixedBufferStream(comptime Buffer: type) type {
     comptime std.debug.assert(@typeInfo(Buffer) == .pointer);
-    const is_const_buf = @typeInfo(Buffer).pointer.is_const;
+    const is_const_buf = @typeInfo(Buffer).pointer.attrs.@"const";
     const Slice = if (is_const_buf) []const u8 else []u8;
 
     return struct {

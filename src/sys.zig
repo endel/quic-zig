@@ -540,7 +540,7 @@ pub fn getenv(name: [*:0]const u8) ?[:0]const u8 {
 }
 
 fn unexpected(err: posix.E) error{Unexpected} {
-    if (builtin.mode == .Debug) {
+    if (builtin.mode == .debug) {
         std.log.warn("sys: unexpected errno: {t}", .{err});
     }
     return error.Unexpected;
