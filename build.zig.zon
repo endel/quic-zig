@@ -2,11 +2,11 @@
     .name = .quic,
     .version = "0.5.0",
     .dependencies = .{
-        // endel/libxev tag quic-zig-2026-09-23: upstream plus the PRs in its
+        // endel/libxev tag quic-zig-2026-09-26: upstream plus the PRs in its
         // fork/patches. See "libxev" in CLAUDE.md before changing this.
         .libxev = .{
-            .url = "https://github.com/endel/libxev/archive/0329dc2d5e5840d5e54e19f5702de4e770b569b0.tar.gz",
-            .hash = "libxev-0.0.0-86vtc2uMFADpKHEeWw2kNuTuLB3h1ddV5Tzz2rKg4VrS",
+            .url = "https://github.com/endel/libxev/archive/9eceb2d9b5b5f3e2f995c04bd45c4efcfba54271.tar.gz",
+            .hash = "libxev-0.0.0-86vtczKoFACEFVygoGoqOb3e-b7vQE1zxtZTfoaQg0Sp",
         },
     },
     .fingerprint = 0xc079525234abfc4c,
