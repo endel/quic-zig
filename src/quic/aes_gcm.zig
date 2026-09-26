@@ -249,13 +249,17 @@ pub const Ctx = struct {
         }
     }
 
+    /// Unaligned vector load and store: on Zig 0.17-dev, `@bitCast(src.*)`
+    /// compiles to 16 byte loads, which doubles the cost of CTR.
     inline fn xorBlock(dst: *[16]u8, src: *const [16]u8, ks: V) void {
-        dst.* = @bitCast(@as(V, @bitCast(src.*)) ^ ks);
+        const in: *align(1) const V = @ptrCast(src);
+        const out: *align(1) V = @ptrCast(dst);
+        out.* = in.* ^ ks;
     }
 
     /// npub || 00000000, so a counter is OR-ed into the top half of lane 1.
     inline fn counterBase(npub: [nonce_length]u8) V {
-        return @bitCast(npub ++ [_]u8{0} ** 4);
+        return @bitCast(npub ++ @as([4]u8, @splat(0)));
     }
 
     inline fn counters(comptime k: usize, base: V, n: u32) [k]V {
