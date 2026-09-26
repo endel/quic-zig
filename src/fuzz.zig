@@ -27,6 +27,7 @@ const ranges = @import("quic/ranges.zig");
 const stream = @import("quic/stream.zig");
 const connection = @import("quic/connection.zig");
 const tls13 = @import("quic/tls13.zig");
+const aes_gcm = @import("quic/aes_gcm.zig");
 const tls_client = @import("tls/client.zig");
 const moq_wire = @import("moq/wire.zig");
 const moq_msg = @import("moq/message.zig");
@@ -1671,4 +1672,52 @@ test "moq-lite FrameReader survives a randomized byte stream" {
             }
         }
     }
+}
+
+// ════════════════════════════════════════════════════════
+// AES-128-GCM packet protection against std
+//
+// `aes_gcm.Ctx` replaces std's CTR and, on arm64, its GHASH. Any
+// input must seal to std's exact bytes and tag, open again, and
+// refuse the same packet with one bit flipped.
+// ════════════════════════════════════════════════════════
+
+test "fuzz: AES-128-GCM agrees with std" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            const input = smith.in orelse return;
+            if (input.len < 16 + 12 + 3) return;
+            const key = input[0..16].*;
+            const npub = input[16..28].*;
+            const flip = input[28];
+            const rest = input[31..];
+            const ad_len = @min(rest.len, std.mem.readInt(u16, input[29..31], .little));
+            const ad = rest[0..ad_len];
+            const m = rest[ad_len..@min(rest.len, ad_len + 4096)];
+
+            const ctx = aes_gcm.Ctx.init(key);
+            var c_ours: [4096]u8 = undefined;
+            var c_std: [4096]u8 = undefined;
+            var tag_ours: [16]u8 = undefined;
+            var tag_std: [16]u8 = undefined;
+            ctx.encrypt(c_ours[0..m.len], &tag_ours, m, ad, npub);
+            std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(c_std[0..m.len], &tag_std, m, ad, npub, key);
+            try testing.expectEqualSlices(u8, c_std[0..m.len], c_ours[0..m.len]);
+            try testing.expectEqualSlices(u8, &tag_std, &tag_ours);
+
+            try ctx.decrypt(c_ours[0..m.len], c_ours[0..m.len], tag_std, ad, npub);
+            try testing.expectEqualSlices(u8, m, c_ours[0..m.len]);
+
+            var bad_tag = tag_std;
+            bad_tag[flip % 16] ^= @as(u8, 1) << @intCast(flip % 8);
+            try testing.expectError(error.AuthenticationFailed, ctx.decrypt(c_std[0..m.len], c_std[0..m.len], bad_tag, ad, npub));
+        }
+    }.f, .{
+        .corpus = &.{
+            // key, nonce, flip, AD length (LE u16), then AD and message
+            "0123456789abcdef" ++ "nonce-000001" ++ "\x05" ++ "\x00\x00" ++ "m",
+            "0123456789abcdef" ++ "nonce-000002" ++ "\x2a" ++ "\x10\x00" ++ "a" ** 16 ++ "m" ** 200,
+            "0123456789abcdef" ++ "nonce-000003" ++ "\x7f" ++ "\x2c\x01" ++ "a" ** 300 ++ "m" ** 1400,
+        },
+    });
 }

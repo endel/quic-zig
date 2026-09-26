@@ -316,13 +316,23 @@ registers around `pclmulqdq`, but that has not been measured.
 
 ## Verifying the copies still match std
 
-- `aes_gcm.zig` has a differential test against std's `Aes128Gcm`: 400 random
-  keys, nonces, messages and AAD lengths. The lengths cross every GHASH
-  aggregation width, and both tampered tags and tampered ciphertext are
-  checked. It passes in Debug, ReleaseFast and ReleaseSmall on arm64, on
-  arm64 with `-mcpu baseline` (software AES), and on x86_64 with and without
-  AES-NI (built with `-target x86_64-linux-musl --test-no-exec`, run under
-  Docker's amd64 emulation).
+- `aes_gcm.zig` is checked three ways, all run by `zig build test`:
+  - Wycheproof's 67 AES-128-GCM vectors with 96-bit IVs (40 valid, 27
+    modified tags), from `aes_gcm_vectors.zig`.
+  - Against std's `Aes128Gcm` on 600 random keys, nonces and lengths
+    (messages to 2 KB, AD to 600 B), and on every message length from 0
+    to 320 B against AD lengths either side of each batch boundary. Each
+    case is sealed in place and not, opened, and refused with one flipped
+    bit in the tag, the message or the AD.
+  - A `zig build fuzz` target doing the same on arbitrary input.
+
+  They pass in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall on arm64, on
+  arm64 with `-mcpu baseline` (software AES) and as generic arm64 Linux, and
+  on x86_64 with and without AES-NI (built with `-target x86_64-linux-musl
+  --test-no-exec`, run under Docker's amd64 emulation). A one-off
+  differential run of 250 million random cases against std (arm64 native
+  and Linux, x86_64 AES-NI and software; 26 Sep 2026) found no difference
+  and no accepted forgery.
 - To see how `ghash.zig` has drifted from std:
 
   ```sh

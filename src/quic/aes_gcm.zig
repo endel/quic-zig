@@ -304,46 +304,116 @@ pub const Ctx = struct {
 const testing = std.testing;
 const StdGcm = crypto.aead.aes_gcm.Aes128Gcm;
 
-test "Ctx matches std Aes128Gcm across lengths that cross every GHASH aggregation width" {
+/// Seals `m` with `ctx` and std, in place and not, and checks they agree;
+/// then opens it, and checks that a flipped tag, message or AD bit is refused.
+fn checkAgainstStd(ctx: *const Ctx, key: [16]u8, npub: [12]u8, m: []const u8, ad: []u8, flip: usize) !void {
+    var c_ours: [2048]u8 = undefined;
+    var c_std: [2048]u8 = undefined;
+    var tag_ours: [16]u8 = undefined;
+    var tag_std: [16]u8 = undefined;
+    ctx.encrypt(c_ours[0..m.len], &tag_ours, m, ad, npub);
+    StdGcm.encrypt(c_std[0..m.len], &tag_std, m, ad, npub, key);
+    try testing.expectEqualSlices(u8, c_std[0..m.len], c_ours[0..m.len]);
+    try testing.expectEqualSlices(u8, &tag_std, &tag_ours);
+
+    // in place, as packet protection uses it
+    var buf: [2048]u8 = undefined;
+    @memcpy(buf[0..m.len], m);
+    var tag_in_place: [16]u8 = undefined;
+    ctx.encrypt(buf[0..m.len], &tag_in_place, buf[0..m.len], ad, npub);
+    try testing.expectEqualSlices(u8, c_std[0..m.len], buf[0..m.len]);
+    try testing.expectEqualSlices(u8, &tag_std, &tag_in_place);
+    try ctx.decrypt(buf[0..m.len], buf[0..m.len], tag_std, ad, npub);
+    try testing.expectEqualSlices(u8, m, buf[0..m.len]);
+
+    var bad_tag = tag_std;
+    bad_tag[flip % 16] ^= 1;
+    @memcpy(buf[0..m.len], c_std[0..m.len]);
+    try testing.expectError(error.AuthenticationFailed, ctx.decrypt(buf[0..m.len], buf[0..m.len], bad_tag, ad, npub));
+    if (m.len > 0) {
+        @memcpy(buf[0..m.len], c_std[0..m.len]);
+        buf[flip % m.len] ^= 0x80;
+        try testing.expectError(error.AuthenticationFailed, ctx.decrypt(buf[0..m.len], buf[0..m.len], tag_std, ad, npub));
+    }
+    if (ad.len > 0) {
+        @memcpy(buf[0..m.len], c_std[0..m.len]);
+        ad[flip % ad.len] ^= 0x01;
+        defer ad[flip % ad.len] ^= 0x01;
+        try testing.expectError(error.AuthenticationFailed, ctx.decrypt(buf[0..m.len], buf[0..m.len], tag_std, ad, npub));
+    }
+}
+
+test "Ctx matches std Aes128Gcm across lengths that cross every aggregation width" {
     var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
     const rand = prng.random();
     var m: [2048]u8 = undefined;
-    var ad: [64]u8 = undefined;
-    for (0..400) |iter| {
+    var ad: [600]u8 = undefined;
+    for (0..600) |iter| {
         var key: [16]u8 = undefined;
         var npub: [12]u8 = undefined;
         rand.bytes(&key);
         rand.bytes(&npub);
         // lengths around 4/8/16-way thresholds (in 16 B blocks), plus odd tails
         const m_len = if (iter < 200) iter * 7 else rand.uintAtMost(usize, m.len);
-        const ad_len = rand.uintAtMost(usize, ad.len);
+        const ad_len = if (iter % 3 == 0) rand.uintAtMost(usize, ad.len) else rand.uintAtMost(usize, 64);
         rand.bytes(m[0..m_len]);
         rand.bytes(ad[0..ad_len]);
-
         const ctx = Ctx.init(key);
-        var c_ours: [2048]u8 = undefined;
-        var c_std: [2048]u8 = undefined;
-        var tag_ours: [16]u8 = undefined;
-        var tag_std: [16]u8 = undefined;
-        ctx.encrypt(c_ours[0..m_len], &tag_ours, m[0..m_len], ad[0..ad_len], npub);
-        StdGcm.encrypt(c_std[0..m_len], &tag_std, m[0..m_len], ad[0..ad_len], npub, key);
-        try testing.expectEqualSlices(u8, c_std[0..m_len], c_ours[0..m_len]);
-        try testing.expectEqualSlices(u8, &tag_std, &tag_ours);
+        try checkAgainstStd(&ctx, key, npub, m[0..m_len], ad[0..ad_len], iter);
+    }
+}
 
-        // in place, as packet protection uses it
-        var buf: [2048]u8 = undefined;
-        @memcpy(buf[0..m_len], c_ours[0..m_len]);
-        try ctx.decrypt(buf[0..m_len], buf[0..m_len], tag_ours, ad[0..ad_len], npub);
-        try testing.expectEqualSlices(u8, m[0..m_len], buf[0..m_len]);
+test "Ctx matches std Aes128Gcm for every message length up to 20 blocks" {
+    var prng = std.Random.DefaultPrng.init(0x2545f4914f6cdd1d);
+    const rand = prng.random();
+    var key: [16]u8 = undefined;
+    var npub: [12]u8 = undefined;
+    var m: [320]u8 = undefined;
+    var ad: [300]u8 = undefined;
+    rand.bytes(&key);
+    rand.bytes(&npub);
+    rand.bytes(&m);
+    rand.bytes(&ad);
+    const ctx = Ctx.init(key);
+    for ([_]usize{ 0, 1, 15, 16, 17, 20, 127, 128, 129, 255, 256, 257, 300 }) |ad_len| {
+        for (0..m.len + 1) |m_len| {
+            try checkAgainstStd(&ctx, key, npub, m[0..m_len], ad[0..ad_len], m_len + ad_len);
+        }
+    }
+}
 
-        var bad_tag = tag_ours;
-        bad_tag[iter % 16] ^= 1;
-        @memcpy(buf[0..m_len], c_ours[0..m_len]);
-        try testing.expectError(error.AuthenticationFailed, ctx.decrypt(buf[0..m_len], buf[0..m_len], bad_tag, ad[0..ad_len], npub));
-        if (m_len > 0) {
-            @memcpy(buf[0..m_len], c_ours[0..m_len]);
-            buf[iter % m_len] ^= 0x80;
-            try testing.expectError(error.AuthenticationFailed, ctx.decrypt(buf[0..m_len], buf[0..m_len], tag_ours, ad[0..ad_len], npub));
+test "Ctx passes Wycheproof's AES-128-GCM vectors (96-bit IV, 128-bit tag)" {
+    for (@import("aes_gcm_vectors.zig").vectors) |v| {
+        var key: [16]u8 = undefined;
+        var iv: [12]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        var aad_buf: [1024]u8 = undefined;
+        var msg_buf: [1024]u8 = undefined;
+        var ct_buf: [1024]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&key, v.key);
+        _ = try std.fmt.hexToBytes(&iv, v.iv);
+        _ = try std.fmt.hexToBytes(&tag, v.tag);
+        const aad = try std.fmt.hexToBytes(&aad_buf, v.aad);
+        const msg = try std.fmt.hexToBytes(&msg_buf, v.msg);
+        const ct = try std.fmt.hexToBytes(&ct_buf, v.ct);
+        const ctx = Ctx.init(key);
+        errdefer std.debug.print("Wycheproof tcId {d}\n", .{v.id});
+
+        if (v.valid) {
+            var out: [1024]u8 = undefined;
+            var out_tag: [16]u8 = undefined;
+            ctx.encrypt(out[0..msg.len], &out_tag, msg, aad, iv);
+            try testing.expectEqualSlices(u8, ct, out[0..msg.len]);
+            try testing.expectEqualSlices(u8, &tag, &out_tag);
+        }
+        var buf: [1024]u8 = undefined;
+        @memcpy(buf[0..ct.len], ct);
+        const opened = ctx.decrypt(buf[0..ct.len], buf[0..ct.len], tag, aad, iv);
+        if (v.valid) {
+            try opened;
+            try testing.expectEqualSlices(u8, msg, buf[0..ct.len]);
+        } else {
+            try testing.expectError(error.AuthenticationFailed, opened);
         }
     }
 }
