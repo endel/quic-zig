@@ -25,13 +25,15 @@ contributions" in `CLAUDE.md`.
 |---|------|----------|------|------------------|
 | 1 | GHASH aggregation threshold | `src/quic/ghash.zig` | vendored copy, one constant changed | yes: tuning |
 | 2 | AES-GCM per-key setup | `src/quic/aes_gcm.zig` | API gap: no keyed AEAD context | yes: API |
-| 3 | CTR mode tail (master regression) | `src/quic/aes_gcm.zig` (`ctr`) | kept 0.16's loop | yes: perf regression |
+| 3 | AES-CTR with hardware AES | `src/quic/aes_gcm.zig` (`ctrFast`) | own CTR loop and arm64 rounds | yes: perf |
 | 4 | RSA modular exponentiation | `src/quic/mont.zig` | narrow replacement for `std.crypto.ff` | maybe: design question |
 | 5 | ECDSA signing without deriving the public key | `src/quic/tls13.zig` `signCertificateVerify` | relies on an internal detail | yes: API |
 | 6 | DER element parsing bounds | `src/quic/tls13.zig` `certificateWellFormed` | guard in front of std | yes: robustness bug |
 | 7 | `std.net.Address` | `src/sockaddr.zig` | adapted copy of 0.15.2 code | no: migration choice |
 | 8 | Fixed-buffer reader/writer | `src/io_compat.zig` | kept our own stream | maybe: codegen observation |
 | 9 | `std.http.Server.WebSocket` | `src/http1/websocket.zig` | replacement: sans-IO codec | maybe: API scope |
+| 10 | GHASH on arm64 | `src/quic/aes_gcm.zig` (`ghashBlocks`) | GHASH in vector registers | yes: codegen |
+| 11 | Master compiles AES-GCM slower | `src/quic/aes_gcm.zig` (`xorBlock`) | explicit unaligned vector loads | yes: codegen regression |
 
 Not a std divergence, but related: std picks the AES and GHASH
 implementation at **compile time** from the target's CPU features.
@@ -75,6 +77,9 @@ reason). Native x86 data across a few microarchitectures would settle it.
 **Master (24 Sep 2026):** still `agg_8_threshold = 84`. The only changes
 since 0.16 are syntax: `.ReleaseSmall` became `.small`, and `@splat`.
 
+On arm64, packets no longer go through this file: see item 10. It still
+serves x86_64, and arm64 builds in ReleaseSmall.
+
 ## 2. std's AEAD API has no keyed context
 
 **std** (`lib/std/crypto/aes_gcm.zig`): `encrypt` and `decrypt` take the raw
@@ -85,20 +90,26 @@ millions of messages, so this work repeats for nothing.
 
 **Ours:** `src/quic/aes_gcm.zig` `Ctx` does that work once, in `init(key)`,
 when the key is installed (`Open`/`Seal.prepareCtx()` in `crypto.zig`). The
-per-message code is std's `encrypt`/`decrypt` line for line, starting from a
-copy of the prepared GHASH state. The copy is about 300 bytes; we hold all
-16 powers because that is what `Ghash.init` computes.
+per-message code follows std's `encrypt`/`decrypt`, over its own CTR (item
+3) and, on arm64, its own GHASH (item 10), which reads the prepared powers of
+H in place. Elsewhere each message starts from a copy of the prepared GHASH
+state, about 300 bytes. We hold all 16 powers because that is what
+`Ghash.init` computes.
 
 **Numbers** (`zig build bench-crypto -Doptimize=ReleaseFast`, 1200 B
-packets, arm64). These include item 1:
+packets, native arm64, called out of line as packets do). These include
+items 3 and 10:
 
 | | std `Aes128Gcm` | `aes_gcm.Ctx` |
 |---|---|---|
-| encrypt | 607 ns | 455 ns |
-| decrypt | 664 ns | 487 ns |
+| encrypt | 624–664 ns | 237 ns |
+| decrypt | 694–749 ns | 239–249 ns |
 
-Caching alone, without item 1, was worth 2–10%. Most of the gain is the
-GHASH threshold.
+Caching alone was worth 2–10%. Most of the gain is items 3 and 10. The
+figures this section first gave (455 and 487 ns) came from calls inlined into
+the timing loop, which kept the round keys in registers across iterations.
+Out of line, that version measured 486–528 ns natively, and in routez's
+Linux build it was slower than std.
 
 **Cost:** `Open`/`Seal` grew from about 288 to 784 bytes. We now pass them by
 pointer through the packer and the receive path, which used to copy them per
@@ -109,37 +120,54 @@ packet.
 `context.decrypt(...)`. Other std primitives already split key setup from
 use (`Aes128.initEnc`, `Ghash.init`); the AEAD wrappers are where that stops.
 
-## 3. CTR mode on master is slower for short messages
+## 3. AES-CTR: our own loop, and arm64 rounds with the key in `aese`
 
-**std 0.16** (`lib/std/crypto/modes.zig` `ctrSlice`):
-- Full batches go through `xorWide`.
-- Whole leftover blocks go through `xor` one at a time.
-- A partial final block is padded.
+**std 0.16** (`lib/std/crypto/modes.zig` `ctrSlice`, over
+`lib/std/crypto/aes/armcrypto.zig`):
+- Full batches of `optimal_parallel_blocks` (6 on arm64) go through
+  `xorWide`, whole leftover blocks through `xor` one at a time, and a partial
+  final block is padded.
+- Each arm64 round is one asm block: `mov`, `aese` with a **zero** key,
+  `aesmc`, then an `eor` of the round key outside the asm. That is four
+  instructions where two do: `aese` XORs its key operand in first, and
+  `aese` + `aesmc` on one register is a pair the core fuses.
+- The asm operands use the `x` constraint, which on arm64 means v0-v15. Six
+  blocks plus 11 round keys don't fit, so keys are moved or reloaded
+  between rounds.
+- Whether `xorWide` is inlined decides whether the keys stay in registers
+  across the loop. With 0.16's loop copied into `aes_gcm.zig`, routez's Linux
+  build compiled it out of line (two callers), and h3-static lost 27% (see
+  routez's `TODO/h3-per-request-latency.md`, 25 Sep 2026).
 
-**Master** (commit `e339566922`, "crypto.mode.ctr: make the counter wrap,
-even in parallel updates", 29 May 2026):
-- The counter wraps now. That part is a correctness fix we agree with.
-- The tail changed: whatever is left after the full batches, even one byte,
-  gets a full `encryptWide(parallel_count)` into a keystream buffer.
-- That keystream is then XORed into the output one byte at a time.
+**Master** (0.17.0-dev.2294, 24 Sep 2026): the same round form and the same
+tail loop as 0.16; the batch counter now wraps (`+%=`). An earlier version of
+this note described a master commit (`e339566922`) that batched the tail;
+master at dev.2294 does not do that.
 
-**Numbers** (same message and key, 0.16 vs master's `ctr`, both compiled
-with 0.16):
+**Ours** (`aes_gcm.zig` `ctrFast`, when `crypto.core.aes.has_hardware_support`):
+- 8 blocks per step with the round keys copied to a local, so they stay in
+  registers and stores to the output can't alias them.
+- The tail as one batch of exactly the blocks left, with the tag mask
+  E(K, J0) as one more lane, so a short packet costs one AES latency.
+- On arm64, each round is `aese v, rk` + `aesmc v, v` in one asm block with
+  `w` operands (all 32 registers). On x86_64, the rounds are std's `aesenc`
+  blocks, which already take the key.
+- The GCM counter is a 32-bit big-endian increment of the last word, as the
+  spec has it.
 
-| | 64 B | 1200 B | 1450 B |
-|---|---|---|---|
-| arm64, 0.16 | 9 ns | 161 ns | 217 ns |
-| arm64, master | 38 ns | 215 ns | 244 ns |
-| x86_64 (Rosetta), 0.16 | 13 ns | 209 ns | 290 ns |
-| x86_64 (Rosetta), master | 50 ns | 328 ns | 390 ns |
+**Numbers** (`zig build bench-crypto -Doptimize=ReleaseFast`, 1200 B,
+native arm64, AES-GCM called out of line as packets do; GHASH unchanged):
 
-**Ours:** `aes_gcm.zig` carries 0.16's loop, with the batch increment made
-wrapping (`+%=`) as master has it. That way moving to 0.17 does not slow
-every packet down.
+| | seal | open |
+|---|---|---|
+| std `Aes128Gcm` | 593–664 ns | 659–749 ns |
+| `Ctx` with 0.16's CTR loop | 486–513 ns | 510–528 ns |
+| `Ctx` with `ctrFast` | 403–433 ns | 409–472 ns |
 
-**Upstream-shaped report:** a performance regression for messages under a
-few KB. A likely fix keeps the wrapping and restores block-sized tail
-handling, or XORs the tail a word or vector at a time.
+**Upstream-shaped report:** armcrypto's `Block.encrypt` could put the round
+key in `aese` and use the `w` constraint. Every AES user on arm64 would
+gain, not only CTR. The master tail regression is separate: keep the
+wrapping and restore block-sized tail handling.
 
 ## 4. RSA modular exponentiation
 
@@ -280,15 +308,79 @@ to raise if std ever wants its WebSocket to be conformant.
 **Master** (Codeberg `5b9147ed59`, 25 Sep 2026): the same design. Only the
 unmask loop changed (`[4]u8` chunks instead of an `align(1) u32` slice).
 
+## 10. GHASH on arm64 runs in general-purpose registers
+
+**std** (`lib/std/crypto/ghash_polyval.zig`, and our copy in
+`src/quic/ghash.zig`): the state and every intermediate are `u128`. On arm64
+LLVM keeps `u128` in pairs of general-purpose registers. Each carryless
+multiply is an asm block on vectors, so every one of them moves its operands
+into vector registers and its result back out. Byte reversal runs as `rev`
+on general registers. In `update` in a ReleaseFast arm64 build, 205 of 826
+instructions move data between the two register files, against 122
+`pmull`s, and some values spill to the stack.
+
+**Ours** (`aes_gcm.zig` `ghashBlocks`, arm64 with the `aes` feature, not
+ReleaseSmall): the same schoolbook product and the same reduction as std,
+on `@Vector(2, u64)`. Blocks are byte-reversed with a vector shuffle.
+Batches of 8 blocks, the tail as one batch, and the length block rides in
+the message's last batch, so each of AD and message costs one reduction. It
+reads the powers of H that `Ghash.init` already computed, so `Ctx` layout
+doesn't change.
+
+**Numbers** (`bench-crypto`, as in item 2, with item 3 in both columns):
+
+| | seal | open |
+|---|---|---|
+| `ghash.zig` | 403–433 ns | 409–472 ns |
+| `ghashBlocks` | 237 ns | 239–249 ns |
+
+**Upstream-shaped report:** a codegen observation more than a bug. On
+arm64, `ghash_polyval.zig` would do better with its state and accumulators
+as vectors. x86_64 likely has the same shape, with `u128` in general
+registers around `pclmulqdq`, but that has not been measured.
+
 ---
+
+## 11. Zig master compiles AES-GCM slower on arm64
+
+Measured 26 Sep 2026 with 0.17.0-dev.2294+71403f299 (LLVM 22.1.8) against
+0.16.0 (LLVM 21.1), same M1 Pro, 1200 B seal out of line:
+
+| | 0.16.0 | master |
+|---|---|---|
+| std `Aes128Gcm` | 569 ns | 723 ns (+27%) |
+| `aes_gcm.Ctx` before `a34c55a` | 219 ns | 336 ns (+53%) |
+| `aes_gcm.Ctx` | 216 ns | 217 ns |
+
+The cause in our code: `@as(V, @bitCast(src.*))` on a `*const [16]u8`
+compiled to sixteen `ldrb` and a chain of shifts and `orr`s instead of one
+`ldr q`, doubling CTR. An `align(1)` vector pointer is one load on both
+compilers (`xorBlock`). std's slowdown is probably the same pattern in
+`Block.fromBytes`/`xorBytes`; not confirmed. Master also names this CPU
+`apple_a14` where 0.16 says `apple_m1`, which made no difference here.
+
+**Upstream-shaped report:** a codegen regression on aarch64: a bitcast of an
+unaligned `[16]u8` load to a 128-bit vector is lowered byte by byte.
 
 ## Verifying the copies still match std
 
-- `aes_gcm.zig` has a differential test against std's `Aes128Gcm`: 400 random
-  keys, nonces, messages and AAD lengths. The lengths cross every GHASH
-  aggregation width, and both tampered tags and tampered ciphertext are
-  checked. It passed in Debug and ReleaseFast on arm64, and on x86_64 with
-  and without AES-NI.
+- `aes_gcm.zig` is checked three ways, all run by `zig build test`:
+  - Wycheproof's 67 AES-128-GCM vectors with 96-bit IVs (40 valid, 27
+    modified tags), from `aes_gcm_vectors.zig`.
+  - Against std's `Aes128Gcm` on 600 random keys, nonces and lengths
+    (messages to 2 KB, AD to 600 B), and on every message length from 0
+    to 320 B against AD lengths either side of each batch boundary. Each
+    case is sealed in place and not, opened, and refused with one flipped
+    bit in the tag, the message or the AD.
+  - A `zig build fuzz` target doing the same on arbitrary input.
+
+  They pass in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall on arm64, on
+  arm64 with `-mcpu baseline` (software AES) and as generic arm64 Linux, and
+  on x86_64 with and without AES-NI (built with `-target x86_64-linux-musl
+  --test-no-exec`, run under Docker's amd64 emulation). A one-off
+  differential run of 250 million random cases against std (arm64 native
+  and Linux, x86_64 AES-NI and software; 26 Sep 2026) found no difference
+  and no accepted forgery.
 - To see how `ghash.zig` has drifted from std:
 
   ```sh
@@ -300,9 +392,10 @@ unmask loop changed (`[4]u8` chunks instead of an `align(1) u32` slice).
 
 ## On a Zig upgrade
 
-1. Re-diff `ghash_polyval.zig`, `aes_gcm.zig` and `modes.zig` against
-   `src/quic/ghash.zig` and `aes_gcm.zig`. Delete a copy once upstream has the
-   same behaviour and `bench-crypto` shows no regression.
+1. Re-diff `ghash_polyval.zig` and `aes_gcm.zig` against `src/quic/ghash.zig`
+   and `aes_gcm.zig`, and check whether armcrypto's rounds take the key in
+   `aese`. Delete our code once upstream has the same behaviour and
+   `bench-crypto` shows no regression.
 2. Check whether `Signer.init` became public, or `der.Element.parse` gained
    bounds checks. If so, drop the workaround.
 3. Rerun `zig build bench-crypto -Doptimize=ReleaseFast` and

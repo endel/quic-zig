@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const sys = @import("../sys.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -154,7 +155,7 @@ pub const SentPacket = struct {
 /// bytes_in_flight and stream ack_offset accounting stale even though packets
 /// had been removed from the sent-packet map.
 pub const SentPacketList = struct {
-    items: std.ArrayListUnmanaged(SentPacket) = .empty,
+    items: std.ArrayListUnmanaged(*SentPacket) = .empty,
 
     pub fn deinit(self: *SentPacketList, allocator: Allocator) void {
         self.items.deinit(allocator);
@@ -164,11 +165,11 @@ pub const SentPacketList = struct {
         self.items.clearRetainingCapacity();
     }
 
-    pub fn append(self: *SentPacketList, allocator: Allocator, item: SentPacket) !void {
+    pub fn append(self: *SentPacketList, allocator: Allocator, item: *SentPacket) !void {
         try self.items.append(allocator, item);
     }
 
-    pub fn constSlice(self: *const SentPacketList) []const SentPacket {
+    pub fn constSlice(self: *const SentPacketList) []const *SentPacket {
         return self.items.items;
     }
 
@@ -195,20 +196,48 @@ const PnList = struct {
 };
 
 /// Result of processing an ACK frame.
+/// The packets an ACK or a loss pass took out of a tracker. They belong to
+/// that tracker's pool until `release`, which the caller runs once done.
 pub const AckResult = struct {
     acked: SentPacketList = .{},
     lost: SentPacketList = .{},
     persistent_congestion: bool = false,
+    owner: ?*SentPacketTracker = null,
 
     pub fn deinit(self: *AckResult, allocator: Allocator) void {
+        self.reset();
         self.acked.deinit(allocator);
         self.lost.deinit(allocator);
     }
 
+    /// Return the packets to their tracker and empty the lists.
     pub fn reset(self: *AckResult) void {
+        if (self.owner) |t| {
+            for (self.acked.constSlice()) |pkt| t.pool.destroy(pkt);
+            for (self.lost.constSlice()) |pkt| t.pool.destroy(pkt);
+            t.live -= self.acked.count() + self.lost.count();
+        }
+        self.owner = null;
         self.acked.clearRetainingCapacity();
         self.lost.clearRetainingCapacity();
         self.persistent_congestion = false;
+    }
+
+    /// `reset`, keeping room for a typical ACK and freeing what a burst grew.
+    pub fn release(self: *AckResult, allocator: Allocator) void {
+        const owner = self.owner;
+        self.reset();
+        // Callers release before the next result is taken: nothing else holds any.
+        if (std.debug.runtime_safety) if (owner) |t| {
+            if (t.live != t.sent_packets.count()) std.debug.panic("{d} SentPackets outstanding", .{t.live - t.sent_packets.count()});
+        };
+        const keep = 64;
+        inline for (.{ &self.acked, &self.lost }) |list| {
+            if (list.items.capacity > keep) {
+                list.deinit(allocator);
+                list.* = .{};
+            }
+        }
     }
 };
 
@@ -219,7 +248,11 @@ pub const SentPacketTracker = struct {
     /// O(count) not O(capacity). Critical for detectLostPackets() which iterates
     /// on every ACK — with AutoHashMap, tombstone bloat after thousands of
     /// insert/remove cycles caused progressive latency degradation.
-    sent_packets: std.AutoArrayHashMapUnmanaged(u64, SentPacket),
+    /// Values point into `pool`: removal moves a pointer, not a 568-byte record.
+    sent_packets: std.AutoArrayHashMapUnmanaged(u64, *SentPacket),
+    pool: std.heap.MemoryPool(SentPacket) = .empty,
+    /// Packets taken from `pool` and not yet returned, in the map or a result.
+    live: usize = 0,
     largest_sent: ?u64 = null,
     largest_acked: ?u64 = null,
     loss_time: ?i64 = null,
@@ -240,6 +273,17 @@ pub const SentPacketTracker = struct {
 
     pub fn deinit(self: *SentPacketTracker) void {
         self.sent_packets.deinit(self.allocator);
+        self.pool.deinit(self.allocator);
+    }
+
+    /// Forget every packet, keeping the pool: an AckResult may still hold some.
+    pub fn clear(self: *SentPacketTracker) void {
+        for (self.sent_packets.values()) |pkt| self.pool.destroy(pkt);
+        const live = self.live - self.sent_packets.count();
+        self.sent_packets.clearAndFree(self.allocator);
+        const allocator = self.allocator;
+        const pool = self.pool;
+        self.* = .{ .allocator = allocator, .sent_packets = .{}, .pool = pool, .live = live };
     }
 
     pub fn onPacketSent(self: *SentPacketTracker, pkt: SentPacket) !void {
@@ -250,7 +294,11 @@ pub const SentPacketTracker = struct {
             self.ack_eliciting_in_flight += 1;
             self.last_ack_eliciting_sent_time = pkt.time_sent;
         }
-        try self.sent_packets.put(self.allocator, pkt.pn, pkt);
+        const p = try self.pool.create(self.allocator);
+        errdefer self.pool.destroy(p);
+        p.* = pkt;
+        try self.sent_packets.put(self.allocator, pkt.pn, p);
+        self.live += 1;
     }
 
     pub fn onAckReceived(
@@ -264,6 +312,7 @@ pub const SentPacketTracker = struct {
         result: *AckResult,
     ) !void {
         result.reset();
+        result.owner = self;
 
         if (self.largest_acked == null or largest_ack > self.largest_acked.?) {
             self.largest_acked = largest_ack;
@@ -290,8 +339,7 @@ pub const SentPacketTracker = struct {
                 continue;
             }
 
-            const kv = self.sent_packets.fetchSwapRemove(pn).?;
-            const pkt = kv.value;
+            const pkt = self.sent_packets.fetchSwapRemove(pn).?.value;
             if (pkt.ack_eliciting) {
                 self.ack_eliciting_in_flight -|= 1;
             }
@@ -309,6 +357,8 @@ pub const SentPacketTracker = struct {
     }
 
     fn detectLostPackets(self: *SentPacketTracker, rtt_stats: *RttStats, now: i64, result: *AckResult) !void {
+        assert(result.owner == null or result.owner == self);
+        result.owner = self;
         self.loss_time = null;
         const loss_delay = rtt_stats.lossDelay();
         const lost_send_time = now - loss_delay;
@@ -854,14 +904,13 @@ pub const PacketHandler = struct {
 
         var it = self.sent[idx].sent_packets.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.in_flight) {
-                self.bytes_in_flight -|= entry.value_ptr.size;
+            if (entry.value_ptr.*.in_flight) {
+                self.bytes_in_flight -|= entry.value_ptr.*.size;
             }
         }
 
-        self.sent[idx].deinit();
+        self.sent[idx].clear();
         self.recv[idx].deinit();
-        self.sent[idx] = SentPacketTracker.init(self.allocator);
         self.recv[idx] = ReceivedPacketTracker.init(self.allocator);
     }
 };
@@ -1148,4 +1197,57 @@ test "NewReno: app_limited suppresses cwnd growth" {
     cc.app_limited = false;
     cc.onPacketAcked(1200, 300);
     try testing.expect(cc.congestion_window > after_ack);
+}
+
+test "AckResult.release keeps a typical ACK's room and frees a burst's" {
+    var result: AckResult = .{};
+    defer result.deinit(testing.allocator);
+    var pkt: SentPacket = .{ .pn = 0, .time_sent = 0, .size = 1200, .ack_eliciting = true, .in_flight = true, .enc_level = .application };
+    for (0..8) |_| try result.acked.append(testing.allocator, &pkt);
+    result.release(testing.allocator);
+    try testing.expect(result.acked.items.capacity >= 8);
+
+    for (0..1000) |_| try result.lost.append(testing.allocator, &pkt);
+    result.release(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), result.lost.items.capacity);
+    try testing.expect(result.acked.items.capacity >= 8);
+}
+
+test "SentPacketTracker: every packet taken from the pool goes back" {
+    var ph = PacketHandler.init(testing.allocator);
+    defer ph.deinit();
+    var result: AckResult = .{};
+    defer result.deinit(testing.allocator);
+    const app = &ph.sent[@intFromEnum(EncLevel.application)];
+
+    var pn: u64 = 0;
+    var now: i64 = 1_000_000;
+    for (0..50) |round| {
+        // Ten packets; the peer acks all but the first two, which go lost.
+        const first = pn;
+        for (0..10) |_| {
+            try ph.onPacketSent(.{ .pn = pn, .time_sent = now, .size = 1200, .ack_eliciting = true, .in_flight = true, .enc_level = .application });
+            pn += 1;
+        }
+        now += 10_000_000;
+        try ph.onAckReceived(.application, pn - 1, 0, 3, &.{}, pn - 1 - (first + 2), now, &result);
+        try testing.expectEqual(@as(usize, 8), result.acked.count());
+        result.release(testing.allocator);
+        // The two left behind are declared lost by the timer, or already were.
+        now += 1_000_000_000;
+        try ph.detectLossesForSpace(.application, now, &result);
+        result.release(testing.allocator);
+        try testing.expectEqual(@as(usize, 0), app.sent_packets.count());
+        try testing.expectEqual(@as(usize, 0), app.live);
+        _ = round;
+    }
+
+    // A space dropped while a result still holds its packets.
+    try ph.onPacketSent(.{ .pn = pn, .time_sent = now, .size = 1200, .ack_eliciting = true, .in_flight = true, .enc_level = .handshake });
+    try ph.onPacketSent(.{ .pn = pn + 1, .time_sent = now, .size = 1200, .ack_eliciting = true, .in_flight = true, .enc_level = .handshake });
+    try ph.onAckReceived(.handshake, pn, 0, 3, &.{}, 0, now + 1000, &result);
+    ph.dropSpace(.handshake);
+    try testing.expectEqual(@as(u64, pn), result.acked.constSlice()[0].pn); // still readable
+    result.release(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), ph.sent[@intFromEnum(EncLevel.handshake)].live);
 }
