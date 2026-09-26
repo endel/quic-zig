@@ -30,7 +30,7 @@ test {
     _ = @import("webtransport/flow_control.zig");
     _ = @import("h3/capsule.zig");
     _ = @import("http1/server.zig");
-    _ = @import("http1/tls.zig");
+    _ = @import("http1/e2e_test.zig");
     _ = @import("tls/server.zig");
     _ = @import("tls/client.zig");
     _ = @import("webtransport/protocol.zig");

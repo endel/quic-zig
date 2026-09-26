@@ -168,6 +168,15 @@ pub fn build(b: *std.Build) void {
     run_wt_browser.step.dependOn(b.getInstallStep());
     b.step("run-wt-browser-server", "Run WebTransport browser server").dependOn(&run_wt_browser.step);
 
+    const exe_ws_echo = App.add(b, "ws-echo-server", "apps/ws_echo_server.zig", target, optimize, need_libc, lib_mod);
+    b.installArtifact(exe_ws_echo);
+    const run_ws_echo = b.addRunArtifact(exe_ws_echo);
+    run_ws_echo.step.dependOn(b.getInstallStep());
+    if (b.args) |ws_args| run_ws_echo.addArgs(ws_args);
+    b.step("run-ws-echo-server", "Run WebSocket + WebTransport echo server").dependOn(&run_ws_echo.step);
+    // Just this binary, for tools/autobahn.sh: a full install is most of a CI run.
+    b.step("ws-echo-server", "Build only ws-echo-server").dependOn(&b.addInstallArtifact(exe_ws_echo, .{}).step);
+
     const exe_moq_relay = App.add(b, "moq-relay", "apps/moq_relay.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_moq_relay);
     const run_moq_relay = b.addRunArtifact(exe_moq_relay);

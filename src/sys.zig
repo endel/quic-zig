@@ -644,6 +644,31 @@ pub const File = struct {
         _ = c.lseek(self.fd, cur, std.c.SEEK.SET);
         return .{ .size = @intCast(end) };
     }
+
+    pub const Kind = enum { file, directory, other };
+
+    /// What the descriptor refers to: a regular file, a directory, or
+    /// anything else. statx on Linux, where 0.16's `std.c.fstat` is void;
+    /// fstat elsewhere.
+    pub fn kind(self: File) !Kind {
+        const mode: u32 = if (builtin.os.tag == .linux) blk: {
+            const linux = std.os.linux;
+            var stx: linux.Statx = undefined;
+            const rc = linux.statx(self.fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                else => |err| return unexpected(err),
+            }
+            break :blk stx.mode;
+        } else blk: {
+            var st: c.Stat = undefined;
+            if (c.fstat(self.fd, &st) != 0) return unexpected(posix.errno(-1));
+            break :blk @intCast(st.mode);
+        };
+        if (c.S.ISREG(mode)) return .file;
+        if (c.S.ISDIR(mode)) return .directory;
+        return .other;
+    }
 };
 
 fn closeFd(fd: fd_t) void {
