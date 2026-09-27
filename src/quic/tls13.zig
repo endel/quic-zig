@@ -1448,7 +1448,7 @@ pub const Tls13Handshake = struct {
         if (self.in_offset > 0 and self.in_len - self.in_offset + data.len > self.in_buf.len - self.in_offset) {
             const remaining = self.in_len - self.in_offset;
             if (remaining > 0) {
-                std.mem.copyForwards(u8, self.in_buf[0..remaining], self.in_buf[self.in_offset..self.in_len]);
+                @memmove(self.in_buf[0..remaining], self.in_buf[self.in_offset..self.in_len]);
             }
             self.in_len = remaining;
             self.in_offset = 0;

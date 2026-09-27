@@ -775,7 +775,7 @@ pub const SendStream = struct {
     fn dropPrefix(self: *SendStream, prefix: usize) void {
         const items = self.write_buffer.items;
         const live = items.len - prefix;
-        std.mem.copyForwards(u8, items[0..live], items[prefix..]);
+        @memmove(items[0..live], items[prefix..]);
         self.write_buffer.items.len = live;
         self.buf_base += prefix;
     }
