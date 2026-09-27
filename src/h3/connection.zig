@@ -194,6 +194,10 @@ pub const H3Connection = struct {
     /// Streams reclaimed since the per-stream maps' tombstones were cleared.
     removed_since_rehash: usize = 0,
 
+    /// Slot in the QUIC streams map of the stream that gave poll() its last
+    /// request-stream event: where `pollBidiStreams` starts next time.
+    bidi_cursor: usize = 0,
+
     /// Request streams whose body the application has paused. poll() leaves
     /// their data in QUIC, so the peer is held back by the stream's flow
     /// control window rather than by our memory.
@@ -1138,51 +1142,73 @@ pub const H3Connection = struct {
         // Can't parse more frames while a body read is pending
         if (self.pending_body != null) return null;
 
-        var stream_it = self.quic_conn.streams.streams.iterator();
-        while (stream_it.next()) |entry| {
-            const stream_id = entry.key_ptr.*;
-            const stream = entry.value_ptr.*;
-
-            // Skip streams owned by the WebTransport layer
-            if (self.excluded_streams.contains(stream_id)) continue;
-
-            // The peer can walk away from the response after its request is
-            // complete, so this is checked on finished streams too.
-            if (self.is_server) {
-                if (stream.send.peer_stop_sending) |code| {
-                    const gop = try self.cancelled_streams.getOrPut(self.allocator, stream_id);
-                    if (!gop.found_existing) {
-                        try self.finished_streams.put(stream_id, {});
-                        return .{ .request_cancelled = .{ .stream_id = stream_id, .error_code = code } };
-                    }
-                }
-            }
-
-            // Skip already-finished streams
-            if (self.finished_streams.contains(stream_id)) continue;
-
-            // Paused: its data stays in QUIC. Only a reset is still news.
-            if (self.paused_bodies.contains(stream_id)) {
-                if (stream.recv.reset_err) |err_code| {
-                    if (try self.reportCancelled(stream_id, err_code)) |ev| return ev;
-                }
+        // Round the map from where the last event came from, and wrap once.
+        // Starting from the top each time, a pass that surfaces one event per
+        // poll() visited every stream once per event: with 16 requests in
+        // flight on a connection, ~190 hash lookups per request, the largest
+        // cost of serving them.
+        const map = &self.quic_conn.streams.streams.unmanaged;
+        const cap = map.capacity();
+        if (cap == 0) return null;
+        const start: @TypeOf(cap) = @intCast(self.bidi_cursor % cap);
+        var it: @TypeOf(map.*).Iterator = .{ .hm = map, .index = start };
+        var wrapped = false;
+        while (true) {
+            const entry = it.next() orelse {
+                if (wrapped or start == 0) break;
+                wrapped = true;
+                it = .{ .hm = map, .index = 0 };
                 continue;
+            };
+            const slot = it.index - 1;
+            if (wrapped and slot >= start) break;
+            if (try self.pollBidiStream(entry.key_ptr.*, entry.value_ptr.*)) |ev| {
+                // This stream may have more to say: start with it next time.
+                self.bidi_cursor = slot;
+                return ev;
             }
+        }
+        return null;
+    }
 
-            // RFC 9114 §5.2: reject client-initiated bidi streams >= our GOAWAY ID
-            if (self.shutdown_state == .going_away_final or self.shutdown_state == .drain_complete) {
-                if (self.local_goaway_id) |goaway_id| {
-                    if (stream_mod.isClient(stream_id) and stream_mod.isBidi(stream_id) and stream_id >= goaway_id) {
-                        stream.send.reset(@intFromEnum(H3Error.request_rejected));
-                        continue;
-                    }
+    fn pollBidiStream(self: *H3Connection, stream_id: u64, stream: *stream_mod.Stream) !?H3Event {
+        // Skip streams owned by the WebTransport layer
+        if (self.excluded_streams.contains(stream_id)) return null;
+
+        // The peer can walk away from the response after its request is
+        // complete, so this is checked on finished streams too.
+        if (self.is_server) {
+            if (stream.send.peer_stop_sending) |code| {
+                const gop = try self.cancelled_streams.getOrPut(self.allocator, stream_id);
+                if (!gop.found_existing) {
+                    try self.finished_streams.put(stream_id, {});
+                    return .{ .request_cancelled = .{ .stream_id = stream_id, .error_code = code } };
                 }
             }
-
-            if (try self.pollRequestStream(stream_id, stream)) |ev| return ev;
         }
 
-        return null;
+        // Skip already-finished streams
+        if (self.finished_streams.contains(stream_id)) return null;
+
+        // Paused: its data stays in QUIC. Only a reset is still news.
+        if (self.paused_bodies.contains(stream_id)) {
+            if (stream.recv.reset_err) |err_code| {
+                if (try self.reportCancelled(stream_id, err_code)) |ev| return ev;
+            }
+            return null;
+        }
+
+        // RFC 9114 §5.2: reject client-initiated bidi streams >= our GOAWAY ID
+        if (self.shutdown_state == .going_away_final or self.shutdown_state == .drain_complete) {
+            if (self.local_goaway_id) |goaway_id| {
+                if (stream_mod.isClient(stream_id) and stream_mod.isBidi(stream_id) and stream_id >= goaway_id) {
+                    stream.send.reset(@intFromEnum(H3Error.request_rejected));
+                    return null;
+                }
+            }
+        }
+
+        return try self.pollRequestStream(stream_id, stream);
     }
 
     /// Advance one request stream to its next event.
