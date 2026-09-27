@@ -191,6 +191,9 @@ pub const H3Connection = struct {
     /// Per-stream position inside a DATA or skipped frame.
     frame_progress: std.AutoHashMapUnmanaged(u64, FrameProgress) = .empty,
 
+    /// Streams reclaimed since the per-stream maps' tombstones were cleared.
+    removed_since_rehash: usize = 0,
+
     /// Request streams whose body the application has paused. poll() leaves
     /// their data in QUIC, so the peer is held back by the stream's flow
     /// control window rather than by our memory.
@@ -664,6 +667,21 @@ pub const H3Connection = struct {
             }
             if (self.pending_body) |pb| {
                 if (pb.stream_id == id) self.pending_body = null;
+            }
+        }
+        // Their tombstones, like the QUIC maps' (`StreamsMap.clearTombstones`):
+        // these are asked about every stream on every poll.
+        self.removed_since_rehash += disposed.len;
+        if (self.removed_since_rehash > self.finished_streams.unmanaged.capacity() / 4) {
+            self.removed_since_rehash = 0;
+            const clear = stream_mod.StreamsMap.clearTombstones;
+            clear(&self.finished_streams);
+            clear(&self.excluded_streams);
+            clear(&self.headers_received_streams);
+            clear(&self.stream_bufs);
+            const ctx: std.hash_map.AutoContext(u64) = .{};
+            inline for (.{ &self.cancelled_streams, &self.paused_bodies, &self.response_states, &self.frame_progress }) |m| {
+                if (m.capacity() > 0) m.rehash(ctx);
             }
         }
     }

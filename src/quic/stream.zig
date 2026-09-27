@@ -1188,6 +1188,10 @@ pub const StreamsMap = struct {
 
     /// All active streams indexed by stream ID.
     streams: std.AutoHashMap(u64, *Stream),
+    /// Streams reclaimed since the maps' tombstones were last cleared; see
+    /// `clearTombstones`. Cleared once it passes a quarter of the capacity:
+    /// the rehash stays O(1) per stream, and most slots stay free.
+    removed_since_rehash: usize = 0,
 
     /// Send-only streams (unidirectional, locally initiated).
     send_streams: std.AutoHashMap(u64, *SendStream),
@@ -1815,6 +1819,13 @@ pub const StreamsMap = struct {
                 self.closeStream(id);
             }
         }
+        self.removed_since_rehash += self.disposal_count;
+        if (self.removed_since_rehash > self.streams.unmanaged.capacity() / 4) {
+            self.removed_since_rehash = 0;
+            clearTombstones(&self.streams);
+            clearTombstones(&self.recv_streams);
+            clearTombstones(&self.send_streams);
+        }
         self.disposal_count = 0;
         if (self.disposal_overflow) {
             self.disposal_overflow = false;
@@ -1822,6 +1833,17 @@ pub const StreamsMap = struct {
         }
         if (self.recv_disposal_overflow) self.recv_disposal_overflow = self.requeueSettled(&self.recv_streams);
         if (self.send_disposal_overflow) self.send_disposal_overflow = self.requeueSettled(&self.send_streams);
+    }
+
+    /// Clear a map's tombstones, which std's HashMap never does by itself. A
+    /// removal leaves one and gives the slot back to the free count, so a
+    /// long-lived connection's maps, one insert and one removal per stream,
+    /// never grow: they fill with tombstones, and a lookup that misses probes
+    /// all of them. HTTP/3 servers ask "is this stream finished" of every
+    /// stream on every poll, and that probing was the largest cost of serving
+    /// small responses on a few busy connections.
+    pub fn clearTombstones(map: anytype) void {
+        if (map.unmanaged.capacity() > 0) map.rehash();
     }
 
     /// Offer the queue the settled streams of `map` that it turned away while
@@ -3048,6 +3070,33 @@ test "collectClosedStreams: marks a stream once both FINs have crossed" {
     // Locally initiated, so the open count drops but nothing is consumed.
     try testing.expectEqual(@as(u64, 0), sm.open_bidi_streams);
     try testing.expectEqual(@as(u64, 0), sm.consumed_bidi_streams);
+}
+
+fn freeSlots(map: anytype) usize {
+    const m = &map.unmanaged;
+    var n: usize = 0;
+    for (m.metadata.?[0..m.capacity()]) |md| n += @intFromBool(md.isFree());
+    return n;
+}
+
+test "reclaiming streams leaves the maps free slots to stop a lookup at" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+    sm.setMaxStreams(1 << 20, 1 << 20);
+
+    // A long-lived connection: a few requests in flight, thousands through.
+    var id: u64 = 0;
+    while (id < 4 * 20_000) : (id += 4) {
+        _ = try sm.getOrCreateStream(id);
+        if (id >= 4 * 8) _ = sm.queueDisposal(id - 4 * 8);
+        sm.drainDisposalQueue();
+    }
+    try testing.expectEqual(@as(u32, 8), sm.streams.count());
+    // Tombstones never give their slot back on their own: a map that only
+    // saw removals would have none free, and a miss would probe all of it.
+    const cap = sm.streams.unmanaged.capacity();
+    try testing.expect(freeSlots(&sm.streams) >= cap - sm.streams.count() - cap / 4);
+    try testing.expect(sm.getStream(1 << 40) == null);
 }
 
 test "closeIfDone: a FIN ahead of a hole keeps the stream until the hole fills" {
