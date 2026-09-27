@@ -1558,6 +1558,13 @@ pub const StreamsMap = struct {
     /// and RFC 9218 priority. Two tiers:
     ///   Tier 1: streams with send_order set — sorted descending (higher = more urgent).
     ///   Tier 2: streams without send_order — RFC 9218 urgency-based scheduling.
+    /// Non-incremental streams at the chosen urgency go one at a time, lowest
+    /// stream ID first (RFC 9218 §4); the others follow the scheduled set, in
+    /// ID order, as backfill. The packer draws from `out` in order and a
+    /// stream with more to send fills the packet, so a backfill stream only
+    /// gets the room left when the one ahead of it ends mid-packet. Without
+    /// that, every response ended in a short packet: wasted space, and a
+    /// packet GSO can't carry on past.
     /// Returns the count of streams written to `out`.
     pub fn getScheduledStreams(self: *StreamsMap, out: *[MAX_SCHEDULABLE]*Stream) usize {
         // One walk fills both tiers: send_order streams (tier 1), and the
@@ -1565,8 +1572,10 @@ pub const StreamsMap = struct {
         var ordered_count: usize = 0;
         var min_urgency: u3 = 7;
         var urgency_count: usize = 0;
-        var found_non_incremental = false;
         var urgency_buf: [MAX_SCHEDULABLE]*Stream = undefined;
+        // Non-incremental streams at `min_urgency`, in no particular order.
+        var sequential_count: usize = 0;
+        var sequential_buf: [MAX_SCHEDULABLE]*Stream = undefined;
         var it = self.streams.valueIterator();
         while (it.next()) |sp| {
             const s = sp.*;
@@ -1586,18 +1595,15 @@ pub const StreamsMap = struct {
             if (s.send.urgency < min_urgency) {
                 min_urgency = s.send.urgency;
                 urgency_count = 0;
-                found_non_incremental = false;
+                sequential_count = 0;
             }
 
             if (s.send.urgency != min_urgency) continue;
 
             if (!s.send.incremental) {
-                if (!found_non_incremental) {
-                    if (urgency_count >= MAX_SCHEDULABLE) continue;
-                    urgency_buf[urgency_count] = s;
-                    urgency_count += 1;
-                    found_non_incremental = true;
-                }
+                if (sequential_count >= MAX_SCHEDULABLE) continue;
+                sequential_buf[sequential_count] = s;
+                sequential_count += 1;
             } else {
                 if (urgency_count >= MAX_SCHEDULABLE) continue;
                 urgency_buf[urgency_count] = s;
@@ -1607,6 +1613,18 @@ pub const StreamsMap = struct {
         // Sort tier 1 descending by send_order (higher first)
         if (ordered_count > 1) {
             sortStreamsBySendOrder(out[0..ordered_count]);
+        }
+
+        // The first non-incremental stream takes its turn with the incremental
+        // ones; the rest wait behind the whole set.
+        std.sort.insertion(*Stream, sequential_buf[0..sequential_count], {}, struct {
+            fn lessThan(_: void, a: *Stream, b: *Stream) bool {
+                return a.stream_id < b.stream_id;
+            }
+        }.lessThan);
+        if (sequential_count > 0 and urgency_count < MAX_SCHEDULABLE) {
+            urgency_buf[urgency_count] = sequential_buf[0];
+            urgency_count += 1;
         }
 
         // Rotate tier 2 incremental streams for fairness
@@ -1624,10 +1642,17 @@ pub const StreamsMap = struct {
         }
         if (urgency_count > 0) self.rr_index +%= 1;
 
-        // Append tier 2 after tier 1
-        const total = @min(ordered_count + urgency_count, MAX_SCHEDULABLE);
+        // Append tier 2 after tier 1, then the backfill.
+        var total = @min(ordered_count + urgency_count, MAX_SCHEDULABLE);
         for (ordered_count..total) |i| {
             out[i] = urgency_buf[i - ordered_count];
+        }
+        if (sequential_count > 1) {
+            for (sequential_buf[1..sequential_count]) |s| {
+                if (total >= MAX_SCHEDULABLE) break;
+                out[total] = s;
+                total += 1;
+            }
         }
         return total;
     }
@@ -2770,8 +2795,37 @@ test "StreamsMap: getScheduledStreams non-incremental is sequential" {
 
     var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
     const count = sm.getScheduledStreams(&out);
-    // Non-incremental: only one stream at a time
-    try testing.expectEqual(@as(usize, 1), count);
+    // Non-incremental: one stream at a time, lowest ID first; the next only
+    // as backfill behind it.
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(u64, 0), out[0].stream_id);
+    try testing.expectEqual(@as(u64, 4), out[1].stream_id);
+}
+
+test "StreamsMap: non-incremental backfill comes after incremental streams, in ID order" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    // Opened in an order the map won't iterate in, with IDs 0, 4, 8, 12.
+    var streams: [4]*Stream = undefined;
+    for (&streams) |*st| st.* = try sm.openBidiStream();
+    for (streams, [_]bool{ false, true, false, false }) |st, incremental| {
+        try st.send.writeData("data");
+        st.send.urgency = 3;
+        st.send.incremental = incremental;
+    }
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    const count = sm.getScheduledStreams(&out);
+    try testing.expectEqual(@as(usize, 4), count);
+    // Scheduled: stream 0 (the first sequential one) and 4 (incremental), in
+    // the round-robin's order; then 8 and 12 as backfill.
+    const a = out[0].stream_id;
+    const b = out[1].stream_id;
+    try testing.expect((a == 0 and b == 4) or (a == 4 and b == 0));
+    try testing.expectEqual(@as(u64, 8), out[2].stream_id);
+    try testing.expectEqual(@as(u64, 12), out[3].stream_id);
 }
 
 test "StreamsMap: getScheduledStreams incremental returns all" {

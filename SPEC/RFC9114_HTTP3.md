@@ -343,6 +343,12 @@ points:
     target stream.
   - `sendPriorityUpdate(stream_id, prio)` emits the frame from a
     client and updates local scheduling state.
+  - Scheduling (`StreamsMap.getScheduledStreams`): the most urgent level
+    only; its incremental streams share packets round-robin, its
+    non-incremental ones go one at a time, lowest stream ID first. The
+    non-incremental streams behind the current one are backfill: a packet
+    whose stream ends partway through carries the start of the next, so a
+    run of responses leaves in full-size packets that GSO can send as one.
 
 ## §10 Security Considerations — ✅ N/A
 
