@@ -739,8 +739,8 @@ pub const SendStream = struct {
     const COMPACT_THRESHOLD: usize = 64 * 1024;
 
     /// Capacity a stream keeps once a burst has drained. Past it, capacity is
-    /// handed back when the unacked bytes fall under a quarter of it, so one
-    /// burst does not pin its high-water mark for the stream's lifetime.
+    /// handed back once every byte written has been acked, so one burst does
+    /// not pin its high-water mark for the stream's lifetime.
     pub const RETAINED_CAPACITY: usize = 64 * 1024;
 
     /// Buffered bytes the peer has acknowledged.
@@ -754,10 +754,14 @@ pub const SendStream = struct {
     fn compactAcked(self: *SendStream) void {
         const prefix = self.ackedPrefix();
         const live = self.write_buffer.items.len - prefix;
-        // Shrinking to twice the live bytes leaves a factor of two either way
-        // before the next grow or shrink, so reallocations stay amortised.
-        if (self.write_buffer.capacity > RETAINED_CAPACITY and live < self.write_buffer.capacity / 4) {
-            if (self.shrinkTo(prefix, @max(RETAINED_CAPACITY, live * 2))) return;
+        // Only once the burst is over. Shrinking while bytes were still in
+        // flight, whenever they fell under a quarter of the capacity, gave a
+        // writer that refills between two marks a shrink and a regrow per
+        // refill: routez keeps an HTTP/3 response between 64 and 256 KiB
+        // buffered, and a 1 MB one spent a third of its time reallocating and
+        // faulting in the fresh pages.
+        if (live == 0 and self.write_buffer.capacity > RETAINED_CAPACITY) {
+            if (self.shrinkTo(prefix, RETAINED_CAPACITY)) return;
         }
         if (prefix < COMPACT_THRESHOLD) return;
         // Move no more than we discard, so the copying is amortised O(1) per
@@ -3643,6 +3647,31 @@ test "SendStream: steady streaming above the retained capacity does not thrash" 
     const warm = ca.allocs;
     try streamThrough(&ss, 8 * 1024 * 1024, 1200, 256 * 1024);
     try testing.expectEqual(warm, ca.allocs);
+}
+
+test "SendStream: a writer refilling between two marks does not reallocate" {
+    var ca: CountingAllocator = .{ .child = testing.allocator };
+    var ss = SendStream.init(ca.allocator(), 0);
+    defer ss.deinit();
+
+    // Topped up to 256 KiB whenever under 64 KiB is left unacked, as routez
+    // feeds a response; sent and acked 1200 bytes at a time.
+    var buf: [16 * 1024]u8 = undefined;
+    @memset(&buf, 'r');
+    var warm: ?usize = null;
+    for (0..64) |round| {
+        if (round == 4) warm = ca.allocs;
+        while (ss.write_offset - ss.ack_offset < 256 * 1024) try ss.writeData(&buf);
+        while (ss.write_offset - ss.ack_offset >= 64 * 1024) {
+            const f = ss.popStreamFrame(1200).?;
+            try ss.onAck(f.stream.offset, f.stream.length, false);
+        }
+    }
+    try testing.expectEqual(warm.?, ca.allocs);
+
+    // Drained, it goes back to the retained capacity.
+    while (ss.popStreamFrame(1200)) |f| try ss.onAck(f.stream.offset, f.stream.length, false);
+    try testing.expectEqual(SendStream.RETAINED_CAPACITY, ss.write_buffer.capacity);
 }
 
 test "FrameSorter: chunk slots from a reordering burst are released once drained" {
