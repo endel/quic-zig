@@ -1490,7 +1490,7 @@ pub fn Server(comptime Handler: type) type {
                     h3c.drainDisposalQueue();
                 }
                 for (conn.streams.disposal_queue[0..conn.streams.disposal_count]) |id| {
-                    _ = entry.finished_streams.remove(id);
+                    _ = entry.finished_streams.swapRemove(id);
                 }
                 conn.streams.drainDisposalQueue();
 
@@ -2541,7 +2541,9 @@ pub fn Client(comptime Handler: type) type {
         session_id: ?u64,
 
         // For raw QUIC: track streams whose fin has been delivered via onStreamData(..., fin)
-        finished_streams: std.AutoHashMap(u64, void),
+        /// Array-backed: one entry per stream for the connection's life, and
+        /// `std.HashMap` never clears the tombstones removals leave.
+        finished_streams: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
         /// See the server's `quic_poll_ids`.
         quic_poll_ids: std.ArrayList(u64),
 
@@ -2698,7 +2700,6 @@ pub fn Client(comptime Handler: type) type {
                 .wt_conn = null,
                 .protocol_initialized = false,
                 .session_id = null,
-                .finished_streams = std.AutoHashMap(u64, void).init(alloc),
                 .quic_poll_ids = .empty,
                 .server_name = config.server_name,
                 .path = config.path,
@@ -2721,7 +2722,7 @@ pub fn Client(comptime Handler: type) type {
                 b.deinit(self.allocator);
                 self.allocator.destroy(b);
             }
-            self.finished_streams.deinit();
+            self.finished_streams.deinit(self.allocator);
             self.quic_poll_ids.deinit(self.allocator);
             self.timer.deinit();
             if (self.shared_loop == null) self.own_loop.deinit();
@@ -2993,7 +2994,7 @@ pub fn Client(comptime Handler: type) type {
                 h3c.drainDisposalQueue();
             }
             for (conn.streams.disposal_queue[0..conn.streams.disposal_count]) |id| {
-                _ = self.finished_streams.remove(id);
+                _ = self.finished_streams.swapRemove(id);
             }
             conn.streams.drainDisposalQueue();
         }
@@ -3228,13 +3229,13 @@ pub fn Client(comptime Handler: type) type {
                 while (conn.streams.getRecvStream(stream_id)) |rs| {
                     const data = rs.read() orelse break;
                     const fin = rs.finished;
-                    if (fin) self.finished_streams.put(stream_id, {}) catch {};
+                    if (fin) self.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, data, fin);
                     self.allocator.free(data);
                 }
                 const rs = conn.streams.getRecvStream(stream_id) orelse continue;
                 if (rs.finished and !self.finished_streams.contains(stream_id)) {
-                    self.finished_streams.put(stream_id, {}) catch {};
+                    self.finished_streams.put(self.allocator, stream_id, {}) catch {};
                     self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
                 }
                 if (rs.finished and !stream_mod.isBidi(stream_id)) conn.streams.releaseRecvStream(stream_id);
