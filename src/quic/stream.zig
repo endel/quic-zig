@@ -1558,13 +1558,18 @@ pub const StreamsMap = struct {
     /// Maximum number of streams returned by getScheduledStreams().
     pub const MAX_SCHEDULABLE: usize = 48;
 
+    /// Sequential streams offered as backfill behind the current one. A
+    /// packet rarely holds the ends of more; ordering every waiting stream
+    /// by ID, once per packet, was the packer's hottest loop.
+    const MAX_BACKFILL: usize = 3;
+
     /// Select bidi streams to send data on, respecting both WebTransport sendOrder
     /// and RFC 9218 priority. Two tiers:
     ///   Tier 1: streams with send_order set — sorted descending (higher = more urgent).
     ///   Tier 2: streams without send_order — RFC 9218 urgency-based scheduling.
     /// Non-incremental streams at the chosen urgency go one at a time, lowest
-    /// stream ID first (RFC 9218 §4); the others follow the scheduled set, in
-    /// ID order, as backfill. The packer draws from `out` in order and a
+    /// stream ID first (RFC 9218 §4); the next few follow the scheduled set,
+    /// in ID order, as backfill. The packer draws from `out` in order and a
     /// stream with more to send fills the packet, so a backfill stream only
     /// gets the room left when the one ahead of it ends mid-packet. Without
     /// that, every response ended in a short packet: wasted space, and a
@@ -1577,9 +1582,10 @@ pub const StreamsMap = struct {
         var min_urgency: u3 = 7;
         var urgency_count: usize = 0;
         var urgency_buf: [MAX_SCHEDULABLE]*Stream = undefined;
-        // Non-incremental streams at `min_urgency`, in no particular order.
+        // The non-incremental streams at `min_urgency` with the lowest IDs,
+        // in ID order: the one whose turn it is, then its backfill.
         var sequential_count: usize = 0;
-        var sequential_buf: [MAX_SCHEDULABLE]*Stream = undefined;
+        var sequential_buf: [1 + MAX_BACKFILL]*Stream = undefined;
         var it = self.streams.valueIterator();
         while (it.next()) |sp| {
             const s = sp.*;
@@ -1605,9 +1611,15 @@ pub const StreamsMap = struct {
             if (s.send.urgency != min_urgency) continue;
 
             if (!s.send.incremental) {
-                if (sequential_count >= MAX_SCHEDULABLE) continue;
-                sequential_buf[sequential_count] = s;
-                sequential_count += 1;
+                // Kept sorted as it fills; full, a higher ID has no place.
+                var at = sequential_count;
+                while (at > 0 and sequential_buf[at - 1].stream_id > s.stream_id) : (at -= 1) {}
+                if (at == sequential_buf.len) continue;
+                const keep: usize = @min(sequential_count, sequential_buf.len - 1);
+                var k = keep;
+                while (k > at) : (k -= 1) sequential_buf[k] = sequential_buf[k - 1];
+                sequential_buf[at] = s;
+                sequential_count = keep + 1;
             } else {
                 if (urgency_count >= MAX_SCHEDULABLE) continue;
                 urgency_buf[urgency_count] = s;
@@ -1621,11 +1633,6 @@ pub const StreamsMap = struct {
 
         // The first non-incremental stream takes its turn with the incremental
         // ones; the rest wait behind the whole set.
-        std.sort.insertion(*Stream, sequential_buf[0..sequential_count], {}, struct {
-            fn lessThan(_: void, a: *Stream, b: *Stream) bool {
-                return a.stream_id < b.stream_id;
-            }
-        }.lessThan);
         if (sequential_count > 0 and urgency_count < MAX_SCHEDULABLE) {
             urgency_buf[urgency_count] = sequential_buf[0];
             urgency_count += 1;
@@ -3672,6 +3679,25 @@ test "SendStream: a writer refilling between two marks does not reallocate" {
     // Drained, it goes back to the retained capacity.
     while (ss.popStreamFrame(1200)) |f| try ss.onAck(f.stream.offset, f.stream.length, false);
     try testing.expectEqual(SendStream.RETAINED_CAPACITY, ss.write_buffer.capacity);
+}
+
+test "StreamsMap: backfill is the lowest IDs, however many streams wait" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(40, 40);
+
+    var streams: [20]*Stream = undefined;
+    for (&streams) |*st| {
+        st.* = try sm.openBidiStream();
+        try st.*.send.writeData("data");
+    }
+    // Stream 0 is done; the lowest waiting IDs are 4, 8, 12, 16.
+    _ = streams[0].send.popStreamFrame(100);
+
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    const count = sm.getScheduledStreams(&out);
+    try testing.expectEqual(@as(usize, 1 + StreamsMap.MAX_BACKFILL), count);
+    for (out[0..count], 1..) |st, k| try testing.expectEqual(@as(u64, 4 * k), st.stream_id);
 }
 
 test "FrameSorter: chunk slots from a reordering burst are released once drained" {
