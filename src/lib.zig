@@ -10,6 +10,7 @@ pub const crypto = @import("quic/crypto.zig");
 pub const aes_gcm = @import("quic/aes_gcm.zig");
 pub const tls13 = @import("quic/tls13.zig");
 pub const mont = @import("quic/mont.zig");
+pub const ecdsa_p256 = @import("quic/ecdsa_p256.zig");
 pub const ca_bundle = @import("quic/ca_bundle.zig");
 pub const ecn_socket = @import("quic/ecn_socket.zig");
 pub const transport_params = @import("quic/transport_params.zig");

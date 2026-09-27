@@ -15,6 +15,7 @@ test {
     _ = @import("quic/packet_packer.zig");
     _ = @import("quic/tls13.zig");
     _ = @import("quic/rsa.zig");
+    _ = @import("quic/ecdsa_p256.zig");
     _ = @import("quic/mtu.zig");
     _ = @import("quic/stateless_reset.zig");
     _ = @import("quic/connection_manager.zig");
