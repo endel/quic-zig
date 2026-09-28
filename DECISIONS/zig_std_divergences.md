@@ -34,6 +34,7 @@ contributions" in `CLAUDE.md`.
 | 9 | `std.http.Server.WebSocket` | `src/http1/websocket.zig` | replacement: sans-IO codec | maybe: API scope |
 | 10 | GHASH on arm64 | `src/quic/aes_gcm.zig` (`ghashBlocks`) | GHASH in vector registers | yes: codegen |
 | 11 | Master compiles AES-GCM slower | `src/quic/aes_gcm.zig` (`xorBlock`) | explicit unaligned vector loads | yes: codegen regression |
+| 12 | ECDSA P-256 signing's k·G | `src/quic/ecdsa_p256.zig` | own signer: std's steps, fixed-base table | yes: perf |
 
 Not a std divergence, but related: std picks the AES and GHASH
 implementation at **compile time** from the target's CPU features.
@@ -227,6 +228,10 @@ private.
 **Upstream-shaped suggestion:** a public way to sign from a `SecretKey`,
 either by making `Signer.init` public or through a `SecretKey.sign`.
 
+**Superseded for P-256** by section 12, which signs from the secret key
+bytes directly. The `KeyPair` workaround remains for nothing in the signing
+path; drop this section if section 12 goes.
+
 ## 6. DER element parsing trusts its lengths
 
 **std** (`lib/std/crypto/Certificate.zig`, `der.Element.parse`): it reads
@@ -362,6 +367,41 @@ compilers (`xorBlock`). std's slowdown is probably the same pattern in
 **Upstream-shaped report:** a codegen regression on aarch64: a bitcast of an
 unaligned `[16]u8` load to a 128-bit vector is lowered byte by byte.
 
+## 12. ECDSA P-256 signing multiplies the base point like any other point
+
+**std** (`lib/std/crypto/ecdsa.zig`, `pcurves/p256.zig`): `Signer` computes
+k·G with `basePoint.mul`, which is `pcMul16`: a 16-entry table of G's
+multiples, 64 additions and 252 doublings, as for any point. With std's field
+arithmetic (54 ns a multiply on the x86_64 server core measured) that is
+440 µs of a 480 µs signature, and a signature is most of the server's CPU in
+a full TLS or QUIC handshake.
+
+**Ours:** `src/quic/ecdsa_p256.zig` keeps j·16^i·G for every nibble
+position i and digit j as affine coordinates (64 × 15 points, 60 KiB, built
+on first use in ~2 ms with one field inversion for all of them; a signature
+needed while another thread builds it uses std's multiplication). k·G is then 64 mixed additions and no
+doublings; each position's point is chosen by a conditional-move scan of all
+15, so the memory touched does not depend on k. Everything else is std's
+`Signer.finalizePrehashed`, step for step, with its private
+`deterministicScalar` copied verbatim, so a signature is byte-identical to
+std's for the same key, message and noise. `signCertificateVerify` in
+`src/quic/tls13.zig` uses it for `ecdsa_secp256r1_sha256`.
+
+**Numbers:** 481 µs to 172 µs per signature (2.8×), `zig build bench-crypto
+-Doptimize=ReleaseFast`, rows "ECDSA sign, key prepared" and "k·G off a
+table", x86_64 (Intel Xeon, native, 27 Sep 2026). routez, one worker, full
+TLS 1.3 handshakes: 1,428/s to 2,254/s. Tests check k·G against std's for
+300 scalars (1, 2, n − 1 and random) and signatures against std's, byte for
+byte, on 40 keys and messages, with and without noise.
+
+**Master (27 Sep 2026):** not re-checked. Check `pcurves/p256.zig` for a
+fixed-base comb before raising it.
+
+**Upstream-shaped suggestion:** a precomputed fixed-base table for P-256's
+base point, used by `mul` when `is_base` is set, as `mulPublic` could too.
+The field multiply itself may be worth a look: 54 ns is several times what
+64-bit Montgomery multiplication takes elsewhere.
+
 ## Verifying the copies still match std
 
 - `aes_gcm.zig` is checked three ways, all run by `zig build test`:
@@ -397,7 +437,10 @@ unaligned `[16]u8` load to a 128-bit vector is lowered byte by byte.
    `aese`. Delete our code once upstream has the same behaviour and
    `bench-crypto` shows no regression.
 2. Check whether `Signer.init` became public, or `der.Element.parse` gained
-   bounds checks. If so, drop the workaround.
+   bounds checks. If so, drop the workaround. Diff std's
+   `Signer.finalizePrehashed` and `deterministicScalar` against
+   `src/quic/ecdsa_p256.zig`, and drop it if `basePoint.mul` has a
+   fixed-base table.
 3. Rerun `zig build bench-crypto -Doptimize=ReleaseFast` and
    `zig build run-bench-codec -Doptimize=ReleaseFast`, and update the numbers
    here.

@@ -500,7 +500,7 @@ fn writeVarIntCapsule(writer: anytype, capsule: H3FrameType, value: u64) !void {
 /// parse out of an ArrayList they then have to compact.
 pub fn consumeFromBuf(buf: *std.ArrayList(u8), n: usize) void {
     const remaining = buf.items.len - n;
-    if (remaining > 0) std.mem.copyForwards(u8, buf.items[0..remaining], buf.items[n..]);
+    if (remaining > 0) @memmove(buf.items[0..remaining], buf.items[n..]);
     buf.items.len = remaining;
 }
 

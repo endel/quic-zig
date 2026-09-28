@@ -155,6 +155,8 @@ retransmission, ACK validation), (b) flow-control enforcement, (c) resource boun
 3. **Pacer burst fixed at 12 KB.** Computed once (`congestion.zig:442-448`), never rescaled by
    bandwidth or PMTUD. With ~1 ms timer granularity that's a ~96 Mbit/s ceiling. quic-go:
    `max(bandwidth × 2 ms, 10 pkts)` + 1 ms min pacing delay (`pacer.go:64-69,105`). S.
+   **Done (2026-09):** the burst now follows quic-go's rule; the 1 ms minimum delay
+   is not taken, since a shorter wait already becomes the next loop pass.
 
 4. **PTO retransmits the whole unacked window (and full crypto stream).** On app PTO every
    stream re-queues `ack_offset..write_offset` (`connection.zig:3488-3503`), and crypto

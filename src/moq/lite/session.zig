@@ -127,7 +127,7 @@ const StreamState = struct {
     }
 
     fn consume(self: *StreamState, n: usize) void {
-        std.mem.copyForwards(u8, self.buf[0 .. self.len - n], self.buf[n..self.len]);
+        @memmove(self.buf[0 .. self.len - n], self.buf[n..self.len]);
         self.len -= n;
     }
 
@@ -544,7 +544,7 @@ pub const FrameReader = struct {
     pub fn push(self: *FrameReader, data: []const u8) error{Overflow}!void {
         if (self.pos > 0) {
             const rest = self.len - self.pos;
-            std.mem.copyForwards(u8, self.buf[0..rest], self.buf[self.pos..self.len]);
+            @memmove(self.buf[0..rest], self.buf[self.pos..self.len]);
             self.len = rest;
             self.pos = 0;
         }

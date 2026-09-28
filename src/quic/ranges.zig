@@ -125,11 +125,8 @@ pub const RangeSet = struct {
             // Remove extra merged ranges
             if (merge_end - merge_start > 1) {
                 const remove_count = merge_end - merge_start - 1;
-                std.mem.copyForwards(
-                    Range,
-                    items[merge_start + 1 ..],
-                    items[merge_start + 1 + remove_count ..],
-                );
+                const rest = items[merge_start + 1 + remove_count ..];
+                @memmove(items[merge_start + 1 ..][0..rest.len], rest);
                 self.ranges.shrinkRetainingCapacity(items.len - remove_count);
             }
         } else {

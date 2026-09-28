@@ -105,7 +105,7 @@ const StreamState = struct {
     }
 
     fn consume(self: *StreamState, n: usize) void {
-        std.mem.copyForwards(u8, self.buf[0 .. self.len - n], self.buf[n..self.len]);
+        @memmove(self.buf[0 .. self.len - n], self.buf[n..self.len]);
         self.len -= n;
     }
 };

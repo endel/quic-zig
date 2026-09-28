@@ -445,7 +445,7 @@ pub const Conn = struct {
     fn compactInput(self: *Conn) void {
         if (self.in_pos == 0) return;
         const rest = self.in.items.len - self.in_pos;
-        std.mem.copyForwards(u8, self.in.items[0..rest], self.in.items[self.in_pos..]);
+        @memmove(self.in.items[0..rest], self.in.items[self.in_pos..]);
         self.in.items.len = rest;
         self.in_pos = 0;
         if (rest == 0 and self.in.capacity > keep_input_capacity) self.in.clearAndFree(self.server.alloc);

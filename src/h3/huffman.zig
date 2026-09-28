@@ -344,6 +344,60 @@ const decode_trie = buildDecodeTrie();
 // EOS symbol value
 const EOS_SYMBOL: u16 = 256;
 
+/// One step of `decode`: where four bits take a trie node, and the symbol
+/// they complete. The shortest code is 5 bits, so four bits complete at most
+/// one, and never one after another.
+const NibbleStep = struct {
+    next: u16,
+    sym: u8 = 0,
+    kind: enum(u8) { none, emit, invalid, eos } = .none,
+};
+
+/// Every internal node's step for each nibble, walked out of the trie.
+const nibble_steps: [decode_trie.count][16]NibbleStep = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var t: [decode_trie.count][16]NibbleStep = undefined;
+    for (0..decode_trie.count) |n| for (0..16) |v| {
+        var node: u16 = n;
+        var step: NibbleStep = .{ .next = 0 };
+        for (0..4) |k| {
+            const bit: u1 = @intCast((v >> (3 - k)) & 1);
+            const tn = decode_trie.nodes[node];
+            if (tn.is_leaf[bit]) {
+                if (tn.symbol[bit] == EOS_SYMBOL) {
+                    step.kind = .eos;
+                    break;
+                }
+                step.kind = .emit;
+                step.sym = @intCast(tn.symbol[bit]);
+                node = 0;
+            } else if (tn.children[bit] == UNALLOCATED) {
+                step.kind = .invalid;
+                break;
+            } else node = tn.children[bit];
+        }
+        step.next = node;
+        t[n][v] = step;
+    };
+    break :blk t;
+};
+
+/// Nodes the input may end on: the root, or at most 7 bits into a code
+/// along 1s only, which is the padding RFC 7541 §5.2 allows (the start of
+/// EOS).
+const ends_ok: [decode_trie.count]bool = blk: {
+    var ok: [decode_trie.count]bool = @splat(false);
+    ok[0] = true;
+    var node: u16 = 0;
+    for (0..7) |_| {
+        const tn = decode_trie.nodes[node];
+        if (tn.is_leaf[1] or tn.children[1] == UNALLOCATED) break;
+        node = tn.children[1];
+        ok[node] = true;
+    }
+    break :blk ok;
+};
+
 /// Decode a Huffman-encoded byte slice according to RFC 7541 Appendix B.
 /// Returns the number of decoded bytes written to out_buf.
 /// Errors:
@@ -351,7 +405,35 @@ const EOS_SYMBOL: u16 = 256;
 ///   - OutputBufferTooSmall: out_buf is not large enough
 ///   - EosSymbolDecoded: the EOS symbol appeared in the encoded data (RFC 7541 violation)
 ///   - InvalidPadding: trailing padding bits are not all 1s or exceed 7 bits
+///
+/// Four bits at a time off `nibble_steps`. Walking the trie a bit at a time
+/// was 6% of routez serving small HTTP/3 requests, all of it header names
+/// and values.
 pub fn decode(encoded: []const u8, out_buf: []u8) DecodeError!usize {
+    var out_pos: usize = 0;
+    var node: u16 = 0;
+    for (encoded) |byte| {
+        inline for (.{ byte >> 4, byte & 0xf }) |nibble| {
+            const st = nibble_steps[node][nibble];
+            switch (st.kind) {
+                .none => {},
+                .emit => {
+                    if (out_pos >= out_buf.len) return DecodeError.OutputBufferTooSmall;
+                    out_buf[out_pos] = st.sym;
+                    out_pos += 1;
+                },
+                .invalid => return DecodeError.InvalidHuffmanEncoding,
+                .eos => return DecodeError.EosSymbolDecoded,
+            }
+            node = st.next;
+        }
+    }
+    if (!ends_ok[node]) return DecodeError.InvalidPadding;
+    return out_pos;
+}
+
+/// The bit-at-a-time decoder `decode` replaced, kept to check it against.
+fn decodeBitwise(encoded: []const u8, out_buf: []u8) DecodeError!usize {
     var out_pos: usize = 0;
     var node_idx: u16 = 0; // current position in trie (0 = root)
     var bits_in_current_code: u8 = 0; // how many bits consumed since last symbol
@@ -717,4 +799,40 @@ test "encode+decode every byte 0..255 round-trips" {
         try testing.expectEqual(@as(usize, 1), dec_len);
         try testing.expectEqual(b, dec_buf[0]);
     }
+}
+
+test "the nibble decoder agrees with the bit-at-a-time one on any input" {
+    var prng = std.Random.DefaultPrng.init(0x9218);
+    const r = prng.random();
+    var in: [128]u8 = undefined;
+    var out_a: [160]u8 = undefined;
+    var out_b: [160]u8 = undefined;
+    var plain: [30]u8 = undefined;
+    for (0..20_000) |i| {
+        const n = r.uintAtMost(usize, 40);
+        if (i % 2 == 0) {
+            // Valid encodings, sometimes cut short or with a byte flipped.
+            const m = r.uintAtMost(usize, plain.len);
+            for (plain[0..m]) |*b| b.* = if (r.boolean()) r.int(u8) else "aeiost/:-."[r.uintLessThan(usize, 10)];
+            const len = encode(plain[0..m], &in) catch unreachable;
+            const cut = if (r.uintLessThan(u8, 4) == 0) r.uintAtMost(usize, len) else len;
+            if (cut > 0 and r.uintLessThan(u8, 4) == 0) in[r.uintLessThan(usize, cut)] ^= r.int(u8);
+            try expectSame(in[0..cut], &out_a, &out_b);
+        } else {
+            r.bytes(in[0..n]);
+            try expectSame(in[0..n], &out_a, &out_b);
+        }
+        // Small output buffers too.
+        const small = r.uintAtMost(usize, 8);
+        try expectSame(in[0..@min(n, 6)], out_a[0..small], out_b[0..small]);
+    }
+}
+
+fn expectSame(in: []const u8, out_a: []u8, out_b: []u8) !void {
+    const a = decode(in, out_a);
+    const b = decodeBitwise(in, out_b);
+    if (b) |nb| {
+        const na = try a;
+        try testing.expectEqualSlices(u8, out_b[0..nb], out_a[0..na]);
+    } else |err| try testing.expectError(err, a);
 }

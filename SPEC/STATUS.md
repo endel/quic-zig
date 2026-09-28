@@ -272,7 +272,7 @@
 | 7.4 | Ignoring Loss of Undecryptable Packets | ✅ Done | PMTU probes excluded |
 | 7.5 | Probe Timeout | ✅ Done | PTO sends don't reduce window |
 | 7.6 | Persistent Congestion | ✅ Done | 3×PTO threshold, reset to 2×MSS |
-| 7.7 | Pacing | ✅ Done | Token bucket, 1.25× cwnd, 10-pkt burst |
+| 7.7 | Pacing | ✅ Done | Token bucket, 1.25× cwnd; burst of 10 packets or 2 ms at the pacing rate, whichever is more (quic-go's rule) |
 | 7.8 | Under-utilizing the Congestion Window | ✅ Done | app_limited flag suppresses cwnd growth in NewReno + CUBIC |
 | B | NewReno Pseudocode | ✅ Done | Matches appendix B |
 | - | CUBIC (RFC 8312) | ✅ Done | Default CC algorithm, fast convergence |

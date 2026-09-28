@@ -2906,7 +2906,7 @@ pub const Connection = struct {
         }
         if (moved > 0) {
             const rest = self.control_retry.items[moved..];
-            std.mem.copyForwards(frame_mod.PendingControlFrame, self.control_retry.items[0..rest.len], rest);
+            @memmove(self.control_retry.items[0..rest.len], rest);
             self.control_retry.shrinkRetainingCapacity(rest.len);
         }
 

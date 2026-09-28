@@ -24,6 +24,7 @@ const Sha384 = crypto.hash.sha2.Sha384;
 const Sha512 = crypto.hash.sha2.Sha512;
 const X25519 = crypto.dh.X25519;
 const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
+const ecdsa_p256 = @import("ecdsa_p256.zig");
 const Ed25519 = crypto.sign.Ed25519;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 
@@ -1448,7 +1449,7 @@ pub const Tls13Handshake = struct {
         if (self.in_offset > 0 and self.in_len - self.in_offset + data.len > self.in_buf.len - self.in_offset) {
             const remaining = self.in_len - self.in_offset;
             if (remaining > 0) {
-                std.mem.copyForwards(u8, self.in_buf[0..remaining], self.in_buf[self.in_offset..self.in_len]);
+                @memmove(self.in_buf[0..remaining], self.in_buf[self.in_offset..self.in_len]);
             }
             self.in_len = remaining;
             self.in_offset = 0;
@@ -3316,12 +3317,8 @@ pub fn signCertificateVerify(
     switch (scheme) {
         .ecdsa_secp256r1_sha256 => {
             if (private_key_bytes.len != 32) return error.InternalError;
-            const sk = EcdsaP256Sha256.SecretKey.fromBytes(private_key_bytes[0..32].*) catch return error.InternalError;
-            // Not `fromSecretKey`: that multiplies the base point to recover a
-            // public key, which signing never reads, and it costs as much as the
-            // signature itself.
-            const kp = EcdsaP256Sha256.KeyPair{ .secret_key = sk, .public_key = undefined };
-            const sig = kp.sign(content, noise) catch return error.InternalError;
+            // Ours, not std's: the same signature, with k·G off a table.
+            const sig = ecdsa_p256.sign(private_key_bytes[0..32].*, content, noise) catch return error.InternalError;
             return sig.toDer(out[0..EcdsaP256Sha256.Signature.der_encoded_length_max]);
         },
         .ed25519 => {

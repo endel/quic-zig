@@ -352,7 +352,7 @@ pub const Conn = struct {
                 try self.processRecord(bufs.in[off..][0..total]);
                 off += total;
             }
-            mem.copyForwards(u8, bufs.in[0 .. self.in_len - off], bufs.in[off..self.in_len]);
+            @memmove(bufs.in[0 .. self.in_len - off], bufs.in[off..self.in_len]);
             self.in_len -= off;
         }
     }
@@ -410,7 +410,7 @@ pub const Conn = struct {
         if (content.len == 0) return;
         if (self.app_in_pos > 0 and self.app_in_pos >= self.app_in.items.len / 2) {
             const live = self.app_in.items[self.app_in_pos..];
-            mem.copyForwards(u8, self.app_in.items[0..live.len], live);
+            @memmove(self.app_in.items[0..live.len], live);
             self.app_in.shrinkRetainingCapacity(live.len);
             self.app_in_pos = 0;
         }
@@ -458,7 +458,7 @@ pub const Conn = struct {
     fn reserveOutput(self: *Conn, n: usize) Error![]u8 {
         if (self.out_pos > 0 and self.out_pos >= self.out.items.len / 2) {
             const live = self.out.items[self.out_pos..];
-            mem.copyForwards(u8, self.out.items[0..live.len], live);
+            @memmove(self.out.items[0..live.len], live);
             self.out.shrinkRetainingCapacity(live.len);
             self.out_pos = 0;
         }
@@ -495,7 +495,7 @@ pub const Conn = struct {
         var pos: usize = 0;
         defer {
             const rest = self.hs_in.items.len - pos;
-            mem.copyForwards(u8, self.hs_in.items[0..rest], self.hs_in.items[pos..]);
+            @memmove(self.hs_in.items[0..rest], self.hs_in.items[pos..]);
             self.hs_in.shrinkRetainingCapacity(rest);
         }
         while (self.hs_in.items.len - pos >= 4) {

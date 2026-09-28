@@ -78,6 +78,11 @@ fn montModexp(m: *const [128]u8, base: *const [128]u8, exp: *const [128]u8, out:
 
 // ── ECDSA P-256 Sign, with and without the redundant public-key derivation ──
 
+fn ecdsaSignTable(sk: *const EcdsaP256Sha256.SecretKey, msg: []const u8) u8 {
+    const sig = quic.ecdsa_p256.sign(sk.toBytes(), msg, null) catch unreachable;
+    return sig.r[0];
+}
+
 fn ecdsaSignNoPublicKey(sk: *const EcdsaP256Sha256.SecretKey, msg: *const [130]u8) EcdsaP256Sha256.Signature {
     // The signer reads only the secret key, so the public half need not exist.
     const kp = EcdsaP256Sha256.KeyPair{ .secret_key = sk.*, .public_key = undefined };
@@ -267,6 +272,7 @@ pub fn main() !void {
 
     const sign_only_ns = benchNs(ecdsaSignNoPublicKey, .{ &ecdsa_kp.secret_key, &sign_content }, N_SIGN);
     const sign_derive_ns = benchNs(ecdsaSignDerivingPublicKey, .{ &ecdsa_kp.secret_key, &sign_content }, N_SIGN);
+    const sign_table_ns = benchNs(ecdsaSignTable, .{ &ecdsa_kp.secret_key, &sign_content }, N_SIGN);
 
     std.debug.print("  {s:<28} {s:>10}  {s:>10}\n", .{ "Operation", "ns/op", "ops/sec" });
     std.debug.print("  ────────────────────────── ──────────  ──────────\n", .{});
@@ -286,6 +292,7 @@ pub fn main() !void {
         .{ .name = "1024-bit modexp (mont)", .ns = mont_ns },
         .{ .name = "ECDSA sign, key prepared", .ns = sign_only_ns },
         .{ .name = "ECDSA sign, deriving pubkey", .ns = sign_derive_ns },
+        .{ .name = "ECDSA sign, k·G off a table", .ns = sign_table_ns },
     };
 
     for (ops) |op| {

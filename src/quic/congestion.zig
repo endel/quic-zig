@@ -36,8 +36,15 @@ const DEFAULT_MAX_DATAGRAM_SIZE: u64 = 1200;
 const NEWRENO_BETA: u64 = 7; // Numerator (divide by 10 for 0.7)
 const NEWRENO_BETA_DENOM: u64 = 10;
 
-/// Maximum burst size for pacer (in packets).
+/// Smallest burst the pacer allows (in packets).
 const MAX_BURST_PACKETS: u64 = 10;
+
+/// The pacer's burst also covers this much sending at its rate: quic-go's
+/// MinPacingDelay plus TimerGranularity (`pacer.go`). Past the fixed ten
+/// packets, a wait shorter than a timer tick buys no smoothness, only another
+/// pass for the next ten: a 1 MB HTTP/3 response on loopback left in 12 KB
+/// bursts, each drawing its own ACK, ~95 of each per response.
+const PACER_BURST_NS: u64 = 2 * std.time.ns_per_ms;
 
 /// Bandwidth multiplier for pacer (1.25x) expressed as fraction.
 const PACER_BANDWIDTH_NUM: u64 = 5;
@@ -431,7 +438,8 @@ pub const Pacer = struct {
     /// Available budget in bytes.
     budget: u64,
 
-    /// Max burst size in bytes.
+    /// Max burst size in bytes: ten packets, or `PACER_BURST_NS` of sending
+    /// at the pacing rate when that is more. Set with the bandwidth.
     max_burst: u64,
 
     /// Last time a packet was sent (nanoseconds).
@@ -471,6 +479,10 @@ pub const Pacer = struct {
             @as(u128, cwnd) * PACER_BANDWIDTH_NUM * (@as(u128, 1) << BANDWIDTH_SHIFT),
             @as(u128, @intCast(srtt)) * PACER_BANDWIDTH_DENOM,
         ));
+        self.max_burst = @max(
+            MAX_BURST_PACKETS * self.max_datagram_size,
+            (self.bandwidth_shifted *| PACER_BURST_NS) >> BANDWIDTH_SHIFT,
+        );
     }
 
     /// Called when a packet is sent. Deducts from the budget.
@@ -776,6 +788,35 @@ test "Pacer: checking between sends does not earn the same interval twice" {
     try testing.expectEqual(left, pacer.delayAt(mid));
     try testing.expect(pacer.timeUntilSend(mid + @divTrunc(left, 2)) > 0);
     try testing.expectEqual(@as(i64, 0), pacer.timeUntilSend(t0 + wait + 1));
+}
+
+test "Pacer: burst covers two milliseconds at a high rate, ten packets at a low one" {
+    var rtt = RttStats{};
+    rtt.updateRtt(1_000_000, 0, false); // 1 ms
+
+    // 1.2 MB per ms (×1.25): two milliseconds of it is 3 MB, far past ten packets.
+    var fast = Pacer.init();
+    fast.setBandwidth(1_200_000, &rtt);
+    try testing.expect(fast.max_burst > 2_900_000 and fast.max_burst <= 3_000_000);
+    const t0: i64 = 1_000_000_000;
+    fast.onPacketSent(1200, t0); // starts the clock
+    fast.credited_at = t0 - 10 * std.time.ns_per_ms;
+    try testing.expectEqual(fast.max_burst, fast.budgetAt(t0));
+    var sent: u64 = 0;
+    while (fast.timeUntilSend(t0) == 0) : (sent += 1) fast.onPacketSent(1200, t0);
+    try testing.expect(sent > 100 * MAX_BURST_PACKETS);
+
+    // 12 KB per 50 ms: two milliseconds of it is well under ten packets.
+    rtt = RttStats{};
+    rtt.updateRtt(50_000_000, 0, false);
+    var slow = Pacer.init();
+    slow.setBandwidth(12000, &rtt);
+    try testing.expectEqual(MAX_BURST_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE, slow.max_burst);
+
+    // A larger datagram after PMTUD raises the floor with it.
+    slow.max_datagram_size = 1452;
+    slow.setBandwidth(12000, &rtt);
+    try testing.expectEqual(MAX_BURST_PACKETS * 1452, slow.max_burst);
 }
 
 test "congestion window is capped at MAX_WINDOW_PACKETS" {

@@ -88,7 +88,7 @@ pub const ConnEntry = struct {
     drain_final_goaway_at: ?i64 = null,
 
     // For raw QUIC protocol: track streams whose fin has been delivered to handler
-    finished_streams: std.AutoHashMapUnmanaged(u64, void) = .{},
+    finished_streams: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
 
     // Track which CIDs are registered in the routing map for this connection.
     // Max 8 from LocalCidPool + 1 initial client DCID = 9.
@@ -243,6 +243,10 @@ pub const ConnectionManager = struct {
     /// lost state finds its connection even though its DCID is random.
     reset_token_map: std.AutoHashMapUnmanaged(ResetKey, *ConnEntry) = .empty,
     reset_lookup_key: [16]u8,
+    /// Removals from the two maps above since their tombstones were cleared.
+    /// std's HashMap never clears them itself, and every connection ID a
+    /// server hands out is inserted and later removed: see `noteRemovals`.
+    removed_since_rehash: usize = 0,
 
     // Server-wide shared config
     tls_config: tls13.TlsConfig,
@@ -340,7 +344,21 @@ pub const ConnectionManager = struct {
                 if (owner == entry) _ = self.reset_token_map.remove(k);
             }
         }
+        self.noteRemovals(entry.reset_key_count);
         entry.reset_key_count = 0;
+    }
+
+    /// Rehash the routing maps in place once removals pass a quarter of their
+    /// capacity. A removal leaves a tombstone and returns the slot to the
+    /// free count, so a long-running server's maps never grow past them;
+    /// they fill with tombstones, and every packet's lookup probes through
+    /// them. O(1) per removal, amortised.
+    fn noteRemovals(self: *ConnectionManager, n: usize) void {
+        self.removed_since_rehash += n;
+        if (self.removed_since_rehash <= (self.cid_map.capacity() + self.reset_token_map.capacity()) / 4) return;
+        self.removed_since_rehash = 0;
+        if (self.cid_map.capacity() > 0) self.cid_map.rehash();
+        if (self.reset_token_map.capacity() > 0) self.reset_token_map.rehash(std.hash_map.AutoContext(ResetKey){});
     }
 
     /// Mirror the peer CID pool's reset tokens into `reset_token_map`.
@@ -443,6 +461,7 @@ pub const ConnectionManager = struct {
                 if (entry.hasRegisteredCid(key)) {
                     _ = self.cid_map.remove(key);
                     entry.removeRegisteredCid(key);
+                    self.noteRemovals(1);
                 }
             }
         }
@@ -458,6 +477,7 @@ pub const ConnectionManager = struct {
         for (entry.registered_cids[0..entry.registered_cid_count]) |key| {
             _ = self.cid_map.remove(key);
         }
+        self.noteRemovals(entry.registered_cid_count);
         self.dropResetKeys(entry);
 
         // Detach the transport layers so stale Session pointers are safe:
@@ -887,6 +907,34 @@ test "max_connections is configurable past 256, and every removed entry is freed
     while (mgr.entries.items.len > 0) mgr.removeConnection(mgr.entries.items[0]);
     try std.testing.expectEqual(@as(usize, 300), mgr.dead_entries.items.len);
     mgr.freeDeadEntries();
+}
+
+test "connections coming and going leave the CID map free slots to stop a lookup at" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+
+    const local = std.mem.zeroes(posix.sockaddr.storage);
+    const scid = [_]u8{0xaa} ** 8;
+    var dcid: [8]u8 = undefined;
+    for (0..3000) |i| {
+        std.mem.writeInt(u64, &dcid, i + 1, .big);
+        const header: packet.Header = .{
+            .version = protocol.SUPPORTED_VERSIONS[0],
+            .packet_type = .initial,
+            .dcid = &dcid,
+            .scid = &scid,
+        };
+        _ = try mgr.acceptConnection(header, local, local, null, null);
+        if (mgr.entries.items.len > 4) mgr.removeConnection(mgr.entries.items[0]);
+        mgr.freeDeadEntries();
+    }
+    const m = &mgr.cid_map.unmanaged;
+    var free: usize = 0;
+    for (m.metadata.?[0..m.capacity()]) |md| free += @intFromBool(md.isFree());
+    // Tombstones never give their slot back on their own: without the
+    // rehash, a map this churned has none free.
+    try std.testing.expect(free >= m.capacity() - m.count() - m.capacity() / 4);
 }
 
 fn testManager(alloc: Allocator) ConnectionManager {

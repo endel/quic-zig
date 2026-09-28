@@ -335,7 +335,7 @@ pub const DynamicTable = struct {
         const base = self.descs[tail].off;
         if (base == 0) return;
         const live = self.used - base;
-        std.mem.copyForwards(u8, self.arena[0..live], self.arena[base..][0..live]);
+        @memmove(self.arena[0..live], self.arena[base..][0..live]);
         var i: usize = 0;
         while (i < self.count) : (i += 1) {
             const idx = (tail + i) % MAX_ENTRIES;
