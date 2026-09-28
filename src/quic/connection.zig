@@ -1670,7 +1670,7 @@ pub const Connection = struct {
                         std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
                     }
 
-                    self.cc.onPacketAcked(pkt.size, pkt.time_sent);
+                    self.cc.onPacketAcked(pkt.size, pkt.time_sent, now);
                     for (pkt.getControlFrames()) |cf| switch (cf) {
                         .retire_connection_id => |seq| self.onRetireCidAcked(seq),
                         else => {},
@@ -1809,7 +1809,7 @@ pub const Connection = struct {
                         self.pacer.max_datagram_size = new_mtu;
                         std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
                     }
-                    self.cc.onPacketAcked(pkt.size, pkt.time_sent);
+                    self.cc.onPacketAcked(pkt.size, pkt.time_sent, now);
                     for (pkt.getControlFrames()) |cf| switch (cf) {
                         .retire_connection_id => |seq| self.onRetireCidAcked(seq),
                         else => {},
@@ -3126,10 +3126,14 @@ pub const Connection = struct {
     }
 
     pub fn send(self: *Connection, out_buf: []u8) !usize {
+        return self.sendAt(out_buf, @intCast(sys.nanoTimestamp()));
+    }
+
+    /// `send` at `now`, a `sys.nanoTimestamp()` the caller read: packets of one
+    /// burst can share it rather than each paying for a clock read.
+    pub fn sendAt(self: *Connection, out_buf: []u8, now: i64) !usize {
         // Draining/terminated: do not send anything
         if (self.state == .draining or self.state == .terminated) return 0;
-
-        const now: i64 = @intCast(sys.nanoTimestamp());
 
         // Closing: retransmit saved close packet on each incoming packet (RFC 9000 §10.2.1)
         if (self.state == .closing) {
