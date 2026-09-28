@@ -24,6 +24,11 @@ const stream_mod = @import("quic/stream.zig");
 const tls13 = @import("quic/tls13.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
+
+/// Packets of one send burst per clock read. A read for each packet was 3-6%
+/// of a busy server's CPU; this keeps sent times, and so RTT samples, within
+/// microseconds of the wire. A flush is a syscall, so one is followed by a read.
+const packets_per_clock_read = 16;
 const h0 = @import("h0/connection.zig");
 const http1 = @import("http1/server.zig");
 const qpack = @import("h3/qpack.zig");
@@ -1898,8 +1903,11 @@ pub fn Server(comptime Handler: type) type {
                 const batch = self.batchForConn(conn);
                 const max_burst_packets = 1000;
                 var send_count: usize = 0;
+                var now_ns: i64 = undefined;
                 while (send_count < max_burst_packets) : (send_count += 1) {
-                    const bytes_written = conn.send(batch.reserve()) catch break;
+                    const buf = batch.reserve();
+                    if (send_count % packets_per_clock_read == 0 or batch.count == 0) now_ns = sys.nanoTimestamp();
+                    const bytes_written = conn.sendAt(buf, now_ns) catch break;
                     if (bytes_written == 0) break;
                     const send_addr = conn.peerAddress();
                     batch.commit(
@@ -3274,8 +3282,11 @@ pub fn Client(comptime Handler: type) type {
 
             const max_burst_packets = 1000;
             var send_count: usize = 0;
+            var now_ns: i64 = undefined;
             while (send_count < max_burst_packets) : (send_count += 1) {
-                const bytes_written = conn.send(self.batch.reserve()) catch break;
+                const buf = self.batch.reserve();
+                if (send_count % packets_per_clock_read == 0 or self.batch.count == 0) now_ns = sys.nanoTimestamp();
+                const bytes_written = conn.sendAt(buf, now_ns) catch break;
                 if (bytes_written == 0) break;
                 self.batch.commit(
                     bytes_written,

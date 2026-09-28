@@ -255,8 +255,8 @@ pub const Cubic = struct {
         };
     }
 
-    /// Called when a packet is acknowledged.
-    pub fn onPacketAcked(self: *Cubic, acked_bytes: u64, sent_time: i64) void {
+    /// Called when a packet is acknowledged, at `now` (nanoseconds).
+    pub fn onPacketAcked(self: *Cubic, acked_bytes: u64, sent_time: i64, now: i64) void {
         // Don't grow window during recovery
         if (self.inCongestionRecovery(sent_time)) return;
 
@@ -267,16 +267,16 @@ pub const Cubic = struct {
             // Slow start: increase by acked_bytes (same as NewReno)
             self.congestion_window += acked_bytes;
         } else {
-            self.cubicUpdate(acked_bytes);
+            self.cubicUpdate(acked_bytes, now);
         }
         self.congestion_window = @min(self.congestion_window, MAX_WINDOW_PACKETS * self.max_datagram_size);
     }
 
     /// CUBIC window update during congestion avoidance.
-    fn cubicUpdate(self: *Cubic, acked_bytes: u64) void {
+    fn cubicUpdate(self: *Cubic, acked_bytes: u64, now: i64) void {
         // Initialize epoch on first ACK after congestion event
         if (self.epoch_start == null) {
-            self.epoch_start = @intCast(sys.nanoTimestamp());
+            self.epoch_start = now;
             if (self.congestion_window < self.w_max) {
                 // Compute K = cbrt(W_max * (1-beta) / C) in MSS units, then convert to nanoseconds
                 // K_mss = cbrt((W_max/MSS) * 0.3 / 0.4) = cbrt((W_max/MSS) * 3/4)
@@ -293,7 +293,6 @@ pub const Cubic = struct {
             self.w_est = self.congestion_window;
         }
 
-        const now: i64 = @intCast(sys.nanoTimestamp());
         const t_ns = now - (self.epoch_start orelse now); // time since epoch start in ns
 
         // W_cubic(t) = C * (t - K)^3 + W_max
@@ -632,7 +631,7 @@ test "Cubic: slow start growth" {
     var cc = Cubic.init();
     const initial_window = cc.congestion_window;
 
-    cc.onPacketAcked(1200, 100);
+    cc.onPacketAcked(1200, 100, 200);
     try testing.expectEqual(initial_window + 1200, cc.congestion_window);
     try testing.expect(cc.inSlowStart());
 }
@@ -826,7 +825,7 @@ test "congestion window is capped at MAX_WINDOW_PACKETS" {
     var i: usize = 0;
     while (i < 20_000) : (i += 1) {
         reno.onPacketAcked(DEFAULT_MAX_DATAGRAM_SIZE, 1);
-        cubic.onPacketAcked(DEFAULT_MAX_DATAGRAM_SIZE, 1);
+        cubic.onPacketAcked(DEFAULT_MAX_DATAGRAM_SIZE, 1, 2);
     }
     try testing.expectEqual(cap, reno.congestion_window);
     try testing.expectEqual(cap, cubic.congestion_window);
