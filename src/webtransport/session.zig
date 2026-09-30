@@ -339,28 +339,19 @@ pub const WebTransportConnection = struct {
 
     /// Server: accept a WebTransport session (send 200 response).
     pub fn acceptSession(self: *WebTransportConnection, session_id: u64) !void {
-        try self.h3.sendConnectResponse(session_id, "200");
-        if (self.getSession(session_id)) |s| {
-            if (s.state != .active) {
-                s.state = .active;
-            }
-        } else {
-            _ = self.allocateSession(session_id, .active) orelse return error.TooManySessions;
-            self.active_session_count += 1;
-        }
+        return self.acceptSessionWithHeaders(session_id, &.{});
     }
 
     /// Server: accept a WebTransport session with extra response headers (e.g., sub-protocol).
+    /// The slot is claimed first: a 200 promises a session we can hold.
     pub fn acceptSessionWithHeaders(self: *WebTransportConnection, session_id: u64, extra_headers: []const qpack.Header) !void {
-        try self.h3.sendConnectResponseWithHeaders(session_id, "200", extra_headers);
-        if (self.getSession(session_id)) |s| {
-            if (s.state != .active) {
-                s.state = .active;
-            }
-        } else {
-            _ = self.allocateSession(session_id, .active) orelse return error.TooManySessions;
+        const s = self.getSession(session_id) orelse blk: {
+            const new = self.allocateSession(session_id, .connecting) orelse return error.TooManySessions;
             self.active_session_count += 1;
-        }
+            break :blk new;
+        };
+        try self.h3.sendConnectResponseWithHeaders(session_id, "200", extra_headers);
+        s.state = .active;
     }
 
     /// Open a WT bidirectional stream: write type prefix 0x41 + session_id varint.
@@ -1453,8 +1444,16 @@ pub const WebTransportConnection = struct {
         switch (event.?) {
             .connect_request => |req| {
                 if (isWebTransportProtocol(req.protocol)) {
-                    // Register as a connecting session
-                    _ = self.allocateSession(req.stream_id, .connecting);
+                    // Register as a connecting session; past our slots the
+                    // request is refused before the application sees it.
+                    if (self.allocateSession(req.stream_id, .connecting) == null) {
+                        if (self.quic.streams.getStream(req.stream_id)) |st| {
+                            st.send.reset(@intFromEnum(h3_conn.H3Error.request_rejected));
+                            st.recv.stopSending(@intFromEnum(h3_conn.H3Error.request_rejected));
+                        }
+                        try self.h3.excluded_streams.put(req.stream_id, {});
+                        return null;
+                    }
                     self.active_session_count += 1;
                     // Exclude this stream from H3 bidi processing
                     try self.h3.excluded_streams.put(req.stream_id, {});
@@ -2908,6 +2907,35 @@ test "WT: a closed session's streams stay away from H3, however many it had" {
     while (id < 14 + 4 * 70) : (id += 4) {
         try testing.expect(setup.quic_conn.streams.recv_streams.get(id).?.stop_sending_err != null);
     }
+}
+
+test "WT: a CONNECT past the session slots is rejected, never answered 200" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    var buf: [512]u8 = undefined;
+    const len = buildConnectRequest(&buf, "/wt");
+    var sid: u64 = 4;
+    while (sid <= 4 * MAX_SESSIONS) : (sid += 4) {
+        try (try setup.quic_conn.streams.getOrCreateStream(sid)).recv.handleStreamFrame(0, buf[0..len], false);
+        var surfaced = false;
+        while (try setup.wt.poll()) |ev| {
+            if (ev == .connect_request) surfaced = true;
+        }
+        if (sid < 4 * MAX_SESSIONS) {
+            try testing.expect(surfaced);
+            try setup.wt.acceptSession(sid);
+        } else {
+            try testing.expect(!surfaced);
+        }
+    }
+    const extra = setup.quic_conn.streams.getStream(4 * MAX_SESSIONS).?;
+    try testing.expectEqual(@as(?u64, @intFromEnum(h3_conn.H3Error.request_rejected)), extra.send.reset_err);
+    try testing.expectEqual(@as(u32, MAX_SESSIONS), setup.wt.active_session_count);
+
+    try testing.expectError(error.TooManySessions, setup.wt.acceptSession(4 * MAX_SESSIONS));
+    try testing.expectEqual(@as(u64, 0), extra.send.write_offset);
 }
 
 test "WT: invalid session ID triggers H3_ID_ERROR on uni stream" {
