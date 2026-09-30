@@ -786,7 +786,7 @@ pub const Connection = struct {
 
     // Connection close state (RFC 9000 Section 10)
     closing_start_time: i64 = 0,
-    close_pkt_buf: [256]u8 = undefined,
+    close_pkt_buf: [1500]u8 = undefined,
     close_pkt_len: u16 = 0,
     needs_close_retransmit: bool = false,
     /// Packets received while closing. The close is resent only when this
@@ -1277,6 +1277,8 @@ pub const Connection = struct {
             return;
         }
         if (self.state == .closing) {
+            // Still received from the peer: it earns the close's resends budget.
+            if (info.datagram_size > 0) self.paths[self.active_path_idx].bytes_received += info.datagram_size;
             self.close_trigger_count += 1;
             if (std.math.isPowerOfTwo(self.close_trigger_count)) self.needs_close_retransmit = true;
             self.last_packet_received_time = @intCast(sys.nanoTimestamp());
@@ -3177,6 +3179,19 @@ pub const Connection = struct {
         return if (self.pkt_num_spaces[space_idx].crypto_seal) |*s| s else null;
     }
 
+    /// `out_buf` cut to what the 3x anti-amplification limit still allows a
+    /// server on an unvalidated path (RFC 9000 §8.1): smaller packets rather
+    /// than none, so every byte of it is used. Null once it is spent.
+    fn amplificationLimit(self: *Connection, out_buf: []u8) ?[]u8 {
+        if (!self.is_server) return out_buf;
+        const path = &self.paths[self.active_path_idx];
+        if (path.is_validated) return out_buf;
+        const budget = 3 * path.bytes_received;
+        if (path.bytes_sent >= budget) return null;
+        const remaining = budget - path.bytes_sent;
+        return if (remaining < out_buf.len) out_buf[0..@intCast(remaining)] else out_buf;
+    }
+
     pub fn send(self: *Connection, out_buf: []u8) !usize {
         return self.sendAt(out_buf, @intCast(sys.nanoTimestamp()));
     }
@@ -3195,7 +3210,10 @@ pub const Connection = struct {
                     // Retransmit saved close packet
                     self.needs_close_retransmit = false;
                     const len = self.close_pkt_len;
-                    @memcpy(out_buf[0..len], self.close_pkt_buf[0..len]);
+                    const room = self.amplificationLimit(out_buf) orelse return 0;
+                    if (len > room.len) return 0;
+                    @memcpy(room[0..len], self.close_pkt_buf[0..len]);
+                    self.paths[self.active_path_idx].bytes_sent += len;
                     return len;
                 }
                 // Not triggered by incoming packet — just waiting for timeout
@@ -3217,8 +3235,9 @@ pub const Connection = struct {
                 // so the peer can decrypt at whatever level they've reached.
                 // Include Initial/Handshake crypto data so the peer can
                 // derive keys before seeing the CONNECTION_CLOSE.
+                const room = self.amplificationLimit(out_buf) orelse return 0;
                 const bytes_written = try self.packer.packCoalesced(
-                    out_buf,
+                    room[0..@min(room.len, self.close_pkt_buf.len)],
                     &self.pkt_handler,
                     &self.crypto_streams,
                     &self.streams,
@@ -3232,10 +3251,10 @@ pub const Connection = struct {
                     false, // not ack_only — sending CONNECTION_CLOSE
                 );
                 if (bytes_written > 0) {
-                    // Save close packet for retransmission
-                    const save_len: u16 = @intCast(@min(bytes_written, self.close_pkt_buf.len));
-                    @memcpy(self.close_pkt_buf[0..save_len], out_buf[0..save_len]);
-                    self.close_pkt_len = save_len;
+                    // Saved whole for retransmission
+                    @memcpy(self.close_pkt_buf[0..bytes_written], out_buf[0..bytes_written]);
+                    self.close_pkt_len = @intCast(bytes_written);
+                    self.paths[self.active_path_idx].bytes_sent += bytes_written;
                 }
                 return bytes_written;
             }
@@ -3314,23 +3333,7 @@ pub const Connection = struct {
             }
         }
 
-        // Anti-amplification: servers must not send more than 3x bytes received
-        // before address validation (RFC 9000 Section 8.1).
-        // Instead of a binary canSend(1200) check, calculate remaining budget
-        // and limit the output buffer size. This allows sending smaller packets
-        // when the full MTU isn't available, using every byte of the 3x budget.
-        var send_buf = out_buf;
-        if (self.is_server) {
-            const active_path = &self.paths[self.active_path_idx];
-            if (!active_path.is_validated) {
-                const budget = 3 * active_path.bytes_received;
-                if (active_path.bytes_sent >= budget) return 0;
-                const remaining = budget - active_path.bytes_sent;
-                if (remaining < out_buf.len) {
-                    send_buf = out_buf[0..@intCast(remaining)];
-                }
-            }
-        }
+        const send_buf = self.amplificationLimit(out_buf) orelse return 0;
 
         // Build coalesced packet with available encryption levels
         // Packet number space indices: 0=Initial, 1=Handshake, 2=Application
@@ -3452,19 +3455,7 @@ pub const Connection = struct {
         // Piggyback flow control updates (MAX_DATA, MAX_STREAMS)
         self.queueFlowControlUpdates();
 
-        // Anti-amplification: limit output to remaining budget
-        var send_buf = out_buf;
-        if (self.is_server) {
-            const active_path = &self.paths[self.active_path_idx];
-            if (!active_path.is_validated) {
-                const budget = 3 * active_path.bytes_received;
-                if (active_path.bytes_sent >= budget) return 0;
-                const remaining = budget - active_path.bytes_sent;
-                if (remaining < out_buf.len) {
-                    send_buf = out_buf[0..@intCast(remaining)];
-                }
-            }
-        }
+        const send_buf = self.amplificationLimit(out_buf) orelse return 0;
 
         // Gather seals at all encryption levels
         const initial_seal = self.levelSeal(0);
@@ -6692,9 +6683,34 @@ test "a peer uni stream keeps getting MAX_STREAM_DATA past its initial window" {
     try std.testing.expect(stream_max > conn.streams.local_max_stream_data_uni);
 }
 
+test "a closing server keeps to the amplification limit, and resends its close whole" {
+    for ([_]bool{ false, true }) |validated| {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        try conn.pkt_num_spaces[0].setupInitial(conn.scid[0..conn.scid_len], conn.version, true);
+        try conn.crypto_streams.getStream(0).writeData(&([_]u8{0xcc} ** 2000));
+        conn.paths[0].is_validated = validated;
+        conn.paths[0].bytes_received = 100;
+        conn.closeWithTransportError(0x0a, 0, "bye");
+
+        var out: [1500]u8 = undefined;
+        const n = try conn.send(&out);
+        try std.testing.expect(n > 0);
+        if (!validated) try std.testing.expect(n <= 300);
+        var first: [1500]u8 = undefined;
+        @memcpy(first[0..n], out[0..n]);
+
+        conn.paths[0].bytes_received += 3000;
+        conn.needs_close_retransmit = true;
+        const m = try conn.send(&out);
+        try std.testing.expectEqualSlices(u8, first[0..n], out[0..m]);
+    }
+}
+
 test "a closing connection resends its close with exponential backoff, not per packet" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
+    conn.paths[0].is_validated = true;
     conn.close(0, "");
     // As if the first CONNECTION_CLOSE already went out.
     conn.close_pkt_len = 32;
