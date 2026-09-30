@@ -397,18 +397,28 @@ const ERR_INVALID_SESSION: i32 = -2;
 const ERR_STREAM: i32 = -3;
 const ERR_QUEUE_FULL: i32 = -4;
 const ERR_TOO_LARGE: i32 = -5;
+/// A NULL handle, or NULL where a non-zero length says bytes are.
+const ERR_INVALID_ARG: i32 = -6;
 const STREAM_ERROR: u64 = std.math.maxInt(u64);
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn getWtServer(handle: *anyopaque) *WtServer {
-    return @ptrCast(@alignCast(handle));
+// Every pointer from C is optional: C can pass NULL, and Zig would take a
+// non-optional one as a promise that it hasn't.
+fn getWtServer(handle: ?*anyopaque) ?*WtServer {
+    return @ptrCast(@alignCast(handle orelse return null));
 }
 
 fn getEntry(ws: *WtServer, client_id: u64) ?*ConnEntry {
     return ws.handler.client_to_entry.get(client_id);
+}
+
+/// Null when NULL stands for a non-zero length.
+fn cBytes(ptr: ?[*]const u8, len: u32) ?[]const u8 {
+    if (len == 0) return &.{};
+    return (ptr orelse return null)[0..len];
 }
 
 // ---------------------------------------------------------------------------
@@ -416,22 +426,25 @@ fn getEntry(ws: *WtServer, client_id: u64) ?*ConnEntry {
 // ---------------------------------------------------------------------------
 
 export fn qz_server_create(
-    addr: [*:0]const u8,
+    addr: ?[*:0]const u8,
     port: u16,
-    cert: [*:0]const u8,
-    key: [*:0]const u8,
+    cert: ?[*:0]const u8,
+    key: ?[*:0]const u8,
 ) ?*anyopaque {
     const allocator = std.heap.c_allocator;
+    const address = std.mem.span(addr orelse return null);
+    const cert_path = std.mem.span(cert orelse return null);
+    const key_path = std.mem.span(key orelse return null);
 
     const ws = allocator.create(WtServer) catch return null;
 
     ws.handler = .{ .allocator = allocator };
     ws.allocator = allocator;
     ws.server = event_loop.Server(CApiHandler).init(allocator, &ws.handler, .{
-        .address = std.mem.span(addr),
+        .address = address,
         .port = port,
-        .cert_path = std.mem.span(cert),
-        .key_path = std.mem.span(key),
+        .cert_path = cert_path,
+        .key_path = key_path,
     }) catch {
         ws.handler.deinit();
         allocator.destroy(ws);
@@ -441,8 +454,8 @@ export fn qz_server_create(
     return ws;
 }
 
-export fn qz_server_tick(handle: *anyopaque) i32 {
-    const ws = getWtServer(handle);
+export fn qz_server_tick(handle: ?*anyopaque) i32 {
+    const ws = getWtServer(handle) orelse return -1;
     ws.server.tick() catch return -1;
     // Explicitly drain socket and process connections on every tick.
     // In no_wait mode, kqueue/epoll edge-triggered events can be missed
@@ -452,35 +465,35 @@ export fn qz_server_tick(handle: *anyopaque) i32 {
     return 0;
 }
 
-export fn qz_server_poll(handle: *anyopaque, buf: [*]u8, buf_len: u32) u32 {
-    const ws = getWtServer(handle);
-    return ws.handler.poll(buf[0..buf_len]);
+export fn qz_server_poll(handle: ?*anyopaque, buf: ?[*]u8, buf_len: u32) u32 {
+    const ws = getWtServer(handle) orelse return 0;
+    return ws.handler.poll((buf orelse return 0)[0..buf_len]);
 }
 
-export fn qz_server_flush(handle: *anyopaque) void {
-    const ws = getWtServer(handle);
+export fn qz_server_flush(handle: ?*anyopaque) void {
+    const ws = getWtServer(handle) orelse return;
     ws.server.flush();
 }
 
-export fn qz_server_stop(handle: *anyopaque) void {
-    const ws = getWtServer(handle);
+export fn qz_server_stop(handle: ?*anyopaque) void {
+    const ws = getWtServer(handle) orelse return;
     ws.server.stop();
 }
 
-export fn qz_server_destroy(handle: *anyopaque) void {
-    const ws = getWtServer(handle);
+export fn qz_server_destroy(handle: ?*anyopaque) void {
+    const ws = getWtServer(handle) orelse return;
     ws.server.deinit();
     ws.handler.deinit();
     ws.allocator.destroy(ws);
 }
 
-export fn qz_server_connection_count(handle: *anyopaque) u32 {
-    const ws = getWtServer(handle);
+export fn qz_server_connection_count(handle: ?*anyopaque) u32 {
+    const ws = getWtServer(handle) orelse return 0;
     return @intCast(ws.handler.client_to_entry.count());
 }
 
-export fn qz_is_client_connected(handle: *anyopaque, client_id: u64) i32 {
-    const ws = getWtServer(handle);
+export fn qz_is_client_connected(handle: ?*anyopaque, client_id: u64) i32 {
+    const ws = getWtServer(handle) orelse return 0;
     const entry = ws.handler.client_to_entry.get(client_id) orelse return 0;
     return if (entry.conn.isClosed()) 0 else 1;
 }
@@ -489,33 +502,34 @@ export fn qz_is_client_connected(handle: *anyopaque, client_id: u64) i32 {
 // Exported C functions — Session management
 // ---------------------------------------------------------------------------
 
-export fn qz_session_accept(handle: *anyopaque, client_id: u64, session_id: u64) i32 {
-    const ws = getWtServer(handle);
+export fn qz_session_accept(handle: ?*anyopaque, client_id: u64, session_id: u64) i32 {
+    const ws = getWtServer(handle) orelse return ERR_INVALID_ARG;
     const entry = getEntry(ws, client_id) orelse return ERR_INVALID_CLIENT;
     var session = event_loop.Session{ .entry = entry };
     session.acceptSession(session_id) catch return ERR_INVALID_SESSION;
     return ERR_OK;
 }
 
-export fn qz_session_close(handle: *anyopaque, client_id: u64, session_id: u64) void {
-    const ws = getWtServer(handle);
+export fn qz_session_close(handle: ?*anyopaque, client_id: u64, session_id: u64) void {
+    const ws = getWtServer(handle) orelse return;
     const entry = getEntry(ws, client_id) orelse return;
     var session = event_loop.Session{ .entry = entry };
     session.closeSession(session_id);
 }
 
 export fn qz_session_close_error(
-    handle: *anyopaque,
+    handle: ?*anyopaque,
     client_id: u64,
     session_id: u64,
     err_code: u32,
-    reason: [*]const u8,
+    reason: ?[*]const u8,
     reason_len: u32,
 ) i32 {
-    const ws = getWtServer(handle);
+    const ws = getWtServer(handle) orelse return ERR_INVALID_ARG;
+    const bytes = cBytes(reason, reason_len) orelse return ERR_INVALID_ARG;
     const entry = getEntry(ws, client_id) orelse return ERR_INVALID_CLIENT;
     var session = event_loop.Session{ .entry = entry };
-    session.closeSessionWithError(session_id, err_code, reason[0..reason_len]) catch return ERR_INVALID_SESSION;
+    session.closeSessionWithError(session_id, err_code, bytes) catch return ERR_INVALID_SESSION;
     return ERR_OK;
 }
 
@@ -523,43 +537,44 @@ export fn qz_session_close_error(
 // Exported C functions — Streams
 // ---------------------------------------------------------------------------
 
-export fn qz_stream_open_bidi(handle: *anyopaque, client_id: u64, session_id: u64) u64 {
-    const ws = getWtServer(handle);
+export fn qz_stream_open_bidi(handle: ?*anyopaque, client_id: u64, session_id: u64) u64 {
+    const ws = getWtServer(handle) orelse return STREAM_ERROR;
     const entry = getEntry(ws, client_id) orelse return STREAM_ERROR;
     var session = event_loop.Session{ .entry = entry };
     return session.openBidiStream(session_id, null) catch return STREAM_ERROR;
 }
 
-export fn qz_stream_open_uni(handle: *anyopaque, client_id: u64, session_id: u64) u64 {
-    const ws = getWtServer(handle);
+export fn qz_stream_open_uni(handle: ?*anyopaque, client_id: u64, session_id: u64) u64 {
+    const ws = getWtServer(handle) orelse return STREAM_ERROR;
     const entry = getEntry(ws, client_id) orelse return STREAM_ERROR;
     var session = event_loop.Session{ .entry = entry };
     return session.openUniStream(session_id, null) catch return STREAM_ERROR;
 }
 
 export fn qz_stream_send(
-    handle: *anyopaque,
+    handle: ?*anyopaque,
     client_id: u64,
     stream_id: u64,
-    data: [*]const u8,
+    data: ?[*]const u8,
     len: u32,
 ) i32 {
-    const ws = getWtServer(handle);
+    const ws = getWtServer(handle) orelse return ERR_INVALID_ARG;
+    const bytes = cBytes(data, len) orelse return ERR_INVALID_ARG;
     const entry = getEntry(ws, client_id) orelse return ERR_INVALID_CLIENT;
     var session = event_loop.Session{ .entry = entry };
-    session.sendStreamData(stream_id, data[0..len]) catch return ERR_STREAM;
+    session.sendStreamData(stream_id, bytes) catch return ERR_STREAM;
     return ERR_OK;
 }
 
-export fn qz_stream_close(handle: *anyopaque, client_id: u64, stream_id: u64) void {
-    const ws = getWtServer(handle);
+export fn qz_stream_close(handle: ?*anyopaque, client_id: u64, stream_id: u64) void {
+    const ws = getWtServer(handle) orelse return;
     const entry = getEntry(ws, client_id) orelse return;
     var session = event_loop.Session{ .entry = entry };
     session.closeStream(stream_id);
 }
 
-export fn qz_stream_reset(handle: *anyopaque, client_id: u64, stream_id: u64, err: u32) void {
-    const ws = getWtServer(handle);
+export fn qz_stream_reset(handle: ?*anyopaque, client_id: u64, stream_id: u64, err: u32) void {
+    const ws = getWtServer(handle) orelse return;
     const entry = getEntry(ws, client_id) orelse return;
     var session = event_loop.Session{ .entry = entry };
     session.resetStream(stream_id, err);
@@ -570,25 +585,26 @@ export fn qz_stream_reset(handle: *anyopaque, client_id: u64, stream_id: u64, er
 // ---------------------------------------------------------------------------
 
 export fn qz_datagram_send(
-    handle: *anyopaque,
+    handle: ?*anyopaque,
     client_id: u64,
     session_id: u64,
-    data: [*]const u8,
+    data: ?[*]const u8,
     len: u32,
 ) i32 {
-    const ws = getWtServer(handle);
+    const ws = getWtServer(handle) orelse return ERR_INVALID_ARG;
+    const bytes = cBytes(data, len) orelse return ERR_INVALID_ARG;
     const entry = getEntry(ws, client_id) orelse return ERR_INVALID_CLIENT;
     var session = event_loop.Session{ .entry = entry };
     if (session.isDatagramSendQueueFull()) return ERR_QUEUE_FULL;
     if (session.maxDatagramPayloadSize(session_id)) |max| {
         if (len > max) return ERR_TOO_LARGE;
     }
-    session.sendDatagram(session_id, data[0..len]) catch return ERR_STREAM;
+    session.sendDatagram(session_id, bytes) catch return ERR_STREAM;
     return ERR_OK;
 }
 
-export fn qz_datagram_max_size(handle: *anyopaque, client_id: u64, session_id: u64) u32 {
-    const ws = getWtServer(handle);
+export fn qz_datagram_max_size(handle: ?*anyopaque, client_id: u64, session_id: u64) u32 {
+    const ws = getWtServer(handle) orelse return 0;
     const entry = getEntry(ws, client_id) orelse return 0;
     const session = event_loop.Session{ .entry = entry };
     return @intCast(session.maxDatagramPayloadSize(session_id) orelse 0);
@@ -704,4 +720,36 @@ test "c_api: an event too big for the host's buffer doesn't stall the queue" {
     try testing.expectEqual(big.len, got);
     try testing.expect(fin);
     try testing.expectEqual(@as(usize, 0), h.event_queue.len);
+}
+
+test "c_api: NULL from C is refused, not dereferenced" {
+    try testing.expectEqual(@as(?*anyopaque, null), qz_server_create(null, 4433, null, null));
+    try testing.expectEqual(@as(i32, -1), qz_server_tick(null));
+    try testing.expectEqual(@as(u32, 0), qz_server_poll(null, null, 64));
+    qz_server_flush(null);
+    qz_server_stop(null);
+    qz_server_destroy(null);
+    try testing.expectEqual(@as(u32, 0), qz_server_connection_count(null));
+    try testing.expectEqual(@as(i32, 0), qz_is_client_connected(null, 1));
+    try testing.expectEqual(ERR_INVALID_ARG, qz_session_accept(null, 1, 0));
+    qz_session_close(null, 1, 0);
+    try testing.expectEqual(STREAM_ERROR, qz_stream_open_bidi(null, 1, 0));
+    try testing.expectEqual(STREAM_ERROR, qz_stream_open_uni(null, 1, 0));
+    qz_stream_close(null, 1, 0);
+    qz_stream_reset(null, 1, 0, 0);
+    try testing.expectEqual(@as(u32, 0), qz_datagram_max_size(null, 1, 0));
+
+    // A live handle, with NULL where bytes should be.
+    var ws: WtServer = undefined;
+    testServer(&ws);
+    defer ws.handler.deinit();
+    var p: TestPeer = .{};
+    p.init();
+    defer p.deinit();
+    var s = p.session();
+    ws.handler.onSessionReady(&s, 0);
+    try testing.expectEqual(@as(u32, 0), qz_server_poll(&ws, null, 64));
+    try testing.expectEqual(ERR_INVALID_ARG, qz_stream_send(&ws, 1, 0, null, 5));
+    try testing.expectEqual(ERR_INVALID_ARG, qz_datagram_send(&ws, 1, 0, null, 5));
+    try testing.expectEqual(ERR_INVALID_ARG, qz_session_close_error(&ws, 1, 0, 0, null, 5));
 }
