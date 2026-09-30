@@ -2351,6 +2351,10 @@ pub const Connection = struct {
                     self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY not negotiated");
                     return error.ProtocolViolation;
                 }
+                if (af.request_max_ack_delay < (self.local_params.min_ack_delay orelse 0)) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY delay under min_ack_delay");
+                    return error.ProtocolViolation;
+                }
                 const applied = self.pkt_handler.recv[2].applyAckFrequency(
                     af.sequence_number,
                     af.ack_eliciting_threshold,
@@ -5978,6 +5982,19 @@ test "an ACK Delay no clock could produce is clamped, not overflowed" {
         try conn.processFrame(&.{ .ack = .{ .largest_ack = pn, .ack_delay = delay, .first_ack_range = 0 } }, .initial, std.time.ns_per_s);
     }
     try std.testing.expect(conn.pkt_handler.rtt_stats.has_measurement);
+}
+
+test "ACK_FREQUENCY: a huge max ack delay is capped, one under our min_ack_delay refused" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.peer_supports_ack_freq = true;
+    conn.local_params.min_ack_delay = 1000;
+
+    try conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = 1 << 60, .reordering_threshold = 1 } }, .application, 0);
+    conn.pkt_handler.recv[2].ack_alarm = null;
+    try conn.pkt_handler.recv[2].onPacketReceived(0, true, std.math.maxInt(i64) / 2, 0);
+
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 1, .ack_eliciting_threshold = 2, .request_max_ack_delay = 999, .reordering_threshold = 1 } }, .application, 0));
 }
 
 test "a uni stream is reclaimed once its FIN is acked" {

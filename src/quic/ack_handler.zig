@@ -518,7 +518,8 @@ pub const ReceivedPacketTracker = struct {
         if (self.ack_frequency_seq > 0 and seq < self.ack_frequency_seq) return false;
         self.ack_frequency_seq = seq + 1; // store next expected (> current)
         self.ack_eliciting_threshold = @intCast(@max(1, @min(threshold, 256)));
-        self.max_ack_delay_ns = @intCast(max_delay_us * 1000); // µs → ns
+        // Capped where the max_ack_delay transport parameter's range ends (2^14 ms).
+        self.max_ack_delay_ns = @as(i64, @min(max_delay_us, (1 << 14) * 1000)) * 1000;
         self.reordering_threshold = reorder_threshold;
         return true;
     }
