@@ -785,14 +785,13 @@ pub fn generateRetryToken(
     const pt_len = pt_fbs.seek;
     const pt_data = plaintext[0..pt_len];
 
-    // Encrypt: no AD, just nonce+key
     var ciphertext_buf: [TOKEN_MAX_PLAINTEXT_LEN]u8 = undefined;
     var tag: [TOKEN_TAG_LEN]u8 = undefined;
     crypto.Aead.encrypt(
         ciphertext_buf[0..pt_len],
         &tag,
         pt_data,
-        "",
+        RETRY_TOKEN_AD,
         nonce,
         token_key,
     );
@@ -821,6 +820,15 @@ pub const ValidatedToken = struct {
 // Token validity duration: 60 seconds
 const TOKEN_MAX_AGE_NS: i64 = 60 * std.time.ns_per_s;
 
+// Both token kinds share one key; the AD keeps either from opening as the other.
+const RETRY_TOKEN_AD = "quic-zig retry token";
+const NEW_TOKEN_AD = "quic-zig new token";
+
+fn tokenFresh(timestamp: i64) bool {
+    const now: i64 = @intCast(sys.nanoTimestamp());
+    return timestamp <= now and timestamp >= now - TOKEN_MAX_AGE_NS;
+}
+
 pub fn validateRetryToken(
     token_data: []const u8,
     client_addr: posix.sockaddr.storage,
@@ -840,7 +848,7 @@ pub fn validateRetryToken(
         plaintext[0..ct_len],
         ciphertext,
         tag,
-        "",
+        RETRY_TOKEN_AD,
         nonce,
         token_key,
     ) catch return null; // decryption failed = invalid token
@@ -863,8 +871,7 @@ pub fn validateRetryToken(
 
     // Read timestamp and check age
     const timestamp = pt_reader.takeInt(i64, ENDIAN) catch return null;
-    const now: i64 = @intCast(sys.nanoTimestamp());
-    if (now - timestamp > TOKEN_MAX_AGE_NS or timestamp > now) return null;
+    if (!tokenFresh(timestamp)) return null;
 
     const bound = pt_reader.takeArray(ADDR_BINDING_LEN) catch return null;
     if (!std.mem.eql(u8, bound, &addrBinding(&client_addr))) return null;
@@ -903,7 +910,7 @@ pub fn generateNewToken(
         &ciphertext_buf,
         &tag,
         &plaintext,
-        "",
+        NEW_TOKEN_AD,
         nonce,
         token_key,
     );
@@ -930,7 +937,7 @@ pub fn validateNewToken(
         &plaintext,
         ciphertext,
         tag,
-        "",
+        NEW_TOKEN_AD,
         nonce,
         token_key,
     ) catch return false;
@@ -939,8 +946,7 @@ pub fn validateNewToken(
     const pt_reader = &pt_fbs;
 
     const timestamp = pt_reader.takeInt(i64, ENDIAN) catch return false;
-    const now: i64 = @intCast(sys.nanoTimestamp());
-    if (now - timestamp > TOKEN_MAX_AGE_NS or timestamp > now) return false;
+    if (!tokenFresh(timestamp)) return false;
 
     const bound = pt_reader.takeArray(ADDR_BINDING_LEN) catch return false;
     if (!std.mem.eql(u8, bound, &addrBinding(&client_addr))) return false;
@@ -1225,6 +1231,26 @@ test "tokens bind the whole client address, IPv4 on a dual-stack socket included
         try std.testing.expect(validateNewToken(out[0..new_len], pair[0], key));
         try std.testing.expect(!validateNewToken(out[0..new_len], pair[1], key));
     }
+}
+
+test "a token sealed under our key but not as a Retry token is rejected, whatever it holds" {
+    const key: [crypto.key_len]u8 = @splat(3);
+    const addr = testIn6(@splat(0), 4433);
+    // No CIDs, then a timestamp no clock gives: what a NEW_TOKEN's bytes
+    // look like when read with the Retry layout.
+    var plaintext: [2 + 8 + ADDR_BINDING_LEN]u8 = undefined;
+    plaintext[0..2].* = .{ 0, 0 };
+    std.mem.writeInt(i64, plaintext[2..10], std.math.minInt(i64), ENDIAN);
+    plaintext[10..].* = addrBinding(&addr);
+
+    var token: [TOKEN_NONCE_LEN + plaintext.len + TOKEN_TAG_LEN]u8 = undefined;
+    token[0..TOKEN_NONCE_LEN].* = @splat(7);
+    crypto.Aead.encrypt(token[TOKEN_NONCE_LEN..][0..plaintext.len], token[TOKEN_NONCE_LEN + plaintext.len ..][0..TOKEN_TAG_LEN], &plaintext, "", token[0..TOKEN_NONCE_LEN].*, key);
+    try std.testing.expect(try validateRetryToken(&token, addr, key) == null);
+
+    var new_token: [TOKEN_MAX_LEN]u8 = undefined;
+    const n = try generateNewToken(&new_token, addr, key);
+    try std.testing.expect(try validateRetryToken(new_token[0..n], addr, key) == null);
 }
 
 // Retry integrity tag verification
