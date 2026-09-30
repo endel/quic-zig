@@ -86,6 +86,19 @@ Every cell matched except two, and both flake on `4988228` as well:
     rebind-port  quic-zig<-quic-go   fails 2 of 14 here and 2 of 13 on 4988228, each time with the
                                      first rebind landing mid-handshake (see below)
 
+### Rerun at `3fa4923` (security fixes, #44)
+67 of 88 pass, as on the 23 Sep matrix; 84 cells match. The other four:
+
+    rebind-port    quic-zig<-quiche   ❌ → ✅
+    rebind-addr    quic-zig<-quiche   ❌ → ✅
+    handshakeloss  quic-zig<-quiche   ✅ → ❌  fails 5/5 here and 5/5 on 14b9dc3 (main): the quiche
+                                               client exits 255 in both, so not this branch
+    longrtt        quic-zig<-quic-go  runner error (pyshark lost its TShark process); passes on rerun
+
+The rebind cells moved with the migration fixes, which validate every new peer
+address. v2 stays unsupported by both peers here; it passes against ngtcp2 in
+both directions (see `RFC9369_QUIC_V2.md`).
+
 ## A caution about this table
 
 The binaries under test must be cross-compiled by
