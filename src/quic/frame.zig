@@ -935,6 +935,16 @@ pub const PendingFrameQueue = struct {
                     .immediate_ack => return true,
                     else => {},
                 },
+                // Only the latest challenge is answered, so a flood of them
+                // takes one slot, not the queue; a validator whose challenge
+                // goes unanswered sends another (RFC 9000 §8.2.1).
+                .path_response => switch (self.items[i]) {
+                    .path_response => {
+                        self.items[i] = frame;
+                        return true;
+                    },
+                    else => {},
+                },
                 .max_data => |new_max| switch (self.items[i]) {
                     .max_data => |old_max| {
                         self.items[i] = .{ .max_data = @max(old_max, new_max) };

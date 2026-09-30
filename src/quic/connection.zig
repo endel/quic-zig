@@ -2195,7 +2195,8 @@ pub const Connection = struct {
                 // re-advertise our current receive limit. MAX_DATA is
                 // idempotent, and blocked frames are the peer's explicit
                 // signal that a previous update might not have arrived.
-                self.queueFlowControlUpdates();
+                // No stream walk here: two bytes of frame would buy one, and
+                // the send path runs it before packing anyway.
                 const current = self.conn_flow_ctrl.base.receive_window;
                 if (current > limit) {
                     self.pending_frames.push(.{ .max_data = current });
@@ -2204,7 +2205,6 @@ pub const Connection = struct {
             .stream_data_blocked => |blocked| {
                 // Same logic for per-stream credit. For bidi streams, the
                 // receive side carries the limit we advertise to the peer.
-                self.queueFlowControlUpdates();
                 if (self.streams.getRecvStream(blocked.stream_id)) |rs| {
                     const current = rs.receive_window;
                     if (rs.receive_window_size > 0 and current > blocked.limit) {
@@ -6242,6 +6242,26 @@ test "PMTUD probes wait for the path to be validated" {
     conn.mtu_discoverer.start();
     const n = try conn.send(&buf);
     try std.testing.expect(n <= 300);
+}
+
+test "a PATH_CHALLENGE flood takes one queue slot, and DATA_BLOCKED is still answered" {
+    // Each challenge queued its own PATH_RESPONSE until the queue was full
+    // and everything else pushed was dropped.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    for (0..300) |i| {
+        var data: [8]u8 = @splat(0);
+        std.mem.writeInt(u64, &data, i, .big);
+        try conn.processFrame(&.{ .path_challenge = data }, .application, 0);
+    }
+    try std.testing.expect(conn.pending_frames.len <= 1);
+    try std.testing.expect(conn.pending_frames.hasRoomFor(8));
+    var last: [8]u8 = @splat(0);
+    std.mem.writeInt(u64, &last, 299, .big);
+    try std.testing.expectEqual(last, conn.pending_frames.pop().?.path_response);
+
+    try conn.processFrame(&.{ .data_blocked = 0 }, .application, 0);
+    try std.testing.expect(conn.pending_frames.pop().? == .max_data);
 }
 
 test "a uni stream is reclaimed once its FIN is acked" {
