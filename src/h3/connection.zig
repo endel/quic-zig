@@ -817,11 +817,12 @@ pub const H3Connection = struct {
             const stream_id = entry.key_ptr.*;
             const recv_stream = entry.value_ptr.*;
 
-            // Skip already-identified streams
+            // Skip already-identified streams, and ones abandoned as unknown
             if (self.peer_control_stream_id != null and self.peer_control_stream_id.? == stream_id) continue;
             if (self.peer_qpack_enc_stream_id != null and self.peer_qpack_enc_stream_id.? == stream_id) continue;
             if (self.peer_qpack_dec_stream_id != null and self.peer_qpack_dec_stream_id.? == stream_id) continue;
             if (self.excluded_streams.contains(stream_id)) continue;
+            if (recv_stream.released) continue;
 
             // Try to read type byte (read() transfers ownership of heap-allocated data)
             const data = recv_stream.read() orelse {
@@ -848,9 +849,21 @@ pub const H3Connection = struct {
         var fbs = io.fixedBufferStream(data);
         const stream_type = h3_frame.readUniStreamType(&fbs) catch |err| {
             std.log.debug("H3 uni stream type parse error on stream {d}: {}", .{ stream_id, err });
-            return;
+            return self.abandonUniStream(stream_id);
         };
         const remaining = data[fbs.seek..];
+
+        // RFC 9114 6.2.1: one of each critical stream.
+        const already = switch (stream_type) {
+            .control => self.peer_control_stream_id,
+            .qpack_encoder => self.peer_qpack_enc_stream_id,
+            .qpack_decoder => self.peer_qpack_dec_stream_id,
+            .push => null,
+        };
+        if (already != null) {
+            self.closeWithError(.stream_creation_error, "second critical stream of one type");
+            return error.H3StreamCreationError;
+        }
 
         switch (stream_type) {
             .control => {
@@ -882,8 +895,24 @@ pub const H3Connection = struct {
                     };
                 }
             },
-            .push => {}, // ignore server push
+            // RFC 9114 6.2.2: only a server pushes. We never send MAX_PUSH_ID.
+            .push => {
+                if (self.is_server) {
+                    self.closeWithError(.stream_creation_error, "push stream from a client");
+                    return error.H3StreamCreationError;
+                }
+                self.abandonUniStream(stream_id);
+            },
         }
+    }
+
+    /// RFC 9114 6.2: stop reading a stream of a type we don't take. Released,
+    /// it is skipped from then on, and whatever follows is never read as a
+    /// stream type of its own.
+    pub fn abandonUniStream(self: *H3Connection, stream_id: u64) void {
+        const streams = &self.quic_conn.streams;
+        if (streams.recv_streams.get(stream_id)) |rs| rs.stopSending(@intFromEnum(H3Error.stream_creation_error));
+        streams.releaseRecvStream(stream_id);
     }
 
     /// Poll the peer's control stream for SETTINGS/GOAWAY frames.
@@ -2103,6 +2132,40 @@ test "H3 integration: poll identifies QPACK encoder + decoder streams" {
     try testing.expectEqual(@as(u64, 6), h3.peer_qpack_enc_stream_id.?);
     try testing.expect(h3.peer_qpack_dec_stream_id != null);
     try testing.expectEqual(@as(u64, 10), h3.peer_qpack_dec_stream_id.?);
+}
+
+test "H3 integration: a second control or QPACK stream is H3_STREAM_CREATION_ERROR" {
+    // RFC 9114 6.2.1. Replacing the first let its buffer leak and the
+    // original be closed without H3_CLOSED_CRITICAL_STREAM.
+    for ([_]u8{ 0x00, 0x02, 0x03 }) |ty| {
+        var quic_conn = createTestQuicConn(true);
+        defer quic_conn.deinit();
+        var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+        defer h3.deinit();
+        try injectUniStreamData(&quic_conn, 2, &.{ty}, false);
+        _ = try h3.poll();
+        try injectUniStreamData(&quic_conn, 6, &.{ty}, false);
+        try testing.expectError(error.H3StreamCreationError, h3.poll());
+    }
+}
+
+test "H3 integration: an unknown uni stream is abandoned, not re-read for a type" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    var buf: [64]u8 = undefined;
+    const len = buildControlStreamPayload(&buf);
+    try injectUniStreamData(&quic_conn, 2, buf[0..len], false);
+    try injectUniStreamData(&quic_conn, 6, &.{ 0x21, 0xaa }, false); // reserved type
+    while (try h3.poll()) |_| {}
+
+    const rs = quic_conn.streams.recv_streams.get(6).?;
+    try rs.handleStreamFrame(2, &.{0x00}, false);
+    while (try h3.poll()) |_| {}
+    try testing.expectEqual(@as(u64, 2), h3.peer_control_stream_id.?);
+    try testing.expectEqual(@as(?u64, @intFromEnum(H3Error.stream_creation_error)), rs.stop_sending_err);
 }
 
 // ---- Group C: Control stream tests ----
