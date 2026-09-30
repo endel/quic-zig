@@ -751,7 +751,10 @@ const RelayHandler = struct {
             self.sendRequestError(session, stream_id, moq_codes.ERR_EXCESSIVE_LOAD, "too many namespace subscriptions");
             return;
         };
-        slot.prefix_len = moq_wire.flattenNamespace(sn.track_namespace_prefix, &slot.prefix_buf);
+        slot.prefix_len = moq_wire.flattenNamespace(sn.track_namespace_prefix, &slot.prefix_buf) orelse {
+            self.sendRequestError(session, stream_id, moq_codes.ERR_NAMESPACE_TOO_LARGE, "namespace prefix too long");
+            return;
+        };
         slot.client_idx = ci;
         slot.stream_id = stream_id;
         slot.active = true;
@@ -774,10 +777,11 @@ const RelayHandler = struct {
     /// the whole namespace being echoed back.
     fn sendNamespace(self: *RelayHandler, sub: *const NamespaceSub, ns_key: []const u8, done: bool) void {
         var parts: [moq_wire.MAX_TUPLE_PARTS][]const u8 = undefined;
+        var fields: [256]u8 = undefined;
         var buf: [512]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
         const msg = moq_msg.Namespace{
-            .track_namespace_suffix = moq_wire.splitNamespace(ns_key[sub.prefix_len..], &parts),
+            .track_namespace_suffix = moq_wire.splitNamespace(ns_key[sub.prefix_len..], &parts, &fields),
         };
         if (done) {
             moq_msg.writeNamespaceDone(&fbs, msg) catch return;
@@ -804,7 +808,10 @@ const RelayHandler = struct {
             return;
         };
         var key: [256]u8 = undefined;
-        const key_len = moq_wire.flattenNamespace(pn.track_namespace, &key);
+        const key_len = moq_wire.flattenNamespace(pn.track_namespace, &key) orelse {
+            self.sendRequestError(session, stream_id, moq_codes.ERR_NAMESPACE_TOO_LARGE, "namespace too long");
+            return;
+        };
         std.debug.print("[relay] PUBLISH_NAMESPACE client={d} ns=\"{s}\"\n", .{ ci, key[0..key_len] });
 
         const outcome = self.registerNamespace(ci, stream_id, key[0..key_len]);
@@ -913,7 +920,10 @@ const RelayHandler = struct {
         };
 
         var ns_key: [256]u8 = undefined;
-        const ns_len = moq_wire.flattenNamespace(sub.track_namespace, &ns_key);
+        const ns_len = moq_wire.flattenNamespace(sub.track_namespace, &ns_key) orelse {
+            self.sendRequestError(session, stream_id, moq_codes.ERR_NAMESPACE_TOO_LARGE, "namespace too long");
+            return;
+        };
         std.debug.print("[relay] SUBSCRIBE client={d} ns=\"{s}\" track=\"{s}\"\n", .{ ci, ns_key[0..ns_len], sub.track_name });
 
         // §9.3.4: with no RENDEZVOUS_TIMEOUT — the default is 0 — a
@@ -1055,11 +1065,12 @@ const RelayHandler = struct {
     fn subscribeUpstream(self: *RelayHandler, t: *Track, owner: usize) bool {
         var l = self.link(owner) orelse return false;
         var parts: [moq_wire.MAX_TUPLE_PARTS][]const u8 = undefined;
+        var fields: [256]u8 = undefined;
         var buf: [512]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
         moq_msg.writeSubscribe(&fbs, .{
             .request_id = self.clients[owner].next_request_id,
-            .track_namespace = moq_wire.splitNamespace(t.namespace_buf[0..t.namespace_len], &parts),
+            .track_namespace = moq_wire.splitNamespace(t.namespace_buf[0..t.namespace_len], &parts, &fields),
             .track_name = t.name_buf[0..t.name_len],
         }, self.clients[owner].draft) catch return false;
         const sid = l.openBidi() catch return false;
@@ -1262,7 +1273,10 @@ const RelayHandler = struct {
         };
 
         var ns_key: [256]u8 = undefined;
-        const ns_len = moq_wire.flattenNamespace(pub_msg.track_namespace, &ns_key);
+        const ns_len = moq_wire.flattenNamespace(pub_msg.track_namespace, &ns_key) orelse {
+            self.sendRequestError(session, stream_id, moq_codes.ERR_NAMESPACE_TOO_LARGE, "namespace too long");
+            return;
+        };
         std.debug.print("[relay] PUBLISH client={d} ns=\"{s}\" track=\"{s}\" alias={d}\n", .{
             ci, ns_key[0..ns_len], pub_msg.track_name, pub_msg.track_alias,
         });

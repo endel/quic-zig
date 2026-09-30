@@ -296,33 +296,57 @@ pub fn tupleEncodedLen(parts: []const []const u8) usize {
     return n;
 }
 
-// A namespace tuple flattened to one comparable key, "a/b/c/". The trailing
-// separator is what makes a prefix test a tuple-boundary test: "moq/" matches
-// "moq/demo/" and not "moqtail/". Relays key their tables on this, so the
-// convention and its inverse live here rather than in each of them.
-pub fn flattenNamespace(parts: []const []const u8, buf: []u8) usize {
+// A namespace tuple as one comparable key, "a/b/c/": each field with '%'
+// and '/' escaped (%25, %2F) and followed by '/'. Escaping keeps distinct
+// tuples apart, and the trailing separator makes a prefix test a
+// tuple-boundary test: "moq/" matches "moq/demo/" and not "moqtail/".
+// Relays key their tables on this, so the convention and its inverse live
+// here rather than in each of them. Null when the key doesn't fit `buf`: a
+// shortened one would name another namespace.
+pub fn flattenNamespace(parts: []const []const u8, buf: []u8) ?usize {
     var off: usize = 0;
     for (parts) |part| {
-        if (off + part.len + 1 > buf.len) break;
-        @memcpy(buf[off .. off + part.len], part);
-        off += part.len;
+        for (part) |c| {
+            const esc: ?*const [2]u8 = switch (c) {
+                '%' => "25",
+                '/' => "2F",
+                else => null,
+            };
+            const n: usize = if (esc != null) 3 else 1;
+            if (off + n > buf.len) return null;
+            if (esc) |e| {
+                buf[off] = '%';
+                buf[off + 1 ..][0..2].* = e.*;
+            } else buf[off] = c;
+            off += n;
+        }
+        if (off == buf.len) return null;
         buf[off] = '/';
         off += 1;
     }
     return off;
 }
 
-// The inverse: parts alias `flat`, so it must outlive the result. Empty
-// segments are dropped, which makes a flattened key and a re-flattened one
-// compare equal.
-pub fn splitNamespace(flat: []const u8, out: [][]const u8) [][]const u8 {
+// The inverse, for a key or the part of one past a prefix. Fields are
+// unescaped into `buf`, at least as long as `flat`, which the result aliases.
+pub fn splitNamespace(flat: []const u8, out: [][]const u8, buf: []u8) [][]const u8 {
     var n: usize = 0;
-    var it = std.mem.splitScalar(u8, flat, '/');
-    while (it.next()) |part| {
-        if (part.len == 0) continue;
-        if (n == out.len) break;
-        out[n] = part;
-        n += 1;
+    var w: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < flat.len and n < out.len) : (i += 1) {
+        const c = flat[i];
+        if (c == '/') {
+            out[n] = buf[start..w];
+            n += 1;
+            start = w;
+            continue;
+        }
+        if (c == '%' and i + 2 < flat.len and flat[i + 1] == '2' and (flat[i + 2] == '5' or flat[i + 2] == 'F')) {
+            buf[w] = if (flat[i + 2] == '5') '%' else '/';
+            i += 2;
+        } else buf[w] = c;
+        w += 1;
     }
     return out[0..n];
 }
@@ -330,27 +354,50 @@ pub fn splitNamespace(flat: []const u8, out: [][]const u8) [][]const u8 {
 test "a namespace flattens to a key and splits back" {
     const parts = [_][]const u8{ "moq-test", "interop" };
     var buf: [64]u8 = undefined;
-    const flat = buf[0..flattenNamespace(&parts, &buf)];
+    const flat = buf[0..flattenNamespace(&parts, &buf).?];
     try testing.expectEqualStrings("moq-test/interop/", flat);
 
     var out: [MAX_TUPLE_PARTS][]const u8 = undefined;
-    const back = splitNamespace(flat, &out);
+    var fields: [64]u8 = undefined;
+    const back = splitNamespace(flat, &out, &fields);
     try testing.expectEqual(@as(usize, 2), back.len);
     try testing.expectEqualStrings("moq-test", back[0]);
     try testing.expectEqualStrings("interop", back[1]);
 
     // The trailing separator keeps a prefix test on tuple boundaries.
     var pbuf: [64]u8 = undefined;
-    const prefix = pbuf[0..flattenNamespace(&[_][]const u8{"moq-test"}, &pbuf)];
+    const prefix = pbuf[0..flattenNamespace(&[_][]const u8{"moq-test"}, &pbuf).?];
     try testing.expect(std.mem.startsWith(u8, flat, prefix));
     var obuf: [64]u8 = undefined;
-    const other = obuf[0..flattenNamespace(&[_][]const u8{"moq-tested"}, &obuf)];
+    const other = obuf[0..flattenNamespace(&[_][]const u8{"moq-tested"}, &obuf).?];
     try testing.expect(!std.mem.startsWith(u8, other, prefix));
 
     // A suffix cut from the key splits into the tuple parts past the prefix.
-    const suffix = splitNamespace(flat[prefix.len..], &out);
+    const suffix = splitNamespace(flat[prefix.len..], &out, &fields);
     try testing.expectEqual(@as(usize, 1), suffix.len);
     try testing.expectEqualStrings("interop", suffix[0]);
+}
+
+test "distinct namespaces never share a key" {
+    // Fields were joined with an unescaped '/', and fields past the buffer
+    // dropped, so one publisher's namespace could answer for another's.
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    const slash = a[0..flattenNamespace(&[_][]const u8{"a/b"}, &a).?];
+    const two = b[0..flattenNamespace(&[_][]const u8{ "a", "b" }, &b).?];
+    try testing.expect(!std.mem.eql(u8, slash, two));
+
+    // What doesn't fit has no key, rather than a shorter one.
+    var small: [8]u8 = undefined;
+    try testing.expectEqual(@as(?usize, null), flattenNamespace(&[_][]const u8{ "live", "alice" }, &small));
+
+    // Separators, escapes and empty fields come back as they went in.
+    const odd = [_][]const u8{ "a/b", "", "100%" };
+    const key = a[0..flattenNamespace(&odd, &a).?];
+    var out: [MAX_TUPLE_PARTS][]const u8 = undefined;
+    const back = splitNamespace(key, &out, &b);
+    try testing.expectEqual(odd.len, back.len);
+    for (odd, back) |want, got| try testing.expectEqualStrings(want, got);
 }
 
 // Round-trip tests.
