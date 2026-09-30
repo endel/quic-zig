@@ -1220,7 +1220,7 @@ pub const Connection = struct {
             const off = self.undecryptable.off[i];
             const len = self.undecryptable.plen[i];
             var rfbs = io.fixedBufferStream(self.undecryptable.buf[off..][0..len]);
-            var h = packet.Header.parse(&rfbs, 0) catch continue;
+            var h = packet.Header.parse(&rfbs, self.scid_len) catch continue;
             self.recv(&h, &rfbs, rinfo) catch continue;
         }
         self.undecryptable.reset();
