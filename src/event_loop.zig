@@ -851,6 +851,7 @@ pub fn Server(comptime Handler: type) type {
                 break :blk cc;
             };
             if (config.quic_lb) |lb| conn_config.quic_lb = lb;
+            if (conn_config.quic_lb) |*lb| try quic_lb.validate(lb);
             if (config.foreign_datagram != null and conn_config.quic_lb == null) return error.ForeignDatagramNeedsQuicLb;
 
             const sockfd, const local_addr = if (config.socket) |fd| .{ fd, try boundAddress(fd) } else try openUdpSocket(config, config.port);

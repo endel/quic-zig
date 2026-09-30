@@ -17,6 +17,15 @@ pub const Config = struct {
     encode_length: bool = true, // first octet encodes CID length
 };
 
+/// Checks the lengths fit a CID of at most 20 bytes, with the draft's
+/// minimums; config_id 7 is reserved for unroutable CIDs. Every other
+/// function here assumes a config that passed.
+pub fn validate(config: *const Config) error{InvalidQuicLbConfig}!void {
+    if (config.config_id > 6 or config.server_id_len < 1 or config.nonce_len < 4 or
+        @as(u8, config.server_id_len) + config.nonce_len > 19)
+        return error.InvalidQuicLbConfig;
+}
+
 /// Total CID length: 1 (first octet) + server_id_len + nonce_len.
 pub fn cidLength(config: *const Config) u8 {
     return 1 + @as(u8, config.server_id_len) + @as(u8, config.nonce_len);
@@ -76,7 +85,8 @@ pub fn extractServerId(config: *const Config, cid: []const u8, out: []u8) bool {
 
     if (config.key) |key| {
         // Decrypt in a temporary buffer (don't mutate input)
-        var tmp: [20]u8 = undefined; // max payload: 15 + 18 = 33, but CID max is 20
+        var tmp: [19]u8 = undefined;
+        if (payload_len > tmp.len) return false; // a config validate() refuses
         @memcpy(tmp[0..payload_len], cid[1 .. 1 + payload_len]);
 
         if (payload_len == 16) {
@@ -414,4 +424,17 @@ test "quic_lb encrypted no length encoding" {
     var extracted_sid: [15]u8 = undefined;
     try std.testing.expect(extractServerId(&config, &cid, &extracted_sid));
     try std.testing.expectEqualSlices(u8, &.{ 0x11, 0x22, 0x33 }, extracted_sid[0..3]);
+}
+
+test "a config past a 20-byte CID is refused, and never overruns a decode" {
+    const too_long: Config = .{ .config_id = 0, .server_id_len = 15, .nonce_len = 18, .key = @splat(1) };
+    var cid: [34]u8 = @splat(0x42);
+    var out: [15]u8 = undefined;
+    try std.testing.expect(!extractServerId(&too_long, &cid, &out));
+
+    try std.testing.expectError(error.InvalidQuicLbConfig, validate(&too_long));
+    try std.testing.expectError(error.InvalidQuicLbConfig, validate(&.{ .config_id = 7, .server_id_len = 1, .nonce_len = 7 }));
+    try std.testing.expectError(error.InvalidQuicLbConfig, validate(&.{ .config_id = 0, .server_id_len = 1, .nonce_len = 3 }));
+    try validate(&.{ .config_id = 0, .server_id_len = 15, .nonce_len = 4 });
+    try validate(&.{ .config_id = 6, .server_id_len = 1, .nonce_len = 18 });
 }

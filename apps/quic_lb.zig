@@ -135,6 +135,10 @@ fn parseConfigFile(path: []const u8, allocator: std.mem.Allocator) !LbConfig {
         }
     }
 
+    quic_lb.validate(&config.lb_config) catch {
+        std.log.err("server_id_len + nonce_len must fit a 20-byte CID (at most 19), nonce_len at least 4, config_id at most 6", .{});
+        return error.InvalidConfig;
+    };
     return config;
 }
 
