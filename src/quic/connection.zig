@@ -2446,6 +2446,18 @@ pub const Connection = struct {
         }
     }
 
+    /// Hands TLS what CRYPTO stream `level` has contiguous; whether it had any.
+    fn feedCrypto(self: *Connection, hs: *tls13.Tls13Handshake, level: u8) bool {
+        const cs = self.crypto_streams.getStream(level);
+        var fed = false;
+        while (cs.read()) |data| {
+            defer self.allocator.free(data);
+            hs.provideData(data);
+            fed = true;
+        }
+        return fed;
+    }
+
     /// Advance the TLS 1.3 handshake by reading contiguous crypto data.
     fn advanceHandshake(self: *Connection) !void {
         // Allow post-handshake messages (NST) even after handshake_confirmed
@@ -2490,20 +2502,10 @@ pub const Connection = struct {
 
         std.log.info("advanceHandshake: state={}, iterations starting", .{@intFromEnum(hs.state)});
 
-        // Feed crypto stream data to the handshake
-        inline for ([_]u8{ 0, 2, 3 }) |level| {
-            const cs = self.crypto_streams.getStream(level);
-            var crypto_data_count: usize = 0;
-            while (cs.read()) |data| {
-                defer self.allocator.free(data);
-                crypto_data_count += 1;
-                std.log.info("advanceHandshake: feeding crypto level={} data len={}", .{ level, data.len });
-                hs.provideData(data);
-            }
-            if (crypto_data_count > 0) {
-                std.log.info("advanceHandshake: fed {d} crypto frames from level {}", .{ crypto_data_count, level });
-            }
-        }
+        // RFC 9001 §4.1.3: TLS reads each level's CRYPTO data only while it
+        // is at that level; the rest waits in its own stream.
+        var level = hs.readLevel();
+        _ = self.feedCrypto(hs, level);
 
         // Drive the state machine until it needs more data or completes
         var iterations: usize = 0;
@@ -2538,6 +2540,17 @@ pub const Connection = struct {
                 return;
             };
             std.log.info("advanceHandshake: step {d} produced action={s}", .{ iterations, @tagName(action) });
+
+            // Moving to a new level: nothing may be left of the old one.
+            const next_level = hs.readLevel();
+            if (next_level != level) {
+                if (hs.hasUnreadInput() or self.crypto_streams.getStream(level).hasReadable()) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.crypto), "CRYPTO data left at a superseded level");
+                    return;
+                }
+                level = next_level;
+                _ = self.feedCrypto(hs, level);
+            }
 
             switch (action) {
                 .send_data => |sd| {
@@ -2622,7 +2635,7 @@ pub const Connection = struct {
                         else => {},
                     }
                 },
-                .wait_for_data => break,
+                .wait_for_data => if (!self.feedCrypto(hs, level)) break,
                 .complete => {
                     // Skip if already connected (duplicate .complete from post-handshake messages)
                     if (self.state == .connected) break;
@@ -6404,6 +6417,43 @@ test "RETIRE_CONNECTION_ID for a CID never issued, or the one it came on, is PRO
         conn.handleDatagram(buf[0..n], .{ .to = conn.paths[0].local_addr, .from = conn.paths[0].peer_addr, .datagram_size = n });
         try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
     }
+}
+
+test "CRYPTO data past the ClientHello at the Initial level is PROTOCOL_VIOLATION" {
+    // RFC 9001 4.1.3. TLS read it as the next handshake message, as if it
+    // had come at the Handshake level: Initial keys are public, so anyone
+    // could splice messages into the handshake.
+    const kp = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.generate(std.testing.io);
+    const secret = kp.secret_key.toBytes();
+    const cert = kp.public_key.toUncompressedSec1();
+    const chain = [_][]const u8{&cert};
+    const addr = makeIpv4Addr(192, 0, 2, 7, 5000);
+    const odcid = [_]u8{0x0d} ** 8;
+    const conn = try std.testing.allocator.create(Connection);
+    defer std.testing.allocator.destroy(conn);
+    try Connection.acceptInto(conn, std.testing.allocator, .{ .packet_type = .initial, .version = protocol.SUPPORTED_VERSIONS[0], .dcid = &odcid, .scid = &odcid }, addr, addr, true, .{}, .{
+        .cert_chain_der = &chain,
+        .private_key_bytes = &secret,
+        .alpn = &[_][]const u8{"h3"},
+    }, null, null);
+    defer conn.deinit();
+
+    var client = tls13.Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    }, .{ .initial_source_connection_id = .init(&odcid) });
+    _ = try client.step();
+    var data: [2048]u8 = undefined;
+    const hello = client.out_buf[0..client.out_len];
+    @memcpy(data[0..hello.len], hello);
+    // A Finished that belongs at the Handshake level, sent at Initial.
+    const fake = [_]u8{ 0x14, 0, 0, 32 } ++ [_]u8{0x5a} ** 32;
+    @memcpy(data[hello.len..][0..fake.len], &fake);
+    try conn.processFrame(&.{ .crypto = .{ .offset = 0, .data = data[0 .. hello.len + fake.len] } }, .initial, 0);
+    try conn.advanceHandshake();
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
 }
 
 test "a uni stream is reclaimed once its FIN is acked" {

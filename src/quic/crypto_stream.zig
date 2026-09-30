@@ -65,6 +65,12 @@ pub const CryptoStream = struct {
         return self.recv_sorter.pop();
     }
 
+    /// Whether contiguous received data is waiting to be read.
+    pub fn hasReadable(self: *const CryptoStream) bool {
+        var b: [1]u8 = undefined;
+        return self.recv_sorter.peek(&b) > 0;
+    }
+
     /// Queue TLS handshake data for sending.
     pub fn writeData(self: *CryptoStream, data: []const u8) !void {
         try self.send_buffer.appendSlice(self.allocator, data);

@@ -1454,6 +1454,21 @@ pub const Tls13Handshake = struct {
     }
 
     // Provide incoming crypto stream data to the handshake.
+    /// The CRYPTO stream (0 Initial, 2 Handshake, 3 application) whose data
+    /// the current state reads: RFC 9001 §4.1.3 ties each message to one.
+    pub fn readLevel(self: *const Tls13Handshake) u8 {
+        return switch (self.state) {
+            .client_start, .client_wait_server_hello, .server_wait_client_hello => 0,
+            .connected, .server_send_ticket => 3,
+            else => 2,
+        };
+    }
+
+    /// Handshake bytes provided but not yet consumed as messages.
+    pub fn hasUnreadInput(self: *const Tls13Handshake) bool {
+        return self.in_len > self.in_offset;
+    }
+
     pub fn provideData(self: *Tls13Handshake, data: []const u8) void {
         // Compact buffer if we've consumed some data and need space
         if (self.in_offset > 0 and self.in_len - self.in_offset + data.len > self.in_buf.len - self.in_offset) {
