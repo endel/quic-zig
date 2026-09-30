@@ -304,7 +304,9 @@ pub const Cubic = struct {
         // W_cubic_mss = C * ((t_sec - K_sec))^3 + W_max_mss
 
         const t_minus_k_ns = t_ns - self.k_ns;
-        const t_minus_k_sec_10 = @divTrunc(t_minus_k_ns, 100_000_000); // in 0.1 second units
+        // In 0.1 second units, capped so its cube fits an i64: an epoch lasts
+        // as long as the peer avoids congestion, hours if it likes.
+        const t_minus_k_sec_10 = @min(@divTrunc(t_minus_k_ns, 100_000_000), 1 << 20);
 
         // (t-K)^3 in units of 0.001 seconds^3
         const t_cubed = t_minus_k_sec_10 * t_minus_k_sec_10 * t_minus_k_sec_10;
@@ -314,7 +316,7 @@ pub const Cubic = struct {
         // W_cubic_bytes = 0.4 * t_cubed / 1000 * MSS + W_max
         // = t_cubed * MSS * 4 / 10000 + W_max
         const w_cubic_bytes: u64 = if (t_cubed >= 0)
-            @as(u64, @intCast(t_cubed)) * self.max_datagram_size * 4 / 10000 + self.w_max
+            (@as(u64, @intCast(t_cubed)) *| self.max_datagram_size *| 4) / 10000 +| self.w_max
         else
             self.w_max -| @as(u64, @intCast(-t_cubed)) * self.max_datagram_size * 4 / 10000;
 
@@ -335,7 +337,7 @@ pub const Cubic = struct {
         // Increase cwnd toward target
         if (target > self.congestion_window) {
             // Increase proportionally to acked_bytes
-            const increase = (target - self.congestion_window) * acked_bytes / self.congestion_window;
+            const increase = (target - self.congestion_window) *| acked_bytes / self.congestion_window;
             self.congestion_window += @max(increase, 1);
         }
     }
@@ -724,6 +726,17 @@ test "Cubic: PTO does not reduce window" {
     const window_before = cc.congestion_window;
     cc.onPtoExpired();
     try testing.expectEqual(window_before, cc.congestion_window);
+}
+
+test "Cubic: an epoch hours old grows the window without overflowing" {
+    // A peer that idles on PINGs after one loss keeps the epoch running.
+    var cc = Cubic.init();
+    cc.onCongestionEvent(100, 200);
+    cc.onPacketAcked(1200, 300, 1_000);
+    for ([_]i64{ 5, 50, 5000 }) |hours| {
+        cc.onPacketAcked(1200, 300, hours * 3600 * std.time.ns_per_s);
+        try testing.expect(cc.congestion_window <= MAX_WINDOW_PACKETS * cc.max_datagram_size);
+    }
 }
 
 // ── icbrt tests ──
