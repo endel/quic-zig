@@ -627,6 +627,46 @@ test "ws: an idle peer gets a ping, and is dropped when it stays silent" {
     try testing.expectEqual(@as(u16, 1006), h.handler.close_code);
 }
 
+test "ws: a message that stops making progress is dropped, a slow one is not" {
+    // Any byte counted as a sign of life, so a peer that trickled a byte per
+    // interval held its unfinished message in memory for good.
+    var h: Harness = undefined;
+    try h.init(29460, .{ .tls = false, .websocket = .{ .ping_interval_ms = 200 } });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try h.upgrade(&c, "/", false);
+
+    // 16 KiB over ~0.6 s, well above the floor, spanning several intervals.
+    var msg: [16 * 1024]u8 = undefined;
+    @memset(&msg, 'm');
+    try c.send(&.{ 0x82, 0xfe, 0x40, 0x00, 0, 0, 0, 0 });
+    var sent: usize = 0;
+    while (sent < msg.len) : (sent += 256) {
+        try c.send(msg[sent..][0..256]);
+        const next = sys.nanoTimestamp() + 10 * std.time.ns_per_ms;
+        while (sys.nanoTimestamp() < next) try h.step();
+    }
+    const echo = try h.frame(&c);
+    try testing.expectEqual(websocket.Opcode.binary, echo.opcode);
+    try testing.expectEqual(msg.len, echo.payload.len);
+
+    // A 64 KiB frame fed a byte every 50 ms.
+    try c.send(&.{ 0x82, 0xfe, 0xff, 0xff, 0, 0, 0, 0 });
+    const deadline = sys.nanoTimestamp() + 3 * std.time.ns_per_s;
+    while (!c.eof) {
+        if (sys.nanoTimestamp() > deadline) return error.Timeout;
+        try c.send("x");
+        const next = sys.nanoTimestamp() + 50 * std.time.ns_per_ms;
+        while (sys.nanoTimestamp() < next and !c.eof) {
+            c.poll();
+            try h.step();
+        }
+    }
+    try h.handlerCloses(1);
+    try testing.expectEqual(@as(u16, 1006), h.handler.close_code);
+}
+
 test "ws: send refuses to queue past max_send_buffer for a peer that isn't reading" {
     var h: Harness = undefined;
     try h.init(29446, .{ .tls = false, .websocket = .{ .max_send_buffer = 256 * 1024 } });

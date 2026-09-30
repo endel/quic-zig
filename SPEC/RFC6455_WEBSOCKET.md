@@ -75,7 +75,7 @@ config table.
 | 5.6 | Data frames | ✅ | Text must be UTF-8 (otherwise 1007). Surrogates are rejected |
 | 8.1 | Invalid UTF-8, fail fast | ✅ | Checked as bytes arrive, across fragments and inside a frame still coming in: the first byte no valid text can continue with fails the connection |
 | 5.8 | Extensibility | ✅ | An RSV bit or a reserved opcode gets 1002 |
-| 7 | Closing the connection | ✅ | Close handshake in both directions. Our `close()` waits 5 s for the peer's Close. A peer that goes quiet is pinged after `ping_interval_ms` and dropped after twice that (1006) |
+| 7 | Closing the connection | ✅ | Close handshake in both directions. Our `close()` waits 5 s for the peer's Close. A peer that goes quiet is pinged after `ping_interval_ms` and dropped after twice that (1006). Mid-message, or with its output unread, quiet means under `min_receive_rate` (500 B/s) |
 | 7.4 | Status codes | ✅ | Received codes are checked: 1000–1003, 1007–1014 and 3000–4999 are accepted, anything else gets 1002. `close()` sends 1000 in place of a code the peer may not receive |
 | 9 / RFC 7692 | Extensions, permessage-deflate | ❌ | Not implemented. Browsers offer it and carry on without it |
 | RFC 8441 / 9220 | WebSockets over HTTP/2 or HTTP/3 | ❌ | Not implemented. Browsers use HTTP/1.1 for `wss://` when a server offers nothing else |

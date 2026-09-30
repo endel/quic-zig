@@ -65,8 +65,10 @@ pub const WsConn = struct {
     /// The handler has heard `onWsClose`, or was never given this handle.
     notified: bool = true,
     close_sent: bool = false,
-    /// Anything arrived since the last ping timer.
-    rx_since_ping: bool = false,
+    /// Bytes arrived since the last ping timer.
+    rx_bytes: usize = 0,
+    /// `sock.drained` at the last ping timer.
+    drained_mark: u64 = 0,
     ping_outstanding: bool = false,
 
     fn conn(self: *WsConn) *Conn {
@@ -279,7 +281,7 @@ pub const Conn = struct {
     // ─── Socket events ───────────────────────────────────────────────
 
     pub fn onSocketData(self: *Conn, data: []u8) void {
-        if (self.phase == .ws_open or self.phase == .ws_closing) self.ws.rx_since_ping = true;
+        if (self.phase == .ws_open or self.phase == .ws_closing) self.ws.rx_bytes +|= data.len;
         if (self.tls) |t| {
             t.feed(data) catch |err| {
                 log.debug("tls: {s}", .{@errorName(err)});
@@ -542,7 +544,9 @@ pub const Conn = struct {
             .ping => |payload| {
                 if (self.phase == .ws_open) self.sendFrame(.pong, payload);
             },
-            .pong => self.ws.ping_outstanding = false,
+            // Counted with the rest of rx_bytes, so a pong between the
+            // fragments of a stalled message doesn't keep it alive.
+            .pong => {},
             .close => |c| self.onPeerClose(c.code, c.reason),
         }
         return step.consumed;
@@ -573,8 +577,10 @@ pub const Conn = struct {
 
     fn onPingTimer(self: *Conn) void {
         const interval = self.server.config.websocket.ping_interval_ms;
-        if (self.ws.rx_since_ping) {
-            self.ws.rx_since_ping = false;
+        const alive = self.wsProgressed(interval);
+        self.ws.rx_bytes = 0;
+        self.ws.drained_mark = self.sock.drained;
+        if (alive) {
             self.ws.ping_outstanding = false;
         } else if (self.ws.ping_outstanding) {
             // Silent for two intervals, pong included.
@@ -586,6 +592,19 @@ pub const Conn = struct {
             if (self.in.items.len == self.in_pos) self.in.clearAndFree(self.server.alloc);
         }
         self.server.timers.set(&self.deadline, interval);
+    }
+
+    /// Whether the peer did enough since the last ping timer to count as
+    /// alive. Idle, any byte will do; holding a partial message, or leaving
+    /// our output unread, it must keep up `min_receive_rate`.
+    fn wsProgressed(self: *Conn, interval_ms: u32) bool {
+        // Paused, we read nothing: the peer's reading is what moves.
+        const drained = if (self.sock.read_paused) self.sock.drained - self.ws.drained_mark else 0;
+        const moved = self.ws.rx_bytes +| drained;
+        const holding = self.unreadLen() > 0 or self.ws.decoder.fragment_kind != null or self.sock.read_paused;
+        if (!holding) return moved > 0;
+        const floor = @as(u64, self.server.config.websocket.min_receive_rate) * interval_ms / 1000;
+        return moved >= @max(floor, 1);
     }
 
     // ─── WebSocket output ────────────────────────────────────────────

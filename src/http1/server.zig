@@ -72,6 +72,13 @@ pub const WebSocketConfig = struct {
     /// A connection quiet this long gets a ping; one quiet for two intervals
     /// is dropped (1006). Zero disables both.
     ping_interval_ms: u32 = 30_000,
+    /// Bytes per second, over a ping interval, below which a connection
+    /// counts as quiet while a message is partly in or while its output
+    /// waits on the peer to read. Without it a byte per interval would hold
+    /// a message, up to `max_message_size`, in memory for good. Zero takes
+    /// any byte as a sign of life, for a client that streams a fragmented
+    /// message slower than this.
+    min_receive_rate: u32 = 500,
 };
 
 /// Where a listener's socket goes and what it shares with the QUIC server.

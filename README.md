@@ -236,6 +236,7 @@ var server = try event_loop.Server(MyHandler).init(alloc, &handler, .{
 | `websocket.max_message_size` | 1 MiB | Larger messages close with 1009 |
 | `websocket.max_send_buffer` | 4 MiB | Bytes `send` may leave queued for a slow peer |
 | `websocket.ping_interval_ms` | `30000` | Ping after this much silence; drop (1006) after twice it. `0` disables |
+| `websocket.min_receive_rate` | `500` | Bytes/s under which a peer mid-message, or not reading its output, counts as silent. `0` takes any byte |
 
 `drain()` stops new TCP connections and lets requests in flight finish;
 WebSockets stay open, as WebTransport sessions do. `stop()` sends every

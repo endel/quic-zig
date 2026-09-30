@@ -63,6 +63,9 @@ pub fn Socket(comptime Owner: type) type {
         active: std.ArrayList(u8) = .empty,
         active_off: usize = 0,
         pending: std.ArrayList(u8) = .empty,
+        /// Bytes the kernel has taken off the queue: how an owner tells a
+        /// slow reader from one that stopped.
+        drained: u64 = 0,
 
         state: State = .open,
         fd_closed: bool = false,
@@ -244,6 +247,7 @@ pub fn Socket(comptime Owner: type) type {
                 return .disarm;
             };
             self.active_off += n;
+            self.drained += n;
             if (self.active_off >= self.active.items.len) {
                 self.active.clearRetainingCapacity();
                 self.active_off = 0;
