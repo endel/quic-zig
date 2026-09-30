@@ -115,26 +115,49 @@ const StreamState = struct {
     id: u64 = NO_STREAM,
     role: Role = .unknown_uni,
     buf: [CONTROL_BUF_SIZE]u8 = undefined,
+    /// Unread bytes are `buf[start..len]`. Events point into what is
+    /// consumed, so it is reclaimed only when the next read is appended.
+    start: usize = 0,
     len: usize = 0,
     /// Set once a subscribe stream has produced its first response, so a
     /// later one can be told apart from the mandatory first.
     started: bool = false,
 
-    fn append(self: *StreamState, bytes: []const u8) void {
+    /// Appends what fits and returns how much that was.
+    fn append(self: *StreamState, bytes: []const u8) usize {
+        if (self.start > 0) {
+            const rest = self.len - self.start;
+            @memmove(self.buf[0..rest], self.buf[self.start..self.len]);
+            self.len = rest;
+            self.start = 0;
+        }
         const n = @min(bytes.len, self.buf.len - self.len);
         @memcpy(self.buf[self.len..][0..n], bytes[0..n]);
         self.len += n;
+        return n;
     }
 
     fn consume(self: *StreamState, n: usize) void {
-        @memmove(self.buf[0 .. self.len - n], self.buf[n..self.len]);
-        self.len -= n;
+        self.start += n;
     }
 
     fn slice(self: *const StreamState) []const u8 {
-        return self.buf[0..self.len];
+        return self.buf[self.start..self.len];
+    }
+
+    /// Frees the slot. The buffer is left as it is: this read's events
+    /// still point into it.
+    fn reset(self: *StreamState) void {
+        self.id = NO_STREAM;
+        self.role = .unknown_uni;
+        self.start = 0;
+        self.len = 0;
+        self.started = false;
     }
 };
+
+/// Events one read produces at most; each gets its own hop list.
+const MAX_EVENTS: usize = 16;
 
 pub fn Session(comptime Transport: type) type {
     return struct {
@@ -152,7 +175,9 @@ pub fn Session(comptime Transport: type) type {
         peer_setup: msg.Setup = .{},
 
         streams: [MAX_STREAMS]StreamState = [_]StreamState{.{}} ** MAX_STREAMS,
-        hop_buf: [msg.MAX_HOPS]u64 = undefined,
+        hop_bufs: [MAX_EVENTS][msg.MAX_HOPS]u64 = undefined,
+        /// The peer's SETUP path, copied: its stream's slot is reused.
+        peer_path_buf: [512]u8 = undefined,
         next_subscribe_id: u64 = 0,
 
         pub fn init(transport: Transport) Self {
@@ -169,14 +194,16 @@ pub fn Session(comptime Transport: type) type {
         fn claim(self: *Self, id: u64, role: Role) ?*StreamState {
             if (self.slot(id)) |s| return s;
             for (&self.streams) |*s| if (s.id == NO_STREAM) {
-                s.* = .{ .id = id, .role = role };
+                s.reset();
+                s.id = id;
+                s.role = role;
                 return s;
             };
             return null;
         }
 
         pub fn release(self: *Self, id: u64) void {
-            if (self.slot(id)) |s| s.* = .{};
+            if (self.slot(id)) |s| s.reset();
         }
 
         pub fn roleOf(self: *Self, id: u64) ?Role {
@@ -355,8 +382,16 @@ pub fn Session(comptime Transport: type) type {
                         n += 1;
                     }
                 } else {
-                    s.append(data);
+                    const took = s.append(data);
                     n += try self.drain(stream_id, s, out[n..]);
+                    if (took < data.len) {
+                        // What did not fit: the rest of a group's first read,
+                        // forwarded as it stands once the buffered part has
+                        // been; anything else is a control message too large.
+                        if (s.role != .group_in or s.slice().len != 0 or n == out.len) return Error.MessageTooLarge;
+                        out[n] = .{ .group_data = .{ .stream_id = stream_id, .data = data[took..] } };
+                        n += 1;
+                    }
                 }
             }
 
@@ -374,7 +409,8 @@ pub fn Session(comptime Transport: type) type {
             return n;
         }
 
-        fn drain(self: *Self, stream_id: u64, s: *StreamState, out: []Event) !usize {
+        fn drain(self: *Self, stream_id: u64, s: *StreamState, out_all: []Event) !usize {
+            const out = out_all[0..@min(out_all.len, MAX_EVENTS)];
             var n: usize = 0;
             while (n < out.len) {
                 switch (s.role) {
@@ -404,17 +440,18 @@ pub fn Session(comptime Transport: type) type {
                     // payload, not messages: hand over whatever is still
                     // buffered and let onStreamData forward the rest.
                     .group_in => {
-                        if (s.len == 0) break;
-                        out[n] = .{ .group_data = .{ .stream_id = stream_id, .data = s.slice() } };
+                        const rest = s.slice();
+                        if (rest.len == 0) break;
+                        out[n] = .{ .group_data = .{ .stream_id = stream_id, .data = rest } };
                         n += 1;
                         // The slice aliases the buffer, so it has to be
                         // consumed by the caller before the next read; that
                         // is the same contract every event here has.
-                        s.len = 0;
+                        s.consume(rest.len);
                         break;
                     },
                     else => {
-                        const ev = (try self.next(stream_id, s)) orelse break;
+                        const ev = (try self.next(stream_id, s, &self.hop_bufs[n])) orelse break;
                         if (ev) |e| {
                             out[n] = e;
                             n += 1;
@@ -428,13 +465,13 @@ pub fn Session(comptime Transport: type) type {
         /// Reads the next message on an already-classified stream. Returns
         /// null when the buffer does not hold a whole one yet, and an
         /// optional event because some messages only advance state.
-        fn next(self: *Self, stream_id: u64, s: *StreamState) Error!?(?Event) {
+        fn next(self: *Self, stream_id: u64, s: *StreamState, hop_buf: *[msg.MAX_HOPS]u64) Error!?(?Event) {
             // Subscribe responses carry a type varint ahead of the length.
             if (s.role == .subscribe_out) {
                 var fbs = io.fixedBufferStream(s.slice());
                 const raw = wire.readVarInt(&fbs) catch return null;
                 const kind = msg.ResponseType.fromInt(raw) orelse return Error.ProtocolViolation;
-                const f = (try msg.frame(s.buf[fbs.seek..s.len])) orelse return null;
+                const f = (try msg.frame(s.slice()[fbs.seek..])) orelse return null;
                 const r = try msg.decodeSubscribeResponse(kind, f.body);
                 s.consume(fbs.seek + f.consumed);
                 s.started = true;
@@ -446,6 +483,11 @@ pub fn Session(comptime Transport: type) type {
             const ev: ?Event = switch (s.role) {
                 .setup_in => blk: {
                     self.peer_setup = try msg.decodeSetup(body);
+                    if (self.peer_setup.path) |path| {
+                        if (path.len > self.peer_path_buf.len) return Error.MessageTooLarge;
+                        @memcpy(self.peer_path_buf[0..path.len], path);
+                        self.peer_setup.path = self.peer_path_buf[0..path.len];
+                    }
                     self.setup_received = true;
                     break :blk Event{ .peer_setup = .{ .setup = self.peer_setup } };
                 },
@@ -471,7 +513,7 @@ pub fn Session(comptime Transport: type) type {
                     }
                     break :blk Event{ .announce_broadcast = .{
                         .stream_id = stream_id,
-                        .broadcast = try msg.decodeAnnounceBroadcast(body, &self.hop_buf),
+                        .broadcast = try msg.decodeAnnounceBroadcast(body, hop_buf),
                     } };
                 },
                 .subscribe_in => blk: {
@@ -730,6 +772,69 @@ test "an announce stream gives ANNOUNCE_OK once, then broadcasts" {
     try testing.expectEqual(@as(u64, 2), events[0].announce_ok.ok.hop_id);
     try testing.expectEqualStrings("alice", events[1].announce_broadcast.broadcast.suffix);
     try testing.expectEqual(msg.AnnounceStatus.ended, events[2].announce_broadcast.broadcast.status);
+}
+
+test "events from one read keep their bytes for the rest of the call" {
+    // Coalesced messages and a FIN in one read: consuming the next message
+    // or releasing the slot must not move bytes under an earlier event.
+    var t = FakeTransport{};
+    var s = TestSession.init(&t);
+    const sid = try s.openAnnounce(.{ .prefix = "room" });
+    var buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try msg.writeAnnounceOk(&fbs, .{ .hop_id = 2, .active_count = 1 });
+    try msg.writeAnnounceBroadcast(&fbs, .{ .status = .active, .suffix = "alice", .hops = &.{ 1, 2 } });
+    try msg.writeAnnounceBroadcast(&fbs, .{ .status = .active, .suffix = "bobby", .hops = &.{3} });
+
+    var events: [8]Event = undefined;
+    const n = try s.onStreamData(sid, buf[0..fbs.seek], true, &events);
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqualStrings("alice", events[1].announce_broadcast.broadcast.suffix);
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, events[1].announce_broadcast.broadcast.hops);
+    try testing.expectEqualStrings("bobby", events[2].announce_broadcast.broadcast.suffix);
+    try testing.expectEqualSlices(u64, &.{3}, events[2].announce_broadcast.broadcast.hops);
+}
+
+test "a group's first read is forwarded whole, however large" {
+    var t = FakeTransport{};
+    var s = TestSession.init(&t);
+    var buf: [CONTROL_BUF_SIZE * 3]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try msg.writeStreamType(&fbs, @intFromEnum(msg.DataType.group));
+    try msg.writeGroup(&fbs, .{ .subscribe_id = 0, .sequence = 1 });
+    const payload = CONTROL_BUF_SIZE * 2;
+    @memset(buf[fbs.seek..][0..payload], 0x5a);
+
+    var events: [8]Event = undefined;
+    const n = try s.onStreamData(3, buf[0 .. fbs.seek + payload], false, &events);
+    var got: usize = 0;
+    for (events[0..n]) |e| {
+        if (e == .group_data) {
+            for (e.group_data.data) |b| try testing.expectEqual(@as(u8, 0x5a), b);
+            got += e.group_data.data.len;
+        }
+    }
+    try testing.expectEqual(payload, got);
+}
+
+test "the peer's SETUP path outlives its stream's slot" {
+    var t = FakeTransport{};
+    var s = TestSession.init(&t);
+    var buf: [128]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try msg.writeStreamType(&fbs, @intFromEnum(msg.DataType.setup));
+    try msg.writeSetup(&fbs, .{ .path = "/room" });
+    var events: [8]Event = undefined;
+    _ = try s.onStreamData(3, buf[0..fbs.seek], true, &events);
+
+    // The released slot is taken by the next stream.
+    var other: [128]u8 = undefined;
+    var ofbs = io.fixedBufferStream(&other);
+    try msg.writeStreamType(&ofbs, @intFromEnum(msg.DataType.group));
+    try msg.writeGroup(&ofbs, .{ .subscribe_id = 9, .sequence = 9 });
+    @memset(other[ofbs.seek..][0..40], 'z');
+    _ = try s.onStreamData(7, other[0 .. ofbs.seek + 40], false, &events);
+    try testing.expectEqualStrings("/room", s.peer_setup.path.?);
 }
 
 test "frames arriving with the group header are not swallowed" {
