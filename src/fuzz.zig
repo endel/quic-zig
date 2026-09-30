@@ -1296,9 +1296,9 @@ test "transport parameters survive a randomized sweep" {
         }
 
         const p = transport_params.TransportParams.decode(input) catch continue;
-        if (p.original_destination_connection_id) |c| try testing.expect(borrowedFrom(input, c));
-        if (p.initial_source_connection_id) |c| try testing.expect(borrowedFrom(input, c));
-        if (p.retry_source_connection_id) |c| try testing.expect(borrowedFrom(input, c));
+        if (p.original_destination_connection_id) |*c| try testing.expect(std.mem.indexOf(u8, input, c.slice()) != null);
+        if (p.initial_source_connection_id) |*c| try testing.expect(std.mem.indexOf(u8, input, c.slice()) != null);
+        if (p.retry_source_connection_id) |*c| try testing.expect(std.mem.indexOf(u8, input, c.slice()) != null);
 
         var out: [4096]u8 = undefined;
         var wfbs = io_compat.fixedBufferStream(&out);
@@ -1327,10 +1327,10 @@ fn seedTransportParams(buf: []u8, rand: std.Random) ?usize {
         .max_ack_delay = rand.int(u14),
         .disable_active_migration = rand.boolean(),
         .active_connection_id_limit = 2 + rand.uintLessThan(u64, 6),
-        .initial_source_connection_id = cid[0..rand.uintLessThan(usize, cid.len + 1)],
+        .initial_source_connection_id = .init(cid[0..rand.uintLessThan(usize, cid.len + 1)]),
     };
-    if (rand.boolean()) p.original_destination_connection_id = &cid;
-    if (rand.boolean()) p.retry_source_connection_id = &cid;
+    if (rand.boolean()) p.original_destination_connection_id = .init(&cid);
+    if (rand.boolean()) p.retry_source_connection_id = .init(&cid);
     if (rand.boolean()) p.stateless_reset_token = [_]u8{0x5a} ** 16;
     if (rand.boolean()) p.max_datagram_frame_size = rand.int(u16);
     if (rand.boolean()) p.min_ack_delay = rand.int(u16);

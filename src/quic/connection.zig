@@ -868,16 +868,16 @@ pub const Connection = struct {
         conn.local_cid_pool.registerInitialCid(conn.scid[0..conn.scid_len], conn.static_reset_key);
 
         // For Retry: use the original DCID (before Retry) for the transport param
-        const tp_odcid = odcid orelse (if (is_server) header.dcid else null);
+        const tp_odcid: ?[]const u8 = odcid orelse (if (is_server) header.dcid else null);
 
         // Server SHOULD include stateless_reset_token for the initial SCID (RFC 9000 §18.2)
         const reset_token: ?[16]u8 = if (is_server) conn.local_cid_pool.entries[0].stateless_reset_token else null;
 
         // Build transport params AFTER CIDs are stored in conn (to avoid dangling slices)
         var local_params: transport_params.TransportParams = .{
-            .original_destination_connection_id = tp_odcid,
-            .initial_source_connection_id = conn.scid[0..conn.scid_len],
-            .retry_source_connection_id = retry_scid,
+            .original_destination_connection_id = if (tp_odcid) |c| .init(c) else null,
+            .initial_source_connection_id = .init(conn.scid[0..conn.scid_len]),
+            .retry_source_connection_id = if (retry_scid) |c| .init(c) else null,
             .stateless_reset_token = reset_token,
             .max_idle_timeout = config.max_idle_timeout,
             .initial_max_data = config.initial_max_data,
@@ -3873,8 +3873,8 @@ pub const Connection = struct {
         // Client-side: validate ODCID and retry_scid transport params (RFC 9000 §7.3)
         if (!self.is_server) {
             // original_destination_connection_id must match the DCID we initially sent
-            if (peer_tp.original_destination_connection_id) |peer_odcid| {
-                if (!std.mem.eql(u8, peer_odcid, self.odcid_buf[0..self.odcid_len])) {
+            if (peer_tp.original_destination_connection_id) |*peer_odcid| {
+                if (!std.mem.eql(u8, peer_odcid.slice(), self.odcid_buf[0..self.odcid_len])) {
                     self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "ODCID mismatch");
                     return error.TransportParameterError;
                 }
@@ -4569,7 +4569,7 @@ pub fn connectInto(
         .initial_max_streams_uni = config.initial_max_streams_uni,
         .max_datagram_frame_size = config.max_datagram_frame_size,
         .min_ack_delay = 1000, // 1ms minimum ACK delay (draft-ietf-quic-ack-frequency)
-        .initial_source_connection_id = &scid,
+        .initial_source_connection_id = .init(&scid),
     };
 
     // RFC 9368: Include version_information when v2 is enabled
@@ -5507,6 +5507,24 @@ test "accept: create server connection" {
     try std.testing.expectEqual(@as(u8, 8), conn.scid_len);
     // Path should be initialized
     try std.testing.expect(conn.path_initialized);
+}
+
+test "acceptInto keeps its own copy of the ODCID and retry SCID" {
+    // Both come from a Retry token decoded on route()'s stack.
+    const local = makeIpv4Addr(0, 0, 0, 0, 443);
+    const remote = makeIpv4Addr(192, 168, 1, 100, 12345);
+    const dcid = [_]u8{0x0d} ** 8;
+    const header = packet.Header{ .packet_type = .initial, .version = protocol.SUPPORTED_VERSIONS[0], .dcid = &dcid, .scid = &dcid };
+    var odcid = [_]u8{0x0a} ** 8;
+    var retry_scid = [_]u8{0x0b} ** 8;
+    const conn = try std.testing.allocator.create(Connection);
+    defer std.testing.allocator.destroy(conn);
+    try Connection.acceptInto(conn, std.testing.allocator, header, local, remote, true, .{}, null, &odcid, &retry_scid);
+    defer conn.deinit();
+    @memset(&odcid, 0);
+    @memset(&retry_scid, 0);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x0a} ** 8), conn.local_params.original_destination_connection_id.?.slice());
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x0b} ** 8), conn.local_params.retry_source_connection_id.?.slice());
 }
 
 test "accept: a client may choose a zero-length SCID" {

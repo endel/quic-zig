@@ -74,9 +74,28 @@ pub const PreferredAddress = struct {
     }
 };
 
+/// A connection ID held by value: params are copied between TLS and the
+/// connection, and a slice would point into a buffer since reused.
+pub const ConnectionId = struct {
+    buf: [20]u8 = undefined,
+    len: u8 = 0,
+
+    /// At most 20 bytes; decode refuses longer ones before getting here.
+    pub fn init(bytes: []const u8) ConnectionId {
+        std.debug.assert(bytes.len <= 20);
+        var c: ConnectionId = .{ .len = @intCast(bytes.len) };
+        @memcpy(c.buf[0..bytes.len], bytes);
+        return c;
+    }
+
+    pub fn slice(self: *const ConnectionId) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 /// QUIC Transport Parameters (RFC 9000 Section 18).
 pub const TransportParams = struct {
-    original_destination_connection_id: ?[]const u8 = null,
+    original_destination_connection_id: ?ConnectionId = null,
     max_idle_timeout: u64 = 0,
     stateless_reset_token: ?[16]u8 = null,
     max_udp_payload_size: u64 = 65527,
@@ -91,8 +110,8 @@ pub const TransportParams = struct {
     disable_active_migration: bool = false,
     preferred_address: ?PreferredAddress = null,
     active_connection_id_limit: u64 = 2,
-    initial_source_connection_id: ?[]const u8 = null,
-    retry_source_connection_id: ?[]const u8 = null,
+    initial_source_connection_id: ?ConnectionId = null,
+    retry_source_connection_id: ?ConnectionId = null,
     max_datagram_frame_size: ?u64 = null,
 
     // draft-ietf-quic-ack-frequency: minimum ACK delay in microseconds.
@@ -137,8 +156,8 @@ pub const TransportParams = struct {
             }
         };
 
-        if (self.original_destination_connection_id) |cid| {
-            try Helper.writeParamBytes(writer, .original_destination_connection_id, cid);
+        if (self.original_destination_connection_id) |*cid| {
+            try Helper.writeParamBytes(writer, .original_destination_connection_id, cid.slice());
         }
 
         if (self.max_idle_timeout > 0) {
@@ -209,12 +228,12 @@ pub const TransportParams = struct {
             try Helper.writeParam(writer, .active_connection_id_limit, self.active_connection_id_limit);
         }
 
-        if (self.initial_source_connection_id) |cid| {
-            try Helper.writeParamBytes(writer, .initial_source_connection_id, cid);
+        if (self.initial_source_connection_id) |*cid| {
+            try Helper.writeParamBytes(writer, .initial_source_connection_id, cid.slice());
         }
 
-        if (self.retry_source_connection_id) |cid| {
-            try Helper.writeParamBytes(writer, .retry_source_connection_id, cid);
+        if (self.retry_source_connection_id) |*cid| {
+            try Helper.writeParamBytes(writer, .retry_source_connection_id, cid.slice());
         }
 
         if (self.max_datagram_frame_size) |size| {
@@ -254,6 +273,12 @@ pub const TransportParams = struct {
     }
 
     /// Decode transport parameters from a buffer.
+    /// RFC 9000 §18.2: a connection ID parameter longer than 20 bytes is invalid.
+    fn readCid(bytes: []const u8) error{TransportParameterError}!ConnectionId {
+        if (bytes.len > 20) return error.TransportParameterError;
+        return ConnectionId.init(bytes);
+    }
+
     pub fn decode(data: []const u8) !TransportParams {
         var params = TransportParams{};
         var fbs = io.fixedBufferStream(data);
@@ -270,7 +295,7 @@ pub const TransportParams = struct {
 
             switch (param_id) {
                 @intFromEnum(ParamId.original_destination_connection_id) => {
-                    params.original_destination_connection_id = data[fbs.seek..][0..param_len];
+                    params.original_destination_connection_id = try readCid(data[fbs.seek..][0..param_len]);
                     fbs.seek += param_len;
                 },
                 @intFromEnum(ParamId.max_idle_timeout) => {
@@ -333,11 +358,11 @@ pub const TransportParams = struct {
                     params.active_connection_id_limit = try packet.readVarInt(reader);
                 },
                 @intFromEnum(ParamId.initial_source_connection_id) => {
-                    params.initial_source_connection_id = data[fbs.seek..][0..param_len];
+                    params.initial_source_connection_id = try readCid(data[fbs.seek..][0..param_len]);
                     fbs.seek += param_len;
                 },
                 @intFromEnum(ParamId.retry_source_connection_id) => {
-                    params.retry_source_connection_id = data[fbs.seek..][0..param_len];
+                    params.retry_source_connection_id = try readCid(data[fbs.seek..][0..param_len]);
                     fbs.seek += param_len;
                 },
                 @intFromEnum(ParamId.max_datagram_frame_size) => {
@@ -520,8 +545,8 @@ test "TransportParams: connection IDs roundtrip" {
     const odcid = [_]u8{ 0x11, 0x12, 0x13, 0x14 };
 
     const original = TransportParams{
-        .initial_source_connection_id = &scid,
-        .original_destination_connection_id = &odcid,
+        .initial_source_connection_id = ConnectionId.init(&scid),
+        .original_destination_connection_id = ConnectionId.init(&odcid),
         .max_idle_timeout = 30000,
     };
 
@@ -531,12 +556,29 @@ test "TransportParams: connection IDs roundtrip" {
 
     const decoded = try TransportParams.decode(fbs.buffered());
     try testing.expect(decoded.initial_source_connection_id != null);
-    try testing.expectEqualSlices(u8, &scid, decoded.initial_source_connection_id.?);
+    try testing.expectEqualSlices(u8, &scid, decoded.initial_source_connection_id.?.slice());
     try testing.expect(decoded.original_destination_connection_id != null);
-    try testing.expectEqualSlices(u8, &odcid, decoded.original_destination_connection_id.?);
+    try testing.expectEqualSlices(u8, &odcid, decoded.original_destination_connection_id.?.slice());
 }
 
 // RFC 9000 §18.1: greased transport parameters are encoded and decode is tolerant
+test "TransportParams: decoded connection IDs outlive the bytes they came from" {
+    // TLS reads the peer's params out of a buffer the next handshake message reuses.
+    const odcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    var buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try (TransportParams{
+        .original_destination_connection_id = ConnectionId.init(&odcid),
+        .initial_source_connection_id = ConnectionId.init(&odcid),
+        .retry_source_connection_id = ConnectionId.init(&odcid),
+    }).encode(&fbs);
+    const decoded = try TransportParams.decode(buf[0..fbs.seek]);
+    @memset(&buf, 0xee);
+    try std.testing.expectEqualSlices(u8, &odcid, decoded.original_destination_connection_id.?.slice());
+    try std.testing.expectEqualSlices(u8, &odcid, decoded.initial_source_connection_id.?.slice());
+    try std.testing.expectEqualSlices(u8, &odcid, decoded.retry_source_connection_id.?.slice());
+}
+
 test "TransportParams: greasing roundtrip" {
     const original = TransportParams{
         .max_idle_timeout = 30000,
