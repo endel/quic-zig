@@ -48,6 +48,16 @@ test {
     _ = @import("moq/lite/version.zig");
     _ = @import("moq/lite/session.zig");
     _ = @import("quic/qlog.zig");
+    _ = @import("sys.zig");
+    _ = @import("http1/conn.zig");
+    _ = @import("http1/websocket.zig");
+    _ = @import("http1/parser.zig");
+    _ = @import("h3/priority.zig");
+    _ = @import("quic/mont.zig");
+    _ = @import("quic/crypto.zig");
+    _ = @import("quic/aes_gcm.zig");
+    _ = @import("quic/util.zig");
+    _ = @import("quic/ca_bundle.zig");
     _ = @import("h0/connection.zig");
     _ = @import("event_loop.zig");
 }
