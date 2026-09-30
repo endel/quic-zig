@@ -198,7 +198,7 @@ poll loop (connection.zig:976).
 - **No Stream Cancellation bookkeeping** — the static-only encoder has
   no per-stream state, so incoming Stream Cancellation instructions are
   consumed and ignored.
-- **`huffman_scratch`** is a 16 KiB file-scope buffer shared across
-  decode calls. Decoded slices are valid only until the next
-  `decodeHeaders` / `QpackDecoder.decode` call on the same thread —
-  callers must consume or copy immediately.
+- **Decoded slices point into the caller's scratch** (`SCRATCH_SIZE`,
+  16 KiB), valid until the next decode into it. The event loop shares one
+  per loop across its connections, so headers are valid only during the
+  handler callback; safe builds poison the buffer after it returns.

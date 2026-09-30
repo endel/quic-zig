@@ -1716,7 +1716,16 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
+        /// Header slices end with their callback: every connection on the
+        /// loop decodes into `qpack_scratch`. Safe builds poison it, so a
+        /// handler that kept one reads 0xAA in its tests rather than, in
+        /// production, the next client's headers.
+        fn forgetHeaders(self: *Self) void {
+            @memset(&self.qpack_scratch, undefined);
+        }
+
         fn dispatchRequest(self: *Self, session: *Session, stream_id: u64, headers: []const qpack.Header) void {
+            defer self.forgetHeaders();
             if (@hasDecl(Handler, "onRequest")) {
                 self.handler.onRequest(session, stream_id, headers);
             } else {
@@ -1746,6 +1755,7 @@ pub fn Server(comptime Handler: type) type {
         // The 5-arity form also receives the CONNECT request headers, which
         // is where WebTransport carries the application-protocol offer.
         fn dispatchConnectRequest(self: *Self, session: *Session, session_id: u64, path: []const u8, headers: []const qpack.Header) void {
+            defer self.forgetHeaders();
             if (!@hasDecl(Handler, "onConnectRequest")) return;
 
             if (comptime @typeInfo(@TypeOf(Handler.onConnectRequest)).@"fn".params.len == 5) {
@@ -1756,6 +1766,7 @@ pub fn Server(comptime Handler: type) type {
         }
 
         fn dispatchSessionReady(self: *Self, session: *Session, session_id: u64, headers: []const qpack.Header) void {
+            defer self.forgetHeaders();
             if (!@hasDecl(Handler, "onSessionReady")) return;
 
             if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".params.len == 4) {
@@ -4361,6 +4372,39 @@ const HelloServer = struct {
         session.sendResponse(stream_id, &.{.{ .name = ":status", .value = "200" }}, "hello") catch unreachable;
     }
 };
+
+/// Keeps the request's path past `onRequest`, which the contract forbids.
+const PathKeepingServer = struct {
+    pub const protocol: Protocol = .h3;
+    path: ?[]const u8 = null,
+
+    pub fn onRequest(self: *@This(), session: *Session, stream_id: u64, headers: []const qpack.Header) void {
+        for (headers) |h| {
+            if (std.mem.eql(u8, h.name, ":path")) self.path = h.value;
+        }
+        session.sendResponse(stream_id, &.{.{ .name = ":status", .value = "200" }}, "hello") catch unreachable;
+    }
+};
+
+test "e2e: a header slice kept past its callback reads as poison, not another client's headers" {
+    // Every connection on a loop decodes into one scratch buffer, so a slice
+    // kept from onRequest showed whichever client was decoded next.
+    if (!std.debug.runtime_safety) return error.SkipZigTest;
+    var server_handler = PathKeepingServer{};
+    // Not "/", which the static table would answer from constant memory.
+    const request = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = ":path", .value = "/kept" },
+    };
+    var client_handler = CheckingClient{ .request = &request };
+    var e2e: E2e(PathKeepingServer, CheckingClient) = undefined;
+    try e2e.initWith(29464, &server_handler, &client_handler, null, null);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 10_000);
+    try testing.expect(std.mem.allEqual(u8, server_handler.path.?, 0xaa));
+}
 
 fn allFinished(clients: []CheckingClient) bool {
     for (clients) |*c| if (!c.finished) return false;

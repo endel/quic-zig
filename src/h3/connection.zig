@@ -178,10 +178,11 @@ pub const H3Connection = struct {
     qpack_decoder: qpack.QpackDecoder = .{},
 
     /// Scratch the decoder copies header names/values into; `headers_buf`
-    /// slices point in here and survive only until the next decode on this
-    /// connection. Point every connection on an event loop at one shared
-    /// buffer to pay 16 KB per loop instead of per connection; left empty,
-    /// the first decode allocates a private one.
+    /// slices point in here and survive only until the next decode into it.
+    /// Point every connection on an event loop at one shared buffer to pay
+    /// 16 KB per loop instead of per connection, and that next decode may be
+    /// another connection's; left empty, the first decode allocates a
+    /// private one.
     qpack_scratch: []u8 = &.{},
     qpack_scratch_owned: bool = false,
 

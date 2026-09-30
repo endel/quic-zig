@@ -153,6 +153,9 @@ STOP_SENDING), and `onConnectionClosed(session)` — called once per connection,
 after which its `Session`/`ConnEntry` must not be used. `session.id()` is a
 stable per-connection key.
 
+Request headers, and a CONNECT's path, are valid only during their callback:
+every connection on a loop decodes into one buffer, so copy what you keep.
+
 To run beside other I/O, pass `Config.loop` (a `event_loop.Xev.Loop` you own)
 and run it yourself; on teardown call `stop()` and keep running the loop until
 `isStopped()` before `deinit()`. `Client` works the same way. A timer of your
