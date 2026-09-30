@@ -2516,6 +2516,15 @@ pub const Tls13Handshake = struct {
 
     // ─── Server: Send NewSessionTicket ──────────────────────────────
 
+    /// Ticket plaintext: psk(32) || creation_time(8) || alpn_len(1) || alpn(<=16).
+    const ticket_plain_min = 32 + 8 + 1;
+    const ticket_plain_max = ticket_plain_min + 16;
+    /// Sealed ticket: nonce(12) || ciphertext || tag(16). The PSK identity a
+    /// client offers back must fall within these bounds.
+    const ticket_overhead = Aes128Gcm.nonce_length + Aes128Gcm.tag_length;
+    const ticket_sealed_min = ticket_overhead + ticket_plain_min;
+    const ticket_sealed_max = ticket_overhead + ticket_plain_max;
+
     fn serverSendTicket(self: *Tls13Handshake) !Action {
         const ticket_key = self.config.ticket_key orelse return error.InternalError;
 
@@ -2537,7 +2546,7 @@ pub const Tls13Handshake = struct {
         const ticket_age_add = std.mem.readInt(u32, &ticket_age_add_bytes, .big);
 
         // Build ticket plaintext: psk(32) || creation_time(8) || alpn_len(1) || alpn
-        var ticket_plain: [64]u8 = .{0} ** 64;
+        var ticket_plain: [ticket_plain_max]u8 = @splat(0);
         @memcpy(ticket_plain[0..32], &psk);
         const now_sec = sys.realtimeSeconds();
         std.mem.writeInt(i64, ticket_plain[32..40], now_sec, .big);
@@ -2547,21 +2556,19 @@ pub const Tls13Handshake = struct {
         @memcpy(ticket_plain[41..][0..alpn_copy_len], alpn_bytes[0..alpn_copy_len]);
         const plaintext_len = 41 + @as(usize, alpn_copy_len);
 
-        // Encrypt ticket with AES-128-GCM using ticket_key
-        var nonce_for_ticket: [12]u8 = .{0} ** 12;
-        @memcpy(nonce_for_ticket[8..12], &nonce_buf);
-        var encrypted_ticket: [80]u8 = undefined; // plaintext + 16 tag
-        var tag: [16]u8 = undefined;
+        // The key outlives this connection, so every ticket needs its own nonce.
+        var encrypted_ticket: [ticket_sealed_max]u8 = undefined;
+        const nonce = encrypted_ticket[0..Aes128Gcm.nonce_length];
+        sys.randomBytes(nonce);
         Aes128Gcm.encrypt(
-            encrypted_ticket[0..plaintext_len],
-            &tag,
+            encrypted_ticket[Aes128Gcm.nonce_length..][0..plaintext_len],
+            encrypted_ticket[Aes128Gcm.nonce_length + plaintext_len ..][0..Aes128Gcm.tag_length],
             ticket_plain[0..plaintext_len],
             "",
-            nonce_for_ticket,
+            nonce.*,
             ticket_key,
         );
-        @memcpy(encrypted_ticket[plaintext_len..][0..16], &tag);
-        const encrypted_len = plaintext_len + 16;
+        const encrypted_len = ticket_overhead + plaintext_len;
 
         // Build NewSessionTicket message (RFC 8446 §4.6.1):
         // type(1) + length(3) + lifetime(4) + ticket_age_add(4) + nonce_len(1) + nonce(4) +
@@ -2662,42 +2669,18 @@ pub const Tls13Handshake = struct {
         const received_binder = psk_data[binders_start + 1 ..][0..32];
 
         // Decrypt ticket identity to get PSK
-        if (identity_len < 16 + 1) return; // at least tag + 1 byte
-        const ciphertext_len = identity_len - 16;
-
-        // Reconstruct nonce from ticket (we use the last 4 bytes of identity as hint)
-        var ticket_nonce: [12]u8 = .{0} ** 12;
-        // Use zeros as nonce — server encrypts with incrementing nonce_buf in [8..12]
-        // We need to try nonce counter values. For simplicity, try a few.
-        var decrypted: [64]u8 = undefined;
-        var psk_found = false;
-        var found_psk: [32]u8 = undefined;
-
-        for (0..256) |nonce_try| {
-            std.mem.writeInt(u32, ticket_nonce[8..12], @intCast(nonce_try), .big);
-            var ct_copy: [80]u8 = undefined;
-            @memcpy(ct_copy[0..identity_len], identity[0..identity_len]);
-            const tag_start = ciphertext_len;
-            const tag: [16]u8 = ct_copy[tag_start..][0..16].*;
-
-            Aes128Gcm.decrypt(
-                decrypted[0..ciphertext_len],
-                ct_copy[0..ciphertext_len],
-                tag,
-                "",
-                ticket_nonce,
-                ticket_key,
-            ) catch continue;
-
-            // Decrypted successfully
-            if (ciphertext_len >= 32) {
-                @memcpy(&found_psk, decrypted[0..32]);
-                psk_found = true;
-                break;
-            }
-        }
-
-        if (!psk_found) return;
+        if (identity_len < ticket_sealed_min or identity_len > ticket_sealed_max) return;
+        const ciphertext_len = identity_len - ticket_overhead;
+        var decrypted: [ticket_plain_max]u8 = undefined;
+        Aes128Gcm.decrypt(
+            decrypted[0..ciphertext_len],
+            identity[Aes128Gcm.nonce_length..][0..ciphertext_len],
+            identity[Aes128Gcm.nonce_length + ciphertext_len ..][0..Aes128Gcm.tag_length].*,
+            "",
+            identity[0..Aes128Gcm.nonce_length].*,
+            ticket_key,
+        ) catch return;
+        const found_psk: [32]u8 = decrypted[0..32].*;
 
         // Compute binder key from PSK WITHOUT modifying self.key_schedule yet
         // (if binder fails, we must leave key_schedule untouched)
@@ -4148,6 +4131,96 @@ test "loopback PSK resumption: two handshakes with session ticket" {
         &client2.key_schedule.server_app_traffic_secret,
         &server2.key_schedule.server_app_traffic_secret,
     );
+}
+
+test "server: a PSK identity longer than any ticket we issue falls back to a full handshake" {
+    const server_key_pair = EcdsaP256Sha256.KeyPair.generate(std.testing.io);
+    const secret_key_bytes = server_key_pair.secret_key.toBytes();
+    const fake_cert = server_key_pair.public_key.toUncompressedSec1();
+    const tp = transport_params.TransportParams{};
+
+    var ticket = SessionTicket{ .psk = @splat(0x42), .lifetime = 3600 };
+    ticket.creation_time = sys.realtimeSeconds();
+    @memset(&ticket.ticket, 0xAA);
+    ticket.ticket_len = ticket.ticket.len;
+
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+        .session_ticket = &ticket,
+    }, tp);
+    var server = Tls13Handshake.initServer(.{
+        .cert_chain_der = &[_][]const u8{&fake_cert},
+        .private_key_bytes = &secret_key_bytes,
+        .alpn = &[_][]const u8{"h3"},
+        .ticket_key = @splat(7),
+    }, tp);
+
+    _ = try client.step();
+    server.provideData(client.out_buf[0..client.out_len]);
+    _ = try server.step();
+    try std.testing.expect(!server.using_psk);
+}
+
+/// Runs a full handshake and returns the ticket the client took from it.
+fn issueTicket(server_config: TlsConfig) !SessionTicket {
+    const tp = transport_params.TransportParams{ .initial_max_data = 1 << 20, .initial_max_streams_bidi = 10 };
+    var server = Tls13Handshake.initServer(server_config, tp);
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+    }, tp);
+    var client_done = false;
+    var server_done = false;
+    var i: usize = 0;
+    while ((!client_done or !server_done) and i < 100) : (i += 1) {
+        if (!client_done) switch (try client.step()) {
+            .send_data => |sd| server.provideData(sd.data),
+            .complete => client_done = true,
+            else => {},
+        };
+        if (!server_done) switch (try server.step()) {
+            .send_data => client.provideData(server.out_buf[0..server.out_len]),
+            .complete => server_done = true,
+            else => {},
+        };
+    }
+    for (0..10) |_| {
+        if (client.received_ticket) |t| return t;
+        _ = try client.step();
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "server: tickets from one key never share a keystream" {
+    const server_key_pair = EcdsaP256Sha256.KeyPair.generate(std.testing.io);
+    const secret_key_bytes = server_key_pair.secret_key.toBytes();
+    const fake_cert = server_key_pair.public_key.toUncompressedSec1();
+    const config = TlsConfig{
+        .cert_chain_der = &[_][]const u8{&fake_cert},
+        .private_key_bytes = &secret_key_bytes,
+        .alpn = &[_][]const u8{"h3"},
+        .ticket_key = @splat(7),
+    };
+    const a = try issueTicket(config);
+    const b = try issueTicket(config);
+    try std.testing.expect(!std.mem.eql(u8, &a.psk, &b.psk));
+
+    // A client knows its own PSK. Were the keystream shared, XORing the two
+    // tickets would give the XOR of the PSKs wherever they sit.
+    var psk_xor: [32]u8 = undefined;
+    for (&psk_xor, a.psk, b.psk) |*x, p, q| x.* = p ^ q;
+    const n = @min(a.ticket_len, b.ticket_len);
+    var off: usize = 0;
+    while (off + 32 <= n) : (off += 1) {
+        var ct_xor: [32]u8 = undefined;
+        for (&ct_xor, a.ticket[off..][0..32], b.ticket[off..][0..32]) |*x, p, q| x.* = p ^ q;
+        try std.testing.expect(!std.mem.eql(u8, &ct_xor, &psk_xor));
+    }
 }
 
 // NewSessionTicket roundtrip test
