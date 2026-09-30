@@ -385,6 +385,8 @@ pub const WebTransportConnection = struct {
         try stream.send.writeData(fbs.buffered());
 
         try self.wt_bidi_streams.put(stream_id, session_id);
+        // The peer's side of it is WT data, never a response for H3 to parse.
+        try self.h3.excluded_streams.put(stream_id, {});
         if (session) |sess| sess.fc.bidi.open();
         return stream_id;
     }
@@ -711,66 +713,64 @@ pub const WebTransportConnection = struct {
 
     /// Reset all streams belonging to a session and free their buffers.
     /// Uses WEBTRANSPORT_SESSION_GONE error code per draft-ietf-webtrans-http3.
+    /// Reset a closed session's streams. They stay in `h3.excluded_streams`
+    /// until QUIC reclaims them: whatever the peer still sends on them is
+    /// neither a request nor a stream type for H3.
     fn cleanupSessionStreams(self: *WebTransportConnection, session_id: u64) void {
-        // Collect stream IDs to remove (can't remove during iteration)
-        var bidi_to_remove: [64]u64 = undefined;
-        var bidi_count: usize = 0;
-        var bidi_it = self.wt_bidi_streams.iterator();
-        while (bidi_it.next()) |entry| {
-            if (entry.value_ptr.* == session_id) {
-                if (bidi_count < 64) {
-                    bidi_to_remove[bidi_count] = entry.key_ptr.*;
-                    bidi_count += 1;
+        // Removed in batches: the maps cannot change while iterated.
+        while (true) {
+            var batch: [64]u64 = undefined;
+            var n: usize = 0;
+            var it = self.wt_bidi_streams.iterator();
+            while (n < batch.len) {
+                const entry = it.next() orelse break;
+                if (entry.value_ptr.* == session_id) {
+                    batch[n] = entry.key_ptr.*;
+                    n += 1;
                 }
             }
-        }
-        for (bidi_to_remove[0..bidi_count]) |sid| {
-            _ = self.wt_bidi_streams.remove(sid);
-            _ = self.h3.excluded_streams.remove(sid);
-            // Reset the stream with WEBTRANSPORT_SESSION_GONE
-            if (self.quic.streams.getStream(sid)) |s| {
-                if (!s.send.fin_sent) {
-                    s.send.reset(WEBTRANSPORT_SESSION_GONE);
+            if (n == 0) break;
+            for (batch[0..n]) |sid| {
+                _ = self.wt_bidi_streams.remove(sid);
+                if (self.quic.streams.getStream(sid)) |st| {
+                    if (!st.send.fin_sent) st.send.reset(WEBTRANSPORT_SESSION_GONE);
+                    st.recv.stopSending(WEBTRANSPORT_SESSION_GONE);
                 }
-                s.recv.stopSending(WEBTRANSPORT_SESSION_GONE);
+                self.dropStreamState(sid);
             }
-            // Free buffered data
-            if (self.stream_bufs.getPtr(sid)) |buf| {
-                buf.deinit(self.allocator);
-                _ = self.stream_bufs.remove(sid);
-            }
-            _ = self.reset_delivered.remove(sid);
         }
+        while (true) {
+            var batch: [64]u64 = undefined;
+            var n: usize = 0;
+            var it = self.wt_uni_streams.iterator();
+            while (n < batch.len) {
+                const entry = it.next() orelse break;
+                if (entry.value_ptr.* == session_id) {
+                    batch[n] = entry.key_ptr.*;
+                    n += 1;
+                }
+            }
+            if (n == 0) break;
+            for (batch[0..n]) |sid| {
+                _ = self.wt_uni_streams.remove(sid);
+                if (self.quic.streams.send_streams.get(sid)) |send_stream| {
+                    if (!send_stream.fin_sent) send_stream.reset(WEBTRANSPORT_SESSION_GONE);
+                }
+                if (self.quic.streams.recv_streams.get(sid)) |recv_stream| {
+                    recv_stream.stopSending(WEBTRANSPORT_SESSION_GONE);
+                    self.quic.streams.releaseRecvStream(sid);
+                }
+                self.dropStreamState(sid);
+            }
+        }
+    }
 
-        var uni_to_remove: [64]u64 = undefined;
-        var uni_count: usize = 0;
-        var uni_it = self.wt_uni_streams.iterator();
-        while (uni_it.next()) |entry| {
-            if (entry.value_ptr.* == session_id) {
-                if (uni_count < 64) {
-                    uni_to_remove[uni_count] = entry.key_ptr.*;
-                    uni_count += 1;
-                }
-            }
+    fn dropStreamState(self: *WebTransportConnection, sid: u64) void {
+        if (self.stream_bufs.fetchRemove(sid)) |kv| {
+            var buf = kv.value;
+            buf.deinit(self.allocator);
         }
-        for (uni_to_remove[0..uni_count]) |sid| {
-            _ = self.wt_uni_streams.remove(sid);
-            _ = self.h3.excluded_streams.remove(sid);
-            // Reset send side if we opened it
-            if (self.quic.streams.send_streams.get(sid)) |send_stream| {
-                if (!send_stream.fin_sent) {
-                    send_stream.reset(WEBTRANSPORT_SESSION_GONE);
-                }
-            }
-            if (self.quic.streams.recv_streams.get(sid)) |recv_stream| {
-                recv_stream.stopSending(WEBTRANSPORT_SESSION_GONE);
-            }
-            if (self.stream_bufs.getPtr(sid)) |buf| {
-                buf.deinit(self.allocator);
-                _ = self.stream_bufs.remove(sid);
-            }
-            _ = self.reset_delivered.remove(sid);
-        }
+        _ = self.reset_delivered.remove(sid);
     }
 
     /// Drain the QUIC-layer disposal queue and clean up corresponding WT bookkeeping.
@@ -2867,6 +2867,46 @@ test "WT: bidi streams are classified before H3 reads them, however their bytes 
         r.wt = r.wt or later.wt;
         r.request = r.request or later.request;
         try testing.expect(r.wt and !r.request);
+    }
+}
+
+test "WT: a paused stream we opened keeps the peer's data from H3" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    const sid = try setup.wt.openBidiStream(session_id, null);
+    try setup.wt.pauseStream(sid);
+
+    var buf: [256]u8 = undefined;
+    const len = buildConnectRequest(&buf, "/forged");
+    try setup.quic_conn.streams.getStream(sid).?.recv.handleStreamFrame(0, buf[0..len], false);
+    const r = try pollClassified(&setup, sid);
+    try testing.expect(!r.request);
+}
+
+test "WT: a closed session's streams stay away from H3, however many it had" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+    var id: u64 = 14;
+    while (id < 14 + 4 * 70) : (id += 4) {
+        const rs = try setup.quic_conn.streams.getOrCreateRecvStream(id);
+        try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+    }
+    _ = try pollClassified(&setup, 0);
+    setup.wt.closeSession(session_id);
+
+    // What arrives on them now is no stream type of their own.
+    const first = setup.quic_conn.streams.recv_streams.get(14).?;
+    try first.handleStreamFrame(prefix_len, &.{0x00}, false);
+    _ = try pollClassified(&setup, 0);
+    try testing.expectEqual(@as(u64, 2), setup.h3.peer_control_stream_id.?);
+    id = 14;
+    while (id < 14 + 4 * 70) : (id += 4) {
+        try testing.expect(setup.quic_conn.streams.recv_streams.get(id).?.stop_sending_err != null);
     }
 }
 
