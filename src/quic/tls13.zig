@@ -1660,6 +1660,7 @@ pub const Tls13Handshake = struct {
         if (pos + 2 > body.len) return error.DecodeError;
         const ext_len = readU16(body[pos..]);
         pos += 2;
+        if (ext_len > body.len - pos) return error.DecodeError;
 
         var found_key_share = false;
         var ext_pos: usize = 0;
@@ -1669,6 +1670,7 @@ pub const Tls13Handshake = struct {
             ext_pos += 2;
             const elen = readU16(ext_data[ext_pos..]);
             ext_pos += 2;
+            if (elen > ext_data.len - ext_pos) return error.DecodeError;
 
             if (etype == @intFromEnum(tls.ExtensionType.key_share)) {
                 // key_share: named_group(2) + key_exchange_length(2) + key_exchange(...)
@@ -4162,6 +4164,46 @@ test "server: a PSK identity longer than any ticket we issue falls back to a ful
     server.provideData(client.out_buf[0..client.out_len]);
     _ = try server.step();
     try std.testing.expect(!server.using_psk);
+}
+
+/// A ServerHello choosing x25519 and TLS_AES_128_GCM_SHA256, followed by
+/// `extra` extensions, with `ext_len` written as the extensions' length.
+fn testServerHello(buf: []u8, extra: []const u8, ext_len: ?u16) []const u8 {
+    const pub_key = X25519.recoverPublicKey(@splat(5)) catch unreachable;
+    var w = io.fixedBufferStream(buf);
+    const exts_len: u16 = @intCast(6 + 4 + 4 + 32 + extra.len);
+    const body_len: u24 = @intCast(2 + 32 + 1 + 2 + 1 + 2 + exts_len);
+    w.writeByte(@intFromEnum(tls.HandshakeType.server_hello)) catch unreachable;
+    w.writeInt(u24, body_len, .big) catch unreachable;
+    w.writeAll(&([_]u8{ 0x03, 0x03 } ++ [_]u8{0x11} ** 32 ++ [_]u8{ 0, 0x13, 0x01, 0 })) catch unreachable;
+    w.writeInt(u16, ext_len orelse exts_len, .big) catch unreachable;
+    w.writeAll(&.{ 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04 }) catch unreachable; // supported_versions: TLS 1.3
+    w.writeAll(&.{ 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 }) catch unreachable; // key_share: x25519
+    w.writeAll(&pub_key) catch unreachable;
+    w.writeAll(extra) catch unreachable;
+    return buf[0..w.seek];
+}
+
+fn clientAwaitingServerHello(ticket: ?*const SessionTicket) Tls13Handshake {
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+        .session_ticket = ticket,
+    }, .{});
+    // ClientHello, then any 0-RTT keys.
+    while (true) switch (client.step() catch unreachable) {
+        .wait_for_data => return client,
+        else => {},
+    };
+}
+
+test "client: a ServerHello whose extensions overrun the message is a DecodeError" {
+    var buf: [256]u8 = undefined;
+    var client = clientAwaitingServerHello(null);
+    client.provideData(testServerHello(&buf, &.{}, 0xffff));
+    try std.testing.expectError(error.DecodeError, client.step());
 }
 
 /// Runs a full handshake and returns the ticket the client took from it.
