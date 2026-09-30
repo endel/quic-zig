@@ -1283,6 +1283,11 @@ pub const Connection = struct {
             return;
         }
 
+        // RFC 9000 §9: a client initiates every migration, so a packet from a
+        // server address other than the one it is using is not the server's.
+        if (!self.is_server and self.path_initialized and
+            !sockaddrEql(&info.from, &self.paths[self.active_path_idx].peer_addr)) return;
+
         // Intercept Retry packets before normal processing (client only)
         if (header.packet_type == .retry) {
             if (!self.is_server) {
@@ -3487,12 +3492,11 @@ pub const Connection = struct {
     /// Handle connection migration (RFC 9000 Section 9).
     /// Called when a 1-RTT packet with non-probing frames arrives from a different address.
     fn handleMigration(self: *Connection, new_peer_addr: posix.sockaddr.storage, local_addr: posix.sockaddr.storage, now: i64) void {
-        // Check if peer disabled active migration
-        if (self.peer_params) |pp| {
-            if (pp.disable_active_migration) {
-                std.log.info("migration: peer disabled active migration, ignoring", .{});
-                return;
-            }
+        // RFC 9000 §18.2: disable_active_migration is what we promised not to
+        // follow. The peer's own says nothing about its address changing.
+        if (self.local_params.disable_active_migration) {
+            std.log.info("migration: we disabled active migration, ignoring", .{});
+            return;
         }
 
         // Set up candidate path at the alternate index
@@ -3524,9 +3528,9 @@ pub const Connection = struct {
             self.ecn_validator.reset();
             std.log.info("migration: IP changed, reset CC, RTT, MTU and ECN", .{});
         } else {
-            // NAT rebinding (port-only change): path is already validated since same IP,
-            // and carry over MTU from old path
-            self.paths[candidate_idx].is_validated = true;
+            // NAT rebinding (port-only change): keep CC and MTU, but the new
+            // port is validated like any new address (RFC 9000 §9.3) — until
+            // then the 3x limit covers what goes to it.
             // Mark current time as congestion recovery start so that loss detection
             // for pre-migration packets (sent to old port) won't reduce CWND —
             // these are path losses, not congestion losses.
@@ -6125,6 +6129,78 @@ test "a peer's close reason outlives the packet it came in" {
         try conn.processFrame(&f, .application, 0);
         @memset(&reason, 0);
         try std.testing.expectEqualStrings("going away\r\n", conn.local_err.?.reason());
+    }
+}
+
+/// Sets `conn` up to open 1-RTT packets under keys derived from its SCID,
+/// and seals a PING-only one to it from the peer's side.
+fn testPingToward(conn: *Connection, out: []u8) !usize {
+    conn.state = .connected;
+    conn.handshake_confirmed = true;
+    const cid = conn.scid[0..conn.scid_len];
+    if (conn.is_server)
+        try conn.pkt_num_spaces[2].setupInitial(cid, conn.version, true)
+    else
+        try conn.pkt_num_spaces[2].setupInitial(cid, conn.version, false);
+    const seal = if (conn.is_server)
+        (try quic_crypto.deriveInitialKeyMaterial(cid, conn.version, false))[1]
+    else
+        (try quic_crypto.deriveInitialKeyMaterial(cid, conn.version, true))[1];
+    var packer = packet_packer.PacketPacker.init(std.testing.allocator, !conn.is_server, "peer1234", cid, conn.version);
+    var handler = ack_handler.PacketHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(std.testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(std.testing.allocator, !conn.is_server);
+    defer streams.deinit();
+    var pending: frame_mod.PendingFrameQueue = .{};
+    pending.push(.ping);
+    return packer.packCoalesced(out, &handler, &crypto_mgr, &streams, &pending, null, null, null, &seal, 0, null, false);
+}
+
+test "migration: a client drops packets from a server address it does not know" {
+    // RFC 9000 9: clients initiate migration; a server's packets from
+    // elsewhere are someone else's.
+    const conn = try std.testing.allocator.create(Connection);
+    defer std.testing.allocator.destroy(conn);
+    try connectInto(conn, std.testing.allocator, "example.com", .{}, null, null);
+    defer conn.deinit();
+    const server = makeIpv4Addr(192, 0, 2, 1, 443);
+    const elsewhere = makeIpv4Addr(198, 51, 100, 9, 443);
+    conn.paths[0].peer_addr = server;
+    conn.path_initialized = true;
+
+    var buf: [1500]u8 = undefined;
+    const n = try testPingToward(conn, &buf);
+    conn.handleDatagram(buf[0..n], .{ .to = conn.paths[0].local_addr, .from = elsewhere, .datagram_size = n });
+    try std.testing.expect(sockaddrEql(&server, &conn.paths[conn.active_path_idx].peer_addr));
+    try std.testing.expectEqual(@as(?u64, null), conn.pkt_handler.recv[2].largest_received);
+}
+
+test "migration: our disable_active_migration holds, and a new port is validated" {
+    var buf: [1500]u8 = undefined;
+    const client = makeIpv4Addr(192, 0, 2, 7, 5000);
+    // We said no migration: a packet from a new address moves nothing.
+    {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        conn.paths[0] = NetworkPath.init(makeIpv4Addr(0, 0, 0, 0, 443), client, true);
+        conn.path_initialized = true;
+        conn.local_params.disable_active_migration = true;
+        const n = try testPingToward(&conn, &buf);
+        conn.handleDatagram(buf[0..n], .{ .to = conn.paths[0].local_addr, .from = makeIpv4Addr(203, 0, 113, 5, 6000), .datagram_size = n });
+        try std.testing.expect(sockaddrEql(&client, &conn.paths[conn.active_path_idx].peer_addr));
+    }
+    // A port change is a new address too (RFC 9000 9.3): not trusted unchecked.
+    {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        conn.paths[0] = NetworkPath.init(makeIpv4Addr(0, 0, 0, 0, 443), client, true);
+        conn.path_initialized = true;
+        conn.paths[0].is_validated = true;
+        const n = try testPingToward(&conn, &buf);
+        conn.handleDatagram(buf[0..n], .{ .to = conn.paths[0].local_addr, .from = makeIpv4Addr(192, 0, 2, 7, 5001), .datagram_size = n });
+        try std.testing.expect(!conn.paths[conn.active_path_idx].is_validated);
     }
 }
 
