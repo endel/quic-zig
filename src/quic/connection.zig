@@ -4013,6 +4013,16 @@ pub const Connection = struct {
                     return error.TransportParameterError;
                 }
             }
+
+            // RFC 9368 §4: TLS authenticates the Chosen Version and not the
+            // long header, so this is what catches a forged Version field.
+            // The version in use is always one we offered.
+            if (peer_tp.version_info_chosen) |chosen| {
+                if (chosen != self.version) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.version_negotiation_error), @intFromEnum(FrameType.crypto), "Chosen Version differs from the negotiated one");
+                    return error.VersionNegotiationError;
+                }
+            }
         }
 
         // Server-side: reject server-only params from client (RFC 9000 §18.2)
@@ -7368,4 +7378,30 @@ test "a client moves to QUIC v2 only for a packet that opens under v2's keys" {
     n = try testServerInitial(conn, &buf, protocol.QUIC_V2, &v2_seal);
     conn.handleDatagram(buf[0..n], .{ .to = addr, .from = addr, .datagram_size = n });
     try std.testing.expectEqual(protocol.QUIC_V2, conn.version);
+}
+
+test "a client closes when the server's Chosen Version isn't the one its packets negotiated" {
+    // RFC 9368 4: TLS authenticates the Chosen Version, not the long header,
+    // which makes it the check on a forged Version field. It was never made.
+    const conn = try std.testing.allocator.create(Connection);
+    defer std.testing.allocator.destroy(conn);
+    try connectInto(conn, std.testing.allocator, "example.com", .{ .enable_v2 = true }, null, null);
+    defer conn.deinit();
+    const odcid = conn.odcid_buf[0..conn.odcid_len];
+    const addr = makeIpv4Addr(192, 0, 2, 9, 4433);
+    var buf: [1500]u8 = undefined;
+    const v2_seal = (try quic_crypto.deriveInitialKeyMaterial(odcid, protocol.QUIC_V2, true))[1];
+    const n = try testServerInitial(conn, &buf, protocol.QUIC_V2, &v2_seal);
+    conn.handleDatagram(buf[0..n], .{ .to = addr, .from = addr, .datagram_size = n });
+    try std.testing.expectEqual(protocol.QUIC_V2, conn.version);
+
+    var tp: transport_params.TransportParams = .{
+        .initial_source_connection_id = .init(conn.peer_initial_scid[0..conn.peer_initial_scid_len]),
+        .original_destination_connection_id = .init(odcid),
+        .version_info_chosen = protocol.QUIC_V2,
+    };
+    try conn.validatePeerTransportParams(&tp);
+    tp.version_info_chosen = protocol.QUIC_V1;
+    try std.testing.expectError(error.VersionNegotiationError, conn.validatePeerTransportParams(&tp));
+    try std.testing.expectEqual(@intFromEnum(TransportError.version_negotiation_error), conn.local_err.?.code);
 }

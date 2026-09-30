@@ -513,7 +513,7 @@ in CI). Details, API and caveats: [RFC6455_WEBSOCKET.md](RFC6455_WEBSOCKET.md).
 |---|---------|--------|-------|
 | 2 | Version Negotiation Mechanism | ✅ Done | Client advertises v1+v2, server selects v2 |
 | 3 | version_information Transport Parameter (0x11) | ✅ Done | chosen_version + available_versions encode/decode |
-| 4 | Asymmetric Key Switching | ✅ Done | Server keeps v1 open + v2 seal; client keeps v1 seal + v2 open |
+| 4 | Asymmetric Key Switching | ✅ Done | Server keeps v1 open + v2 seal; client keeps v1 seal + v2 open. The client moves only for an Initial that opens under the new keys, and checks the server's Chosen Version |
 
 ### Summary — RFC 9368: ✅ Complete
 

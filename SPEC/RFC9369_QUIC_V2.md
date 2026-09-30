@@ -43,7 +43,13 @@ Version negotiation is triggered via the `version_information` transport paramet
 1. **Client** sends v1 Initial with `version_information` containing `chosen_version=v1` and `available_versions=[v2, v1]`
 2. **Server** parses client's transport params, sees v2 in available versions, selects v2
 3. **Server** updates TLS config to v2, sends v2 Initial + Handshake
-4. **Client** detects server response has different version, calls `switchVersion()`
+4. **Client** detects server response has different version, calls `switchVersion()`.
+   Only an Initial that opens under the new version's keys commits the move,
+   and only once; any other packet naming another version is dropped. Initial
+   keys come from public inputs, so the header alone proves nothing.
+5. **Client** checks the server's `chosen_version`, which TLS authenticates,
+   against the version it moved to, and closes with
+   VERSION_NEGOTIATION_ERROR if they differ (RFC 9368 §4)
 
 ### Asymmetric Key Switching
 
@@ -72,8 +78,19 @@ Self-interop test: `TESTCASE=v2` with interop server + client confirms:
 - Handshake completes with v2 keys
 - File transfer succeeds over v2 connection
 
+Interop runner, `v2` case, 30 Sep 2026 at `94aa9ab`: passes quic-zig↔quic-zig and
+against ngtcp2 in both directions. quic-go's and quiche's images don't implement
+the case, which is why the default matrix (`interop/runner/matrix.sh`) shows it
+as unsupported; run `interop/runner/matrix.sh ngtcp2 v2` to cover it.
+
+Unit tests: a client moves only for an Initial that opens under the new keys,
+and closes when the server's Chosen Version differs; an event-loop e2e test
+negotiates v2 end to end.
+
 ## Caveats
 
 - No greasing with reserved versions (not sending random versions in version_information)
 - version_information only advertises v1 and v2 (no extensibility for future versions yet)
-- Downgrade prevention (RFC 9368 §3) not explicitly validated (both sides prefer v2 when available)
+- The client checks the server's Chosen Version (RFC 9368 §4) but never reacts to
+  Version Negotiation packets, so the Available Versions checks that apply after
+  one don't arise
