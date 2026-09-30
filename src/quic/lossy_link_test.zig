@@ -298,16 +298,20 @@ const Pair = struct {
     s_addr: posix.sockaddr.storage = addr(4433),
 
     fn init(self: *Pair) !void {
+        return self.initWith(.{}, .{});
+    }
+
+    fn initWith(self: *Pair, server_config: connection.ConnectionConfig, client_config: connection.ConnectionConfig) !void {
         const alloc = testing.allocator;
         self.* = .{
-            .mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, .{1} ** 16, .{2} ** 16),
+            .mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), server_config, .{1} ** 16, .{2} ** 16),
             .client = try alloc.create(connection.Connection),
         };
         errdefer {
             alloc.destroy(self.client);
             self.mgr.deinit();
         }
-        try connection.connectInto(self.client, alloc, "localhost", .{}, .{
+        try connection.connectInto(self.client, alloc, "localhost", client_config, .{
             .cert_chain_der = &.{},
             .private_key_bytes = &.{},
             .alpn = &client_alpn,
@@ -475,4 +479,19 @@ test "handshake: the server holds 1-RTT packets until the client's Finished" {
     }
     try testing.expect(sconn.isEstablished());
     try testing.expect(sconn.streams.getStream(s.stream_id) != null);
+}
+
+test "idle timeout: a peer's value too large for nanoseconds is capped" {
+    // With ours disabled (0) the peer's is used alone.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    for ([_]u64{ std.math.maxInt(i64) / std.time.ns_per_ms, (1 << 62) - 1 }) |peer_ms| {
+        var p: Pair = undefined;
+        try p.initWith(.{ .max_idle_timeout = 0 }, .{ .max_idle_timeout = peer_ms });
+        defer p.deinit();
+        const sconn = p.mgr.entries.items[0].conn;
+        try testing.expect(sconn.nextTimeoutNs() != null);
+        try sconn.onTimeout();
+        try testing.expect(!sconn.isClosed());
+    }
 }

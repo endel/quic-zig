@@ -544,6 +544,13 @@ pub const ConnectionConfig = struct {
     static_reset_key: ?[16]u8 = null,
 };
 
+/// An idle timeout in nanoseconds. The wire allows 2^62 ms, past what i64
+/// nanoseconds hold, and deadlines add it to the clock: capped at 2^32 ms
+/// (about 50 days).
+fn idleTimeoutNs(ms: u64) i64 {
+    return @as(i64, @min(ms, 1 << 32)) * std.time.ns_per_ms;
+}
+
 /// A QUIC connection.
 ///
 // General queue for packets that can't be decrypted yet because the keys
@@ -973,7 +980,7 @@ pub const Connection = struct {
         conn.conn_flow_ctrl.base.send_window = config.initial_max_data;
 
         if (config.max_idle_timeout > 0) {
-            conn.idle_timeout_ns = @as(i64, @intCast(config.max_idle_timeout)) * 1_000_000;
+            conn.idle_timeout_ns = idleTimeoutNs(config.max_idle_timeout);
         }
 
         // Resize datagram queues if configured larger than default
@@ -2679,9 +2686,9 @@ pub const Connection = struct {
                         // Negotiate idle timeout: use min of local and peer when both non-zero (RFC 9000 §10.1)
                         if (peer_tp.max_idle_timeout > 0 and self.local_params.max_idle_timeout > 0) {
                             const effective_ms = @min(peer_tp.max_idle_timeout, self.local_params.max_idle_timeout);
-                            self.idle_timeout_ns = @as(i64, @intCast(effective_ms)) * 1_000_000;
+                            self.idle_timeout_ns = idleTimeoutNs(effective_ms);
                         } else if (peer_tp.max_idle_timeout > 0) {
-                            self.idle_timeout_ns = @as(i64, @intCast(peer_tp.max_idle_timeout)) * 1_000_000;
+                            self.idle_timeout_ns = idleTimeoutNs(peer_tp.max_idle_timeout);
                         }
                         // else: keep local timeout (already set)
 
@@ -4665,7 +4672,7 @@ pub fn connectInto(
     conn.conn_flow_ctrl.base.send_window = config.initial_max_data;
 
     if (config.max_idle_timeout > 0) {
-        conn.idle_timeout_ns = @as(i64, @intCast(config.max_idle_timeout)) * 1_000_000;
+        conn.idle_timeout_ns = idleTimeoutNs(config.max_idle_timeout);
     }
 
     // Initialize TLS 1.3 handshake and generate ClientHello
