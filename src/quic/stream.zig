@@ -194,10 +194,11 @@ pub const FrameSorter = struct {
     pub fn push(self: *FrameSorter, offset: u64, data: []const u8, fin: bool) !void {
         if (fin) {
             const new_fin = offset + data.len;
-            // RFC 9000 §4.5: final size cannot change once known
+            // RFC 9000 §4.5: final size cannot change once known, nor fall
+            // below data already received
             if (self.fin_offset) |existing| {
                 if (existing != new_fin) return error.FinalSizeError;
-            }
+            } else if (new_fin < self.highestReceived()) return error.FinalSizeError;
             self.fin_offset = new_fin;
         }
 
@@ -2243,6 +2244,16 @@ test "FrameSorter: conflicting final size from FIN" {
     // Different FIN offset must fail
     const err = sorter.push(0, "hi", true); // would set fin_offset = 2
     try testing.expectError(error.FinalSizeError, err);
+}
+
+test "FrameSorter: a FIN below data already received is FINAL_SIZE_ERROR" {
+    // RFC 9000 4.5. Accepted, the stream delivered bytes past its end.
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+    try sorter.push(0, &([_]u8{0xab} ** 1000), false);
+    try testing.expectError(error.FinalSizeError, sorter.push(5, &.{}, true));
+    try testing.expectError(error.FinalSizeError, sorter.push(500, "x", true));
+    try sorter.push(1000, &.{}, true);
 }
 
 test "FrameSorter: data beyond final size" {
