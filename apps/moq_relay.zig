@@ -116,6 +116,11 @@ const Track = struct {
         self.subs[si] = self.subs[self.sub_count];
     }
 
+    /// Nobody publishes it and nobody wants it: the slot goes back.
+    fn reapIfIdle(self: *Track) void {
+        if (self.publisher_idx == null and self.upstream_idx == null and self.sub_count == 0) self.active = false;
+    }
+
     fn matchesNsName(self: *const Track, ns: []const u8, name: []const u8) bool {
         return std.mem.eql(u8, self.namespace_buf[0..self.namespace_len], ns) and
             std.mem.eql(u8, self.name_buf[0..self.name_len], name);
@@ -393,6 +398,7 @@ const RelayHandler = struct {
                 t.removeSub(si);
             }
             if (t.sub_count == 0 and t.upstream_idx != null and t.upstream_idx != ci) self.unsubscribeUpstream(t);
+            t.reapIfIdle();
         }
         for (&self.ns_subs) |*n| {
             if (n.active and n.client_idx == ci) n.active = false;
@@ -1019,6 +1025,7 @@ const RelayHandler = struct {
                 } else si += 1;
             }
             if (t.sub_count == 0 and t.upstream_idx != null and t.upstream_idx != ci) self.unsubscribeUpstream(t);
+            t.reapIfIdle();
         }
         for (&self.ns_subs) |*n| {
             if (n.active and n.client_idx == ci and n.stream_id == stream_id) n.active = false;
@@ -1085,7 +1092,7 @@ const RelayHandler = struct {
             t.removeSub(si);
         }
         t.dropPublisherState();
-        if (t.sub_count == 0) t.active = false;
+        t.reapIfIdle();
     }
 
     /// The namespace publisher's answer to a SUBSCRIBE the relay sent it.
@@ -1316,6 +1323,7 @@ const RelayHandler = struct {
         }
         t.sub_count = 0;
         t.dropPublisherState();
+        t.active = false;
     }
 
     fn closeClientStream(self: *RelayHandler, ci: usize, stream_id: u64) void {
@@ -1687,4 +1695,28 @@ test "an upstream subscription gives its stream slot back when it ends" {
     const finished = t.pub_stream_id.?;
     r.onStreamData(&publisher, finished, "", true);
     try std.testing.expectEqual(@as(?usize, null), r.clients[0].slotOf(finished));
+}
+
+test "a track with no publisher and no subscribers gives its slot back" {
+    // Ended publications and abandoned subscriptions kept their tracks, and
+    // the 32 slots filled for good.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    const r = tr.r;
+    const t = &r.tracks[0];
+
+    var buf: [64]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    try moq_msg.writePublishDone(&fbs, .{ .status_code = moq_codes.DONE_TRACK_ENDED, .stream_count = 0, .reason = "" });
+    var publisher = tr.session(0);
+    r.onStreamData(&publisher, 0, buf[0..fbs.seek], false);
+    try std.testing.expect(!t.active);
+
+    // Waiting on a publisher that never came, until its subscriber left.
+    t.* = .{ .active = true, .sub_count = 1 };
+    t.subs[0] = .{ .client_idx = 1, .alias = 9, .stream_id = 4 };
+    var subscriber = tr.session(1);
+    r.onStreamReset(&subscriber, 0, 4, 0);
+    try std.testing.expect(!t.active);
 }
