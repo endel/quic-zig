@@ -159,11 +159,22 @@ pub const MtuDiscoverer = struct {
         self.search_max = MAX_PLPMTU;
         self.probe_pn = null;
         self.probe_count = 0;
-        self.state = .searching;
+        // Starts over, unless it was never started (PMTUD turned off).
+        if (self.state != .disabled) self.state = .searching;
     }
 };
 
 // Tests
+
+test "reset leaves a disabled discoverer disabled" {
+    // Migration resets it; with PMTUD turned off that must not start probing.
+    var d: MtuDiscoverer = .{};
+    d.reset();
+    try std.testing.expectEqual(MtuState.disabled, d.state);
+    d.start();
+    d.reset();
+    try std.testing.expectEqual(MtuState.searching, d.state);
+}
 
 test "MtuDiscoverer: initial state" {
     const d = MtuDiscoverer{};

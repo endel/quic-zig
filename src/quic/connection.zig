@@ -1545,7 +1545,11 @@ pub const Connection = struct {
 
         // Detect connection migration (RFC 9000 Section 9)
         // Only for 1-RTT packets after handshake is confirmed, with non-probing frames
-        if (epoch == .application and self.handshake_confirmed and has_non_probing) {
+        // RFC 9000 §9.3: only the highest-numbered packet moves the path, so a
+        // reordered one from the old address does not move it back.
+        if (epoch == .application and self.handshake_confirmed and has_non_probing and
+            self.largest_pn_received == header.packet_number)
+        {
             const active_path = &self.paths[self.active_path_idx];
             if (!sockaddrEql(&info.from, &active_path.peer_addr)) {
                 std.log.info("connection migration detected from new peer address", .{});
@@ -3254,8 +3258,11 @@ pub const Connection = struct {
         // At most one probe per 5×RTT (200 ms floor), so the data it delays is
         // one datagram that rarely exists.
         self.mtu_discoverer.checkRaiseTimer(now);
-        // shouldProbe first: it is almost always false.
-        if (self.mtu_discoverer.shouldProbe(now, self.pkt_handler.rtt_stats.smoothedRttOrDefault())) {
+        // shouldProbe first: it is almost always false. A probe fills out_buf,
+        // not the amplification budget below, so an unvalidated path gets none.
+        if (self.mtu_discoverer.shouldProbe(now, self.pkt_handler.rtt_stats.smoothedRttOrDefault()) and
+            (!self.is_server or self.paths[self.active_path_idx].is_validated))
+        {
             if (self.appSeal()) |seal| {
                 const probe_size: usize = self.mtu_discoverer.nextProbeSize();
                 if (out_buf.len >= probe_size) {
@@ -6135,6 +6142,14 @@ test "a peer's close reason outlives the packet it came in" {
 /// Sets `conn` up to open 1-RTT packets under keys derived from its SCID,
 /// and seals a PING-only one to it from the peer's side.
 fn testPingToward(conn: *Connection, out: []u8) !usize {
+    var outs = [_][]u8{out};
+    var lens: [1]usize = undefined;
+    try testPingsToward(conn, &outs, &lens);
+    return lens[0];
+}
+
+/// The same for several packets, numbered in order.
+fn testPingsToward(conn: *Connection, outs: [][]u8, lens: []usize) !void {
     conn.state = .connected;
     conn.handshake_confirmed = true;
     const cid = conn.scid[0..conn.scid_len];
@@ -6153,9 +6168,11 @@ fn testPingToward(conn: *Connection, out: []u8) !usize {
     defer crypto_mgr.deinit();
     var streams = stream_mod.StreamsMap.init(std.testing.allocator, !conn.is_server);
     defer streams.deinit();
-    var pending: frame_mod.PendingFrameQueue = .{};
-    pending.push(.ping);
-    return packer.packCoalesced(out, &handler, &crypto_mgr, &streams, &pending, null, null, null, &seal, 0, null, false);
+    for (outs, lens) |out, *len| {
+        var pending: frame_mod.PendingFrameQueue = .{};
+        pending.push(.ping);
+        len.* = try packer.packCoalesced(out, &handler, &crypto_mgr, &streams, &pending, null, null, null, &seal, 0, null, false);
+    }
 }
 
 test "migration: a client drops packets from a server address it does not know" {
@@ -6202,6 +6219,38 @@ test "migration: our disable_active_migration holds, and a new port is validated
         conn.handleDatagram(buf[0..n], .{ .to = conn.paths[0].local_addr, .from = makeIpv4Addr(192, 0, 2, 7, 5001), .datagram_size = n });
         try std.testing.expect(!conn.paths[conn.active_path_idx].is_validated);
     }
+}
+
+test "migration: a reordered older packet from another address moves nothing" {
+    // RFC 9000 9.3: only the highest-numbered non-probing packet migrates.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    const client = makeIpv4Addr(192, 0, 2, 7, 5000);
+    conn.paths[0] = NetworkPath.init(makeIpv4Addr(0, 0, 0, 0, 443), client, true);
+    conn.path_initialized = true;
+    var a: [1500]u8 = undefined;
+    var b: [1500]u8 = undefined;
+    var outs = [_][]u8{ &a, &b };
+    var lens: [2]usize = undefined;
+    try testPingsToward(&conn, &outs, &lens);
+    conn.handleDatagram(b[0..lens[1]], .{ .to = conn.paths[0].local_addr, .from = client, .datagram_size = lens[1] });
+    conn.handleDatagram(a[0..lens[0]], .{ .to = conn.paths[0].local_addr, .from = makeIpv4Addr(198, 51, 100, 3, 7000), .datagram_size = lens[0] });
+    try std.testing.expect(sockaddrEql(&client, &conn.paths[conn.active_path_idx].peer_addr));
+}
+
+test "PMTUD probes wait for the path to be validated" {
+    // A probe skipped the 3x amplification budget the rest of send() obeys.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    var buf: [1500]u8 = undefined;
+    _ = try testPingToward(&conn, &buf); // installs 1-RTT keys
+    try conn.pkt_num_spaces[2].setupInitial(conn.scid[0..conn.scid_len], conn.version, true);
+    conn.path_initialized = true;
+    conn.paths[0].is_validated = false;
+    conn.paths[0].bytes_received = 100;
+    conn.mtu_discoverer.start();
+    const n = try conn.send(&buf);
+    try std.testing.expect(n <= 300);
 }
 
 test "a uni stream is reclaimed once its FIN is acked" {
