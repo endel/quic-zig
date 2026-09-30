@@ -198,6 +198,10 @@ poll loop (connection.zig:976).
 - **No Stream Cancellation bookkeeping** — the static-only encoder has
   no per-stream state, so incoming Stream Cancellation instructions are
   consumed and ignored.
+- **Encoder-stream inserts are budgeted per read**: at most 64× the bytes
+  read, plus one table. A one-byte Duplicate or name reference can copy a
+  whole entry, so past the budget the connection closes with
+  `H3_EXCESSIVE_LOAD` rather than spend a table's worth of copying per byte.
 - **Decoded slices point into the caller's scratch** (`SCRATCH_SIZE`,
   16 KiB), valid until the next decode into it. The event loop shares one
   per loop across its connections, so headers are valid only during the

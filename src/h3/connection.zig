@@ -1564,6 +1564,8 @@ pub const H3Connection = struct {
                         self.qpack_decoder.processEncoderInstruction(data) catch |err| {
                             if (err == error.CapacityExceeded) {
                                 self.closeWithError(.qpack_encoder_stream_error, "QPACK encoder stream error");
+                            } else if (err == error.ExcessiveLoad) {
+                                self.closeWithError(.excessive_load, "QPACK encoder stream inserts too much");
                             } else {
                                 self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
                             }

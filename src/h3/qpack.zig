@@ -556,6 +556,8 @@ pub const SCRATCH_SIZE = 16384;
 pub const QpackDecoder = struct {
     dynamic: DynamicTable = .{},
     max_capacity: usize = 0,
+    /// Bytes the current read's inserts may still copy into the table.
+    insert_budget: usize = 0,
     instruction_buf: [4096]u8 = undefined,
     instruction_len: usize = 0,
     /// An encoder-stream instruction cut off at the end of the last read.
@@ -710,7 +712,18 @@ pub const QpackDecoder = struct {
     /// Process encoder instructions from the encoder stream, as they arrive:
     /// an instruction split across reads is held until the rest comes.
     pub fn processEncoderInstruction(self: *QpackDecoder, data: []const u8) !void {
+        // A one-byte Duplicate or name reference can copy a whole entry, so
+        // a read may insert only in proportion to its size, plus one table
+        // for an instruction it completes.
+        self.insert_budget = data.len *| 64 + DynamicTable.MAX_CAPACITY;
         return self.pending.feed(data, self, processEncoderInstructions);
+    }
+
+    fn insert(self: *QpackDecoder, name: []const u8, value: []const u8) !void {
+        const n = name.len + value.len;
+        if (n > self.insert_budget) return error.ExcessiveLoad;
+        self.insert_budget -= n;
+        try self.dynamic.insert(name, value);
     }
 
     /// Apply every complete instruction in `data`; returns the bytes they
@@ -752,7 +765,7 @@ pub const QpackDecoder = struct {
                 const entry = self.dynamic.getRelative(self.dynamic.insert_count, name_idx) orelse return error.InvalidIndex;
                 name = entry.name;
             }
-            try self.dynamic.insert(name, value);
+            try self.insert(name, value);
         } else if (first & 0xc0 == 0x40) {
             // Insert with Literal Name: 01HXXXXX
             const is_name_huffman = (first & 0x20) != 0;
@@ -767,12 +780,12 @@ pub const QpackDecoder = struct {
                 try stashString(raw_name, true, scratch, scratch_pos)
             else
                 raw_name;
-            try self.dynamic.insert(name, value);
+            try self.insert(name, value);
         } else if (first & 0xe0 == 0x00) {
             // Duplicate: 000XXXXX — 5-bit relative index (RFC 9204 4.3.4)
             const idx = try decodeInteger(data, pos_ptr, 5);
             const entry = self.dynamic.getRelative(self.dynamic.insert_count, idx) orelse return error.InvalidIndex;
-            try self.dynamic.insert(entry.name, entry.value);
+            try self.insert(entry.name, entry.value);
         } else {
             // Set Dynamic Table Capacity: 001XXXXX — 5-bit capacity
             const cap = try decodeInteger(data, pos_ptr, 5);
@@ -1620,6 +1633,31 @@ test "QpackDecoder: Required Insert Count wraps at the advertised capacity, not 
     // RIC 9 encodes as 9 % (2 * 128) + 1; Base 9, relative 0 = the ninth insert.
     try testing.expectEqual(@as(usize, 1), try decoder.decode(&[_]u8{ 0x0a, 0x00, 0x80 }, &out, &test_scratch, 0));
     try testing.expectEqualStrings("i", out[0].name);
+}
+
+test "QpackDecoder: one-byte Duplicates can't each cost a table's worth of copying" {
+    // A Duplicate of a near-capacity entry copied it whole, so a thousand
+    // bytes of encoder stream bought megabytes of memcpy.
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    try decoder.processEncoderInstruction(&set_capacity_4096);
+    var big: [4000]u8 = undefined;
+    var pos: usize = 0;
+    big[0] = 0x41;
+    big[1] = 'n';
+    pos = 2;
+    try encodeInteger(&big, &pos, 3900, 7, 0);
+    @memset(big[pos..][0..3900], 'v');
+    try decoder.processEncoderInstruction(big[0 .. pos + 3900]);
+
+    const dups: [1000]u8 = @splat(0x00);
+    try testing.expectError(error.ExcessiveLoad, decoder.processEncoderInstruction(&dups));
+    // A few, as an encoder refreshing entries sends them, are fine.
+    var d2 = QpackDecoder{};
+    d2.setCapacity(4096);
+    try d2.processEncoderInstruction(&set_capacity_4096);
+    try d2.processEncoderInstruction(big[0 .. pos + 3900]);
+    try d2.processEncoderInstruction(dups[0..1]);
 }
 
 test "QpackDecoder: a prefix without its Delta Base byte is rejected" {
