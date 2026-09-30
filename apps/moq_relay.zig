@@ -224,6 +224,10 @@ const Client = struct {
     stream_bufs: [MAX_STREAMS_PER_CLIENT]StreamBuf = [_]StreamBuf{.{}} ** MAX_STREAMS_PER_CLIENT,
     fwd_states: [MAX_STREAMS_PER_CLIENT]FwdState = [_]FwdState{.{}} ** MAX_STREAMS_PER_CLIENT,
 
+    fn slotOf(self: *const Client, sid: u64) ?usize {
+        return std.mem.indexOfScalar(u64, &self.stream_ids, sid);
+    }
+
     fn findOrAddSlot(self: *Client, sid: u64) ?usize {
         for (self.stream_ids[0..], 0..) |id, i| {
             if (id == sid) return i;
@@ -964,12 +968,28 @@ const RelayHandler = struct {
 
     /// The peer cancelled a request by resetting its stream: an announcement,
     /// a subscription, or a namespace subscription it no longer wants.
-    pub fn onStreamReset(self: *RelayHandler, session: *event_loop.Session, _: u64, stream_id: u64, _: u32) void {
+    pub fn onStreamReset(self: *RelayHandler, session: *event_loop.Session, _: u64, stream_id: u64, code: u32) void {
         const ci = for (&self.clients, 0..) |*c, i| {
             if (c.active and c.entry == session.entry) break i;
         } else return;
+        self.abandonForward(ci, stream_id, code);
         self.requestWithdrawn(ci, stream_id);
         self.clients[ci].clearSlot(stream_id);
+    }
+
+    /// A publisher's data stream reset mid-group: reset what it fed, and
+    /// drop the part-built group rather than cache it.
+    fn abandonForward(self: *RelayHandler, ci: usize, stream_id: u64, code: u64) void {
+        const c = &self.clients[ci];
+        const slot = c.slotOf(stream_id) orelse return;
+        if (c.stream_roles[slot] != .data) return;
+        const fs = &c.fwd_states[slot];
+        for (fs.out_stream_ids[0..fs.out_count], fs.out_sub_idx[0..fs.out_count]) |out, sub_ci| {
+            var l = self.link(sub_ci) orelse continue;
+            l.reset(out, code);
+        }
+        fs.out_count = 0;
+        if (fs.track_idx) |ti| self.tracks[ti].live.reset();
     }
 
     fn requestWithdrawn(self: *RelayHandler, ci: usize, stream_id: u64) void {
@@ -981,6 +1001,16 @@ const RelayHandler = struct {
         }
         for (self.tracks[0..self.track_count]) |*t| {
             if (!t.active) continue;
+            // Its PUBLISH, or the publisher's answer to our SUBSCRIBE: the
+            // publication is over for everyone it served.
+            if (t.pub_stream_id == stream_id and (t.publisher_idx == ci or t.upstream_idx == ci)) {
+                if (t.upstream_pending) {
+                    self.failWaitingSubs(t, moq_codes.ERR_INTERNAL_ERROR, "publisher gone");
+                } else {
+                    self.endPublication(t, moq_codes.DONE_TRACK_ENDED, "publisher gone");
+                }
+                continue;
+            }
             var si: usize = 0;
             while (si < t.sub_count) {
                 if (t.subs[si].client_idx == ci and t.subs[si].stream_id == stream_id) {
@@ -1482,4 +1512,107 @@ test "a subscriber leaving takes its outputs with it" {
     try std.testing.expectEqual(@as(usize, 1), fs.out_count);
     try std.testing.expectEqual(@as(usize, 2), fs.out_sub_idx[0]);
     try std.testing.expectEqual(@as(u64, 11), fs.out_stream_ids[0]);
+}
+
+/// A connection with nothing on the wire: enough for a native-QUIC client's
+/// link to open, write, finish and reset streams.
+fn testConn() !*connection_mod.Connection {
+    const C = connection_mod.Connection;
+    const alloc = std.testing.allocator;
+    const cid = [_]u8{1} ** 20;
+    const conn = try alloc.create(C);
+    conn.* = .{
+        .allocator = alloc,
+        .is_server = true,
+        .dcid = cid,
+        .dcid_len = 8,
+        .scid = cid,
+        .scid_len = 8,
+        .version = 1,
+        .pkt_handler = @FieldType(C, "pkt_handler").init(alloc),
+        .conn_flow_ctrl = @FieldType(C, "conn_flow_ctrl").init(1 << 20, 6 << 20),
+        .streams = @FieldType(C, "streams").init(alloc, true),
+        .crypto_streams = @FieldType(C, "crypto_streams").init(alloc),
+        .packer = @FieldType(C, "packer").init(alloc, true, cid[0..8], cid[0..8], 1),
+    };
+    conn.streams.setMaxStreams(100, 100);
+    conn.streams.setMaxIncomingStreams(100, 100);
+    conn.streams.peer_initial_max_stream_data_uni = 1 << 20;
+    conn.streams.peer_initial_max_stream_data_bidi_local = 1 << 20;
+    conn.streams.peer_initial_max_stream_data_bidi_remote = 1 << 20;
+    conn.conn_flow_ctrl.base.send_window = 1 << 20;
+    return conn;
+}
+
+/// Native-QUIC client 0 publishes track 0 under alias 5 from its request
+/// stream 0; client 1 subscribes to it from its request stream 4.
+const TestRelay = struct {
+    r: *RelayHandler,
+    conns: [2]*connection_mod.Connection,
+    entries: [2]cm.ConnEntry,
+
+    fn init(self: *TestRelay) !void {
+        self.r = try std.testing.allocator.create(RelayHandler);
+        self.r.* = .{};
+        for (0..2) |i| {
+            self.conns[i] = try testConn();
+            self.entries[i] = .{ .conn = self.conns[i] };
+            self.r.clients[i] = .{ .active = true, .entry = &self.entries[i], .raw = true };
+        }
+        _ = try self.conns[1].streams.getOrCreateStream(4);
+        const t = &self.r.tracks[0];
+        t.* = .{ .active = true, .publisher_idx = 0, .pub_alias = 5, .pub_stream_id = 0, .sub_count = 1 };
+        t.subs[0] = .{ .client_idx = 1, .alias = 9, .stream_id = 4 };
+        self.r.track_count = 1;
+        self.r.clients[0].setRole(0, .request);
+        self.r.clients[1].setRole(4, .request);
+    }
+
+    fn deinit(self: *TestRelay) void {
+        for (self.conns) |c| {
+            c.deinit();
+            std.testing.allocator.destroy(c);
+        }
+        std.testing.allocator.destroy(self.r);
+    }
+
+    fn session(self: *TestRelay, i: usize) event_loop.Session {
+        return .{ .entry = &self.entries[i] };
+    }
+
+    /// Opens a group on the publisher's uni stream `sid`, with one object.
+    fn openGroup(self: *TestRelay, sid: u64) !void {
+        var buf: [64]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&buf);
+        try moq_obj.writeSubgroupHeader(&fbs, .{
+            .track_alias = 5,
+            .group = 1,
+            .subgroup = 0,
+            .publisher_priority = 128,
+            .end_of_group = false,
+            .per_object_properties = false,
+        }, .draft_17);
+        try fbs.writeAll("object");
+        var s = self.session(0);
+        self.r.onStreamData(&s, sid, buf[0..fbs.seek], false);
+    }
+};
+
+test "a publisher's reset reaches its subscribers" {
+    // Its streams were forgotten, not reset, so subscribers waited on a
+    // group, or a publication, that would never finish.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    var publisher = tr.session(0);
+
+    try tr.openGroup(2);
+    const out = tr.conns[1].streams.send_streams.get(3) orelse return error.NoOutput;
+    tr.r.onStreamReset(&publisher, 0, 2, 7);
+    try std.testing.expectEqual(@as(?u64, 7), out.reset_err);
+
+    // Withdrawing the PUBLISH ends the publication for its subscribers.
+    tr.r.onStreamReset(&publisher, 0, 0, 0);
+    try std.testing.expectEqual(@as(usize, 0), tr.r.tracks[0].sub_count);
+    try std.testing.expect(tr.conns[1].streams.getStream(4).?.send.fin_queued);
 }
