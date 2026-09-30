@@ -90,10 +90,13 @@ pub const ConnEntry = struct {
     // For raw QUIC protocol: track streams whose fin has been delivered to handler
     finished_streams: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
 
-    // Track which CIDs are registered in the routing map for this connection.
-    // Max 8 from LocalCidPool + 1 initial client DCID = 9.
-    registered_cids: [9]CidKey = .{CidKey{}} ** 9,
+    /// The connection's own CIDs this entry holds in the routing map: at most
+    /// one per LocalCidPool slot.
+    registered_cids: [connection.LocalCidPool.MAX_POOL_SIZE]CidKey = @splat(.{}),
     registered_cid_count: u8 = 0,
+    /// The DCID the client chose for its first Initial, which it keeps using
+    /// until it learns ours. Not in LocalCidPool.
+    initial_dcid: CidKey = .{},
 
     // Keys this connection holds in `reset_token_map`, one per peer CID.
     reset_keys: [8]ResetKey = undefined,
@@ -111,7 +114,7 @@ pub const ConnEntry = struct {
     }
 
     fn addRegisteredCid(self: *ConnEntry, key: CidKey) void {
-        if (self.registered_cid_count < 9) {
+        if (self.registered_cid_count < self.registered_cids.len) {
             self.registered_cids[self.registered_cid_count] = key;
             self.registered_cid_count += 1;
         }
@@ -434,7 +437,7 @@ pub const ConnectionManager = struct {
         // Also register the client's initial DCID so retransmitted Initials route correctly
         const client_dcid_key = CidKey.fromSlice(header.dcid);
         try self.cid_map.put(client_dcid_key, entry);
-        entry.addRegisteredCid(client_dcid_key);
+        entry.initial_dcid = client_dcid_key;
 
         self.entries.appendAssumeCapacity(entry);
 
@@ -442,30 +445,53 @@ pub const ConnectionManager = struct {
     }
 
     /// Synchronize the CID routing map with the connection's LocalCidPool.
-    /// Registers new CIDs and unregisters retired ones.
+    ///
+    /// The pool can hand a retired CID's slot to its replacement before this
+    /// runs, so what the entry registered is checked against the pool's active
+    /// CIDs rather than read off the pool's retired flags.
     pub fn syncCids(self: *ConnectionManager, entry: *ConnEntry) void {
         const pool = &entry.conn.local_cid_pool;
 
-        for (&pool.entries) |*cid_entry| {
-            const key = CidKey.fromSlice(cid_entry.cid_buf[0..cid_entry.cid_len]);
-            if (key.len == 0) continue;
-
-            if (cid_entry.occupied and !cid_entry.retired) {
-                // Active CID — register if not already present
-                if (!entry.hasRegisteredCid(key)) {
-                    self.cid_map.put(key, entry) catch {};
-                    entry.addRegisteredCid(key);
-                }
-            } else if (cid_entry.retired) {
-                // Retired CID — unregister if present
-                if (entry.hasRegisteredCid(key)) {
-                    _ = self.cid_map.remove(key);
-                    entry.removeRegisteredCid(key);
-                    self.noteRemovals(1);
-                }
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < entry.registered_cid_count) {
+            const key = entry.registered_cids[i];
+            if (poolHasActive(pool, key)) {
+                i += 1;
+                continue;
             }
+            self.unrouteCid(key, entry);
+            entry.removeRegisteredCid(key);
+            removed += 1;
         }
+
+        for (&pool.entries) |*cid_entry| {
+            if (!cid_entry.occupied or cid_entry.retired or cid_entry.cid_len == 0) continue;
+            const key = CidKey.fromSlice(cid_entry.getCid());
+            if (entry.hasRegisteredCid(key)) continue;
+            // Untracked, a map entry would outlive the connection.
+            if (entry.registered_cid_count == entry.registered_cids.len) break;
+            const slot = self.cid_map.getOrPut(key) catch continue;
+            if (slot.found_existing and slot.value_ptr.* != entry) continue; // another connection's
+            slot.value_ptr.* = entry;
+            entry.addRegisteredCid(key);
+        }
+        self.noteRemovals(removed);
         self.syncResetTokens(entry);
+    }
+
+    fn poolHasActive(pool: *const connection.LocalCidPool, key: CidKey) bool {
+        for (&pool.entries) |*c| {
+            if (c.occupied and !c.retired and std.mem.eql(u8, c.getCid(), key.getSlice())) return true;
+        }
+        return false;
+    }
+
+    /// Removes `key` from routing only while it still routes to `entry`.
+    fn unrouteCid(self: *ConnectionManager, key: CidKey, entry: *ConnEntry) void {
+        if (self.cid_map.get(key)) |owner| {
+            if (owner == entry) _ = self.cid_map.remove(key);
+        }
     }
 
     /// Remove a terminated connection. Invalidates the entry immediately
@@ -474,10 +500,9 @@ pub const ConnectionManager = struct {
     /// of accessing freed memory.
     pub fn removeConnection(self: *ConnectionManager, entry: *ConnEntry) void {
         // Unregister all CIDs from the routing map
-        for (entry.registered_cids[0..entry.registered_cid_count]) |key| {
-            _ = self.cid_map.remove(key);
-        }
-        self.noteRemovals(entry.registered_cid_count);
+        for (entry.registered_cids[0..entry.registered_cid_count]) |key| self.unrouteCid(key, entry);
+        if (entry.initial_dcid.len > 0) self.unrouteCid(entry.initial_dcid, entry);
+        self.noteRemovals(entry.registered_cid_count + 1);
         self.dropResetKeys(entry);
 
         // Detach the transport layers so stale Session pointers are safe:
@@ -935,6 +960,38 @@ test "connections coming and going leave the CID map free slots to stop a lookup
     // Tombstones never give their slot back on their own: without the
     // rehash, a map this churned has none free.
     try std.testing.expect(free >= m.capacity() - m.count() - m.capacity() / 4);
+}
+
+test "a CID the peer retires stops routing, and none outlive the connection" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    const local = std.mem.zeroes(posix.sockaddr.storage);
+    const dcid = [_]u8{0x11} ** 8;
+    const scid = [_]u8{0xaa} ** 8;
+    const e = try mgr.acceptConnection(.{
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .packet_type = .initial,
+        .dcid = &dcid,
+        .scid = &scid,
+    }, local, local, null, null);
+
+    // Each retirement frees a pool slot, and its replacement takes that slot
+    // within the same recv(), before the manager syncs.
+    for (0..12) |seq| {
+        var old: CidKey = undefined;
+        for (&e.conn.local_cid_pool.entries) |*c| {
+            if (c.occupied and c.seq_num == seq) old = CidKey.fromSlice(c.cid_buf[0..c.cid_len]);
+        }
+        try e.conn.processFrame(&.{ .retire_connection_id = .{ .seq_num = seq } }, .application, 0);
+        mgr.syncCids(e);
+        try std.testing.expect(mgr.findByDcid(old.getSlice()) == null);
+        try std.testing.expect(mgr.findByDcid(&dcid) == e);
+    }
+
+    mgr.removeConnection(e);
+    mgr.freeDeadEntries();
+    try std.testing.expectEqual(@as(usize, 0), mgr.cid_map.count());
 }
 
 fn testManager(alloc: Allocator) ConnectionManager {

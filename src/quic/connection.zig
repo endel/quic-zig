@@ -229,7 +229,7 @@ pub const LocalCidEntry = struct {
 /// Pool of locally-issued connection IDs (RFC 9000 §5.1).
 /// Seq 0 = initial SCID. New CIDs issued via issueNewCid().
 pub const LocalCidPool = struct {
-    const MAX_POOL_SIZE: usize = 8;
+    pub const MAX_POOL_SIZE: usize = 8;
 
     entries: [MAX_POOL_SIZE]LocalCidEntry = .{LocalCidEntry{}} ** MAX_POOL_SIZE,
     next_seq_num: u64 = 1,
