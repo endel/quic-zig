@@ -102,6 +102,9 @@ const Track = struct {
     /// SUBSCRIBE sent upstream, no answer yet.
     upstream_pending: bool = false,
     active: bool = false,
+    /// Moves on whenever the slot's publication changes, reuse included: a
+    /// data stream feeds the cache only while the one it began in stands.
+    gen: u32 = 0,
     subs: [MAX_SUBS_PER_TRACK]Sub = [_]Sub{.{}} ** MAX_SUBS_PER_TRACK,
     sub_count: usize = 0,
 
@@ -133,6 +136,7 @@ const Track = struct {
     // already ended. moq-rs's test client catches this as
     // `publish-track-subscribe` receiving `publish-track-only`'s payload.
     fn dropPublisherState(self: *Track) void {
+        self.gen +%= 1;
         self.publisher_idx = null;
         self.pub_alias = 0;
         self.pub_stream_id = null;
@@ -299,6 +303,7 @@ const FwdState = struct {
     header_parsed: bool = false,
     forwarded_pos: usize = 0, // byte offset in publisher stream (after subgroup header)
     track_idx: ?usize = null,
+    track_gen: u32 = 0,
     out_stream_ids: [MAX_SUBS_PER_TRACK]u64 = [_]u64{0} ** MAX_SUBS_PER_TRACK,
     out_sub_idx: [MAX_SUBS_PER_TRACK]usize = [_]usize{0} ** MAX_SUBS_PER_TRACK,
     out_count: usize = 0,
@@ -941,7 +946,7 @@ const RelayHandler = struct {
             break :blk self.track_count - 1;
         };
         const t = &self.tracks[idx];
-        t.* = .{ .active = true };
+        t.* = .{ .active = true, .gen = t.gen +% 1 };
         @memcpy(t.namespace_buf[0..ns_key.len], ns_key);
         t.namespace_len = ns_key.len;
         @memcpy(t.name_buf[0..name.len], name);
@@ -996,7 +1001,17 @@ const RelayHandler = struct {
             l.reset(out, code);
         }
         fs.out_count = 0;
-        if (fs.track_idx) |ti| self.tracks[ti].live.reset();
+        if (self.fwdTrack(fs)) |t| t.live.reset();
+    }
+
+    /// The track a data stream feeds, while it still carries the publication
+    /// the stream began in.
+    fn fwdTrack(self: *RelayHandler, fs: *FwdState) ?*Track {
+        const ti = fs.track_idx orelse return null;
+        const t = &self.tracks[ti];
+        if (t.active and t.gen == fs.track_gen) return t;
+        fs.track_idx = null;
+        return null;
     }
 
     fn requestWithdrawn(self: *RelayHandler, ci: usize, stream_id: u64) void {
@@ -1353,6 +1368,7 @@ const RelayHandler = struct {
             const ti = track_idx orelse return;
             const t = &self.tracks[ti];
             fs.track_idx = ti;
+            fs.track_gen = t.gen;
 
             // Initialize the live cache for this group on the track.
             t.live.reset();
@@ -1395,8 +1411,7 @@ const RelayHandler = struct {
         if (fs.forwarded_pos < buf.len) {
             const chunk = buf.slice()[fs.forwarded_pos..];
             // Append to live cache (so late subscribers can catch up later).
-            if (fs.track_idx) |ti_cap| {
-                const t = &self.tracks[ti_cap];
+            if (self.fwdTrack(fs)) |t| {
                 const free = t.live.payload.len - t.live.payload_len;
                 const copy_n = @min(chunk.len, free);
                 if (copy_n > 0) {
@@ -1422,12 +1437,11 @@ const RelayHandler = struct {
                 var l = self.link(sub_ci) orelse continue;
                 l.finish(fs.out_stream_ids[i]);
             }
-            if (fs.track_idx) |ti_cap| {
-                const t = &self.tracks[ti_cap];
+            if (self.fwdTrack(fs)) |t| {
                 if (t.live.payload_len > 0) {
                     t.cacheGroup(&t.live);
                     std.debug.print("[relay] cached group {d} for track {d} ({d} bytes)\n", .{
-                        t.live.hdr.group, ti_cap, t.live.payload_len,
+                        t.live.hdr.group, fs.track_idx.?, t.live.payload_len,
                     });
                 }
                 t.live.reset();
@@ -1719,4 +1733,26 @@ test "a track with no publisher and no subscribers gives its slot back" {
     var subscriber = tr.session(1);
     r.onStreamReset(&subscriber, 0, 4, 0);
     try std.testing.expect(!t.active);
+}
+
+test "a group outliving its track caches nothing into the track that took the slot" {
+    // A data stream kept the index it resolved at its header, so bytes sent
+    // after the publication ended were cached, and replayed, as whichever
+    // track reused the slot.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    const r = tr.r;
+    var publisher = tr.session(0);
+
+    try tr.openGroup(2);
+    var buf: [64]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    try moq_msg.writePublishDone(&fbs, .{ .status_code = moq_codes.DONE_TRACK_ENDED, .stream_count = 1, .reason = "" });
+    r.onStreamData(&publisher, 0, buf[0..fbs.seek], false);
+    try std.testing.expectEqual(@as(?usize, 0), r.allocTrack("other", "track"));
+
+    r.onStreamData(&publisher, 2, "late bytes", true);
+    for (r.tracks[0].cached) |g| try std.testing.expect(!g.valid);
+    try std.testing.expectEqual(@as(usize, 0), r.tracks[0].live.payload_len);
 }
