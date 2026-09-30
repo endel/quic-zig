@@ -37,6 +37,8 @@ const track = @import("track.zig");
 const version = @import("version.zig");
 
 pub const MAX_STREAMS: usize = 32;
+/// Events one read produces at most; each gets its own namespace buffer.
+pub const MAX_EVENTS: usize = 16;
 pub const STREAM_BUF_SIZE: usize = 16 * 1024;
 
 const NO_STREAM: u64 = std.math.maxInt(u64);
@@ -129,9 +131,9 @@ pub fn Session(comptime Transport: type) type {
 
         streams: [MAX_STREAMS]StreamState = [_]StreamState{.{}} ** MAX_STREAMS,
 
-        // Namespace tuples decoded out of incoming messages alias this, so
-        // it lives as long as the session rather than as long as a call.
-        ns_buf: msg.NamespaceBuf = undefined,
+        // Namespace tuples decoded out of incoming messages alias these, one
+        // per event of a read, so they outlive the call that decoded them.
+        ns_bufs: [MAX_EVENTS]msg.NamespaceBuf = undefined,
         kv_buf: [16]wire.KvEntry = undefined,
 
         pub fn init(transport: Transport) Self {
@@ -154,8 +156,10 @@ pub fn Session(comptime Transport: type) type {
             return null;
         }
 
+        /// Frees the slot at the next call: this read's events still point
+        /// into its buffer.
         fn release(self: *Self, id: u64) void {
-            if (self.slot(id)) |s| s.* = .{};
+            if (self.slot(id)) |s| s.release_pending = true;
         }
 
         pub fn kindOf(self: *Self, id: u64) ?StreamKind {
@@ -230,10 +234,10 @@ pub fn Session(comptime Transport: type) type {
                 // improve by waiting for more bytes.
                 if (s.len == s.buf.len) return Error.StreamStalled;
 
-                while (n < out.len) {
+                while (n < @min(out.len, MAX_EVENTS)) {
                     const parsed = msg.parseEnvelope(s.buf[s.parsed..s.len]) catch break;
                     s.parsed += parsed.consumed;
-                    const ev = self.classify(stream_id, s, parsed.env) catch continue;
+                    const ev = self.classify(stream_id, s, parsed.env, &self.ns_bufs[n]) catch continue;
                     if (ev) |e| {
                         out[n] = e;
                         n += 1;
@@ -264,7 +268,7 @@ pub fn Session(comptime Transport: type) type {
             }
         }
 
-        fn classify(self: *Self, stream_id: u64, s: *StreamState, env: msg.Envelope) !?Event {
+        fn classify(self: *Self, stream_id: u64, s: *StreamState, env: msg.Envelope, ns_buf: *msg.NamespaceBuf) !?Event {
             // A SETUP arriving on a stream we have not classified marks it
             // as the peer's control stream.
             if (env.type == codes.MSG_SETUP) {
@@ -285,7 +289,7 @@ pub fn Session(comptime Transport: type) type {
                 } },
                 codes.MSG_SUBSCRIBE => Event{ .subscribe = .{
                     .stream_id = stream_id,
-                    .subscribe = try msg.decodeSubscribe(env.payload, &self.ns_buf, self.draft),
+                    .subscribe = try msg.decodeSubscribe(env.payload, ns_buf, self.draft),
                 } },
                 codes.MSG_SUBSCRIBE_OK => Event{ .subscribe_ok = .{
                     .stream_id = stream_id,
@@ -293,11 +297,11 @@ pub fn Session(comptime Transport: type) type {
                 } },
                 codes.MSG_PUBLISH => Event{ .publish = .{
                     .stream_id = stream_id,
-                    .publish = try msg.decodePublish(env.payload, &self.ns_buf, self.draft),
+                    .publish = try msg.decodePublish(env.payload, ns_buf, self.draft),
                 } },
                 codes.MSG_NAMESPACE => Event{ .namespace = .{
                     .stream_id = stream_id,
-                    .namespace = try msg.decodeNamespace(env.payload, &self.ns_buf),
+                    .namespace = try msg.decodeNamespace(env.payload, ns_buf),
                 } },
                 codes.MSG_NAMESPACE_DONE => Event{ .namespace_done = .{ .stream_id = stream_id } },
                 codes.MSG_GOAWAY => Event{ .goaway = .{
@@ -531,6 +535,29 @@ test "namespaces decoded from an event outlive the call" {
     try testing.expectEqual(@as(usize, 2), got.len);
     try testing.expectEqualStrings("moq-test", got[0]);
     try testing.expectEqualStrings("interop", got[1]);
+}
+
+test "coalesced namespaces each keep their own, even past a cancel" {
+    // All of a read's namespaces shared one buffer, and cancelling a request
+    // from an event handler wiped the stream the rest were read from.
+    var t = FakeTransport{};
+    var s = TestSession.init(&t);
+    const sid = try s.sendRequest("");
+
+    var buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try msg.writeNamespace(&fbs, .{ .track_namespace_suffix = &.{ "alice", "cam" } });
+    try msg.writeNamespace(&fbs, .{ .track_namespace_suffix = &.{"bob"} });
+
+    var events: [4]Event = undefined;
+    const n = try s.onStreamData(sid, buf[0..fbs.seek], false, &events);
+    try testing.expectEqual(@as(usize, 2), n);
+    s.cancelRequest(sid, 0);
+    const first = events[0].namespace.namespace.track_namespace_suffix;
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expectEqualStrings("alice", first[0]);
+    try testing.expectEqualStrings("cam", first[1]);
+    try testing.expectEqualStrings("bob", events[1].namespace.namespace.track_namespace_suffix[0]);
 }
 
 test "a stream that never yields a message is not buffered forever" {
