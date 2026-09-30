@@ -283,6 +283,10 @@ pub const TransportParams = struct {
         var params = TransportParams{};
         var fbs = io.fixedBufferStream(data);
         const reader = &fbs;
+        // RFC 9000 §7.4: each parameter we know at most once. Their IDs are
+        // 0x00-0x11 and 0x20, bar min_ack_delay's.
+        var seen = std.StaticBitSet(0x21).initEmpty();
+        var seen_min_ack_delay = false;
 
         while (fbs.seek < data.len) {
             const param_id = try packet.readVarInt(reader);
@@ -291,116 +295,93 @@ pub const TransportParams = struct {
             const param_len = packet.readVarIntUsize(reader) catch
                 return error.TransportParameterError;
             if (param_len > data.len - fbs.seek) return error.TransportParameterError;
-            const param_start = fbs.seek;
+            // Each value is read from its own bytes and must fill them.
+            const value = data[fbs.seek..][0..param_len];
+            fbs.seek += param_len;
 
-            switch (param_id) {
-                @intFromEnum(ParamId.original_destination_connection_id) => {
-                    params.original_destination_connection_id = try readCid(data[fbs.seek..][0..param_len]);
-                    fbs.seek += param_len;
-                },
-                @intFromEnum(ParamId.max_idle_timeout) => {
-                    params.max_idle_timeout = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.stateless_reset_token) => {
-                    if (param_len != 16) return error.TransportParameterError;
-                    var token: [16]u8 = undefined;
-                    _ = try reader.readSliceShort(&token);
-                    params.stateless_reset_token = token;
-                },
-                @intFromEnum(ParamId.max_udp_payload_size) => {
-                    params.max_udp_payload_size = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.initial_max_data) => {
-                    params.initial_max_data = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.initial_max_stream_data_bidi_local) => {
-                    params.initial_max_stream_data_bidi_local = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.initial_max_stream_data_bidi_remote) => {
-                    params.initial_max_stream_data_bidi_remote = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.initial_max_stream_data_uni) => {
-                    params.initial_max_stream_data_uni = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.initial_max_streams_bidi) => {
-                    params.initial_max_streams_bidi = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.initial_max_streams_uni) => {
-                    params.initial_max_streams_uni = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.ack_delay_exponent) => {
-                    params.ack_delay_exponent = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.max_ack_delay) => {
-                    params.max_ack_delay = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.disable_active_migration) => {
-                    params.disable_active_migration = true;
-                },
-                @intFromEnum(ParamId.preferred_address) => {
-                    // IPv4 addr (4) + port (2) + IPv6 addr (16) + port (2) + CID len (1) + CID + reset token (16)
-                    var pref = PreferredAddress{};
-                    _ = try reader.readSliceShort(&pref.ipv4_addr);
-                    var ipv4_port_bytes: [2]u8 = undefined;
-                    _ = try reader.readSliceShort(&ipv4_port_bytes);
-                    pref.ipv4_port = std.mem.readInt(u16, &ipv4_port_bytes, .big);
-                    _ = try reader.readSliceShort(&pref.ipv6_addr);
-                    var ipv6_port_bytes: [2]u8 = undefined;
-                    _ = try reader.readSliceShort(&ipv6_port_bytes);
-                    pref.ipv6_port = std.mem.readInt(u16, &ipv6_port_bytes, .big);
-                    pref.cid_len = try reader.takeByte();
-                    if (pref.cid_len > 20) return error.TransportParameterError;
-                    _ = try reader.readSliceShort(pref.cid_buf[0..pref.cid_len]);
-                    _ = try reader.readSliceShort(&pref.stateless_reset_token);
-                    params.preferred_address = pref;
-                },
-                @intFromEnum(ParamId.active_connection_id_limit) => {
-                    params.active_connection_id_limit = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.initial_source_connection_id) => {
-                    params.initial_source_connection_id = try readCid(data[fbs.seek..][0..param_len]);
-                    fbs.seek += param_len;
-                },
-                @intFromEnum(ParamId.retry_source_connection_id) => {
-                    params.retry_source_connection_id = try readCid(data[fbs.seek..][0..param_len]);
-                    fbs.seek += param_len;
-                },
-                @intFromEnum(ParamId.max_datagram_frame_size) => {
-                    params.max_datagram_frame_size = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.min_ack_delay) => {
-                    params.min_ack_delay = try packet.readVarInt(reader);
-                },
-                @intFromEnum(ParamId.version_information) => {
-                    if (param_len < 4 or (param_len % 4) != 0) {
-                        fbs.seek = param_start + param_len;
-                    } else {
-                        params.version_info_chosen = try reader.takeInt(u32, .big);
-                        const avail_count = (param_len - 4) / 4;
-                        const n: u8 = @intCast(@min(avail_count, 8));
-                        for (0..n) |i| {
-                            params.version_info_available[i] = try reader.takeInt(u32, .big);
-                        }
-                        params.version_info_available_count = n;
-                        // Skip any extra versions beyond our buffer
-                        if (avail_count > 8) {
-                            fbs.seek = param_start + param_len;
-                        }
-                    }
-                },
-                else => {
-                    // Unknown parameter - skip
-                    fbs.seek = param_start + param_len;
-                },
+            if (param_id == @intFromEnum(ParamId.min_ack_delay)) {
+                if (seen_min_ack_delay) return error.TransportParameterError;
+                seen_min_ack_delay = true;
+            } else if (param_id <= @intFromEnum(ParamId.version_information) or
+                param_id == @intFromEnum(ParamId.max_datagram_frame_size))
+            {
+                if (seen.isSet(@intCast(param_id))) return error.TransportParameterError;
+                seen.set(@intCast(param_id));
             }
 
-            // Ensure we consumed exactly param_len bytes
-            if (fbs.seek != param_start + param_len) {
-                fbs.seek = param_start + param_len;
+            switch (param_id) {
+                @intFromEnum(ParamId.original_destination_connection_id) => params.original_destination_connection_id = try readCid(value),
+                @intFromEnum(ParamId.max_idle_timeout) => params.max_idle_timeout = try readVarIntParam(value),
+                @intFromEnum(ParamId.stateless_reset_token) => {
+                    if (value.len != 16) return error.TransportParameterError;
+                    params.stateless_reset_token = value[0..16].*;
+                },
+                @intFromEnum(ParamId.max_udp_payload_size) => {
+                    params.max_udp_payload_size = try readVarIntParam(value);
+                    if (params.max_udp_payload_size < 1200) return error.TransportParameterError;
+                },
+                @intFromEnum(ParamId.initial_max_data) => params.initial_max_data = try readVarIntParam(value),
+                @intFromEnum(ParamId.initial_max_stream_data_bidi_local) => params.initial_max_stream_data_bidi_local = try readVarIntParam(value),
+                @intFromEnum(ParamId.initial_max_stream_data_bidi_remote) => params.initial_max_stream_data_bidi_remote = try readVarIntParam(value),
+                @intFromEnum(ParamId.initial_max_stream_data_uni) => params.initial_max_stream_data_uni = try readVarIntParam(value),
+                @intFromEnum(ParamId.initial_max_streams_bidi) => params.initial_max_streams_bidi = try readVarIntParam(value),
+                @intFromEnum(ParamId.initial_max_streams_uni) => params.initial_max_streams_uni = try readVarIntParam(value),
+                @intFromEnum(ParamId.ack_delay_exponent) => params.ack_delay_exponent = try readVarIntParam(value),
+                @intFromEnum(ParamId.max_ack_delay) => params.max_ack_delay = try readVarIntParam(value),
+                @intFromEnum(ParamId.disable_active_migration) => {
+                    if (value.len != 0) return error.TransportParameterError;
+                    params.disable_active_migration = true;
+                },
+                @intFromEnum(ParamId.preferred_address) => params.preferred_address = try readPreferredAddress(value),
+                @intFromEnum(ParamId.active_connection_id_limit) => {
+                    params.active_connection_id_limit = try readVarIntParam(value);
+                    if (params.active_connection_id_limit < 2) return error.TransportParameterError;
+                },
+                @intFromEnum(ParamId.initial_source_connection_id) => params.initial_source_connection_id = try readCid(value),
+                @intFromEnum(ParamId.retry_source_connection_id) => params.retry_source_connection_id = try readCid(value),
+                @intFromEnum(ParamId.max_datagram_frame_size) => params.max_datagram_frame_size = try readVarIntParam(value),
+                @intFromEnum(ParamId.min_ack_delay) => params.min_ack_delay = try readVarIntParam(value),
+                @intFromEnum(ParamId.version_information) => {
+                    // A malformed one is skipped, as before; up to 8 versions kept.
+                    if (value.len >= 4 and value.len % 4 == 0) {
+                        params.version_info_chosen = std.mem.readInt(u32, value[0..4], .big);
+                        const n: u8 = @intCast(@min((value.len - 4) / 4, 8));
+                        for (0..n) |i| {
+                            params.version_info_available[i] = std.mem.readInt(u32, value[4 + 4 * i ..][0..4], .big);
+                        }
+                        params.version_info_available_count = n;
+                    }
+                },
+                else => {}, // unknown parameters are ignored (§7.4.2)
             }
         }
 
         return params;
+    }
+
+    /// A varint parameter's value must be exactly one varint.
+    fn readVarIntParam(value: []const u8) error{TransportParameterError}!u64 {
+        var v = io.fixedBufferStream(value);
+        const n = packet.readVarInt(&v) catch return error.TransportParameterError;
+        if (v.seek != value.len) return error.TransportParameterError;
+        return n;
+    }
+
+    /// IPv4 addr (4) + port (2) + IPv6 addr (16) + port (2) + CID len (1) +
+    /// CID + reset token (16). RFC 9000 §18.2: the CID is not empty.
+    fn readPreferredAddress(value: []const u8) error{TransportParameterError}!PreferredAddress {
+        if (value.len < 25) return error.TransportParameterError;
+        var pref = PreferredAddress{};
+        pref.ipv4_addr = value[0..4].*;
+        pref.ipv4_port = std.mem.readInt(u16, value[4..6], .big);
+        pref.ipv6_addr = value[6..22].*;
+        pref.ipv6_port = std.mem.readInt(u16, value[22..24], .big);
+        pref.cid_len = value[24];
+        if (pref.cid_len == 0 or pref.cid_len > 20 or value.len != 25 + @as(usize, pref.cid_len) + 16)
+            return error.TransportParameterError;
+        @memcpy(pref.cid_buf[0..pref.cid_len], value[25..][0..pref.cid_len]);
+        pref.stateless_reset_token = value[25 + @as(usize, pref.cid_len) ..][0..16].*;
+        return pref;
     }
 };
 
@@ -577,6 +558,20 @@ test "TransportParams: decoded connection IDs outlive the bytes they came from" 
     try std.testing.expectEqualSlices(u8, &odcid, decoded.original_destination_connection_id.?.slice());
     try std.testing.expectEqualSlices(u8, &odcid, decoded.initial_source_connection_id.?.slice());
     try std.testing.expectEqualSlices(u8, &odcid, decoded.retry_source_connection_id.?.slice());
+}
+
+test "TransportParams: values RFC 9000 18.2 rules out are TRANSPORT_PARAMETER_ERROR" {
+    const bad = [_][]const u8{
+        &.{ 0x01, 0x01, 0x0a, 0x01, 0x01, 0x0b }, // max_idle_timeout twice
+        &.{ 0x0e, 0x01, 0x01 }, // active_connection_id_limit 1
+        &.{ 0x03, 0x02, 0x44, 0x00 }, // max_udp_payload_size 1024
+        &.{ 0x0c, 0x01, 0x00 }, // disable_active_migration with a value
+        &.{ 0x04, 0x02, 0x05, 0x00 }, // a varint shorter than its length
+        &.{ 0x04, 0x01, 0x40, 0x10 }, // a varint longer than its length
+        &.{ 0x0d, 41, 0, 0, 0, 0, 0x11, 0x51, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x51, 0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa }, // preferred_address with no CID
+    };
+    for (bad) |b| try testing.expectError(error.TransportParameterError, TransportParams.decode(b));
+    _ = try TransportParams.decode(&.{ 0x0e, 0x01, 0x02, 0x0c, 0x00, 0x03, 0x02, 0x44, 0xb0 });
 }
 
 test "TransportParams: greasing roundtrip" {
