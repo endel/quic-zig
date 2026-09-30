@@ -49,7 +49,8 @@ pub const QlogWriter = struct {
         @memcpy(path_buf[pos..][0..suffix.len], suffix);
         pos += suffix.len;
 
-        const file = sys.createFile(path_buf[0..pos]) catch return null;
+        // Named after an ODCID the client chose: never someone else's file.
+        const file = sys.createFileNew(path_buf[0..pos]) catch return null;
         const now: i64 = sys.nanoTimestamp();
 
         var self = Self{
@@ -351,6 +352,32 @@ pub fn packetTypeStr(pkt_type: packet.PacketType) []const u8 {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
+
+test "a trace never opens a file that is already there" {
+    // Named after the ODCID the client chose: another client picking the
+    // same one truncated its trace, and a symlink planted there was followed.
+    var dir_buf: [64]u8 = undefined;
+    var rnd: [4]u8 = undefined;
+    sys.randomBytes(&rnd);
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/quic-zig-qlog-{x}", .{rnd});
+    try sys.makeDir(dir);
+    const odcid = [_]u8{ 0xab, 0xcd };
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/abcd_server.sqlog", .{dir});
+    const existing = try sys.createFile(path);
+    try existing.writeAll("keep");
+    existing.close();
+
+    try std.testing.expect(QlogWriter.init(dir, &odcid, true) == null);
+    const kept = try sys.readFileAlloc(std.testing.allocator, path, 64);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings("keep", kept);
+
+    path_buf[path.len] = 0;
+    _ = std.c.unlink(path_buf[0..path.len :0]);
+    dir_buf[dir.len] = 0;
+    _ = std.c.rmdir(dir_buf[0..dir.len :0]);
+}
 
 test "QlogWriter.serializeFrame - ping" {
     var buf: [256]u8 = undefined;

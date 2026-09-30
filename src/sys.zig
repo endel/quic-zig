@@ -716,6 +716,16 @@ pub fn openFileRead(path: []const u8) OpenError!File {
 /// Create/truncate a file for writing (mode 0644 on POSIX). Replaces
 /// the `std.fs.cwd().createFile(path, .{})` pattern.
 pub fn createFile(path: []const u8) OpenError!File {
+    return openForWrite(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true });
+}
+
+/// Create a file that must not exist yet: `error.PathAlreadyExists` if
+/// anything is there, a symlink included (O_EXCL does not follow one).
+pub fn createFileNew(path: []const u8) OpenError!File {
+    return openForWrite(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true });
+}
+
+fn openForWrite(path: []const u8, flags: posix.O) OpenError!File {
     switch (builtin.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.createFile: Windows support pending"),
@@ -723,7 +733,6 @@ pub fn createFile(path: []const u8) OpenError!File {
     }
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = try pathZ(path, &path_buf);
-    const flags: posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
     const rc = c.open(z.ptr, flags, @as(posix.mode_t, 0o644));
     switch (posix.errno(rc)) {
         .SUCCESS => return .{ .fd = @intCast(rc) },

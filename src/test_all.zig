@@ -47,6 +47,7 @@ test {
     _ = @import("moq/lite/message.zig");
     _ = @import("moq/lite/version.zig");
     _ = @import("moq/lite/session.zig");
+    _ = @import("quic/qlog.zig");
     _ = @import("h0/connection.zig");
     _ = @import("event_loop.zig");
 }
