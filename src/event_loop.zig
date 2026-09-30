@@ -1525,54 +1525,16 @@ pub fn Server(comptime Handler: type) type {
         }
 
         fn initProtocol(self: *Self, entry: *ConnEntry) void {
-            if (serves_raw_quic and !std.mem.eql(u8, entry.conn.negotiatedAlpn(), "h3")) {
-                entry.raw_quic = true;
-            } else switch (Handler.protocol) {
-                .webtransport => {
-                    const h3c = self.allocator.create(h3.H3Connection) catch return;
-                    h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
-                    h3c.qpack_scratch = &self.qpack_scratch;
-                    h3c.local_settings = .{
-                        .enable_connect_protocol = true,
-                        .h3_datagram = true,
-                        .enable_webtransport = self.wt_settings.legacy,
-                        .webtransport_max_sessions = if (self.wt_settings.legacy) self.wt_settings.max_sessions else null,
-                        .wt_max_sessions_v13 = self.wt_settings.max_sessions,
-                        .wt_initial_max_data = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_data),
-                        .wt_initial_max_streams_bidi = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_bidi),
-                        .wt_initial_max_streams_uni = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_uni),
-                    };
-                    entry.h3_conn = h3c;
-                    h3c.initConnection() catch return;
-
-                    const wtc = self.allocator.create(wt.WebTransportConnection) catch return;
-                    wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, entry.conn, true);
-                    wtc.grants = self.wt_settings.credits;
-                    entry.wt_conn = wtc;
-
-                    // Install zero-copy datagram callback on the QUIC connection.
-                    // Datagrams will be delivered directly during packet processing,
-                    // bypassing the recv ring buffer entirely.
-                    if (@hasDecl(Handler, "onDatagram")) {
-                        entry.conn.datagram_recv_callback = datagramRecvCallback;
-                        entry.conn.datagram_recv_ctx = @ptrCast(entry);
-                        entry.datagram_handler_ctx = @ptrCast(self.handler);
-                    }
-                },
-                .h3 => {
-                    const h3c = self.allocator.create(h3.H3Connection) catch return;
-                    h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
-                    h3c.qpack_scratch = &self.qpack_scratch;
-                    entry.h3_conn = h3c;
-                    h3c.initConnection() catch return;
-                },
-                .h0 => {
-                    const h0c = self.allocator.create(h0.H0Connection) catch return;
-                    h0c.* = h0.H0Connection.init(self.allocator, entry.conn, true);
-                    entry.h0_conn = h0c;
-                },
-                .quic => {},
-            }
+            self.buildLayers(entry) catch |err| {
+                // Left half-built, the next pass would build another over it.
+                connection_manager.destroyProtocols(self.allocator, entry.wt_conn, entry.h3_conn, entry.h0_conn);
+                entry.wt_conn = null;
+                entry.h3_conn = null;
+                entry.h0_conn = null;
+                const code: h3.H3Error = if (err == error.StreamLimitError) .general_protocol_error else .internal_error;
+                entry.conn.close(@intFromEnum(code), "protocol setup failed");
+                return;
+            };
 
             entry.wake_fn = wakeFromEntry;
             entry.repoll_fn = repollFromEntry;
@@ -1591,6 +1553,61 @@ pub fn Server(comptime Handler: type) type {
                 } else {
                     entry.conn.close(0, "server shutdown");
                 }
+            }
+        }
+
+        /// A layer is the entry's as soon as it is built, so a failure part
+        /// way leaves the caller everything to free.
+        fn buildLayers(self: *Self, entry: *ConnEntry) !void {
+            if (serves_raw_quic and !std.mem.eql(u8, entry.conn.negotiatedAlpn(), "h3")) {
+                entry.raw_quic = true;
+                return;
+            }
+            switch (Handler.protocol) {
+                .webtransport => {
+                    const h3c = try self.allocator.create(h3.H3Connection);
+                    h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
+                    entry.h3_conn = h3c;
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.local_settings = .{
+                        .enable_connect_protocol = true,
+                        .h3_datagram = true,
+                        .enable_webtransport = self.wt_settings.legacy,
+                        .webtransport_max_sessions = if (self.wt_settings.legacy) self.wt_settings.max_sessions else null,
+                        .wt_max_sessions_v13 = self.wt_settings.max_sessions,
+                        .wt_initial_max_data = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_data),
+                        .wt_initial_max_streams_bidi = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_bidi),
+                        .wt_initial_max_streams_uni = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_uni),
+                    };
+                    try h3c.initConnection();
+
+                    const wtc = try self.allocator.create(wt.WebTransportConnection);
+                    wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, entry.conn, true);
+                    wtc.grants = self.wt_settings.credits;
+                    entry.wt_conn = wtc;
+
+                    // Install zero-copy datagram callback on the QUIC connection.
+                    // Datagrams will be delivered directly during packet processing,
+                    // bypassing the recv ring buffer entirely.
+                    if (@hasDecl(Handler, "onDatagram")) {
+                        entry.conn.datagram_recv_callback = datagramRecvCallback;
+                        entry.conn.datagram_recv_ctx = @ptrCast(entry);
+                        entry.datagram_handler_ctx = @ptrCast(self.handler);
+                    }
+                },
+                .h3 => {
+                    const h3c = try self.allocator.create(h3.H3Connection);
+                    h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
+                    entry.h3_conn = h3c;
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    try h3c.initConnection();
+                },
+                .h0 => {
+                    const h0c = try self.allocator.create(h0.H0Connection);
+                    h0c.* = h0.H0Connection.init(self.allocator, entry.conn, true);
+                    entry.h0_conn = h0c;
+                },
+                .quic => {},
             }
         }
 
@@ -2981,7 +2998,7 @@ pub fn Client(comptime Handler: type) type {
             if (conn.isEstablished() and !self.protocol_initialized) {
                 self.initProtocol();
 
-                if (@hasDecl(Handler, "onConnected")) {
+                if (self.protocol_initialized and @hasDecl(Handler, "onConnected")) {
                     var session = self.makeSession();
                     self.handler.onConnected(&session);
                 }
@@ -3008,10 +3025,26 @@ pub fn Client(comptime Handler: type) type {
         }
 
         fn initProtocol(self: *Self) void {
+            self.buildLayers() catch |err| {
+                // Left half-built, the next pass would build another over it.
+                connection_manager.destroyProtocols(self.allocator, self.wt_conn, self.h3_conn, null);
+                self.wt_conn = null;
+                self.h3_conn = null;
+                const code: h3.H3Error = if (err == error.StreamLimitError) .general_protocol_error else .internal_error;
+                self.conn.close(@intFromEnum(code), "protocol setup failed");
+                return;
+            };
+            self.protocol_initialized = true;
+        }
+
+        /// A layer is the client's as soon as it is built, so a failure part
+        /// way leaves the caller everything to free.
+        fn buildLayers(self: *Self) !void {
             switch (Handler.protocol) {
                 .webtransport => {
-                    const h3c = self.allocator.create(h3.H3Connection) catch return;
+                    const h3c = try self.allocator.create(h3.H3Connection);
                     h3c.* = h3.H3Connection.init(self.allocator, self.conn, false);
+                    self.h3_conn = h3c;
                     h3c.qpack_scratch = &self.qpack_scratch;
                     h3c.local_settings = .{
                         .enable_connect_protocol = true,
@@ -3028,32 +3061,29 @@ pub fn Client(comptime Handler: type) type {
                         .wt_initial_max_streams_bidi = announced(self.wt_advertise_credits, self.wt_credits.max_streams_bidi),
                         .wt_initial_max_streams_uni = announced(self.wt_advertise_credits, self.wt_credits.max_streams_uni),
                     };
-                    self.h3_conn = h3c;
-                    h3c.initConnection() catch return;
+                    try h3c.initConnection();
 
-                    const wtc = self.allocator.create(wt.WebTransportConnection) catch return;
+                    const wtc = try self.allocator.create(wt.WebTransportConnection);
                     wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, self.conn, false);
                     wtc.grants = self.wt_credits;
                     self.wt_conn = wtc;
 
                     // Send Extended CONNECT to establish WebTransport session
-                    const session_id = wtc.connectWithHeaders(
+                    self.session_id = try wtc.connectWithHeaders(
                         self.server_name,
                         self.path,
                         self.connect_headers,
-                    ) catch return;
-                    self.session_id = session_id;
+                    );
                 },
                 .h3 => {
-                    const h3c = self.allocator.create(h3.H3Connection) catch return;
+                    const h3c = try self.allocator.create(h3.H3Connection);
                     h3c.* = h3.H3Connection.init(self.allocator, self.conn, false);
-                    h3c.qpack_scratch = &self.qpack_scratch;
                     self.h3_conn = h3c;
-                    h3c.initConnection() catch return;
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    try h3c.initConnection();
                 },
                 .quic, .h0 => {},
             }
-            self.protocol_initialized = true;
         }
 
         fn pollWtEvents(self: *Self) void {
@@ -4080,6 +4110,30 @@ const StallingServer = struct {
         return self.cancelled_stream != null;
     }
 };
+
+test "e2e: a client allowing no uni streams is closed, not given a new H3 layer every pass" {
+    // HTTP/3 needs three uni streams (RFC 9114 6.2); a peer granting fewer
+    // left the server rebuilding its H3 layer on every loop pass.
+    const Closed = struct {
+        fn done(c: *Client(CheckingClient)) bool {
+            return switch (c.conn.state) {
+                .closing, .draining, .terminated => true,
+                else => false,
+            };
+        }
+    };
+    const none: connection.ConnectionConfig = .{ .initial_max_streams_uni = 0 };
+    for ([_][2]?connection.ConnectionConfig{ .{ null, none }, .{ none, null } }, [_]u16{ 29438, 29439 }) |configs, port| {
+        var server_handler = TestH3Handler{};
+        var client_handler = CheckingClient{};
+        var e2e: E2e(TestH3Handler, CheckingClient) = undefined;
+        try e2e.initWith(port, &server_handler, &client_handler, configs[0], configs[1]);
+        defer e2e.deinit();
+
+        try runUntil(&e2e.loop, &e2e.client, Closed.done, 3000);
+        try testing.expectEqual(@as(u32, 0), server_handler.request_count);
+    }
+}
 
 test "e2e: a client abandoning a response reaches onRequestCancelled" {
     var client_handler = CheckingClient{ .cancel_on_headers = true };
