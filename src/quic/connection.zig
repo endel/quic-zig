@@ -2006,8 +2006,11 @@ pub const Connection = struct {
             },
 
             .reset_stream => |rs| {
-                // RFC 9000 §19.4: RESET_STREAM on a send-only stream is STREAM_STATE_ERROR
-                if (stream_mod.isLocal(rs.stream_id, self.is_server) and !stream_mod.isBidi(rs.stream_id)) {
+                // RFC 9000 §19.4: RESET_STREAM on a send-only stream, or on one of
+                // ours not yet opened, is STREAM_STATE_ERROR
+                if (stream_mod.isLocal(rs.stream_id, self.is_server) and
+                    (!stream_mod.isBidi(rs.stream_id) or self.streams.localNeverOpened(rs.stream_id)))
+                {
                     self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM on send-only stream");
                     return error.ProtocolViolation;
                 }
@@ -2093,6 +2096,10 @@ pub const Connection = struct {
                 // RFC 9000 §19.7: server MUST NOT send NEW_TOKEN; client receiving it is valid
                 if (self.is_server) {
                     self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.new_token), "server received NEW_TOKEN");
+                    return error.ProtocolViolation;
+                }
+                if (token.len == 0) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), @intFromEnum(FrameType.new_token), "empty NEW_TOKEN");
                     return error.ProtocolViolation;
                 }
                 if (token.len <= self.new_token_buf.len) {
@@ -2393,6 +2400,7 @@ pub const Connection = struct {
             },
 
             .datagram => |d| {
+                try self.checkDatagramAllowed(d.data.len);
                 if (self.datagrams_enabled) {
                     if (self.datagram_recv_callback) |cb| {
                         cb(d.data, self.datagram_recv_ctx);
@@ -2405,6 +2413,7 @@ pub const Connection = struct {
             },
 
             .datagram_with_length => |d| {
+                try self.checkDatagramAllowed(d.data.len);
                 if (self.datagrams_enabled) {
                     if (self.datagram_recv_callback) |cb| {
                         cb(d.data, self.datagram_recv_ctx);
@@ -2443,6 +2452,16 @@ pub const Connection = struct {
                 // draft-ietf-quic-ack-frequency: force immediate ACK
                 self.pkt_handler.recv[2].triggerImmediateAck();
             },
+        }
+    }
+
+    /// RFC 9221 §3: a DATAGRAM we never advertised support for, or larger than
+    /// we advertised, is PROTOCOL_VIOLATION.
+    fn checkDatagramAllowed(self: *Connection, len: usize) error{ProtocolViolation}!void {
+        const max = self.local_params.max_datagram_frame_size orelse 0;
+        if (max == 0 or len > max) {
+            self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.datagram), "DATAGRAM not advertised or too large");
+            return error.ProtocolViolation;
         }
     }
 
@@ -6103,6 +6122,7 @@ test "0-RTT: a replayed packet is processed once" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     conn.datagrams_enabled = true;
+    conn.local_params.max_datagram_frame_size = 1200;
     const cid = conn.scid[0..conn.scid_len];
     const server_keys = try quic_crypto.deriveInitialKeyMaterial(cid, conn.version, true);
     const client_keys = try quic_crypto.deriveInitialKeyMaterial(cid, conn.version, false);
@@ -6454,6 +6474,33 @@ test "CRYPTO data past the ClientHello at the Initial level is PROTOCOL_VIOLATIO
     try conn.processFrame(&.{ .crypto = .{ .offset = 0, .data = data[0 .. hello.len + fake.len] } }, .initial, 0);
     try conn.advanceHandshake();
     try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+}
+
+test "frames the RFCs rule out: an empty NEW_TOKEN, an unadvertised DATAGRAM, a reset of a stream never opened" {
+    {
+        // RFC 9000 19.7.
+        const conn = try std.testing.allocator.create(Connection);
+        defer std.testing.allocator.destroy(conn);
+        try connectInto(conn, std.testing.allocator, "example.com", .{}, null, null);
+        defer conn.deinit();
+        try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_token = &.{} }, .application, 0));
+        try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.frame_encoding_error)), conn.local_err.?.code);
+    }
+    {
+        // RFC 9221 3: we never advertised max_datagram_frame_size.
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        var d = "hi".*;
+        try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .datagram_with_length = .{ .data = &d } }, .application, 0));
+        try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+    }
+    {
+        // RFC 9000 19.4: stream 1 is ours (server-initiated bidi) and unopened.
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .reset_stream = .{ .stream_id = 1, .error_code = 0, .final_size = 0 } }, .application, 0));
+        try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.stream_state_error)), conn.local_err.?.code);
+    }
 }
 
 test "a uni stream is reclaimed once its FIN is acked" {
