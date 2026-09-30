@@ -138,60 +138,6 @@ pub const BaseFlowController = struct {
     }
 };
 
-/// Stream-level flow controller.
-pub const StreamFlowController = struct {
-    base: BaseFlowController,
-    connection: *ConnectionFlowController,
-
-    pub fn init(
-        receive_window: u64,
-        max_receive_window: u64,
-        connection: *ConnectionFlowController,
-    ) StreamFlowController {
-        return .{
-            .base = BaseFlowController.init(receive_window, max_receive_window),
-            .connection = connection,
-        };
-    }
-
-    pub fn updateSendWindow(self: *StreamFlowController, new_window: u64) void {
-        self.base.updateSendWindow(new_window);
-    }
-
-    /// Returns the number of bytes available to send (minimum of stream and connection window).
-    pub fn sendWindowSize(self: *const StreamFlowController) u64 {
-        return @min(
-            self.base.sendWindowSize(),
-            self.connection.base.sendWindowSize(),
-        );
-    }
-
-    pub fn addBytesSent(self: *StreamFlowController, n: u64) void {
-        self.base.addBytesSent(n);
-        self.connection.base.addBytesSent(n);
-    }
-
-    pub fn addBytesReceived(self: *StreamFlowController, offset: u64) !void {
-        try self.base.addBytesReceived(offset);
-        try self.connection.base.addBytesReceived(
-            self.connection.base.highest_received + (offset - self.base.highest_received),
-        );
-    }
-
-    pub fn addBytesRead(self: *StreamFlowController, n: u64) void {
-        self.base.addBytesRead(n);
-        self.connection.addBytesRead(n);
-    }
-
-    pub fn getWindowUpdate(self: *StreamFlowController, rtt_stats: *const RttStats) ?u64 {
-        return self.base.getWindowUpdate(rtt_stats);
-    }
-
-    pub fn isBlocked(self: *const StreamFlowController) bool {
-        return self.base.isBlocked() or self.connection.base.isBlocked();
-    }
-};
-
 /// Connection-level flow controller.
 pub const ConnectionFlowController = struct {
     base: BaseFlowController,
@@ -273,17 +219,6 @@ test "ConnectionFlowController: basic" {
     try testing.expect(!cfc.isBlocked());
 }
 
-test "StreamFlowController: limited by connection" {
-    var cfc = ConnectionFlowController.init(10000, MAX_RECEIVE_WINDOW);
-    cfc.base.send_window = 500; // Connection window is 500
-
-    var sfc = StreamFlowController.init(10000, MAX_RECEIVE_WINDOW, &cfc);
-    sfc.base.send_window = 2000; // Stream window is 2000
-
-    // Should be limited by connection window
-    try testing.expectEqual(@as(u64, 500), sfc.sendWindowSize());
-}
-
 test "BaseFlowController: shouldSendBlocked emits once per blocked limit" {
     var fc = BaseFlowController.init(1000, MAX_RECEIVE_WINDOW);
     fc.send_window = 100;
@@ -312,33 +247,6 @@ test "BaseFlowController: updateSendWindow ignores smaller values" {
     // Larger window should be accepted
     fc.updateSendWindow(8000);
     try testing.expectEqual(@as(u64, 8000), fc.send_window);
-}
-
-test "StreamFlowController: addBytesSent updates both stream and connection" {
-    var cfc = ConnectionFlowController.init(10000, MAX_RECEIVE_WINDOW);
-    cfc.base.send_window = 10000;
-
-    var sfc = StreamFlowController.init(10000, MAX_RECEIVE_WINDOW, &cfc);
-    sfc.base.send_window = 10000;
-
-    sfc.addBytesSent(500);
-    try testing.expectEqual(@as(u64, 500), sfc.base.bytes_sent);
-    try testing.expectEqual(@as(u64, 500), cfc.base.bytes_sent);
-}
-
-test "StreamFlowController: isBlocked when either is blocked" {
-    var cfc = ConnectionFlowController.init(10000, MAX_RECEIVE_WINDOW);
-    cfc.base.send_window = 1000;
-
-    var sfc = StreamFlowController.init(10000, MAX_RECEIVE_WINDOW, &cfc);
-    sfc.base.send_window = 5000;
-
-    // Neither blocked initially
-    try testing.expect(!sfc.isBlocked());
-
-    // Block at connection level
-    cfc.base.addBytesSent(1000);
-    try testing.expect(sfc.isBlocked());
 }
 
 test "BaseFlowController: auto-tuning doubles window" {
