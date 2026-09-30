@@ -571,7 +571,8 @@ const RelayHandler = struct {
         // Reclaim slot when stream is done — data streams close after each object.
         if (fin) {
             const r = self.clients[ci].getRole(stream_id);
-            if (r == .data or r == .unknown) self.clients[ci].clearSlot(stream_id);
+            if (r == .upstream) self.upstreamFinished(ci, stream_id);
+            if (r == .data or r == .unknown or r == .upstream) self.clients[ci].clearSlot(stream_id);
         }
     }
 
@@ -1111,20 +1112,49 @@ const RelayHandler = struct {
                     } else |e| {
                         std.debug.print("[relay] undecodable upstream SUBSCRIBE_OK client={d}: {t}\n", .{ ci, e });
                         self.failWaitingSubs(tr, moq_codes.ERR_INTERNAL_ERROR, "publisher answer undecodable");
+                        return self.endUpstream(ci, stream_id);
                     }
                 },
                 moq_codes.MSG_REQUEST_ERROR => {
                     const e = moq_msg.decodeRequestError(parsed.env.payload) catch moq_msg.RequestError{ .error_code = moq_codes.ERR_INTERNAL_ERROR, .reason = "" };
                     std.debug.print("[relay] REQUEST_ERROR ← publisher client {d} code={d}\n", .{ ci, e.error_code });
                     self.failWaitingSubs(tr, e.error_code, e.reason);
+                    return self.endUpstream(ci, stream_id);
                 },
-                moq_codes.MSG_PUBLISH_DONE => self.handlePublishDone(ci, stream_id, parsed.env.payload),
+                moq_codes.MSG_PUBLISH_DONE => {
+                    if (tr.upstream_pending) {
+                        self.failWaitingSubs(tr, moq_codes.ERR_INTERNAL_ERROR, "publisher gave no answer");
+                    } else {
+                        self.handlePublishDone(ci, stream_id, parsed.env.payload);
+                    }
+                    return self.endUpstream(ci, stream_id);
+                },
                 else => std.debug.print("[relay] upstream client {d} type=0x{x}\n", .{ ci, parsed.env.type }),
             };
 
             const remaining = buf.slice()[parsed.consumed..];
             std.mem.copyForwards(u8, &buf.data, remaining);
             buf.len = remaining.len;
+        }
+    }
+
+    /// Nothing more comes on an upstream SUBSCRIBE's stream: close our half
+    /// and free its slot, buffer included.
+    fn endUpstream(self: *RelayHandler, ci: usize, stream_id: u64) void {
+        if (self.link(ci)) |l_| {
+            var l = l_;
+            l.finish(stream_id);
+        }
+        self.clients[ci].clearSlot(stream_id);
+    }
+
+    /// The publisher finished the stream our SUBSCRIBE went out on; if it
+    /// never answered, it won't.
+    fn upstreamFinished(self: *RelayHandler, ci: usize, stream_id: u64) void {
+        for (self.tracks[0..self.track_count]) |*t| {
+            if (t.active and t.upstream_pending and t.upstream_idx == ci and t.pub_stream_id == stream_id) {
+                self.failWaitingSubs(t, moq_codes.ERR_INTERNAL_ERROR, "publisher gave no answer");
+            }
         }
     }
 
@@ -1615,4 +1645,46 @@ test "a publisher's reset reaches its subscribers" {
     tr.r.onStreamReset(&publisher, 0, 0, 0);
     try std.testing.expectEqual(@as(usize, 0), tr.r.tracks[0].sub_count);
     try std.testing.expect(tr.conns[1].streams.getStream(4).?.send.fin_queued);
+}
+
+test "an upstream subscription gives its stream slot back when it ends" {
+    // Refused, done or finished, the relay's SUBSCRIBE to a namespace's
+    // publisher kept its slot, and 64 of them used the publisher up.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    const r = tr.r;
+    var publisher = tr.session(0);
+    const t = &r.tracks[0];
+    var buf: [256]u8 = undefined;
+
+    // Refused.
+    t.dropPublisherState();
+    t.subs[0].answered = false;
+    try std.testing.expect(r.subscribeUpstream(t, 0));
+    const refused = t.pub_stream_id.?;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    try moq_msg.writeRequestError(&fbs, .{ .error_code = moq_codes.ERR_DOES_NOT_EXIST, .reason = "" });
+    r.onStreamData(&publisher, refused, buf[0..fbs.seek], false);
+    try std.testing.expectEqual(@as(?usize, null), r.clients[0].slotOf(refused));
+    try std.testing.expect(tr.conns[0].streams.getStream(refused).?.send.fin_queued);
+
+    // Answered, then done.
+    t.* = .{ .active = true, .sub_count = 1 };
+    t.subs[0] = .{ .client_idx = 1, .alias = 9, .stream_id = 4, .answered = false };
+    try std.testing.expect(r.subscribeUpstream(t, 0));
+    const done = t.pub_stream_id.?;
+    fbs = io_compat.fixedBufferStream(&buf);
+    try moq_msg.writeSubscribeOk(&fbs, .{ .track_alias = 5 });
+    try moq_msg.writePublishDone(&fbs, .{ .status_code = moq_codes.DONE_TRACK_ENDED, .stream_count = 0, .reason = "" });
+    r.onStreamData(&publisher, done, buf[0..fbs.seek], false);
+    try std.testing.expectEqual(@as(?usize, null), r.clients[0].slotOf(done));
+
+    // Finished by the publisher with nothing more to say.
+    t.* = .{ .active = true, .sub_count = 1 };
+    t.subs[0] = .{ .client_idx = 1, .alias = 9, .stream_id = 4, .answered = false };
+    try std.testing.expect(r.subscribeUpstream(t, 0));
+    const finished = t.pub_stream_id.?;
+    r.onStreamData(&publisher, finished, "", true);
+    try std.testing.expectEqual(@as(?usize, null), r.clients[0].slotOf(finished));
 }
