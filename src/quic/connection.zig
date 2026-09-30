@@ -4087,6 +4087,22 @@ pub const Connection = struct {
         return ss.write_offset -| ss.send_offset;
     }
 
+    /// `streamBufferedBytes` over every stream: what a peer that withholds
+    /// flow control has us holding.
+    pub fn sendBufferedBytes(self: *const Connection) u64 {
+        var total: u64 = 0;
+        var bidi = self.streams.streams.valueIterator();
+        while (bidi.next()) |s| total += unsentBytes(&s.*.send);
+        var uni = self.streams.send_streams.valueIterator();
+        while (uni.next()) |ss| total += unsentBytes(ss.*);
+        return total;
+    }
+
+    fn unsentBytes(ss: *const stream_mod.SendStream) u64 {
+        if (ss.reset_err != null) return 0;
+        return ss.write_offset -| ss.send_offset;
+    }
+
     pub fn isDatagramSendQueueFull(self: *const Connection) bool {
         return self.datagram_send_queue.isFull();
     }

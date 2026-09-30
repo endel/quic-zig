@@ -25,6 +25,7 @@ const moq_msg = quic.moq.message;
 const moq_codes = quic.moq.message_codes;
 const moq_obj = quic.moq.object;
 const moq_version = quic.moq.version;
+const relay_test = @import("relay_test.zig");
 
 pub const std_options: std.Options = .{ .log_level = .err };
 
@@ -43,6 +44,12 @@ const DUMP_HEAD_BYTES: usize = 48; // of an undecodable message, for the log
 const STREAM_BUF_SIZE: usize = 65_536; // VP8 keyframes typically ≤ 16 KB
 const N_CACHED_GROUPS: usize = 2; // number of completed groups retained per track
 const CACHE_GROUP_SIZE: usize = 256 * 1024; // 256 KB of object payload per group
+/// Unsent bytes on one output stream past which its subscriber is too far
+/// behind to go on queueing for (§9.3.3): it loses the subscription.
+const MAX_OUT_BACKLOG: usize = 1024 * 1024;
+/// Unsent bytes on a subscriber's connection past which it is replayed no
+/// cached groups on top.
+const MAX_SUB_BACKLOG: usize = 4 * 1024 * 1024;
 
 /// `upstream`: a SUBSCRIBE the relay sent a namespace's publisher, whose
 /// answer comes back on the same stream.
@@ -1238,6 +1245,58 @@ const RelayHandler = struct {
         }
     }
 
+    /// §9.3.3: a subscriber too slow for the relay to go on queueing for
+    /// loses its subscriptions to `t`, rather than have its backlog held.
+    fn dropSlowSubscriber(self: *RelayHandler, t: *Track, sub_ci: usize) void {
+        const status = moq_version.Rules.of(self.clients[sub_ci].draft).done_too_far_behind;
+        var si: usize = 0;
+        while (si < t.sub_count) {
+            const sub = t.subs[si];
+            if (sub.client_idx != sub_ci) {
+                si += 1;
+                continue;
+            }
+            var buf: [256]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&buf);
+            if (moq_msg.writePublishDone(&fbs, .{
+                .status_code = status,
+                .stream_count = sub.streams,
+                .reason = "too far behind",
+            })) |_| {
+                self.sendToClient(sub_ci, sub.stream_id, buf[0..fbs.seek]);
+                self.closeClientStream(sub_ci, sub.stream_id);
+            } else |_| {}
+            t.removeSub(si);
+        }
+        std.debug.print("[relay] client {d} too far behind; subscription dropped\n", .{sub_ci});
+        for (&self.clients) |*c| {
+            if (!c.active) continue;
+            for (&c.fwd_states) |*fs| {
+                const ti = fs.track_idx orelse continue;
+                if (&self.tracks[ti] == t) self.resetOutputs(fs, sub_ci);
+            }
+        }
+        if (t.sub_count == 0 and t.upstream_idx != null) self.unsubscribeUpstream(t);
+        t.reapIfIdle();
+    }
+
+    fn resetOutputs(self: *RelayHandler, fs: *FwdState, sub_ci: usize) void {
+        var i: usize = 0;
+        while (i < fs.out_count) {
+            if (fs.out_sub_idx[i] != sub_ci) {
+                i += 1;
+                continue;
+            }
+            if (self.link(sub_ci)) |l_| {
+                var l = l_;
+                l.reset(fs.out_stream_ids[i], moq_codes.STREAM_RESET_TOO_FAR_BEHIND);
+            }
+            fs.out_count -= 1;
+            fs.out_sub_idx[i] = fs.out_sub_idx[fs.out_count];
+            fs.out_stream_ids[i] = fs.out_stream_ids[fs.out_count];
+        }
+    }
+
     // Replay every cached complete group to a freshly-subscribed subscriber.
     // Each cached group is sent as a fresh uni stream on the subscriber's WT
     // session with the subscriber's track alias remapped.
@@ -1245,6 +1304,9 @@ const RelayHandler = struct {
         if (!sub.forward) return;
         const sub_ci = sub.client_idx;
         var l = self.link(sub_ci) orelse return;
+        // Resubscribing in a loop without reading would have us queue a
+        // replay per turn.
+        if (l.s.sendBufferedBytes() > MAX_SUB_BACKLOG) return;
 
         var slots: [N_CACHED_GROUPS]*const CachedGroup = undefined;
         const n = t.cachedInOrder(&slots);
@@ -1434,14 +1496,24 @@ const RelayHandler = struct {
                 }
             }
             // Forward to currently-attached subscribers.
+            var slow: [MAX_SUBS_PER_TRACK]usize = undefined;
+            var n_slow: usize = 0;
             for (0..fs.out_count) |i| {
                 const sub_ci = fs.out_sub_idx[i];
                 var l = self.link(sub_ci) orelse continue;
+                if ((l.s.streamBufferedBytes(fs.out_stream_ids[i]) orelse 0) + chunk.len > MAX_OUT_BACKLOG) {
+                    slow[n_slow] = sub_ci;
+                    n_slow += 1;
+                    continue;
+                }
                 l.send(fs.out_stream_ids[i], chunk) catch |e| {
                     std.debug.print("[relay] fwd chunk to sub {d}: {}\n", .{ sub_ci, e });
                 };
             }
             fs.forwarded_pos = buf.len;
+            for (slow[0..n_slow]) |sub_ci| {
+                if (self.fwdTrack(fs)) |t| self.dropSlowSubscriber(t, sub_ci) else self.resetOutputs(fs, sub_ci);
+            }
         }
 
         // On FIN: close all sub-streams and commit the live cache.
@@ -1580,36 +1652,6 @@ test "a subscriber leaving takes its outputs with it" {
     try std.testing.expectEqual(@as(u64, 11), fs.out_stream_ids[0]);
 }
 
-/// A connection with nothing on the wire: enough for a native-QUIC client's
-/// link to open, write, finish and reset streams.
-fn testConn() !*connection_mod.Connection {
-    const C = connection_mod.Connection;
-    const alloc = std.testing.allocator;
-    const cid = [_]u8{1} ** 20;
-    const conn = try alloc.create(C);
-    conn.* = .{
-        .allocator = alloc,
-        .is_server = true,
-        .dcid = cid,
-        .dcid_len = 8,
-        .scid = cid,
-        .scid_len = 8,
-        .version = 1,
-        .pkt_handler = @FieldType(C, "pkt_handler").init(alloc),
-        .conn_flow_ctrl = @FieldType(C, "conn_flow_ctrl").init(1 << 20, 6 << 20),
-        .streams = @FieldType(C, "streams").init(alloc, true),
-        .crypto_streams = @FieldType(C, "crypto_streams").init(alloc),
-        .packer = @FieldType(C, "packer").init(alloc, true, cid[0..8], cid[0..8], 1),
-    };
-    conn.streams.setMaxStreams(100, 100);
-    conn.streams.setMaxIncomingStreams(100, 100);
-    conn.streams.peer_initial_max_stream_data_uni = 1 << 20;
-    conn.streams.peer_initial_max_stream_data_bidi_local = 1 << 20;
-    conn.streams.peer_initial_max_stream_data_bidi_remote = 1 << 20;
-    conn.conn_flow_ctrl.base.send_window = 1 << 20;
-    return conn;
-}
-
 /// Native-QUIC client 0 publishes track 0 under alias 5 from its request
 /// stream 0; client 1 subscribes to it from its request stream 4.
 const TestRelay = struct {
@@ -1621,7 +1663,7 @@ const TestRelay = struct {
         self.r = try std.testing.allocator.create(RelayHandler);
         self.r.* = .{};
         for (0..2) |i| {
-            self.conns[i] = try testConn();
+            self.conns[i] = try relay_test.conn();
             self.entries[i] = .{ .conn = self.conns[i] };
             self.r.clients[i] = .{ .active = true, .entry = &self.entries[i], .raw = true };
         }
@@ -1635,10 +1677,7 @@ const TestRelay = struct {
     }
 
     fn deinit(self: *TestRelay) void {
-        for (self.conns) |c| {
-            c.deinit();
-            std.testing.allocator.destroy(c);
-        }
+        for (self.conns) |c| relay_test.free(c);
         std.testing.allocator.destroy(self.r);
     }
 
@@ -1769,4 +1808,50 @@ test "a group outliving its track caches nothing into the track that took the sl
     r.onStreamData(&publisher, 2, "late bytes", true);
     for (r.tracks[0].cached) |g| try std.testing.expect(!g.valid);
     try std.testing.expectEqual(@as(usize, 0), r.tracks[0].live.payload_len);
+}
+
+test "a subscriber that can't keep up is dropped, not queued for" {
+    // Every chunk went to every subscriber, read or not, so one that granted
+    // no flow control grew the relay's send buffers without end.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    const r = tr.r;
+    var publisher = tr.session(0);
+
+    try tr.openGroup(2);
+    const out = tr.conns[1].streams.send_streams.get(3).?;
+    // Nothing is ever sent in a test, so every byte stays queued.
+    const chunk: [60 * 1024]u8 = @splat('v');
+    for (0..32) |_| {
+        r.onStreamData(&publisher, 2, &chunk, false);
+        if (r.tracks[0].sub_count == 0) break;
+    }
+    try std.testing.expectEqual(@as(usize, 0), r.tracks[0].sub_count);
+    try std.testing.expectEqual(@as(?u64, moq_codes.STREAM_RESET_TOO_FAR_BEHIND), out.reset_err);
+    try std.testing.expect(tr.conns[1].streams.getStream(4).?.send.fin_queued);
+}
+
+test "resubscribing can't make the relay queue replays without end" {
+    // Each SUBSCRIBE replayed up to two cached groups on fresh streams, so a
+    // subscriber that subscribed and reset in a loop without reading grew
+    // the relay's send buffers by half a megabyte a turn.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    const r = tr.r;
+    const t = &r.tracks[0];
+    t.sub_count = 0;
+    for (&t.cached) |*g| {
+        g.valid = true;
+        g.payload_len = CACHE_GROUP_SIZE;
+        @memset(&g.payload, 'c');
+    }
+    var subscriber = tr.session(1);
+    for (0..20) |i| {
+        const sid: u64 = 8 + 4 * i;
+        r.admitSubscriber(1, sid, "", "", true);
+        r.onStreamReset(&subscriber, 0, sid, 0);
+    }
+    try std.testing.expect(tr.conns[1].sendBufferedBytes() <= MAX_SUB_BACKLOG + N_CACHED_GROUPS * CACHE_GROUP_SIZE + 4096);
 }

@@ -25,6 +25,7 @@ const lite = quic.moq.lite;
 const lite_msg = lite.message;
 const lite_session = lite.session;
 const lite_version = lite.version;
+const relay_test = @import("relay_test.zig");
 
 pub const std_options: std.Options = .{ .log_level = .err };
 
@@ -34,6 +35,9 @@ const MAX_SUBSCRIPTIONS: usize = 64;
 const MAX_FLOWS: usize = 64;
 const MAX_PATH: usize = 128;
 const MAX_NAME: usize = 64;
+/// Unsent bytes on a group's outbound stream past which its subscriber
+/// loses the group rather than have the relay hold it.
+const MAX_OUT_BACKLOG: usize = 1024 * 1024;
 const NONE: usize = std.math.maxInt(usize);
 
 fn print(comptime fmt: []const u8, args: anytype) void {
@@ -126,6 +130,10 @@ const Relay = struct {
         pub fn reset(self: *Ref, stream_id: u64, code: u64) void {
             const w = self.wtc() orelse return;
             w.resetStream(stream_id, @truncate(code));
+        }
+        fn unsent(self: *Ref, stream_id: u64) u64 {
+            const w = self.wtc() orelse return 0;
+            return w.quic.streamBufferedBytes(stream_id) orelse 0;
         }
     };
 
@@ -476,9 +484,15 @@ const Relay = struct {
 
     fn forwardFlow(self: *Self, ci: usize, stream_id: u64, data: []const u8) void {
         const f = self.flowOf(ci, stream_id) orelse return;
+        const out = &self.clients[f.out_ci];
+        if (out.ref.unsent(f.out_stream) + data.len > MAX_OUT_BACKLOG) {
+            out.sess.resetStream(f.out_stream, lite_session.ResetCode.CANCEL);
+            f.active = false;
+            return;
+        }
         // Frames pass through untouched: only the GROUP header needed
         // rewriting, and that happened when the flow was opened.
-        self.clients[f.out_ci].ref.write(f.out_stream, data) catch {
+        out.ref.write(f.out_stream, data) catch {
             f.active = false;
         };
     }
@@ -631,4 +645,30 @@ test "a stream the peer resets frees what it held" {
     try std.testing.expect(!r.watches[0].active);
     r.onStreamReset(&origin, 0, 3, 0);
     try std.testing.expect(!r.flows[0].active);
+}
+
+test "a subscriber that can't keep up loses the group, not the relay's memory" {
+    // Group data went to every subscriber, read or not, so one that granted
+    // no flow control grew the relay's send buffers without end.
+    var r: Relay = .{};
+    const conn = try relay_test.conn();
+    defer relay_test.free(conn);
+    var h3c: quic.h3.H3Connection = undefined;
+    var wtc = wt.WebTransportConnection.init(std.testing.allocator, &h3c, conn, true);
+    defer wtc.deinit();
+    var entries: [2]cm.ConnEntry = .{ .{ .conn = undefined }, .{ .conn = conn, .wt_conn = &wtc } };
+    for (0..2) |i| {
+        r.clients[i].active = true;
+        r.clients[i].entry = &entries[i];
+        r.clients[i].ref = .{ .owner = &r, .idx = i };
+        r.clients[i].sess = Relay.Sess.init(&r.clients[i].ref);
+    }
+    const out = try conn.openUniStream();
+    r.flows[0] = .{ .active = true, .in_ci = 0, .in_stream = 2, .out_ci = 1, .out_stream = out.stream_id };
+
+    // Nothing is ever sent in a test, so every byte stays queued.
+    const chunk: [60 * 1024]u8 = @splat('g');
+    for (0..32) |_| r.forwardFlow(0, 2, &chunk);
+    try std.testing.expect(!r.flows[0].active);
+    try std.testing.expect(out.reset_err != null);
 }

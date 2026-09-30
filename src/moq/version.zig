@@ -64,6 +64,8 @@ pub const Rules = struct {
     has_subscribe_tracks: bool,
     /// draft-18 only: SUBGROUP_HEADER bit 0x40.
     subgroup_first_object_bit: bool,
+    /// PUBLISH_DONE's TOO_FAR_BEHIND, which draft-18 swapped with EXPIRED.
+    done_too_far_behind: u64,
 
     pub fn of(draft: Draft) Rules {
         return switch (draft) {
@@ -74,6 +76,7 @@ pub const Rules = struct {
                 .subscribe_namespace_options = true,
                 .has_subscribe_tracks = false,
                 .subgroup_first_object_bit = false,
+                .done_too_far_behind = 0x6,
             },
             .draft_18 => .{
                 .required_request_id_delta = false,
@@ -82,6 +85,7 @@ pub const Rules = struct {
                 .subscribe_namespace_options = false,
                 .has_subscribe_tracks = true,
                 .subgroup_first_object_bit = true,
+                .done_too_far_behind = 0x5,
             },
         };
     }

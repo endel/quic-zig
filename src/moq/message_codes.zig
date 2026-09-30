@@ -145,4 +145,10 @@ pub const DONE_UNAUTHORIZED: u64 = 0x1;
 pub const DONE_TRACK_ENDED: u64 = 0x2;
 pub const DONE_SUBSCRIPTION_ENDED: u64 = 0x3;
 pub const DONE_GOING_AWAY: u64 = 0x4;
+/// draft-17's; draft-18 swapped it with TOO_FAR_BEHIND, which
+/// `version.Rules.done_too_far_behind` carries.
 pub const DONE_EXPIRED: u64 = 0x5;
+
+// Data stream reset codes (draft-17 §10.4.3, draft-18 §3.3.3).
+/// The subscription outran the publisher's resource limits and is ending.
+pub const STREAM_RESET_TOO_FAR_BEHIND: u64 = 0x5;

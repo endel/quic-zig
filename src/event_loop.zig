@@ -342,6 +342,11 @@ pub const Session = struct {
         return self.entry.conn.streamBufferedBytes(stream_id);
     }
 
+    /// `streamBufferedBytes` over every stream of the connection.
+    pub fn sendBufferedBytes(self: *const Session) u64 {
+        return self.entry.conn.sendBufferedBytes();
+    }
+
     // --- WebTransport methods ---
 
     /// Stop `onStreamData` for a WebTransport stream until `resumeStream`,
