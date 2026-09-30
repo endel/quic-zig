@@ -1516,7 +1516,7 @@ pub fn Server(comptime Handler: type) type {
             const quarter_id = packet.readVarInt(&reader) catch return;
             const session_id = quarter_id * 4;
 
-            if (wtc.getSession(session_id) == null) return;
+            if (!wtc.sessionActive(session_id)) return;
             const payload = data[reader.seek..];
 
             // Deliver directly to handler — bypasses ring buffer + poll chain entirely.

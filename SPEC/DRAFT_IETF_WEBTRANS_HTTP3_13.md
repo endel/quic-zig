@@ -97,12 +97,19 @@ lost or crossed in flight.
 | Item | Note |
 | --- | --- |
 | `RESET_STREAM_AT` reliable reset (§4.3) | The draft makes it a MUST for resetting a WT data stream, so both ends agree the header arrived. `TODO.md` I5. Without it, §5.3's note stands: the two ends cannot agree on which streams are open — which is why our stream limit counts opens rather than closures, and does not need to. |
-| `WT_BUFFERED_STREAM_REJECTED` (§4.5) | Constant declared, never sent; a stream naming an unknown session is surfaced as a normal stream. |
 | `WT_MAX_STREAM_DATA` / `WT_STREAM_DATA_BLOCKED` | §5.4 prohibits them — receipt should be a session error. We ignore them instead. |
 | Flow control across an intermediary (§5.6.1) | We are not an intermediary. |
 | 0-RTT limit retention (§3.2) | No 0-RTT on the WebTransport path. |
 
 ## Caveats worth knowing
+
+**Streams wait for their session (§4.5).** A stream naming a session that is
+still connecting, or whose CONNECT has not been read yet, is kept from the
+application with its data unread, and surfaced once the session is accepted.
+At most 16 wait at once; past that a stream is reset with
+`WT_BUFFERED_STREAM_REJECTED`. One naming a session that is gone, or a request
+stream that never was one, is reset with `WT_SESSION_GONE`. Datagrams for a
+session not yet active are dropped rather than buffered.
 
 **A capsule may not straddle a DATA frame.** RFC 9297 §3.2 puts the capsule
 stream in the HTTP message content, so in HTTP/3 capsules travel inside DATA
