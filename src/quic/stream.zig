@@ -109,6 +109,13 @@ pub const FrameSorter = struct {
         self.chunks.deinit(self.allocator);
     }
 
+    /// Frees the buffered data, keeping the offsets it reached.
+    pub fn discard(self: *FrameSorter) void {
+        for (self.chunks.items) |c| self.allocator.free(c.allocation());
+        self.chunks.clearAndFree(self.allocator);
+        self.breaks = 0;
+    }
+
     /// Index of the first chunk ending after `pos`, or `items.len` if none is.
     fn lowerBound(self: *const FrameSorter, pos: u64) usize {
         var lo: usize = 0;
@@ -506,6 +513,8 @@ pub const ReceiveStream = struct {
 
         self.reset_err = error_code;
         self.sorter.fin_offset = final_size;
+        // Never read now, and its connection credit is handed back at once.
+        self.sorter.discard();
     }
 
     /// Read contiguous data from the stream.
@@ -1175,9 +1184,17 @@ pub const Stream = struct {
     /// cannot do once the stream is gone. Nothing is left to recover only when
     /// every byte is acknowledged and no retransmit range is outstanding.
     pub fn isDisposable(self: *const Stream) bool {
-        return self.closed_for_gc and
-            self.send.retransmit_count == 0 and
-            !self.send.hasUnackedData();
+        if (!self.closed_for_gc) return false;
+        // A queued RESET_STREAM carries all it needs; see SendStream.isDisposable.
+        if (self.send.reset_err != null) return self.send.reset_stream_sent;
+        return self.send.retransmit_count == 0 and !self.send.hasUnackedData();
+    }
+
+    /// Neither direction carries anything more: the peer's data all arrived
+    /// or it reset, and our FIN went out or we reset.
+    fn bothSidesDone(self: *const Stream) bool {
+        const recv_done = self.recv.reset_err != null or (self.recv.fin_received and self.recv.allReceived());
+        return recv_done and (self.send.fin_sent or self.send.reset_err != null);
     }
 };
 
@@ -1724,7 +1741,7 @@ pub const StreamsMap = struct {
         var it = self.streams.iterator();
         while (it.next()) |kv| {
             const s = kv.value_ptr.*;
-            if (!s.closed_for_gc and s.recv.allReceived() and s.send.fin_sent) {
+            if (!s.closed_for_gc and s.bothSidesDone()) {
                 s.closed_for_gc = true;
                 self.closeStream(s.stream_id);
             }
@@ -1734,13 +1751,13 @@ pub const StreamsMap = struct {
 
     /// Close a bidi stream once both directions are done, and reclaim it if
     /// that also settles it. Called wherever either direction finishes: the
-    /// peer's last byte arriving, or our FIN going out.
+    /// peer's last byte or reset arriving, or our FIN or reset going out.
+    /// Counts the stream against MAX_STREAMS once, however often it is called.
     pub fn closeIfDone(self: *StreamsMap, s: *Stream) void {
-        if (s.closed_for_gc) return;
-        if (!s.recv.fin_received or !s.recv.allReceived()) return;
-        if (!s.send.fin_sent and s.send.reset_err == null) return;
-        s.closed_for_gc = true;
-        self.closeStream(s.stream_id);
+        if (!s.closed_for_gc and s.bothSidesDone()) {
+            s.closed_for_gc = true;
+            self.closeStream(s.stream_id);
+        }
         self.disposeIfSettled(s);
     }
 

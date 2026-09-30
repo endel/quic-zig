@@ -1973,10 +1973,7 @@ pub const Connection = struct {
                     // RFC 9000 §4.5: the final size counts once; the credit
                     // comes back when queueFlowControlUpdates harvests it.
                     try self.chargeConnWindow(&s.recv, rs.final_size, .reset_stream);
-                    // If send side is also done, stream is fully closed
-                    if (s.send.fin_sent or s.send.reset_err != null) {
-                        self.streams.closeStream(rs.stream_id);
-                    }
+                    self.streams.closeIfDone(s);
                 } else if (self.streams.recv_streams.get(rs.stream_id)) |s| {
                     // Peer-initiated uni stream. The peer counted final_size
                     // against connection flow control when it sent the data, so
@@ -2983,6 +2980,8 @@ pub const Connection = struct {
             while (stream_it.next()) |s_ptr| {
                 self.queueSendSideFrames(&s_ptr.*.send);
                 self.queueStopSending(&s_ptr.*.recv);
+                // A reset on our side finishes it here, with no FIN to pack.
+                self.streams.closeIfDone(s_ptr.*);
             }
             var uni_it = self.streams.send_streams.valueIterator();
             while (uni_it.next()) |ss_ptr| {
@@ -6075,6 +6074,67 @@ test "a closed bidi stream is reclaimed when its last byte is acked after the cl
     try ackPacket(&conn, pn);
     conn.streams.drainDisposalQueue();
     try std.testing.expect(conn.streams.getStream(0) == null);
+}
+
+test "RESET_STREAM repeated on a bidi stream counts it against MAX_STREAMS once" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+
+    var x = "x".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = 1, .data = &x, .fin = false } }, .application, 0);
+    try conn.processFrame(&.{ .stop_sending = .{ .stream_id = 0, .error_code = 0 } }, .application, 0);
+    for (0..50) |_| try conn.processFrame(&.{ .reset_stream = .{ .stream_id = 0, .error_code = 0, .final_size = 1 } }, .application, 0);
+    try std.testing.expectEqual(@as(u64, 1), conn.streams.consumed_bidi_streams);
+}
+
+test "a bidi stream the peer resets is reclaimed once our side is done, in either order" {
+    var x = "GET".*;
+    // Our FIN acked, then the peer's reset.
+    {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        conn.streams.setMaxIncomingStreams(10, 10);
+        try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = x.len, .data = &x, .fin = false } }, .application, 0);
+        const s = conn.streams.getStream(0).?;
+        try s.send.writeData("response");
+        s.send.close();
+        try ackPacket(&conn, try sendStreamFrameOf(&conn, &s.send));
+        try conn.processFrame(&.{ .reset_stream = .{ .stream_id = 0, .error_code = 0, .final_size = x.len } }, .application, 0);
+
+        conn.queueFlowControlUpdates();
+        conn.streams.drainDisposalQueue();
+        try std.testing.expect(conn.streams.getStream(0) == null);
+        try std.testing.expectEqual(@as(u64, 1), conn.streams.consumed_bidi_streams);
+    }
+    // The peer's reset, then ours.
+    {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        conn.streams.setMaxIncomingStreams(10, 10);
+        try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = x.len, .data = &x, .fin = false } }, .application, 0);
+        try conn.processFrame(&.{ .reset_stream = .{ .stream_id = 0, .error_code = 0, .final_size = x.len } }, .application, 0);
+        conn.streams.getStream(0).?.send.reset(0);
+
+        conn.queueFlowControlUpdates();
+        conn.streams.drainDisposalQueue();
+        try std.testing.expect(conn.streams.getStream(0) == null);
+        try std.testing.expectEqual(@as(u64, 1), conn.streams.consumed_bidi_streams);
+    }
+}
+
+test "a reset stream lets go of the data it buffered" {
+    // Its connection credit comes back at once, so the memory must too.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    var data = [_]u8{0xab} ** 1000;
+    for ([_]u64{ 0, 2 }) |id| {
+        try conn.processFrame(&.{ .stream = .{ .stream_id = id, .offset = 1, .length = data.len, .data = &data, .fin = false } }, .application, 0);
+        try conn.processFrame(&.{ .reset_stream = .{ .stream_id = id, .error_code = 0, .final_size = 1 + data.len } }, .application, 0);
+    }
+    try std.testing.expectEqual(@as(usize, 0), conn.streams.getStream(0).?.recv.sorter.chunks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.streams.recv_streams.get(2).?.sorter.chunks.items.len);
 }
 
 test "a bidi stream whose FIN arrives ahead of a hole outlives our acked FIN" {
