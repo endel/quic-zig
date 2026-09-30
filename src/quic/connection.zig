@@ -763,6 +763,9 @@ pub const Connection = struct {
 
     // Connection state
     got_peer_conn_id: bool = false,
+    /// Sequence number of our CID the 1-RTT packet being processed came on,
+    /// which the peer may not retire in that packet (RFC 9000 §19.16).
+    current_dcid_seq: ?u64 = null,
     /// The SCID of the first long-header packet from the peer that
     /// decrypted: what initial_source_connection_id must name (RFC 9000 §7.3).
     peer_initial_scid: [packet.CONNECTION_ID_MAX_SIZE]u8 = undefined,
@@ -1469,6 +1472,13 @@ pub const Connection = struct {
                 self.got_peer_conn_id = true;
             } else if (!std.mem.eql(u8, header.scid, self.peer_initial_scid[0..self.peer_initial_scid_len])) {
                 return;
+            }
+        }
+
+        self.current_dcid_seq = null;
+        if (header.packet_type == .one_rtt) {
+            for (&self.local_cid_pool.entries) |*e| {
+                if (e.occupied and std.mem.eql(u8, e.getCid(), header.dcid)) self.current_dcid_seq = e.seq_num;
             }
         }
 
@@ -2291,6 +2301,15 @@ pub const Connection = struct {
                     std.log.info("stored peer CID in pool from NEW_CONNECTION_ID seq={d}, pool_size={d}", .{ ncid.seq_num, self.peer_cid_pool.count() });
                 }
 
+                // RFC 9000 §5.1.1: what is left active must fit the limit we
+                // advertised. The handshake DCID counts until it is retired.
+                const active = self.peer_cid_pool.count() +
+                    @intFromBool(self.active_cid_seq == 0 and !self.peer_cid_pool.contains(0));
+                if (active > self.local_params.active_connection_id_limit) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.connection_id_limit_error), @intFromEnum(FrameType.new_connection_id), "more active connection IDs than our limit");
+                    return error.ProtocolViolation;
+                }
+
                 // §5.1.2: keep the DCID in use until Retire Prior To takes it.
                 // Switching early moved our Handshake Finished onto a CID
                 // imquic does not route long headers by, so it never arrived.
@@ -2298,6 +2317,12 @@ pub const Connection = struct {
             },
 
             .retire_connection_id => |rcid| {
+                // RFC 9000 §19.16: only a CID we issued, and not the one this
+                // very packet came on.
+                if (rcid.seq_num >= self.local_cid_pool.next_seq_num or self.current_dcid_seq == rcid.seq_num) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.retire_connection_id), "RETIRE_CONNECTION_ID for a CID not ours to retire");
+                    return error.ProtocolViolation;
+                }
                 std.log.info("peer retired connection ID seq={d}", .{rcid.seq_num});
                 self.local_cid_pool.retireBySeq(rcid.seq_num);
 
@@ -6145,14 +6170,23 @@ test "a peer's close reason outlives the packet it came in" {
 /// Sets `conn` up to open 1-RTT packets under keys derived from its SCID,
 /// and seals a PING-only one to it from the peer's side.
 fn testPingToward(conn: *Connection, out: []u8) !usize {
+    return testFrameToward(conn, .ping, out);
+}
+
+/// The same with `frame` in it rather than a PING.
+fn testFrameToward(conn: *Connection, frame: frame_mod.PendingControlFrame, out: []u8) !usize {
     var outs = [_][]u8{out};
     var lens: [1]usize = undefined;
-    try testPingsToward(conn, &outs, &lens);
+    try testFramesToward(conn, frame, &outs, &lens);
     return lens[0];
 }
 
-/// The same for several packets, numbered in order.
 fn testPingsToward(conn: *Connection, outs: [][]u8, lens: []usize) !void {
+    return testFramesToward(conn, .ping, outs, lens);
+}
+
+/// Several packets, numbered in order, each carrying `frame`.
+fn testFramesToward(conn: *Connection, frame: frame_mod.PendingControlFrame, outs: [][]u8, lens: []usize) !void {
     conn.state = .connected;
     conn.handshake_confirmed = true;
     const cid = conn.scid[0..conn.scid_len];
@@ -6173,7 +6207,7 @@ fn testPingsToward(conn: *Connection, outs: [][]u8, lens: []usize) !void {
     defer streams.deinit();
     for (outs, lens) |out, *len| {
         var pending: frame_mod.PendingFrameQueue = .{};
-        pending.push(.ping);
+        pending.push(frame);
         len.* = try packer.packCoalesced(out, &handler, &crypto_mgr, &streams, &pending, null, null, null, &seal, 0, null, false);
     }
 }
@@ -6338,6 +6372,38 @@ test "a server keeps the first SCID its peer proved, and checks initial_source_c
     try std.testing.expectError(error.TransportParameterError, conn.validatePeerTransportParams(&tp));
     tp.initial_source_connection_id = .init(&first);
     try conn.validatePeerTransportParams(&tp);
+}
+
+test "NEW_CONNECTION_ID past our active_connection_id_limit is CONNECTION_ID_LIMIT_ERROR" {
+    // RFC 9000 5.1.1. The pool silently dropped what did not fit instead.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    var cid = [_]u8{0xab} ** 8;
+    // The handshake DCID is one; seq 1 makes two, our limit.
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{1} ** 16 } }, .application, 0);
+    try std.testing.expect(conn.local_err == null);
+    cid[0] = 0xac;
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 2, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{2} ** 16 } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.connection_id_limit_error)), conn.local_err.?.code);
+}
+
+test "RETIRE_CONNECTION_ID for a CID never issued, or the one it came on, is PROTOCOL_VIOLATION" {
+    // RFC 9000 19.16.
+    {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .retire_connection_id = .{ .seq_num = 50 } }, .application, 0));
+    }
+    {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        conn.path_initialized = true;
+        conn.local_cid_pool.registerInitialCid(conn.scid[0..conn.scid_len], null);
+        var buf: [1500]u8 = undefined;
+        const n = try testFrameToward(&conn, .{ .retire_connection_id = 0 }, &buf);
+        conn.handleDatagram(buf[0..n], .{ .to = conn.paths[0].local_addr, .from = conn.paths[0].peer_addr, .datagram_size = n });
+        try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+    }
 }
 
 test "a uni stream is reclaimed once its FIN is acked" {
