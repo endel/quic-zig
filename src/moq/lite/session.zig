@@ -558,7 +558,8 @@ pub const FrameReader = struct {
     /// The next whole frame, or null when more bytes are needed.
     pub fn next(self: *FrameReader) msg.Error!?Item {
         const r = (try msg.readFrame(self.buf[self.pos..self.len])) orelse return null;
-        self.timestamp += r.frame.timestamp_delta;
+        // Deltas summing past i64 are no timestamps a publisher could mean.
+        self.timestamp = std.math.add(i64, self.timestamp, r.frame.timestamp_delta) catch return error.MalformedMessage;
         self.pos += r.consumed;
         return .{ .timestamp = self.timestamp, .payload = r.frame.payload };
     }
@@ -836,6 +837,18 @@ test "FrameReader accumulates timestamps and survives split pushes" {
     try testing.expectEqual(@as(usize, 2), got);
     try testing.expectEqual(@as(i64, 60), last); // 100 then -40
     try testing.expectEqual(@as(usize, 0), reader.buffered());
+}
+
+test "FrameReader refuses timestamps that run out of range" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    for (0..5) |_| try msg.writeFrame(&fbs, .{ .timestamp_delta = (1 << 61) - 1, .payload = "x" });
+
+    var rbuf: [64]u8 = undefined;
+    var reader = FrameReader.init(&rbuf);
+    try reader.push(buf[0..fbs.seek]);
+    for (0..4) |_| _ = try reader.next();
+    try testing.expectError(error.MalformedMessage, reader.next());
 }
 
 test "FrameReader refuses to overflow its buffer" {
