@@ -192,6 +192,9 @@ pub const H3Connection = struct {
 
     /// Per-stream position inside a DATA or skipped frame.
     frame_progress: std.AutoHashMapUnmanaged(u64, FrameProgress) = .empty,
+    /// Server: body bytes still owed on each request that declared a
+    /// content-length (RFC 9114 §4.1.2).
+    body_owed: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
     /// Streams reclaimed since the per-stream maps' tombstones were cleared.
     removed_since_rehash: usize = 0,
@@ -243,6 +246,7 @@ pub const H3Connection = struct {
         self.paused_bodies.deinit(self.allocator);
         self.response_states.deinit(self.allocator);
         self.frame_progress.deinit(self.allocator);
+        self.body_owed.deinit(self.allocator);
     }
 
     fn qpackScratch(self: *H3Connection) ![]u8 {
@@ -437,6 +441,29 @@ pub const H3Connection = struct {
             if (std.mem.eql(u8, h.name, ":status")) return h.value.len == 3 and h.value[0] == '1';
         }
         return false;
+    }
+
+    /// The content-length a header section declares: digits only, and every
+    /// copy the same (RFC 9110 §8.6). Null when there is none, or on CONNECT.
+    fn contentLength(headers: []const qpack.Header) error{Invalid}!?u64 {
+        var n: ?u64 = null;
+        for (headers) |h| {
+            if (std.mem.eql(u8, h.name, ":method") and std.mem.eql(u8, h.value, "CONNECT")) return null;
+            if (!std.mem.eql(u8, h.name, "content-length")) continue;
+            if (h.value.len == 0) return error.Invalid;
+            for (h.value) |c| if (!std.ascii.isDigit(c)) return error.Invalid;
+            const v = std.fmt.parseInt(u64, h.value, 10) catch return error.Invalid;
+            if (n != null and n.? != v) return error.Invalid;
+            n = v;
+        }
+        return n;
+    }
+
+    /// DATA past the declared content-length.
+    fn bodyMismatch(self: *H3Connection, rs: *stream_mod.ReceiveStream, buf: *std.ArrayList(u8), header_len: usize) error{H3MessageError} {
+        self.consumeRequestBytes(rs, buf, header_len);
+        self.closeWithError(.message_error, "request body longer than its content-length");
+        return error.H3MessageError;
     }
 
     /// The send side of a request stream the response can still be written to.
@@ -667,6 +694,7 @@ pub const H3Connection = struct {
             _ = self.paused_bodies.remove(id);
             _ = self.response_states.remove(id);
             _ = self.frame_progress.remove(id);
+            _ = self.body_owed.remove(id);
             if (self.stream_bufs.fetchRemove(id)) |kv| {
                 var buf = kv.value;
                 buf.deinit(self.allocator);
@@ -686,7 +714,7 @@ pub const H3Connection = struct {
             clear(&self.headers_received_streams);
             clear(&self.stream_bufs);
             const ctx: std.hash_map.AutoContext(u64) = .{};
-            inline for (.{ &self.cancelled_streams, &self.paused_bodies, &self.response_states, &self.frame_progress }) |m| {
+            inline for (.{ &self.cancelled_streams, &self.paused_bodies, &self.response_states, &self.frame_progress, &self.body_owed }) |m| {
                 if (m.capacity() > 0) m.rehash(ctx);
             }
         }
@@ -1315,6 +1343,10 @@ pub const H3Connection = struct {
             self.closeWithError(.frame_error, "request stream ended mid-frame");
             return error.H3FrameError;
         }
+        if ((self.body_owed.get(stream_id) orelse 0) != 0) {
+            self.closeWithError(.message_error, "request body shorter than its content-length");
+            return error.H3MessageError;
+        }
         try self.finished_streams.put(stream_id, {});
         return .{ .finished = stream_id };
     }
@@ -1338,6 +1370,10 @@ pub const H3Connection = struct {
                     self.consumeRequestBytes(rs, buf, hdr.len);
                     self.closeWithError(.frame_unexpected, "DATA outside the message body");
                     return error.H3FrameUnexpected;
+                }
+                if (self.body_owed.getPtr(stream_id)) |owed| {
+                    if (hdr.length > owed.*) return self.bodyMismatch(rs, buf, hdr.len);
+                    owed.* -= hdr.length;
                 }
                 self.consumeRequestBytes(rs, buf, hdr.len);
                 if (hdr.length > 0) try self.frame_progress.put(self.allocator, stream_id, .{ .data = hdr.length });
@@ -1402,8 +1438,8 @@ pub const H3Connection = struct {
             return error.H3FrameUnexpected;
         }
         if (phase == .final) {
-            if (!fieldsValid(hdrs)) {
-                self.closeWithError(.message_error, "invalid trailer field");
+            if (!fieldsValid(hdrs) or (self.body_owed.get(stream_id) orelse 0) != 0) {
+                self.closeWithError(.message_error, "invalid trailer field or short body");
                 return error.H3MessageError;
             }
             try self.headers_received_streams.put(stream_id, .trailers);
@@ -1421,6 +1457,13 @@ pub const H3Connection = struct {
         }
 
         try self.headers_received_streams.put(stream_id, if (!self.is_server and isInformational(hdrs)) .interim else .final);
+        if (self.is_server) {
+            const declared = contentLength(hdrs) catch {
+                self.closeWithError(.message_error, "invalid content-length");
+                return error.H3MessageError;
+            };
+            if (declared) |n| try self.body_owed.put(self.allocator, stream_id, n);
+        }
 
         // Check for Extended CONNECT (:method=CONNECT + :protocol)
         var method: ?[]const u8 = null;
@@ -1569,6 +1612,7 @@ test "H3Connection: init and deinit" {
     conn.paused_bodies = .empty;
     conn.response_states = .empty;
     conn.frame_progress = .empty;
+    conn.body_owed = .empty;
     conn.qpack_scratch_owned = false;
     conn.deinit();
 }
@@ -2998,6 +3042,48 @@ test "H3: a request stream carries one request; nothing follows its trailers" {
         try injectBidiStreamData(&quic_conn, 0, buf[0..pos], true);
         var tags: [8]std.meta.Tag(H3Event) = undefined;
         try testing.expectError(error.H3FrameUnexpected, pollTags(&h3, &tags));
+    }
+}
+
+test "H3: a request body must match its content-length" {
+    // RFC 9114 4.1.2. Forwarded to HTTP/1.1 a mismatch reframes the stream.
+    const Case = struct { cl: []const []const u8, body: []const u8, ok: bool };
+    const cases = [_]Case{
+        .{ .cl = &.{"3"}, .body = "abc", .ok = true },
+        .{ .cl = &.{"5"}, .body = "abc", .ok = false },
+        .{ .cl = &.{"2"}, .body = "abc", .ok = false },
+        .{ .cl = &.{ "3", "4" }, .body = "abc", .ok = false },
+        .{ .cl = &.{"+3"}, .body = "abc", .ok = false },
+        .{ .cl = &.{"3, 3"}, .body = "abc", .ok = false },
+    };
+    var buf: [512]u8 = undefined;
+    for (cases) |c| {
+        var quic_conn = createTestQuicConn(true);
+        defer quic_conn.deinit();
+        var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+        defer h3.deinit();
+        try h3.initConnection();
+        try injectPeerControlStream(&quic_conn, &h3);
+
+        var hdrs: [8]qpack.Header = undefined;
+        const base = [_]qpack.Header{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = ":authority", .value = "example.com" },
+        };
+        @memcpy(hdrs[0..base.len], &base);
+        for (c.cl, base.len..) |v, i| hdrs[i] = .{ .name = "content-length", .value = v };
+        var pos = buildHeadersFrame(&buf, hdrs[0 .. base.len + c.cl.len]);
+        pos += buildDataFrame(buf[pos..], c.body);
+        try injectBidiStreamData(&quic_conn, 0, buf[0..pos], true);
+
+        var tags: [8]std.meta.Tag(H3Event) = undefined;
+        if (c.ok) {
+            try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{ .headers, .data, .finished }, try pollTags(&h3, &tags));
+        } else {
+            try testing.expectError(error.H3MessageError, pollTags(&h3, &tags));
+        }
     }
 }
 
