@@ -1234,8 +1234,8 @@ pub const Connection = struct {
     /// the end of its payload (excludes any coalesced packets that follow).
     /// Valid before decrypt() advances the stream.
     fn currentPacketBytes(header: *packet.Header, fbs: anytype) ?[]const u8 {
-        const pkt_len = (fbs.seek - header.packet_start) + header.remainder_len;
-        if (header.packet_start + pkt_len > fbs.buffer.len) return null;
+        const pkt_len = (fbs.seek - header.packet_start) +| header.remainder_len;
+        if (pkt_len > fbs.buffer.len - header.packet_start) return null;
         return fbs.buffer[header.packet_start..][0..pkt_len];
     }
 
@@ -4534,7 +4534,8 @@ pub const Connection = struct {
 
             const pkt_start = fbs.seek;
             var header = packet.Header.parse(&fbs, self.scid_len) catch break;
-            const full_size = fbs.seek - pkt_start + header.remainder_len;
+            // Clamped: a Length past the datagram would wrap a 32-bit usize.
+            const full_size = @min(fbs.seek - pkt_start +| header.remainder_len, bytes.len - pkt_start);
 
             // Only count datagram_size for the first packet to avoid
             // double-counting in amplification limit calculations.

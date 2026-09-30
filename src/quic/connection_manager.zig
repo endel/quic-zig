@@ -632,7 +632,8 @@ pub const ConnectionManager = struct {
 
             const pkt_start = fbs.seek;
             var header = packet.Header.parse(&fbs, self.local_cid_len) catch break;
-            const full_size = fbs.seek - pkt_start + header.remainder_len;
+            // Clamped: a Length past the datagram would wrap a 32-bit usize.
+            const full_size = @min(fbs.seek - pkt_start +| header.remainder_len, bytes.len - pkt_start);
 
             // Version negotiation (RFC 9000 §6). Only for a datagram as large
             // as a real Initial, so it cannot amplify a spoofed small one.
