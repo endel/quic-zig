@@ -229,6 +229,8 @@ pub const Frame = union(FrameType) {
         defer size.* = stream.seek;
 
         const frame_type = try packet.readVarInt(reader);
+        // RFC 9000 §12.4: shortest encoding only.
+        if (stream.seek != packet.varIntLength(frame_type)) return FrameError.FrameEncodingError;
 
         return switch (frame_type) {
             // padding
@@ -1046,6 +1048,23 @@ test "parseSized ends each frame where the next one starts" {
         var size: usize = undefined;
         _ = try Frame.parseSized(buf[0 .. len + 1], &size);
         try std.testing.expectEqual(len, size);
+    }
+}
+
+test "a frame type in a longer encoding than it needs is FRAME_ENCODING_ERROR" {
+    // Receive loops advance by the parsed size: PADDING read as `40 00`
+    // measured 0 bytes and pinned them in place.
+    const cases = [_][]const u8{
+        &.{ 0x40, 0x00, 0x01 },
+        &.{ 0x80, 0x00, 0x00, 0x00, 0x01 },
+        &.{ 0x40, 0x01 },
+        &.{ 0x40, 0x1e },
+    };
+    for (cases) |bytes| {
+        var buf: [8]u8 = undefined;
+        @memcpy(buf[0..bytes.len], bytes);
+        var size: usize = undefined;
+        try std.testing.expectError(error.FrameEncodingError, Frame.parseSized(buf[0..bytes.len], &size));
     }
 }
 
