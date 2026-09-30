@@ -1416,19 +1416,14 @@ pub const H3Connection = struct {
         qpack_data: []const u8,
         frame_len: usize,
     ) !?H3Event {
-        var hdr_count: usize = 0;
         const scratch = try self.qpackScratch();
-        if (self.qpack_decoder.decode(qpack_data, &self.headers_buf, scratch, stream_id)) |c| {
-            hdr_count = c;
-        } else |_| {
-            // Fallback to static-only decoder for compatibility
-            hdr_count = qpack.decodeHeaders(qpack_data, &self.headers_buf, scratch) catch {
-                // RFC 9204 §4.5.5: QPACK decompression failure
-                self.consumeRequestBytes(rs, buf, frame_len);
-                self.closeWithError(.qpack_decompression_failed, "QPACK decode failure");
-                return error.H3FrameError;
-            };
-        }
+        // RFC 9204 §2.2.3: a block that does not decode fails the connection;
+        // decoding around its dynamic references would drop fields.
+        const hdr_count = self.qpack_decoder.decode(qpack_data, &self.headers_buf, scratch, stream_id) catch {
+            self.consumeRequestBytes(rs, buf, frame_len);
+            self.closeWithError(.qpack_decompression_failed, "QPACK decode failure");
+            return error.H3FrameError;
+        };
         // Decoded headers live in `scratch`, so the frame can go now.
         self.consumeRequestBytes(rs, buf, frame_len);
         const hdrs = self.headers_buf[0..hdr_count];
@@ -3012,6 +3007,29 @@ fn buildHeadersFrame(buf: []u8, headers: []const qpack.Header) usize {
     var fbs = io.fixedBufferStream(buf);
     h3_frame.write(.{ .headers = qb[0..ql] }, &fbs) catch unreachable;
     return fbs.seek;
+}
+
+test "H3: a header block QPACK cannot decode is refused, not decoded without its dynamic fields" {
+    // RFC 9204 2.2.3. Decoding what the static table covers and dropping the
+    // rest hands the application a request other than the one sent.
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Required Insert Count 1 with no table; GET https / example.com, then a
+    // dynamic reference that has nothing to name.
+    const block = [_]u8{ 0x02, 0x00, 0xd1, 0xd7, 0xc1, 0x50, 0x0b } ++ "example.com".* ++ [_]u8{0x80};
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try h3_frame.write(.{ .headers = &block }, &fbs);
+    try injectBidiStreamData(&quic_conn, 0, fbs.buffered(), true);
+
+    var tags: [8]std.meta.Tag(H3Event) = undefined;
+    try testing.expectError(error.H3FrameError, pollTags(&h3, &tags));
+    try testing.expectEqual(@intFromEnum(H3Error.qpack_decompression_failed), quic_conn.local_err.?.code);
 }
 
 test "H3: a request stream carries one request; nothing follows its trailers" {
