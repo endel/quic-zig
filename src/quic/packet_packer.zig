@@ -321,6 +321,16 @@ pub const PacketPacker = struct {
         // Record where the plaintext payload starts
         const payload_start = fbs.seek;
 
+        // RFC 9001 §5.4.2: The header protection sample starts 4 bytes after the PN offset.
+        // We need pn_offset + 4 + SAMPLE_LEN(16) <= total packet length.
+        // Equivalently: plaintext_payload >= 4 - pn_len (minimum to place the sample).
+        // For safety, ensure at least 4 bytes of plaintext regardless of PN length.
+        const min_plaintext: usize = 4;
+        if (effective_max < payload_start + min_plaintext) {
+            pkt_handler.next_pn[@intFromEnum(level)] -= 1;
+            return 0;
+        }
+
         // Collect frames
         var ack_eliciting = false;
         var has_crypto_data = false;
@@ -363,7 +373,7 @@ pub const PacketPacker = struct {
                 .application => 3,
             };
             const cs = crypto_mgr.getStream(crypto_level_idx);
-            const remaining_space = effective_max - fbs.seek - AEAD_TAG_LEN - 4;
+            const remaining_space = effective_max -| (fbs.seek + AEAD_TAG_LEN + 4);
             // Checked first: past the handshake there is never any, and building
             // the 576-byte ?Frame to say so cost 5.6% of the 10 KB HTTP/3 row.
             if (remaining_space > 0 and cs.hasData()) {
@@ -587,11 +597,6 @@ pub const PacketPacker = struct {
             return 0; // Nothing to send
         }
 
-        // RFC 9001 §5.4.2: The header protection sample starts 4 bytes after the PN offset.
-        // We need pn_offset + 4 + SAMPLE_LEN(16) <= total packet length.
-        // Equivalently: plaintext_payload >= 4 - pn_len (minimum to place the sample).
-        // For safety, ensure at least 4 bytes of plaintext regardless of PN length.
-        const min_plaintext: usize = 4;
         if (payload_len < min_plaintext) {
             const min_pad = min_plaintext - payload_len;
             @memset(tmp[fbs.seek..][0..min_pad], 0x00);
@@ -604,7 +609,8 @@ pub const PacketPacker = struct {
         if (pad_target > 0 and (pkt_type == .initial or pkt_type == .zero_rtt or pkt_type == .handshake)) {
             const current_total = fbs.seek - header_start + AEAD_TAG_LEN;
             if (current_total < pad_target) {
-                const pad_needed = @min(pad_target - current_total, tmp.len - fbs.seek);
+                // Within effective_max: the send buffer may be cut to the amplification budget.
+                const pad_needed = @min(pad_target - current_total, effective_max - fbs.seek);
                 @memset(tmp[fbs.seek..][0..pad_needed], 0x00);
                 fbs.seek += pad_needed;
             }
@@ -1069,6 +1075,46 @@ test "PacketPacker: coalesced Initial + Handshake" {
     // Both Initial and Handshake packet numbers should have been used
     try testing.expectEqual(@as(u64, 1), pkt_handler.next_pn[0]); // Initial PN 0 used
     try testing.expectEqual(@as(u64, 1), pkt_handler.next_pn[1]); // Handshake PN 0 used
+}
+
+test "PacketPacker: padding stays inside a buffer cut short by the amplification limit" {
+    const keys = try testServerKeys();
+    const long_cid = [_]u8{0x5a} ** 20;
+    const cases = [_]struct { cid: []const u8, budget: usize }{
+        .{ .cid = &.{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }, .budget = 300 },
+        .{ .cid = &long_cid, .budget = 70 },
+    };
+    for (cases) |c| {
+        var packer = PacketPacker.init(testing.allocator, true, c.cid, c.cid, 0x00000001);
+        var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+        defer pkt_handler.deinit();
+        var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+        defer crypto_mgr.deinit();
+        var streams = stream_mod.StreamsMap.init(testing.allocator, true);
+        defer streams.deinit();
+        var pending_frames = frame_mod.PendingFrameQueue{};
+
+        try crypto_mgr.getStream(0).writeData("Initial crypto");
+        try crypto_mgr.getStream(2).writeData(&([_]u8{0xcc} ** 2000));
+
+        var backing: [1500]u8 = @splat(0xee);
+        const written = try packer.packCoalesced(
+            backing[0..c.budget],
+            &pkt_handler,
+            &crypto_mgr,
+            &streams,
+            &pending_frames,
+            &keys.seal,
+            null,
+            &keys.seal,
+            null,
+            1000,
+            null,
+            false,
+        );
+        try testing.expect(written <= c.budget);
+        for (backing[c.budget..]) |b| try testing.expectEqual(@as(u8, 0xee), b);
+    }
 }
 
 test "PacketPacker: HANDSHAKE_DONE frame packed in 1-RTT" {
