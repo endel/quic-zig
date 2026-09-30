@@ -646,6 +646,29 @@ test "ws: send refuses to queue past max_send_buffer for a peer that isn't readi
     try testing.expect(h.handler.ws.?.bufferedAmount() <= 256 * 1024);
 }
 
+test "http1: a client that sends but never reads cannot grow the send queue without end" {
+    // Pipelined requests were all answered as they came, so a client that
+    // never read queued responses until the server ran out of memory.
+    var h: Harness = undefined;
+    try h.init(29459, .{ .tls = false, .static_dir = "src/http1" });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+
+    const req = "GET /missing.txt HTTP/1.1\r\nHost: a\r\n\r\n";
+    var reqs: [req.len * 512]u8 = undefined;
+    for (0..512) |i| @memcpy(reqs[i * req.len ..][0..req.len], req);
+    var off: usize = 0;
+    for (0..3000) |_| {
+        const rc = std.c.send(c.fd, reqs[off..].ptr, reqs.len - off, 0);
+        if (rc > 0) off = (off + @as(usize, @intCast(rc))) % req.len;
+        try h.step();
+    }
+    const conn = h.server.http1_server.?.conns.?;
+    try testing.expect(conn.sock.buffered() <= socket.high_water + 16 * 1024);
+}
+
 test "ws: over TLS, with ALPN http/1.1" {
     var h: Harness = undefined;
     try h.init(29447, .{});

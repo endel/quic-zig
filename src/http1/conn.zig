@@ -318,7 +318,17 @@ pub const Conn = struct {
     }
 
     pub fn onSocketWritable(self: *Conn) void {
-        if (self.phase == .static_body) self.pumpFile();
+        switch (self.phase) {
+            .static_body => self.pumpFile(),
+            // Output drained after afterInput paused for it: read again, and
+            // answer what was left buffered.
+            .head, .ws_open, .ws_closing => {
+                if (!self.sock.read_paused) return;
+                self.sock.resumeRead();
+                if (self.unreadLen() > 0) self.process();
+            },
+            .closing => {},
+        }
     }
 
     pub fn onSocketClosed(self: *Conn) void {
@@ -422,7 +432,9 @@ pub const Conn = struct {
         self.processing = true;
         defer self.processing = false;
         var pos: usize = 0;
-        while (self.sock.isOpen()) {
+        // Past high_water the rest waits: a peer that sends and never reads
+        // would otherwise have every pipelined request answered into memory.
+        while (self.sock.isOpen() and self.sock.buffered() <= socket.high_water) {
             const used = switch (self.phase) {
                 .head => self.processHead(buf[pos..]),
                 .ws_open, .ws_closing => self.processFrame(buf[pos..]),
@@ -440,6 +452,8 @@ pub const Conn = struct {
 
     fn afterInput(self: *Conn) void {
         if (self.phase == .static_body and self.unreadLen() > max_pipelined_input) self.sock.pauseRead();
+        // Resumed by onSocketWritable once the output drains.
+        if (self.sock.buffered() > socket.high_water) self.sock.pauseRead();
     }
 
     fn compactInput(self: *Conn) void {

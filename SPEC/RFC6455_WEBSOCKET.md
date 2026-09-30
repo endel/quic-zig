@@ -94,6 +94,9 @@ config table.
 - **The send buffer is bounded.** `WsConn.send` refuses to queue more than
   `max_send_buffer` bytes (`error.SendBufferFull`) and queues nothing when
   it refuses. What to do with a slow peer is the application's decision.
+- **A peer that doesn't read stops being read.** Past 256 KiB of queued
+  output, a connection stops reading and answering (pipelined requests,
+  pings) until the queue drains below 64 KiB.
 - **Origin isn't checked.** `onWsUpgrade` can read it with
   `req.header("origin")`. A server that authenticates by cookie must check
   it (RFC 6455 §10.2).
