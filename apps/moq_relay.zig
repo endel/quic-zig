@@ -403,6 +403,23 @@ const RelayHandler = struct {
         for (&self.pending) |*pn| {
             if (pn.active and pn.client_idx == ci) pn.active = false;
         }
+        // Outputs other clients forward to it: the slot is about to be
+        // reused, and its stream ids would name a newcomer's streams.
+        for (&self.clients) |*c| {
+            if (!c.active) continue;
+            for (&c.fwd_states) |*fs| {
+                var i: usize = 0;
+                while (i < fs.out_count) {
+                    if (fs.out_sub_idx[i] != ci) {
+                        i += 1;
+                        continue;
+                    }
+                    fs.out_count -= 1;
+                    fs.out_sub_idx[i] = fs.out_sub_idx[fs.out_count];
+                    fs.out_stream_ids[i] = fs.out_stream_ids[fs.out_count];
+                }
+            }
+        }
         self.clients[ci] = .{};
     }
 
@@ -1442,4 +1459,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("Video demo: https://127.0.0.1:{d}/moq_video.html\n", .{port});
     std.debug.print("Clock demo: https://127.0.0.1:{d}/moq.html\n\n", .{port});
     try server.run();
+}
+
+test "a subscriber leaving takes its outputs with it" {
+    // Forwarding named subscribers by table index: the next client in the
+    // slot got the rest of the group on the leaver's stream ids, which could
+    // be its own streams for another track.
+    const r = try std.testing.allocator.create(RelayHandler);
+    defer std.testing.allocator.destroy(r);
+    r.* = .{};
+    var entries: [3]cm.ConnEntry = undefined;
+    for (0..3) |i| r.clients[i] = .{ .active = true, .entry = &entries[i] };
+    const fs = r.clients[0].fwdState(3).?;
+    fs.* = .{ .active = true, .out_count = 2 };
+    fs.out_sub_idx[0] = 1;
+    fs.out_stream_ids[0] = 7;
+    fs.out_sub_idx[1] = 2;
+    fs.out_stream_ids[1] = 11;
+
+    var gone: event_loop.Session = .{ .entry = &entries[1] };
+    r.onSessionClosed(&gone, 0, 0, "");
+    try std.testing.expectEqual(@as(usize, 1), fs.out_count);
+    try std.testing.expectEqual(@as(usize, 2), fs.out_sub_idx[0]);
+    try std.testing.expectEqual(@as(u64, 11), fs.out_stream_ids[0]);
 }
