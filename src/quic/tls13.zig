@@ -45,6 +45,16 @@ pub const PrivateKeyAlgorithm = enum {
     rsa,
 };
 
+/// What a client offers in signature_algorithms, and so all a server's
+/// CertificateVerify may use.
+const client_signature_schemes = [_]tls.SignatureScheme{
+    .ed25519,
+    .ecdsa_secp256r1_sha256,
+    .rsa_pss_rsae_sha256,
+    .rsa_pss_rsae_sha384,
+    .rsa_pss_rsae_sha512,
+};
+
 /// The CertificateVerify scheme for a key, from the client's
 /// signature_algorithms (the list body: big-endian u16s). Null when the
 /// client offers none that fits.
@@ -1786,6 +1796,8 @@ pub const Tls13Handshake = struct {
         pos += 3;
 
         if (pos + cert_list_len > body.len) return error.DecodeError;
+        // RFC 8446 §4.4.2.4: with no leaf there is nothing to verify against.
+        if (cert_list_len == 0) return error.DecodeError;
 
         const cert_list_end = pos + cert_list_len;
         var cert_index: usize = 0;
@@ -1813,11 +1825,11 @@ pub const Tls13Handshake = struct {
                     const cert: Certificate = .{ .buffer = cert_der, .index = 0 };
                     const parsed = cert.parse() catch return error.BadCertificate;
                     const pub_key = parsed.pubKey();
-                    if (pub_key.len <= self.leaf_pub_key_buf.len) {
-                        @memcpy(self.leaf_pub_key_buf[0..pub_key.len], pub_key);
-                        self.leaf_pub_key_len = @intCast(pub_key.len);
-                        self.leaf_pub_key_algo = std.meta.activeTag(parsed.pub_key_algo);
-                    }
+                    // Unstored, CertificateVerify could not be checked.
+                    if (pub_key.len > self.leaf_pub_key_buf.len) return error.BadCertificate;
+                    @memcpy(self.leaf_pub_key_buf[0..pub_key.len], pub_key);
+                    self.leaf_pub_key_len = @intCast(pub_key.len);
+                    self.leaf_pub_key_algo = std.meta.activeTag(parsed.pub_key_algo);
 
                     var digest: [32]u8 = undefined;
                     std.crypto.hash.sha2.Sha256.hash(cert_der, &digest, .{});
@@ -1835,11 +1847,11 @@ pub const Tls13Handshake = struct {
                 if (cert_index == 0) {
                     // Leaf cert: extract public key for CertificateVerify
                     const pub_key = parsed.pubKey();
-                    if (pub_key.len <= self.leaf_pub_key_buf.len) {
-                        @memcpy(self.leaf_pub_key_buf[0..pub_key.len], pub_key);
-                        self.leaf_pub_key_len = @intCast(pub_key.len);
-                        self.leaf_pub_key_algo = std.meta.activeTag(parsed.pub_key_algo);
-                    }
+                    // Unstored, CertificateVerify could not be checked.
+                    if (pub_key.len > self.leaf_pub_key_buf.len) return error.BadCertificate;
+                    @memcpy(self.leaf_pub_key_buf[0..pub_key.len], pub_key);
+                    self.leaf_pub_key_len = @intCast(pub_key.len);
+                    self.leaf_pub_key_algo = std.meta.activeTag(parsed.pub_key_algo);
 
                     // Verify hostname if SNI was set
                     if (self.config.server_name) |server_name| {
@@ -1878,7 +1890,8 @@ pub const Tls13Handshake = struct {
 
         if (msg[0] != @intFromEnum(tls.HandshakeType.certificate_verify)) return error.UnexpectedMessage;
 
-        if (!self.config.skip_cert_verify and self.leaf_pub_key_len > 0) {
+        if (!self.config.skip_cert_verify) {
+            if (self.leaf_pub_key_len == 0) return error.BadCertificateVerify;
             // Get transcript hash BEFORE updating with CertificateVerify
             const transcript_hash = self.transcript.current();
 
@@ -1886,6 +1899,10 @@ pub const Tls13Handshake = struct {
             if (body.len < 4) return error.DecodeError;
 
             const sig_algo = (@as(u16, body[0]) << 8) | @as(u16, body[1]);
+            // RFC 8446 §4.4.3: one of the schemes we offered.
+            for (client_signature_schemes) |offered| {
+                if (sig_algo == @intFromEnum(offered)) break;
+            } else return error.IllegalParameter;
             const sig_len = (@as(usize, body[2]) << 8) | @as(usize, body[3]);
             if (body.len < 4 + sig_len) return error.DecodeError;
             const sig_bytes = body[4..][0..sig_len];
@@ -2958,19 +2975,14 @@ fn buildClientHello(
     pos += 65;
 
     // signature_algorithms extension
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.signature_algorithms), 2 + 10);
-    writeU16(buf[pos..], 10); // list length (5 algorithms x 2 bytes)
+    const sig_list_len: u16 = 2 * client_signature_schemes.len;
+    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.signature_algorithms), 2 + sig_list_len);
+    writeU16(buf[pos..], sig_list_len);
     pos += 2;
-    writeU16(buf[pos..], @intFromEnum(tls.SignatureScheme.ed25519));
-    pos += 2;
-    writeU16(buf[pos..], @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256));
-    pos += 2;
-    writeU16(buf[pos..], @intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha256));
-    pos += 2;
-    writeU16(buf[pos..], @intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha384));
-    pos += 2;
-    writeU16(buf[pos..], @intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha512));
-    pos += 2;
+    for (client_signature_schemes) |scheme| {
+        writeU16(buf[pos..], @intFromEnum(scheme));
+        pos += 2;
+    }
 
     // supported_groups extension
     pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.supported_groups), 2 + 4);
@@ -4425,6 +4437,40 @@ test "client answers a CertificateRequest with an empty Certificate" {
     try std.testing.expectEqual(@as(usize, 8 + 36), out.len);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x0b, 0, 0, 4, 0, 0, 0, 0 }, out[0..8]);
     try std.testing.expectEqual(@intFromEnum(tls.HandshakeType.finished), out[8]);
+}
+
+test "client: an empty Certificate from the server ends the handshake" {
+    // RFC 8446 4.4.2.4. With no leaf there was no key to check the
+    // CertificateVerify against, and it was skipped: anyone could finish
+    // the handshake, CA bundle or pins notwithstanding.
+    var bundle: Certificate.Bundle = .{ .map = .empty, .bytes = .empty };
+    defer bundle.deinit(std.testing.allocator);
+    const pins = [_][32]u8{@splat(1)};
+    for ([_]TlsConfig{
+        .{ .cert_chain_der = &.{}, .private_key_bytes = &.{}, .alpn = &[_][]const u8{"h3"}, .server_name = "localhost", .skip_cert_verify = false, .ca_bundle = &bundle },
+        .{ .cert_chain_der = &.{}, .private_key_bytes = &.{}, .alpn = &[_][]const u8{"h3"}, .server_name = "localhost", .skip_cert_verify = false, .cert_hashes = &pins },
+    }) |config| {
+        var client = Tls13Handshake.initClient(config, .{});
+        client.state = .client_wait_certificate;
+        client.provideData(&.{ 0x0b, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00 });
+        try std.testing.expectError(error.DecodeError, client.step());
+    }
+}
+
+test "client: a CertificateVerify in a scheme it never offered is refused" {
+    // RFC 8446 4.4.3: ecdsa_secp384r1_sha384 is verifiable but not offered.
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+        .skip_cert_verify = false,
+    }, .{});
+    client.state = .client_wait_certificate_verify;
+    client.leaf_pub_key_len = 65;
+    client.leaf_pub_key_algo = .X9_62_id_ecPublicKey;
+    client.provideData(&.{ 0x0f, 0x00, 0x00, 0x06, 0x05, 0x03, 0x00, 0x02, 0x30, 0x00 });
+    try std.testing.expectError(error.IllegalParameter, client.step());
 }
 
 test "client without a CertificateRequest sends only Finished" {
