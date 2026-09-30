@@ -36,9 +36,20 @@ const QueuedEvent = struct {
     error_code: u32 = 0, // SESSION_CLOSED
     extra_id: u64 = 0, // stream_id for BIDI/UNI, session_id for STREAM_DATA
     data: ?[]u8 = null, // owned copy — freed when event is consumed
+    /// Bytes of `data` already delivered, in parts.
+    sent: usize = 0,
 
     fn deinit(self: *QueuedEvent, allocator: Allocator) void {
         if (self.data) |d| allocator.free(d);
+    }
+
+    fn payload(self: *const QueuedEvent) []const u8 {
+        const d = self.data orelse return &.{};
+        return d[self.sent..];
+    }
+
+    fn headerSize(self: *const QueuedEvent) usize {
+        return HEADER_SIZE + self.extendedSize();
     }
 
     fn extendedSize(self: *const QueuedEvent) usize {
@@ -50,22 +61,21 @@ const QueuedEvent = struct {
     }
 
     fn totalSize(self: *const QueuedEvent) usize {
-        return HEADER_SIZE + self.extendedSize() + (if (self.data) |d| d.len else 0);
+        return self.headerSize() + self.payload().len;
     }
 
-    /// Serialize into caller-provided buffer. Returns bytes written.
-    fn serialize(self: *const QueuedEvent, buf: [*]u8, buf_len: u32) u32 {
-        const total = self.totalSize();
-        if (total > buf_len) return 0;
-
-        const data_len: u32 = if (self.data) |d| @intCast(d.len) else 0;
-        const out = buf[0..buf_len];
+    /// Serialize with the first `n` bytes of the payload into `out`, which
+    /// must hold them. Returns bytes written.
+    fn serialize(self: *const QueuedEvent, out: []u8, n: usize) u32 {
+        const data = self.payload()[0..n];
+        // FIN goes with the last part.
+        const flags = if (self.event_type == .stream_data and n < self.payload().len) self.flags & ~@as(u8, 1) else self.flags;
 
         // Fixed header (24 bytes, little-endian)
         out[0] = @intFromEnum(self.event_type);
-        out[1] = self.flags;
+        out[1] = flags;
         std.mem.writeInt(u16, out[2..4], 0, .little); // reserved
-        std.mem.writeInt(u32, out[4..8], data_len, .little);
+        std.mem.writeInt(u32, out[4..8], @intCast(n), .little);
         std.mem.writeInt(u64, out[8..16], self.client_id, .little);
         std.mem.writeInt(u64, out[16..24], self.id1, .little);
 
@@ -83,12 +93,8 @@ const QueuedEvent = struct {
             else => {},
         }
 
-        // Variable-length data
-        if (self.data) |d| {
-            @memcpy(out[offset .. offset + d.len], d);
-        }
-
-        return @intCast(total);
+        @memcpy(out[offset..][0..n], data);
+        return @intCast(offset + n);
     }
 };
 
@@ -183,14 +189,53 @@ pub const CApiHandler = struct {
     }
 
     /// Writes the next event into `buf`. Returns its size, or 0 when there
-    /// is none or it doesn't fit.
+    /// is none, or `buf` can't hold its header and a byte of stream data.
+    ///
+    /// An event never waits for a bigger buffer, which the host may never
+    /// bring: stream data comes in parts, a close reason is cut short, and
+    /// a datagram or CONNECT path that doesn't fit is dropped.
     fn poll(self: *CApiHandler, buf: []u8) u32 {
-        const next = self.event_queue.frontPtr() orelse return 0;
-        if (next.totalSize() > buf.len) return 0;
+        while (self.event_queue.frontPtr()) |ev| {
+            const head = ev.headerSize();
+            if (head > buf.len) return 0;
+            const room = buf.len - head;
+            const len = ev.payload().len;
+            if (len <= room) return self.take(buf, len, true);
+            switch (ev.event_type) {
+                .stream_data => return if (room > 0) self.take(buf, room, false) else 0,
+                .session_closed => return self.take(buf, room, true),
+                .connect_request => {
+                    // Cut short, it would name another resource.
+                    if (self.client_to_entry.get(ev.client_id)) |entry| {
+                        var session: event_loop.Session = .{ .entry = entry };
+                        session.resetRequest(ev.id1, @intFromEnum(quic.h3.H3Error.request_rejected));
+                    }
+                    self.discard();
+                },
+                else => self.discard(),
+            }
+        }
+        return 0;
+    }
+
+    /// Writes the head event with `n` bytes of its payload. Pops it once
+    /// the payload is out, or when `last` drops the rest.
+    fn take(self: *CApiHandler, buf: []u8, n: usize, last: bool) u32 {
+        const ev = self.event_queue.frontPtr().?;
+        const written = ev.serialize(buf, n);
+        if (!last and n < ev.payload().len) {
+            ev.sent += n;
+            self.release(ev.client_id, n);
+            return written;
+        }
+        self.discard();
+        return written;
+    }
+
+    fn discard(self: *CApiHandler) void {
         var ev = self.event_queue.popFront().?;
         defer ev.deinit(self.allocator);
-        self.release(ev.client_id, if (ev.data) |d| d.len else 0);
-        return ev.serialize(buf.ptr, @intCast(buf.len));
+        self.release(ev.client_id, ev.payload().len);
     }
 
     /// Scan for closed connections and emit CLIENT_DISCONNECTED events.
@@ -618,4 +663,45 @@ test "c_api: a peer the host isn't keeping up with is held back, not queued" {
     while (queuedBytes(h) > resume_client_backlog) try testing.expect(qz_server_poll(&ws, &buf, buf.len) > 0);
     try testing.expect(!p.wt.isStreamPaused(4));
     try testing.expect(!p.wt.isStreamPaused(8));
+}
+
+test "c_api: an event too big for the host's buffer doesn't stall the queue" {
+    // It stayed at the head, and poll's 0 reads as "no events", for good.
+    var ws: WtServer = undefined;
+    testServer(&ws);
+    const h = &ws.handler;
+    defer h.deinit();
+    var p: TestPeer = .{};
+    p.init();
+    defer p.deinit();
+    var s = p.session();
+
+    const big: [10 * 1024]u8 = @splat('b');
+    h.onConnectRequest(&s, 0, &big);
+    h.onDatagram(&s, 0, &big);
+    h.onStreamData(&s, 4, &big, true);
+    h.onSessionClosed(&s, 0, 7, big[0..1024]);
+
+    var buf: [4096]u8 = undefined;
+    var got: usize = 0;
+    var fin = false;
+    while (true) {
+        const n = qz_server_poll(&ws, &buf, buf.len);
+        try testing.expect(n > 0);
+        const len = std.mem.readInt(u32, buf[4..8], .little);
+        switch (@as(EventType, @enumFromInt(buf[0]))) {
+            .stream_data => {
+                try testing.expect(!fin);
+                try testing.expectEqual(n, HEADER_SIZE + 8 + len);
+                got += len;
+                fin = buf[1] & 1 != 0;
+            },
+            .session_closed => break,
+            // A path can't be cut short, nor a datagram: both are dropped.
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(big.len, got);
+    try testing.expect(fin);
+    try testing.expectEqual(@as(usize, 0), h.event_queue.len);
 }
