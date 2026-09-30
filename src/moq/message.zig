@@ -444,7 +444,7 @@ fn decodeSubscribeLike(payload: []const u8, ns_buf: *NamespaceBuf, draft: versio
             try wire.readVarInt(&fbs)
         else
             0,
-        .track_namespace = wire.readTuple(&fbs, ns_buf) catch return Error.MalformedMessage,
+        .track_namespace = wire.readNamespace(&fbs, ns_buf) catch return Error.MalformedMessage,
         .track_name = try wire.readVarBytesZc(&fbs),
     };
     var params: [MAX_PARAMS]Param = undefined;
@@ -607,7 +607,7 @@ pub fn decodePublish(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.
             try wire.readVarInt(&fbs)
         else
             0,
-        .track_namespace = wire.readTuple(&fbs, ns_buf) catch return Error.MalformedMessage,
+        .track_namespace = wire.readNamespace(&fbs, ns_buf) catch return Error.MalformedMessage,
         .track_name = try wire.readVarBytesZc(&fbs),
         .track_alias = try wire.readVarInt(&fbs),
     };
@@ -788,7 +788,7 @@ pub fn decodeFetch(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Dr
             .request_id = request_id,
             .required_request_id_delta = delta,
             .body = .{ .standalone = .{
-                .track_namespace = wire.readTuple(&fbs, ns_buf) catch return Error.MalformedMessage,
+                .track_namespace = wire.readNamespace(&fbs, ns_buf) catch return Error.MalformedMessage,
                 .track_name = try wire.readVarBytesZc(&fbs),
                 .start = .{ .group = try wire.readVarInt(&fbs), .object = try wire.readVarInt(&fbs) },
                 .end = .{ .group = try wire.readVarInt(&fbs), .object = try wire.readVarInt(&fbs) },
@@ -905,7 +905,7 @@ pub fn decodePublishNamespace(payload: []const u8, ns_buf: *NamespaceBuf, draft:
             try wire.readVarInt(&fbs)
         else
             0,
-        .track_namespace = wire.readTuple(&fbs, ns_buf) catch return Error.MalformedMessage,
+        .track_namespace = wire.readNamespace(&fbs, ns_buf) catch return Error.MalformedMessage,
     };
     var params: [MAX_PARAMS]Param = undefined;
     _ = try readParams(&fbs, &params);
@@ -1418,6 +1418,24 @@ test "PUBLISH_NAMESPACE has the request id, delta and parameter count" {
     const pn = try decodePublishNamespace(body, &ns_buf, .draft_17);
     try testing.expectEqual(@as(usize, 2), pn.track_namespace.len);
     try testing.expectEqualStrings("interop", pn.track_namespace[1]);
+}
+
+test "a namespace has 1 to 32 fields and at most 4096 bytes" {
+    // An empty one prefixes every namespace: a relay took it for a
+    // wildcard owner of all of them.
+    const long = "x" ** 2049;
+    const cases = [_][]const []const u8{ &.{}, &.{ long, long } };
+    var buf: [8192]u8 = undefined;
+    var ns_buf: NamespaceBuf = undefined;
+    for (cases) |ns| {
+        var fbs = io.fixedBufferStream(&buf);
+        try writePublishNamespace(&fbs, .{ .request_id = 0, .track_namespace = ns }, .draft_17);
+        const p = try parseEnvelope(buf[0..fbs.seek]);
+        try testing.expectError(error.MalformedMessage, decodePublishNamespace(p.env.payload, &ns_buf, .draft_17));
+    }
+    var fbs = io.fixedBufferStream(&buf);
+    try writePublishNamespace(&fbs, .{ .request_id = 0, .track_namespace = &.{"live"} }, .draft_17);
+    _ = try decodePublishNamespace((try parseEnvelope(buf[0..fbs.seek])).env.payload, &ns_buf, .draft_17);
 }
 
 test "SUBSCRIBE_NAMESPACE carries its subscribe options" {

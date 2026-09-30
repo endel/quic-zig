@@ -30,6 +30,7 @@ pub const Error = error{
     DeltaOverflow,
     KeyOrderViolation,
     ValueTooLong,
+    EmptyNamespace,
 };
 
 pub fn varIntLength(value: u64) usize {
@@ -256,8 +257,9 @@ pub const KvIterator = struct {
 };
 
 // Track Namespace tuple: count (varint) followed by N length-prefixed parts.
-// Spec caps the tuple at 32 parts.
+// Spec caps the tuple at 32 parts, and a full track name at 4096 bytes.
 pub const MAX_TUPLE_PARTS: usize = 32;
+pub const MAX_TUPLE_BYTES: usize = 4096;
 
 pub fn writeTuple(writer: anytype, parts: []const []const u8) !void {
     if (parts.len > MAX_TUPLE_PARTS) return Error.ValueTooLong;
@@ -271,8 +273,21 @@ pub fn readTuple(fbs: *io.FixedBufferStream([]const u8), out: [][]const u8) ![][
     const count = try readVarInt(fbs);
     if (count > out.len) return Error.ValueTooLong;
     const n: usize = @intCast(count);
-    for (0..n) |i| out[i] = try readVarBytesZc(fbs);
+    var total: usize = 0;
+    for (0..n) |i| {
+        out[i] = try readVarBytesZc(fbs);
+        total += out[i].len;
+        if (total > MAX_TUPLE_BYTES) return Error.ValueTooLong;
+    }
     return out[0..n];
+}
+
+/// A full track namespace: a tuple of at least one field (draft §2.4.1).
+/// Prefixes and suffixes are plain tuples, which may be empty.
+pub fn readNamespace(fbs: *io.FixedBufferStream([]const u8), out: [][]const u8) ![][]const u8 {
+    const t = try readTuple(fbs, out);
+    if (t.len == 0) return Error.EmptyNamespace;
+    return t;
 }
 
 pub fn tupleEncodedLen(parts: []const []const u8) usize {
