@@ -37,10 +37,20 @@ pub const CidKey = struct {
 /// cannot time-leak token bytes (RFC 9000 §10.3.1).
 pub const ResetKey = [16]u8;
 
+fn randomSeed() u64 {
+    var b: [8]u8 = undefined;
+    sys.randomBytes(&b);
+    return std.mem.readInt(u64, &b, .little);
+}
+
 /// Hash/equality context for CidKey in HashMap.
 pub const CidKeyContext = struct {
-    pub fn hash(_: CidKeyContext, key: CidKey) u64 {
-        return std.hash.Wyhash.hash(0, key.buf[0..key.len]);
+    /// Random per manager: clients choose the DCIDs hashed, and under a
+    /// fixed seed colliding ones can be computed offline.
+    seed: u64 = 0,
+
+    pub fn hash(self: CidKeyContext, key: CidKey) u64 {
+        return std.hash.Wyhash.hash(self.seed, key.buf[0..key.len]);
     }
 
     pub fn eql(_: CidKeyContext, a: CidKey, b: CidKey) bool {
@@ -300,7 +310,7 @@ pub const ConnectionManager = struct {
         cc.static_reset_key = static_reset_key;
         return .{
             .allocator = allocator,
-            .cid_map = std.HashMap(CidKey, *ConnEntry, CidKeyContext, 80).init(allocator),
+            .cid_map = std.HashMap(CidKey, *ConnEntry, CidKeyContext, 80).initContext(allocator, .{ .seed = randomSeed() }),
             .entries = .{ .items = &.{}, .capacity = 0 },
             .reset_lookup_key = lookup_key,
             .tls_config = tls_config,
@@ -816,6 +826,17 @@ pub fn writeRefusal(header: packet.Header, out: []u8) !usize {
 }
 
 // Tests
+test "the CID map hashes under a seed of its own" {
+    // Clients choose the DCIDs it hashes; under a fixed seed, colliding ones
+    // can be computed offline and every lookup made to walk them.
+    var a = testManager(std.testing.allocator);
+    defer a.deinit();
+    var b = testManager(std.testing.allocator);
+    defer b.deinit();
+    const key = CidKey.fromSlice(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try std.testing.expect(a.cid_map.ctx.hash(key) != b.cid_map.ctx.hash(key));
+}
+
 test "CidKey roundtrip" {
     const cid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
     const key = CidKey.fromSlice(&cid);
