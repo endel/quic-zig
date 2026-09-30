@@ -2975,9 +2975,10 @@ pub fn Client(comptime Handler: type) type {
                     std.log.warn("datagram truncated at {d} bytes — raise MAX_RECV_DATAGRAM", .{recv_result.bytes_read});
                 }
 
-                // Update remote addr (may change due to preferred address migration)
-                self.remote_addr = recv_result.from_addr;
-
+                // remote_addr stays the configured server's: before the
+                // handshake nothing received is authenticated, and after it
+                // the connection's own path (migration, preferred_address)
+                // is where we send.
                 self.conn.handleDatagram(self.recv_buf[0..recv_result.bytes_read], .{
                     .to = self.local_addr,
                     .from = recv_result.from_addr,
@@ -3729,6 +3730,47 @@ test "Client: closeConnection from a handler arms the run loop's exit" {
     var session = client.makeSession();
     session.closeConnection();
     try testing.expect(client.stopping);
+}
+
+test "Client: a datagram from elsewhere does not redirect the handshake" {
+    // The client sent its Initials to whatever address it last heard from,
+    // so one spoofed datagram to its port pointed them at a victim.
+    const H = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    };
+    var handler = H{};
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var client = try Client(H).init(testing.allocator, &handler, .{
+        .port = 29441,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    defer client.deinit();
+    const server_addr = client.remote_addr;
+    client.start();
+    try loop.run(.no_wait);
+
+    var to = try boundAddress(client.sockfd);
+    to.in.sa.addr = std.mem.nativeToBig(u32, 0x7f000001);
+    const spoofer = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(spoofer);
+    const junk = [_]u8{0x40} ** 64;
+    _ = try sys.sendto(spoofer, &junk, 0, &to.any, to.getOsSockLen());
+    for (0..20) |_| {
+        try loop.run(.no_wait);
+        sys.sleepNs(std.time.ns_per_ms);
+    }
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&server_addr), std.mem.asBytes(&client.remote_addr));
+
+    client.stop();
+    const Stopped = struct {
+        fn done(c: *Client(H)) bool {
+            return c.isStopped();
+        }
+    };
+    try runUntil(&loop, &client, Stopped.done, 5000);
 }
 
 test "two clients share one loop" {
