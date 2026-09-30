@@ -248,6 +248,14 @@ const Relay = struct {
         for (events[0..n]) |ev| self.handle(i, ev);
     }
 
+    /// Ends the stream like a FIN would, passing the reset on to whatever it
+    /// fed.
+    pub fn onStreamReset(self: *Self, session: *event_loop.Session, _: u64, stream_id: u64, code: u32) void {
+        const i = self.find(session.entry) orelse return;
+        self.clients[i].sess.release(stream_id);
+        self.streamGone(i, stream_id, code);
+    }
+
     pub fn onSessionClosed(self: *Self, session: *event_loop.Session, _: u64, _: u32, _: []const u8) void {
         const i = self.find(session.entry) orelse return;
         self.releaseClient(i);
@@ -280,7 +288,7 @@ const Relay = struct {
             .fetch_request => |f| {
                 self.clients[ci].sess.resetStream(f.stream_id, lite_session.ResetCode.NOT_FOUND);
             },
-            .stream_finished => |f| self.streamGone(ci, f.stream_id),
+            .stream_finished => |f| self.streamGone(ci, f.stream_id, null),
             else => {},
         }
     }
@@ -481,23 +489,37 @@ const Relay = struct {
         f.active = false;
     }
 
-    fn streamGone(self: *Self, ci: usize, stream_id: u64) void {
+    /// A stream ended, by FIN or, with its code, by reset.
+    fn streamGone(self: *Self, ci: usize, stream_id: u64, reset: ?u64) void {
         // A downstream subscriber closing its subscribe stream unsubscribes;
         // tear the upstream one down with it.
         for (&self.subs) |*s| {
             if (!s.active) continue;
             if (s.down_ci == ci and s.down_stream == stream_id) {
-                self.clients[s.up_ci].sess.finishStream(s.up_stream);
+                self.endPartner(s.up_ci, s.up_stream, reset);
                 s.active = false;
                 print("client {d}: unsubscribed\n", .{ci});
             } else if (s.up_ci == ci and s.up_stream == stream_id) {
-                self.clients[s.down_ci].sess.finishStream(s.down_stream);
+                self.endPartner(s.down_ci, s.down_stream, reset);
                 s.active = false;
             }
         }
         for (&self.watches) |*w| {
             if (w.active and w.ci == ci and w.stream == stream_id) w.active = false;
         }
+        // A finished group arrives as group_end; only a reset ends one here.
+        const code = reset orelse return;
+        for (&self.flows) |*f| {
+            if (f.active and f.in_ci == ci and f.in_stream == stream_id) {
+                self.clients[f.out_ci].sess.resetStream(f.out_stream, code);
+                f.active = false;
+            }
+        }
+    }
+
+    fn endPartner(self: *Self, ci: usize, stream_id: u64, reset: ?u64) void {
+        const sess = &self.clients[ci].sess;
+        if (reset) |code| sess.resetStream(stream_id, code) else sess.finishStream(stream_id);
     }
 
     fn releaseClient(self: *Self, ci: usize) void {
@@ -584,4 +606,29 @@ test "only a broadcast's origin can end it" {
     try std.testing.expectEqual(@as(?usize, 0), r.originOf("alice"));
     r.originAnnounced(0, .{ .status = .ended, .suffix = "alice" });
     try std.testing.expectEqual(@as(?usize, null), r.originOf("alice"));
+}
+
+test "a stream the peer resets frees what it held" {
+    // Only a FIN freed them, so a client that cancelled by reset kept its
+    // slots until it left, and the relay-wide 64 ran out for everyone.
+    var r: Relay = .{};
+    var entries: [2]cm.ConnEntry = .{ .{ .conn = undefined }, .{ .conn = undefined } };
+    for (0..2) |i| {
+        r.clients[i].active = true;
+        r.clients[i].entry = &entries[i];
+        r.clients[i].ref = .{ .owner = &r, .idx = i };
+        r.clients[i].sess = Relay.Sess.init(&r.clients[i].ref);
+    }
+    r.subs[0] = .{ .active = true, .down_ci = 1, .down_stream = 4, .up_ci = 0, .up_stream = 1 };
+    r.flows[0] = .{ .active = true, .in_ci = 0, .in_stream = 3, .out_ci = 1, .out_stream = 7 };
+    r.watches[0] = .{ .active = true, .ci = 1, .stream = 8 };
+    var origin: event_loop.Session = .{ .entry = &entries[0] };
+    var subscriber: event_loop.Session = .{ .entry = &entries[1] };
+
+    r.onStreamReset(&subscriber, 0, 4, 0);
+    try std.testing.expect(!r.subs[0].active);
+    r.onStreamReset(&subscriber, 0, 8, 0);
+    try std.testing.expect(!r.watches[0].active);
+    r.onStreamReset(&origin, 0, 3, 0);
+    try std.testing.expect(!r.flows[0].active);
 }
