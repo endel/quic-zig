@@ -109,6 +109,23 @@ pub const FrameSorter = struct {
         self.chunks.deinit(self.allocator);
     }
 
+    /// Copies up to `out.len` contiguous bytes from the read position into
+    /// `out` without consuming them; returns how many there were.
+    pub fn peek(self: *const FrameSorter, out: []u8) usize {
+        var n: usize = 0;
+        var pos = self.read_pos;
+        for (self.chunks.items) |c| {
+            if (n == out.len or c.offset > pos) break;
+            if (c.end() <= pos) continue;
+            const skip: usize = @intCast(pos - c.offset);
+            const take = @min(out.len - n, c.data.len - skip);
+            @memcpy(out[n..][0..take], c.data[skip..][0..take]);
+            n += take;
+            pos += take;
+        }
+        return n;
+    }
+
     /// Frees the buffered data, keeping the offsets it reached.
     pub fn discard(self: *FrameSorter) void {
         for (self.chunks.items) |c| self.allocator.free(c.allocation());
@@ -515,6 +532,12 @@ pub const ReceiveStream = struct {
         self.sorter.fin_offset = final_size;
         // Never read now, and its connection credit is handed back at once.
         self.sorter.discard();
+    }
+
+    /// The next contiguous bytes, up to `out.len`, left unread.
+    pub fn peek(self: *const ReceiveStream, out: []u8) usize {
+        if (self.reset_err != null) return 0;
+        return self.sorter.peek(out);
     }
 
     /// Read contiguous data from the stream.

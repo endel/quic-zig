@@ -155,8 +155,12 @@ pub const H3Connection = struct {
     // reads them, even while their data sits unread.
     excluded_streams: std.AutoHashMap(u64, void),
 
-    // Streams that have received HEADERS (for DATA-before-HEADERS detection)
+    // How far each stream's received header sections have got.
     headers_received_streams: std.AutoHashMap(u64, HeaderPhase),
+    /// Set by the WebTransport layer, which classifies the peer's bidi
+    /// streams: until it has handed one over (a `stream_bufs` entry), its
+    /// bytes may be a WT preamble and are not ours to read.
+    defer_peer_bidi: bool = false,
 
     /// Request streams already reported as `request_cancelled`.
     cancelled_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -1258,6 +1262,8 @@ pub const H3Connection = struct {
     fn pollBidiStream(self: *H3Connection, stream_id: u64, stream: *stream_mod.Stream) !?H3Event {
         // Skip streams owned by the WebTransport layer
         if (self.excluded_streams.contains(stream_id)) return null;
+        if (self.defer_peer_bidi and !stream_mod.isLocal(stream_id, self.is_server) and
+            !self.stream_bufs.contains(stream_id)) return null;
 
         // The peer can walk away from the response after its request is
         // complete, so this is checked on finished streams too.

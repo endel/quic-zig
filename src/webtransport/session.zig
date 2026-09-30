@@ -197,6 +197,7 @@ pub const WebTransportConnection = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, h3: *h3_conn.H3Connection, quic: *quic_connection.Connection, is_server: bool) WebTransportConnection {
+        h3.defer_peer_bidi = true; // see identifyWtBidiStreams
         return .{
             .h3 = h3,
             .quic = quic,
@@ -1139,75 +1140,82 @@ pub const WebTransportConnection = struct {
     }
 
     /// Identify incoming WT bidirectional streams by reading type prefix.
+    const Classified = union(enum) { waiting, done, closed, wt: WtEvent };
+
+    /// Classify the peer's bidi streams, which H3 leaves alone until this has
+    /// (`H3Connection.defer_peer_bidi`): a WT stream is registered, anything
+    /// else handed to H3 unread. A stream whose preamble has not all arrived
+    /// waits without holding up the ones after it.
     fn identifyWtBidiStreams(self: *WebTransportConnection) !?WtEvent {
         const highest = self.quic.streams.highest_peer_bidi_stream_id orelse return null;
-        while (self.next_peer_bidi_to_examine <= highest) {
-            const stream_id = self.next_peer_bidi_to_examine;
-
-            // Already-classified streams: advance past them.
-            if (self.wt_bidi_streams.contains(stream_id) or
-                self.h3.finished_streams.contains(stream_id) or
-                self.getSession(stream_id) != null)
-            {
-                self.next_peer_bidi_to_examine += 4;
-                continue;
-            }
-
-            const stream = self.quic.streams.getStream(stream_id) orelse break;
-
-            // Need prefix bytes to identify. If nothing readable yet (e.g. stream
-            // opened but first STREAM frame not yet contiguous at offset 0),
-            // defer — do NOT advance the cursor, or we'll skip the stream forever.
-            const data = stream.recv.read() orelse break;
-            defer self.allocator.free(data);
-
-            // Prefix bytes arrived: commit the advance.
-            self.next_peer_bidi_to_examine += 4;
-
-            if (data.len == 0) continue;
-
-            var fbs = io.fixedBufferStream(data);
-            const reader = &fbs;
-            const stream_type = packet.readVarInt(reader) catch continue;
-
-            if (stream_type == WT_BIDI_STREAM_TYPE) {
-                const session_id = packet.readVarInt(reader) catch continue;
-
-                // Validate session ID: must be a client-initiated bidi stream (divisible by 4)
-                if (session_id % 4 != 0) {
-                    self.h3.closeWithError(.id_error, "invalid WT session ID");
-                    return null;
-                }
-
-                // Register the stream (even if session not yet accepted —
-                // the Go client may open bidi streams before CONNECT is processed).
-                try self.wt_bidi_streams.put(stream_id, session_id);
-                try self.h3.excluded_streams.put(stream_id, {});
-                if (self.getSession(session_id)) |session| session.fc.bidi.peerOpened();
-
-                // Buffer remaining data for delivery via pollWtStreamData.
-                // Always return .bidi_stream first so the application can register
-                // the stream before receiving .stream_data events.
-                if (fbs.seek < data.len) {
-                    const buf = try self.streamBuf(stream_id);
-                    try buf.appendSlice(self.allocator, data[fbs.seek..]);
-                }
-                return .{ .bidi_stream = .{
-                    .session_id = session_id,
-                    .stream_id = stream_id,
-                } };
-            } else {
-                // Not a WT stream — buffer for H3 to handle
-                var buf = self.h3.stream_bufs.getPtr(stream_id) orelse blk: {
-                    const new_buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
-                    try self.h3.stream_bufs.put(stream_id, new_buf);
-                    break :blk self.h3.stream_bufs.getPtr(stream_id).?;
-                };
-                try buf.appendSlice(self.allocator, data);
-                stream.recv.retained += data.len; // credited as H3 consumes it
+        var settled = true; // every stream below `id` is classified
+        var id = self.next_peer_bidi_to_examine;
+        while (id <= highest) : (id += 4) {
+            const c = try self.classifyBidi(id);
+            if (c == .waiting) settled = false else if (settled) self.next_peer_bidi_to_examine = id + 4;
+            switch (c) {
+                .waiting, .done => {},
+                .closed => return null,
+                .wt => |ev| return ev,
             }
         }
         return null;
+    }
+
+    fn classifyBidi(self: *WebTransportConnection, stream_id: u64) !Classified {
+        if (self.wt_bidi_streams.contains(stream_id) or
+            self.h3.stream_bufs.contains(stream_id) or
+            self.h3.finished_streams.contains(stream_id) or
+            self.getSession(stream_id) != null) return .done;
+        const stream = self.quic.streams.getStream(stream_id) orelse return .done; // reclaimed
+
+        // Type and session ID: two varints, 16 bytes at most.
+        var pre: [16]u8 = undefined;
+        const n = stream.recv.peek(&pre);
+        var fbs = io.fixedBufferStream(pre[0..n]);
+        const ended = stream.recv.reset_err != null or stream.recv.allReceived();
+        const stream_type = packet.readVarInt(&fbs) catch
+            return if (ended) self.handToH3(stream_id) else .waiting;
+        if (stream_type != WT_BIDI_STREAM_TYPE) return self.handToH3(stream_id);
+        const session_id = packet.readVarInt(&fbs) catch
+            return if (ended) self.handToH3(stream_id) else .waiting;
+
+        // Validate session ID: must be a client-initiated bidi stream (divisible by 4)
+        if (session_id % 4 != 0) {
+            self.h3.closeWithError(.id_error, "invalid WT session ID");
+            return .closed;
+        }
+
+        // Register the stream (even if session not yet accepted —
+        // the Go client may open bidi streams before CONNECT is processed).
+        try self.wt_bidi_streams.put(stream_id, session_id);
+        try self.h3.excluded_streams.put(stream_id, {});
+        if (self.getSession(session_id)) |session| session.fc.bidi.peerOpened();
+
+        // Take the preamble; what follows it in the same reads is buffered
+        // for pollWtStreamData, after .bidi_stream lets the application
+        // register the stream.
+        var left = fbs.seek;
+        while (left > 0) {
+            const data = stream.recv.read() orelse break;
+            defer self.allocator.free(data);
+            const take = @min(left, data.len);
+            left -= take;
+            if (take < data.len) {
+                const buf = try self.streamBuf(stream_id);
+                try buf.appendSlice(self.allocator, data[take..]);
+            }
+        }
+        return .{ .wt = .{ .bidi_stream = .{
+            .session_id = session_id,
+            .stream_id = stream_id,
+        } } };
+    }
+
+    /// Not a WT stream: H3 reads it from here on.
+    fn handToH3(self: *WebTransportConnection, stream_id: u64) !Classified {
+        try self.h3.stream_bufs.put(stream_id, .empty);
+        return .done;
     }
 
     /// Poll known WT streams for data, counting what arrives against the
@@ -2796,6 +2804,70 @@ test "WT: invalid session ID triggers H3_ID_ERROR on bidi stream" {
     try testing.expect(setup.quic_conn.local_err != null);
     try testing.expect(setup.quic_conn.local_err.?.is_app);
     try testing.expectEqual(@intFromEnum(h3_conn.H3Error.id_error), setup.quic_conn.local_err.?.code);
+}
+
+const Surfaced = struct { wt: bool = false, request: bool = false };
+
+/// Polls to quiescence: whether stream `wt_id` surfaced as a WT stream, and
+/// whether H3 surfaced any request.
+fn pollClassified(setup: *WtTestSetup, wt_id: u64) !Surfaced {
+    var r: Surfaced = .{};
+    while (try setup.wt.poll()) |ev| switch (ev) {
+        .bidi_stream => |b| r.wt = r.wt or b.stream_id == wt_id,
+        .request, .connect_request => r.request = true,
+        .stream_data => |sd| testing.allocator.free(sd.data),
+        else => {},
+    };
+    return r;
+}
+
+test "WT: bidi streams are classified before H3 reads them, however their bytes arrive" {
+    // H3 read an unclassified stream's preamble as an unknown frame and the
+    // payload after it as a request: forged headers from browser JS.
+    const get = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/secret" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qb: [256]u8 = undefined;
+    const ql = try qpack.encodeHeaders(&get, &qb);
+    var payload: [300]u8 = undefined;
+    var pfbs = io.fixedBufferStream(&payload);
+    try h3_frame.write(.{ .headers = qb[0..ql] }, &pfbs);
+
+    // A stream with nothing yet ahead of it.
+    {
+        var setup: WtTestSetup = undefined;
+        const session_id = try setup.initServer();
+        defer setup.deinit();
+        _ = try setup.quic_conn.streams.getOrCreateStream(4);
+        var buf: [320]u8 = undefined;
+        var pos = buildWtBidiPrefix(&buf, session_id);
+        @memcpy(buf[pos..][0..pfbs.seek], payload[0..pfbs.seek]);
+        pos += pfbs.seek;
+        try (try setup.quic_conn.streams.getOrCreateStream(8)).recv.handleStreamFrame(0, buf[0..pos], false);
+        const r = try pollClassified(&setup, 8);
+        try testing.expect(r.wt and !r.request);
+    }
+    // Its preamble split across reads.
+    {
+        var setup: WtTestSetup = undefined;
+        const session_id = try setup.initServer();
+        defer setup.deinit();
+        var buf: [320]u8 = undefined;
+        var pos = buildWtBidiPrefix(&buf, session_id);
+        @memcpy(buf[pos..][0..pfbs.seek], payload[0..pfbs.seek]);
+        pos += pfbs.seek;
+        const s4 = try setup.quic_conn.streams.getOrCreateStream(4);
+        try s4.recv.handleStreamFrame(0, buf[0..1], false);
+        var r = try pollClassified(&setup, 4);
+        try s4.recv.handleStreamFrame(1, buf[1..pos], false);
+        const later = try pollClassified(&setup, 4);
+        r.wt = r.wt or later.wt;
+        r.request = r.request or later.request;
+        try testing.expect(r.wt and !r.request);
+    }
 }
 
 test "WT: invalid session ID triggers H3_ID_ERROR on uni stream" {
