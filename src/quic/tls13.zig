@@ -1689,13 +1689,12 @@ pub const Tls13Handshake = struct {
                     return error.NoKeyShare;
                 }
             } else if (etype == @intFromEnum(tls.ExtensionType.pre_shared_key)) {
-                // Server accepted PSK: selected_identity(2) = 0x0000
-                if (elen >= 2) {
-                    const selected = readU16(ext_data[ext_pos..]);
-                    if (selected == 0) {
-                        self.using_psk = true;
-                    }
-                }
+                // RFC 8446 §4.2.11: only the one identity we offered. Resumption
+                // skips the certificate, so an unoffered PSK (all zeros) would
+                // let anyone finish the handshake.
+                if (self.config.session_ticket == null or elen != 2 or readU16(ext_data[ext_pos..]) != 0)
+                    return error.IllegalParameter;
+                self.using_psk = true;
             }
             ext_pos += elen;
         }
@@ -4204,6 +4203,29 @@ test "client: a ServerHello whose extensions overrun the message is a DecodeErro
     var client = clientAwaitingServerHello(null);
     client.provideData(testServerHello(&buf, &.{}, 0xffff));
     try std.testing.expectError(error.DecodeError, client.step());
+}
+
+test "client: a pre_shared_key it never offered is refused, not taken as resumption" {
+    // With no ticket the PSK would be all zeros: anyone could finish the
+    // handshake without a certificate.
+    var buf: [256]u8 = undefined;
+    const psk_ext = [_]u8{ 0x00, 0x29, 0x00, 0x02, 0x00, 0x00 };
+    var client = clientAwaitingServerHello(null);
+    client.provideData(testServerHello(&buf, &psk_ext, null));
+    try std.testing.expectError(error.IllegalParameter, client.step());
+
+    // One identity offered: selecting a second one is out of range.
+    var ticket = SessionTicket{ .psk = @splat(1), .lifetime = 3600, .ticket_len = 60 };
+    ticket.creation_time = sys.realtimeSeconds();
+    var resuming = clientAwaitingServerHello(&ticket);
+    resuming.provideData(testServerHello(&buf, &.{ 0x00, 0x29, 0x00, 0x02, 0x00, 0x01 }, null));
+    try std.testing.expectError(error.IllegalParameter, resuming.step());
+
+    // The identity it did offer is resumption.
+    var resumed = clientAwaitingServerHello(&ticket);
+    resumed.provideData(testServerHello(&buf, &psk_ext, null));
+    _ = try resumed.step();
+    try std.testing.expect(resumed.using_psk);
 }
 
 /// Runs a full handshake and returns the ticket the client took from it.
