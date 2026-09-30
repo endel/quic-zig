@@ -160,9 +160,6 @@ pub const WebTransportConnection = struct {
     wt_bidi_streams: std.AutoHashMap(u64, u64),
     wt_uni_streams: std.AutoHashMap(u64, u64),
 
-    // Streams whose type prefix hasn't been read yet
-    pending_uni_streams: std.AutoHashMap(u64, void),
-
     // Next peer-initiated bidi stream ID to examine for WT type prefix.
     // Peer-initiated bidi IDs are sequential: server sees 0, 4, 8, 12...
     // This counter advances as streams are identified, giving O(1) discovery
@@ -206,7 +203,6 @@ pub const WebTransportConnection = struct {
             .is_server = is_server,
             .wt_bidi_streams = std.AutoHashMap(u64, u64).init(allocator),
             .wt_uni_streams = std.AutoHashMap(u64, u64).init(allocator),
-            .pending_uni_streams = std.AutoHashMap(u64, void).init(allocator),
             .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
             .fin_delivered = std.AutoHashMap(u64, void).init(allocator),
             .reset_delivered = std.AutoHashMap(u64, ResetDelivery).init(allocator),
@@ -231,7 +227,6 @@ pub const WebTransportConnection = struct {
         self.paused_streams.deinit(self.allocator);
         self.wt_bidi_streams.deinit();
         self.wt_uni_streams.deinit();
-        self.pending_uni_streams.deinit();
     }
 
     /// Find a session by ID.
@@ -1084,7 +1079,8 @@ pub const WebTransportConnection = struct {
             if (self.h3.peer_control_stream_id != null and self.h3.peer_control_stream_id.? == stream_id) continue;
             if (self.h3.peer_qpack_enc_stream_id != null and self.h3.peer_qpack_enc_stream_id.? == stream_id) continue;
             if (self.h3.peer_qpack_dec_stream_id != null and self.h3.peer_qpack_dec_stream_id.? == stream_id) continue;
-            if (self.pending_uni_streams.contains(stream_id)) continue;
+            // Handed to H3 and abandoned as a type neither layer takes.
+            if (recv_stream.released) continue;
 
             // Try to read data (read() transfers ownership)
             const data = recv_stream.read() orelse {
@@ -1097,10 +1093,17 @@ pub const WebTransportConnection = struct {
 
             var fbs = io.fixedBufferStream(data);
             const reader = &fbs;
-            const stream_type = packet.readVarInt(reader) catch continue;
+            // Unparsable, it goes to H3 to be abandoned: the bytes are gone.
+            const stream_type = packet.readVarInt(reader) catch {
+                try self.h3.adoptUniStream(stream_id, data);
+                continue;
+            };
 
             if (stream_type == WT_UNI_STREAM_TYPE) {
-                const session_id = packet.readVarInt(reader) catch continue;
+                const session_id = packet.readVarInt(reader) catch {
+                    self.h3.abandonUniStream(stream_id);
+                    continue;
+                };
 
                 // Validate session ID: must be a client-initiated bidi stream (divisible by 4)
                 if (session_id % 4 != 0) {
@@ -1131,7 +1134,6 @@ pub const WebTransportConnection = struct {
             // the peer's control stream carries its SETTINGS in that first read
             // — so hand them over rather than drop them.
             try self.h3.adoptUniStream(stream_id, data);
-            try self.pending_uni_streams.put(stream_id, {});
         }
         return null;
     }
@@ -2817,6 +2819,24 @@ test "WT: invalid session ID triggers H3_ID_ERROR on uni stream" {
     try testing.expect(setup.quic_conn.local_err != null);
     try testing.expect(setup.quic_conn.local_err.?.is_app);
     try testing.expectEqual(@intFromEnum(h3_conn.H3Error.id_error), setup.quic_conn.local_err.?.code);
+}
+
+test "WT: a uni stream whose type does not parse is abandoned, not read again for one" {
+    // Dropping the bytes and retrying took whatever came next as the type.
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, &.{0x80}, false); // a 4-byte varint, cut short
+    while (try setup.wt.poll()) |_| {}
+
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+    try rs.handleStreamFrame(1, prefix_buf[0..prefix_len], false);
+    while (try setup.wt.poll()) |_| {}
+    try testing.expect(!setup.wt.wt_uni_streams.contains(14));
+    try testing.expect(rs.stop_sending_err != null);
 }
 
 test "WT: uni stream to unknown session gets BUFFERED_STREAM_REJECTED" {
