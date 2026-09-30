@@ -71,6 +71,13 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   switches it on for load signals of your own.
 - `Config.stateless_reply_rate` caps Version Negotiation, stateless reset and
   CONNECTION_REFUSED replies per second, each kind separately (default 200).
+- `websocket.min_receive_rate` (default 500 bytes/s): a WebSocket peer holding a
+  half-sent message, or leaving its output unread, must keep up this rate or is
+  dropped as silent. `0` counts any byte as a sign of life.
+- `Connection.sendBufferedBytes()` and `Session.sendBufferedBytes()`: bytes
+  written to all of a connection's streams and not yet sent.
+- C API: `ERR_INVALID_ARG` (-6) for a NULL handle, or a NULL pointer with a
+  non-zero length.
 
 ### Changed
 
@@ -79,6 +86,24 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   offers no scheme for the certificate, instead of signing anyway.
 - A server at `max_connections` now answers new clients with
   CONNECTION_REFUSED instead of ignoring them until they time out.
+- Request headers, and a CONNECT's path, are valid only during their callback:
+  every connection on an event loop decodes into one buffer. Copy what you keep.
+- HTTP/3 requests are held to RFC 9114: connection-specific fields, a second
+  request on one stream and a body that disagrees with `content-length` are
+  refused.
+- WebTransport endpoints hold peers to the QPACK table capacity they advertise,
+  which is zero.
+- Servers under `reuse_port` that share a `static_reset_key` send no stateless
+  resets unless `foreign_datagram` steers packets to their owner.
+- The HTTP/1.1 listener stops reading from a connection while more than 256 KiB
+  of its responses are unsent.
+- C API: `qz_server_poll` hands out stream data in parts when it doesn't fit
+  the buffer (FIN on the last part), drops a datagram that doesn't fit and
+  refuses a CONNECT whose path doesn't. Past 1 MiB queued for a client, its
+  streams are paused until the host catches up.
+- MoQ relays drop a subscriber more than 1 MiB behind on a group
+  (TOO_FAR_BEHIND in the MoQT relay), and the MoQT relay refuses namespaces
+  whose key would pass 256 bytes (NAMESPACE_TOO_LARGE).
 
 ### Fixed
 
@@ -154,6 +179,45 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   with H3_MESSAGE_ERROR. They are accepted, though not yet surfaced.
 - `Server.stop()` now refuses connections that arrive while it finishes;
   under steady arrivals they could keep it from ever finishing.
+
+### Security
+
+A security review found about 70 issues, all fixed below except three that
+need a design decision. Thanks @notramo for suggesting it
+([#44](https://github.com/endel/quic-zig/issues/44)).
+
+- Reachable with one packet or handshake: a stack overflow from an oversized
+  PSK identity; an infinite loop on a PADDING frame type encoded longer than
+  needed; crashes on overflowing ACK Delay and ACK_FREQUENCY values; a
+  use-after-free through retired connection IDs; buffer overflows and path
+  traversal in the `hq-interop` file server; padding written past an
+  amplification-limited buffer; Retry and NEW_TOKEN tokens that didn't bind an
+  IPv4 client on a dual-stack socket.
+- TLS and the handshake: the QUIC client could finish a handshake without
+  verifying the server (an empty Certificate message); the server accepted
+  1-RTT data before the client's Finished; ServerHello extensions were read
+  past the message. Handshake connection IDs, transport parameters and CRYPTO
+  levels are now validated, and a QUIC v2 client no longer switches versions
+  on an unauthenticated header.
+- QUIC: reset streams inflated flow-control and stream credit; replayed 0-RTT
+  and duplicate packets were processed again; clients followed server address
+  changes, and unvalidated paths escaped the amplification limit; BLOCKED,
+  PATH_CHALLENGE and datagram floods could starve the server; `reuse_port`
+  workers sharing a reset key could leak stateless reset tokens.
+- HTTP/3 and WebTransport: a stalled WebTransport stream let later ones be
+  read as HTTP/3 requests; a closed session's streams reached the HTTP/3 and
+  QPACK parsers; session limits weren't enforced before answering 200; QPACK
+  decoded around errors and could be made to copy a table's worth per
+  encoder-stream byte; a kept header slice could show another client's headers.
+- HTTP/1.1 and WebSocket: a client that doesn't read grew the send queue, and a
+  WebSocket peer could pin a half-sent message by trickling bytes.
+- MoQ relays: any client could end any broadcast; namespaces could collide or
+  be empty; slots leaked on resets and failed subscriptions; a leaving
+  subscriber's group went to the next client in its slot; a reused track slot
+  could replay another track's cache; slow subscribers were queued for without
+  bound.
+- C API: the event queue had no bound, an event larger than the host's buffer
+  stalled every client, and NULL handles were dereferenced.
 
 ## 0.5.0
 
