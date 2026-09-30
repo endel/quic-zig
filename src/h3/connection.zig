@@ -115,6 +115,8 @@ const WritableWait = struct {
 /// HTTP/3 connection state machine.
 /// Wraps a QUIC connection and manages H3 framing, control streams, and QPACK.
 const ResponseState = enum { informational, final };
+/// How far a stream's received header sections have got (RFC 9114 §4.1).
+const HeaderPhase = enum { interim, final, trailers };
 
 pub const H3Connection = struct {
     allocator: Allocator,
@@ -154,7 +156,7 @@ pub const H3Connection = struct {
     excluded_streams: std.AutoHashMap(u64, void),
 
     // Streams that have received HEADERS (for DATA-before-HEADERS detection)
-    headers_received_streams: std.AutoHashMap(u64, void),
+    headers_received_streams: std.AutoHashMap(u64, HeaderPhase),
 
     /// Request streams already reported as `request_cancelled`.
     cancelled_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -217,7 +219,7 @@ pub const H3Connection = struct {
             .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
             .finished_streams = std.AutoHashMap(u64, void).init(allocator),
             .excluded_streams = std.AutoHashMap(u64, void).init(allocator),
-            .headers_received_streams = std.AutoHashMap(u64, void).init(allocator),
+            .headers_received_streams = std.AutoHashMap(u64, HeaderPhase).init(allocator),
         };
         // Advertise dynamic table capacity in local settings
         conn.local_settings.qpack_max_table_capacity = qpack.DynamicTable.MAX_CAPACITY;
@@ -1305,10 +1307,11 @@ pub const H3Connection = struct {
                 return error.H3FrameUnexpected;
             },
             .data => {
-                // RFC 9114 §4.1: DATA before HEADERS is H3_FRAME_UNEXPECTED
-                if (!self.headers_received_streams.contains(stream_id)) {
+                // RFC 9114 §4.1: DATA only between the final header section
+                // and the trailers.
+                if (self.headers_received_streams.get(stream_id) != .final) {
                     self.consumeRequestBytes(rs, buf, hdr.len);
-                    self.closeWithError(.frame_unexpected, "DATA before HEADERS");
+                    self.closeWithError(.frame_unexpected, "DATA outside the message body");
                     return error.H3FrameUnexpected;
                 }
                 self.consumeRequestBytes(rs, buf, hdr.len);
@@ -1366,13 +1369,19 @@ pub const H3Connection = struct {
         // Flush decoder instructions (header ack)
         self.flushDecoderInstructions() catch {};
 
-        // RFC 9114 §4.1: a later HEADERS frame without pseudo-headers is the
-        // trailer section.
-        if (self.headers_received_streams.contains(stream_id) and !hasPseudoHeader(hdrs)) {
+        // RFC 9114 §4.1: one final header section, after any 1xx ones on a
+        // response, then at most the trailers. A request has no 1xx.
+        const phase = self.headers_received_streams.get(stream_id);
+        if (phase == .trailers or (phase == .final and hasPseudoHeader(hdrs))) {
+            self.closeWithError(.frame_unexpected, "HEADERS after the message's last header section");
+            return error.H3FrameUnexpected;
+        }
+        if (phase == .final) {
             if (!fieldsValid(hdrs)) {
                 self.closeWithError(.message_error, "invalid trailer field");
                 return error.H3MessageError;
             }
+            try self.headers_received_streams.put(stream_id, .trailers);
             return null;
         }
 
@@ -1386,8 +1395,7 @@ pub const H3Connection = struct {
             return error.H3MessageError;
         }
 
-        // Track that HEADERS was received on this stream
-        try self.headers_received_streams.put(stream_id, {});
+        try self.headers_received_streams.put(stream_id, if (!self.is_server and isInformational(hdrs)) .interim else .final);
 
         // Check for Extended CONNECT (:method=CONNECT + :protocol)
         var method: ?[]const u8 = null;
@@ -1530,7 +1538,7 @@ test "H3Connection: init and deinit" {
     conn.stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(testing.allocator);
     conn.finished_streams = std.AutoHashMap(u64, void).init(testing.allocator);
     conn.excluded_streams = std.AutoHashMap(u64, void).init(testing.allocator);
-    conn.headers_received_streams = std.AutoHashMap(u64, void).init(testing.allocator);
+    conn.headers_received_streams = std.AutoHashMap(u64, HeaderPhase).init(testing.allocator);
     conn.cancelled_streams = .empty;
     conn.writable_waits = .empty;
     conn.paused_bodies = .empty;
@@ -2882,6 +2890,74 @@ test "H3: request trailers are accepted, not a message error" {
 
     var tags: [8]std.meta.Tag(H3Event) = undefined;
     try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{ .headers, .data, .finished }, try pollTags(&h3, &tags));
+}
+
+fn buildHeadersFrame(buf: []u8, headers: []const qpack.Header) usize {
+    var qb: [256]u8 = undefined;
+    const ql = qpack.encodeHeaders(headers, &qb) catch unreachable;
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .headers = qb[0..ql] }, &fbs) catch unreachable;
+    return fbs.seek;
+}
+
+test "H3: a request stream carries one request; nothing follows its trailers" {
+    // A second header section read as a new request smuggles one past
+    // whatever vetted the first.
+    const post = [_]qpack.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/admin" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    const trailer = [_]qpack.Header{.{ .name = "grpc-status", .value = "0" }};
+    var buf: [512]u8 = undefined;
+    for (0..3) |case| {
+        var quic_conn = createTestQuicConn(true);
+        defer quic_conn.deinit();
+        var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+        defer h3.deinit();
+        try h3.initConnection();
+        try injectPeerControlStream(&quic_conn, &h3);
+
+        var pos = buildGetRequestFrame(&buf);
+        switch (case) {
+            0 => pos += buildHeadersFrame(buf[pos..], &post),
+            1 => {
+                pos += buildHeadersFrame(buf[pos..], &trailer);
+                pos += buildDataFrame(buf[pos..], "late");
+            },
+            else => {
+                pos += buildHeadersFrame(buf[pos..], &trailer);
+                pos += buildHeadersFrame(buf[pos..], &trailer);
+            },
+        }
+        try injectBidiStreamData(&quic_conn, 0, buf[0..pos], true);
+        var tags: [8]std.meta.Tag(H3Event) = undefined;
+        try testing.expectError(error.H3FrameUnexpected, pollTags(&h3, &tags));
+    }
+}
+
+test "H3: a response may follow 1xx responses, but not another final one" {
+    var buf: [512]u8 = undefined;
+    for ([_]bool{ false, true }) |second_final| {
+        var quic_conn = createTestQuicConn(false);
+        defer quic_conn.deinit();
+        var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+        defer h3.deinit();
+        const sid = try testClientRequest(&quic_conn, &h3);
+
+        var pos = buildHeadersFrame(&buf, &.{.{ .name = ":status", .value = "103" }});
+        pos += buildHeadersFrame(buf[pos..], &.{.{ .name = ":status", .value = "200" }});
+        if (second_final) pos += buildHeadersFrame(buf[pos..], &.{.{ .name = ":status", .value = "200" }});
+        try quic_conn.streams.getStream(sid).?.recv.handleStreamFrame(0, buf[0..pos], true);
+
+        var tags: [8]std.meta.Tag(H3Event) = undefined;
+        if (second_final) {
+            try testing.expectError(error.H3FrameUnexpected, pollTags(&h3, &tags));
+        } else {
+            try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{ .headers, .headers, .finished }, try pollTags(&h3, &tags));
+        }
+    }
 }
 
 test "H3: a response stream ended before its first byte is reported finished" {
