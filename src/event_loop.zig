@@ -64,6 +64,11 @@ pub const WsCloseCode = http1.WsCloseCode;
 /// read. Safari fills the 16 KB loopback MTU and found that the hard way.
 const MAX_RECV_DATAGRAM: usize = (transport_params.TransportParams{}).max_udp_payload_size;
 
+/// Datagrams read in one pass before connections get their turn, so a flood
+/// that keeps the socket full can't hold off timers and sends. Small under
+/// test, where the OS default receive buffer holds only a few hundred.
+const max_recv_per_pass: usize = if (builtin.is_test) 64 else 1024;
+
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
     port: u16 = 4433,
@@ -1376,7 +1381,8 @@ pub fn Server(comptime Handler: type) type {
 
         fn drainSocket(self: *Self, sockfd: posix.socket_t, local_addr: posix.sockaddr.storage, recv_batch: *ecn_socket.SendBatch) bool {
             var received = false;
-            while (true) {
+            var n: usize = 0;
+            while (n < max_recv_per_pass) : (n += 1) {
                 const recv_result = ecn_socket.recvmsgEcn(sockfd, &self.recv_buf) catch |err| {
                     if (err == error.WouldBlock) break;
                     break;
@@ -1417,6 +1423,8 @@ pub fn Server(comptime Handler: type) type {
                     },
                 }
             }
+            // The rest on the next pass, without waiting for another edge.
+            if (n == max_recv_per_pass) self.armWake();
 
             return received;
         }
@@ -2965,7 +2973,8 @@ pub fn Client(comptime Handler: type) type {
 
         fn recvAllPackets(self: *Self) bool {
             var received = false;
-            while (true) {
+            var n: usize = 0;
+            while (n < max_recv_per_pass) : (n += 1) {
                 const recv_result = ecn_socket.recvmsgEcn(self.sockfd, &self.recv_buf) catch |err| {
                     if (err == error.WouldBlock) break;
                     break;
@@ -2989,6 +2998,7 @@ pub fn Client(comptime Handler: type) type {
                 // Don't send here — tickAndSend will coalesce ACKs with
                 // stream data into a single QUIC packet, reducing round-trips.
             }
+            if (n == max_recv_per_pass) self.armWake();
             // No flush — tickAndSend handles it
             return received;
         }
@@ -5034,6 +5044,45 @@ test "e2e: a WebTransport client pauses a server stream the same way" {
     try runUntil(&e2e.loop, &client_handler.sink, WtSink.done, 20_000);
     try testing.expectEqual(PAUSE_BODY, client_handler.sink.bytes);
     try testing.expect(client_handler.sink.ok);
+}
+
+test "e2e: a flood of datagrams can't keep a server reading" {
+    // The receive loop ran until the socket was empty, so datagrams arriving
+    // as fast as they were read held off every timer and send.
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var handler = HelloServer{};
+    var server = try Server(HelloServer).init(testing.allocator, &handler, .{
+        .port = 29461,
+        .tls_config = makeTestTlsConfig(),
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+
+    const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(fd);
+    const to = try net.Address.parseIp4("127.0.0.1", 29461);
+    for (0..max_recv_per_pass + 16) |_| _ = std.c.sendto(fd, "x", 1, 0, &to.any, to.getOsSockLen());
+    sys.sleepNs(20 * std.time.ns_per_ms);
+
+    const Waiting = struct {
+        fn f(srv: *Server(HelloServer)) bool {
+            var peek: [1]u8 = undefined;
+            return std.c.recv(srv.sockfd, &peek, 1, std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT) > 0;
+        }
+        fn not(srv: *Server(HelloServer)) bool {
+            return !f(srv);
+        }
+    };
+    try testing.expect(server.recvAllPackets());
+    try testing.expect(Waiting.f(&server));
+    // The rest is read on a pass of its own, with nothing new arriving.
+    try testing.expect(server.wake_armed);
+    try runUntil(&loop, &server, Waiting.not, 5_000);
+
+    server.stop();
+    try runUntil(&loop, &server, Server(HelloServer).isStopped, 5_000);
 }
 
 test "e2e: a server past retry_threshold makes a client retry, then serves it" {
