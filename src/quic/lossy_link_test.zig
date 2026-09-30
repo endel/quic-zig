@@ -396,3 +396,83 @@ test "stateless reset: the server drains a connection its client reset" {
     try testing.expect(sconn.isDraining());
     try testing.expect(sconn.received_stateless_reset);
 }
+
+const packet = @import("packet.zig");
+const io = @import("../io_compat.zig");
+
+/// Where the first short-header packet of a datagram starts: its length if
+/// it has none.
+fn shortHeaderStart(bytes: []u8) !usize {
+    var pos: usize = 0;
+    while (pos < bytes.len and bytes[pos] & 0x80 != 0) {
+        var r = io.fixedBufferStream(bytes[pos..]);
+        const h = try packet.Header.parse(&r, 0);
+        pos += r.seek + h.remainder_len;
+    }
+    return pos;
+}
+
+test "handshake: the server holds 1-RTT packets until the client's Finished" {
+    // RFC 9001 5.7: before it, the client is not authenticated.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    const alloc = testing.allocator;
+    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, .{1} ** 16, .{2} ** 16);
+    defer mgr.deinit();
+    const client = try alloc.create(connection.Connection);
+    defer alloc.destroy(client);
+    try connection.connectInto(client, alloc, "localhost", .{}, .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &client_alpn,
+        .server_name = "localhost",
+        .skip_cert_verify = true,
+    }, null);
+    defer client.deinit();
+    const c_addr = addr(40000);
+    const s_addr = addr(4433);
+    client.paths[0].peer_addr = s_addr;
+    client.paths[0].local_addr = c_addr;
+
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var resp: [MAX_DGRAM]u8 = undefined;
+    var i: usize = 0;
+    while (!client.isEstablished() and i < 20) : (i += 1) {
+        while (true) {
+            const n = client.send(&buf) catch break;
+            if (n == 0) break;
+            _ = mgr.recvDatagram(buf[0..n], c_addr, s_addr, 0, &resp);
+        }
+        for (mgr.entries.items) |e| while (true) {
+            const n = e.conn.send(&buf) catch break;
+            if (n == 0) break;
+            client.handleDatagram(buf[0..n], .{ .to = c_addr, .from = s_addr, .datagram_size = n });
+        };
+    }
+    const sconn = mgr.entries.items[0].conn;
+    try testing.expect(client.isEstablished() and !sconn.isEstablished());
+
+    const s = try client.openStream();
+    try s.send.writeData("before Finished");
+    var dgrams: [4][MAX_DGRAM]u8 = undefined;
+    var lens: [4]usize = undefined;
+    var count: usize = 0;
+    while (count < dgrams.len) : (count += 1) {
+        lens[count] = try client.send(&dgrams[count]);
+        if (lens[count] == 0) break;
+    }
+    // 1-RTT parts first: the server must not act on them yet.
+    for (dgrams[0..count], lens[0..count]) |*d, n| {
+        const at = try shortHeaderStart(d[0..n]);
+        if (at < n) _ = mgr.recvDatagram(d[at..n], c_addr, s_addr, 0, &resp);
+    }
+    try testing.expect(sconn.streams.getStream(s.stream_id) == null);
+
+    // The Finished completes the handshake, and what was held is read then.
+    for (dgrams[0..count], lens[0..count]) |*d, n| {
+        const at = try shortHeaderStart(d[0..n]);
+        if (at > 0) _ = mgr.recvDatagram(d[0..at], c_addr, s_addr, 0, &resp);
+    }
+    try testing.expect(sconn.isEstablished());
+    try testing.expect(sconn.streams.getStream(s.stream_id) != null);
+}

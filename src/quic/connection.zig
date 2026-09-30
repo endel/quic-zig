@@ -1307,6 +1307,13 @@ pub const Connection = struct {
             return;
         }
 
+        // RFC 9001 §5.7: until the client's Finished, 1-RTT data comes from a
+        // peer not yet authenticated. Held, and replayed once the handshake completes.
+        if (self.is_server and enc_level == .application and self.state != .connected) {
+            self.bufferUndecryptable(header, fbs, info, "pre-Finished 1-RTT");
+            return;
+        }
+
         // For 1-RTT packets with key update manager, use the appropriate key generation
         var payload: []u8 = undefined;
         if (epoch == .application and self.key_update != null) {
@@ -2565,10 +2572,15 @@ pub const Connection = struct {
                     // Clear early data keys (0-RTT period is over)
                     self.early_data_open = null;
                     self.early_data_seal = null;
-                    // Handshake done: discard any still-buffered packets
+                    // Handshake done. A server replays the 1-RTT packets it
+                    // held for this; anything else still buffered is dropped
                     // (RFC 9001 §4.1.4 — peers retransmit if needed).
-                    self.undecryptable.reset();
-                    self.pending_replay_undecryptable = false;
+                    if (self.is_server) {
+                        self.pending_replay_undecryptable = true;
+                    } else {
+                        self.undecryptable.reset();
+                        self.pending_replay_undecryptable = false;
+                    }
 
                     // Handle 0-RTT rejection (RFC 9001 §4.1.2):
                     // When the server rejects 0-RTT, the client must retransmit all
