@@ -230,8 +230,6 @@ pub const H3Connection = struct {
         };
         // Advertise dynamic table capacity in local settings
         conn.local_settings.qpack_max_table_capacity = qpack.DynamicTable.MAX_CAPACITY;
-        // Set decoder's local max capacity
-        conn.qpack_decoder.setCapacity(qpack.DynamicTable.MAX_CAPACITY);
         return conn;
     }
 
@@ -277,6 +275,12 @@ pub const H3Connection = struct {
         var type_fbs = io.fixedBufferStream(&type_buf);
         try h3_frame.writeUniStreamType(&type_fbs, .control);
         try ctrl.writeData(type_fbs.buffered());
+
+        // The decoder holds the peer to what SETTINGS says, whoever set it,
+        // and SETTINGS can't promise more table than there is.
+        const cap = &self.local_settings.qpack_max_table_capacity;
+        cap.* = @min(cap.*, qpack.DynamicTable.MAX_CAPACITY);
+        self.qpack_decoder.setCapacity(@intCast(cap.*));
 
         // Send SETTINGS frame on control stream
         var settings_buf: [128]u8 = undefined;
@@ -2624,6 +2628,22 @@ test "H3 integration: sendResponse writes HEADERS + DATA + FIN" {
     const stream = quic_conn.streams.getStream(0).?;
     try testing.expect(stream.send.write_buffer.items.len > 0);
     try testing.expect(stream.send.fin_queued);
+}
+
+test "H3: the decoder holds the encoder to the table capacity SETTINGS advertised" {
+    // A server with its own settings sent no capacity, meaning 0, but
+    // accepted a dynamic table of 4096 bytes anyway (RFC 9204 4.3.1).
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings = .{ .enable_connect_protocol = true };
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Client uni stream 6: QPACK encoder stream, Set Dynamic Table Capacity 4096.
+    try injectUniStreamData(&quic_conn, 6, &[_]u8{ 0x02, 0x3f, 0xe1, 0x1f }, false);
+    try testing.expectError(error.H3GeneralProtocolError, h3.poll());
 }
 
 // ---- Group E: Extended CONNECT ----

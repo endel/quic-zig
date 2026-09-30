@@ -412,12 +412,6 @@ pub const DynamicTable = struct {
     pub fn getRelative(self: *const DynamicTable, base: u64, rel_idx: u64) ?DynEntry {
         return self.get(relativeToAbsolute(base, rel_idx) orelse return null);
     }
-
-    /// Compute MaxEntries = floor(capacity / 32).
-    pub fn maxEntries(self: *const DynamicTable) u64 {
-        if (self.capacity == 0) return 0;
-        return @intCast(self.capacity / ENTRY_OVERHEAD);
-    }
 };
 
 /// RFC 9204 3.2.5: relative index `rel` counts back from `base`.
@@ -571,7 +565,8 @@ pub const QpackDecoder = struct {
     /// Name and value together are bounded by the table (RFC 9204 3.2.1).
     const MAX_ENCODER_INSTRUCTION = DynamicTable.MAX_CAPACITY + 2 * MAX_INTEGER_LEN;
 
-    /// Set local max capacity.
+    /// Set the capacity our SETTINGS advertise: the most the encoder may ask
+    /// for, and what Required Insert Count wraps at.
     pub fn setCapacity(self: *QpackDecoder, cap: usize) void {
         self.max_capacity = cap;
         // Don't set dynamic table capacity yet — wait for encoder's Set Capacity instruction
@@ -605,7 +600,9 @@ pub const QpackDecoder = struct {
         var ric: u64 = 0;
         var base: u64 = 0;
         if (encoded_ric > 0) {
-            const max_entries = self.dynamic.maxEntries();
+            // RFC 9204 4.5.1.1: from the capacity we advertised, not the
+            // encoder's current one.
+            const max_entries = self.max_capacity / ENTRY_OVERHEAD;
             ric = try decodeRequiredInsertCount(encoded_ric, max_entries, self.dynamic.insert_count);
             if (sign_bit) {
                 // RFC 9204 4.5.1.2: Base = RIC - DeltaBase - 1 must not go negative.
@@ -1608,6 +1605,21 @@ test "QpackDecoder: a reference at or past Required Insert Count is rejected" {
     // RIC 1, Base 1, post-base index 0 = absolute 1: in the table, but not
     // covered by the block's Required Insert Count.
     try testing.expectError(error.InvalidIndex, decoder.decode(&[_]u8{ 0x02, 0x00, 0x10 }, &out, &test_scratch, 0));
+}
+
+test "QpackDecoder: Required Insert Count wraps at the advertised capacity, not the current one" {
+    // RFC 9204 4.5.1.1: MaxEntries comes from the capacity we advertised. The
+    // encoder's smaller table made a valid prefix decode wrong, or not at all.
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    try decoder.processEncoderInstruction(&[_]u8{ 0x3f, 0x61 }); // capacity 128: 4 entries
+    for (0..9) |i| {
+        try decoder.processEncoderInstruction(&[_]u8{ 0x41, 'a' + @as(u8, @intCast(i)), 0x01, '1' });
+    }
+    var out: [8]Header = undefined;
+    // RIC 9 encodes as 9 % (2 * 128) + 1; Base 9, relative 0 = the ninth insert.
+    try testing.expectEqual(@as(usize, 1), try decoder.decode(&[_]u8{ 0x0a, 0x00, 0x80 }, &out, &test_scratch, 0));
+    try testing.expectEqualStrings("i", out[0].name);
 }
 
 test "QpackDecoder: a prefix without its Delta Base byte is rejected" {

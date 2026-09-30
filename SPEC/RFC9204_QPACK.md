@@ -61,8 +61,10 @@ the spec formula. Eviction happens on insert when `size + entry > cap`.
 
 ### §3.2.2 Dynamic Table Capacity — ✅ Done
 
-- The decoder's local max is set via `setCapacity(cap)` (the advertised
-  value, default 4096).
+- The decoder's local max is whatever the SETTINGS we send advertise, set
+  in `initConnection()`: 4096 by default, and 0 for WebTransport, whose
+  settings don't advertise a table. Until then it is 0, as the peer must
+  assume.
 - The peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY` is ignored: the encoder
   never sends `Set Dynamic Table Capacity`, so our table in the peer's
   decoder stays at capacity 0.
@@ -137,9 +139,10 @@ path via `huffman.decode()`.
 
 `encodeRequiredInsertCount(ric, max_entries)` and
 `decodeRequiredInsertCount(encoded, max_entries, total_insert_count)`
-implement the wrapping algorithm. Invalid encodings (RIC > 2·MaxEntries,
-result ≤ 0, max_entries == 0 with non-zero encoded) return
-`error.InvalidRIC`.
+implement the wrapping algorithm. MaxEntries comes from the advertised
+maximum capacity, not the encoder's current one. Invalid encodings
+(RIC > 2·MaxEntries, result ≤ 0, max_entries == 0 with non-zero encoded)
+return `error.InvalidRIC`.
 
 ### §4.5.5 Decompression Failure — ✅ Done
 
@@ -150,7 +153,8 @@ poll loop (connection.zig:976).
 
 ## §5 Configuration — ✅ Done
 
-- `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 4096` advertised in local SETTINGS.
+- `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 4096` advertised in local SETTINGS,
+  except by WebTransport endpoints (0).
 - `SETTINGS_QPACK_BLOCKED_STREAMS = 0` advertised — see caveats.
 - The peer's advertised capacity and blocked-streams limit are not used:
   the encoder is static-only.
