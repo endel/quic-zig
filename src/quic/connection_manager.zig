@@ -282,6 +282,12 @@ pub const ConnectionManager = struct {
     /// Budgets for stateless replies; see `ReplyLimits`.
     reply_limits: ReplyLimits = .{},
 
+    /// Answer a 1-RTT packet for an unknown CID with a stateless reset. Off
+    /// when servers sharing `static_reset_key` can't be sure a packet reaches
+    /// its connection's owner: another one's reset would hand the sender that
+    /// connection's token (RFC 9000 §21.11).
+    reset_unknown: bool = true,
+
     /// Report packets for another server as `foreign` instead of answering
     /// them with a stateless reset. Needs `conn_config.quic_lb`: a
     /// Handshake or 1-RTT packet whose unknown DCID decodes, under the same
@@ -658,7 +664,7 @@ pub const ConnectionManager = struct {
                 }
                 if (header.packet_type != .initial) {
                     // Short-header for unknown CID: stateless reset (RFC 9000 §10.3)
-                    if (header.packet_type == .one_rtt and full_size >= MIN_RESET_TRIGGER and
+                    if (header.packet_type == .one_rtt and full_size >= MIN_RESET_TRIGGER and self.reset_unknown and
                         self.reply_limits.stateless_reset.allow(sys.nanoTimestamp()))
                     {
                         // RFC 9000 §10.3.3: response SHOULD be smaller than the trigger

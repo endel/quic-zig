@@ -125,6 +125,13 @@ pub const Config = struct {
     tls_config: ?tls13.TlsConfig = null,
     conn_config: ?connection.ConnectionConfig = null,
     retry_token_key: ?[16]u8 = null,
+    /// Key for stateless reset tokens (RFC 9000 §10.3.2). Null draws a
+    /// random one, whose tokens die with the server. A key shared by
+    /// servers a packet can reach in place of its connection's owner lets
+    /// any of them give that connection's token away (§21.11), so under
+    /// `reuse_port` they send no resets unless `foreign_datagram` steers
+    /// packets home. Servers sharing a key some other way must route by
+    /// CID themselves.
     static_reset_key: ?[16]u8 = null,
 
     // Use IPv6 dual-stack socket (supports both IPv4 and IPv6)
@@ -893,6 +900,7 @@ pub fn Server(comptime Handler: type) type {
             conn_mgr.max_connections = config.max_connections;
             conn_mgr.reply_limits = .init(config.stateless_reply_rate);
             conn_mgr.steer_foreign = config.foreign_datagram != null;
+            conn_mgr.reset_unknown = !(config.reuse_port and config.static_reset_key != null and config.foreign_datagram == null);
 
             // Init libxev
             const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
@@ -5044,6 +5052,32 @@ test "e2e: a WebTransport client pauses a server stream the same way" {
     try runUntil(&e2e.loop, &client_handler.sink, WtSink.done, 20_000);
     try testing.expectEqual(PAUSE_BODY, client_handler.sink.bytes);
     try testing.expect(client_handler.sink.ok);
+}
+
+test "Server: workers sharing a reset key send no resets unless they steer" {
+    // A packet for one worker's connection can reach another, whose reset
+    // handed the sender that connection's token (RFC 9000 §21.11).
+    var handler = HelloServer{};
+    var shared = try Server(HelloServer).init(testing.allocator, &handler, .{
+        .port = 29462,
+        .reuse_port = true,
+        .static_reset_key = @splat(0x5e),
+        .tls_config = makeTestTlsConfig(),
+    });
+    defer shared.deinit();
+    var own = try Server(HelloServer).init(testing.allocator, &handler, .{
+        .port = 29463,
+        .reuse_port = true,
+        .tls_config = makeTestTlsConfig(),
+    });
+    defer own.deinit();
+
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+    var pkt = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
+    try testing.expect(shared.conn_mgr.recvDatagram(&pkt, addr, addr, 0, &out) == .dropped);
+    pkt = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
+    try testing.expect(own.conn_mgr.recvDatagram(&pkt, addr, addr, 0, &out) == .send_response);
 }
 
 test "e2e: a flood of datagrams can't keep a server reading" {
