@@ -730,16 +730,30 @@ pub fn verifyRetryIntegrity(
 
 // Encrypted Retry token format:
 // nonce(12) || AES-128-GCM-encrypt(plaintext) || tag(16)
-// Plaintext: odcid_len(1) + odcid(<=20) + retry_scid_len(1) + retry_scid(<=20) + timestamp_ns(8) + addr_data(14)
+// Plaintext: odcid_len(1) + odcid(<=20) + retry_scid_len(1) + retry_scid(<=20) + timestamp_ns(8) + addr_binding(18)
 pub const TOKEN_NONCE_LEN = 12;
 pub const TOKEN_TAG_LEN = 16;
-pub const TOKEN_MAX_PLAINTEXT_LEN = 1 + 20 + 1 + 20 + 8 + 14; // 64
-pub const TOKEN_MAX_LEN = TOKEN_NONCE_LEN + TOKEN_MAX_PLAINTEXT_LEN + TOKEN_TAG_LEN; // 92
+pub const TOKEN_MAX_PLAINTEXT_LEN = 1 + 20 + 1 + 20 + 8 + ADDR_BINDING_LEN; // 68
+pub const TOKEN_MAX_LEN = TOKEN_NONCE_LEN + TOKEN_MAX_PLAINTEXT_LEN + TOKEN_TAG_LEN; // 96
 
-/// Extract the 14 address-data bytes from a sockaddr.storage (same layout as sockaddr.data).
-fn addrDataBytes(addr: *const posix.sockaddr.storage) *const [14]u8 {
-    const raw: [*]const u8 = @ptrCast(addr);
-    return raw[2..16];
+const ADDR_BINDING_LEN = 2 + 16;
+
+/// The client address a token is bound to: port, then the IP as 16 bytes,
+/// IPv4 in its v4-mapped form so either socket family binds it the same way.
+fn addrBinding(addr: *const posix.sockaddr.storage) [ADDR_BINDING_LEN]u8 {
+    var out: [ADDR_BINDING_LEN]u8 = @splat(0);
+    const raw = std.mem.asBytes(addr);
+    if (addr.family == posix.AF.INET6) {
+        const in6 = std.mem.bytesToValue(posix.sockaddr.in6, raw[0..@sizeOf(posix.sockaddr.in6)]);
+        out[0..2].* = @bitCast(in6.port);
+        out[2..18].* = in6.addr;
+    } else {
+        const in4 = std.mem.bytesToValue(posix.sockaddr.in, raw[0..@sizeOf(posix.sockaddr.in)]);
+        out[0..2].* = @bitCast(in4.port);
+        out[12..14].* = .{ 0xff, 0xff };
+        out[14..18].* = @bitCast(in4.addr);
+    }
+    return out;
 }
 
 pub fn generateRetryToken(
@@ -766,8 +780,7 @@ pub fn generateRetryToken(
     try pt_writer.writeAll(retry_scid);
     const now: i64 = @intCast(sys.nanoTimestamp());
     try pt_writer.writeInt(i64, now, ENDIAN);
-    // Write first 14 bytes of sockaddr.data (covers IPv4 port+addr)
-    try pt_writer.writeAll(addrDataBytes(&client_addr));
+    try pt_writer.writeAll(&addrBinding(&client_addr));
 
     const pt_len = pt_fbs.seek;
     const pt_data = plaintext[0..pt_len];
@@ -853,20 +866,18 @@ pub fn validateRetryToken(
     const now: i64 = @intCast(sys.nanoTimestamp());
     if (now - timestamp > TOKEN_MAX_AGE_NS or timestamp > now) return null;
 
-    // Check address
-    var addr_data: [14]u8 = undefined;
-    _ = pt_reader.readSliceShort(&addr_data) catch return null;
-    if (!std.mem.eql(u8, &addr_data, addrDataBytes(&client_addr))) return null;
+    const bound = pt_reader.takeArray(ADDR_BINDING_LEN) catch return null;
+    if (!std.mem.eql(u8, bound, &addrBinding(&client_addr))) return null;
 
     return result;
 }
 
 // NEW_TOKEN token format (RFC 9000 §8.1.3):
 // nonce(12) || AES-128-GCM-encrypt(plaintext) || tag(16)
-// Plaintext: timestamp_ns(8) + addr_data(14) = 22 bytes
+// Plaintext: timestamp_ns(8) + addr_binding(18) = 26 bytes
 // Distinguishable from Retry tokens by shorter ciphertext.
-const NEW_TOKEN_PLAINTEXT_LEN: usize = 8 + 14; // timestamp + addr
-const NEW_TOKEN_MAX_LEN: usize = TOKEN_NONCE_LEN + NEW_TOKEN_PLAINTEXT_LEN + TOKEN_TAG_LEN; // 50
+const NEW_TOKEN_PLAINTEXT_LEN: usize = 8 + ADDR_BINDING_LEN;
+const NEW_TOKEN_MAX_LEN: usize = TOKEN_NONCE_LEN + NEW_TOKEN_PLAINTEXT_LEN + TOKEN_TAG_LEN; // 54
 
 pub fn generateNewToken(
     out: []u8,
@@ -884,7 +895,7 @@ pub fn generateNewToken(
     const pt_writer = &pt_fbs;
     const now: i64 = @intCast(sys.nanoTimestamp());
     try pt_writer.writeInt(i64, now, ENDIAN);
-    try pt_writer.writeAll(addrDataBytes(&client_addr));
+    try pt_writer.writeAll(&addrBinding(&client_addr));
 
     var ciphertext_buf: [NEW_TOKEN_PLAINTEXT_LEN]u8 = undefined;
     var tag: [TOKEN_TAG_LEN]u8 = undefined;
@@ -931,9 +942,8 @@ pub fn validateNewToken(
     const now: i64 = @intCast(sys.nanoTimestamp());
     if (now - timestamp > TOKEN_MAX_AGE_NS or timestamp > now) return false;
 
-    var addr_data: [14]u8 = undefined;
-    _ = pt_reader.readSliceShort(&addr_data) catch return false;
-    if (!std.mem.eql(u8, &addr_data, addrDataBytes(&client_addr))) return false;
+    const bound = pt_reader.takeArray(ADDR_BINDING_LEN) catch return false;
+    if (!std.mem.eql(u8, bound, &addrBinding(&client_addr))) return false;
 
     return true;
 }
@@ -1185,6 +1195,36 @@ test "Retry token: oversized token rejected" {
     var token: [200]u8 = undefined;
     sys.randomBytes(&token);
     try std.testing.expect(try validateRetryToken(&token, addr, token_key) == null);
+}
+
+fn testIn6(ip: [16]u8, port: u16) posix.sockaddr.storage {
+    var in6: posix.sockaddr.in6 = std.mem.zeroes(posix.sockaddr.in6);
+    in6.family = posix.AF.INET6;
+    in6.port = std.mem.nativeToBig(u16, port);
+    in6.addr = ip;
+    var storage = std.mem.zeroes(posix.sockaddr.storage);
+    @memcpy(std.mem.asBytes(&storage)[0..@sizeOf(posix.sockaddr.in6)], std.mem.asBytes(&in6));
+    return storage;
+}
+
+test "tokens bind the whole client address, IPv4 on a dual-stack socket included" {
+    const key: [crypto.key_len]u8 = @splat(3);
+    const v4 = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff };
+    const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1 } ++ [_]u8{0} ** 7;
+    const pairs = [_][2]posix.sockaddr.storage{
+        .{ testIn6(v4 ++ [_]u8{ 198, 51, 100, 7 }, 4433), testIn6(v4 ++ [_]u8{ 203, 0, 113, 9 }, 4433) },
+        .{ testIn6(v6 ++ [_]u8{1}, 4433), testIn6(v6 ++ [_]u8{2}, 4433) },
+    };
+    for (pairs) |pair| {
+        var out: [TOKEN_MAX_LEN]u8 = undefined;
+        const retry_len = try generateRetryToken(&out, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 9, 9, 9, 9 }, pair[0], key);
+        try std.testing.expect(try validateRetryToken(out[0..retry_len], pair[0], key) != null);
+        try std.testing.expect(try validateRetryToken(out[0..retry_len], pair[1], key) == null);
+
+        const new_len = try generateNewToken(&out, pair[0], key);
+        try std.testing.expect(validateNewToken(out[0..new_len], pair[0], key));
+        try std.testing.expect(!validateNewToken(out[0..new_len], pair[1], key));
+    }
 }
 
 // Retry integrity tag verification
