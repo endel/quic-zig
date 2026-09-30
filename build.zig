@@ -352,7 +352,22 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_tests = b.addRunArtifact(exe_tests);
-    b.step("test", "Run unit tests").dependOn(&run_tests.step);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
+    // The relays' routing logic is tested in their own files.
+    for ([_][]const u8{ "apps/moq_relay.zig", "apps/moq_lite_relay.zig" }) |app| {
+        const app_tests = b.addTest(.{
+            .filters = test_filters,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(app),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = need_libc,
+                .imports = &.{.{ .name = "quic", .module = lib_mod }},
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(app_tests).step);
+    }
 
     // Fuzz tests (smoke test: zig build fuzz)
     const exe_fuzz = b.addTest(.{

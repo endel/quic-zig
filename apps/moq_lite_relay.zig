@@ -313,6 +313,8 @@ const Relay = struct {
     fn originAnnounced(self: *Self, ci: usize, b: lite_msg.AnnounceBroadcast) void {
         // The suffix is relative to the prefix we asked for, which is "".
         if (b.status == .ended) {
+            // Only its origin can end a broadcast.
+            if (self.originOf(b.suffix) != ci) return;
             self.dropBroadcast(b.suffix);
             self.notifyWatchers(b.suffix, .ended);
             print("client {d}: unannounced \"{s}\"\n", .{ ci, b.suffix });
@@ -569,4 +571,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     print("https://0.0.0.0:{d}\n\n", .{port});
 
     try server.run();
+}
+
+test "only a broadcast's origin can end it" {
+    // Any client's ANNOUNCE_BROADCAST(ended) took the broadcast down for
+    // every watcher.
+    var r: Relay = .{};
+    r.clients[0].active = true;
+    r.clients[1].active = true;
+    r.originAnnounced(0, .{ .status = .active, .suffix = "alice" });
+    r.originAnnounced(1, .{ .status = .ended, .suffix = "alice" });
+    try std.testing.expectEqual(@as(?usize, 0), r.originOf("alice"));
+    r.originAnnounced(0, .{ .status = .ended, .suffix = "alice" });
+    try std.testing.expectEqual(@as(?usize, null), r.originOf("alice"));
 }
