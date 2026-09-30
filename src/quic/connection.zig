@@ -1154,14 +1154,21 @@ pub const Connection = struct {
             self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "empty packet payload");
             return error.InvalidPacket;
         }
+        // RFC 9000 §17.2: reserved bits MUST be zero after header protection removal
+        if (header.reserved_bits_set) {
+            self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "reserved header bits are non-zero");
+            return error.ProtocolViolation;
+        }
 
         const now: i64 = @intCast(sys.nanoTimestamp());
-        self.last_packet_received_time = now;
-        self.keep_alive_ping_sent = false;
         self.total_packets_received += 1;
         if (info.datagram_size > 0) {
             self.paths[self.active_path_idx].bytes_received += info.datagram_size;
         }
+        // RFC 9000 §12.3: a replay is dropped, and restarts no timer.
+        if (self.pkt_handler.recv[2].isDuplicate(header.packet_number)) return;
+        self.last_packet_received_time = now;
+        self.keep_alive_ping_sent = false;
 
         // Process 0-RTT frames (STREAM, DATAGRAM etc. - no CRYPTO or HANDSHAKE_DONE)
         var remaining = payload;
@@ -1172,7 +1179,10 @@ pub const Connection = struct {
                 continue;
             }
             var frame_len: usize = undefined;
-            const frame = Frame.parseSized(remaining, &frame_len) catch break;
+            const frame = Frame.parseSized(remaining, &frame_len) catch {
+                self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), 0, "frame encoding error");
+                return error.ProtocolViolation;
+            };
             // Enforce frame-in-correct-space (RFC 9000 §12.5)
             if (!frame.isAllowedIn(.zero_rtt)) {
                 self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.crypto), "frame not allowed in 0-RTT");
@@ -6031,6 +6041,38 @@ test "ACK_FREQUENCY: a huge max ack delay is capped, one under our min_ack_delay
     try conn.pkt_handler.recv[2].onPacketReceived(0, true, std.math.maxInt(i64) / 2, 0);
 
     try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 1, .ack_eliciting_threshold = 2, .request_max_ack_delay = 999, .reordering_threshold = 1 } }, .application, 0));
+}
+
+test "0-RTT: a replayed packet is processed once" {
+    // RFC 9000 12.3. 0-RTT is the packet an on-path attacker can replay.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.datagrams_enabled = true;
+    const cid = conn.scid[0..conn.scid_len];
+    const server_keys = try quic_crypto.deriveInitialKeyMaterial(cid, conn.version, true);
+    const client_keys = try quic_crypto.deriveInitialKeyMaterial(cid, conn.version, false);
+    conn.early_data_open = server_keys[0];
+
+    var packer = packet_packer.PacketPacker.init(std.testing.allocator, false, "cli12345", cid, conn.version);
+    var handler = ack_handler.PacketHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(std.testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(std.testing.allocator, false);
+    defer streams.deinit();
+    var pending: frame_mod.PendingFrameQueue = .{};
+    var dq: DatagramQueue = .{};
+    try std.testing.expect(dq.push("once"));
+    var buf: [1500]u8 = undefined;
+    const n = try packer.packCoalesced(&buf, &handler, &crypto_mgr, &streams, &pending, null, &client_keys[1], null, null, 0, &dq, false);
+    try std.testing.expect(n > 0);
+
+    const from = conn.paths[0].peer_addr;
+    for (0..3) |_| {
+        var copy = buf; // header protection is removed in place
+        conn.handleDatagram(copy[0..n], .{ .to = from, .from = from, .datagram_size = n });
+    }
+    try std.testing.expectEqual(@as(usize, 1), conn.datagram_recv_queue.count);
 }
 
 test "a uni stream is reclaimed once its FIN is acked" {

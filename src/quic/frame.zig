@@ -744,12 +744,14 @@ pub const Frame = union(FrameType) {
             .crypto => pkt_type != .zero_rtt,
             // CONNECTION_CLOSE: Initial, Handshake, 1-RTT (NOT 0-RTT)
             .connection_close => pkt_type != .zero_rtt,
-            // NEW_TOKEN, NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, HANDSHAKE_DONE: 1-RTT only
+            // NEW_TOKEN, NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, HANDSHAKE_DONE,
+            // PATH_RESPONSE: 1-RTT only (RFC 9000 §17.2.3)
             // ACK_FREQUENCY, IMMEDIATE_ACK: 1-RTT only (draft-ietf-quic-ack-frequency)
             .new_token,
             .new_connection_id,
             .retire_connection_id,
             .handshake_done,
+            .path_response,
             .ack_frequency,
             .immediate_ack,
             => pkt_type == .one_rtt,
@@ -766,7 +768,6 @@ pub const Frame = union(FrameType) {
             .streams_blocked_bidi,
             .streams_blocked_uni,
             .path_challenge,
-            .path_response,
             .application_close,
             .datagram,
             .datagram_with_length,
@@ -1066,6 +1067,13 @@ test "a frame type in a longer encoding than it needs is FRAME_ENCODING_ERROR" {
         var size: usize = undefined;
         try std.testing.expectError(error.FrameEncodingError, Frame.parseSized(buf[0..bytes.len], &size));
     }
+}
+
+test "PATH_RESPONSE is a 1-RTT frame only" {
+    // RFC 9000 17.2.3: a 0-RTT packet answers no challenge.
+    const f: Frame = .{ .path_response = @splat(1) };
+    try std.testing.expect(!f.isAllowedIn(.zero_rtt));
+    try std.testing.expect(f.isAllowedIn(.one_rtt));
 }
 
 test "parse padding frame" {
