@@ -763,6 +763,13 @@ pub const Connection = struct {
 
     // Connection state
     got_peer_conn_id: bool = false,
+    /// The SCID of the first long-header packet from the peer that
+    /// decrypted: what initial_source_connection_id must name (RFC 9000 §7.3).
+    peer_initial_scid: [packet.CONNECTION_ID_MAX_SIZE]u8 = undefined,
+    peer_initial_scid_len: u8 = 0,
+    /// Client: the SCID of the Retry we followed, for retry_source_connection_id.
+    retry_scid: [packet.CONNECTION_ID_MAX_SIZE]u8 = undefined,
+    retry_scid_len: u8 = 0,
     peer_max_cid_seq: u64 = 0,
     active_cid_seq: u64 = 0,
     /// Sequence number of the peer CID we send to; 0 is the handshake DCID.
@@ -866,7 +873,7 @@ pub const Connection = struct {
                 conn.scid_len = 8;
                 generateConnectionId(conn.scid[0..8]);
             }
-            conn.got_peer_conn_id = true;
+            // header.scid is not decrypted yet: the first packet that is sets it.
         } else {
             conn.dcid_len = @intCast(header.dcid.len);
             @memcpy(conn.dcid[0..header.dcid.len], header.dcid);
@@ -1110,24 +1117,29 @@ pub const Connection = struct {
             return;
         }
 
+        // RFC 9000 §17.2.5.2: discard one with no token or naming our own
+        // DCID; and one whose token we cannot echo back is no use either.
+        // Checked before anything is committed.
+        const token = header.token orelse &.{};
+        if (token.len == 0 or token.len > self.retry_token_buf.len or
+            std.mem.eql(u8, header.scid, self.odcid_buf[0..self.odcid_len]))
+        {
+            std.log.warn("discarding Retry: token_len={d}", .{token.len});
+            return;
+        }
+
         // Update DCID to the Retry packet's SCID
         self.dcid_len = @intCast(header.scid.len);
         @memcpy(self.dcid[0..header.scid.len], header.scid);
         self.packer.updateDcid(header.scid);
+        @memcpy(self.retry_scid[0..header.scid.len], header.scid);
+        self.retry_scid_len = @intCast(header.scid.len);
 
         // Store the Retry token for inclusion in the next Initial packet
-        if (header.token) |token| {
-            if (token.len <= self.retry_token_buf.len) {
-                @memcpy(self.retry_token_buf[0..token.len], token);
-                self.retry_token_len = @intCast(token.len);
-                // Point the packer's initial_token to our owned buffer
-                self.packer.initial_token = self.retry_token_buf[0..self.retry_token_len];
-            } else {
-                std.log.err("Retry token too large ({d} bytes, max {d})", .{ token.len, self.retry_token_buf.len });
-            }
-        } else {
-            std.log.warn("Retry packet has no token", .{});
-        }
+        @memcpy(self.retry_token_buf[0..token.len], token);
+        self.retry_token_len = @intCast(token.len);
+        // Point the packer's initial_token to our owned buffer
+        self.packer.initial_token = self.retry_token_buf[0..self.retry_token_len];
 
         // Re-derive Initial keys with the new DCID (Retry SCID)
         try self.pkt_num_spaces[0].setupInitial(
@@ -1442,30 +1454,21 @@ pub const Connection = struct {
         self.last_packet_received_time = now;
         self.keep_alive_ping_sent = false;
 
-        // Determine path - set peer connection ID on first packet
-        if (!self.got_peer_conn_id and header.scid.len > 0) {
-            std.log.info("recv: updating DCID to peer SCID={any}", .{header.scid});
-            self.dcid_len = @intCast(header.scid.len);
-            @memcpy(self.dcid[0..header.scid.len], header.scid);
-            // Update packer with new DCID
-            self.packer.updateDcid(header.scid);
-            self.got_peer_conn_id = true;
-        }
-
-        // Server: re-verify DCID from AEAD-authenticated long-header packets.
-        // If the Initial that created this connection was corrupted in transit,
-        // accept() may have stored a wrong peer SCID as our outgoing DCID.
-        // The first successfully-decrypted packet has the real peer SCID.
-        if (self.is_server and !self.handshake_confirmed and
-            (epoch == .initial or epoch == .handshake) and header.scid.len > 0)
-        {
-            if (self.dcid_len != @as(u8, @intCast(header.scid.len)) or
-                !std.mem.eql(u8, self.dcid[0..self.dcid_len], header.scid))
-            {
-                std.log.info("recv: correcting DCID to AEAD-verified SCID (len {d})", .{header.scid.len});
+        // The peer's SCID comes from its first long-header packet that
+        // decrypts, and then holds: RFC 9000 §7.2 drops later packets naming
+        // another, and §7.3 checks it against initial_source_connection_id.
+        // (A server's accept() read it off a packet not yet decrypted.)
+        if (header.packet_type != .one_rtt) {
+            if (!self.got_peer_conn_id) {
+                std.log.info("recv: peer SCID={any}", .{header.scid});
                 self.dcid_len = @intCast(header.scid.len);
                 @memcpy(self.dcid[0..header.scid.len], header.scid);
                 self.packer.updateDcid(header.scid);
+                @memcpy(self.peer_initial_scid[0..header.scid.len], header.scid);
+                self.peer_initial_scid_len = @intCast(header.scid.len);
+                self.got_peer_conn_id = true;
+            } else if (!std.mem.eql(u8, header.scid, self.peer_initial_scid[0..self.peer_initial_scid_len])) {
+                return;
             }
         }
 
@@ -3869,9 +3872,14 @@ pub const Connection = struct {
 
     /// Validate peer transport parameters (RFC 9000 §7.3, §7.4, §18.2).
     fn validatePeerTransportParams(self: *Connection, peer_tp: *const transport_params.TransportParams) !void {
-        // Validate initial_source_connection_id is present (RFC 9000 §7.3)
-        if (peer_tp.initial_source_connection_id == null) {
+        // RFC 9000 §7.3: initial_source_connection_id names the SCID the
+        // peer's packets carried, or someone rewrote them in flight.
+        const iscid = peer_tp.initial_source_connection_id orelse {
             self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "missing initial_source_connection_id");
+            return error.TransportParameterError;
+        };
+        if (!std.mem.eql(u8, iscid.slice(), self.peer_initial_scid[0..self.peer_initial_scid_len])) {
+            self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "initial_source_connection_id mismatch");
             return error.TransportParameterError;
         }
 
@@ -3905,8 +3913,12 @@ pub const Connection = struct {
             // If Retry was used, retry_source_connection_id must be present
             // If not, it must be absent
             if (self.retry_received) {
-                if (peer_tp.retry_source_connection_id == null) {
+                const rscid = peer_tp.retry_source_connection_id orelse {
                     self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "retry_scid missing after Retry");
+                    return error.TransportParameterError;
+                };
+                if (!std.mem.eql(u8, rscid.slice(), self.retry_scid[0..self.retry_scid_len])) {
+                    self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "retry_scid mismatch");
                     return error.TransportParameterError;
                 }
             } else {
@@ -6262,6 +6274,70 @@ test "a PATH_CHALLENGE flood takes one queue slot, and DATA_BLOCKED is still ans
 
     try conn.processFrame(&.{ .data_blocked = 0 }, .application, 0);
     try std.testing.expect(conn.pending_frames.pop().? == .max_data);
+}
+
+test "Retry: one with no token, our own DCID, or a token too long is discarded" {
+    // RFC 9000 17.2.5.2. The long token used to commit the new DCID first.
+    var long_token: [512]u8 = @splat(0x7a);
+    var cases = [_]struct { scid: []const u8, token: []u8 }{
+        .{ .scid = "retry-scid", .token = &.{} },
+        .{ .scid = "", .token = long_token[0..8] }, // filled in with our DCID
+        .{ .scid = "retry-scid", .token = &long_token },
+    };
+    for (&cases, 0..) |*c, i| {
+        const conn = try std.testing.allocator.create(Connection);
+        defer std.testing.allocator.destroy(conn);
+        try connectInto(conn, std.testing.allocator, "example.com", .{}, null, null);
+        defer conn.deinit();
+        const odcid = conn.odcid_buf[0..conn.odcid_len];
+        if (i == 1) c.scid = odcid;
+        var scid_copy: [20]u8 = undefined;
+        @memcpy(scid_copy[0..c.scid.len], c.scid);
+
+        var buf: [1500]u8 = undefined;
+        var fbs = io.fixedBufferStream(&buf);
+        try packet.retry(.{ .version = conn.version, .packet_type = .initial, .dcid = odcid, .scid = conn.scid[0..conn.scid_len] }, scid_copy[0..c.scid.len], c.token, &fbs);
+        var rfbs = io.fixedBufferStream(buf[0..fbs.seek]);
+        const h = try packet.Header.parse(&rfbs, 0);
+        try conn.handleRetryPacket(&h, buf[0..fbs.seek]);
+        try std.testing.expect(!conn.retry_received);
+        try std.testing.expectEqualSlices(u8, odcid, conn.dcid[0..conn.dcid_len]);
+    }
+}
+
+test "a server keeps the first SCID its peer proved, and checks initial_source_connection_id against it" {
+    // RFC 9000 7.2, 7.3. Any later Initial that decrypted replaced it.
+    const odcid = [_]u8{0x0d} ** 8;
+    const first = [_]u8{0xa1} ** 8;
+    const other = [_]u8{0xb2} ** 8;
+    const addr = makeIpv4Addr(192, 0, 2, 7, 5000);
+    const conn = try std.testing.allocator.create(Connection);
+    defer std.testing.allocator.destroy(conn);
+    try Connection.acceptInto(conn, std.testing.allocator, .{ .packet_type = .initial, .version = protocol.SUPPORTED_VERSIONS[0], .dcid = &odcid, .scid = &first }, addr, addr, true, .{}, null, null, null);
+    defer conn.deinit();
+
+    const seal = (try quic_crypto.deriveInitialKeyMaterial(&odcid, conn.version, false))[1];
+    // One handler: the second packet is numbered after the first, not a duplicate.
+    var handler = ack_handler.PacketHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(std.testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(std.testing.allocator, false);
+    defer streams.deinit();
+    for ([_][]const u8{ &first, &other }) |scid| {
+        var packer = packet_packer.PacketPacker.init(std.testing.allocator, false, scid, &odcid, conn.version);
+        var pending: frame_mod.PendingFrameQueue = .{};
+        pending.push(.ping);
+        var buf: [1500]u8 = undefined;
+        const n = try packer.packCoalesced(&buf, &handler, &crypto_mgr, &streams, &pending, &seal, null, null, null, 0, null, false);
+        conn.handleDatagram(buf[0..n], .{ .to = addr, .from = addr, .datagram_size = n });
+    }
+    try std.testing.expectEqualSlices(u8, &first, conn.dcid[0..conn.dcid_len]);
+
+    var tp: transport_params.TransportParams = .{ .initial_source_connection_id = .init(&other) };
+    try std.testing.expectError(error.TransportParameterError, conn.validatePeerTransportParams(&tp));
+    tp.initial_source_connection_id = .init(&first);
+    try conn.validatePeerTransportParams(&tp);
 }
 
 test "a uni stream is reclaimed once its FIN is acked" {
