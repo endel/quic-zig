@@ -738,8 +738,8 @@ pub const PacketHandler = struct {
     ) !void {
         const idx = @intFromEnum(level);
 
-        const ack_delay_us = ack_delay_encoded << ack_delay_exponent;
-        const ack_delay_ns: i64 = @intCast(ack_delay_us * 1000);
+        // Peer-chosen u62: saturate; updateRtt clamps it to max_ack_delay anyway.
+        const ack_delay_ns: i64 = @intCast(@min((ack_delay_encoded <<| ack_delay_exponent) *| 1000, std.math.maxInt(i64)));
 
         try self.sent[idx].onAckReceived(
             largest_ack,

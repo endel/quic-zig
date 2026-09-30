@@ -5968,6 +5968,18 @@ fn ackPacket(conn: *Connection, pn: u64) !void {
     try conn.processFrame(&.{ .ack = .{ .largest_ack = pn, .ack_delay = 0, .first_ack_range = 0 } }, .application, std.time.ns_per_s);
 }
 
+test "an ACK Delay no clock could produce is clamped, not overflowed" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    // The ACK a client can send before any key exchange, naming our first Initial.
+    for ([_]u64{ 1 << 52, (1 << 62) - 1 }) |delay| {
+        const pn = conn.pkt_handler.nextPacketNumber(.initial);
+        try conn.pkt_handler.onPacketSent(.{ .pn = pn, .time_sent = 0, .size = 1200, .ack_eliciting = true, .in_flight = true, .enc_level = .initial });
+        try conn.processFrame(&.{ .ack = .{ .largest_ack = pn, .ack_delay = delay, .first_ack_range = 0 } }, .initial, std.time.ns_per_s);
+    }
+    try std.testing.expect(conn.pkt_handler.rtt_stats.has_measurement);
+}
+
 test "a uni stream is reclaimed once its FIN is acked" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
