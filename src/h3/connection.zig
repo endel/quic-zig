@@ -1050,10 +1050,31 @@ pub const H3Connection = struct {
     fn fieldsValid(headers: []const qpack.Header) bool {
         for (headers) |h| {
             const pseudo = h.name.len > 0 and h.name[0] == ':';
-            if (!pseudo and (h.name.len == 0 or anyByte(h.name, badNameBytes))) return false;
+            if (!pseudo and (h.name.len == 0 or !nameValid(h.name) or connectionSpecific(h.name))) return false;
             if (anyByte(h.value, badValueBytes)) return false;
         }
         return true;
+    }
+
+    /// RFC 9110 §5.1 tchar, lowercase only (RFC 9114 §4.2).
+    const name_bytes: [256]bool = blk: {
+        var t: [256]bool = @splat(false);
+        for ("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyz") |c| t[c] = true;
+        break :blk t;
+    };
+
+    fn nameValid(name: []const u8) bool {
+        for (name) |c| if (!name_bytes[c]) return false;
+        return true;
+    }
+
+    /// RFC 9114 §4.2: a message carrying any of these is malformed. Passed on
+    /// to HTTP/1.1 they would reframe the message.
+    fn connectionSpecific(name: []const u8) bool {
+        for ([_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" }) |n| {
+            if (std.mem.eql(u8, name, n)) return true;
+        }
+        return false;
     }
 
     fn anyByte(bytes: []const u8, comptime bad: anytype) bool {
@@ -1066,12 +1087,6 @@ pub const H3Connection = struct {
             if (bad(1, .{c})) return true;
         }
         return false;
-    }
-
-    fn badNameBytes(comptime V: usize, c: @Vector(V, u8)) bool {
-        const invisible = c -% @as(@Vector(V, u8), @splat(0x21)) > @as(@Vector(V, u8), @splat(0x7e - 0x21));
-        const upper = c -% @as(@Vector(V, u8), @splat('A')) < @as(@Vector(V, u8), @splat(26));
-        return @reduce(.Or, invisible) or @reduce(.Or, upper);
     }
 
     fn badValueBytes(comptime V: usize, c: @Vector(V, u8)) bool {
@@ -1091,8 +1106,9 @@ pub const H3Connection = struct {
         var has_status = false;
         var pseudo_done = false;
         var is_connect = false;
-        var has_protocol = false;
-        var has_host = false;
+        var protocol_count: u8 = 0;
+        var host: ?[]const u8 = null;
+        var authority: []const u8 = "";
         var scheme_value: []const u8 = "";
 
         for (headers) |h| {
@@ -1110,15 +1126,19 @@ pub const H3Connection = struct {
                 } else if (std.mem.eql(u8, h.name, ":status")) {
                     has_status = true;
                 } else if (std.mem.eql(u8, h.name, ":protocol")) {
-                    has_protocol = true;
+                    protocol_count += 1;
                 } else if (std.mem.eql(u8, h.name, ":authority")) {
                     authority_count += 1;
+                    authority = h.value;
                 } else {
                     return false; // unknown pseudo-header (RFC 9114 §4.1.1)
                 }
             } else {
                 pseudo_done = true;
-                if (std.mem.eql(u8, h.name, "host")) has_host = true;
+                if (std.mem.eql(u8, h.name, "host")) {
+                    if (host != null) return false;
+                    host = h.value;
+                }
                 // te header: only "trailers" allowed
                 if (std.mem.eql(u8, h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) {
                     return false;
@@ -1128,19 +1148,24 @@ pub const H3Connection = struct {
 
         if (has_status) return false; // request must not have :status
         if (method_count != 1) return false;
-        if (method_count > 1 or scheme_count > 1 or path_count > 1 or authority_count > 1) return false;
+        if (method_count > 1 or scheme_count > 1 or path_count > 1 or authority_count > 1 or protocol_count > 1) return false;
+        // RFC 9220 §3: :protocol belongs to extended CONNECT alone.
+        if (protocol_count == 1 and !is_connect) return false;
+        // RFC 9114 §4.3.1: both present, they must agree.
+        if (authority_count == 1 and host != null and !std.mem.eql(u8, authority, host.?)) return false;
 
         // Plain CONNECT: no :scheme/:path required, :authority mandatory
         // Extended CONNECT (with :protocol): all pseudo-headers required
-        if (is_connect and !has_protocol) return authority_count == 1;
+        if (is_connect and protocol_count == 0) return authority_count == 1;
 
         if (scheme_count != 1) return false;
         if (path_count != 1) return false;
         if (path_empty) return false;
 
-        // RFC 9114 §4.3.1: for http/https, :authority or Host must be present
+        // RFC 9114 §4.3.1: for http/https, a non-empty :authority or Host
         if (std.mem.eql(u8, scheme_value, "http") or std.mem.eql(u8, scheme_value, "https")) {
-            if (authority_count == 0 and !has_host) return false;
+            const named = if (authority_count == 1) authority else host orelse "";
+            if (named.len == 0) return false;
         }
 
         return true;
@@ -1676,6 +1701,45 @@ test "validateRequestHeaders: valid GET" {
         .{ .name = ":authority", .value = "example.com" },
     };
     try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: refuses what a proxy to HTTP/1 could be smuggled with" {
+    const base = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+    };
+    const authority: qpack.Header = .{ .name = ":authority", .value = "example.com" };
+    const bad = [_][]const qpack.Header{
+        &.{ authority, .{ .name = "transfer-encoding", .value = "chunked" } },
+        &.{ authority, .{ .name = "connection", .value = "keep-alive" } },
+        &.{ authority, .{ .name = "keep-alive", .value = "timeout=5" } },
+        &.{ authority, .{ .name = "proxy-connection", .value = "close" } },
+        &.{ authority, .{ .name = "upgrade", .value = "websocket" } },
+        &.{ authority, .{ .name = "host:evil", .value = "x" } },
+        &.{ authority, .{ .name = "x(y)", .value = "x" } },
+        &.{ authority, .{ .name = "a\"b", .value = "x" } },
+        &.{ .{ .name = ":authority", .value = "" } },
+        &.{ .{ .name = "host", .value = "" } },
+        &.{ authority, .{ .name = "host", .value = "other.example" } },
+        &.{ authority, .{ .name = ":protocol", .value = "websocket" } },
+    };
+    for (bad) |extra| {
+        var hdrs: [8]qpack.Header = undefined;
+        @memcpy(hdrs[0..base.len], &base);
+        @memcpy(hdrs[base.len..][0..extra.len], extra);
+        // Pseudo-headers go first.
+        std.mem.sort(qpack.Header, hdrs[0 .. base.len + extra.len], {}, struct {
+            fn lt(_: void, a: qpack.Header, b: qpack.Header) bool {
+                return a.name[0] == ':' and b.name[0] != ':';
+            }
+        }.lt);
+        try testing.expect(!H3Connection.validateRequestHeaders(hdrs[0 .. base.len + extra.len]));
+    }
+    const same_host = base ++ [_]qpack.Header{ authority, .{ .name = "host", .value = "example.com" } };
+    try testing.expect(H3Connection.validateRequestHeaders(&same_host));
+    const host_only = base ++ [_]qpack.Header{.{ .name = "host", .value = "example.com" }};
+    try testing.expect(H3Connection.validateRequestHeaders(&host_only));
 }
 
 test "validateRequestHeaders: valid POST with body headers" {
