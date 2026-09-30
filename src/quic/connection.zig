@@ -1361,8 +1361,6 @@ pub const Connection = struct {
         }
 
         const now: i64 = @intCast(sys.nanoTimestamp());
-        self.last_packet_received_time = now;
-        self.keep_alive_ping_sent = false;
 
         // RFC 9000 §8.1: Receipt of a Handshake packet from the client confirms
         // address ownership (client derived keys → it processed our Initial).
@@ -1416,6 +1414,10 @@ pub const Connection = struct {
         if (self.pkt_handler.recv[@intFromEnum(enc_level)].isDuplicate(header.packet_number)) {
             return; // Duplicate, ignore
         }
+        // RFC 9000 §10.1: only a packet processed restarts the idle timer; a
+        // replay must not keep a dead connection alive.
+        self.last_packet_received_time = now;
+        self.keep_alive_ping_sent = false;
 
         // Determine path - set peer connection ID on first packet
         if (!self.got_peer_conn_id and header.scid.len > 0) {
@@ -6073,6 +6075,40 @@ test "0-RTT: a replayed packet is processed once" {
         conn.handleDatagram(copy[0..n], .{ .to = from, .from = from, .datagram_size = n });
     }
     try std.testing.expectEqual(@as(usize, 1), conn.datagram_recv_queue.count);
+}
+
+test "a replayed 1-RTT packet does not keep the connection alive" {
+    // RFC 9000 10.1: only a packet processed successfully restarts the idle timer.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.state = .connected;
+    const cid = conn.scid[0..conn.scid_len];
+    try conn.pkt_num_spaces[2].setupInitial(cid, conn.version, true);
+    const client_keys = try quic_crypto.deriveInitialKeyMaterial(cid, conn.version, false);
+
+    var packer = packet_packer.PacketPacker.init(std.testing.allocator, false, "cli12345", cid, conn.version);
+    var handler = ack_handler.PacketHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(std.testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(std.testing.allocator, false);
+    defer streams.deinit();
+    var pending: frame_mod.PendingFrameQueue = .{};
+    pending.push(.ping);
+    var buf: [1500]u8 = undefined;
+    const n = try packer.packCoalesced(&buf, &handler, &crypto_mgr, &streams, &pending, null, null, null, &client_keys[1], 0, null, false);
+    try std.testing.expect(n > 0);
+
+    const from = conn.paths[0].peer_addr;
+    var copy = buf;
+    conn.handleDatagram(copy[0..n], .{ .to = from, .from = from, .datagram_size = n });
+    const first = conn.last_packet_received_time;
+    sys.test_clock.? += 10 * std.time.ns_per_s;
+    copy = buf;
+    conn.handleDatagram(copy[0..n], .{ .to = from, .from = from, .datagram_size = n });
+    try std.testing.expectEqual(first, conn.last_packet_received_time);
 }
 
 test "a uni stream is reclaimed once its FIN is acked" {
