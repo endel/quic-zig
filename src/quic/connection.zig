@@ -490,7 +490,23 @@ pub const DatagramQueue = struct {
 pub const ConnectionError = struct {
     is_app: bool,
     code: u64,
-    reason: []const u8,
+    /// The reason, copied: a peer's is a view of the receive buffer, and a
+    /// caller's may not outlive the call. Truncated past `max_reason`.
+    reason_buf: [max_reason]u8 = undefined,
+    reason_len: u16 = 0,
+
+    pub const max_reason = 256;
+
+    pub fn init(is_app: bool, code: u64, reason_bytes: []const u8) ConnectionError {
+        var e: ConnectionError = .{ .is_app = is_app, .code = code };
+        e.reason_len = @intCast(@min(reason_bytes.len, max_reason));
+        @memcpy(e.reason_buf[0..e.reason_len], reason_bytes[0..e.reason_len]);
+        return e;
+    }
+
+    pub fn reason(self: *const ConnectionError) []const u8 {
+        return self.reason_buf[0..self.reason_len];
+    }
 };
 
 // ECN codepoint values from IP TOS field (2 low bits)
@@ -2300,29 +2316,22 @@ pub const Connection = struct {
             },
 
             .connection_close => |cc| {
-                std.log.warn("peer CONNECTION_CLOSE: error_code=0x{x}, frame_type=0x{x}, reason_len={d}, reason={s}", .{
+                // The reason is the peer's bytes: escaped, so they cannot forge log lines.
+                std.log.warn("peer CONNECTION_CLOSE: error_code=0x{x}, frame_type=0x{x}, reason_len={d}, reason=\"{f}\"", .{
                     cc.error_code,
                     cc.frame_type,
                     cc.reason.len,
-                    if (cc.reason.len > 0) cc.reason else "none",
+                    std.zig.fmtString(cc.reason[0..@min(cc.reason.len, ConnectionError.max_reason)]),
                 });
                 self.state = .draining;
                 self.closing_start_time = now;
-                self.local_err = .{
-                    .is_app = false,
-                    .code = cc.error_code,
-                    .reason = cc.reason,
-                };
+                self.local_err = .init(false, cc.error_code, cc.reason);
             },
 
             .application_close => |ac| {
                 self.state = .draining;
                 self.closing_start_time = now;
-                self.local_err = .{
-                    .is_app = true,
-                    .code = ac.error_code,
-                    .reason = ac.reason,
-                };
+                self.local_err = .init(true, ac.error_code, ac.reason);
             },
 
             .handshake_done => {
@@ -3848,11 +3857,7 @@ pub const Connection = struct {
         if (self.state == .closing or self.state == .draining or self.state == .terminated) return;
         self.state = .closing;
         self.closing_start_time = @intCast(sys.nanoTimestamp());
-        self.local_err = .{
-            .is_app = true,
-            .code = error_code,
-            .reason = reason,
-        };
+        self.local_err = .init(true, error_code, reason);
         self.pending_frames.push(.{ .connection_close = .{
             .error_code = error_code,
             .frame_type = 0,
@@ -3959,11 +3964,7 @@ pub const Connection = struct {
         if (self.state == .closing or self.state == .draining or self.state == .terminated) return;
         self.state = .closing;
         self.closing_start_time = @intCast(sys.nanoTimestamp());
-        self.local_err = .{
-            .is_app = false,
-            .code = error_code,
-            .reason = reason,
-        };
+        self.local_err = .init(false, error_code, reason);
         self.pending_frames.push(.{ .connection_close = .{
             .error_code = error_code,
             .frame_type = frame_type,
@@ -4399,7 +4400,7 @@ pub const Connection = struct {
         self.state = .draining;
         self.closing_start_time = @intCast(sys.nanoTimestamp());
         self.received_stateless_reset = true;
-        self.local_err = .{ .is_app = false, .code = 0, .reason = "stateless reset" };
+        self.local_err = .init(false, 0, "stateless reset");
         return true;
     }
 
@@ -6109,6 +6110,22 @@ test "a replayed 1-RTT packet does not keep the connection alive" {
     copy = buf;
     conn.handleDatagram(copy[0..n], .{ .to = from, .from = from, .datagram_size = n });
     try std.testing.expectEqual(first, conn.last_packet_received_time);
+}
+
+test "a peer's close reason outlives the packet it came in" {
+    // The frame's reason is a view of the receive buffer, reused by the next datagram.
+    for ([_]bool{ false, true }) |app| {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        var reason = "going away\r\n".*;
+        const f: Frame = if (app)
+            .{ .application_close = .{ .error_code = 7, .reason = &reason } }
+        else
+            .{ .connection_close = .{ .error_code = 7, .frame_type = 0, .reason = &reason } };
+        try conn.processFrame(&f, .application, 0);
+        @memset(&reason, 0);
+        try std.testing.expectEqualStrings("going away\r\n", conn.local_err.?.reason());
+    }
 }
 
 test "a uni stream is reclaimed once its FIN is acked" {
