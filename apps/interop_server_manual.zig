@@ -393,24 +393,9 @@ fn pollH0Server(h0c: *h0.H0Connection, www_dir: []const u8) void {
 }
 
 fn readFileFromWww(alloc: std.mem.Allocator, www_dir: []const u8, path: []const u8) ![]u8 {
-    var clean_path = path;
-    while (clean_path.len > 0 and clean_path[0] == '/') {
-        clean_path = clean_path[1..];
-    }
-    if (clean_path.len == 0) clean_path = "index.html";
-
-    var full_path_buf: [4096]u8 = undefined;
-    var pos: usize = 0;
-    @memcpy(full_path_buf[pos..][0..www_dir.len], www_dir);
-    pos += www_dir.len;
-    if (www_dir.len > 0 and www_dir[www_dir.len - 1] != '/') {
-        full_path_buf[pos] = '/';
-        pos += 1;
-    }
-    @memcpy(full_path_buf[pos..][0..clean_path.len], clean_path);
-    pos += clean_path.len;
-
-    return sys.readFileAlloc(alloc, full_path_buf[0..pos], 10 * 1024 * 1024);
+    var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const full_path = lib.h0.resolvePath(&full_path_buf, www_dir, path) orelse return error.BadPathName;
+    return sys.readFileAlloc(alloc, full_path, 10 * 1024 * 1024);
 }
 
 fn loadFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
