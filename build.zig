@@ -354,8 +354,9 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
-    // The relays' routing logic is tested in their own files.
-    for ([_][]const u8{ "apps/moq_relay.zig", "apps/moq_lite_relay.zig" }) |app| {
+    // Built against the `quic` module, so tested apart: the relays' routing
+    // and the C API.
+    for ([_][]const u8{ "apps/moq_relay.zig", "apps/moq_lite_relay.zig", "src/c_api.zig" }) |app| {
         const app_tests = b.addTest(.{
             .filters = test_filters,
             .root_module = b.createModule(.{
