@@ -176,7 +176,7 @@ pub const Header = struct {
     /// The address verification token of the packet. Only present in `Initial`
     /// and `Retry` packets.
     token: ?[]const u8 = null,
-    remainder_len: usize = undefined,
+    remainder_len: usize = 0,
 
     /// The packet number. It's only meaningful after the header protection is
     /// removed.
@@ -588,7 +588,8 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
                 header.remainder_len = remaining;
             },
 
-            PacketType.version_negotiation => {},
+            // The supported-versions list runs to the end of the datagram.
+            PacketType.version_negotiation => header.remainder_len = fbs.buffer.len - fbs.seek,
 
             PacketType.handshake, PacketType.zero_rtt => {
                 // Long header packets (like Initial but without Token field)
@@ -1251,6 +1252,16 @@ test "a token sealed under our key but not as a Retry token is rejected, whateve
     var new_token: [TOKEN_MAX_LEN]u8 = undefined;
     const n = try generateNewToken(&new_token, addr, key);
     try std.testing.expect(try validateRetryToken(new_token[0..n], addr, key) == null);
+}
+
+test "a Version Negotiation packet's remainder is its version list" {
+    // Routing sizes every packet from remainder_len, this one included.
+    var bytes = [_]u8{ 0xc0, 0, 0, 0, 0, 4, 1, 2, 3, 4, 2, 5, 6, 0, 0, 0, 1, 0x6b, 0x33, 0x43, 0xcf };
+    var fbs = io.fixedBufferStream(bytes[0..]);
+    const header = try Header.parse(&fbs, 0);
+    try std.testing.expectEqual(PacketType.version_negotiation, header.packet_type);
+    try std.testing.expectEqual(@as(usize, 8), header.remainder_len);
+    try std.testing.expectEqual(bytes.len, fbs.seek + header.remainder_len);
 }
 
 // Retry integrity tag verification
