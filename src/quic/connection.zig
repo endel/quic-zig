@@ -784,6 +784,8 @@ pub const Connection = struct {
     spin_bit: bool = false, // Spin bit for passive RTT measurement (RFC 9000 §17.4)
     largest_pn_received: ?u64 = null, // Tracks largest 1-RTT PN for spin bit toggling
     enable_v2: bool = false, // Compatible Version Negotiation (RFC 9368/9369)
+    /// The client has moved to the server's negotiated version; it moves once.
+    version_negotiated: bool = false,
     // DCID used for initial key derivation (needed for v2 re-derivation)
     initial_dcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
     initial_dcid_len: u8 = 0,
@@ -1324,14 +1326,19 @@ pub const Connection = struct {
         const epoch = try packet.Epoch.fromPacketType(header.packet_type);
         std.log.debug("recv: packet_type={s}, epoch={s}", .{ @tagName(header.packet_type), @tagName(epoch) });
 
-        // RFC 9368: Client-side Compatible Version Negotiation detection
-        // If we receive an Initial/Handshake from the server with a different version
-        // than what we sent, and we advertised that version, switch to it.
+        // RFC 9368: the server's long header names the version it negotiated.
+        // Initial keys come from public inputs, so the header proves nothing:
+        // a client moves only for an Initial that opens under the new
+        // version's keys, and only once.
+        var prior: ?VersionState = null;
+        var opened = false;
+        defer if (prior) |p| {
+            if (opened) self.version_negotiated = true else self.restoreVersion(p);
+        };
         if (!self.is_server and self.enable_v2 and header.version != 0 and header.version != self.version) {
-            if (protocol.isSupportedVersion(header.version)) {
-                std.log.info("recv: compatible version negotiation detected, switching to 0x{x:0>8}", .{header.version});
-                try self.switchVersion(header.version);
-            }
+            if (header.packet_type != .initial or self.version_negotiated or !protocol.isSupportedVersion(header.version)) return;
+            prior = self.versionState();
+            try self.switchVersion(header.version);
         }
 
         // 0-RTT packets use the application PN space but with early data keys
@@ -1386,6 +1393,7 @@ pub const Connection = struct {
                 return;
             };
         }
+        opened = true;
 
         if (payload.len == 0) {
             self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "empty packet payload");
@@ -2900,6 +2908,27 @@ pub const Connection = struct {
 
     /// Install handshake-level encryption keys.
     /// Called when the TLS handshake produces Handshake-level secrets.
+    /// What `switchVersion` changes on a client, to undo a move that a packet
+    /// didn't earn.
+    const VersionState = struct {
+        version: u32,
+        initial_open: @FieldType(packet.PacketNumSpace, "crypto_open"),
+    };
+
+    fn versionState(self: *const Connection) VersionState {
+        return .{
+            .version = self.version,
+            .initial_open = self.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].crypto_open,
+        };
+    }
+
+    fn restoreVersion(self: *Connection, s: VersionState) void {
+        self.version = s.version;
+        self.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].crypto_open = s.initial_open;
+        self.packer.version = s.version;
+        if (self.tls13_hs) |hs| hs.config.quic_version = s.version;
+    }
+
     /// Switch the connection to a new QUIC version (Compatible Version Negotiation, RFC 9368).
     /// Re-derives Initial keys asymmetrically:
     /// - Server: keeps v1 open keys (to decrypt client retransmissions), switches seal to v2
@@ -7301,4 +7330,42 @@ test "connection flow control: a repeated RESET_STREAM counts its final size onc
 
     try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.highest_received);
     try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.bytes_read);
+}
+
+/// A server Initial carrying a PING to `conn`'s client, labelled `version` and
+/// sealed with `seal`.
+fn testServerInitial(conn: *Connection, buf: []u8, version: u32, seal: *const quic_crypto.Seal) !usize {
+    const server_scid = [_]u8{0x5c} ** 8;
+    var handler = ack_handler.PacketHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(std.testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(std.testing.allocator, true);
+    defer streams.deinit();
+    var packer = packet_packer.PacketPacker.init(std.testing.allocator, true, conn.scid[0..conn.scid_len], &server_scid, version);
+    var pending: frame_mod.PendingFrameQueue = .{};
+    pending.push(.ping);
+    return packer.packCoalesced(buf, &handler, &crypto_mgr, &streams, &pending, seal, null, null, null, 0, null, false);
+}
+
+test "a client moves to QUIC v2 only for a packet that opens under v2's keys" {
+    // The long header's version switched it before anything decrypted, so
+    // one spoofed packet left the server's real Initials undecryptable.
+    const conn = try std.testing.allocator.create(Connection);
+    defer std.testing.allocator.destroy(conn);
+    try connectInto(conn, std.testing.allocator, "example.com", .{ .enable_v2 = true }, null, null);
+    defer conn.deinit();
+    const odcid = conn.odcid_buf[0..conn.odcid_len];
+    const addr = makeIpv4Addr(192, 0, 2, 9, 4433);
+    var buf: [1500]u8 = undefined;
+
+    const v1_seal = (try quic_crypto.deriveInitialKeyMaterial(odcid, protocol.QUIC_V1, true))[1];
+    var n = try testServerInitial(conn, &buf, protocol.QUIC_V2, &v1_seal);
+    conn.handleDatagram(buf[0..n], .{ .to = addr, .from = addr, .datagram_size = n });
+    try std.testing.expectEqual(protocol.QUIC_V1, conn.version);
+
+    const v2_seal = (try quic_crypto.deriveInitialKeyMaterial(odcid, protocol.QUIC_V2, true))[1];
+    n = try testServerInitial(conn, &buf, protocol.QUIC_V2, &v2_seal);
+    conn.handleDatagram(buf[0..n], .{ .to = addr, .from = addr, .datagram_size = n });
+    try std.testing.expectEqual(protocol.QUIC_V2, conn.version);
 }

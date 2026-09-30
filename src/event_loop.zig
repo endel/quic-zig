@@ -5103,6 +5103,17 @@ test "e2e: a WebTransport client pauses a server stream the same way" {
     try testing.expect(client_handler.sink.ok);
 }
 
+test "e2e: a client and server that both offer QUIC v2 finish the handshake in it" {
+    var server_handler = HelloServer{};
+    var client_handler = CheckingClient{};
+    var e2e: E2e(HelloServer, CheckingClient) = undefined;
+    try e2e.initWith(29465, &server_handler, &client_handler, .{ .enable_v2 = true }, .{ .enable_v2 = true });
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 10_000);
+    try testing.expectEqualStrings("hello", client_handler.body[0..client_handler.received]);
+    try testing.expectEqual(@as(u32, 0x6b3343cf), e2e.client.conn.version);
+}
+
 test "Server: workers sharing a reset key send no resets unless they steer" {
     // A packet for one worker's connection can reach another, whose reset
     // handed the sender that connection's token (RFC 9000 §21.11).
