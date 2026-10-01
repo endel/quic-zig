@@ -99,6 +99,13 @@ The rebind cells moved with the migration fixes, which validate every new peer
 address. v2 stays unsupported by both peers here; it passes against ngtcp2 in
 both directions (see `RFC9369_QUIC_V2.md`).
 
+### Rerun at `0d731a2` (secure defaults)
+67 of 88 pass, and 86 cells match the `3fa4923` rerun. `longrtt` against
+quic-go passes, where that run hit the runner error. `handshakecorruption`
+quiche<-quic-zig failed once: one of its 50 downloads timed out after the
+handshake on the corrupted link. It passed 5 of 5 on rerun. The handshake
+timeout didn't fire in any of these runs.
+
 ## A caution about this table
 
 The binaries under test must be cross-compiled by
