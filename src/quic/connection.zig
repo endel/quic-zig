@@ -528,6 +528,9 @@ pub const RecvInfo = struct {
 /// Configuration for a QUIC connection.
 pub const ConnectionConfig = struct {
     max_idle_timeout: u64 = 30_000, // ms
+    /// Milliseconds a handshake may take from the first packet; past it the
+    /// connection closes silently, like an idle timeout. Zero disables it.
+    handshake_timeout: u64 = 10_000,
     initial_max_data: u64 = 16_777_216, // 16MB
     initial_max_stream_data_bidi_local: u64 = 6_291_456, // 6MB
     initial_max_stream_data_bidi_remote: u64 = 6_291_456, // 6MB
@@ -818,6 +821,7 @@ pub const Connection = struct {
     last_packet_sent_time: i64 = 0,
     creation_time: i64 = 0,
     idle_timeout_ns: i64 = 30_000_000_000, // 30s default
+    handshake_timeout_ns: i64 = 10_000_000_000,
 
     /// Builds the connection in place — see connectInto for why.
     pub fn acceptInto(
@@ -1010,6 +1014,7 @@ pub const Connection = struct {
         if (config.max_idle_timeout > 0) {
             conn.idle_timeout_ns = idleTimeoutNs(config.max_idle_timeout);
         }
+        conn.handshake_timeout_ns = idleTimeoutNs(config.handshake_timeout);
 
         // Resize datagram queues if configured larger than default
         if (config.datagram_queue_capacity > DatagramQueue.DEFAULT_MAX_ITEMS) {
@@ -3645,6 +3650,14 @@ pub const Connection = struct {
             return;
         }
 
+        if (self.handshakeDeadline()) |deadline| {
+            if (now >= deadline) {
+                std.log.info("handshake not complete after {d} ms; closing", .{@divTrunc(self.handshake_timeout_ns, std.time.ns_per_ms)});
+                self.state = .terminated;
+                return;
+            }
+        }
+
         // Check idle timeout (RFC 9000 §10.1, §10.1.2)
         // The effective idle timeout MUST be at least 3× the *base* PTO (without backoff)
         // to avoid terminating the connection before probes have a chance to be answered.
@@ -4249,6 +4262,13 @@ pub const Connection = struct {
     /// Compute the next timeout deadline (nanosecond timestamp) without side effects.
     /// Returns null if the connection is terminated and needs no timer.
     /// Used by event loop to schedule the global timer.
+    /// When a connection still in its handshake gives up on it; null once
+    /// the handshake is done or the limit is off.
+    fn handshakeDeadline(self: *const Connection) ?i64 {
+        if (self.handshake_timeout_ns == 0 or self.state == .connected) return null;
+        return self.creation_time +| self.handshake_timeout_ns;
+    }
+
     pub fn nextTimeoutNs(self: *const Connection) ?i64 {
         if (self.state == .terminated) return null;
 
@@ -4263,6 +4283,8 @@ pub const Connection = struct {
             }
             return null;
         }
+
+        earliest = self.handshakeDeadline();
 
         // Idle timeout — use base PTO (no backoff), matching quic-go/quiche
         {
@@ -4814,6 +4836,7 @@ pub fn connectInto(
     if (config.max_idle_timeout > 0) {
         conn.idle_timeout_ns = idleTimeoutNs(config.max_idle_timeout);
     }
+    conn.handshake_timeout_ns = idleTimeoutNs(config.handshake_timeout);
 
     // Initialize TLS 1.3 handshake and generate ClientHello
     if (tls_config) |tc| {
@@ -7404,4 +7427,41 @@ test "a client closes when the server's Chosen Version isn't the one its packets
     tp.version_info_chosen = protocol.QUIC_V1;
     try std.testing.expectError(error.VersionNegotiationError, conn.validatePeerTransportParams(&tp));
     try std.testing.expectEqual(@intFromEnum(TransportError.version_negotiation_error), conn.local_err.?.code);
+}
+
+test "a connection still in its handshake after handshake_timeout closes" {
+    // Only the 30 s idle timeout ended one, and a peer that kept the
+    // handshake trickling along could hold it open for good.
+    const alloc = std.testing.allocator;
+    const addr = makeIpv4Addr(192, 0, 2, 7, 5000);
+    const odcid = [_]u8{0x0d} ** 8;
+    const client = try alloc.create(Connection);
+    defer alloc.destroy(client);
+    try connectInto(client, alloc, "example.com", .{}, null, null);
+    defer client.deinit();
+    const server = try alloc.create(Connection);
+    defer alloc.destroy(server);
+    try Connection.acceptInto(server, alloc, .{ .packet_type = .initial, .version = protocol.SUPPORTED_VERSIONS[0], .dcid = &odcid, .scid = &odcid }, addr, addr, true, .{}, null, null, null);
+    defer server.deinit();
+
+    const now: i64 = @intCast(sys.nanoTimestamp());
+    for ([_]*Connection{ client, server }) |c| {
+        // Begun 11 s ago, and heard from just now.
+        c.creation_time = now - 11 * std.time.ns_per_s;
+        c.last_packet_received_time = now;
+        c.last_packet_sent_time = now;
+        try std.testing.expect(c.nextTimeoutNs().? <= c.creation_time + 10 * std.time.ns_per_s);
+        try c.onTimeout();
+        try std.testing.expectEqual(State.terminated, c.state);
+    }
+
+    // A finished handshake is past it.
+    const done = try alloc.create(Connection);
+    defer alloc.destroy(done);
+    try connectInto(done, alloc, "example.com", .{}, null, null);
+    defer done.deinit();
+    done.state = .connected;
+    done.creation_time = now - 11 * std.time.ns_per_s;
+    try done.onTimeout();
+    try std.testing.expectEqual(State.connected, done.state);
 }

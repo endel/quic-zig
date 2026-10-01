@@ -69,7 +69,7 @@
 | 9.6.3 | Interaction of Client Migration and Preferred Address | ✅ Done | Reuses existing migration infrastructure |
 | 9.7 | Use of IPv6 Flow Label and Migration | ❌ N/A | Not applicable (IPv6 flow label is OS-level) |
 | **10** | **Connection Termination** | | |
-| 10.1 | Idle Timeout | ✅ Done | Negotiated min(local, peer), 30s default |
+| 10.1 | Idle Timeout | ✅ Done | Negotiated min(local, peer), 30s default. A handshake not done 10 s after its first packet closes the connection the same way (`handshake_timeout`) |
 | 10.1.1 | Liveness Testing | ✅ Done | PING frames |
 | 10.1.2 | Deferring Idle Timeout | ✅ Done | Reset on recv + sent ack-eliciting during handshake |
 | 10.2 | Immediate Close | ✅ Done | CONNECTION_CLOSE frame |
