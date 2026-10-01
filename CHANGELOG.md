@@ -78,9 +78,23 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   written to all of a connection's streams and not yet sent.
 - C API: `ERR_INVALID_ARG` (-6) for a NULL handle, or a NULL pointer with a
   non-zero length.
+- `Config.max_handshakes`: past that many connections still in their
+  handshake, a new client must answer a Retry before it gets any state. It
+  defaults to a quarter of `max_connections`.
+- `ConnectionConfig.handshake_timeout` (default 10 s): a handshake not done in
+  that time closes the connection, client or server.
 
 ### Changed
 
+- **Breaking:** the event-loop `Client` now verifies servers against the
+  platform's trust store by default (`ClientConfig.ca = .system`, loaded once
+  per process), and a server whose chain ends at no trusted anchor is refused.
+  `.ca = .none` is gone. `tls13.TlsConfig.skip_cert_verify` now defaults to
+  `false`, and verifying with neither `ca_bundle` nor `cert_hashes` fails.
+  `skip_cert_verify = true` still accepts any certificate, now whatever `ca`
+  says.
+- A server opens a new client's first Initial before giving it any state, so
+  datagrams that only look like Initials no longer hold a connection slot.
 - A QUIC server now aborts with `missing_extension` when a ClientHello without
   a PSK has no `signature_algorithms`, and with `handshake_failure` when it
   offers no scheme for the certificate, instead of signing anyway.
