@@ -7352,7 +7352,7 @@ fn testServerInitial(conn: *Connection, buf: []u8, version: u32, seal: *const qu
     defer crypto_mgr.deinit();
     var streams = stream_mod.StreamsMap.init(std.testing.allocator, true);
     defer streams.deinit();
-    var packer = packet_packer.PacketPacker.init(std.testing.allocator, true, conn.scid[0..conn.scid_len], &server_scid, version);
+    var packer = packet_packer.PacketPacker.init(std.testing.allocator, true, &server_scid, conn.scid[0..conn.scid_len], version);
     var pending: frame_mod.PendingFrameQueue = .{};
     pending.push(.ping);
     return packer.packCoalesced(buf, &handler, &crypto_mgr, &streams, &pending, seal, null, null, null, 0, null, false);
