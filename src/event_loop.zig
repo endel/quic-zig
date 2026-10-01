@@ -168,6 +168,12 @@ pub const Config = struct {
     /// CONNECTION_REFUSED.
     max_connections: usize = connection_manager.ConnectionManager.DEFAULT_MAX_CONNECTIONS,
 
+    /// Connections still in their handshake past which a new client must
+    /// first answer a Retry, so a flood of Initials from spoofed addresses
+    /// costs no state and leaves room for real clients. Null is a quarter of
+    /// `max_connections`.
+    max_handshakes: ?usize = null,
+
     /// Server-wide cap, per second, on each kind of reply sent without
     /// connection state: Version Negotiation, stateless reset and
     /// CONNECTION_REFUSED, budgeted separately. Each is triggerable with a
@@ -903,6 +909,7 @@ pub fn Server(comptime Handler: type) type {
             conn_mgr.require_retry = config.require_retry;
             conn_mgr.retry_threshold = config.retry_threshold;
             conn_mgr.max_connections = config.max_connections;
+            conn_mgr.max_handshakes = config.max_handshakes orelse @max(config.max_connections / 4, 1);
             conn_mgr.reply_limits = .init(config.stateless_reply_rate);
             conn_mgr.steer_foreign = config.foreign_datagram != null;
             conn_mgr.reset_unknown = !(config.reuse_port and config.static_reset_key != null and config.foreign_datagram == null);
@@ -5177,6 +5184,48 @@ test "e2e: a flood of datagrams can't keep a server reading" {
 
     server.stop();
     try runUntil(&loop, &server, Server(HelloServer).isStopped, 5_000);
+}
+
+test "e2e: a finished handshake gives its place under max_handshakes back" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var server_handler = HelloServer{};
+    var server = try Server(HelloServer).init(testing.allocator, &server_handler, .{
+        .port = 29466,
+        .tls_config = makeTestTlsConfig(),
+        .max_handshakes = 1,
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+
+    // The first stays connected: only its finished handshake, not its
+    // removal, can make room for the second.
+    var first_handler = CheckingClient{};
+    var first = try Client(CheckingClient).init(testing.allocator, &first_handler, .{ .port = 29466, .skip_cert_verify = true, .loop = &loop });
+    defer first.deinit();
+    first.start();
+    try runUntil(&loop, &first_handler, CheckingClient.done, 10_000);
+
+    var second_handler = CheckingClient{};
+    var second = try Client(CheckingClient).init(testing.allocator, &second_handler, .{ .port = 29466, .skip_cert_verify = true, .loop = &loop });
+    defer second.deinit();
+    second.start();
+    try runUntil(&loop, &second_handler, CheckingClient.done, 10_000);
+    try testing.expect(!second.conn.retry_received);
+
+    first.stop();
+    second.stop();
+    server.stop();
+    const All = struct {
+        s: *Server(HelloServer),
+        a: *Client(CheckingClient),
+        b: *Client(CheckingClient),
+        fn stopped(self: *const @This()) bool {
+            return self.s.isStopped() and self.a.isStopped() and self.b.isStopped();
+        }
+    };
+    try runUntil(&loop, &All{ .s = &server, .a = &first, .b = &second }, All.stopped, 5000);
 }
 
 test "e2e: a server past retry_threshold makes a client retry, then serves it" {

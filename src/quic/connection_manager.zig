@@ -69,6 +69,9 @@ pub const CidKeyContext = struct {
 /// `freeDeadEntries` releases it.
 pub const ConnEntry = struct {
     conn: *connection.Connection,
+    /// Counted in `ConnectionManager.handshakes` until its handshake is done
+    /// or it is removed.
+    handshaking: bool = false,
     /// Unique per manager, never reused.
     id: u64 = 0,
     h3_conn: ?*h3.H3Connection = null,
@@ -275,6 +278,14 @@ pub const ConnectionManager = struct {
     /// server spends state only on clients that proved their address.
     retry_threshold: ?usize = null,
 
+    /// Connections still in their handshake past which a new client must
+    /// first answer a Retry: a flood of Initials from spoofed addresses, which
+    /// never finish, then costs no state, and established connections keep
+    /// their room under `max_connections`.
+    max_handshakes: usize = DEFAULT_MAX_CONNECTIONS / 4,
+    /// Half-open connections, as far as `route` has seen; see `openHandshakes`.
+    handshakes: usize = 0,
+
     /// When true, every new connection is answered with CONNECTION_REFUSED,
     /// as it is at `max_connections`. Set while a server drains.
     refuse_new: bool = false,
@@ -461,6 +472,8 @@ pub const ConnectionManager = struct {
         entry.initial_dcid = client_dcid_key;
 
         self.entries.appendAssumeCapacity(entry);
+        entry.handshaking = true;
+        self.handshakes += 1;
 
         return entry;
     }
@@ -539,6 +552,11 @@ pub const ConnectionManager = struct {
         entry.wt_conn = null;
         entry.h3_conn = null;
         entry.h0_conn = null;
+
+        if (entry.handshaking) {
+            entry.handshaking = false;
+            self.handshakes -= 1;
+        }
 
         // Swap-remove from entries list
         var idx: usize = 0;
@@ -704,7 +722,8 @@ pub const ConnectionManager = struct {
                 // client will insist on seeing retry_source_connection_id.
                 const token = header.token orelse &[_]u8{};
                 const need_retry = self.require_retry or
-                    (if (self.retry_threshold) |n| self.entries.items.len >= n else false);
+                    (if (self.retry_threshold) |n| self.entries.items.len >= n else false) or
+                    self.openHandshakes() >= self.max_handshakes;
                 if (token.len > 0) {
                     retry_token = packet.validateRetryToken(token, from, self.retry_token_key) catch null;
                     if (retry_token) |*vt| {
@@ -761,6 +780,7 @@ pub const ConnectionManager = struct {
         }
 
         if (current_entry) |e| {
+            self.noteHandshakeDone(e);
             return .{ .processed = e };
         }
         return .{ .dropped = {} };
@@ -781,6 +801,21 @@ pub const ConnectionManager = struct {
     /// Answer an Initial we will not serve with CONNECTION_REFUSED (RFC 9000
     /// 5.2.2), sealed with the Initial keys its own DCID derives, so the
     /// client fails fast instead of retransmitting into silence.
+    fn noteHandshakeDone(self: *ConnectionManager, e: *ConnEntry) void {
+        if (e.handshaking and e.conn.state == .connected) {
+            e.handshaking = false;
+            self.handshakes -= 1;
+        }
+    }
+
+    /// Half-open connections, recounted at the cap: a handshake can also
+    /// finish outside `route`, when a held packet is replayed later.
+    fn openHandshakes(self: *ConnectionManager) usize {
+        if (self.handshakes < self.max_handshakes) return self.handshakes;
+        for (self.entries.items) |e| self.noteHandshakeDone(e);
+        return self.handshakes;
+    }
+
     /// Whether `pkt`, an unknown client's first packet, opens under the
     /// Initial keys its DCID derives. They are public, so this proves only
     /// that the bytes are a QUIC Initial and not noise, which is what earns
@@ -1342,6 +1377,55 @@ test "an Initial is accepted locally even when its DCID decodes to another serve
     var id: [1]u8 = undefined;
     try std.testing.expect(quic_lb.extractServerId(&lbConfig(1), scid, &id));
     try std.testing.expectEqual(@as(u8, 1), id[0]);
+}
+
+test "past max_handshakes a new client gets Retry, and is served once it echoes the token" {
+    // Half-open connections had no cap of their own: valid Initials from
+    // spoofed sources, which never finish, filled max_connections and locked
+    // real clients out.
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.max_handshakes = 1;
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+    var buf: [1500]u8 = undefined;
+
+    const first = try clientInitial(alloc, &buf);
+    defer {
+        first.conn.deinit();
+        alloc.destroy(first.conn);
+    }
+    try std.testing.expect(mgr.recvDatagram(buf[0..first.len], addr, addr, 0, &out) == .processed);
+
+    const second = try clientInitial(alloc, &buf);
+    defer {
+        second.conn.deinit();
+        alloc.destroy(second.conn);
+    }
+    const retry = switch (mgr.recvDatagram(buf[0..second.len], addr, addr, 0, &out)) {
+        .send_response => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+    second.conn.handleDatagram(@constCast(retry), .{ .to = addr, .from = addr, .datagram_size = retry.len });
+    try std.testing.expect(second.conn.retry_received);
+
+    // Its address proven, it is served with the cap still reached.
+    var n = try second.conn.send(&buf);
+    try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .processed);
+    try std.testing.expectEqual(@as(usize, 2), mgr.connectionCount());
+
+    // Handshakes that end, here by removal, give their places back.
+    mgr.removeConnection(mgr.entries.items[1]);
+    mgr.removeConnection(mgr.entries.items[0]);
+    const third = try clientInitial(alloc, &buf);
+    defer {
+        third.conn.deinit();
+        alloc.destroy(third.conn);
+    }
+    n = third.len;
+    try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .processed);
 }
 
 test "past retry_threshold a new client gets Retry, and is served once it echoes the token" {
