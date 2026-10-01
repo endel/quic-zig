@@ -2159,30 +2159,24 @@ pub const ClientConfig = struct {
     alpn: ?[]const u8 = null,
 
     // TLS verification
-    /// Where the trust anchors come from. `.none` leaves the chain unrooted:
-    /// the hostname, each link's signature, CA:TRUE/keyCertSign and the
-    /// validity dates are still checked, but nothing says the chain ends
-    /// anywhere you trust. `.system` reads the platform's store, `.file` a
-    /// PEM bundle of your own — a private CA, an interop peer's.
+    /// Where the trust anchors come from. The server's chain must end at one,
+    /// besides naming `server_name` and being in date, or the handshake fails.
+    /// `.system` is the platform's store, loaded once per process and shared;
+    /// `.file` a PEM bundle of your own, such as a private CA or an interop
+    /// peer's.
     ///
     /// `.pinned_hashes` is the browsers' `serverCertificateHashes`: SHA-256
     /// fingerprints of leaf certificates to accept outright. The fingerprint
     /// replaces the chain, the hostname and the validity dates, so it reaches
     /// a self-signed server the trust store knows nothing about — the same
     /// bargain that lets a browser talk to our test server.
-    ///
-    /// Anything but `.none` also turns `skip_cert_verify` off.
-    ///
-    /// Each client loads its own copy — about 13 ms for the 163 certificates
-    /// in the macOS store. For many short-lived clients in one process, build
-    /// one `ca_bundle.loadSystem()` yourself and hand it to every connection
-    /// through `tls_config`.
     ca: union(enum) {
-        none,
         system,
         file: []const u8,
         pinned_hashes: []const [32]u8,
-    } = .none,
+    } = .system,
+    /// Accept any certificate, whatever `ca` says. For a test server;
+    /// `.pinned_hashes` is the way to reach one without trusting everyone.
     skip_cert_verify: bool = false,
 
     // QUIC transport
@@ -2639,25 +2633,21 @@ pub fn Client(comptime Handler: type) type {
                     .quic, .h0 => "h3", // default; override via config.alpn for custom protocols
                 };
 
-                // On the heap: init() returns by value, so a bundle stored
-                // in the client would move out from under this pointer.
-                switch (config.ca) {
-                    .none, .pinned_hashes => {},
-                    .system, .file => {
+                var anchors: ?*const Certificate.Bundle = null;
+                var pins: ?[]const [32]u8 = null;
+                if (!config.skip_cert_verify) switch (config.ca) {
+                    .system => anchors = try ca_bundle.system(),
+                    .file => |path| {
+                        // On the heap: init() returns by value, so a bundle
+                        // stored in the client would move out from under
+                        // this pointer.
                         const b = try alloc.create(Certificate.Bundle);
                         errdefer alloc.destroy(b);
-                        b.* = switch (config.ca) {
-                            .system => try ca_bundle.loadSystem(alloc),
-                            .file => |path| try ca_bundle.loadFile(alloc, path),
-                            else => unreachable,
-                        };
+                        b.* = try ca_bundle.loadFile(alloc, path);
                         owned_ca = b;
+                        anchors = b;
                     },
-                }
-
-                const pins: ?[]const [32]u8 = switch (config.ca) {
-                    .pinned_hashes => |h| h,
-                    else => null,
+                    .pinned_hashes => |h| pins = h,
                 };
 
                 break :blk .{
@@ -2665,11 +2655,9 @@ pub fn Client(comptime Handler: type) type {
                     .private_key_bytes = &.{},
                     .alpn = alpn,
                     .server_name = config.server_name,
-                    // Pinning needs CertificateVerify, so it forces verification
-                    // on just as a trust store does.
-                    .skip_cert_verify = if (owned_ca != null or pins != null) false else config.skip_cert_verify,
+                    .skip_cert_verify = config.skip_cert_verify,
                     .cert_hashes = pins,
-                    .ca_bundle = owned_ca,
+                    .ca_bundle = anchors,
                 };
             };
 
@@ -5184,6 +5172,61 @@ test "e2e: a flood of datagrams can't keep a server reading" {
 
     server.stop();
     try runUntil(&loop, &server, Server(HelloServer).isStopped, 5_000);
+}
+
+test "e2e: a client trusts only the system's roots by default, so a self-signed server is refused" {
+    // Nothing anchored the default client's chain, so any certificate with
+    // the right name passed, whoever made it.
+    const test_certs = @import("tls/test_certs.zig");
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    var server_handler = HelloServer{};
+    var server = try Server(HelloServer).init(testing.allocator, &server_handler, .{
+        .port = 29467,
+        .tls_config = .{ .cert_chain_der = &.{}, .private_key_bytes = &.{}, .certs = certs.entries[0..1], .alpn = &.{"h3"} },
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+
+    const Over = struct {
+        c: *Client(CheckingClient),
+        h: *CheckingClient,
+        fn f(self: *const @This()) bool {
+            return self.h.finished or self.c.conn.isClosed();
+        }
+    };
+    var refused_handler = CheckingClient{};
+    var refused = try Client(CheckingClient).init(testing.allocator, &refused_handler, .{ .port = 29467, .loop = &loop });
+    defer refused.deinit();
+    refused.start();
+    try runUntil(&loop, &Over{ .c = &refused, .h = &refused_handler }, Over.f, 10_000);
+    try testing.expect(!refused_handler.finished);
+
+    // Pinned, the same certificate is accepted.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(certs.chains[0][0], &digest, .{});
+    const pins = [_][32]u8{digest};
+    var pinned_handler = CheckingClient{};
+    var pinned = try Client(CheckingClient).init(testing.allocator, &pinned_handler, .{ .port = 29467, .ca = .{ .pinned_hashes = &pins }, .loop = &loop });
+    defer pinned.deinit();
+    pinned.start();
+    try runUntil(&loop, &pinned_handler, CheckingClient.done, 10_000);
+
+    refused.stop();
+    pinned.stop();
+    server.stop();
+    const All = struct {
+        s: *Server(HelloServer),
+        a: *Client(CheckingClient),
+        b: *Client(CheckingClient),
+        fn stopped(self: *const @This()) bool {
+            return self.s.isStopped() and self.a.isStopped() and self.b.isStopped();
+        }
+    };
+    try runUntil(&loop, &All{ .s = &server, .a = &refused, .b = &pinned }, All.stopped, 5000);
 }
 
 test "e2e: a finished handshake gives its place under max_handshakes back" {

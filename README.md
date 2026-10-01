@@ -353,8 +353,8 @@ pub fn main() !void {
 | `port` | `4433` | Server port |
 | `server_name` | `"localhost"` | TLS SNI / CONNECT authority |
 | `path` | `"/.well-known/webtransport"` | WebTransport CONNECT path |
-| `ca` | `.none` | Trust anchors: `.none`, `.system`, `.file` (a PEM bundle), or `.pinned_hashes` (SHA-256 leaf fingerprints, the `serverCertificateHashes` equivalent). Anything but `.none` turns `skip_cert_verify` off |
-| `skip_cert_verify` | `false` | Skip certificate verification (testing only) |
+| `ca` | `.system` | Trust anchors: `.system` (the platform's store, loaded once per process), `.file` (a PEM bundle), or `.pinned_hashes` (SHA-256 leaf fingerprints, the `serverCertificateHashes` equivalent). A server whose chain ends at none of them is refused |
+| `skip_cert_verify` | `false` | Accept any certificate, whatever `ca` says (testing only) |
 | `max_datagram_frame_size` | `65536` | QUIC datagram frame size limit |
 | `wt_credits` | QUIC's own limits | draft-13 §5.6 session credit granted to the peer, per session: `.max_streams_bidi`, `.max_streams_uni`, `.max_data` |
 | `wt_advertise_credits` | `false` | Also announce those credits in SETTINGS (§5.5). Off: Safari 26.4 refuses the session when it sees them |

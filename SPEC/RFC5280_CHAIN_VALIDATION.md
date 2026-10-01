@@ -26,11 +26,10 @@
   this module is where that `Io` is built and torn down so it stays out of the
   library's signatures (the same call `src/sys.zig` documents).
 - Supports macOS (Keychain), Linux (`/etc/ssl/certs/`), FreeBSD, OpenBSD, etc.
-- Event-loop clients ask for it with `ClientConfig.ca` = `.system` or
-  `.{ .file = path }`; either turns `skip_cert_verify` off. Each client loads
-  its own copy — about 13 ms for the 163 certificates in the macOS store — so
-  a process making many short-lived clients should build one bundle and pass
-  it through `tls_config`.
+- Event-loop clients trust `.system` by default (`ClientConfig.ca`), or a
+  `.{ .file = path }` of their own. The system store is loaded once per
+  process (`ca_bundle.system()`, about 13 ms for the 163 certificates in the
+  macOS store) and shared by every client.
 
 ### Configuration
 
@@ -51,7 +50,6 @@ const tls_config = TlsConfig{
 - **Extended Key Usage** — `id-kp-serverAuth` not checked on a server's leaf (recommended but not required by TLS 1.3); `id-kp-clientAuth` is checked on a client's
 - **Name Constraints** — RFC 5280 §4.2.1.10
 - **Policy Constraints** — RFC 5280 §4.2.1.11
-- **Mandatory ca_bundle enforcement** — When `skip_cert_verify=false` and no `ca_bundle` is provided, the chain's self-signed root is accepted without trust anchor verification
 
 #### Client certificates
 - A server asks for one when the certificate SNI selected has
@@ -93,7 +91,9 @@ feed what it accepts to std's parser and our extension readers.
 
 ### Caveats
 
-- `skip_cert_verify` defaults to `true` for backward compatibility
+- `skip_cert_verify` defaults to `false`, and verifying with neither
+  `ca_bundle` nor `cert_hashes` fails closed: a chain no anchor vouches for
+  proves only that someone made a certificate with the right name
 - V1 certificates (no extensions) are accepted as CAs when no basicConstraints is present — this matches common practice but is less strict than RFC 5280's recommendation
 - The interop client always uses `skip_cert_verify=true` since interop test
   peers use various self-signed certs. The MoQ interop image's

@@ -37,6 +37,31 @@ pub fn loadSystem(gpa: Allocator) Error!Certificate.Bundle {
     return bundle;
 }
 
+/// `loadSystem`, once per process: every client that trusts the platform's
+/// store shares this bundle and pays for the load (about 13 ms on macOS)
+/// once. It lives as long as the process; a failed load is retried on the
+/// next call.
+pub fn system() Error!*const Certificate.Bundle {
+    while (true) {
+        switch (shared_state.load(.acquire)) {
+            .ready => return &shared_bundle,
+            .loading => std.atomic.spinLoopHint(),
+            .empty => if (shared_state.cmpxchgWeak(.empty, .loading, .acquire, .monotonic) == null) {
+                shared_bundle = loadSystem(std.heap.smp_allocator) catch |err| {
+                    shared_state.store(.empty, .release);
+                    return err;
+                };
+                shared_state.store(.ready, .release);
+                return &shared_bundle;
+            },
+        }
+    }
+}
+
+const SharedState = enum(u8) { empty, loading, ready };
+var shared_state: std.atomic.Value(SharedState) = .init(.empty);
+var shared_bundle: Certificate.Bundle = undefined;
+
 /// One PEM file of CA certificates, in place of the platform's. Use it to
 /// trust a private CA — an interop peer's, a test rig's — without trusting
 /// everything the machine does.

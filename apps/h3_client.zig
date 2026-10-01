@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var handler = H3Client{ .alloc = alloc, .path = path };
     var client = try event_loop.Client(H3Client).init(alloc, &handler, .{
         .port = port,
-        .ca = if (insecure) .none else .{ .file = "interop/certs/ca.crt" },
+        .ca = .{ .file = "interop/certs/ca.crt" },
         .skip_cert_verify = insecure,
     });
     defer client.deinit();

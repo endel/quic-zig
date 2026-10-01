@@ -2544,7 +2544,8 @@ pub const Connection = struct {
         while (iterations < 50) {
             iterations += 1;
             const action = hs.step() catch |err| {
-                std.log.err("TLS 1.3 handshake error: {}", .{err});
+                // The peer's doing, such as a certificate we don't trust.
+                std.log.warn("TLS 1.3 handshake error: {}", .{err});
                 // RFC 9000 §7.4: TransportParameterError is a QUIC transport error, not TLS
                 if (err == error.TransportParameterError) {
                     self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "transport parameter error");

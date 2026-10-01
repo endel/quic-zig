@@ -1083,7 +1083,10 @@ pub const TlsConfig = struct {
     /// without one the client answers with an empty Certificate.
     client_certificate: ?ServerCertificate = null,
     server_name: ?[]const u8 = null, // SNI (client only)
-    skip_cert_verify: bool = true, // Skip X.509 chain + CertificateVerify validation
+    /// Client only: accept any certificate, unchecked. Otherwise the server
+    /// must chain to `ca_bundle` or match `cert_hashes`, and with neither the
+    /// handshake fails.
+    skip_cert_verify: bool = false,
     /// SHA-256 fingerprints of acceptable leaf certificates — the
     /// `serverCertificateHashes` bargain from the W3C WebTransport API. When
     /// set, the fingerprint stands in for the chain, the hostname and the
@@ -1091,7 +1094,7 @@ pub const TlsConfig = struct {
     /// `skip_cert_verify = false`, or CertificateVerify never runs and the pin
     /// proves only that someone copied a public certificate.
     cert_hashes: ?[]const [32]u8 = null,
-    ca_bundle: ?*Certificate.Bundle = null, // Caller-owned CA bundle for trust anchor verification
+    ca_bundle: ?*const Certificate.Bundle = null, // Caller-owned CA bundle for trust anchor verification
     session_ticket: ?*const SessionTicket = null, // Stored ticket from previous connection (client)
     ticket_key: ?[16]u8 = null, // AES-128-GCM key for encrypting/decrypting tickets (server)
     keylog_file: ?@import("../sys.zig").File = null, // SSLKEYLOGFILE output (NSS Key Log format)
@@ -1881,12 +1884,11 @@ pub const Tls13Handshake = struct {
                     if (!issuerConstraintsOk(cert_der, cert_index)) return error.BadCertificate;
                 }
 
-                // If this is the last cert, verify against CA bundle
+                // The chain has to end at an anchor: without one, it proves
+                // only that someone made a certificate with this name.
                 if (pos >= cert_list_end) {
-                    if (self.config.ca_bundle) |bundle| {
-                        const now_sec = sys.realtimeSeconds();
-                        bundle.verify(parsed, now_sec) catch return error.BadCertificate;
-                    }
+                    const bundle = self.config.ca_bundle orelse return error.BadCertificate;
+                    bundle.verify(parsed, sys.realtimeSeconds()) catch return error.BadCertificate;
                 }
 
                 prev_parsed = parsed;
@@ -3846,6 +3848,7 @@ test "loopback handshake: client and server complete" {
         .cert_chain_der = &.{},
         .private_key_bytes = &.{},
         .alpn = &[_][]const u8{"h3"},
+        .skip_cert_verify = true, // against a self-signed test server
         .server_name = "localhost",
     };
 
@@ -3891,6 +3894,7 @@ test "loopback handshake: the server answers with the one ALPN it chose" {
         .cert_chain_der = &.{},
         .private_key_bytes = &.{},
         .alpn = &[_][]const u8{ "moqt-17", "moqt-18" },
+        .skip_cert_verify = true, // against a self-signed test server
         .server_name = "localhost",
     }, tp);
     try driveLoopback(&client, &server);
@@ -4017,6 +4021,7 @@ test "loopback PSK resumption: two handshakes with session ticket" {
         .cert_chain_der = &.{},
         .private_key_bytes = &.{},
         .alpn = &[_][]const u8{"h3"},
+        .skip_cert_verify = true, // against a self-signed test server
         .server_name = "localhost",
     };
 
@@ -4264,6 +4269,7 @@ fn issueTicket(server_config: TlsConfig) !SessionTicket {
         .private_key_bytes = &.{},
         .alpn = &[_][]const u8{"h3"},
         .server_name = "localhost",
+        .skip_cert_verify = true, // against a self-signed test server
     }, tp);
     var client_done = false;
     var server_done = false;
@@ -4469,6 +4475,48 @@ test "client: an empty Certificate from the server ends the handshake" {
         client.state = .client_wait_certificate;
         client.provideData(&.{ 0x0b, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00 });
         try std.testing.expectError(error.DecodeError, client.step());
+    }
+}
+
+test "client: verification is on unless turned off, and fails closed without an anchor" {
+    // skip_cert_verify defaulted to true, and with it false but no CA bundle
+    // or pins, a chain that nothing vouched for passed: any certificate with
+    // the right name, whoever made it.
+    const gpa = std.testing.allocator;
+    var der: [4096]u8 = undefined;
+    const leaf = try parsePemCert(test_certs.interop_server_pem, &der);
+    var msg_buf: [4200]u8 = undefined;
+    const list_len = 3 + leaf.len + 2;
+    const body_len = 1 + 3 + list_len;
+    msg_buf[0] = @intFromEnum(tls.HandshakeType.certificate);
+    std.mem.writeInt(u24, msg_buf[1..4], @intCast(body_len), .big);
+    msg_buf[4] = 0;
+    std.mem.writeInt(u24, msg_buf[5..8], @intCast(list_len), .big);
+    std.mem.writeInt(u24, msg_buf[8..11], @intCast(leaf.len), .big);
+    @memcpy(msg_buf[11..][0..leaf.len], leaf);
+    std.mem.writeInt(u16, msg_buf[11 + leaf.len ..][0..2], 0, .big);
+    const msg = msg_buf[0 .. 4 + body_len];
+
+    var bundle: Certificate.Bundle = .empty;
+    defer bundle.deinit(gpa);
+    var ca_der: [2048]u8 = undefined;
+    try bundle.bytes.appendSlice(gpa, try parsePemCert(test_certs.interop_ca_pem, &ca_der));
+    try bundle.parseCert(gpa, 0, sys.realtimeSeconds());
+
+    const base: TlsConfig = .{ .cert_chain_der = &.{}, .private_key_bytes = &.{}, .alpn = &[_][]const u8{"h3"}, .server_name = "localhost" };
+    var unrooted = base;
+    unrooted.skip_cert_verify = false;
+    var anchored = unrooted;
+    anchored.ca_bundle = &bundle;
+    for ([_]TlsConfig{ base, unrooted, anchored }, 0..) |config, i| {
+        var client = Tls13Handshake.initClient(config, .{});
+        client.state = .client_wait_certificate;
+        client.provideData(msg);
+        if (i < 2) {
+            try std.testing.expectError(error.BadCertificate, client.step());
+        } else {
+            try std.testing.expect(try client.step() == ._continue);
+        }
     }
 }
 
@@ -4930,6 +4978,7 @@ fn clientAuthHandshake(gpa: std.mem.Allocator, server_config: TlsConfig, client_
         .private_key_bytes = &.{},
         .alpn = &[_][]const u8{"h3"},
         .server_name = "localhost",
+        .skip_cert_verify = true, // against a self-signed test server
         .client_certificate = client_cert,
     }, tp);
 
