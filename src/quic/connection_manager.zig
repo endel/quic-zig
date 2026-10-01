@@ -302,6 +302,10 @@ pub const ConnectionManager = struct {
     // removeConnection can never fail to queue one.
     dead_entries: std.ArrayList(DeadEntry) = .empty,
 
+    /// Where a new client's first packet is opened on trial, so the datagram
+    /// itself stays untouched for the connection that then decrypts it.
+    initial_scratch: std.ArrayList(u8) = .empty,
+
     pub fn init(
         allocator: Allocator,
         tls_config: tls13.TlsConfig,
@@ -328,6 +332,7 @@ pub const ConnectionManager = struct {
     }
 
     pub fn deinit(self: *ConnectionManager) void {
+        self.initial_scratch.deinit(self.allocator);
         // Free deferred-dead entries first
         self.freeDeadEntries();
         // Clean up all live connections
@@ -686,6 +691,9 @@ pub const ConnectionManager = struct {
                 if (bytes.len < MIN_INITIAL_DATAGRAM or header.dcid.len < MIN_INITIAL_DCID_LEN) {
                     return .{ .dropped = {} };
                 }
+                if (!self.initialOpens(header, bytes[pkt_start..][0..full_size], fbs.seek - pkt_start)) {
+                    return .{ .dropped = {} };
+                }
 
                 if (self.refuse_new or self.entries.items.len >= self.max_connections) {
                     return self.refuse(header, out_buf);
@@ -773,6 +781,24 @@ pub const ConnectionManager = struct {
     /// Answer an Initial we will not serve with CONNECTION_REFUSED (RFC 9000
     /// 5.2.2), sealed with the Initial keys its own DCID derives, so the
     /// client fails fast instead of retransmitting into silence.
+    /// Whether `pkt`, an unknown client's first packet, opens under the
+    /// Initial keys its DCID derives. They are public, so this proves only
+    /// that the bytes are a QUIC Initial and not noise, which is what earns
+    /// them a connection's state. `pn_offset` is where the header ends.
+    fn initialOpens(self: *ConnectionManager, header: packet.Header, pkt: []const u8, pn_offset: usize) bool {
+        const keys = crypto.deriveInitialKeyMaterial(header.dcid, header.version, true) catch return false;
+        self.initial_scratch.resize(self.allocator, pkt.len) catch return false;
+        const copy = self.initial_scratch.items;
+        @memcpy(copy, pkt);
+        var h = header;
+        h.packet_start = 0;
+        var fbs = io.fixedBufferStream(copy);
+        fbs.seek = pn_offset;
+        const space: packet.PacketNumSpace = .{ .crypto_open = keys[0] };
+        _ = packet.decrypt(&h, &fbs, &space) catch return false;
+        return true;
+    }
+
     fn refuse(self: *ConnectionManager, header: packet.Header, out_buf: []u8) RecvAction {
         if (!self.reply_limits.refusal.allow(sys.nanoTimestamp())) return .{ .dropped = {} };
         const len = writeRefusal(header, out_buf) catch return .{ .dropped = {} };
@@ -1040,6 +1066,27 @@ fn clientInitial(alloc: Allocator, out: []u8) !struct { conn: *connection.Connec
     return .{ .conn = conn, .len = len };
 }
 
+/// A client Initial to `dcid` carrying a PING, sealed as a real client seals it.
+fn pingInitial(alloc: Allocator, out: []u8, dcid: []const u8) !usize {
+    const ack_handler = @import("ack_handler.zig");
+    const crypto_stream = @import("crypto_stream.zig");
+    const stream_mod = @import("stream.zig");
+    const packet_packer = @import("packet_packer.zig");
+    const version = protocol.SUPPORTED_VERSIONS[0];
+    const seal = (try crypto.deriveInitialKeyMaterial(dcid, version, false))[1];
+    var handler = ack_handler.PacketHandler.init(alloc);
+    defer handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(alloc);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(alloc, false);
+    defer streams.deinit();
+    const scid = [_]u8{0xc1} ** 8;
+    var packer = packet_packer.PacketPacker.init(alloc, false, &scid, dcid, version);
+    var pending: frame_mod.PendingFrameQueue = .{};
+    pending.push(.ping);
+    return packer.packCoalesced(out, &handler, &crypto_mgr, &streams, &pending, &seal, null, null, null, 0, null, false);
+}
+
 /// Hand-built long header: enough for routing, never decrypted.
 fn fakeLongHeader(buf: []u8, version: u32, dcid: []const u8) usize {
     var fbs = io.fixedBufferStream(buf);
@@ -1065,6 +1112,29 @@ test "an Initial in a datagram under 1200 bytes opens no connection" {
     const n = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &([_]u8{0x11} ** 8));
     try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .dropped);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+}
+
+test "an Initial that doesn't decrypt opens no connection" {
+    // A connection was allocated before its first packet was opened, so
+    // random bytes under a plausible header each held a slot until the idle
+    // timeout.
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const dcid = [_]u8{0x11} ** 8;
+    var out: [1500]u8 = undefined;
+
+    var junk = [_]u8{0} ** 1200;
+    _ = fakeLongHeader(&junk, protocol.SUPPORTED_VERSIONS[0], &dcid);
+    try std.testing.expect(mgr.recvDatagram(&junk, addr, addr, 0, &out) == .dropped);
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+
+    var buf: [1500]u8 = undefined;
+    const n = try pingInitial(alloc, &buf, &dcid);
+    try std.testing.expect(n >= 1200);
+    try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .processed);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
 }
 
 test "an Initial with a DCID under 8 bytes opens no connection" {
@@ -1263,9 +1333,9 @@ test "an Initial is accepted locally even when its DCID decodes to another serve
 
     var cid: [8]u8 = undefined;
     quic_lb.generateCid(&lbConfig(2), &cid);
-    var buf = [_]u8{0} ** 1200;
-    _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &cid);
-    try std.testing.expect(mgr.recvDatagram(&buf, addr, addr, 0, &out) == .processed);
+    var buf: [1500]u8 = undefined;
+    const n = try pingInitial(alloc, &buf, &cid);
+    try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .processed);
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
     // And the connection's own CID carries our id.
     const scid = mgr.entries.items[0].conn.scid[0..8];
