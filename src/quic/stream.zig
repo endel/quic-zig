@@ -636,6 +636,43 @@ const RetransmitRange = struct {
 /// heap-allocated so the pointer survives a move of the owning connection.
 pub const SendLedger = struct {
     committed: u64 = 0,
+    /// Send buffers that streams drained or finished with, for the next one
+    /// to grow past `SPARE_MIN`. Most allocators hand out a buffer that size
+    /// straight from the kernel (std's smp_allocator maps anything of 64 KiB
+    /// or more), so streams growing and freeing their own would fault in
+    /// fresh pages and unmap them again for every burst they send.
+    spares: [MAX_SPARES][]u8 = @splat(&.{}),
+    spare_count: usize = 0,
+
+    pub const MAX_SPARES = 2;
+    /// Smaller buffers come cheaply from any allocator's size classes.
+    pub const SPARE_MIN: usize = 64 * 1024;
+    /// Larger ones are rare enough not to keep around.
+    pub const SPARE_MAX: usize = 1024 * 1024;
+
+    /// A spare of at least `len` bytes, or null.
+    fn takeSpare(self: *SendLedger, len: usize) ?[]u8 {
+        for (self.spares[0..self.spare_count], 0..) |b, i| {
+            if (b.len < len) continue;
+            self.spare_count -= 1;
+            self.spares[i] = self.spares[self.spare_count];
+            return b;
+        }
+        return null;
+    }
+
+    /// Keep `buf` for a later stream; false when it isn't wanted.
+    fn giveSpare(self: *SendLedger, buf: []u8) bool {
+        if (buf.len < SPARE_MIN or buf.len > SPARE_MAX or self.spare_count == MAX_SPARES) return false;
+        self.spares[self.spare_count] = buf;
+        self.spare_count += 1;
+        return true;
+    }
+
+    pub fn freeSpares(self: *SendLedger, allocator: Allocator) void {
+        for (self.spares[0..self.spare_count]) |b| allocator.free(b);
+        self.spare_count = 0;
+    }
 };
 
 /// A QUIC send stream.
@@ -737,7 +774,17 @@ pub const SendStream = struct {
 
     pub fn deinit(self: *SendStream) void {
         self.acked_ranges.deinit();
+        self.releaseBuffer();
+    }
+
+    /// Give the buffer to the connection's spares, or free it.
+    fn releaseBuffer(self: *SendStream) void {
+        if (self.ledger) |l| if (l.giveSpare(self.write_buffer.allocatedSlice())) {
+            self.write_buffer = .{ .items = &.{}, .capacity = 0 };
+            return;
+        };
         self.write_buffer.deinit(self.allocator);
+        self.write_buffer = .{ .items = &.{}, .capacity = 0 };
     }
 
     /// Write data to the stream. Buffers it for later sending. Dropped once the
@@ -750,11 +797,19 @@ pub const SendStream = struct {
             const prefix = self.ackedPrefix();
             if (prefix > 0 and prefix >= self.write_buffer.items.len - prefix) self.dropPrefix(prefix);
         }
+        const new_total = self.write_buffer.items.len + data.len;
+        if (new_total > self.write_buffer.capacity and new_total >= SendLedger.SPARE_MIN) {
+            if (self.ledger) |l| if (l.takeSpare(new_total)) |mem| {
+                const items = self.write_buffer.items;
+                @memcpy(mem[0..items.len], items);
+                self.write_buffer.deinit(self.allocator);
+                self.write_buffer = .{ .items = mem[0..items.len], .capacity = mem.len };
+            };
+        }
         // Once the stream has buffered more than a few small writes, jump
         // capacity to 4 KiB in one shot. Avoids the 8→16→32→… realloc cascade
         // for streaming workloads (measured 2-5× faster on multi-write patterns)
         // while leaving small one-shot writes on the default growth path.
-        const new_total = self.write_buffer.items.len + data.len;
         if (self.write_buffer.capacity < 4096 and new_total > 256) {
             try self.write_buffer.ensureTotalCapacity(
                 self.allocator,
@@ -793,7 +848,21 @@ pub const SendStream = struct {
         // refill: routez keeps an HTTP/3 response between 64 and 256 KiB
         // buffered, and a 1 MB one spent a third of its time reallocating and
         // faulting in the fresh pages.
+        if (live == 0 and self.fin_queued) {
+            // Nothing more can be written, and all of it is acknowledged.
+            self.buf_base += prefix;
+            self.releaseBuffer();
+            return;
+        }
         if (live == 0 and self.write_buffer.capacity > RETAINED_CAPACITY) {
+            // Between bursts the connection holds the buffer for the next
+            // one, this stream's or another's: shrinking would unmap it, and
+            // the refill fault a fresh one in.
+            if (self.ledger) |l| if (l.giveSpare(self.write_buffer.allocatedSlice())) {
+                self.buf_base += prefix;
+                self.write_buffer = .{ .items = &.{}, .capacity = 0 };
+                return;
+            };
             if (self.shrinkTo(prefix, RETAINED_CAPACITY)) return;
         }
         if (prefix < COMPACT_THRESHOLD) return;
@@ -1380,7 +1449,10 @@ pub const StreamsMap = struct {
         }
         self.recv_streams.deinit();
 
-        if (self.send_ledger) |l| self.allocator.destroy(l);
+        if (self.send_ledger) |l| {
+            l.freeSpares(self.allocator);
+            self.allocator.destroy(l);
+        }
     }
 
     /// Update the maximum stream limits from peer's transport parameters.
@@ -1868,6 +1940,9 @@ pub const StreamsMap = struct {
             clearTombstones(&self.send_streams);
         }
         self.disposal_count = 0;
+        // Spares are for streams to come while others run; an idle
+        // connection keeps none.
+        if (self.streams.count() == 0) if (self.send_ledger) |l| l.freeSpares(self.allocator);
         if (self.disposal_overflow) {
             self.disposal_overflow = false;
             self.needs_gc_scan = true; // there was more than the queue could hold
@@ -3779,6 +3854,79 @@ test "SendStream: a writer refilling between two marks does not reallocate" {
     // Drained, it goes back to the retained capacity.
     while (ss.popStreamFrame(1200)) |f| try ss.onAck(f.stream.offset, f.stream.length, false);
     try testing.expectEqual(SendStream.RETAINED_CAPACITY, ss.write_buffer.capacity);
+}
+
+test "StreamsMap: a finished stream's send buffer goes to the next, and leaves with the last" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(40, 40);
+    var buf: [16 * 1024]u8 = undefined;
+    @memset(&buf, 'r');
+
+    // A response of 320 KiB, sent and acknowledged with its FIN.
+    const first = try sm.openBidiStream();
+    for (0..20) |_| try first.send.writeData(&buf);
+    const big = first.send.write_buffer.allocatedSlice();
+    first.send.close();
+    while (first.send.popStreamFrame(1200)) |f| try first.send.onAck(f.stream.offset, f.stream.length, f.stream.fin);
+    try testing.expect(first.send.fin_acked);
+    try testing.expectEqual(@as(usize, 0), first.send.write_buffer.capacity);
+    try testing.expectEqual(@as(usize, 1), sm.send_ledger.?.spare_count);
+
+    // The next one takes it once past what an allocator's size classes hold.
+    const next = try sm.openBidiStream();
+    for (0..20) |_| try next.send.writeData(&buf);
+    try testing.expectEqual(big.ptr, next.send.write_buffer.items.ptr);
+    try testing.expectEqual(big.len, next.send.write_buffer.capacity);
+    try testing.expectEqual(@as(usize, 0), sm.send_ledger.?.spare_count);
+
+    // With no stream left, the connection keeps no spare.
+    next.send.close();
+    while (next.send.popStreamFrame(1200)) |f| try next.send.onAck(f.stream.offset, f.stream.length, f.stream.fin);
+    try testing.expectEqual(@as(usize, 1), sm.send_ledger.?.spare_count);
+    _ = sm.queueDisposal(first.stream_id);
+    _ = sm.queueDisposal(next.stream_id);
+    sm.drainDisposalQueue();
+    try testing.expectEqual(@as(usize, 0), sm.send_ledger.?.spare_count);
+}
+
+test "StreamsMap: a stream drained between bursts gets its buffer back for the next" {
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(40, 40);
+    var buf: [16 * 1024]u8 = undefined;
+    @memset(&buf, 'r');
+
+    const st = try sm.openBidiStream();
+    for (0..20) |_| try st.send.writeData(&buf);
+    const big = st.send.write_buffer.allocatedSlice();
+    // Everything sent is acknowledged before the writer refills.
+    while (st.send.popStreamFrame(1200)) |f| try st.send.onAck(f.stream.offset, f.stream.length, f.stream.fin);
+    try testing.expectEqual(@as(usize, 0), st.send.write_buffer.capacity);
+    try testing.expectEqual(@as(usize, 1), sm.send_ledger.?.spare_count);
+
+    for (0..20) |_| try st.send.writeData(&buf);
+    try testing.expectEqual(big.ptr, st.send.write_buffer.items.ptr);
+    // Offsets carry on where they were.
+    const f = st.send.popStreamFrame(1200).?;
+    try testing.expectEqual(@as(u64, 20 * buf.len), f.stream.offset);
+}
+
+test "SendLedger: spares are bounded in number and size" {
+    var l: SendLedger = .{};
+    defer l.freeSpares(testing.allocator);
+    const small = try testing.allocator.alloc(u8, SendLedger.SPARE_MIN - 1);
+    defer testing.allocator.free(small);
+    const huge = try testing.allocator.alloc(u8, SendLedger.SPARE_MAX + 1);
+    defer testing.allocator.free(huge);
+    try testing.expect(!l.giveSpare(small));
+    try testing.expect(!l.giveSpare(huge));
+    for (0..SendLedger.MAX_SPARES) |_| try testing.expect(l.giveSpare(try testing.allocator.alloc(u8, SendLedger.SPARE_MIN)));
+    const extra = try testing.allocator.alloc(u8, SendLedger.SPARE_MIN);
+    defer testing.allocator.free(extra);
+    try testing.expect(!l.giveSpare(extra));
+    // Only one big enough.
+    try testing.expect(l.takeSpare(SendLedger.SPARE_MIN + 1) == null);
 }
 
 test "StreamsMap: backfill is the lowest IDs, however many streams wait" {

@@ -35,6 +35,7 @@ contributions" in `CLAUDE.md`.
 | 10 | GHASH on arm64 | `src/quic/aes_gcm.zig` (`ghashBlocks`) | GHASH in vector registers | yes: codegen |
 | 11 | Master compiles AES-GCM slower | `src/quic/aes_gcm.zig` (`xorBlock`) | explicit unaligned vector loads | yes: codegen regression |
 | 12 | ECDSA P-256 signing's k·G | `src/quic/ecdsa_p256.zig` | own signer: std's steps, fixed-base table | yes: perf |
+| 13 | Large allocations go straight to the kernel | `src/quic/stream.zig` (`SendLedger`) | send buffers kept for reuse | maybe: design question |
 
 Not a std divergence, but related: std picks the AES and GHASH
 implementation at **compile time** from the target's CPU features.
@@ -401,6 +402,32 @@ fixed-base comb before raising it.
 base point, used by `mul` when `is_base` is set, as `mulPublic` could too.
 The field multiply itself may be worth a look: 54 ns is several times what
 64-bit Montgomery multiplication takes elsewhere.
+
+## 13. smp_allocator maps every large allocation afresh
+
+**std 0.16:** `std.heap.smp_allocator` serves sizes below its 64 KiB slab
+from per-thread size classes. Anything larger goes to `PageAllocator`: an
+mmap on allocation, a munmap on free, and a page fault per page on first
+touch. Nothing is cached in between.
+
+**Ours:** a stream's send buffer grows past 64 KiB for any large response,
+and routez lets it drain between refills. The buffer was shrunk once drained
+and freed when the stream ended, so every burst mapped, faulted in and
+unmapped one. A connection's `SendLedger` now keeps up to two drained or
+finished buffers for its next stream. In routez's HTTP/3 bench
+(`bench/run.sh h3`, paired A/B, 10 rounds) the 1 MB row went from 2.2k to
+2.8k requests/s and 1.27 to 1.04 ms of CPU per request; buffers under
+64 KiB, as on the 10 KB row, don't change.
+
+With three workers in one process, the cost is not only per thread: munmap
+takes the address space's lock for writing, and the other workers' page
+faults wait on it (`rwsem_down_write_slowpath` in a profile).
+
+**Master:** not re-checked.
+
+**Upstream-shaped question:** whether `SmpAllocator` should keep a few freed
+large blocks per thread, as glibc's malloc does below its trim threshold.
+It is a memory-for-speed trade, so it is a design question, not a bug.
 
 ## Verifying the copies still match std
 
