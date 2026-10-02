@@ -82,6 +82,7 @@ fn selectCipherSuite(list: []const u8, only: ?quic_crypto.CipherSuite) ?quic_cry
 const client_signature_schemes = [_]tls.SignatureScheme{
     .ed25519,
     .ecdsa_secp256r1_sha256,
+    .ecdsa_secp384r1_sha384,
     .rsa_pss_rsae_sha256,
     .rsa_pss_rsae_sha384,
     .rsa_pss_rsae_sha512,
@@ -4731,7 +4732,7 @@ test "client: verification is on unless turned off, and fails closed without an 
 }
 
 test "client: a CertificateVerify in a scheme it never offered is refused" {
-    // RFC 8446 4.4.3: ecdsa_secp384r1_sha384 is verifiable but not offered.
+    // RFC 8446 4.4.3: ecdsa_secp521r1_sha512 is not offered.
     var client = Tls13Handshake.initClient(.{
         .cert_chain_der = &.{},
         .private_key_bytes = &.{},
@@ -4742,7 +4743,7 @@ test "client: a CertificateVerify in a scheme it never offered is refused" {
     client.state = .client_wait_certificate_verify;
     client.leaf_pub_key_len = 65;
     client.leaf_pub_key_algo = .X9_62_id_ecPublicKey;
-    client.provideData(&.{ 0x0f, 0x00, 0x00, 0x06, 0x05, 0x03, 0x00, 0x02, 0x30, 0x00 });
+    client.provideData(&.{ 0x0f, 0x00, 0x00, 0x06, 0x06, 0x03, 0x00, 0x02, 0x30, 0x00 });
     try std.testing.expectError(error.IllegalParameter, client.step());
 }
 
@@ -5061,7 +5062,7 @@ test "a QUIC handshake with an RSA certificate, from a PKCS#1 or a PKCS#8 key" {
 
 /// The server's answer to our client's ClientHello with its
 /// signature_algorithms list replaced by `schemes` (null: extension renamed away).
-fn serverAnswer(cert: ServerCertificate, schemes: ?[5]tls.SignatureScheme) !void {
+fn serverAnswer(cert: ServerCertificate, schemes: ?[6]tls.SignatureScheme) !void {
     const tp = transport_params.TransportParams{ .initial_max_data = 1 << 20 };
     var server = Tls13Handshake.initServer(.{
         .cert_chain_der = cert.cert_chain_der,
@@ -5084,7 +5085,7 @@ fn serverAnswer(cert: ServerCertificate, schemes: ?[5]tls.SignatureScheme) !void
     var buf: [2048]u8 = undefined;
     const msg = buf[0..ch.len];
     @memcpy(msg, ch);
-    const at = std.mem.indexOf(u8, msg, &.{ 0x00, 0x0d, 0x00, 0x0c, 0x00, 0x0a }).?;
+    const at = std.mem.indexOf(u8, msg, &.{ 0x00, 0x0d, 0x00, 0x0e, 0x00, 0x0c }).?;
     if (schemes) |list| {
         for (list, 0..) |scheme, i| std.mem.writeInt(u16, msg[at + 6 + 2 * i ..][0..2], @intFromEnum(scheme), .big);
     } else {
@@ -5134,8 +5135,8 @@ test "a QUIC server fails a client that offers no scheme for its certificate" {
     try ec_certs.load();
     const ec = ec_certs.entries[0].cert;
 
-    const no_pss: [5]tls.SignatureScheme = .{ .ecdsa_secp256r1_sha256, .ed25519, .rsa_pkcs1_sha256, .rsa_pss_pss_sha256, .ecdsa_secp384r1_sha384 };
-    const only_pss512: [5]tls.SignatureScheme = @splat(.rsa_pss_rsae_sha512);
+    const no_pss: [6]tls.SignatureScheme = .{ .ecdsa_secp256r1_sha256, .ed25519, .rsa_pkcs1_sha256, .rsa_pss_pss_sha256, .ecdsa_secp384r1_sha384, .ecdsa_secp521r1_sha512 };
+    const only_pss512: [6]tls.SignatureScheme = @splat(.rsa_pss_rsae_sha512);
     try std.testing.expectError(error.HandshakeFailure, serverAnswer(rsa_cert.cert, no_pss));
     try std.testing.expectError(error.HandshakeFailure, serverAnswer(ec, only_pss512));
     try std.testing.expectError(error.MissingExtension, serverAnswer(rsa_cert.cert, null));
@@ -5461,6 +5462,50 @@ test "server: AES-128-GCM over ChaCha20, unless the client lists ChaCha20 first"
         _ = try testServerAnswer(&server, &certs, withCipherSuites(&out, base, c.suites));
         try std.testing.expectEqual(c.want, server.negotiated_cipher_suite);
     }
+}
+
+test "client: offers ecdsa_secp384r1_sha384, and takes a P-384 CertificateVerify" {
+    // A server whose only certificate is P-384, as OpenSSL's can be, fails the
+    // handshake unless the client offers the scheme.
+    var buf: [2048]u8 = undefined;
+    const ch = try testClientHello(&buf, test_client_config);
+    const sa = helloExtension(ch, .signature_algorithms, false).?;
+    const offered = ch[sa + 2 ..][0..readU16(ch[sa..])];
+    try std.testing.expect(std.mem.indexOf(u8, offered, &.{ 0x05, 0x03 }) != null);
+
+    const P384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+    const kp = P384.KeyPair.generate(std.testing.io);
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+        .server_name = "localhost",
+        .skip_cert_verify = false,
+    }, .{});
+    client.state = .client_wait_certificate_verify;
+    const pub_key = kp.public_key.toUncompressedSec1();
+    @memcpy(client.leaf_pub_key_buf[0..pub_key.len], &pub_key);
+    client.leaf_pub_key_len = pub_key.len;
+    client.leaf_pub_key_algo = .X9_62_id_ecPublicKey;
+
+    const label = "TLS 1.3, server CertificateVerify";
+    var content: [64 + label.len + 1 + 32]u8 = undefined;
+    @memset(content[0..64], 0x20);
+    @memcpy(content[64..][0..label.len], label);
+    content[64 + label.len] = 0;
+    content[64 + label.len + 1 ..].* = client.transcript.current();
+    var der_buf: [P384.Signature.der_encoded_length_max]u8 = undefined;
+    const der = (try kp.sign(&content, null)).toDer(&der_buf);
+
+    var cv: [8 + P384.Signature.der_encoded_length_max]u8 = undefined;
+    cv[0] = @intFromEnum(tls.HandshakeType.certificate_verify);
+    std.mem.writeInt(u24, cv[1..4], @intCast(4 + der.len), .big);
+    writeU16(cv[4..], @intFromEnum(tls.SignatureScheme.ecdsa_secp384r1_sha384));
+    writeU16(cv[6..], @intCast(der.len));
+    @memcpy(cv[8..][0..der.len], der);
+    client.provideData(cv[0 .. 8 + der.len]);
+    _ = try client.step();
+    try std.testing.expectEqual(HandshakeState.client_wait_finished, client.state);
 }
 
 /// Runs a client and a server to completion, the client then reading the
