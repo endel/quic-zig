@@ -108,18 +108,13 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
 
 - [ ] **I1. Server-level 0-RTT queue + undecryptable-queue expiry (M)** —
   `connection_manager.zig:317`. (Relevant to `debug/zerortt-quic-go-interop`.)
-- [ ] **I2. HelloRetryRequest unsupported (M)** — `tls13.zig`. Still missing,
-  but no longer known to block anything. The `cdn.moq.dev` failure attributed
-  to it here was a misdiagnosis: instrumenting the `UnexpectedMessage` showed
-  handshake type 13, a **CertificateRequest**, arriving where the server's own
-  Certificate was expected. X25519 had been accepted and there was no HRR in
-  sight. Handling it (RFC 8446 4.3.2/4.4.2 — accept the request, answer with an
-  empty Certificate) makes `cdn.moq.dev` work over both raw QUIC and
-  WebTransport: full moq-lite session, 8 broadcasts listed.
-
-  An HRR would fail as `DecodeError`, not `UnexpectedMessage` — its key_share
-  carries a bare selected_group, which our 4-byte minimum rejects. That is the
-  fingerprint to look for next time.
+- [x] **I2. HelloRetryRequest unsupported (M)** — done, both ways. It did
+  block something: OpenSSL clients set with `-groups X25519MLKEM768:X25519`,
+  `P-384:X25519` or `X448:X25519` send a share for the first group only, and
+  failed with handshake_failure though X25519 was common. The server now asks
+  for X25519 (else P-256); the client answers a retry, and
+  `TlsConfig.key_share_groups` chooses its first shares. The `cdn.moq.dev`
+  failure once blamed on HRR was a CertificateRequest.
 
 - [x] **I2b. Certificate validity was checked against the monotonic clock
   (S)** — `sys.nanoTimestamp()` is `CLOCK_MONOTONIC`, whose zero is the last
@@ -143,7 +138,12 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
   `moq-lite` and `moq-test-client` default to the trust store unless
   `--tls-disable-verify` is passed. Verified against `cdn.moq.dev` (system
   store) and our own interop CA (file).
-- [ ] **I4. Cipher/curve breadth (S/M/L)** — AES-256-GCM-SHA384, P-384, X25519MLKEM768.
+- [ ] **I4. Cipher/curve breadth (S/M/L)** — AES-256-GCM-SHA384, P-384 and
+  X25519MLKEM768 key exchange. OpenSSL clients list AES-256-GCM first and
+  offer an X25519MLKEM768 share by default; both fall back fine (AES-128-GCM,
+  X25519), but a client offering only AES-256-GCM fails. AES-256 needs SHA-384
+  through the QUIC key schedule, which is SHA-256 throughout. The client now
+  verifies P-384 certificates.
 - [ ] **I5. RESET_STREAM_AT reliable reset (M/L)** — needed by WebTransport draft-13.
 - [ ] **I6. Proactive key-update cadence (S)** — rotate every ~100k pkts (`crypto.zig:788`).
 - [ ] **I7. STREAMS_BLOCKED never emitted (S)** — `stream.zig:899-923`.

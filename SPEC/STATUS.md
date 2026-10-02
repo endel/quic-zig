@@ -69,9 +69,9 @@
 | 9.6.3 | Interaction of Client Migration and Preferred Address | ✅ Done | Reuses existing migration infrastructure |
 | 9.7 | Use of IPv6 Flow Label and Migration | ❌ N/A | Not applicable (IPv6 flow label is OS-level) |
 | **10** | **Connection Termination** | | |
-| 10.1 | Idle Timeout | ✅ Done | Negotiated min(local, peer), 30s default. A handshake not done 10 s after its first packet closes the connection the same way (`handshake_timeout`) |
+| 10.1 | Idle Timeout | ✅ Done | Negotiated min(local, peer), 30s default. Restarted by a packet received, or by the first ack-eliciting packet sent after one, never by later sends. A handshake not done 10 s after its first packet closes the connection the same way (`handshake_timeout`) |
 | 10.1.1 | Liveness Testing | ✅ Done | PING frames |
-| 10.1.2 | Deferring Idle Timeout | ✅ Done | Reset on recv + sent ack-eliciting during handshake |
+| 10.1.2 | Deferring Idle Timeout | ✅ Done | Keep-alive PINGs; see 10.1 for what restarts the timer |
 | 10.2 | Immediate Close | ✅ Done | CONNECTION_CLOSE frame |
 | 10.2.1 | Closing Connection State | ✅ Done | Resends CONNECTION_CLOSE on the 1st, 2nd, 4th, 8th… packet received, not on every one; 3×PTO drain |
 | 10.2.2 | Draining Connection State | ✅ Done | Proper draining state after close |
@@ -192,10 +192,10 @@
 | 2 | Notational Conventions | ✅ N/A | |
 | 3 | Protocol Overview | ✅ Done | TLS 1.3 integrated via tls13.zig |
 | 4 | Carrying TLS Messages | | |
-| 4.1 | Interface to TLS | ✅ Done | Action-based step() pattern |
+| 4.1 | Interface to TLS | ✅ Done | Action-based step() pattern. HelloRetryRequest both ways (X25519, P-256): the server asks for a share it can use, the client answers one; `TlsConfig.key_share_groups` sets the client's first shares |
 | 4.2 | TLS Version | ✅ Done | TLS 1.3 only |
 | 4.3 | ClientHello Size | ✅ Done | Initial packet padded to 1200 bytes (RFC 9001 requires packet padding, not CH padding) |
-| 4.4 | Peer Authentication | ✅ Done | Chain validation, hostname verify, trust anchors via `ClientConfig.ca`; asks for client certificates per SNI entry (`ClientAuth`: required or optional, CA bundle, no tickets while it applies) and presents one as a client. The server signs with ECDSA P-256, Ed25519 or RSA-PSS, picking the scheme (and, among certificates for the same name, the certificate) from the client's `signature_algorithms`; `handshake_failure` when nothing fits. See [RFC5280_CHAIN_VALIDATION.md](RFC5280_CHAIN_VALIDATION.md) for what is still not checked |
+| 4.4 | Peer Authentication | ✅ Done | Chain validation, hostname verify, trust anchors via `ClientConfig.ca`; asks for client certificates per SNI entry (`ClientAuth`: required or optional, CA bundle, no tickets while it applies) and presents one as a client. The client verifies ECDSA P-256 and P-384, Ed25519 and RSA-PSS. The server signs with ECDSA P-256, Ed25519 or RSA-PSS, picking the scheme (and, among certificates for the same name, the certificate) from the client's `signature_algorithms`; `handshake_failure` when nothing fits. See [RFC5280_CHAIN_VALIDATION.md](RFC5280_CHAIN_VALIDATION.md) for what is still not checked |
 | 4.5 | Session Resumption | ✅ Done | PSK/tickets, binder, NewSessionTicket |
 | 4.6 | 0-RTT | ✅ Done | Early key install, 0-RTT packing; `early_data` answered in EncryptedExtensions only when the ClientHello offered it (RFC 8446 §4.2.10) |
 | 4.7 | Cryptographic Message Buffering | ✅ Done | CryptoStreamManager |
@@ -204,7 +204,7 @@
 | 5 | Packet Protection | | |
 | 5.1 | Packet Protection Keys | ✅ Done | HKDF-SHA256 derivation |
 | 5.2 | Initial Secrets | ✅ Done | Per RFC 9001 §5.2 salt |
-| 5.3 | AEAD Usage | ✅ Done | AES-128-GCM, nonce = IV XOR pn |
+| 5.3 | AEAD Usage | ✅ Done | AES-128-GCM and ChaCha20-Poly1305, nonce = IV XOR pn. The server takes AES-128-GCM when AES is in hardware unless the client lists ChaCha20 first. No AES-256-GCM-SHA384 (`TODO.md` I4) |
 | 5.4 | Header Protection | ✅ Done | AES-128-ECB 5-byte mask |
 | 5.4.1 | Header Protection Application | ✅ Done | |
 | 5.4.2 | Header Protection Sample | ✅ Done | |
@@ -213,11 +213,11 @@
 | 5.7 | Receiving Out-of-Order Protected Packets | ✅ Done | Packet number window |
 | 5.8 | Retry Packet Integrity | ✅ Done | AES-128-GCM tag verification |
 | 6 | Key Update | ✅ Done | 3-generation keys, phase bit, 2^23 limit |
-| 6.1 | Initiating a Key Update | ✅ Done | Proactive at confidentiality limit |
-| 6.2 | Responding to a Key Update | ✅ Done | Peer phase bit change detection |
+| 6.1 | Initiating a Key Update | ✅ Done | Proactive at confidentiality limit; old read keys kept until a packet opens with the new ones |
+| 6.2 | Responding to a Key Update | ✅ Done | A packet opened with the next keys rolls ours, send keys included |
 | 6.3 | Timing of Receive Key Generation | ✅ Done | Next keys pre-generated |
 | 6.4 | Send Key Update | ✅ Done | |
-| 6.5 | Receiving with Different Keys | ✅ Done | Try current, then previous |
+| 6.5 | Receiving with Different Keys | ✅ Done | The other phase is the previous keys below the lowest packet number opened with the current ones, the next above it; previous keys go 3×PTO after that first packet. Choosing by time alone dropped a peer's second update for good |
 | 6.6 | Key Update and HP Keys | ✅ Done | HP keys never change |
 | 6.7 | Key Update Error Code | ✅ Done | KEY_UPDATE_ERROR |
 | 7 | Security of Initial Messages | ✅ Done | Known keys, anti-amplification |
@@ -258,9 +258,9 @@
 | 6.1.2 | Time Threshold | ✅ Done | 9/8 × max(srtt, latest_rtt) |
 | 6.2 | Probe Timeout | | |
 | 6.2.1 | Computing PTO | ✅ Done | srtt + max(4×rttvar, 1ms) + ack_delay; no Application-space timer before handshake confirmation |
-| 6.2.2 | Handshakes and New Paths | ✅ Done | No ack_delay for Initial/Handshake |
+| 6.2.2 | Handshakes and New Paths | ✅ Done | No ack_delay for Initial/Handshake. The client's anti-deadlock probe (6.2.2.1) is the handshake-space PTO, armed with nothing in flight and backed off like any other |
 | 6.2.3 | Speeding Up Handshake Completion | ✅ Done | |
-| 6.2.4 | Sending Probe Packets | ✅ Done | PTO probes prefer data retransmit |
+| 6.2.4 | Sending Probe Packets | ✅ Done | PTO probes prefer data retransmit; CRYPTO data is resent only while a packet carrying it is in flight, else the probe is a PING |
 | 6.3 | Handling Retry Packets | ✅ Done | Reset RTT + congestion state |
 | 6.4 | Discarding Keys and Packet State | ✅ Done | Clear PN space on key discard |
 | 7 | Congestion Control | | |

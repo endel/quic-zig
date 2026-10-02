@@ -106,6 +106,62 @@ quiche<-quic-zig failed once: one of its 50 downloads timed out after the
 handshake on the corrupted link. It passed 5 of 5 on rerun. The handshake
 timeout didn't fire in any of these runs.
 
+### Rerun on the OpenSSL fixes (`openssl-interop-fixes`, 1 Oct 2026)
+67 of 88 pass; 87 cells match `3fa4923`. The other:
+
+    rebind-addr  quic-zig<-quic-go  ✅ → ❌  a flake, not this branch: rerun 8 times
+                                           each, it passes 7/8 here and 6/8 on main
+                                           (7796666), failing as rebind-port does when
+                                           the first rebind lands mid-handshake
+
+## OpenSSL
+
+Peer: `quay.io/openssl-ci/openssl-quic-interop:latest` (OpenSSL 4.2.0-dev, built
+30 Sep 2026). OpenSSL is not in the runner's list: add it to
+`implementations_quic.json` as `openssl` with `role: both`, as OpenSSL's own CI
+does. Its endpoint implements fewer cases, so more come back unsupported.
+
+| Test | openssl<-quic-zig | quic-zig<-openssl |
+|---|---|---|
+| handshake | ✅ | ✅ |
+| transfer | ✅ | ✅ |
+| http3 | ✅ | ✅ |
+| retry | ✅ | ✅ |
+| resumption | ✅ | ✅ |
+| zerortt | — | — |
+| multiplexing | ✅ | ✅ |
+| longrtt | ✅ | ❌ |
+| keyupdate | ✅ | — |
+| chacha20 | ✅ | ✅ |
+| v2 | — | — |
+| ipv6 | ✅ | ✅ |
+| amplificationlimit | ✅ | ✅ |
+| blackhole | ✅ | ✅ |
+| ecn | — | — |
+| handshakeloss | — | — |
+| transferloss | ✅ | ✅ |
+| handshakecorruption | — | — |
+| transfercorruption | ✅ | ✅ |
+| rebind-port | ❌ | ✅ |
+| rebind-addr | ❌ | ✅ |
+| connectionmigration | — | ❌ |
+
+28 pass, 4 fail, 12 unsupported, the same before and after the OpenSSL fixes.
+Each failure is OpenSSL's, and fails against quic-go or ngtcp2 alike:
+
+- **rebind-port, rebind-addr** (OpenSSL server): after a NAT rebind it keeps
+  sending to the old port. quic-go's and ngtcp2's clients fail the same way.
+- **longrtt** (OpenSSL client): its PTO probes are bare PINGs, never the
+  ClientHello again, and the case counts ClientHellos. Fails against ngtcp2 too.
+- **connectionmigration** (OpenSSL client): it never migrates.
+
+What the runner does not reach, checked natively against OpenSSL 3.6.3's
+`s_client -quic` and its `quic-hq-interop` demos: groups configured as
+`X25519MLKEM768:X25519`, `P-384:X25519` or `X448:X25519` (HelloRetryRequest),
+key updates from either side every 20 KB, a P-384 server certificate, and
+handshakes under 30 % random loss (20/20 each way). OpenSSL's default client
+now gets AES-128-GCM rather than ChaCha20.
+
 ## A caution about this table
 
 The binaries under test must be cross-compiled by
