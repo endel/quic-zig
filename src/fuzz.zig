@@ -338,7 +338,7 @@ test "fuzz: tls client fed a server flight" {
     try testing.fuzz({}, struct {
         fn f(_: void, smith: *std.testing.Smith) anyerror!void {
             const input = smith.in orelse return;
-            var client = try tls_client.Conn.init(testing.allocator, &.{ .server_name = "localhost", .alpn = &.{"http/1.1"} });
+            var client = try tls_client.Conn.init(testing.allocator, &.{ .server_name = "localhost", .skip_cert_verify = true, .alpn = &.{"http/1.1"} });
             defer client.deinit();
             client.feed(input) catch {};
         }

@@ -104,9 +104,11 @@ feed what it accepts to std's parser and our extension readers.
 Same checks, from the same helpers (`tls13.issuerConstraintsOk`,
 `tls13.verifyCertificateVerifySignature`), with these differences:
 
-- Verification is all or nothing: `Config.ca_bundle` set means chain, host
-  name and CertificateVerify are all checked; null means none are. There is
-  no "chain without trust anchor" middle ground.
+- Verification is all or nothing: chain, host name and CertificateVerify are
+  all checked unless `Config.skip_cert_verify`, which checks none. A null
+  `ca_bundle` means the platform's store (`ca_bundle.system()`), and `init`
+  fails with `NoTrustAnchors` when it can't be loaded. There is no "chain
+  without trust anchor" middle ground.
 - The chain is accepted at the first certificate a bundle CA signed, so extra
   certificates a server appends (a cross-signed root, say) do not matter.
 - An IP literal in `server_name` is matched against iPAddress SANs

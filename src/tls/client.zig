@@ -27,6 +27,7 @@
 const std = @import("std");
 const sys = @import("../sys.zig");
 const tls13 = @import("../quic/tls13.zig");
+const ca_bundle = @import("../quic/ca_bundle.zig");
 const common = @import("common.zig");
 
 const crypto = std.crypto;
@@ -71,14 +72,18 @@ const Builder = common.Builder;
 pub const Config = struct {
     /// Host name sent as SNI and matched against the certificate. An IP
     /// address is matched against the certificate's IP addresses instead,
-    /// and never sent as SNI (RFC 6066 §3).
+    /// and never sent as SNI (RFC 6066 §3). Required unless
+    /// `skip_cert_verify`.
     server_name: ?[]const u8 = null,
     /// Offered in this order. A server that picks none leaves `alpn()` null.
     alpn: []const []const u8 = &.{},
-    /// Trust anchors for authenticating the server; requires `server_name`.
-    /// Null skips every certificate check: the connection is encrypted, but
-    /// to whoever answered.
+    /// Trust anchors for authenticating the server. Null trusts the
+    /// platform's CA store, loaded once per process; `init` fails with
+    /// `NoTrustAnchors` when there is none.
     ca_bundle: ?*const Certificate.Bundle = null,
+    /// Accept any certificate, whatever `ca_bundle` says: the connection is
+    /// encrypted, but to whoever answered.
+    skip_cert_verify: bool = false,
     /// Offered in this order.
     cipher_suites: []const CipherSuite = &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256, .aes_256_gcm_sha384 },
     /// The first gets a key share in the ClientHello; the server may ask for
@@ -110,6 +115,8 @@ pub const Error = error{
     CertificateExpired,
     /// The certificate is not for `Config.server_name`.
     CertificateHostMismatch,
+    /// No `Config.ca_bundle`, and the platform's CA store couldn't be loaded.
+    NoTrustAnchors,
     /// The peer sent a fatal alert; see `peerAlert()`.
     PeerAlert,
     /// An earlier `feed` already failed; the connection is dead.
@@ -174,6 +181,8 @@ pub const Conn = struct {
     leaf_key_buf: [1100]u8 = undefined,
     leaf_key_len: usize = 0,
     leaf_key_algo: Certificate.AlgorithmCategory = undefined,
+    /// What the server's chain must lead to; null under `skip_cert_verify`.
+    anchors: ?*const Certificate.Bundle = null,
 
     bufs: ?*Buffers = null,
     in_len: usize = 0,
@@ -198,11 +207,15 @@ pub const Conn = struct {
     /// `config` must outlive the connection.
     pub fn init(allocator: Allocator, config: *const Config) Error!Conn {
         if (config.cipher_suites.len == 0 or config.groups.len == 0) return error.InternalError;
-        if (config.ca_bundle != null and config.server_name == null) return error.InternalError;
+        if (!config.skip_cert_verify and config.server_name == null) return error.InternalError;
         for (config.alpn) |proto| if (proto.len == 0 or proto.len > 255) return error.InternalError;
         if (config.server_name) |name| if (name.len == 0 or name.len > 255) return error.InternalError;
 
         var self: Conn = .{ .allocator = allocator, .config = config, .group = config.groups[0] };
+        if (!config.skip_cert_verify) self.anchors = config.ca_bundle orelse ca_bundle.system() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.LoadFailed => return error.NoTrustAnchors,
+        };
         errdefer self.deinit();
         sys.randomBytes(&self.session_id);
         try self.sendClientHello(null);
@@ -826,7 +839,7 @@ pub const Conn = struct {
         }
         // RFC 8446 §4.4.2.4.
         if (n == 0) return error.DecodeError;
-        if (self.config.ca_bundle) |bundle| try self.verifyChain(chain[0..n], bundle);
+        if (self.anchors) |bundle| try self.verifyChain(chain[0..n], bundle);
         self.transcript.update(msg);
         self.state = .wait_certificate_verify;
     }
@@ -869,7 +882,7 @@ pub const Conn = struct {
     }
 
     fn onCertificateVerify(self: *Conn, msg: []const u8) Error!void {
-        if (self.config.ca_bundle != null) {
+        if (self.anchors != null) {
             var p: Parser = .{ .buf = msg[4..] };
             const scheme = try p.int(u16);
             const sig = try p.vec(u16);
@@ -1004,7 +1017,7 @@ fn alertFor(err: Error) ?tls.Alert.Description {
         error.UnknownCa => .unknown_ca,
         error.CertificateExpired => .certificate_expired,
         error.InternalError, error.OutOfMemory => .internal_error,
-        error.PeerAlert, error.ConnectionFailed, error.NotConnected => null,
+        error.PeerAlert, error.ConnectionFailed, error.NotConnected, error.NoTrustAnchors => null,
     };
 }
 
@@ -1113,7 +1126,7 @@ test "a handshake with tls_server for every suite and group, HelloRetryRequest i
     for ([_]CipherSuite{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256, .aes_256_gcm_sha384 }) |cs| {
         for ([_]Group{ .x25519, .secp256r1 }) |g| {
             const server_config: tls_server.Config = .{ .certs = &certs.entries, .cipher_suites = &.{cs}, .groups = &.{g} };
-            const client_config: Config = .{ .server_name = "localhost" };
+            const client_config: Config = .{ .server_name = "localhost", .skip_cert_verify = true };
             var p = try Pair.init(&client_config, &server_config);
             defer p.deinit();
             try expectRoundTrip(&p);
@@ -1181,7 +1194,7 @@ test "KeyUpdate both ways, at the AES-GCM record limit" {
     var certs: test_certs.TestCerts = undefined;
     try certs.load();
     const server_config: tls_server.Config = .{ .certs = &certs.entries };
-    var p = try Pair.init(&.{ .server_name = "localhost" }, &server_config);
+    var p = try Pair.init(&.{ .server_name = "localhost", .skip_cert_verify = true }, &server_config);
     defer p.deinit();
     try p.pump();
     // Both ends agree on the sequence numbers, as if that many records had passed.
@@ -1227,6 +1240,19 @@ test "a verified client needs a server name" {
     var bundle = try testBundle(test_certs.test_localhost_pem);
     defer bundle.deinit(testing.allocator);
     try testing.expectError(error.InternalError, Conn.init(testing.allocator, &.{ .ca_bundle = &bundle }));
+    try testing.expectError(error.InternalError, Conn.init(testing.allocator, &.{}));
+}
+
+test "with no ca_bundle the system's roots decide, and a self-signed server fails them" {
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    const server_config: tls_server.Config = .{ .certs = &certs.entries };
+    var p = Pair.init(&.{ .server_name = "localhost" }, &server_config) catch |err| {
+        // A host with no CA store fails closed at init instead.
+        return testing.expectEqual(error.NoTrustAnchors, err);
+    };
+    defer p.deinit();
+    try testing.expectError(error.UnknownCa, p.pump());
 }
 
 test "an IP literal is not sent as SNI" {
@@ -1234,7 +1260,7 @@ test "an IP literal is not sent as SNI" {
     try certs.load();
     const server_config: tls_server.Config = .{ .certs = &certs.entries };
     inline for (.{ "127.0.0.1", "::1", "localhost" }) |name| {
-        var p = try Pair.init(&.{ .server_name = name }, &server_config);
+        var p = try Pair.init(&.{ .server_name = name, .skip_cert_verify = true }, &server_config);
         defer p.deinit();
         try p.pump();
         try testing.expect(p.client.handshakeComplete());
@@ -1246,7 +1272,7 @@ test "an IP literal is not sent as SNI" {
 test "ALPN: the server's pick among ours, none when it has none" {
     var certs: test_certs.TestCerts = undefined;
     try certs.load();
-    const client_config: Config = .{ .server_name = "localhost", .alpn = &.{ "h2", "http/1.1" } };
+    const client_config: Config = .{ .server_name = "localhost", .skip_cert_verify = true, .alpn = &.{ "h2", "http/1.1" } };
     {
         const server_config: tls_server.Config = .{ .certs = &certs.entries, .alpn = &.{"http/1.1"} };
         var p = try Pair.init(&client_config, &server_config);
@@ -1268,7 +1294,7 @@ test "data written before the handshake completes follows the client Finished" {
     var certs: test_certs.TestCerts = undefined;
     try certs.load();
     const server_config: tls_server.Config = .{ .certs = &certs.entries };
-    var p = try Pair.init(&.{ .server_name = "localhost" }, &server_config);
+    var p = try Pair.init(&.{ .server_name = "localhost", .skip_cert_verify = true }, &server_config);
     defer p.deinit();
     try p.client.write("GET / HTTP/1.1\r\n");
     try p.client.write("\r\n");
@@ -1281,7 +1307,7 @@ test "close_notify in both directions, and a closed client refuses writes" {
     var certs: test_certs.TestCerts = undefined;
     try certs.load();
     const server_config: tls_server.Config = .{ .certs = &certs.entries };
-    var p = try Pair.init(&.{ .server_name = "localhost" }, &server_config);
+    var p = try Pair.init(&.{ .server_name = "localhost", .skip_cert_verify = true }, &server_config);
     defer p.deinit();
     try p.pump();
     try p.server.write("bye");
@@ -1300,7 +1326,7 @@ test "a tampered server record is bad_record_mac" {
     var certs: test_certs.TestCerts = undefined;
     try certs.load();
     const server_config: tls_server.Config = .{ .certs = &certs.entries };
-    var p = try Pair.init(&.{ .server_name = "localhost" }, &server_config);
+    var p = try Pair.init(&.{ .server_name = "localhost", .skip_cert_verify = true }, &server_config);
     defer p.deinit();
     try p.pump();
     try p.server.write("hello");
@@ -1312,7 +1338,7 @@ test "a tampered server record is bad_record_mac" {
 }
 
 test "a TLS 1.2 ServerHello is protocol_version" {
-    var client = try Conn.init(testing.allocator, &.{ .server_name = "localhost" });
+    var client = try Conn.init(testing.allocator, &.{ .server_name = "localhost", .skip_cert_verify = true });
     defer client.deinit();
     // Echo our session id in a ServerHello with no supported_versions.
     var sh: [5 + 4 + 2 + 32 + 1 + 32 + 2 + 1 + 2]u8 = undefined;
@@ -1334,7 +1360,7 @@ test "a server flight fed one byte at a time" {
     var certs: test_certs.TestCerts = undefined;
     try certs.load();
     const server_config: tls_server.Config = .{ .certs = &certs.entries };
-    var p = try Pair.init(&.{ .server_name = "localhost" }, &server_config);
+    var p = try Pair.init(&.{ .server_name = "localhost", .skip_cert_verify = true }, &server_config);
     defer p.deinit();
     try p.server.feed(p.client.pendingOutput());
     p.client.consumeOutput(p.client.pendingOutput().len);
@@ -1420,7 +1446,7 @@ test "a client certificate is verified and handed to the server" {
     defer s.deinit();
     for ([_]test_certs.ClientCerts.Which{ .valid, .rsa }) |which| {
         const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
-        const client_config: Config = .{ .server_name = "localhost", .client_certificate = s.clients.certificate(which) };
+        const client_config: Config = .{ .server_name = "localhost", .skip_cert_verify = true, .client_certificate = s.clients.certificate(which) };
         var p = try Pair.init(&client_config, &server_config);
         defer p.deinit();
         try expectRoundTrip(&p);
@@ -1438,6 +1464,7 @@ fn expectClientRefused(mode: tls13.ClientAuth.Mode, which: ?test_certs.ClientCer
     const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
     const client_config: Config = .{
         .server_name = "localhost",
+        .skip_cert_verify = true,
         .client_certificate = if (which) |w| s.clients.certificate(w) else null,
     };
     var p = try Pair.init(&client_config, &server_config);
@@ -1463,7 +1490,7 @@ test "optional client auth completes without a certificate" {
     try s.init(.optional);
     defer s.deinit();
     const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
-    const client_config: Config = .{ .server_name = "localhost" };
+    const client_config: Config = .{ .server_name = "localhost", .skip_cert_verify = true };
     var p = try Pair.init(&client_config, &server_config);
     defer p.deinit();
     try expectRoundTrip(&p);
@@ -1477,7 +1504,7 @@ test "client auth follows the certificate SNI picks" {
     defer s.deinit();
     // *.example.com asks for nothing, so a client without a certificate gets in.
     const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
-    const client_config: Config = .{ .server_name = "a.example.com" };
+    const client_config: Config = .{ .server_name = "a.example.com", .skip_cert_verify = true };
     var p = try Pair.init(&client_config, &server_config);
     defer p.deinit();
     try expectRoundTrip(&p);
@@ -1493,7 +1520,7 @@ test "no session ticket under client auth" {
         if (!with_auth) s.certs.entries[0].client_auth = null;
         defer s.certs.entries[0].client_auth = &s.auth;
         const server_config: tls_server.Config = .{ .certs = &s.certs.entries, .ticket_key = @splat(3) };
-        const client_config: Config = .{ .server_name = "localhost", .client_certificate = s.clients.certificate(.valid) };
+        const client_config: Config = .{ .server_name = "localhost", .skip_cert_verify = true, .client_certificate = s.clients.certificate(.valid) };
         var p = try Pair.init(&client_config, &server_config);
         defer p.deinit();
         // ClientHello, the server's flight, then the client's.
@@ -1520,7 +1547,7 @@ test "the client answers a CertificateRequest it can't satisfy with an empty Cer
     const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
     // An Ed25519 key the server offers no scheme for would do the same; a
     // client without a certificate is the common case.
-    const client_config: Config = .{ .server_name = "localhost" };
+    const client_config: Config = .{ .server_name = "localhost", .skip_cert_verify = true };
     var p = try Pair.init(&client_config, &server_config);
     defer p.deinit();
     try p.pump();
@@ -1538,7 +1565,7 @@ test "certificate_authorities lists the bundle's subjects" {
     try testing.expectEqual(list.len - 2, std.mem.readInt(u16, list[0..2], .big));
     s.auth.authorities = list;
     const server_config: tls_server.Config = .{ .certs = &s.certs.entries };
-    const client_config: Config = .{ .server_name = "localhost", .client_certificate = s.clients.certificate(.valid) };
+    const client_config: Config = .{ .server_name = "localhost", .skip_cert_verify = true, .client_certificate = s.clients.certificate(.valid) };
     var p = try Pair.init(&client_config, &server_config);
     defer p.deinit();
     try expectRoundTrip(&p);

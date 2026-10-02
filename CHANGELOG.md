@@ -15,10 +15,11 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   it. `tls_client` and the QUIC client present `client_certificate` when a
   server asks.
 - `quic.tls_client`, a sans-IO TLS 1.3 client for TLS over TCP, the
-  counterpart of `tls_server`. It verifies the server against a CA bundle
-  (chain, host name or IP address, CertificateVerify with ECDSA, Ed25519 or
-  RSA-PSS), does SNI and ALPN, and holds data written before the handshake
-  finishes. No resumption or 0-RTT.
+  counterpart of `tls_server`. It verifies the server (chain, host name or IP
+  address, CertificateVerify with ECDSA, Ed25519 or RSA-PSS) against the
+  platform's trust store, or a `ca_bundle` you give it, unless
+  `skip_cert_verify` is set. It does SNI and ALPN, and holds data written
+  before the handshake finishes. No resumption or 0-RTT.
 - `quic.tls_server`, a sans-IO TLS 1.3 server for TLS over TCP: feed it the
   bytes you read and send what it queues, from any event loop. It negotiates
   AES-GCM or ChaCha20, X25519 or P-256 (with HelloRetryRequest), picks the

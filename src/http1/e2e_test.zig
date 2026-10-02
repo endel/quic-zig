@@ -284,7 +284,7 @@ const TestClient = struct {
         socket.setNonBlocking(fd);
         self.fd = fd;
         if (use_tls) {
-            self.tls_config = .{ .server_name = "localhost", .alpn = &.{"http/1.1"} };
+            self.tls_config = .{ .server_name = "localhost", .skip_cert_verify = true, .alpn = &.{"http/1.1"} };
             self.tls = try tls_client.Conn.init(testing.allocator, &self.tls_config);
             self.flushTls();
         }
