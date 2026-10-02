@@ -17,3 +17,6 @@ HANDOFF.md
 
 # Package cache fetched by `zig build --fetch`; never commit it.
 zig-pkg/
+
+# Built by interop/quic-go; SPEC/interop-results.md runs them in place.
+interop/quic-go/*_bin
