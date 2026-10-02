@@ -341,7 +341,7 @@ fn downloadAll(
     const handshake_start = sys.nanoTimestamp();
     const handshake_timeout_ns: i128 = if (skip_ticket_and_drain) MULTICONNECT_HANDSHAKE_TIMEOUT_S * std.time.ns_per_s else DEFAULT_TIMEOUT_S * std.time.ns_per_s;
 
-    while (!handshake_complete and (sys.nanoTimestamp() - handshake_start) < handshake_timeout_ns) {
+    while (!handshake_complete and !conn.isClosed() and (sys.nanoTimestamp() - handshake_start) < handshake_timeout_ns) {
         // Fire ALL expired PTO timers (multiple spaces may expire simultaneously)
         {
             var ti: usize = 0;
@@ -667,6 +667,8 @@ fn downloadH0(
 
     if (completed < urls.len) {
         std.log.warn("H0: download timeout, completed {d}/{d}", .{ completed, urls.len });
+        // The runner checks the files too, but an exit of 0 here hid the failure.
+        return error.DownloadIncomplete;
     }
 }
 
@@ -816,6 +818,7 @@ fn downloadH3(
             }
         }
     }
+    if (completed < urls.len) return error.DownloadIncomplete;
 }
 
 fn saveFile(dir: []const u8, filename: []const u8, data: []const u8) !void {

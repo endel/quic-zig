@@ -797,6 +797,15 @@ pub const PacketHandler = struct {
         return self.recv[idx].hasUnackedAckEliciting();
     }
 
+    /// Whether a packet in flight at `level` carries CRYPTO data, the only
+    /// case in which a probe there has handshake bytes to resend.
+    pub fn cryptoInFlight(self: *const PacketHandler, level: EncLevel) bool {
+        for (self.sent[@intFromEnum(level)].sent_packets.values()) |pkt| {
+            if (pkt.in_flight and pkt.has_crypto_data) return true;
+        }
+        return false;
+    }
+
     /// Compute PTO deadline for a single packet number space.
     /// Returns null if the space should not arm PTO (no data, application space idle).
     /// RFC 9002 §6.2.2.1: handshake spaces arm PTO even with no packets in flight.

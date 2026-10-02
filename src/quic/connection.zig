@@ -819,6 +819,10 @@ pub const Connection = struct {
     // Timing
     last_packet_received_time: i64 = 0,
     last_packet_sent_time: i64 = 0,
+    /// When the first ack-eliciting packet since the peer was last heard
+    /// from went out. RFC 9000 §10.1 restarts the idle timer there, and at
+    /// no later send.
+    idle_restart_sent: ?i64 = null,
     creation_time: i64 = 0,
     idle_timeout_ns: i64 = 30_000_000_000, // 30s default
     handshake_timeout_ns: i64 = 10_000_000_000,
@@ -1206,6 +1210,7 @@ pub const Connection = struct {
         // RFC 9000 §12.3: a replay is dropped, and restarts no timer.
         if (self.pkt_handler.recv[2].isDuplicate(header.packet_number)) return;
         self.last_packet_received_time = now;
+        self.idle_restart_sent = null;
         self.keep_alive_ping_sent = false;
 
         // Process 0-RTT frames (STREAM, DATAGRAM etc. - no CRYPTO or HANDSHAKE_DONE)
@@ -1473,6 +1478,7 @@ pub const Connection = struct {
         // RFC 9000 §10.1: only a packet processed restarts the idle timer; a
         // replay must not keep a dead connection alive.
         self.last_packet_received_time = now;
+        self.idle_restart_sent = null;
         self.keep_alive_ping_sent = false;
 
         // The peer's SCID comes from its first long-header packet that
@@ -3503,16 +3509,17 @@ pub const Connection = struct {
             self.total_packets_sent += 1;
             self.pacer.onPacketSent(bytes_written, now);
             self.last_packet_sent_time = now;
+            if (self.idle_restart_sent == null and self.sentAckElicitingAt(now)) self.idle_restart_sent = now;
 
             // If more PTO probes are pending, re-queue stream data + crypto data
             // so the next probe ALSO carries the retransmission (not just a PING).
             // Under burst-3 loss, both probes carrying data doubles the delivery chance.
             if (self.pto_probe_pending > 0) {
                 // Re-queue crypto retransmissions
-                if (self.pkt_num_spaces[0].crypto_seal != null) {
+                if (self.pkt_num_spaces[0].crypto_seal != null and self.pkt_handler.cryptoInFlight(.initial)) {
                     self.queueCryptoRetransmission(.initial);
                 }
-                if (self.pkt_num_spaces[1].crypto_seal != null) {
+                if (self.pkt_num_spaces[1].crypto_seal != null and self.pkt_handler.cryptoInFlight(.handshake)) {
                     self.queueCryptoRetransmission(.handshake);
                 }
                 _ = self.queueStreamPtoRetransmissions();
@@ -3682,15 +3689,7 @@ pub const Connection = struct {
                 const backed_off_pto = base_pto << shift;
                 effective_idle = @max(effective_idle, 3 * backed_off_pto);
             }
-            // RFC 9000 §10.1.2: Before handshake confirmed, also defer idle timeout
-            // when sending ack-eliciting packets (to avoid premature timeout during
-            // handshake retransmission). After handshake confirmed, only received
-            // packets reset the idle timer.
-            const last_activity = if (!self.handshake_confirmed)
-                @max(self.last_packet_received_time, self.last_packet_sent_time)
-            else
-                self.last_packet_received_time;
-            if (now - last_activity > effective_idle) {
+            if (now - self.idleTimerStart() > effective_idle) {
                 self.state = .terminated;
                 return;
             }
@@ -3798,13 +3797,15 @@ pub const Connection = struct {
                 // through burst loss (burst_to_client=3 drops 3 consecutive packets).
                 var has_data = false;
 
-                // Handshake spaces: re-queue crypto data
+                // Handshake spaces: resend CRYPTO only while it is in flight;
+                // without, the probe is a PING — the client's anti-deadlock
+                // probe (RFC 9002 §6.2.2.1).
                 {
                     const has_hs_keys = self.pkt_num_spaces[1].crypto_seal != null;
-                    if (!has_hs_keys and self.pkt_num_spaces[0].crypto_seal != null) {
+                    if (!has_hs_keys and self.pkt_num_spaces[0].crypto_seal != null and self.pkt_handler.cryptoInFlight(.initial)) {
                         self.queueCryptoRetransmission(.initial);
                     }
-                    if (self.pkt_num_spaces[1].crypto_seal != null) {
+                    if (self.pkt_num_spaces[1].crypto_seal != null and self.pkt_handler.cryptoInFlight(.handshake)) {
                         self.queueCryptoRetransmission(.handshake);
                     }
                     if (self.crypto_streams.getStream(0).hasData() or
@@ -3821,7 +3822,7 @@ pub const Connection = struct {
                     {
                         // Client: also retransmit Handshake Finished when Application
                         // PTO fires but the handshake is not yet confirmed.
-                        if (!self.is_server and !self.handshake_confirmed) {
+                        if (!self.is_server and !self.handshake_confirmed and self.pkt_handler.cryptoInFlight(.handshake)) {
                             self.queueCryptoRetransmission(.handshake);
                             if (self.crypto_streams.getStream(2).hasData()) {
                                 has_data = true;
@@ -3895,46 +3896,6 @@ pub const Connection = struct {
                 if (self.pkt_handler.getPtoSpace()) |space| {
                     std.log.info("PTO fired: count={d}, space={s}, has_data={}", .{ self.pkt_handler.pto_count, @tagName(space), has_data });
                 }
-            }
-        }
-
-        // RFC 9002 §6.2.2.1: Client anti-deadlock timer.
-        // When the client has no ack-eliciting packets in flight and the handshake
-        // is not confirmed, the server might be blocked by the anti-amplification
-        // limit. The client MUST arm a PTO timer to send packets that unblock the
-        // server (e.g. a PING in a Handshake or padded Initial packet).
-        if (!self.is_server and !self.handshake_confirmed) {
-            // Compute PTO based on time since handshake start (creation_time)
-            var pto_duration = self.pkt_handler.rtt_stats.ptoNoAckDelay();
-            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 30));
-            pto_duration = pto_duration << shift;
-            pto_duration = @min(pto_duration, 60_000_000_000); // cap at 60s
-
-            const deadline = self.creation_time + pto_duration;
-            if (now >= deadline) {
-                self.pkt_handler.pto_count += 1;
-
-                // Force-arm ACKs so anti-deadlock probes include them.
-                // Without ACKs, the server can't confirm we received its data
-                // and stays amplification-limited.
-                for (&self.pkt_handler.recv) |*recv_tracker| {
-                    if (recv_tracker.largest_received != null) {
-                        recv_tracker.ack_queued = true;
-                    }
-                }
-
-                // Send a Handshake packet if we have Handshake keys, else padded Initial.
-                // This gives the server more anti-amplification credit.
-                if (self.pkt_num_spaces[1].crypto_seal != null) {
-                    // Re-queue Initial crypto data too if still outstanding
-                    self.queueCryptoRetransmission(.initial);
-                    self.queueCryptoRetransmission(.handshake);
-                } else {
-                    self.queueCryptoRetransmission(.initial);
-                }
-                self.pending_frames.push(.{ .ping = {} });
-                self.pto_probe_pending = 2;
-                std.log.info("client anti-deadlock PTO fired (pto_count={d})", .{self.pkt_handler.pto_count});
             }
         }
 
@@ -4266,6 +4227,21 @@ pub const Connection = struct {
         return self.state == .connected;
     }
 
+    /// Where the idle timer last restarted (RFC 9000 §10.1): a packet
+    /// received, or the first ack-eliciting one sent after it. Not every
+    /// send, or a client probing a silent server would never time out.
+    fn idleTimerStart(self: *const Connection) i64 {
+        return @max(self.last_packet_received_time, self.idle_restart_sent orelse 0);
+    }
+
+    /// Whether a packet sent at `now` was ack-eliciting.
+    fn sentAckElicitingAt(self: *const Connection, now: i64) bool {
+        for (self.pkt_handler.sent) |t| {
+            if (t.last_ack_eliciting_sent_time == now) return true;
+        }
+        return false;
+    }
+
     /// Compute the next timeout deadline (nanosecond timestamp) without side effects.
     /// Returns null if the connection is terminated and needs no timer.
     /// Used by event loop to schedule the global timer.
@@ -4297,11 +4273,7 @@ pub const Connection = struct {
         {
             const base_pto = self.pkt_handler.rtt_stats.pto();
             const effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
-            const last_activity = if (!self.handshake_confirmed)
-                @max(self.last_packet_received_time, self.last_packet_sent_time)
-            else
-                self.last_packet_received_time;
-            const idle_deadline = last_activity + effective_idle;
+            const idle_deadline = self.idleTimerStart() + effective_idle;
             if (earliest == null or idle_deadline < earliest.?) {
                 earliest = idle_deadline;
             }
@@ -7469,4 +7441,57 @@ test "a connection still in its handshake after handshake_timeout closes" {
     done.creation_time = now - 11 * std.time.ns_per_s;
     try done.onTimeout();
     try std.testing.expectEqual(State.connected, done.state);
+}
+
+test "client anti-deadlock: once its Initial is acknowledged, one padded probe per PTO" {
+    // RFC 9002 6.2.2.1 and A.9: with nothing in flight the client sends a
+    // single ack-eliciting padded Initial, not the acknowledged ClientHello
+    // again.
+    const alloc = std.testing.allocator;
+    const start: i64 = 1_000 * std.time.ns_per_s;
+    sys.test_clock = start;
+    defer sys.test_clock = null;
+    const client = try alloc.create(Connection);
+    defer alloc.destroy(client);
+    // Twenty seconds of handshake: past the handshake limit, which isn't under test.
+    try connectInto(client, alloc, "localhost", .{ .max_idle_timeout = 300_000, .handshake_timeout = 0 }, .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &.{"hq-interop"},
+        .server_name = "localhost",
+        .skip_cert_verify = true,
+    }, null);
+    defer client.deinit();
+    client.paths[0].peer_addr = makeIpv4Addr(127, 0, 0, 1, 4433);
+    client.paths[0].local_addr = makeIpv4Addr(127, 0, 0, 1, 40000);
+
+    var buf: [1500]u8 = undefined;
+    while ((try client.send(&buf)) > 0) {}
+
+    // The server acknowledges every Initial it got, and says nothing more.
+    const largest = client.pkt_handler.sent[0].largest_sent.?;
+    try client.processFrame(&.{ .ack = .{ .largest_ack = largest, .ack_delay = 0, .first_ack_range = largest } }, .initial, start);
+    client.last_packet_received_time = start;
+
+    var bursts: usize = 0;
+    var total: usize = 0;
+    var now = start;
+    while (now - start < 20 * std.time.ns_per_s) : (now += std.time.ns_per_ms) {
+        sys.test_clock = now;
+        try client.onTimeout();
+        var burst: usize = 0;
+        while (true) {
+            const n = try client.send(&buf);
+            if (n == 0) break;
+            try std.testing.expect(n >= 1200);
+            burst += 1;
+        }
+        if (burst == 0) continue;
+        bursts += 1;
+        total += burst;
+        // The first probe: one datagram. Later PTOs may send two (6.2.4).
+        try std.testing.expect(burst <= if (bursts == 1) @as(usize, 1) else 2);
+    }
+    try std.testing.expect(bursts >= 2);
+    try std.testing.expect(total <= 16);
 }

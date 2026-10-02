@@ -571,6 +571,68 @@ test "key update: a packet sent before an update and delivered after it still op
     try testing.expectEqualStrings("early", d);
 }
 
+/// A client whose server never answers, driven like an application loop
+/// that calls onTimeout() every `tick_ns` whether or not a timer is due.
+/// Returns how many datagrams it sent in [from_ns, to_ns), and when it
+/// closed (null if it never did before `to_ns`).
+fn silentServer(config: connection.ConnectionConfig, tick_ns: i64, from_ns: i64, to_ns: i64) !struct { sent: usize, closed_at: ?i64 } {
+    const alloc = testing.allocator;
+    const start: i64 = 1_000 * std.time.ns_per_s;
+    sys.test_clock = start;
+    defer sys.test_clock = null;
+
+    // The idle timer and the probes are under test, not a handshake deadline.
+    var cfg = config;
+    if (@hasField(connection.ConnectionConfig, "handshake_timeout")) cfg.handshake_timeout = 0;
+
+    const client = try alloc.create(connection.Connection);
+    defer alloc.destroy(client);
+    try connection.connectInto(client, alloc, "localhost", cfg, .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &client_alpn,
+        .server_name = "localhost",
+        .skip_cert_verify = true,
+    }, null);
+    defer client.deinit();
+    client.paths[0].peer_addr = addr(4433);
+    client.paths[0].local_addr = addr(40000);
+
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var sent: usize = 0;
+    var now = start;
+    while (now - start < to_ns) {
+        client.onTimeout() catch {};
+        if (client.isClosed()) return .{ .sent = sent, .closed_at = now - start };
+        while (true) {
+            const n = client.send(&buf) catch break;
+            if (n == 0) break;
+            if (now - start >= from_ns) sent += 1;
+        }
+        now += if (tick_ns > 0) tick_ns else @max(std.time.ns_per_us, (client.nextTimeoutNs() orelse now) - now);
+        sys.test_clock = now;
+    }
+    return .{ .sent = sent, .closed_at = null };
+}
+
+test "handshake: a client that hears nothing gives up at its idle timeout" {
+    // RFC 9000 10.1: only the first ack-eliciting packet after one received
+    // restarts the idle timer. Restarting it on every probe would keep a
+    // client facing silence alive forever.
+    const r = try silentServer(.{}, 0, 0, 120 * std.time.ns_per_s);
+    try testing.expect(r.closed_at != null);
+    try testing.expect(r.closed_at.? <= 31 * std.time.ns_per_s);
+}
+
+test "handshake: a client polled every millisecond through a stalled handshake does not flood" {
+    // Probes back off however old the handshake is. A deadline counted from
+    // the connection's creation, its backoff capped at 60 s, would probe on
+    // every onTimeout() from then on: ~38,000 datagrams a second.
+    const r = try silentServer(.{ .max_idle_timeout = 300_000 }, std.time.ns_per_ms, 60 * std.time.ns_per_s, 75 * std.time.ns_per_s);
+    try testing.expect(r.closed_at == null);
+    try testing.expect(r.sent <= 20);
+}
+
 test "idle timeout: a peer's value too large for nanoseconds is capped" {
     // With ours disabled (0) the peer's is used alone.
     sys.test_clock = 1_000 * std.time.ns_per_s;

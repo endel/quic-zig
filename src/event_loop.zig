@@ -2897,7 +2897,9 @@ pub fn Client(comptime Handler: type) type {
             self.tickAndSend();
             self.in_callback = false;
 
-            if (self.stopping and self.conn.isClosed()) {
+            // Closed by stop() or on its own (idle timeout, the peer's
+            // close): either way there is nothing left to run for.
+            if (self.conn.isClosed()) {
                 self.finishStop(null);
                 return;
             }
@@ -2967,7 +2969,7 @@ pub fn Client(comptime Handler: type) type {
             }
             self.in_callback = false;
 
-            if (self.stopping and self.conn.isClosed()) {
+            if (self.conn.isClosed()) {
                 self.finishStop(c);
                 return .disarm;
             }
@@ -5540,4 +5542,34 @@ test "e2e: a migrated peer landing on the wrong worker is steered to its owner" 
     try testing.expectEqual(router.forwarded.load(.monotonic), router.workers[0].injected);
     try testing.expectEqual(@as(usize, 0), router.workers[1].injected);
     try testing.expectEqual(@as(usize, 0), router.workers[1].server.conn_mgr.connectionCount());
+}
+
+test "client: run() returns once its connection closes on its own" {
+    // Documented to run until the connection closes, it ran until stop(): a
+    // client whose server never answered probed on in run() long after its
+    // connection had timed out.
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    }{};
+    // A peer that reads and never answers.
+    const silent = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(silent);
+    const at = try net.Address.parseIp4("127.0.0.1", 29477);
+    try sys.bind(silent, &at.any, at.getOsSockLen());
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 29477,
+        .skip_cert_verify = true,
+        .conn_config = .{ .max_idle_timeout = 200 },
+    });
+    defer client.deinit();
+
+    const start = sys.nanoTimestamp();
+    while (!client.own_loop.stopped() and sys.nanoTimestamp() - start < 10 * std.time.ns_per_s) {
+        try client.tick();
+        sys.sleepNs(5 * std.time.ns_per_ms);
+    }
+    try testing.expect(client.conn.isClosed());
+    try testing.expect(client.own_loop.stopped());
 }
