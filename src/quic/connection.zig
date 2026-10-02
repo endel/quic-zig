@@ -2570,7 +2570,6 @@ pub const Connection = struct {
                     error.DecodeError => tls.Alert.Description.decode_error,
                     error.BadFinished => tls.Alert.Description.decrypt_error,
                     error.NoKeyShare => tls.Alert.Description.handshake_failure,
-                    error.UnsupportedVersion => tls.Alert.Description.protocol_version,
                     error.NoApplicationProtocol => tls.Alert.Description.no_application_protocol,
                     error.MissingExtension => tls.Alert.Description.missing_extension,
                     error.HandshakeFailure => tls.Alert.Description.handshake_failure,
@@ -2614,6 +2613,9 @@ pub const Connection = struct {
                         data_hash,
                     });
                     try cs.writeData(sd.data);
+                    // A HelloRetryRequest rejects 0-RTT (RFC 8446 4.2.10): stop
+                    // sending it; completion resends what was sent as 1-RTT.
+                    if (!self.is_server and hs.hrr_seen) self.early_data_seal = null;
                 },
                 .install_keys => |ik| {
                     switch (ik.level) {

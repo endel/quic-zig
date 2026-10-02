@@ -45,6 +45,38 @@ pub const PrivateKeyAlgorithm = enum {
     rsa,
 };
 
+/// The suite a server picks from a ClientHello's cipher_suites list, null
+/// when there is none in common. RFC 8446 4.1.1 leaves the choice to the
+/// server: AES-128-GCM when AES runs in hardware, unless the client lists
+/// ChaCha20 ahead of every AES-GCM suite, the sign of a client without.
+/// AES-256-GCM counts though we don't offer it: OpenSSL lists it, then
+/// ChaCha20, then AES-128-GCM.
+fn selectCipherSuite(list: []const u8, only: ?quic_crypto.CipherSuite) ?quic_crypto.CipherSuite {
+    var client_first: ?u16 = null;
+    var aes = false;
+    var chacha = false;
+    var i: usize = 0;
+    while (i + 2 <= list.len) : (i += 2) {
+        const id = readU16(list[i..]);
+        const suite: quic_crypto.CipherSuite = switch (id) {
+            @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256) => .aes_128_gcm_sha256,
+            @intFromEnum(tls.CipherSuite.CHACHA20_POLY1305_SHA256) => .chacha20_poly1305_sha256,
+            @intFromEnum(tls.CipherSuite.AES_256_GCM_SHA384) => {
+                if (client_first == null) client_first = id;
+                continue;
+            },
+            else => continue,
+        };
+        if (client_first == null) client_first = id;
+        if (only) |o| if (suite != o) continue;
+        if (suite == .aes_128_gcm_sha256) aes = true else chacha = true;
+    }
+    const client_prefers_chacha = client_first == @intFromEnum(tls.CipherSuite.CHACHA20_POLY1305_SHA256);
+    if (aes and (!chacha or (std.crypto.core.aes.has_hardware_support and !client_prefers_chacha))) return .aes_128_gcm_sha256;
+    if (chacha) return .chacha20_poly1305_sha256;
+    return null;
+}
+
 /// What a client offers in signature_algorithms, and so all a server's
 /// CertificateVerify may use.
 const client_signature_schemes = [_]tls.SignatureScheme{
@@ -1099,6 +1131,11 @@ pub const TlsConfig = struct {
     ticket_key: ?[16]u8 = null, // AES-128-GCM key for encrypting/decrypting tickets (server)
     keylog_file: ?@import("../sys.zig").File = null, // SSLKEYLOGFILE output (NSS Key Log format)
     cipher_suite_only: ?quic_crypto.CipherSuite = null, // If set, offer ONLY this cipher suite
+    /// Client: the groups the first ClientHello sends key shares for. The
+    /// others we support (X25519, P-256) are only listed in supported_groups,
+    /// and a server that wants one asks for it with a HelloRetryRequest.
+    /// Empty leaves the choice to the server, at the cost of a round trip.
+    key_share_groups: []const tls.NamedGroup = &.{ .x25519, .secp256r1 },
     quic_version: u32 = protocol.QUIC_V1, // QUIC version (affects HKDF labels)
 };
 
@@ -1315,6 +1352,16 @@ pub const Tls13Handshake = struct {
     received_ticket: ?SessionTicket = null,
     ticket_nonce_counter: u32 = 0,
 
+    /// A HelloRetryRequest went out (server) or came in (client).
+    hrr_seen: bool = false,
+    /// The group it named, which the second ClientHello carries the one
+    /// share for, and the cipher suite it fixed (RFC 8446 4.1.4).
+    hrr_group: ?tls.NamedGroup = null,
+    hrr_cipher_suite: quic_crypto.CipherSuite = .aes_128_gcm_sha256,
+    /// Client: the HelloRetryRequest's cookie, echoed in the second ClientHello.
+    hrr_cookie: [512]u8 = undefined,
+    hrr_cookie_len: u16 = 0,
+
     /// The protocol in force: what the server matched, or — on a client,
     /// or before a match — the first one we offered.
     pub fn negotiatedAlpn(self: *const @This()) []const u8 {
@@ -1364,6 +1411,10 @@ pub const Tls13Handshake = struct {
         self.ticket_nonce_counter = 0;
         self.peer_session_id_len = 0;
         self.peer_session_id = .{0} ** 32;
+        self.hrr_seen = false;
+        self.hrr_group = null;
+        self.hrr_cipher_suite = .aes_128_gcm_sha256;
+        self.hrr_cookie_len = 0;
 
         // Pre-encode transport params to avoid dangling slices after struct move
         var tp_fbs = io.fixedBufferStream(&self.tp_encoded);
@@ -1441,6 +1492,10 @@ pub const Tls13Handshake = struct {
         self.ticket_nonce_counter = 0;
         self.peer_session_id_len = 0;
         self.peer_session_id = .{0} ** 32;
+        self.hrr_seen = false;
+        self.hrr_group = null;
+        self.hrr_cipher_suite = .aes_128_gcm_sha256;
+        self.hrr_cookie_len = 0;
 
         // Pre-encode transport params to avoid dangling slices after struct move
         var tp_fbs = io.fixedBufferStream(&self.tp_encoded);
@@ -1615,18 +1670,8 @@ pub const Tls13Handshake = struct {
         sys.randomBytes(&self.client_random);
 
         var buf: [4096]u8 = undefined;
-        const msg = buildClientHello(
-            &buf,
-            &self.client_random,
-            &self.x25519_public,
-            &self.p256_public,
-            self.config.alpn,
-            self.config.server_name,
-            self.tp_encoded[0..self.tp_encoded_len],
-            self.config.session_ticket,
-            &self.key_schedule,
-            self.config.cipher_suite_only,
-        ) catch return error.InternalError;
+        const msg = buildClientHello(&buf, self.clientHelloParams(self.config.key_share_groups, null)) catch
+            return error.InternalError;
 
         self.transcript.update(msg);
 
@@ -1666,6 +1711,9 @@ pub const Tls13Handshake = struct {
         pos += 2; // legacy_version = 0x0303
         @memcpy(&self.server_random, body[pos..][0..32]);
         pos += 32;
+        if (std.mem.eql(u8, &self.server_random, &tls.hello_retry_request_sequence)) {
+            return self.clientProcessHelloRetryRequest(msg);
+        }
 
         const session_id_len = body[pos];
         pos += 1;
@@ -1674,13 +1722,12 @@ pub const Tls13Handshake = struct {
         if (pos + 3 > body.len) return error.DecodeError;
         const cipher_suite_raw = readU16(body[pos..]);
         pos += 2;
-        if (cipher_suite_raw == @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256)) {
-            self.negotiated_cipher_suite = .aes_128_gcm_sha256;
-        } else if (cipher_suite_raw == @intFromEnum(tls.CipherSuite.CHACHA20_POLY1305_SHA256)) {
-            self.negotiated_cipher_suite = .chacha20_poly1305_sha256;
-        } else {
-            return error.UnsupportedVersion;
-        }
+        // RFC 8446 4.1.3: one we offered, or illegal_parameter.
+        var offered: [2]u8 = undefined;
+        writeU16(&offered, cipher_suite_raw);
+        self.negotiated_cipher_suite = selectCipherSuite(&offered, self.config.cipher_suite_only) orelse
+            return error.IllegalParameter;
+        if (self.hrr_seen and self.negotiated_cipher_suite != self.hrr_cipher_suite) return error.IllegalParameter;
 
         pos += 1; // compression_method = 0
 
@@ -1716,6 +1763,8 @@ pub const Tls13Handshake = struct {
                 } else {
                     return error.NoKeyShare;
                 }
+                // RFC 8446 4.2.8: a group we sent a share for.
+                if (!self.sentShareFor(self.negotiated_group)) return error.IllegalParameter;
             } else if (etype == @intFromEnum(tls.ExtensionType.pre_shared_key)) {
                 // RFC 8446 §4.2.11: only the one identity we offered. Resumption
                 // skips the certificate, so an unoffered PSK (all zeros) would
@@ -1757,6 +1806,99 @@ pub const Tls13Handshake = struct {
         self.pending_install_handshake = true;
         self.state = .client_wait_encrypted_extensions;
         return ._continue;
+    }
+
+    fn clientHelloParams(self: *const Tls13Handshake, shares: []const tls.NamedGroup, retry_transcript: ?*const TranscriptHash) ClientHelloParams {
+        return .{
+            .client_random = &self.client_random,
+            .x25519_pub = &self.x25519_public,
+            .p256_pub = &self.p256_public,
+            .shares = shares,
+            .alpn_list = self.config.alpn,
+            .server_name = self.config.server_name,
+            .tp_encoded_data = self.tp_encoded[0..self.tp_encoded_len],
+            .session_ticket = self.config.session_ticket,
+            .key_schedule = &self.key_schedule,
+            .cipher_suite_only = self.config.cipher_suite_only,
+            .cookie = if (self.hrr_cookie_len > 0) self.hrr_cookie[0..self.hrr_cookie_len] else null,
+            .retry_transcript = retry_transcript,
+        };
+    }
+
+    /// Whether the ClientHello in force carried a share for `group`.
+    fn sentShareFor(self: *const Tls13Handshake, group: tls.NamedGroup) bool {
+        if (self.hrr_group) |g| return g == group;
+        for (self.config.key_share_groups) |g| {
+            if (g == group) return true;
+        }
+        return false;
+    }
+
+    /// RFC 8446 4.1.4: the server asks for a share in another group (or for
+    /// its cookie back). The second ClientHello carries that one share, and
+    /// the transcript restarts from a message_hash of the first (4.4.1).
+    fn clientProcessHelloRetryRequest(self: *Tls13Handshake, msg: []const u8) !Action {
+        if (self.hrr_seen) return error.UnexpectedMessage;
+        const body = msg[4..];
+        var pos: usize = 2 + 32;
+        pos += 1 + @as(usize, body[pos]); // legacy_session_id_echo
+        if (pos + 5 > body.len) return error.DecodeError;
+        self.hrr_cipher_suite = selectCipherSuite(body[pos..][0..2], self.config.cipher_suite_only) orelse
+            return error.IllegalParameter;
+        pos += 3;
+        const ext_len = readU16(body[pos..]);
+        pos += 2;
+        if (ext_len > body.len - pos) return error.DecodeError;
+        const exts = body[pos..][0..ext_len];
+
+        var group: ?tls.NamedGroup = null;
+        var cookie: ?[]const u8 = null;
+        var i: usize = 0;
+        while (i + 4 <= exts.len) {
+            const etype = readU16(exts[i..]);
+            const elen = readU16(exts[i + 2 ..]);
+            i += 4;
+            if (elen > exts.len - i) return error.DecodeError;
+            const data = exts[i..][0..elen];
+            if (etype == @intFromEnum(tls.ExtensionType.key_share)) {
+                if (elen != 2) return error.DecodeError;
+                group = @enumFromInt(readU16(data));
+            } else if (etype == @intFromEnum(tls.ExtensionType.cookie)) {
+                if (elen < 3 or @as(usize, readU16(data)) + 2 != elen) return error.DecodeError;
+                cookie = data[2..];
+            }
+            i += elen;
+        }
+        // One of ours that we sent no share for; a retry changing nothing is illegal.
+        if (group) |g| {
+            if (g != .x25519 and g != .secp256r1) return error.IllegalParameter;
+            if (self.sentShareFor(g)) return error.IllegalParameter;
+        } else if (cookie == null) return error.IllegalParameter;
+        if (cookie) |c| {
+            if (c.len > self.hrr_cookie.len) return error.InternalError;
+            @memcpy(self.hrr_cookie[0..c.len], c);
+            self.hrr_cookie_len = @intCast(c.len);
+        }
+
+        const ch1_hash = self.transcript.current();
+        self.transcript = TranscriptHash.init();
+        self.transcript.update(&.{ @intFromEnum(tls.HandshakeType.message_hash), 0, 0, 32 });
+        self.transcript.update(&ch1_hash);
+        self.transcript.update(msg);
+
+        self.hrr_seen = true;
+        self.hrr_group = group;
+        const shares: []const tls.NamedGroup = if (self.hrr_group) |*g| g[0..1] else self.config.key_share_groups;
+        var buf: [4096]u8 = undefined;
+        const ch2 = buildClientHello(&buf, self.clientHelloParams(shares, &self.transcript)) catch
+            return error.InternalError;
+        self.transcript.update(ch2);
+        @memcpy(self.out_buf[0..ch2.len], ch2);
+        self.out_len = ch2.len;
+        return Action{ .send_data = .{
+            .level = .initial,
+            .data = self.out_buf[0..self.out_len],
+        } };
     }
 
     fn clientProcessEncryptedExtensions(self: *Tls13Handshake) !Action {
@@ -2067,34 +2209,14 @@ pub const Tls13Handshake = struct {
         }
         pos += session_id_len; // skip session_id
 
-        // Cipher suites — select the best one we support
+        // Cipher suites; after a HelloRetryRequest, the one it fixed (RFC 8446 4.1.4)
         if (pos + 2 > body.len) return error.DecodeError;
         const cs_len = readU16(body[pos..]);
         pos += 2;
-        {
-            var cs_found = false;
-            var cs_pos: usize = 0;
-            while (cs_pos + 2 <= cs_len) : (cs_pos += 2) {
-                const cs_id = readU16(body[pos + cs_pos ..]);
-                // If cipher_suite_only is set, only accept that cipher
-                if (self.config.cipher_suite_only) |required| {
-                    if (cs_id == @intFromEnum(required)) {
-                        self.negotiated_cipher_suite = required;
-                        cs_found = true;
-                        break;
-                    }
-                } else {
-                    if (cs_id == @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256) and !cs_found) {
-                        self.negotiated_cipher_suite = .aes_128_gcm_sha256;
-                        cs_found = true;
-                    } else if (cs_id == @intFromEnum(tls.CipherSuite.CHACHA20_POLY1305_SHA256) and !cs_found) {
-                        self.negotiated_cipher_suite = .chacha20_poly1305_sha256;
-                        cs_found = true;
-                    }
-                }
-            }
-            if (!cs_found) return error.UnsupportedVersion;
-        }
+        if (cs_len > body.len - pos) return error.DecodeError;
+        const required: ?quic_crypto.CipherSuite = if (self.hrr_seen) self.hrr_cipher_suite else self.config.cipher_suite_only;
+        self.negotiated_cipher_suite = selectCipherSuite(body[pos..][0..cs_len], required) orelse
+            return if (self.hrr_seen) error.IllegalParameter else error.HandshakeFailure;
         pos += cs_len;
 
         // Compression methods
@@ -2109,6 +2231,9 @@ pub const Tls13Handshake = struct {
         pos += 2;
 
         var found_key_share = false;
+        var key_share_count: usize = 0;
+        var lists_x25519 = false;
+        var lists_p256 = false;
         var sni: ?[]const u8 = null;
         var sig_algs: ?[]const u8 = null;
         var psk_ext_offset: ?usize = null; // offset into ext_data where PSK extension starts
@@ -2127,28 +2252,34 @@ pub const Tls13Handshake = struct {
                 // client_shares_len(2) + [named_group(2) + key_len(2) + key(...)]
                 // Prefer X25519, fall back to secp256r1 (P-256)
                 if (elen >= 2) {
+                    var found_x25519 = false;
                     var found_p256 = false;
                     var share_pos: usize = 2; // skip client_shares_len
                     while (share_pos + 4 <= elen) {
                         const group = readU16(ext_data[ext_pos + share_pos ..]);
                         const kelen = readU16(ext_data[ext_pos + share_pos + 2 ..]);
                         share_pos += 4;
+                        key_share_count += 1;
                         if (group == @intFromEnum(tls.NamedGroup.x25519) and kelen == 32 and share_pos + 32 <= elen) {
                             @memcpy(&self.peer_x25519_public, ext_data[ext_pos + share_pos ..][0..32]);
-                            self.negotiated_group = .x25519;
-                            found_key_share = true;
-                            break;
+                            found_x25519 = true;
                         } else if (group == @intFromEnum(tls.NamedGroup.secp256r1) and kelen == 65 and share_pos + 65 <= elen) {
                             @memcpy(&self.peer_p256_public, ext_data[ext_pos + share_pos ..][0..65]);
                             found_p256 = true;
                         }
                         share_pos += kelen;
                     }
-                    // Use P-256 if X25519 not found
-                    if (!found_key_share and found_p256) {
-                        self.negotiated_group = .secp256r1;
+                    if (found_x25519 or found_p256) {
+                        self.negotiated_group = if (found_x25519) .x25519 else .secp256r1;
                         found_key_share = true;
                     }
+                }
+            } else if (etype == @intFromEnum(tls.ExtensionType.supported_groups)) {
+                var gp: usize = 2;
+                while (gp + 2 <= elen) : (gp += 2) {
+                    const g = readU16(ext_data[ext_pos + gp ..]);
+                    if (g == @intFromEnum(tls.NamedGroup.x25519)) lists_x25519 = true;
+                    if (g == @intFromEnum(tls.NamedGroup.secp256r1)) lists_p256 = true;
                 }
             } else if (etype == @intFromEnum(tls.ExtensionType.quic_transport_parameters)) {
                 const tp_data = ext_data[ext_pos..][0..elen];
@@ -2197,7 +2328,6 @@ pub const Tls13Handshake = struct {
             ext_pos += elen;
         }
 
-        if (!found_key_share) return error.NoKeyShare;
         self.client_auth = self.config.client_auth;
         if (self.config.certs.len > 0) {
             const entry = selectCertificateFor(self.config.certs, sni, sig_algs).?.entry;
@@ -2209,6 +2339,17 @@ pub const Tls13Handshake = struct {
         // RFC 9001 §8.2: quic_transport_parameters extension MUST be present
         if (self.peer_transport_params == null) {
             return error.MissingExtension;
+        }
+
+        if (self.hrr_seen) {
+            // RFC 8446 4.1.2: one share, in the group asked for, and no
+            // early_data (4.2.10).
+            if (!found_key_share or key_share_count != 1 or self.negotiated_group != self.hrr_group.?) return error.IllegalParameter;
+            if (self.early_data_offered) return error.IllegalParameter;
+        } else if (!found_key_share) {
+            // OpenSSL's `-groups A:B` sends a share for A alone.
+            const group: tls.NamedGroup = if (lists_x25519) .x25519 else if (lists_p256) .secp256r1 else return error.NoKeyShare;
+            return self.serverSendHelloRetryRequest(msg, group);
         }
 
         // Try to process PSK extension if present and we have a ticket key.
@@ -2234,8 +2375,9 @@ pub const Tls13Handshake = struct {
         self.transcript.update(msg);
         std.log.info("transcript after CH: {x}", .{self.transcript.current()});
 
-        // If PSK accepted, derive early data secret for 0-RTT decryption
-        if (self.using_psk) {
+        // If PSK accepted, derive early data secret for 0-RTT decryption.
+        // Not after a retry: that rejected 0-RTT (RFC 8446 4.2.10).
+        if (self.using_psk and !self.hrr_seen) {
             const transcript_hash = self.transcript.current();
             self.key_schedule.deriveEarlyDataSecret(transcript_hash);
             self.pending_install_early = true;
@@ -2268,6 +2410,43 @@ pub const Tls13Handshake = struct {
 
         self.state = .server_send_server_hello;
         return ._continue;
+    }
+
+    /// RFC 8446 4.1.4: no share in a group we do, but the client lists one;
+    /// ask for it. The transcript goes on from a message_hash standing in for
+    /// this ClientHello (4.4.1), and the next arrives in another Initial.
+    fn serverSendHelloRetryRequest(self: *Tls13Handshake, client_hello: []const u8, group: tls.NamedGroup) !Action {
+        var ch1_hash: [32]u8 = undefined;
+        Sha256.hash(client_hello, &ch1_hash, .{});
+        self.transcript = TranscriptHash.init();
+        self.transcript.update(&.{ @intFromEnum(tls.HandshakeType.message_hash), 0, 0, 32 });
+        self.transcript.update(&ch1_hash);
+
+        var buf: [128]u8 = undefined;
+        const hrr = buildServerHello(
+            &buf,
+            &tls.hello_retry_request_sequence,
+            group,
+            &.{},
+            self.peer_session_id[0..self.peer_session_id_len],
+            false,
+            self.negotiated_cipher_suite,
+        ) catch return error.InternalError;
+        self.transcript.update(hrr);
+        @memcpy(self.out_buf[0..hrr.len], hrr);
+        self.out_len = hrr.len;
+
+        self.hrr_seen = true;
+        self.hrr_group = group;
+        self.hrr_cipher_suite = self.negotiated_cipher_suite;
+        // What the second ClientHello says, it has to say again.
+        self.early_data_offered = false;
+        self.peer_transport_params = null;
+        self.selected_alpn_len = 0;
+        return Action{ .send_data = .{
+            .level = .initial,
+            .data = self.out_buf[0..self.out_len],
+        } };
     }
 
     fn serverBuildServerHello(self: *Tls13Handshake) !Action {
@@ -2732,7 +2911,9 @@ pub const Tls13Handshake = struct {
         _ = body;
         _ = ext_start_in_body;
 
-        var partial_hash: Sha256 = Sha256.init(.{});
+        // After a HelloRetryRequest the binder covers the transcript so far
+        // (message_hash, the retry request) as well (RFC 8446 4.2.11.2).
+        var partial_hash: Sha256 = self.transcript.state;
         partial_hash.update(msg[0..partial_len]);
         var partial_transcript = partial_hash.finalResult();
 
@@ -2906,18 +3087,35 @@ pub const Tls13Handshake = struct {
 
 // ─── Message builders ────────────────────────────────────────────────
 
-fn buildClientHello(
-    buf: []u8,
+const ClientHelloParams = struct {
     client_random: *const [32]u8,
     x25519_pub: *const [32]u8,
     p256_pub: *const [65]u8,
+    /// Groups to send a key share for; X25519 and P-256 only.
+    shares: []const tls.NamedGroup,
     alpn_list: []const []const u8,
     server_name: ?[]const u8,
     tp_encoded_data: []const u8,
     session_ticket: ?*const SessionTicket,
-    key_schedule: *KeySchedule,
+    key_schedule: *const KeySchedule,
     cipher_suite_only: ?quic_crypto.CipherSuite,
-) ![]const u8 {
+    /// Second ClientHello: the HelloRetryRequest's cookie, if it had one.
+    cookie: ?[]const u8 = null,
+    /// Second ClientHello: the transcript before it (message_hash and the
+    /// HelloRetryRequest), which its PSK binder covers too (RFC 8446
+    /// 4.2.11.2). Its presence also drops early_data (4.2.10).
+    retry_transcript: ?*const TranscriptHash = null,
+};
+
+fn buildClientHello(buf: []u8, params: ClientHelloParams) ![]const u8 {
+    const client_random = params.client_random;
+    const alpn_list = params.alpn_list;
+    const server_name = params.server_name;
+    const tp_encoded_data = params.tp_encoded_data;
+    const session_ticket = params.session_ticket;
+    const key_schedule = params.key_schedule;
+    const cipher_suite_only = params.cipher_suite_only;
+
     // Build the body first, then wrap with type + length
     var pos: usize = 4; // reserve space for type + 3-byte length
 
@@ -2969,27 +3167,23 @@ fn buildClientHello(
     writeU16(buf[pos..], @intFromEnum(tls.ProtocolVersion.tls_1_3));
     pos += 2;
 
-    // key_share extension (X25519 + P-256)
-    const x25519_share_len = 2 + 2 + 32; // group(2) + len(2) + key(32)
-    const p256_share_len = 2 + 2 + 65; // group(2) + len(2) + key(65)
-    const shares_total: u16 = x25519_share_len + p256_share_len;
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.key_share), 2 + shares_total);
-    writeU16(buf[pos..], shares_total); // client_shares length
-    pos += 2;
-    // X25519 share (preferred)
-    writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.x25519));
-    pos += 2;
-    writeU16(buf[pos..], 32);
-    pos += 2;
-    @memcpy(buf[pos..][0..32], x25519_pub);
-    pos += 32;
-    // P-256 share (fallback)
-    writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.secp256r1));
-    pos += 2;
-    writeU16(buf[pos..], 65);
-    pos += 2;
-    @memcpy(buf[pos..][0..65], p256_pub);
-    pos += 65;
+    // key_share extension: X25519 and/or P-256, or none to let the server pick
+    const ks_at = pos;
+    pos += 6; // extension header and client_shares length, filled in below
+    for (params.shares) |group| {
+        const key: []const u8 = switch (group) {
+            .x25519 => params.x25519_pub,
+            .secp256r1 => params.p256_pub,
+            else => continue,
+        };
+        writeU16(buf[pos..], @intFromEnum(group));
+        writeU16(buf[pos + 2 ..], @intCast(key.len));
+        @memcpy(buf[pos + 4 ..][0..key.len], key);
+        pos += 4 + key.len;
+    }
+    const shares_total: u16 = @intCast(pos - ks_at - 6);
+    _ = writeExtHeader(buf, ks_at, @intFromEnum(tls.ExtensionType.key_share), 2 + shares_total);
+    writeU16(buf[ks_at + 4 ..], shares_total);
 
     // signature_algorithms extension
     const sig_list_len: u16 = 2 * client_signature_schemes.len;
@@ -3056,11 +3250,20 @@ fn buildClientHello(
     buf[pos] = 0x01; // psk_dhe_ke
     pos += 1;
 
+    if (params.cookie) |cookie| {
+        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.cookie), 2 + cookie.len);
+        writeU16(buf[pos..], @intCast(cookie.len));
+        @memcpy(buf[pos + 2 ..][0..cookie.len], cookie);
+        pos += 2 + cookie.len;
+    }
+
     // PSK extensions (must be last, per RFC 8446 §4.2.11)
     if (session_ticket) |ticket| {
         // early_data extension (RFC 8446 §4.2.10) — empty payload in ClientHello
-        // Tells the server we intend to send 0-RTT data
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.early_data), 0);
+        // Tells the server we intend to send 0-RTT data; never after a retry.
+        if (params.retry_transcript == null) {
+            pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.early_data), 0);
+        }
 
         // pre_shared_key extension (type=41) - MUST be last
         const ticket_bytes = ticket.getTicket();
@@ -3117,7 +3320,7 @@ fn buildClientHello(
         // partial_ch = everything up to and including identities (RFC 8446 §4.2.11.2)
         // Exclude: binders_len_field(2) + binder_len(1) + binder_value(32) = 35 bytes
         const partial_len = pos - 2 - binders_len;
-        var partial_hasher = Sha256.init(.{});
+        var partial_hasher = if (params.retry_transcript) |t| t.state else Sha256.init(.{});
         partial_hasher.update(buf[0..partial_len]);
         const partial_hash = partial_hasher.finalResult();
 
@@ -3186,15 +3389,22 @@ fn buildServerHello(
     writeU16(buf[pos..], @intFromEnum(tls.ProtocolVersion.tls_1_3));
     pos += 2;
 
-    // key_share (server's key)
-    const ks_len: u16 = @intCast(2 + 2 + key_share_data.len);
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.key_share), ks_len);
-    writeU16(buf[pos..], @intFromEnum(key_share_group));
-    pos += 2;
-    writeU16(buf[pos..], @intCast(key_share_data.len));
-    pos += 2;
-    @memcpy(buf[pos..][0..key_share_data.len], key_share_data);
-    pos += key_share_data.len;
+    // key_share: the server's share, or in a HelloRetryRequest (no share)
+    // just the group it selects
+    if (key_share_data.len == 0) {
+        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.key_share), 2);
+        writeU16(buf[pos..], @intFromEnum(key_share_group));
+        pos += 2;
+    } else {
+        const ks_len: u16 = @intCast(2 + 2 + key_share_data.len);
+        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.key_share), ks_len);
+        writeU16(buf[pos..], @intFromEnum(key_share_group));
+        pos += 2;
+        writeU16(buf[pos..], @intCast(key_share_data.len));
+        pos += 2;
+        @memcpy(buf[pos..][0..key_share_data.len], key_share_data);
+        pos += key_share_data.len;
+    }
 
     // pre_shared_key extension (selected_identity = 0)
     if (using_psk) {
@@ -3787,18 +3997,18 @@ test "buildClientHello: produces valid message" {
     var buf: [4096]u8 = undefined;
     var p256_pub: [65]u8 = undefined;
     @memset(&p256_pub, 0xCC);
-    const msg = try buildClientHello(
-        &buf,
-        &random,
-        &pub_key,
-        &p256_pub,
-        &[_][]const u8{"h3"},
-        "example.com",
-        tp_encoded,
-        null,
-        &ks,
-        null,
-    );
+    const msg = try buildClientHello(&buf, .{
+        .client_random = &random,
+        .x25519_pub = &pub_key,
+        .p256_pub = &p256_pub,
+        .shares = &.{ .x25519, .secp256r1 },
+        .alpn_list = &[_][]const u8{"h3"},
+        .server_name = "example.com",
+        .tp_encoded_data = tp_encoded,
+        .session_ticket = null,
+        .key_schedule = &ks,
+        .cipher_suite_only = null,
+    });
 
     // Check message type
     try std.testing.expectEqual(@as(u8, @intFromEnum(tls.HandshakeType.client_hello)), msg[0]);
@@ -5110,4 +5320,268 @@ test "certificateWellFormed: real certificates pass, every truncation and a lyin
             walkAccepted(copy[0..der.len]);
         }
     }
+}
+
+/// Our client's first ClientHello, copied into `buf` for a test to rewrite.
+fn testClientHello(buf: []u8, config: TlsConfig) ![]u8 {
+    var client = Tls13Handshake.initClient(config, .{ .initial_max_data = 1 << 20 });
+    while (true) switch (try client.step()) {
+        .send_data => |sd| {
+            @memcpy(buf[0..sd.data.len], sd.data);
+            return buf[0..sd.data.len];
+        },
+        else => {},
+    };
+}
+
+const test_client_config: TlsConfig = .{
+    .cert_chain_der = &.{},
+    .private_key_bytes = &.{},
+    .alpn = &[_][]const u8{"h3"},
+    .server_name = "localhost",
+    .skip_cert_verify = true, // against a self-signed test server
+};
+
+/// Where extension `ext`'s data starts in a ClientHello (with
+/// `server_hello` false) or a ServerHello.
+fn helloExtension(msg: []const u8, ext: tls.ExtensionType, server_hello: bool) ?usize {
+    var pos: usize = 4 + 2 + 32;
+    pos += 1 + msg[pos]; // legacy_session_id
+    if (server_hello) {
+        pos += 2 + 1; // cipher_suite, compression_method
+    } else {
+        pos += 2 + readU16(msg[pos..]); // cipher_suites
+        pos += 1 + msg[pos]; // compression_methods
+    }
+    const end = pos + 2 + readU16(msg[pos..]);
+    pos += 2;
+    while (pos + 4 <= end) {
+        const len = readU16(msg[pos + 2 ..]);
+        if (readU16(msg[pos..]) == @intFromEnum(ext)) return pos + 4;
+        pos += 4 + len;
+    }
+    return null;
+}
+
+/// `ch` with its cipher_suites replaced by `suites`, written to `out`.
+fn withCipherSuites(out: []u8, ch: []const u8, suites: []const u16) []u8 {
+    const at = 4 + 2 + 32 + 1 + @as(usize, ch[4 + 2 + 32]);
+    const rest = ch[at + 2 + readU16(ch[at..]) ..];
+    @memcpy(out[0..at], ch[0..at]);
+    writeU16(out[at..], @intCast(2 * suites.len));
+    for (suites, 0..) |s, i| writeU16(out[at + 2 + 2 * i ..], s);
+    const len = at + 2 + 2 * suites.len + rest.len;
+    @memcpy(out[at + 2 + 2 * suites.len ..][0..rest.len], rest);
+    std.mem.writeInt(u24, out[1..4], @intCast(len - 4), .big);
+    return out[0..len];
+}
+
+/// A server with an ECDSA certificate, given `ch`; returns its first flight.
+fn testServerAnswer(server: *Tls13Handshake, certs: *const test_certs.TestCerts, ch: []const u8) ![]const u8 {
+    const ec = certs.entries[0].cert;
+    server.* = Tls13Handshake.initServer(.{
+        .cert_chain_der = ec.cert_chain_der,
+        .private_key_bytes = ec.private_key_bytes,
+        .private_key_algorithm = ec.private_key_algorithm,
+        .alpn = &[_][]const u8{"h3"},
+    }, .{ .initial_max_data = 1 << 20 });
+    server.provideData(ch);
+    while (true) switch (try server.step()) {
+        .send_data => |sd| return sd.data,
+        else => {},
+    };
+}
+
+test "server: a ClientHello with no share in a group it supports gets a HelloRetryRequest" {
+    // OpenSSL's `-groups X25519MLKEM768:X25519` sends a share for the first
+    // group only, and lists X25519 in supported_groups.
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    var buf: [2048]u8 = undefined;
+    const ch = try testClientHello(&buf, test_client_config);
+    const ks = helloExtension(ch, .key_share, false).?;
+    var at = ks + 2;
+    while (at < ks + 2 + readU16(ch[ks..])) : (at += 4 + readU16(ch[at + 2 ..])) writeU16(ch[at..], 0x11ec);
+
+    var server: Tls13Handshake = undefined;
+    const hrr = try testServerAnswer(&server, &certs, ch);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(tls.HandshakeType.server_hello)), hrr[0]);
+    try std.testing.expectEqualSlices(u8, &tls.hello_retry_request_sequence, hrr[6..38]);
+    const sel = helloExtension(hrr, .key_share, true).?;
+    try std.testing.expectEqual(@as(u16, 2), readU16(hrr[sel - 2 ..]));
+    try std.testing.expectEqual(@as(u16, @intFromEnum(tls.NamedGroup.x25519)), readU16(hrr[sel..]));
+}
+
+test "server: a ClientHello with no group in common still fails" {
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    var buf: [2048]u8 = undefined;
+    const ch = try testClientHello(&buf, test_client_config);
+    const ks = helloExtension(ch, .key_share, false).?;
+    var at = ks + 2;
+    while (at < ks + 2 + readU16(ch[ks..])) : (at += 4 + readU16(ch[at + 2 ..])) writeU16(ch[at..], 0x11ec);
+    const sg = helloExtension(ch, .supported_groups, false).?;
+    at = sg + 2;
+    while (at < sg + 2 + readU16(ch[sg..])) : (at += 2) writeU16(ch[at..], 0x11ec);
+
+    var server: Tls13Handshake = undefined;
+    try std.testing.expectError(error.NoKeyShare, testServerAnswer(&server, &certs, ch));
+}
+
+test "server: no cipher suite in common is a handshake_failure, not protocol_version" {
+    // RFC 8446 4.1.1: no suite in common is handshake_failure; protocol_version
+    // is for a version mismatch.
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    var buf: [2048]u8 = undefined;
+    var out: [2048]u8 = undefined;
+    const ch = withCipherSuites(&out, try testClientHello(&buf, test_client_config), &.{0x1302});
+    var server: Tls13Handshake = undefined;
+    try std.testing.expectError(error.HandshakeFailure, testServerAnswer(&server, &certs, ch));
+}
+
+test "server: AES-128-GCM over ChaCha20, unless the client lists ChaCha20 first" {
+    // OpenSSL lists TLS_AES_256_GCM_SHA384 first and ChaCha20 before
+    // AES-128-GCM, so taking the client's first one we support gave every
+    // OpenSSL client ChaCha20.
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    const aes: quic_crypto.CipherSuite = if (std.crypto.core.aes.has_hardware_support) .aes_128_gcm_sha256 else .chacha20_poly1305_sha256;
+    const cases = [_]struct { suites: []const u16, want: quic_crypto.CipherSuite }{
+        .{ .suites = &.{ 0x1302, 0x1303, 0x1301 }, .want = aes },
+        .{ .suites = &.{ 0x1301, 0x1303 }, .want = aes },
+        .{ .suites = &.{ 0x1303, 0x1301 }, .want = .chacha20_poly1305_sha256 },
+        .{ .suites = &.{0x1303}, .want = .chacha20_poly1305_sha256 },
+    };
+    var buf: [2048]u8 = undefined;
+    const base = try testClientHello(&buf, test_client_config);
+    for (cases) |c| {
+        var out: [2048]u8 = undefined;
+        var server: Tls13Handshake = undefined;
+        _ = try testServerAnswer(&server, &certs, withCipherSuites(&out, base, c.suites));
+        try std.testing.expectEqual(c.want, server.negotiated_cipher_suite);
+    }
+}
+
+/// Runs a client and a server to completion, the client then reading the
+/// server's NewSessionTicket; says which installed 0-RTT keys.
+fn runLoopback(client: *Tls13Handshake, server: *Tls13Handshake) !struct { client_early: bool, server_early: bool } {
+    var client_done = false;
+    var server_done = false;
+    var client_early = false;
+    var server_early = false;
+    var i: usize = 0;
+    while ((!client_done or !server_done) and i < 100) : (i += 1) {
+        if (!client_done) switch (try client.step()) {
+            .send_data => server.provideData(client.out_buf[0..client.out_len]),
+            .install_keys => |ik| if (ik.level == .early_data) {
+                client_early = true;
+            },
+            .complete => client_done = true,
+            else => {},
+        };
+        if (!server_done) switch (try server.step()) {
+            .send_data => client.provideData(server.out_buf[0..server.out_len]),
+            .install_keys => |ik| if (ik.level == .early_data) {
+                server_early = true;
+            },
+            .complete => server_done = true,
+            else => {},
+        };
+    }
+    try std.testing.expect(client_done and server_done);
+    i = 0;
+    while (i < 10) : (i += 1) switch (try client.step()) {
+        ._continue => continue,
+        else => break,
+    };
+    try std.testing.expectEqualSlices(u8, &client.key_schedule.client_app_traffic_secret, &server.key_schedule.client_app_traffic_secret);
+    try std.testing.expectEqualSlices(u8, &client.key_schedule.server_app_traffic_secret, &server.key_schedule.server_app_traffic_secret);
+    return .{ .client_early = client_early, .server_early = server_early };
+}
+
+test "loopback handshake through a HelloRetryRequest, fresh and resumed" {
+    // A client sending no key share leaves the group to the server, which
+    // asks for one. Resumed, the PSK binder covers the retry too, and 0-RTT
+    // is off (RFC 8446 4.2.10).
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    const ec = certs.entries[0].cert;
+    var ticket_key: [16]u8 = undefined;
+    sys.randomBytes(&ticket_key);
+    const server_config: TlsConfig = .{
+        .cert_chain_der = ec.cert_chain_der,
+        .private_key_bytes = ec.private_key_bytes,
+        .private_key_algorithm = ec.private_key_algorithm,
+        .alpn = &[_][]const u8{"h3"},
+        .ticket_key = ticket_key,
+    };
+    var client_config = test_client_config;
+    client_config.key_share_groups = &.{};
+    const tp: transport_params.TransportParams = .{ .initial_max_data = 1 << 20, .initial_max_streams_bidi = 100 };
+
+    var server1 = Tls13Handshake.initServer(server_config, tp);
+    var client1 = Tls13Handshake.initClient(client_config, tp);
+    _ = try runLoopback(&client1, &server1);
+    try std.testing.expect(client1.hrr_seen and server1.hrr_seen);
+    try std.testing.expectEqual(tls.NamedGroup.x25519, client1.negotiated_group);
+    const ticket = client1.received_ticket orelse return error.TestUnexpectedResult;
+
+    client_config.session_ticket = &ticket;
+    var server2 = Tls13Handshake.initServer(server_config, tp);
+    var client2 = Tls13Handshake.initClient(client_config, tp);
+    const r = try runLoopback(&client2, &server2);
+    try std.testing.expect(client2.hrr_seen and server2.hrr_seen);
+    try std.testing.expect(client2.using_psk and server2.using_psk);
+    try std.testing.expect(!r.server_early);
+    try std.testing.expect(!client2.zero_rtt_accepted);
+}
+
+test "client: a HelloRetryRequest it cannot act on is refused" {
+    var buf: [256]u8 = undefined;
+    const for_x25519 = try buildServerHello(&buf, &tls.hello_retry_request_sequence, .x25519, &.{}, "", false, .aes_128_gcm_sha256);
+
+    // For a group whose share it already sent.
+    var client = Tls13Handshake.initClient(test_client_config, .{});
+    _ = try client.step();
+    client.provideData(for_x25519);
+    try std.testing.expectError(error.IllegalParameter, client.step());
+
+    // A second one.
+    var none = test_client_config;
+    none.key_share_groups = &.{};
+    var twice = Tls13Handshake.initClient(none, .{});
+    _ = try twice.step();
+    twice.provideData(for_x25519);
+    switch (try twice.step()) {
+        .send_data => {},
+        else => return error.TestUnexpectedResult,
+    }
+    twice.provideData(for_x25519);
+    try std.testing.expectError(error.UnexpectedMessage, twice.step());
+
+    // For a group it does not do.
+    var buf2: [256]u8 = undefined;
+    const for_p384 = try buildServerHello(&buf2, &tls.hello_retry_request_sequence, .secp384r1, &.{}, "", false, .aes_128_gcm_sha256);
+    var other = Tls13Handshake.initClient(none, .{});
+    _ = try other.step();
+    other.provideData(for_p384);
+    try std.testing.expectError(error.IllegalParameter, other.step());
+}
+
+test "server: a second ClientHello without the share it asked for is refused" {
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    var none = test_client_config;
+    none.key_share_groups = &.{};
+    var buf: [2048]u8 = undefined;
+    var server: Tls13Handshake = undefined;
+    const hrr = try testServerAnswer(&server, &certs, try testClientHello(&buf, none));
+    try std.testing.expectEqualSlices(u8, &tls.hello_retry_request_sequence, hrr[6..38]);
+
+    var p256_only = test_client_config;
+    p256_only.key_share_groups = &.{.secp256r1};
+    var buf2: [2048]u8 = undefined;
+    server.provideData(try testClientHello(&buf2, p256_only));
+    try std.testing.expectError(error.IllegalParameter, server.step());
 }

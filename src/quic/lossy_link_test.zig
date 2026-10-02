@@ -571,6 +571,70 @@ test "key update: a packet sent before an update and delivered after it still op
     try testing.expectEqualStrings("early", d);
 }
 
+test "handshake: a client that sends no key share is asked for one, and connects" {
+    // RFC 8446 4.1.4 over QUIC: the HelloRetryRequest and the second
+    // ClientHello both travel in Initial packets.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    var client_tls = clientTls();
+    client_tls.key_share_groups = &.{};
+    var p: Pair = undefined;
+    try p.initTls(serverTls(), .{}, .{}, client_tls);
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    try testing.expect(p.client.tls13_hs.?.hrr_seen);
+    try testing.expect(sconn.tls13_hs.?.hrr_seen);
+    try testing.expect(try sendAndRead(&p, p.client, sconn, "after a retry"));
+}
+
+test "handshake: 0-RTT sent before a HelloRetryRequest still arrives, as 1-RTT" {
+    // The retry rejects 0-RTT (RFC 8446 4.2.10), so the client stops sending
+    // it and resends what it had sent once the handshake completes.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    const alloc = testing.allocator;
+    var server_tls = serverTls();
+    server_tls.ticket_key = @splat(7);
+    var client_tls = clientTls();
+
+    const ticket = blk: {
+        var first: Pair = undefined;
+        try first.initTls(server_tls, .{}, .{}, client_tls);
+        defer first.deinit();
+        var i: usize = 0;
+        while (i < 10 and first.exchange()) : (i += 1) {}
+        break :blk first.client.session_ticket orelse return error.TestUnexpectedResult;
+    };
+
+    client_tls.session_ticket = &ticket;
+    client_tls.key_share_groups = &.{};
+    var p: Pair = .{
+        .mgr = connection_manager.ConnectionManager.init(alloc, server_tls, .{}, .{1} ** 16, .{2} ** 16),
+        .client = try alloc.create(connection.Connection),
+    };
+    try connection.connectInto(p.client, alloc, "localhost", .{}, client_tls, null);
+    defer p.deinit();
+    p.client.paths[0].peer_addr = p.s_addr;
+    p.client.paths[0].local_addr = p.c_addr;
+    try testing.expect(p.client.early_data_seal != null);
+
+    const s = try p.client.openStream();
+    try s.send.writeData("sent as 0-RTT");
+    s.send.close();
+    // One round: the first ClientHello and the 0-RTT out, the retry back.
+    try testing.expect(p.exchange());
+    try testing.expect(p.client.tls13_hs.?.hrr_seen and !p.client.isEstablished());
+    try testing.expect(p.client.early_data_seal == null);
+    var i: usize = 0;
+    while (i < 50 and p.exchange()) : (i += 1) {}
+    try testing.expect(p.client.tls13_hs.?.using_psk);
+    const r = p.mgr.entries.items[0].conn.streams.getStream(s.stream_id) orelse return error.TestUnexpectedResult;
+    const d = r.recv.read() orelse return error.TestUnexpectedResult;
+    defer alloc.free(d);
+    try testing.expectEqualStrings("sent as 0-RTT", d);
+    try testing.expect(r.recv.read() == null and r.recv.finished);
+}
+
 /// A client whose server never answers, driven like an application loop
 /// that calls onTimeout() every `tick_ns` whether or not a timer is due.
 /// Returns how many datagrams it sent in [from_ns, to_ns), and when it
