@@ -124,6 +124,18 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - MoQ relays drop a subscriber more than 1 MiB behind on a group
   (TOO_FAR_BEHIND in the MoQT relay), and the MoQT relay refuses namespaces
   whose key would pass 256 bytes (NAMESPACE_TOO_LARGE).
+- Handling an ACK now costs what it acknowledges, not a pass over every
+  packet in flight: 14× less with 512 packets in flight, 184× with 8192.
+- The event loop's server and client look for flow-control frames to send
+  once per burst of packets instead of before every packet: 4% less CPU per
+  10 KB HTTP/3 response in routez. A send loop of your own gets the same from
+  `Connection.beginBurst` and `endBurst`.
+- A connection keeps up to two large send buffers that streams have drained
+  or finished with, and hands them to the next stream that needs one, instead
+  of freeing them. A server streaming large responses no longer maps, faults
+  in and unmaps a buffer for each burst: routez serves 1 MB HTTP/3 responses
+  26% faster, with 17% less CPU each. The buffers go when the connection has
+  no bidirectional streams left.
 
 ### Fixed
 
