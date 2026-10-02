@@ -1160,7 +1160,7 @@ test "PacketPacker: HANDSHAKE_DONE frame packed in 1-RTT" {
     const app_idx = @intFromEnum(ack_handler.EncLevel.application);
     try testing.expectEqual(@as(usize, 1), pkt_handler.sent[app_idx].sent_packets.count());
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
-    const pkt = it.next().?.value_ptr.*;
+    const pkt = it.next().?;
     try testing.expect(pkt.ack_eliciting);
     try testing.expect(pkt.has_handshake_done);
 }
@@ -1211,7 +1211,7 @@ test "PacketPacker: ecn_mark propagates to SentPacket" {
     // Check the sent packet has ecn_marked set
     const app_idx = @intFromEnum(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
-    const pkt = it.next().?.value_ptr.*;
+    const pkt = it.next().?;
     try testing.expect(pkt.ecn_marked);
     try testing.expect(pkt.ack_eliciting);
 }
@@ -1304,7 +1304,7 @@ test "PacketPacker: pending control frames in 1-RTT" {
     // Sent packet should be ack-eliciting
     const app_idx = @intFromEnum(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
-    const pkt = it.next().?.value_ptr.*;
+    const pkt = it.next().?;
     try testing.expect(pkt.ack_eliciting);
 }
 
@@ -1350,7 +1350,7 @@ test "PacketPacker: stream frame info tracked in SentPacket" {
     // Verify stream frame info was recorded in SentPacket
     const app_idx = @intFromEnum(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
-    const pkt = it.next().?.value_ptr.*;
+    const pkt = it.next().?;
     const sf = pkt.getStreamFrames();
     try testing.expect(sf.len > 0);
     try testing.expectEqual(@as(u64, 0), sf[0].stream_id);
@@ -1417,7 +1417,8 @@ test "PacketPacker: a sent packet records the control frames to repeat on loss" 
     var out_buf: [1500]u8 = undefined;
     try testing.expect(try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out_buf) > 0);
 
-    const sent = pkt_handler.sent[2].sent_packets.values()[0];
+    var sent_it = pkt_handler.sent[2].sent_packets.iterator();
+    const sent = sent_it.next().?;
     const records = sent.getControlFrames();
     // PING is never repeated, so it is not recorded.
     try testing.expectEqual(@as(usize, 2), records.len);
@@ -1456,7 +1457,8 @@ test "PacketPacker: control frames past one packet wait for the next" {
         const written = try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out_buf);
         try testing.expect(written > 0 and written <= packer.max_packet_size);
     }
-    for (pkt_handler.sent[2].sent_packets.values()) |p| {
+    var sent_it = pkt_handler.sent[2].sent_packets.iterator();
+    while (sent_it.next()) |p| {
         try testing.expect(p.control_frame_count <= ack_handler.MAX_CONTROL_FRAMES_PER_PACKET);
         for (p.getControlFrames()) |cf| switch (cf) {
             .reset_stream => resets += 1,

@@ -2715,8 +2715,7 @@ pub const Connection = struct {
                     if (!self.is_server and !hs.zero_rtt_accepted) {
                         const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
                         var pkt_it = app_tracker.sent_packets.iterator();
-                        while (pkt_it.next()) |entry| {
-                            const pkt = entry.value_ptr.*;
+                        while (pkt_it.next()) |pkt| {
                             if (pkt.getStreamFrames().len > 0) {
                                 self.queueStreamRetransmissions(pkt);
                             }
@@ -3867,8 +3866,8 @@ pub const Connection = struct {
                     var has_stream_in_flight = false;
                     const app_tracker2 = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
                     var pkt_it2 = app_tracker2.sent_packets.iterator();
-                    while (pkt_it2.next()) |entry| {
-                        if (entry.value_ptr.*.in_flight and entry.value_ptr.*.getStreamFrames().len > 0) {
+                    while (pkt_it2.next()) |pkt| {
+                        if (pkt.in_flight and pkt.getStreamFrames().len > 0) {
                             has_stream_in_flight = true;
                             break;
                         }

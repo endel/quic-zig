@@ -178,21 +178,106 @@ pub const SentPacketList = struct {
     }
 };
 
-/// Heap-backed list of u64 for tracking packet numbers.
-const PnList = struct {
-    items: std.ArrayListUnmanaged(u64) = .empty,
+/// One packet number space's packets in flight, in packet number order.
+///
+/// Packet numbers only grow, so a send appends. An ACK range is found by
+/// binary search and walked to its end, and loss detection stops at the
+/// largest acknowledged packet: an ACK costs what it acknowledges, not the
+/// whole window. A removed packet leaves a hole; the front skips holes as it
+/// reaches them and an append reclaims the space once the front has passed
+/// half of it.
+pub const SentQueue = struct {
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    /// Index of the first entry that can still hold a packet.
+    head: usize = 0,
+    live: usize = 0,
 
-    pub fn deinit(self: *PnList, allocator: Allocator) void {
-        self.items.deinit(allocator);
+    const Entry = struct { pn: u64, pkt: ?*SentPacket };
+
+    pub fn deinit(self: *SentQueue, allocator: Allocator) void {
+        self.entries.deinit(allocator);
+        self.* = .{};
     }
 
-    pub fn append(self: *PnList, allocator: Allocator, item: u64) !void {
-        try self.items.append(allocator, item);
+    pub fn count(self: *const SentQueue) usize {
+        return self.live;
     }
 
-    pub fn constSlice(self: *const PnList) []const u64 {
-        return self.items.items;
+    pub fn append(self: *SentQueue, allocator: Allocator, pkt: *SentPacket) !void {
+        if (self.head > 0 and self.head * 2 >= self.entries.items.len) {
+            const rest = self.entries.items[self.head..];
+            std.mem.copyForwards(Entry, self.entries.items[0..rest.len], rest);
+            self.entries.shrinkRetainingCapacity(rest.len);
+            self.head = 0;
+        }
+        const items = self.entries.items;
+        if (items.len == 0 or items[items.len - 1].pn < pkt.pn) {
+            try self.entries.append(allocator, .{ .pn = pkt.pn, .pkt = pkt });
+        } else {
+            // Never seen: every space numbers its packets upwards.
+            const at = self.lowerBound(pkt.pn);
+            if (at < items.len and items[at].pn == pkt.pn) return error.DuplicatePacketNumber;
+            try self.entries.insert(allocator, at, .{ .pn = pkt.pn, .pkt = pkt });
+        }
+        self.live += 1;
     }
+
+    /// Index of the first entry at or past `head` whose number is at least `pn`.
+    fn lowerBound(self: *const SentQueue, pn: u64) usize {
+        var lo = self.head;
+        var hi = self.entries.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.entries.items[mid].pn < pn) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    pub fn get(self: *const SentQueue, pn: u64) ?*SentPacket {
+        const items = self.entries.items;
+        // The newest is what callers ask for most.
+        if (items.len > self.head and items[items.len - 1].pn == pn) return items[items.len - 1].pkt;
+        const at = self.lowerBound(pn);
+        if (at < items.len and items[at].pn == pn) return items[at].pkt;
+        return null;
+    }
+
+    /// Take the packet at entry `i` out. Entries keep their indices, so a
+    /// walk by index can remove as it goes.
+    fn takeAt(self: *SentQueue, i: usize) *SentPacket {
+        const items = self.entries.items;
+        const pkt = items[i].pkt.?;
+        items[i].pkt = null;
+        self.live -= 1;
+        while (self.head < items.len and items[self.head].pkt == null) self.head += 1;
+        return pkt;
+    }
+
+    pub fn remove(self: *SentQueue, pn: u64) ?*SentPacket {
+        const at = self.lowerBound(pn);
+        const items = self.entries.items;
+        if (at >= items.len or items[at].pn != pn or items[at].pkt == null) return null;
+        return self.takeAt(at);
+    }
+
+    /// The packets still held, oldest first.
+    pub fn iterator(self: *const SentQueue) Iterator {
+        return .{ .entries = self.entries.items, .i = self.head };
+    }
+
+    pub const Iterator = struct {
+        entries: []const Entry,
+        i: usize,
+
+        pub fn next(it: *Iterator) ?*SentPacket {
+            while (it.i < it.entries.len) {
+                const e = it.entries[it.i];
+                it.i += 1;
+                if (e.pkt) |pkt| return pkt;
+            }
+            return null;
+        }
+    };
 };
 
 /// Result of processing an ACK frame.
@@ -244,12 +329,8 @@ pub const AckResult = struct {
 /// Tracks sent packets and handles loss detection for a single packet number space.
 pub const SentPacketTracker = struct {
     allocator: Allocator,
-    /// Dense array-backed map: no tombstones on removal, so iterator() is always
-    /// O(count) not O(capacity). Critical for detectLostPackets() which iterates
-    /// on every ACK — with AutoHashMap, tombstone bloat after thousands of
-    /// insert/remove cycles caused progressive latency degradation.
     /// Values point into `pool`: removal moves a pointer, not a 568-byte record.
-    sent_packets: std.AutoArrayHashMapUnmanaged(u64, *SentPacket),
+    sent_packets: SentQueue = .{},
     pool: std.heap.MemoryPool(SentPacket) = .empty,
     /// Packets taken from `pool` and not yet returned, in the map or a result.
     live: usize = 0,
@@ -265,10 +346,7 @@ pub const SentPacketTracker = struct {
     pto_count: u32 = 0,
 
     pub fn init(allocator: Allocator) SentPacketTracker {
-        return .{
-            .allocator = allocator,
-            .sent_packets = .{},
-        };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *SentPacketTracker) void {
@@ -278,12 +356,13 @@ pub const SentPacketTracker = struct {
 
     /// Forget every packet, keeping the pool: an AckResult may still hold some.
     pub fn clear(self: *SentPacketTracker) void {
-        for (self.sent_packets.values()) |pkt| self.pool.destroy(pkt);
+        var it = self.sent_packets.iterator();
+        while (it.next()) |pkt| self.pool.destroy(pkt);
         const live = self.live - self.sent_packets.count();
-        self.sent_packets.clearAndFree(self.allocator);
+        self.sent_packets.deinit(self.allocator);
         const allocator = self.allocator;
         const pool = self.pool;
-        self.* = .{ .allocator = allocator, .sent_packets = .{}, .pool = pool, .live = live };
+        self.* = .{ .allocator = allocator, .pool = pool, .live = live };
     }
 
     pub fn onPacketSent(self: *SentPacketTracker, pkt: SentPacket) !void {
@@ -297,7 +376,7 @@ pub const SentPacketTracker = struct {
         const p = try self.pool.create(self.allocator);
         errdefer self.pool.destroy(p);
         p.* = pkt;
-        try self.sent_packets.put(self.allocator, pkt.pn, p);
+        try self.sent_packets.append(self.allocator, p);
         self.live += 1;
     }
 
@@ -318,42 +397,42 @@ pub const SentPacketTracker = struct {
             self.largest_acked = largest_ack;
         }
 
-        // ACK ranges can span hundreds of thousands of packet numbers after ACK
-        // compression. Iterate the packets still in flight instead of walking
-        // every packet number in the encoded ranges.
-        const first_range_start = largest_ack -| first_ack_range;
-        var i: usize = 0;
-        while (i < self.sent_packets.count()) {
-            const pn = self.sent_packets.keys()[i];
-            var acked = pn >= first_range_start and pn <= largest_ack;
-            if (!acked) {
-                for (ack_ranges) |range| {
-                    if (pn >= range.start and pn <= range.end) {
-                        acked = true;
-                        break;
-                    }
-                }
-            }
-            if (!acked) {
-                i += 1;
-                continue;
-            }
-
-            const pkt = self.sent_packets.fetchSwapRemove(pn).?.value;
-            if (pkt.ack_eliciting) {
-                self.ack_eliciting_in_flight -|= 1;
-            }
-
-            if (pkt.pn == largest_ack) {
-                const send_delta = now - pkt.time_sent;
-                rtt_stats.updateRtt(send_delta, ack_delay_ns, true);
-            }
-
-            try result.acked.append(self.allocator, pkt);
+        try self.takeAcked(largest_ack -| first_ack_range, largest_ack, largest_ack, ack_delay_ns, rtt_stats, now, result);
+        for (ack_ranges) |range| {
+            try self.takeAcked(range.start, range.end, largest_ack, ack_delay_ns, rtt_stats, now, result);
         }
 
         // Detect lost packets
         try self.detectLostPackets(rtt_stats, now, result);
+    }
+
+    /// Move the packets numbered `start` to `end` from flight to `result`.
+    fn takeAcked(
+        self: *SentPacketTracker,
+        start: u64,
+        end: u64,
+        largest_ack: u64,
+        ack_delay_ns: i64,
+        rtt_stats: *RttStats,
+        now: i64,
+        result: *AckResult,
+    ) !void {
+        const q = &self.sent_packets;
+        var i = q.lowerBound(start);
+        while (i < q.entries.items.len and q.entries.items[i].pn <= end) : (i += 1) {
+            if (q.entries.items[i].pkt == null) continue;
+            // Reserved first, so a failed append can't leave a packet in neither place.
+            try result.acked.items.ensureUnusedCapacity(self.allocator, 1);
+            const pkt = q.takeAt(i);
+            if (pkt.ack_eliciting) {
+                self.ack_eliciting_in_flight -|= 1;
+            }
+            if (pkt.pn == largest_ack) {
+                const send_delta = now - pkt.time_sent;
+                rtt_stats.updateRtt(send_delta, ack_delay_ns, true);
+            }
+            result.acked.items.appendAssumeCapacity(pkt);
+        }
     }
 
     fn detectLostPackets(self: *SentPacketTracker, rtt_stats: *RttStats, now: i64, result: *AckResult) !void {
@@ -363,59 +442,37 @@ pub const SentPacketTracker = struct {
         const loss_delay = rtt_stats.lossDelay();
         const lost_send_time = now - loss_delay;
 
-        var to_remove: PnList = .{};
-        defer to_remove.deinit(self.allocator);
-
         // Track earliest and latest send times of lost ack-eliciting packets
         // for persistent congestion detection (RFC 9002 §7.6.2)
         var earliest_lost_time: ?i64 = null;
         var latest_lost_time: ?i64 = null;
 
-        var it = self.sent_packets.iterator();
-        while (it.next()) |entry| {
-            const pkt = entry.value_ptr.*;
-            if (self.largest_acked == null or pkt.pn > self.largest_acked.?) {
-                continue;
-            }
-
-            if (pkt.time_sent <= lost_send_time) {
-                try result.lost.append(self.allocator, pkt);
-                try to_remove.append(self.allocator, pkt.pn);
-                if (pkt.ack_eliciting) {
-                    if (earliest_lost_time == null or pkt.time_sent < earliest_lost_time.?) {
-                        earliest_lost_time = pkt.time_sent;
-                    }
-                    if (latest_lost_time == null or pkt.time_sent > latest_lost_time.?) {
-                        latest_lost_time = pkt.time_sent;
-                    }
+        // Only packets up to the largest acknowledged can be lost, and they
+        // are the front of the queue.
+        const largest_acked = self.largest_acked orelse return;
+        const q = &self.sent_packets;
+        var i = q.head;
+        while (i < q.entries.items.len and q.entries.items[i].pn <= largest_acked) : (i += 1) {
+            const pkt = q.entries.items[i].pkt orelse continue;
+            const lost = pkt.time_sent <= lost_send_time or
+                (largest_acked >= PACKET_THRESHOLD and pkt.pn <= largest_acked - PACKET_THRESHOLD);
+            if (!lost) {
+                const loss_time_for_pkt = pkt.time_sent + loss_delay;
+                if (self.loss_time == null or loss_time_for_pkt < self.loss_time.?) {
+                    self.loss_time = loss_time_for_pkt;
                 }
                 continue;
             }
-
-            if (self.largest_acked.? >= PACKET_THRESHOLD and
-                pkt.pn <= self.largest_acked.? - PACKET_THRESHOLD)
-            {
-                try result.lost.append(self.allocator, pkt);
-                try to_remove.append(self.allocator, pkt.pn);
-                if (pkt.ack_eliciting) {
-                    if (earliest_lost_time == null or pkt.time_sent < earliest_lost_time.?) {
-                        earliest_lost_time = pkt.time_sent;
-                    }
-                    if (latest_lost_time == null or pkt.time_sent > latest_lost_time.?) {
-                        latest_lost_time = pkt.time_sent;
-                    }
+            try result.lost.items.ensureUnusedCapacity(self.allocator, 1);
+            result.lost.items.appendAssumeCapacity(q.takeAt(i));
+            if (pkt.ack_eliciting) {
+                if (earliest_lost_time == null or pkt.time_sent < earliest_lost_time.?) {
+                    earliest_lost_time = pkt.time_sent;
                 }
-                continue;
+                if (latest_lost_time == null or pkt.time_sent > latest_lost_time.?) {
+                    latest_lost_time = pkt.time_sent;
+                }
             }
-
-            const loss_time_for_pkt = pkt.time_sent + loss_delay;
-            if (self.loss_time == null or loss_time_for_pkt < self.loss_time.?) {
-                self.loss_time = loss_time_for_pkt;
-            }
-        }
-
-        for (to_remove.constSlice()) |pn| {
-            _ = self.sent_packets.swapRemove(pn);
         }
 
         // Persistent congestion: if the time span of lost ack-eliciting packets
@@ -800,7 +857,8 @@ pub const PacketHandler = struct {
     /// Whether a packet in flight at `level` carries CRYPTO data, the only
     /// case in which a probe there has handshake bytes to resend.
     pub fn cryptoInFlight(self: *const PacketHandler, level: EncLevel) bool {
-        for (self.sent[@intFromEnum(level)].sent_packets.values()) |pkt| {
+        var it = self.sent[@intFromEnum(level)].sent_packets.iterator();
+        while (it.next()) |pkt| {
             if (pkt.in_flight and pkt.has_crypto_data) return true;
         }
         return false;
@@ -913,9 +971,9 @@ pub const PacketHandler = struct {
         const idx = @intFromEnum(level);
 
         var it = self.sent[idx].sent_packets.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.*.in_flight) {
-                self.bytes_in_flight -|= entry.value_ptr.*.size;
+        while (it.next()) |pkt| {
+            if (pkt.in_flight) {
+                self.bytes_in_flight -|= pkt.size;
             }
         }
 
@@ -1260,4 +1318,158 @@ test "SentPacketTracker: every packet taken from the pool goes back" {
     try testing.expectEqual(@as(u64, pn), result.acked.constSlice()[0].pn); // still readable
     result.release(testing.allocator);
     try testing.expectEqual(@as(usize, 0), ph.sent[@intFromEnum(EncLevel.handshake)].live);
+}
+
+test "SentQueue: holes left by removal, skipped at the front and reclaimed by appends" {
+    var pool: std.heap.MemoryPool(SentPacket) = .empty;
+    defer pool.deinit(testing.allocator);
+    var q: SentQueue = .{};
+    defer q.deinit(testing.allocator);
+
+    for (0..100) |i| {
+        const p = try pool.create(testing.allocator);
+        p.* = .{ .pn = i * 2, .time_sent = 0, .size = 1, .ack_eliciting = true, .in_flight = true, .enc_level = .application };
+        try q.append(testing.allocator, p);
+    }
+    try testing.expectEqual(@as(u64, 198), q.get(198).?.pn);
+    try testing.expectEqual(@as(u64, 100), q.get(100).?.pn);
+    try testing.expect(q.get(101) == null);
+    try testing.expect(q.get(1000) == null);
+
+    // Every other packet out, from the middle: the front stays put.
+    var i: u64 = 50;
+    while (i < 150) : (i += 4) pool.destroy(q.remove(i).?);
+    try testing.expect(q.remove(50) == null);
+    try testing.expectEqual(@as(usize, 75), q.count());
+    try testing.expectEqual(@as(usize, 0), q.head);
+
+    // The first 30 out: the front moves past them and the holes beyond.
+    for (0..30) |k| if (q.remove(k * 2)) |p| pool.destroy(p);
+    var front = q.iterator();
+    try testing.expectEqual(@as(u64, 60), front.next().?.pn);
+    try testing.expectEqual(@as(usize, 30), q.head);
+
+    // Order holds through the holes.
+    var it = q.iterator();
+    var last: u64 = 0;
+    var n: usize = 0;
+    while (it.next()) |p| : (n += 1) {
+        try testing.expect(n == 0 or p.pn > last);
+        last = p.pn;
+    }
+    try testing.expectEqual(q.count(), n);
+
+    // Past half, an append moves the rest down.
+    for (30..60) |k| if (q.remove(k * 2)) |p| pool.destroy(p);
+    try testing.expect(q.head * 2 >= q.entries.items.len);
+    const p = try pool.create(testing.allocator);
+    p.* = .{ .pn = 500, .time_sent = 0, .size = 1, .ack_eliciting = true, .in_flight = true, .enc_level = .application };
+    try q.append(testing.allocator, p);
+    try testing.expectEqual(@as(usize, 0), q.head);
+    front = q.iterator();
+    try testing.expectEqual(@as(u64, 120), front.next().?.pn);
+    try testing.expectEqual(@as(u64, 500), q.get(500).?.pn);
+
+    var rest = q.iterator();
+    while (rest.next()) |r| pool.destroy(r);
+}
+
+test "SentPacketTracker: ACK and loss match a model over random frames" {
+    // A model with a list of everything in flight; the tracker only visits
+    // the ACK's ranges and the front of the window.
+    const Model = struct { pn: u64, time_sent: i64, ack_eliciting: bool };
+    var prng = std.Random.DefaultPrng.init(0x5eed_ac4);
+    const rand = prng.random();
+
+    for (0..40) |_| {
+        var tracker = SentPacketTracker.init(testing.allocator);
+        defer tracker.deinit();
+        var model: std.ArrayListUnmanaged(Model) = .empty;
+        defer model.deinit(testing.allocator);
+        var result: AckResult = .{};
+        defer result.deinit(testing.allocator);
+        var rtt_stats = RttStats{};
+
+        var pn: u64 = 0;
+        var now: i64 = 1_000_000_000;
+        var largest_acked: ?u64 = null;
+        for (0..60) |_| {
+            for (0..rand.intRangeAtMost(usize, 0, 30)) |_| {
+                pn += if (rand.uintLessThan(u8, 10) == 0) 2 else 1; // the odd skipped number
+                const eliciting = rand.uintLessThan(u8, 8) != 0;
+                try tracker.onPacketSent(.{ .pn = pn, .time_sent = now, .size = 1200, .ack_eliciting = eliciting, .in_flight = true, .enc_level = .application });
+                try model.append(testing.allocator, .{ .pn = pn, .time_sent = now, .ack_eliciting = eliciting });
+                now += rand.intRangeAtMost(i64, 0, 2_000_000);
+            }
+            now += rand.intRangeAtMost(i64, 0, 30_000_000);
+            if (pn == 0) continue;
+
+            // Ranges as the wire carries them, plus some no peer should send:
+            // overlapping, unordered, past what was sent.
+            const largest = rand.intRangeAtMost(u64, pn -| 40, pn);
+            const first = rand.intRangeAtMost(u64, 0, @min(largest, 8));
+            var ranges_buf: [6]AckRange = undefined;
+            const n_ranges = rand.uintAtMost(usize, ranges_buf.len);
+            for (ranges_buf[0..n_ranges]) |*r| {
+                const end = rand.intRangeAtMost(u64, 0, pn + 5);
+                r.* = .{ .start = end -| rand.intRangeAtMost(u64, 0, 6), .end = end };
+            }
+            const frame_ranges = ranges_buf[0..n_ranges];
+
+            const in = struct {
+                fn acked(x: u64, l: u64, f: u64, rs: []const AckRange) bool {
+                    if (x >= l -| f and x <= l) return true;
+                    for (rs) |r| if (x >= r.start and x <= r.end) return true;
+                    return false;
+                }
+            };
+            var want_acked: usize = 0;
+            var want_eliciting = tracker.ack_eliciting_in_flight;
+            var k: usize = 0;
+            while (k < model.items.len) {
+                if (in.acked(model.items[k].pn, largest, first, frame_ranges)) {
+                    if (model.items[k].ack_eliciting) want_eliciting -= 1;
+                    _ = model.orderedRemove(k);
+                    want_acked += 1;
+                } else k += 1;
+            }
+            if (largest_acked == null or largest > largest_acked.?) largest_acked = largest;
+
+            try tracker.onAckReceived(largest, 0, frame_ranges, first, &rtt_stats, now, &result);
+            try testing.expectEqual(want_acked, result.acked.count());
+            for (result.acked.constSlice()) |a| try testing.expect(in.acked(a.pn, largest, first, frame_ranges));
+
+            // Loss, by RFC 9002 6.1, with the RTT the ACK just set.
+            const loss_delay = rtt_stats.lossDelay();
+            var want_lost: usize = 0;
+            var want_loss_time: ?i64 = null;
+            k = 0;
+            while (k < model.items.len) {
+                const m = model.items[k];
+                if (m.pn > largest_acked.?) {
+                    k += 1;
+                    continue;
+                }
+                const lost = m.time_sent <= now - loss_delay or
+                    (largest_acked.? >= 3 and m.pn <= largest_acked.? - 3);
+                if (lost) {
+                    _ = model.orderedRemove(k);
+                    want_lost += 1;
+                } else {
+                    const t = m.time_sent + loss_delay;
+                    if (want_loss_time == null or t < want_loss_time.?) want_loss_time = t;
+                    k += 1;
+                }
+            }
+            try testing.expectEqual(want_lost, result.lost.count());
+            try testing.expectEqual(want_loss_time, tracker.loss_time);
+            try testing.expectEqual(want_eliciting, tracker.ack_eliciting_in_flight);
+            result.release(testing.allocator);
+
+            try testing.expectEqual(model.items.len, tracker.sent_packets.count());
+            var it = tracker.sent_packets.iterator();
+            for (model.items) |m| try testing.expectEqual(m.pn, it.next().?.pn);
+            try testing.expect(it.next() == null);
+        }
+    }
 }
