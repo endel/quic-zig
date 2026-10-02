@@ -423,10 +423,16 @@ pub fn decrypt(header: *Header, fbs: anytype, space: *const PacketNumSpace) ![]u
     return decrypted;
 }
 
+pub const Opened = struct {
+    payload: []u8,
+    /// The receive keys that opened it; `.next` means the peer updated.
+    generation: crypto.KeyUpdateManager.Generation,
+};
+
 /// Decrypt a 1-RTT packet using the KeyUpdateManager for key phase handling.
 /// Uses the (unchanging) HP key for header unprotection, then selects the
-/// appropriate AEAD keys based on the key phase bit (RFC 9001 Section 6).
-pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *const PacketNumSpace, ku: *crypto.KeyUpdateManager) ![]u8 {
+/// AEAD keys from the key phase bit and packet number (RFC 9001 §6.5).
+pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *const PacketNumSpace, ku: *crypto.KeyUpdateManager) !Opened {
     if (fbs.seek + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
         return error.InvalidPacket;
     }
@@ -492,10 +498,8 @@ pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *const PacketN
     // Decode packet number
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
 
-    // Select the right Open keys based on key phase
-    var aead = ku.getOpenKeys(header.key_phase) orelse return error.InvalidPacket;
-
-    const decrypted = try aead.decryptPayload(
+    const generation = ku.generationFor(header.key_phase, header.packet_number);
+    const decrypted = try ku.openKeys(generation).decryptPayload(
         header.packet_number,
         header_bytes,
         encrypted_payload,
@@ -503,7 +507,7 @@ pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *const PacketN
 
     fbs.buffer[header.packet_start] = first_byte;
 
-    return decrypted;
+    return .{ .payload = decrypted, .generation = generation };
 }
 
 // inline

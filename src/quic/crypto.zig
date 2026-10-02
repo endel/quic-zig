@@ -662,8 +662,13 @@ pub const KeyUpdateManager = struct {
     recv_secret: [32]u8,
     send_secret: [32]u8,
 
-    // Timestamp when previous keys expire (now + 3×PTO)
+    // When the previous keys go: 3×PTO after a packet first opens with the
+    // current ones (RFC 9001 §6.1, §6.5). Null until then.
     prev_open_expires: ?i64 = null,
+
+    // Lowest packet number opened with the current keys. Below it, the other
+    // key phase is the previous keys; above it, the next (RFC 9001 §6.5).
+    current_first_recv_pn: ?u64 = null,
 
     // Packet number of first packet sent with current keys
     first_sent_with_current: ?u64 = null,
@@ -730,11 +735,13 @@ pub const KeyUpdateManager = struct {
     }
 
     /// Rotate keys: prev←current, current←next, pre-compute new next.
-    /// Toggles the key phase bit. Sets prev_open expiry to now + 3×PTO.
-    pub fn rollKeys(self: *KeyUpdateManager, now: i64, pto_ns: i64) void {
+    /// Toggles the key phase bit. The previous keys stay until a packet
+    /// opens with the new ones; see `onCurrentPacketOpened`.
+    pub fn rollKeys(self: *KeyUpdateManager) void {
         // Move current → previous
         self.prev_open = self.current_open;
-        self.prev_open_expires = now + 3 * pto_ns;
+        self.prev_open_expires = null;
+        self.current_first_recv_pn = null;
 
         // Move next → current
         self.current_open = self.next_open;
@@ -774,19 +781,33 @@ pub const KeyUpdateManager = struct {
         self.packets_sent_with_current = 0;
     }
 
-    /// Get the Open keys for decrypting a packet based on its key phase bit.
-    /// Returns null if the key phase doesn't match any available generation.
-    pub fn getOpenKeys(self: *KeyUpdateManager, key_phase_bit: bool) ?*Open {
-        if (key_phase_bit == self.key_phase) {
-            return &self.current_open;
-        }
-        // Key phase differs from current:
-        // 1. If prev_open exists → reordered packet from previous generation
-        // 2. Otherwise → peer-initiated key update, use next_open (RFC 9001 §6.1)
-        if (self.prev_open != null) {
-            return &self.prev_open.?;
-        }
-        return &self.next_open;
+    pub const Generation = enum { previous, current, next };
+
+    /// Which receive keys a 1-RTT packet is protected with (RFC 9001 §6.5).
+    /// The other key phase is the previous generation only for a packet
+    /// older than every one opened with the current keys; anything newer is
+    /// the peer's next update, which may come before the previous keys
+    /// expire.
+    pub fn generationFor(self: *const KeyUpdateManager, key_phase_bit: bool, pn: u64) Generation {
+        if (key_phase_bit == self.key_phase) return .current;
+        if (self.prev_open == null) return .next;
+        const first = self.current_first_recv_pn orelse return .previous;
+        return if (pn < first) .previous else .next;
+    }
+
+    pub fn openKeys(self: *KeyUpdateManager, generation: Generation) *Open {
+        return switch (generation) {
+            .previous => &self.prev_open.?,
+            .current => &self.current_open,
+            .next => &self.next_open,
+        };
+    }
+
+    /// Record a packet opened with the current keys. The first one starts
+    /// the previous keys' 3×PTO (RFC 9001 §6.5).
+    pub fn onCurrentPacketOpened(self: *KeyUpdateManager, pn: u64, now: i64, pto_ns: i64) void {
+        if (self.current_first_recv_pn == null or pn < self.current_first_recv_pn.?) self.current_first_recv_pn = pn;
+        if (self.prev_open != null and self.prev_open_expires == null) self.prev_open_expires = now + 3 * pto_ns;
     }
 
     /// Get the current Seal keys and key phase bit for encrypting a packet.
@@ -859,9 +880,9 @@ test "KeyUpdateManager: init and basic operations" {
     // Initial key phase is false
     try std.testing.expect(!mgr.key_phase);
 
-    // Current keys should match key phase
-    const open = mgr.getOpenKeys(false);
-    try std.testing.expect(open != null);
+    // Same phase: the current keys; the other phase, with nothing to roll back to: the next
+    try std.testing.expectEqual(KeyUpdateManager.Generation.current, mgr.generationFor(false, 0));
+    try std.testing.expectEqual(KeyUpdateManager.Generation.next, mgr.generationFor(true, 0));
 
     // Get seal should return current seal and phase
     const seal_info = mgr.getSealAndPhase();
@@ -889,7 +910,7 @@ test "KeyUpdateManager: roll keys" {
     // Roll keys
     const now: i64 = 1_000_000_000;
     const pto: i64 = 100_000_000; // 100ms
-    mgr.rollKeys(now, pto);
+    mgr.rollKeys();
 
     // Key phase should toggle
     try std.testing.expect(mgr.key_phase);
@@ -902,7 +923,9 @@ test "KeyUpdateManager: roll keys" {
     try std.testing.expect(mgr.prev_open != null);
     try std.testing.expectEqualSlices(u8, &orig_open_key, &mgr.prev_open.?.key);
 
-    // Previous should expire at now + 3*PTO
+    // Previous keys stay until a packet opens with the new ones, then 3*PTO
+    try std.testing.expect(mgr.prev_open_expires == null);
+    mgr.onCurrentPacketOpened(7, now, pto);
     try std.testing.expectEqual(now + 3 * pto, mgr.prev_open_expires.?);
 
     // HP keys should not change
@@ -925,7 +948,12 @@ test "KeyUpdateManager: prev key expiry" {
 
     const now: i64 = 1_000_000_000;
     const pto: i64 = 100_000_000;
-    mgr.rollKeys(now, pto);
+    mgr.rollKeys();
+
+    // Never let go before a packet opens with the new keys
+    mgr.maybeDropPrevKeys(now + 1000 * pto);
+    try std.testing.expect(mgr.prev_open != null);
+    mgr.onCurrentPacketOpened(7, now, pto);
 
     // Before expiry: prev keys should exist
     mgr.maybeDropPrevKeys(now + 2 * pto);
@@ -953,19 +981,19 @@ test "KeyUpdateManager: encrypt/decrypt roundtrip across key update" {
     var ciphertext: [plaintext.len + Aead.tag_length]u8 = undefined;
     _ = client.current_seal.encryptPayload(0, ad, plaintext, &ciphertext);
 
-    const open_keys = server.getOpenKeys(false).?;
+    const open_keys = server.openKeys(server.generationFor(false, 0));
     const decrypted = try open_keys.decryptPayload(0, ad, &ciphertext);
     try std.testing.expectEqualStrings(plaintext, decrypted);
 
     // Roll both sides
-    client.rollKeys(1_000_000_000, 100_000_000);
-    server.rollKeys(1_000_000_000, 100_000_000);
+    client.rollKeys();
+    server.rollKeys();
 
     // Client encrypts with new keys, server decrypts (generation 1)
     var ciphertext2: [plaintext.len + Aead.tag_length]u8 = undefined;
     _ = client.current_seal.encryptPayload(1, ad, plaintext, &ciphertext2);
 
-    const open_keys2 = server.getOpenKeys(true).?;
+    const open_keys2 = server.openKeys(server.generationFor(true, 1));
     const decrypted2 = try open_keys2.decryptPayload(1, ad, &ciphertext2);
     try std.testing.expectEqualStrings(plaintext, decrypted2);
 }

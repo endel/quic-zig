@@ -94,6 +94,16 @@ fn serverTls() tls13.TlsConfig {
     return .{ .cert_chain_der = &S.cert_chain, .private_key_bytes = &S.secret_key_bytes, .alpn = &S.alpn };
 }
 
+fn clientTls() tls13.TlsConfig {
+    return .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &client_alpn,
+        .server_name = "localhost",
+        .skip_cert_verify = true,
+    };
+}
+
 /// Point at a directory to get qlog traces of both ends when debugging.
 var qlog_dir: ?[]const u8 = null;
 const client_alpn = [_][]const u8{"bulk"};
@@ -302,22 +312,20 @@ const Pair = struct {
     }
 
     fn initWith(self: *Pair, server_config: connection.ConnectionConfig, client_config: connection.ConnectionConfig) !void {
+        return self.initTls(serverTls(), server_config, client_config, clientTls());
+    }
+
+    fn initTls(self: *Pair, server_tls: tls13.TlsConfig, server_config: connection.ConnectionConfig, client_config: connection.ConnectionConfig, client_tls: tls13.TlsConfig) !void {
         const alloc = testing.allocator;
         self.* = .{
-            .mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), server_config, .{1} ** 16, .{2} ** 16),
+            .mgr = connection_manager.ConnectionManager.init(alloc, server_tls, server_config, .{1} ** 16, .{2} ** 16),
             .client = try alloc.create(connection.Connection),
         };
         errdefer {
             alloc.destroy(self.client);
             self.mgr.deinit();
         }
-        try connection.connectInto(self.client, alloc, "localhost", client_config, .{
-            .cert_chain_der = &.{},
-            .private_key_bytes = &.{},
-            .alpn = &client_alpn,
-            .server_name = "localhost",
-            .skip_cert_verify = true,
-        }, null);
+        try connection.connectInto(self.client, alloc, "localhost", client_config, client_tls, null);
         self.client.paths[0].peer_addr = self.s_addr;
         self.client.paths[0].local_addr = self.c_addr;
 
@@ -479,6 +487,88 @@ test "handshake: the server holds 1-RTT packets until the client's Finished" {
     }
     try testing.expect(sconn.isEstablished());
     try testing.expect(sconn.streams.getStream(s.stream_id) != null);
+}
+
+/// Sends `data` on a new stream from `sender`, runs the pair until quiet, and
+/// says whether `receiver` read all of it.
+fn sendAndRead(p: *Pair, sender: *connection.Connection, receiver: *connection.Connection, data: []const u8) !bool {
+    const s = try sender.openStream();
+    try s.send.writeData(data);
+    s.send.close();
+    var i: usize = 0;
+    while (i < 50 and p.exchange()) : (i += 1) {}
+    const r = receiver.streams.getStream(s.stream_id) orelse return false;
+    var got: usize = 0;
+    while (r.recv.read()) |d| {
+        got += d.len;
+        testing.allocator.free(d);
+    }
+    return got == data.len and r.recv.finished;
+}
+
+test "key update: a peer's second update right after its first is still read" {
+    // OpenSSL updates again as soon as its first update is acknowledged: the
+    // flipped phase then comes from the next keys, not from stragglers on the
+    // previous ones, and has to be read.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    for ([_]bool{ true, false }) |client_initiates| {
+        var p: Pair = undefined;
+        try p.init();
+        defer p.deinit();
+        const sconn = p.mgr.entries.items[0].conn;
+        const initiator = if (client_initiates) p.client else sconn;
+        const responder = if (client_initiates) sconn else p.client;
+        try testing.expect(initiator.initiateKeyUpdate());
+        try testing.expect(try sendAndRead(&p, initiator, responder, "first"));
+        try testing.expect(initiator.initiateKeyUpdate());
+        try testing.expect(try sendAndRead(&p, initiator, responder, "second"));
+    }
+}
+
+test "key update: a peer's next update after a quiet spell is still read" {
+    // The previous keys are long expired, but nothing arrived to discard them.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    for ([_]bool{ true, false }) |client_initiates| {
+        var p: Pair = undefined;
+        try p.init();
+        defer p.deinit();
+        const sconn = p.mgr.entries.items[0].conn;
+        const initiator = if (client_initiates) p.client else sconn;
+        const responder = if (client_initiates) sconn else p.client;
+        try testing.expect(initiator.initiateKeyUpdate());
+        try testing.expect(try sendAndRead(&p, initiator, responder, "first"));
+        sys.test_clock.? += 10 * std.time.ns_per_s;
+        try testing.expect(initiator.initiateKeyUpdate());
+        try testing.expect(try sendAndRead(&p, initiator, responder, "second"));
+    }
+}
+
+test "key update: a packet sent before an update and delivered after it still opens" {
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    var p: Pair = undefined;
+    try p.init();
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+
+    const early = try p.client.openStream();
+    try early.send.writeData("early");
+    early.send.close();
+    var held: [MAX_DGRAM]u8 = undefined;
+    const n = try p.client.send(&held);
+    try testing.expect(n > 0);
+
+    try testing.expect(p.client.initiateKeyUpdate());
+    try testing.expect(try sendAndRead(&p, p.client, sconn, "late"));
+
+    var resp: [MAX_DGRAM]u8 = undefined;
+    _ = p.mgr.recvDatagram(held[0..n], p.c_addr, p.s_addr, 0, &resp);
+    const r = sconn.streams.getStream(early.stream_id) orelse return error.TestUnexpectedResult;
+    const d = r.recv.read() orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(d);
+    try testing.expectEqualStrings("early", d);
 }
 
 test "idle timeout: a peer's value too large for nanoseconds is capped" {

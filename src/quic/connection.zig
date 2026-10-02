@@ -1383,13 +1383,16 @@ pub const Connection = struct {
 
         // For 1-RTT packets with key update manager, use the appropriate key generation
         var payload: []u8 = undefined;
+        var key_generation: quic_crypto.KeyUpdateManager.Generation = .current;
         if (epoch == .application and self.key_update != null) {
             // Decrypt using KeyUpdateManager: first do header unprotection with the
             // (unchanging) HP key, then select the right AEAD key based on key phase
-            payload = packet.decryptWithKeyUpdate(header, fbs, space, &self.key_update.?) catch {
+            const result = packet.decryptWithKeyUpdate(header, fbs, space, &self.key_update.?) catch {
                 // Dropped (RFC 9001 §6.3); the error lets the caller test for a stateless reset.
                 return error.UndecryptablePacket;
             };
+            payload = result.payload;
+            key_generation = result.generation;
         } else {
             payload = packet.decrypt(header, fbs, space) catch {
                 std.log.debug("silently dropping packet enc_level={s}", .{@tagName(enc_level)});
@@ -1424,16 +1427,18 @@ pub const Connection = struct {
         // Handle key phase change for 1-RTT packets (RFC 9001 Section 6)
         if (epoch == .application) {
             if (self.key_update) |*ku| {
-                if (header.key_phase != ku.key_phase and ku.first_acked_with_current and ku.prev_open == null) {
-                    // Peer initiated a key update (RFC 9001 §6.1)
-                    // Only roll if:
-                    // 1. first_acked_with_current: peer has our current keys
-                    // 2. prev_open is null: no recent self-initiated update whose
-                    //    old-generation packets could still be in flight
-                    const pto_ns = self.pkt_handler.rtt_stats.pto();
-                    ku.rollKeys(now, pto_ns);
-                    self.packer.key_phase = ku.key_phase;
-                    std.log.info("key update: peer-initiated, new key_phase={}", .{ku.key_phase});
+                const pto_ns = self.pkt_handler.rtt_stats.pto();
+                switch (key_generation) {
+                    .previous => {},
+                    // Opened with the next keys: the peer updated, and our
+                    // send keys MUST follow before we acknowledge (§6.2).
+                    .next => {
+                        ku.rollKeys();
+                        self.packer.key_phase = ku.key_phase;
+                        std.log.info("key update: peer-initiated, new key_phase={}", .{ku.key_phase});
+                        ku.onCurrentPacketOpened(header.packet_number, now, pto_ns);
+                    },
+                    .current => ku.onCurrentPacketOpened(header.packet_number, now, pto_ns),
                 }
                 ku.maybeDropPrevKeys(now);
             }
@@ -3418,8 +3423,7 @@ pub const Connection = struct {
         // Check if we should proactively initiate a key update (RFC 9001 Section 6)
         if (self.key_update) |*ku| {
             if (ku.shouldInitiateUpdate() and ku.canUpdate()) {
-                const pto_ns = self.pkt_handler.rtt_stats.pto();
-                ku.rollKeys(now, pto_ns);
+                ku.rollKeys();
                 self.packer.key_phase = ku.key_phase;
                 std.log.info("key update: self-initiated at {d} packets, new key_phase={}", .{
                     quic_crypto.CONFIDENTIALITY_LIMIT,
@@ -3658,6 +3662,8 @@ pub const Connection = struct {
                 return;
             }
         }
+
+        if (self.key_update) |*ku| ku.maybeDropPrevKeys(now);
 
         // Check idle timeout (RFC 9000 §10.1, §10.1.2)
         // The effective idle timeout MUST be at least 3× the *base* PTO (without backoff)
@@ -4413,9 +4419,7 @@ pub const Connection = struct {
     pub fn initiateKeyUpdate(self: *Connection) bool {
         if (self.key_update) |*ku| {
             if (ku.canUpdate()) {
-                const now = @as(i64, @intCast(sys.nanoTimestamp()));
-                const pto_ns = self.pkt_handler.rtt_stats.pto();
-                ku.rollKeys(now, pto_ns);
+                ku.rollKeys();
                 self.packer.key_phase = ku.key_phase;
                 return true;
             }
