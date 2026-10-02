@@ -26,6 +26,11 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   certificate by SNI, and can resume sessions from tickets.
 - A QUIC server can serve several certificates and pick one by SNI, via
   `TlsConfig.certs`.
+- QUIC servers answer a ClientHello with no key share they can use with a
+  HelloRetryRequest for X25519 or P-256, so OpenSSL clients configured with
+  `Groups = X25519MLKEM768:X25519` (a share for the first group only) connect.
+  The QUIC client follows one too, and `TlsConfig.key_share_groups` sets the
+  shares its first ClientHello sends.
 - RSA server certificates, for QUIC and `tls_server`: 2048 to 4096-bit keys in
   PKCS#1 or PKCS#8, signing with RSA-PSS. `tls13.extractPrivateKey` reads EC,
   Ed25519 and RSA keys. When several certificates match a name, the server
@@ -122,6 +127,19 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A connection whose peer updated its keys a second time could stop dead,
+  every later packet dropped. OpenSSL, which updates again as soon as it may,
+  hit it from either side.
+- A client that heard nothing back during its handshake never gave up, since
+  each probe restarted the idle timer; it now closes after the idle timeout,
+  and `event_loop.Client.run()` returns once the connection closes, as
+  documented, rather than only after `stop()`. Past 60 s, an application
+  calling `onTimeout()` in a loop made the same client send ~38,000 probes a
+  second.
+- The QUIC client accepts servers with P-384 certificates.
+- QUIC servers choose AES-128-GCM over ChaCha20 when AES runs in hardware,
+  unless the client lists ChaCha20 first; OpenSSL clients always got ChaCha20.
+  No cipher suite in common is now `handshake_failure`, not `protocol_version`.
 - A peer's malformed certificate could crash the TLS and QUIC clients (an
   out-of-bounds read in std's DER parser); certificates are now checked for
   a well-formed structure before they are parsed.
