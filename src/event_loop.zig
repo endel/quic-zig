@@ -1096,6 +1096,8 @@ pub fn Server(comptime Handler: type) type {
                 if (conn.isClosed()) continue;
                 const batch = self.batchForConn(conn);
                 var send_count: usize = 0;
+                conn.beginBurst();
+                defer conn.endBurst();
                 while (send_count < 1000) : (send_count += 1) {
                     const bytes_written = conn.send(batch.reserve()) catch break;
                     if (bytes_written == 0) break;
@@ -1961,6 +1963,8 @@ pub fn Server(comptime Handler: type) type {
                 const max_burst_packets = 1000;
                 var send_count: usize = 0;
                 var now_ns: i64 = undefined;
+                conn.beginBurst();
+                defer conn.endBurst();
                 while (send_count < max_burst_packets) : (send_count += 1) {
                     const buf = batch.reserve();
                     if (send_count % packets_per_clock_read == 0 or batch.count == 0) now_ns = sys.nanoTimestamp();
@@ -2914,6 +2918,8 @@ pub fn Client(comptime Handler: type) type {
             else
                 &self.remote_addr;
             var send_count: usize = 0;
+            conn.beginBurst();
+            defer conn.endBurst();
             while (send_count < 1000) : (send_count += 1) {
                 const bytes_written = conn.send(self.batch.reserve()) catch break;
                 if (bytes_written == 0) break;
@@ -3346,6 +3352,8 @@ pub fn Client(comptime Handler: type) type {
             const max_burst_packets = 1000;
             var send_count: usize = 0;
             var now_ns: i64 = undefined;
+            conn.beginBurst();
+            defer conn.endBurst();
             while (send_count < max_burst_packets) : (send_count += 1) {
                 const buf = self.batch.reserve();
                 if (send_count % packets_per_clock_read == 0 or self.batch.count == 0) now_ns = sys.nanoTimestamp();

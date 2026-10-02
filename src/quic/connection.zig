@@ -701,6 +701,8 @@ pub const Connection = struct {
     mtu_discoverer: mtu_mod.MtuDiscoverer = .{},
     /// The last MAX_STREAM_DATA scan stopped early on a full frame queue.
     window_scan_pending: bool = false,
+    /// Where a burst (`beginBurst`) stands with its one flow-control scan.
+    burst: enum { off, fresh, scanned } = .off,
 
     // HANDSHAKE_DONE delivery tracking (server only)
     // True from handshake completion until the client ACKs a packet carrying HANDSHAKE_DONE.
@@ -3055,9 +3057,34 @@ pub const Connection = struct {
         }
     }
 
-    /// Check if connection-level flow control needs a MAX_DATA or MAX_STREAMS update.
-    fn queueFlowControlUpdates(self: *Connection) void {
-        // Frames that found the queue full last time go first.
+    /// The control frames due before packing: the whole scan once per burst
+    /// (every packet outside one), and the frames waiting for room always.
+    fn queueControlForPacket(self: *Connection) void {
+        switch (self.burst) {
+            .off => self.queueFlowControlUpdates(),
+            .fresh => {
+                self.queueFlowControlUpdates();
+                self.burst = .scanned;
+            },
+            .scanned => self.retryControlFrames(),
+        }
+    }
+
+    /// Packets sent from here to `endBurst` share one flow-control scan,
+    /// the first `send`'s. The scan walks every stream; between the sends of
+    /// a burst nothing it reads changes but through the packer, and what
+    /// the packer changes (a stream finishing, a limit reached) can wait
+    /// for the next burst.
+    pub fn beginBurst(self: *Connection) void {
+        self.burst = .fresh;
+    }
+
+    pub fn endBurst(self: *Connection) void {
+        self.burst = .off;
+    }
+
+    /// Frames that found the queue full last time, while there is room.
+    fn retryControlFrames(self: *Connection) void {
         var moved: usize = 0;
         for (self.control_retry.items) |f| {
             if (!self.pending_frames.tryPush(f)) break;
@@ -3068,6 +3095,12 @@ pub const Connection = struct {
             @memmove(self.control_retry.items[0..rest.len], rest);
             self.control_retry.shrinkRetainingCapacity(rest.len);
         }
+    }
+
+    /// Check if connection-level flow control needs a MAX_DATA or MAX_STREAMS update.
+    fn queueFlowControlUpdates(self: *Connection) void {
+        // Frames that found the queue full last time go first.
+        self.retryControlFrames();
 
         // Garbage-collect fully-closed bidi streams so consumed count advances
         // and MAX_STREAMS updates can fire.
@@ -3424,8 +3457,7 @@ pub const Connection = struct {
             }
         }
 
-        // Queue flow control updates before packing
-        self.queueFlowControlUpdates();
+        self.queueControlForPacket();
 
         // Check if we should proactively initiate a key update (RFC 9001 Section 6)
         if (self.key_update) |*ku| {
@@ -3560,7 +3592,7 @@ pub const Connection = struct {
     /// ACKs are NOT congestion-controlled per RFC 9000 §13.2.
     fn sendAckOnly(self: *Connection, out_buf: []u8, now: i64) !usize {
         // Piggyback flow control updates (MAX_DATA, MAX_STREAMS)
-        self.queueFlowControlUpdates();
+        self.queueControlForPacket();
 
         const send_buf = self.amplificationLimit(out_buf) orelse return 0;
 
@@ -5844,6 +5876,37 @@ test "RESET_STREAM on a peer uni stream releases connection flow control" {
 
     const rs = conn.streams.recv_streams.get(2).?;
     try std.testing.expectEqual(@as(?u64, 7), rs.reset_err);
+}
+
+test "a burst scans for control frames once; what comes due inside it waits for the next" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    var payload = "0123456789".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 2, .offset = 0, .length = payload.len, .data = &payload, .fin = false } }, .application, 0);
+    const rs = conn.streams.recv_streams.get(2).?;
+
+    conn.beginBurst();
+    conn.queueControlForPacket();
+    // The application gives up on the stream between two packets of a burst.
+    rs.stopSending(9);
+    conn.queueControlForPacket();
+    try std.testing.expect(!rs.stop_sending_sent);
+    conn.endBurst();
+
+    conn.beginBurst();
+    conn.queueControlForPacket();
+    try std.testing.expect(rs.stop_sending_sent);
+    conn.endBurst();
+
+    // Outside a burst every packet scans.
+    var payload2 = "0123456789".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 6, .offset = 0, .length = payload2.len, .data = &payload2, .fin = false } }, .application, 0);
+    const rs2 = conn.streams.recv_streams.get(6).?;
+    conn.queueControlForPacket();
+    rs2.stopSending(9);
+    conn.queueControlForPacket();
+    try std.testing.expect(rs2.stop_sending_sent);
 }
 
 test "a retransmitted uni FIN is counted against MAX_STREAMS only once" {
