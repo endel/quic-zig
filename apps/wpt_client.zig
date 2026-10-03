@@ -633,7 +633,7 @@ fn runScenario(
     }
 
     const detail = if (runner.outcome == null)
-        try std.fmt.allocPrint(alloc, "timeout ({d}ms)", .{timeout_ms})
+        try alloc.print("timeout ({d}ms)", .{timeout_ms})
     else
         try alloc.dupe(u8, runner.detail.items);
 

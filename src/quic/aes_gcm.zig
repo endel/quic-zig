@@ -26,7 +26,7 @@ const Ghash = @import("ghash.zig").Ghash;
 
 /// AES-NI or ARMv8 crypto: both store a block as this vector.
 const fast = crypto.core.aes.has_hardware_support and builtin.zig_backend != .stage2_c and
-    builtin.cpu.arch.endian() == .little;
+    builtin.target.cpu.arch.endian() == .little;
 const V = @Vector(2, u64);
 /// Blocks per CTR step. 8 in flight plus 11 round keys fit arm64's 32 vector
 /// registers.
@@ -36,7 +36,7 @@ const RoundKeys = [Aes128.rounds + 1]Block;
 /// arm64: GHASH in vector registers. `ghash.zig` does its arithmetic on u128,
 /// which LLVM keeps in general registers, so every multiply moves operands
 /// across and back. Same multiply and reduction, on vectors.
-const vec_ghash = fast and builtin.cpu.arch == .aarch64 and builtin.mode != .small;
+const vec_ghash = fast and builtin.target.cpu.arch == .aarch64 and builtin.mode != .small;
 /// Powers of H that `Ghash.init` computes: H, H^2, ... H^16.
 const pc_count = @typeInfo(@FieldType(Ghash, "hx")).array.len;
 /// Byte order of GHASH's big-endian 128-bit integers.
@@ -271,7 +271,7 @@ pub const Ctx = struct {
     /// AES-128 over `k` blocks, round by round so the blocks' rounds overlap.
     inline fn encryptBlocks(comptime k: usize, rk: *const RoundKeys, in: [k]V) [k]V {
         var s = in;
-        if (builtin.cpu.arch == .aarch64) {
+        if (builtin.target.cpu.arch == .aarch64) {
             inline for (0..Aes128.rounds - 1) |r| {
                 inline for (0..k) |b| s[b] = asm (
                     \\ aese  %[s].16b, %[rk].16b

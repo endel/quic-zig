@@ -2079,7 +2079,7 @@ fn openUdpSocket(config: Config, port: u16) !struct { posix.socket_t, net.Addres
 
     if (config.ipv6) {
         // Dual-stack: also accept IPv4 peers.
-        const IPV6_V6ONLY: u32 = if (builtin.os.tag == .linux) 26 else 27;
+        const IPV6_V6ONLY: u32 = if (builtin.target.os.tag == .linux) 26 else 27;
         posix.setsockopt(fd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&@as(c_int, 0))) catch {};
     }
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1))) catch {};
@@ -2708,7 +2708,7 @@ pub fn Client(comptime Handler: type) type {
                 const addr6 = try net.Address.parseIp6("::", 0);
                 const fd = try sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
                 errdefer sys.close(fd);
-                const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
+                const IPV6_V6ONLY: u32 = if (@import("builtin").target.os.tag == .linux) 26 else 27;
                 const zero_val: c_int = 0;
                 posix.setsockopt(fd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero_val)) catch {};
                 try sys.bind(fd, &addr6.any, addr6.getOsSockLen());

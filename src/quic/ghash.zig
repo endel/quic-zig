@@ -29,7 +29,7 @@ pub const Ghash = Hash(.big, true);
 /// POLYVAL is typically used to compute the authentication tag in the AES-GCM-SIV construction.
 pub const Polyval = Hash(.little, false);
 
-fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
+fn Hash(comptime endian: std.lang.Endian, comptime shift_key: bool) type {
     return struct {
         const Self = @This();
 
@@ -48,18 +48,18 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
         // This is no longer the case -- Modern CPUs, including ARM-based ones, have a fast
         // carryless multiplication instruction; using 4 multiplications is now faster than
         // 3 multiplications with extra shifts and additions.
-        const mul_algorithm = if (builtin.cpu.arch == .x86) .karatsuba else .schoolbook;
+        const mul_algorithm = if (builtin.target.cpu.arch == .x86) .karatsuba else .schoolbook;
 
         // Zig 0.17 lowers mem.readInt/writeInt(u128) on a [16]u8 to byte
         // loads and shifts (50 instructions on x86_64); an align(1) u128 load
         // is one or two.
         inline fn load(b: *const [16]u8) u128 {
             const v = @as(*align(1) const u128, @ptrCast(b)).*;
-            return if (endian == builtin.cpu.arch.endian()) v else @byteSwap(v);
+            return if (endian == builtin.target.cpu.arch.endian()) v else @byteSwap(v);
         }
 
         inline fn store(b: *[16]u8, v: u128) void {
-            @as(*align(1) u128, @ptrCast(b)).* = if (endian == builtin.cpu.arch.endian()) v else @byteSwap(v);
+            @as(*align(1) u128, @ptrCast(b)).* = if (endian == builtin.target.cpu.arch.endian()) v else @byteSwap(v);
         }
 
         hx: [pc_count]Precomp,
@@ -174,7 +174,7 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
         }
 
         /// clmulSoft128_64 is faster on platforms with no native 128-bit registers.
-        const clmulSoft = switch (builtin.cpu.arch) {
+        const clmulSoft = switch (builtin.target.cpu.arch) {
             .wasm32, .wasm64 => clmulSoft128_64,
             else => if (std.simd.suggestVectorLength(u128) != null) clmulSoft128 else clmulSoft128_64,
         };
@@ -303,13 +303,13 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
             return d ^ hi;
         }
 
-        const has_pclmul = builtin.cpu.has(.x86, .pclmul);
-        const has_avx = builtin.cpu.has(.x86, .avx);
-        const has_armaes = builtin.cpu.has(.aarch64, .aes);
+        const has_pclmul = builtin.target.cpu.has(.x86, .pclmul);
+        const has_avx = builtin.target.cpu.has(.x86, .avx);
+        const has_armaes = builtin.target.cpu.has(.aarch64, .aes);
         // C backend doesn't currently support passing vectors to inline asm.
-        const clmul = if (builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c and has_pclmul and has_avx) impl: {
+        const clmul = if (builtin.target.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c and has_pclmul and has_avx) impl: {
             break :impl clmulPclmul;
-        } else if (builtin.cpu.arch == .aarch64 and builtin.zig_backend != .stage2_c and has_armaes) impl: {
+        } else if (builtin.target.cpu.arch == .aarch64 and builtin.zig_backend != .stage2_c and has_armaes) impl: {
             break :impl clmulPmull;
         } else impl: {
             break :impl clmulSoft;

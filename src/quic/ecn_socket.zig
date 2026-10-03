@@ -4,21 +4,21 @@ const net = @import("../sockaddr.zig");
 const posix = std.posix;
 const builtin = @import("builtin");
 
-const is_windows = builtin.os.tag == .windows;
-const is_linux = builtin.os.tag == .linux;
+const is_windows = builtin.target.os.tag == .windows;
+const is_linux = builtin.target.os.tag == .linux;
 const linux = if (is_linux) std.os.linux else void;
 
 // Platform-specific constants for ECN socket options (IPv4).
 const IPPROTO_IP: u32 = 0;
 
-const IP_TOS: u32 = switch (builtin.os.tag) {
+const IP_TOS: u32 = switch (builtin.target.os.tag) {
     .macos => 3,
     .linux => 1,
     .windows => 3, // unused — ECN not supported on Windows
     else => @compileError("unsupported OS for ECN"),
 };
 
-const IP_RECVTOS: u32 = switch (builtin.os.tag) {
+const IP_RECVTOS: u32 = switch (builtin.target.os.tag) {
     .macos => 27,
     .linux => 13,
     .windows => 0, // unused — ECN not supported on Windows
@@ -26,14 +26,14 @@ const IP_RECVTOS: u32 = switch (builtin.os.tag) {
 };
 
 // IPv6 ECN constants
-const IPV6_TCLASS: u32 = switch (builtin.os.tag) {
+const IPV6_TCLASS: u32 = switch (builtin.target.os.tag) {
     .macos => 36,
     .linux => 67,
     .windows => 0,
     else => @compileError("unsupported OS for ECN"),
 };
 
-const IPV6_RECVTCLASS: u32 = switch (builtin.os.tag) {
+const IPV6_RECVTCLASS: u32 = switch (builtin.target.os.tag) {
     .macos => 35,
     .linux => 66,
     .windows => 0,
@@ -43,7 +43,7 @@ const IPV6_RECVTCLASS: u32 = switch (builtin.os.tag) {
 // cmsg_type returned by recvmsg for TOS/ECN ancillary data.
 // On macOS, the kernel returns IP_RECVTOS as the cmsg_type.
 // On Linux, the kernel returns IP_TOS as the cmsg_type.
-const CMSG_TYPE_TOS: u32 = switch (builtin.os.tag) {
+const CMSG_TYPE_TOS: u32 = switch (builtin.target.os.tag) {
     .macos => 27, // IP_RECVTOS
     .linux => 1, // IP_TOS
     .windows => 0,
@@ -53,7 +53,7 @@ const CMSG_TYPE_TOS: u32 = switch (builtin.os.tag) {
 // cmsg header — Zig std doesn't expose this on macOS.
 // Not used on Windows.
 const CmsgHdr = extern struct {
-    cmsg_len: switch (builtin.os.tag) {
+    cmsg_len: switch (builtin.target.os.tag) {
         .macos => u32,
         .windows => u32,
         else => usize,
@@ -96,7 +96,7 @@ pub fn enableEcnRecv(sockfd: posix.socket_t) !void {
 /// receive queue can be told apart from a slow answer. Linux only, and only
 /// worth turning on for a diagnostic run: it adds a cmsg to every recvmsg.
 pub fn enableRxTimestamps(sockfd: posix.socket_t) void {
-    if (comptime builtin.os.tag != .linux) return;
+    if (comptime builtin.target.os.tag != .linux) return;
     const val: u32 = 1;
     const rc = std.c.setsockopt(sockfd, SOL_SOCKET_LEVEL, @intCast(SO_TIMESTAMPNS), std.mem.asBytes(&val).ptr, 4);
     if (rc != 0) std.debug.print("rx timestamps: setsockopt failed rc={d}\n", .{rc});
@@ -194,7 +194,7 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
             data_len >= 1 and data_offset < CMSG_BUF_SIZE)
         {
             ecn = @truncate(cmsg_buf[data_offset] & 0x03);
-        } else if (builtin.os.tag == .linux and
+        } else if (builtin.target.os.tag == .linux and
             hdr.cmsg_level == SOL_SOCKET_LEVEL and
             hdr.cmsg_type == @as(i32, @intCast(SO_TIMESTAMPNS)) and
             data_len >= 16 and data_offset + 16 <= CMSG_BUF_SIZE)

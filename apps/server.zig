@@ -19,7 +19,7 @@ const H3Handler = struct {
             if (std.mem.eql(u8, h_item.name, ":path")) path = h_item.value;
         }
 
-        const body = std.fmt.allocPrint(self.alloc, "Hello from Zig HTTP/3 server! You requested {s} {s}\n", .{ method, path }) catch return;
+        const body = self.alloc.print("Hello from Zig HTTP/3 server! You requested {s} {s}\n", .{ method, path }) catch return;
         const resp_headers = [_]qpack.Header{
             .{ .name = ":status", .value = "200" },
             .{ .name = "content-type", .value = "text/plain" },

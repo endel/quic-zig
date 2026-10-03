@@ -13,7 +13,7 @@ const util = @import("util.zig");
 const stream = @import("stream.zig");
 
 // network byte order
-pub const ENDIAN = std.builtin.Endian.big;
+pub const ENDIAN = std.lang.Endian.big;
 
 pub const LONG_HEADER_BIT: u8 = 0x80;
 pub const FIXED_BIT: u8 = 0x40;

@@ -7,7 +7,7 @@ const xev_mod = @import("xev");
 
 // Default backend: epoll on Linux, kqueue on macOS.
 // io_uring init fails in some containers used by the interop runner.
-pub const xev = if (builtin.os.tag == .linux) xev_mod.Epoll else xev_mod;
+pub const xev = if (builtin.target.os.tag == .linux) xev_mod.Epoll else xev_mod;
 
 /// What a socket watch returns once its server has halted, with a cancel for
 /// it queued. Epoll's cancel removes the fd unconditionally and panics if it

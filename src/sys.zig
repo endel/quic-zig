@@ -111,14 +111,14 @@ pub const GetRandomError = error{
 // --- functions ---
 
 pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!socket_t {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.socket: Windows support pending"),
         else => @compileError("sys.socket: unsupported OS"),
     }
     // On Darwin, SOCK.NONBLOCK / SOCK.CLOEXEC are not accepted by socket(2)
     // and must be applied via fcntl after creation.
-    const darwin_family = switch (builtin.os.tag) {
+    const darwin_family = switch (builtin.target.os.tag) {
         .macos, .ios, .watchos, .tvos, .visionos => true,
         else => false,
     };
@@ -152,7 +152,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!socket_t {
 }
 
 pub fn close(fd: fd_t) void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.close: Windows support pending"),
         else => @compileError("sys.close: unsupported OS"),
@@ -163,7 +163,7 @@ pub fn close(fd: fd_t) void {
 }
 
 pub fn bind(sock: socket_t, addr: *const sockaddr, len: socklen_t) BindError!void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.bind: Windows support pending"),
         else => @compileError("sys.bind: unsupported OS"),
@@ -196,7 +196,7 @@ pub fn sendto(
     dest_addr: ?*const sockaddr,
     addrlen: socklen_t,
 ) SendToError!usize {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.sendto: Windows support pending"),
         else => @compileError("sys.sendto: unsupported OS"),
@@ -240,7 +240,7 @@ pub fn recvfrom(
     src_addr: ?*sockaddr,
     addrlen: ?*socklen_t,
 ) RecvFromError!usize {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.recvfrom: Windows support pending"),
         else => @compileError("sys.recvfrom: unsupported OS"),
@@ -307,7 +307,7 @@ pub const ListenError = error{
 };
 
 pub fn listen(sock: socket_t, backlog: u31) ListenError!void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.listen: Windows support pending"),
         else => @compileError("sys.listen: unsupported OS"),
@@ -334,7 +334,7 @@ pub const ResolveError = error{
 /// gone in 0.16. The returned address carries `port` in network byte
 /// order ready for `sys.bind`/`sys.sendto`.
 pub fn resolveHost(host: []const u8, port: u16) ResolveError!posix.sockaddr.storage {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.resolveHost: Windows support pending"),
         else => @compileError("sys.resolveHost: unsupported OS"),
@@ -384,7 +384,7 @@ pub const AcceptError = error{
 };
 
 pub fn accept(sock: socket_t) AcceptError!socket_t {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.accept: Windows support pending"),
         else => @compileError("sys.accept: unsupported OS"),
@@ -409,7 +409,7 @@ pub fn accept(sock: socket_t) AcceptError!socket_t {
 }
 
 pub fn getsockname(sock: socket_t, addr: *sockaddr, addrlen: *socklen_t) GetSockNameError!void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.getsockname: Windows support pending"),
         else => @compileError("sys.getsockname: unsupported OS"),
@@ -430,7 +430,7 @@ pub fn getsockname(sock: socket_t, addr: *sockaddr, addrlen: *socklen_t) GetSock
 /// Sleep for the given number of nanoseconds. Replaces `std.Thread.sleep`
 /// which was removed in Zig 0.16.
 pub fn sleepNs(ns: u64) void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.sleepNs: Windows support pending (use SleepEx)"),
         else => @compileError("sys.sleepNs: unsupported OS"),
@@ -457,7 +457,7 @@ pub fn sleepNs(ns: u64) void {
 /// written into something another host will read back. `nanoTimestamp` is
 /// monotonic, so its zero is the last boot.
 pub fn realtimeSeconds() i64 {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.realtimeSeconds: Windows support pending"),
         else => @compileError("sys.realtimeSeconds: unsupported OS"),
@@ -483,7 +483,7 @@ pub fn realtimeNs() i64 {
 
 pub fn nanoTimestamp() i64 {
     if (builtin.is_test) if (test_clock) |t| return t;
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.nanoTimestamp: Windows support pending (use QueryPerformanceCounter)"),
         else => @compileError("sys.nanoTimestamp: unsupported OS"),
@@ -505,7 +505,7 @@ pub fn randomInt(comptime T: type) T {
 /// Read cryptographic randomness into buf (replaces `std.crypto.random.bytes`).
 /// Uses arc4random_buf on macOS/BSD and getrandom on Linux.
 pub fn randomBytes(buf: []u8) void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux => {
             var off: usize = 0;
             while (off < buf.len) {
@@ -530,7 +530,7 @@ pub fn randomBytes(buf: []u8) void {
 /// On POSIX this is a direct libc getenv() call; the returned slice
 /// points into libc-managed static storage and must not be freed.
 pub fn getenv(name: [*:0]const u8) ?[:0]const u8 {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.getenv: Windows support pending (use GetEnvironmentVariableW)"),
         else => @compileError("sys.getenv: unsupported OS"),
@@ -651,7 +651,7 @@ pub const File = struct {
     /// anything else. statx on Linux, where 0.16's `std.c.fstat` is void;
     /// fstat elsewhere.
     pub fn kind(self: File) !Kind {
-        const mode: u32 = if (builtin.os.tag == .linux) blk: {
+        const mode: u32 = if (builtin.target.os.tag == .linux) blk: {
             const linux = std.os.linux;
             var stx: linux.Statx = undefined;
             const rc = linux.statx(self.fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
@@ -672,7 +672,7 @@ pub const File = struct {
 };
 
 fn closeFd(fd: fd_t) void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.closeFd: Windows support pending"),
         else => @compileError("sys.closeFd: unsupported OS"),
@@ -691,7 +691,7 @@ fn pathZ(path: []const u8, buf: *[std.fs.max_path_bytes]u8) OpenError![:0]const 
 
 /// Open an existing file for reading. Replaces `std.fs.cwd().openFile`.
 pub fn openFileRead(path: []const u8) OpenError!File {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.openFileRead: Windows support pending"),
         else => @compileError("sys.openFileRead: unsupported OS"),
@@ -726,7 +726,7 @@ pub fn createFileNew(path: []const u8) OpenError!File {
 }
 
 fn openForWrite(path: []const u8, flags: posix.O) OpenError!File {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.createFile: Windows support pending"),
         else => @compileError("sys.createFile: unsupported OS"),
@@ -762,7 +762,7 @@ pub const MakeDirError = error{
 /// Create a directory (mode 0755). Returns `PathAlreadyExists` if it
 /// already exists — callers can catch that and treat as success.
 pub fn makeDir(path: []const u8) MakeDirError!void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.makeDir: Windows support pending"),
         else => @compileError("sys.makeDir: unsupported OS"),
@@ -796,7 +796,7 @@ pub fn readFileAlloc(
     path: []const u8,
     max_bytes: usize,
 ) ![]u8 {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {},
         .windows => @compileError("sys.readFileAlloc: Windows support pending"),
         else => @compileError("sys.readFileAlloc: unsupported OS"),

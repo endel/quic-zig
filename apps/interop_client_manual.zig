@@ -229,7 +229,7 @@ fn downloadAll(
     const sockfd = try sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer sys.close(sockfd);
     // Disable IPV6_V6ONLY to allow dual-stack (IPv4 and IPv6 on same socket)
-    const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
+    const IPV6_V6ONLY: u32 = if (@import("builtin").target.os.tag == .linux) 26 else 27;
     const zero: c_int = 0;
     posix.setsockopt(sockfd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero)) catch {};
 
@@ -267,7 +267,7 @@ fn downloadAll(
         // Open streams and send requests as 0-RTT data
         for (urls) |url| {
             const s = conn.openStream() catch break;
-            const req = std.fmt.allocPrint(alloc, "GET {s}\r\n", .{url.path}) catch break;
+            const req = alloc.print("GET {s}\r\n", .{url.path}) catch break;
             s.send.writeData(req) catch break;
             s.send.close();
             std.log.info("0-RTT: sent early request for {s} on stream {d}", .{ url.path, s.stream_id });

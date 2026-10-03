@@ -354,7 +354,7 @@ fn openListener(opts: ListenOptions, tcp_port: u16) !posix.socket_t {
     errdefer sys.close(fd);
     if (opts.ipv6) {
         // Dual-stack: also accept IPv4 peers.
-        const IPV6_V6ONLY: u32 = if (builtin.os.tag == .linux) 26 else 27;
+        const IPV6_V6ONLY: u32 = if (builtin.target.os.tag == .linux) 26 else 27;
         posix.setsockopt(fd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&@as(c_int, 0))) catch {};
     }
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1))) catch {};

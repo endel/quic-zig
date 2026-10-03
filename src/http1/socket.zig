@@ -36,7 +36,7 @@ pub const read_buffer_size = if (shared_read_buf) 256 * 1024 else 16 * 1024;
 threadlocal var thread_read_buf: [read_buffer_size]u8 = undefined;
 /// A library can't ignore SIGPIPE for its host process: MSG_NOSIGNAL on
 /// Linux, SO_NOSIGPIPE on Darwin.
-const send_flags: c_int = if (builtin.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0;
+const send_flags: c_int = if (builtin.target.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0;
 /// Owners stop producing output above this.
 pub const high_water = 256 * 1024;
 pub const low_water = 64 * 1024;
@@ -338,7 +338,7 @@ pub fn Socket(comptime Owner: type) type {
 
 /// Accept one queued connection without waiting; null when none is queued.
 pub fn acceptNow(listen_fd: std.posix.socket_t) ?std.posix.socket_t {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.target.os.tag == .linux) {
         const fd = std.c.accept4(listen_fd, null, null, std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC);
         return if (fd < 0) null else fd;
     }
@@ -361,7 +361,7 @@ pub fn setNoDelay(fd: std.posix.socket_t) void {
 }
 
 fn setNoSigpipe(fd: std.posix.socket_t) void {
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         const one: c_int = 1;
         _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.c.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
     }

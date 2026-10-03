@@ -212,7 +212,7 @@ pub fn main(_: std.process.Init.Minimal) !void {
             };
             break :blk .{ fd4, addr4 };
         };
-        const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
+        const IPV6_V6ONLY: u32 = if (@import("builtin").target.os.tag == .linux) 26 else 27;
         const zero: c_int = 0;
         posix.setsockopt(fd6, posix.IPPROTO.IPV6, IPV6_V6ONLY, mem.asBytes(&zero)) catch {};
         sys.bind(fd6, &addr6.any, addr6.getOsSockLen()) catch {

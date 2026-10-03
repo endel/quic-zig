@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const endian = std.builtin.Endian.big;
+const endian = std.lang.Endian.big;
 
 pub fn sizeOf(comptime T: type) comptime_int {
     return switch (@typeInfo(T)) {

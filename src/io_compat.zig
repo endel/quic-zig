@@ -36,7 +36,7 @@ pub fn FixedBufferStream(comptime Buffer: type) type {
             return b;
         }
 
-        pub fn takeInt(self: *Self, comptime T: type, endian: std.builtin.Endian) error{EndOfStream}!T {
+        pub fn takeInt(self: *Self, comptime T: type, endian: std.lang.Endian) error{EndOfStream}!T {
             const n = @divExact(@typeInfo(T).int.bits, 8);
             if (self.buffer.len - self.seek < n) return error.EndOfStream;
             const slice = self.buffer[self.seek..][0..n];
@@ -78,7 +78,7 @@ pub fn FixedBufferStream(comptime Buffer: type) type {
             self.seek += 1;
         }
 
-        pub fn writeInt(self: *Self, comptime T: type, value: T, endian: std.builtin.Endian) WriteError!void {
+        pub fn writeInt(self: *Self, comptime T: type, value: T, endian: std.lang.Endian) WriteError!void {
             if (comptime is_const) return;
             const n = @divExact(@typeInfo(T).int.bits, 8);
             if (self.buffer.len - self.seek < n) return error.NoSpaceLeft;

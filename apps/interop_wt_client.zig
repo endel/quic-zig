@@ -241,7 +241,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Create dual-stack UDP socket
     const sockfd = try sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer sys.close(sockfd);
-    const IPV6_V6ONLY: u32 = if (@import("builtin").os.tag == .linux) 26 else 27;
+    const IPV6_V6ONLY: u32 = if (@import("builtin").target.os.tag == .linux) 26 else 27;
     const zero: c_int = 0;
     posix.setsockopt(sockfd, posix.IPPROTO.IPV6, IPV6_V6ONLY, mem.asBytes(&zero)) catch {};
     const local_addr = try net.Address.parseIp6("::", 0);
