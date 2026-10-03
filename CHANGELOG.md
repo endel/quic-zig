@@ -137,6 +137,10 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   in and unmaps a buffer for each burst: routez serves 1 MB HTTP/3 responses
   26% faster, with 17% less CPU each. The buffers go when the connection has
   no bidirectional streams left.
+- `tls_server` and `tls_client` key AES-128-GCM once per connection instead
+  of once per record: a 16 KB record seals in 2.8 µs, where std's AES-GCM
+  took 4.5 µs (8.7 µs under Zig 0.17), and routez serves 10 KB files over
+  HTTPS with 18% less CPU each. It costs about 1 KB per connection.
 
 ### Fixed
 

@@ -6,6 +6,7 @@ const crypto = std.crypto;
 const tls = crypto.tls;
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const aes_gcm = @import("../quic/aes_gcm.zig");
 
 /// Errors the shared helpers can return; a subset of both endpoints' sets.
 pub const Error = error{
@@ -129,6 +130,9 @@ pub const TrafficKeys = struct {
     key: [32]u8,
     iv: [12]u8,
     seq: u64 = 0,
+    /// AES-128-GCM keyed once, as QUIC packet protection does: std's
+    /// one-shot AEAD expands the key and GHASH's powers for every record.
+    gcm: ?aes_gcm.Ctx = null,
 
     pub fn derive(cs: CipherSuite, secret: Secret) TrafficKeys {
         switch (cs) {
@@ -136,6 +140,7 @@ pub const TrafficKeys = struct {
                 const S = Suite(c);
                 var k: TrafficKeys = .{ .secret = secret, .key = @splat(0), .iv = S.expand(&secret, "iv", "", 12) };
                 k.key[0..S.Aead.key_length].* = S.expand(&secret, "key", "", S.Aead.key_length);
+                if (c == .aes_128_gcm_sha256) k.gcm = .init(k.key[0..16].*);
                 return k;
             },
         }
@@ -188,7 +193,11 @@ pub fn sealInto(cs: CipherSuite, keys: *TrafficKeys, inner: tls.ContentType, con
             hdr.* = .{ ct_app_data, 0x03, 0x03, 0, 0 };
             mem.writeInt(u16, hdr[3..5], @intCast(pt.len + A.tag_length), .big);
             const body = dst[tls.record_header_len..];
-            A.encrypt(body[0..pt.len], body[pt.len..][0..A.tag_length], pt, hdr, keys.nonce(), keys.key[0..A.key_length].*);
+            const tag = body[pt.len..][0..A.tag_length];
+            if (c == .aes_128_gcm_sha256)
+                keys.gcm.?.encrypt(body[0..pt.len], tag, pt, hdr, keys.nonce())
+            else
+                A.encrypt(body[0..pt.len], tag, pt, hdr, keys.nonce(), keys.key[0..A.key_length].*);
         },
     }
     keys.seq += 1;
@@ -204,14 +213,12 @@ pub fn openWith(cs: CipherSuite, keys: *TrafficKeys, record: []const u8, out: []
             if (payload.len < A.tag_length + 1) return error.BadRecordMac;
             const n = payload.len - A.tag_length;
             if (n > max_plaintext + 1) return error.RecordOverflow;
-            A.decrypt(
-                out[0..n],
-                payload[0..n],
-                payload[n..][0..A.tag_length].*,
-                record[0..tls.record_header_len],
-                keys.nonce(),
-                keys.key[0..A.key_length].*,
-            ) catch return error.BadRecordMac;
+            const tag = payload[n..][0..A.tag_length].*;
+            const hdr = record[0..tls.record_header_len];
+            (if (c == .aes_128_gcm_sha256)
+                keys.gcm.?.decrypt(out[0..n], payload[0..n], tag, hdr, keys.nonce())
+            else
+                A.decrypt(out[0..n], payload[0..n], tag, hdr, keys.nonce(), keys.key[0..A.key_length].*)) catch return error.BadRecordMac;
             break :blk out[0..n];
         },
     };
