@@ -50,6 +50,18 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
         // 3 multiplications with extra shifts and additions.
         const mul_algorithm = if (builtin.cpu.arch == .x86) .karatsuba else .schoolbook;
 
+        // Zig 0.17 lowers mem.readInt/writeInt(u128) on a [16]u8 to byte
+        // loads and shifts (50 instructions on x86_64); an align(1) u128 load
+        // is one or two.
+        inline fn load(b: *const [16]u8) u128 {
+            const v = @as(*align(1) const u128, @ptrCast(b)).*;
+            return if (endian == builtin.cpu.arch.endian()) v else @byteSwap(v);
+        }
+
+        inline fn store(b: *[16]u8, v: u128) void {
+            @as(*align(1) u128, @ptrCast(b)).* = if (endian == builtin.cpu.arch.endian()) v else @byteSwap(v);
+        }
+
         hx: [pc_count]Precomp,
         acc: u128 = 0,
 
@@ -58,7 +70,7 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
 
         /// Initialize the GHASH state with a key, and a minimum number of block count.
         pub fn initForBlockCount(key: *const [key_length]u8, block_count: usize) Self {
-            var h = mem.readInt(u128, key[0..16], endian);
+            var h = load(key[0..16]);
             if (shift_key) {
                 // Shift the key by 1 bit to the left & reduce for GCM.
                 const carry = ((@as(u128, 0xc2) << 120) | 1) & (@as(u128, 0) -% (h >> 127));
@@ -313,46 +325,46 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
             if (builtin.mode != .small and msg.len >= agg_16_threshold * block_length) {
                 // 16-blocks aggregated reduction
                 while (i + 256 <= msg.len) : (i += 256) {
-                    var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[15 - 0]);
+                    var u = clmul128(acc ^ load(msg[i..][0..16]), st.hx[15 - 0]);
                     comptime var j = 1;
                     inline while (j < 16) : (j += 1) {
-                        xor256(&u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[15 - j]));
+                        xor256(&u, clmul128(load(msg[i..][j * 16 ..][0..16]), st.hx[15 - j]));
                     }
                     acc = reduce(u);
                 }
             } else if (builtin.mode != .small and msg.len >= agg_8_threshold * block_length) {
                 // 8-blocks aggregated reduction
                 while (i + 128 <= msg.len) : (i += 128) {
-                    var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[7 - 0]);
+                    var u = clmul128(acc ^ load(msg[i..][0..16]), st.hx[7 - 0]);
                     comptime var j = 1;
                     inline while (j < 8) : (j += 1) {
-                        xor256(&u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[7 - j]));
+                        xor256(&u, clmul128(load(msg[i..][j * 16 ..][0..16]), st.hx[7 - j]));
                     }
                     acc = reduce(u);
                 }
             } else if (builtin.mode != .small and msg.len >= agg_4_threshold * block_length) {
                 // 4-blocks aggregated reduction
                 while (i + 64 <= msg.len) : (i += 64) {
-                    var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[3 - 0]);
+                    var u = clmul128(acc ^ load(msg[i..][0..16]), st.hx[3 - 0]);
                     comptime var j = 1;
                     inline while (j < 4) : (j += 1) {
-                        xor256(&u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[3 - j]));
+                        xor256(&u, clmul128(load(msg[i..][j * 16 ..][0..16]), st.hx[3 - j]));
                     }
                     acc = reduce(u);
                 }
             }
             // 2-blocks aggregated reduction
             while (i + 32 <= msg.len) : (i += 32) {
-                var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[1 - 0]);
+                var u = clmul128(acc ^ load(msg[i..][0..16]), st.hx[1 - 0]);
                 comptime var j = 1;
                 inline while (j < 2) : (j += 1) {
-                    xor256(&u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[1 - j]));
+                    xor256(&u, clmul128(load(msg[i..][j * 16 ..][0..16]), st.hx[1 - j]));
                 }
                 acc = reduce(u);
             }
             // remaining blocks
             if (i < msg.len) {
-                const u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[0]);
+                const u = clmul128(acc ^ load(msg[i..][0..16]), st.hx[0]);
                 acc = reduce(u);
                 i += 16;
             }
@@ -407,7 +419,7 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
         /// Compute the GHASH of the entire input.
         pub fn final(st: *Self, out: *[mac_length]u8) void {
             st.pad();
-            mem.writeInt(u128, out[0..16], st.acc, endian);
+            store(out[0..16], st.acc);
 
             std.crypto.secureZero(Self, st[0..1]);
         }
