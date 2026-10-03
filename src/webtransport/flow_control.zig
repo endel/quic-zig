@@ -11,7 +11,6 @@ const RttStats = @import("../quic/rtt.zig").RttStats;
 /// both the session and the connection permit it. This module is the
 /// accounting alone — `WebTransportConnection` owns the capsule I/O, so there
 /// is one place that knows how a capsule reaches the wire.
-
 /// What a session grants its peer. Taken from the QUIC connection's own
 /// defaults so the session limit is never the tighter of the two by accident:
 /// both slide by half a window, but a session's slides on streams *opened*

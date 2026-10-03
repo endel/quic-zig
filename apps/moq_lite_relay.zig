@@ -149,11 +149,11 @@ const Relay = struct {
         next_sub_id: u64 = 0,
     };
 
-    clients: [MAX_CLIENTS]Client = [_]Client{.{}} ** MAX_CLIENTS,
-    broadcasts: [MAX_BROADCASTS]Broadcast = [_]Broadcast{.{}} ** MAX_BROADCASTS,
-    subs: [MAX_SUBSCRIPTIONS]Subscription = [_]Subscription{.{}} ** MAX_SUBSCRIPTIONS,
-    flows: [MAX_FLOWS]Flow = [_]Flow{.{}} ** MAX_FLOWS,
-    watches: [MAX_SUBSCRIPTIONS]AnnounceWatch = [_]AnnounceWatch{.{}} ** MAX_SUBSCRIPTIONS,
+    clients: [MAX_CLIENTS]Client = @splat(.{}),
+    broadcasts: [MAX_BROADCASTS]Broadcast = @splat(.{}),
+    subs: [MAX_SUBSCRIPTIONS]Subscription = @splat(.{}),
+    flows: [MAX_FLOWS]Flow = @splat(.{}),
+    watches: [MAX_SUBSCRIPTIONS]AnnounceWatch = @splat(.{}),
     hop_id: u64 = 1,
 
     // --- client table --------------------------------------------------

@@ -66,7 +66,7 @@ pub fn writeSubgroupHeader(writer: anytype, h: SubgroupHeader, draft: version.Dr
         (if (sg == 0) .zero else .explicit)
     else
         .first_object;
-    flags |= (@as(u64, @intFromEnum(mode)) << 1);
+    flags |= (@as(u64, @backingInt(mode)) << 1);
 
     try wire.writeVarInt(writer, flags);
     try wire.writeVarInt(writer, h.track_alias);
@@ -88,7 +88,7 @@ pub fn readSubgroupHeader(fbs: *io.FixedBufferStream([]const u8), draft: version
     }
 
     const mode_bits: u2 = @truncate((flags & codes.SUBGROUP_MASK_ID_MODE) >> 1);
-    const id_mode: codes.SubgroupIdMode = @enumFromInt(mode_bits);
+    const id_mode: codes.SubgroupIdMode = @fromBackingInt(@intCast(mode_bits));
     if (id_mode == .reserved) return Error.ReservedSubgroupMode;
 
     const alias = try wire.readVarInt(reader);
@@ -154,7 +154,7 @@ pub fn writeDatagramObject(writer: anytype, obj: DatagramObject) !void {
     if (obj.object) |oid| try wire.writeVarInt(writer, oid);
     if (obj.publisher_priority) |p| try writer.writeByte(p);
     switch (obj.body) {
-        .status => |s| try wire.writeVarInt(writer, @intFromEnum(s)),
+        .status => |s| try wire.writeVarInt(writer, @backingInt(s)),
         .payload => |p| try writer.writeAll(p),
     }
 }

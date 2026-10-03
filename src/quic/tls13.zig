@@ -59,9 +59,9 @@ fn selectCipherSuite(list: []const u8, only: ?quic_crypto.CipherSuite) ?quic_cry
     while (i + 2 <= list.len) : (i += 2) {
         const id = readU16(list[i..]);
         const suite: quic_crypto.CipherSuite = switch (id) {
-            @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256) => .aes_128_gcm_sha256,
-            @intFromEnum(tls.CipherSuite.CHACHA20_POLY1305_SHA256) => .chacha20_poly1305_sha256,
-            @intFromEnum(tls.CipherSuite.AES_256_GCM_SHA384) => {
+            @backingInt(tls.CipherSuite.AES_128_GCM_SHA256) => .aes_128_gcm_sha256,
+            @backingInt(tls.CipherSuite.CHACHA20_POLY1305_SHA256) => .chacha20_poly1305_sha256,
+            @backingInt(tls.CipherSuite.AES_256_GCM_SHA384) => {
                 if (client_first == null) client_first = id;
                 continue;
             },
@@ -71,7 +71,7 @@ fn selectCipherSuite(list: []const u8, only: ?quic_crypto.CipherSuite) ?quic_cry
         if (only) |o| if (suite != o) continue;
         if (suite == .aes_128_gcm_sha256) aes = true else chacha = true;
     }
-    const client_prefers_chacha = client_first == @intFromEnum(tls.CipherSuite.CHACHA20_POLY1305_SHA256);
+    const client_prefers_chacha = client_first == @backingInt(tls.CipherSuite.CHACHA20_POLY1305_SHA256);
     if (aes and (!chacha or (std.crypto.core.aes.has_hardware_support and !client_prefers_chacha))) return .aes_128_gcm_sha256;
     if (chacha) return .chacha20_poly1305_sha256;
     return null;
@@ -101,7 +101,7 @@ pub fn signatureSchemeFor(alg: PrivateKeyAlgorithm, offered: []const u8) ?tls.Si
     for (ours) |scheme| {
         var i: usize = 0;
         while (i + 2 <= offered.len) : (i += 2) {
-            if (std.mem.readInt(u16, offered[i..][0..2], .big) == @intFromEnum(scheme)) return scheme;
+            if (std.mem.readInt(u16, offered[i..][0..2], .big) == @backingInt(scheme)) return scheme;
         }
     }
     return null;
@@ -117,7 +117,7 @@ pub fn verifyCertificateVerifySignature(
     sig_bytes: []const u8,
     signed_content: []const u8,
 ) HandshakeError!void {
-    const scheme: tls.SignatureScheme = @enumFromInt(sig_algo);
+    const scheme: tls.SignatureScheme = @fromBackingInt(@intCast(sig_algo));
     switch (scheme) {
         .ecdsa_secp256r1_sha256 => {
             if (pub_key_algo != .X9_62_id_ecPublicKey) return error.BadCertificateVerify;
@@ -162,7 +162,7 @@ fn verifyRsaPss(
     switch (pk_components.modulus.len) {
         inline 128, 256, 384, 512 => |modulus_len| {
             if (sig_bytes.len != modulus_len) return error.BadCertificateVerify;
-            std_rsa.PSSSignature.verify(modulus_len, sig_bytes[0..modulus_len].*, signed_content, public_key, Hash) catch return error.BadCertificateVerify;
+            std_rsa.PSSSignature.verify(modulus_len, sig_bytes[0..modulus_len], signed_content, public_key, Hash) catch return error.BadCertificateVerify;
         },
         else => return error.BadCertificateVerify,
     }
@@ -399,7 +399,7 @@ pub const client_auth_signature_schemes = blk: {
         .rsa_pkcs1_sha256,       .rsa_pkcs1_sha384,       .rsa_pkcs1_sha512,
     };
     var out: [schemes.len * 2]u8 = undefined;
-    for (schemes, 0..) |s, i| std.mem.writeInt(u16, out[i * 2 ..][0..2], @intFromEnum(s), .big);
+    for (schemes, 0..) |s, i| std.mem.writeInt(u16, out[i * 2 ..][0..2], @backingInt(s), .big);
     break :blk out;
 };
 
@@ -463,18 +463,18 @@ pub fn buildCertificateRequest(buf: []u8, auth: *const ClientAuth) error{BufferT
     if (auth.authorities.len > 0) exts_len += 4 + auth.authorities.len;
     const total = 4 + 1 + 2 + exts_len;
     if (buf.len < total or total - 4 > std.math.maxInt(u24)) return error.BufferTooSmall;
-    buf[0] = @intFromEnum(tls.HandshakeType.certificate_request);
+    buf[0] = @backingInt(tls.HandshakeType.certificate_request);
     std.mem.writeInt(u24, buf[1..4], @intCast(total - 4), .big);
     buf[4] = 0; // certificate_request_context
     writeU16(buf[5..], @intCast(exts_len));
     var pos: usize = 7;
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.signature_algorithms), 2 + sig.len);
+    pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.signature_algorithms), 2 + sig.len);
     writeU16(buf[pos..], sig.len);
     pos += 2;
     @memcpy(buf[pos..][0..sig.len], &sig);
     pos += sig.len;
     if (auth.authorities.len > 0) {
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.certificate_authorities), auth.authorities.len);
+        pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.certificate_authorities), auth.authorities.len);
         @memcpy(buf[pos..][0..auth.authorities.len], auth.authorities);
         pos += auth.authorities.len;
     }
@@ -502,7 +502,7 @@ pub fn parseCertificateRequest(body: []const u8) error{ DecodeError, MissingExte
         if (pos + len > body.len) return error.DecodeError;
         const data = body[pos..][0..len];
         pos += len;
-        if (kind == @intFromEnum(tls.ExtensionType.signature_algorithms)) {
+        if (kind == @backingInt(tls.ExtensionType.signature_algorithms)) {
             if (sig_algs != null) return error.IllegalParameter;
             if (data.len < 2 or readU16(data) + 2 != data.len or data.len % 2 != 0) return error.DecodeError;
             sig_algs = data[2..];
@@ -648,7 +648,7 @@ fn parseX509Extensions(cert_der: []const u8) X509Extensions {
         pos = elem.slice.end;
 
         if (elem.identifier.class == .context_specific) {
-            if (@intFromEnum(elem.identifier.tag) == 3) {
+            if (@backingInt(elem.identifier.tag) == 3) {
                 // Extensions SEQUENCE
                 const extensions = der.Element.parse(cert_der, elem.slice.start) catch return result;
                 var ext_i = extensions.slice.start;
@@ -802,8 +802,8 @@ pub const KeySchedule = struct {
     server_handshake_traffic_secret: [32]u8,
     client_app_traffic_secret: [32]u8,
     server_app_traffic_secret: [32]u8,
-    resumption_master_secret: [32]u8 = .{0} ** 32,
-    client_early_traffic_secret: [32]u8 = .{0} ** 32,
+    resumption_master_secret: [32]u8 = @splat(0),
+    client_early_traffic_secret: [32]u8 = @splat(0),
     computed_handshake: bool = false,
     computed_app: bool = false,
 
@@ -811,11 +811,11 @@ pub const KeySchedule = struct {
         var ks: KeySchedule = undefined;
         ks.computed_handshake = false;
         ks.computed_app = false;
-        ks.resumption_master_secret = .{0} ** 32;
-        ks.client_early_traffic_secret = .{0} ** 32;
+        ks.resumption_master_secret = @splat(0);
+        ks.client_early_traffic_secret = @splat(0);
         // early_secret = HKDF-Extract(salt=0, IKM=0)
-        const zero_key: [32]u8 = .{0} ** 32;
-        ks.early_secret = HkdfSha256.extract(&(.{0} ** 1), &zero_key);
+        const zero_key: [32]u8 = @splat(0);
+        ks.early_secret = HkdfSha256.extract(&@as([1]u8, @splat(0)), &zero_key);
         return ks;
     }
 
@@ -824,10 +824,10 @@ pub const KeySchedule = struct {
         var ks: KeySchedule = undefined;
         ks.computed_handshake = false;
         ks.computed_app = false;
-        ks.resumption_master_secret = .{0} ** 32;
-        ks.client_early_traffic_secret = .{0} ** 32;
+        ks.resumption_master_secret = @splat(0);
+        ks.client_early_traffic_secret = @splat(0);
         // early_secret = HKDF-Extract(salt=0, IKM=PSK)
-        ks.early_secret = HkdfSha256.extract(&(.{0} ** 1), &psk);
+        ks.early_secret = HkdfSha256.extract(&@as([1]u8, @splat(0)), &psk);
         return ks;
     }
 
@@ -866,7 +866,7 @@ pub const KeySchedule = struct {
         const derived2 = deriveSecret(self.handshake_secret, "derived", empty_hash);
 
         // master_secret = HKDF-Extract(derived2, 0)
-        const zero_key: [32]u8 = .{0} ** 32;
+        const zero_key: [32]u8 = @splat(0);
         self.master_secret = HkdfSha256.extract(&derived2, &zero_key);
 
         // c_ap_traffic = Derive-Secret(master_secret, "c ap traffic", transcript)
@@ -944,13 +944,13 @@ pub const KeySchedule = struct {
 
 pub const SessionTicket = struct {
     psk: [32]u8, // Pre-shared key derived from resumption_master_secret
-    ticket: [512]u8 = .{0} ** 512, // Opaque ticket data (encrypted by server)
+    ticket: [512]u8 = @splat(0), // Opaque ticket data (encrypted by server)
     ticket_len: u16 = 0,
     ticket_age_add: u32 = 0, // Age obfuscation value
     creation_time: i64 = 0, // Seconds since epoch
     lifetime: u32 = 0, // Seconds
     max_early_data_size: u32 = 0, // From early_data extension
-    alpn: [16]u8 = .{0} ** 16, // Negotiated ALPN
+    alpn: [16]u8 = @splat(0), // Negotiated ALPN
     alpn_len: u8 = 0,
 
     // RFC 9000 §7.4.1: remembered transport parameters for 0-RTT
@@ -1294,7 +1294,7 @@ pub const Tls13Handshake = struct {
     client_random: [32]u8 = undefined,
 
     // Peer's legacy_session_id from ClientHello (must be echoed in ServerHello)
-    peer_session_id: [32]u8 = .{0} ** 32,
+    peer_session_id: [32]u8 = @splat(0),
     peer_session_id_len: u8 = 0,
 
     // Server hello random
@@ -1339,7 +1339,7 @@ pub const Tls13Handshake = struct {
     /// Server side: which of `config.alpn` the client also offered. A
     /// server advertising several has to echo the one that matched, not
     /// its own first choice.
-    selected_alpn: [32]u8 = .{0} ** 32,
+    selected_alpn: [32]u8 = @splat(0),
     selected_alpn_len: usize = 0,
 
     /// Server: the certificate we present — the config's single one, or the
@@ -1411,7 +1411,7 @@ pub const Tls13Handshake = struct {
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
         self.peer_session_id_len = 0;
-        self.peer_session_id = .{0} ** 32;
+        self.peer_session_id = @splat(0);
         self.hrr_seen = false;
         self.hrr_group = null;
         self.hrr_cipher_suite = .aes_128_gcm_sha256;
@@ -1424,11 +1424,7 @@ pub const Tls13Handshake = struct {
 
         // Generate X25519 key pair
         sys.randomBytes(&self.x25519_secret);
-        self.x25519_public = X25519.recoverPublicKey(self.x25519_secret) catch blk: {
-            // If key is bad (unlikely), regenerate
-            sys.randomBytes(&self.x25519_secret);
-            break :blk X25519.recoverPublicKey(self.x25519_secret) catch unreachable;
-        };
+        self.x25519_public = X25519.recoverPublicKey(self.x25519_secret);
 
         // Generate P-256 key pair (offered alongside X25519 in ClientHello)
         sys.randomBytes(&self.p256_secret);
@@ -1492,7 +1488,7 @@ pub const Tls13Handshake = struct {
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
         self.peer_session_id_len = 0;
-        self.peer_session_id = .{0} ** 32;
+        self.peer_session_id = @splat(0);
         self.hrr_seen = false;
         self.hrr_group = null;
         self.hrr_cipher_suite = .aes_128_gcm_sha256;
@@ -1505,10 +1501,7 @@ pub const Tls13Handshake = struct {
 
         // Generate X25519 key pair
         sys.randomBytes(&self.x25519_secret);
-        self.x25519_public = X25519.recoverPublicKey(self.x25519_secret) catch blk: {
-            sys.randomBytes(&self.x25519_secret);
-            break :blk X25519.recoverPublicKey(self.x25519_secret) catch unreachable;
-        };
+        self.x25519_public = X25519.recoverPublicKey(self.x25519_secret);
         self.negotiated_group = .x25519;
     }
 
@@ -1637,7 +1630,7 @@ pub const Tls13Handshake = struct {
                     if (msg[0] == 24) return error.UnexpectedMessage;
                     // RFC 9001 §8.3: EndOfEarlyData (5) MUST NOT be sent in QUIC
                     if (msg[0] == 5) return error.UnexpectedMessage;
-                    if (!self.is_server and msg[0] == @intFromEnum(tls.HandshakeType.new_session_ticket)) {
+                    if (!self.is_server and msg[0] == @backingInt(tls.HandshakeType.new_session_ticket)) {
                         self.parseNewSessionTicket(msg);
                         return ._continue;
                     }
@@ -1701,7 +1694,7 @@ pub const Tls13Handshake = struct {
     fn clientProcessServerHello(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
 
-        if (msg[0] != @intFromEnum(tls.HandshakeType.server_hello)) return error.UnexpectedMessage;
+        if (msg[0] != @backingInt(tls.HandshakeType.server_hello)) return error.UnexpectedMessage;
 
         // Parse ServerHello
         const body = msg[4..]; // skip type + 3-byte length
@@ -1748,16 +1741,16 @@ pub const Tls13Handshake = struct {
             ext_pos += 2;
             if (elen > ext_data.len - ext_pos) return error.DecodeError;
 
-            if (etype == @intFromEnum(tls.ExtensionType.key_share)) {
+            if (etype == @backingInt(tls.ExtensionType.key_share)) {
                 // key_share: named_group(2) + key_exchange_length(2) + key_exchange(...)
                 if (elen < 4) return error.DecodeError;
                 const group = readU16(ext_data[ext_pos..]);
                 const kelen = readU16(ext_data[ext_pos + 2 ..]);
-                if (group == @intFromEnum(tls.NamedGroup.x25519) and kelen == 32 and ext_pos + 4 + 32 <= ext_data.len) {
+                if (group == @backingInt(tls.NamedGroup.x25519) and kelen == 32 and ext_pos + 4 + 32 <= ext_data.len) {
                     @memcpy(&self.peer_x25519_public, ext_data[ext_pos + 4 ..][0..32]);
                     self.negotiated_group = .x25519;
                     found_key_share = true;
-                } else if (group == @intFromEnum(tls.NamedGroup.secp256r1) and kelen == 65 and ext_pos + 4 + 65 <= ext_data.len) {
+                } else if (group == @backingInt(tls.NamedGroup.secp256r1) and kelen == 65 and ext_pos + 4 + 65 <= ext_data.len) {
                     @memcpy(&self.peer_p256_public, ext_data[ext_pos + 4 ..][0..65]);
                     self.negotiated_group = .secp256r1;
                     found_key_share = true;
@@ -1766,7 +1759,7 @@ pub const Tls13Handshake = struct {
                 }
                 // RFC 8446 4.2.8: a group we sent a share for.
                 if (!self.sentShareFor(self.negotiated_group)) return error.IllegalParameter;
-            } else if (etype == @intFromEnum(tls.ExtensionType.pre_shared_key)) {
+            } else if (etype == @backingInt(tls.ExtensionType.pre_shared_key)) {
                 // RFC 8446 §4.2.11: only the one identity we offered. Resumption
                 // skips the certificate, so an unoffered PSK (all zeros) would
                 // let anyone finish the handshake.
@@ -1861,10 +1854,10 @@ pub const Tls13Handshake = struct {
             i += 4;
             if (elen > exts.len - i) return error.DecodeError;
             const data = exts[i..][0..elen];
-            if (etype == @intFromEnum(tls.ExtensionType.key_share)) {
+            if (etype == @backingInt(tls.ExtensionType.key_share)) {
                 if (elen != 2) return error.DecodeError;
-                group = @enumFromInt(readU16(data));
-            } else if (etype == @intFromEnum(tls.ExtensionType.cookie)) {
+                group = @fromBackingInt(@intCast(readU16(data)));
+            } else if (etype == @backingInt(tls.ExtensionType.cookie)) {
                 if (elen < 3 or @as(usize, readU16(data)) + 2 != elen) return error.DecodeError;
                 cookie = data[2..];
             }
@@ -1883,7 +1876,7 @@ pub const Tls13Handshake = struct {
 
         const ch1_hash = self.transcript.current();
         self.transcript = TranscriptHash.init();
-        self.transcript.update(&.{ @intFromEnum(tls.HandshakeType.message_hash), 0, 0, 32 });
+        self.transcript.update(&.{ @backingInt(tls.HandshakeType.message_hash), 0, 0, 32 });
         self.transcript.update(&ch1_hash);
         self.transcript.update(msg);
 
@@ -1905,7 +1898,7 @@ pub const Tls13Handshake = struct {
     fn clientProcessEncryptedExtensions(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
 
-        if (msg[0] != @intFromEnum(tls.HandshakeType.encrypted_extensions)) return error.UnexpectedMessage;
+        if (msg[0] != @backingInt(tls.HandshakeType.encrypted_extensions)) return error.UnexpectedMessage;
 
         // Parse EncryptedExtensions to extract transport params + ALPN + early_data
         self.parseEncryptedExtensions(msg[4..]) catch |e| switch (e) {
@@ -1930,7 +1923,7 @@ pub const Tls13Handshake = struct {
         // between EncryptedExtensions and its own Certificate. Cloudflare's
         // edge does — `cdn.moq.dev` failed at this message — and refusing it
         // ends the handshake over a request we are allowed to decline.
-        if (msg[0] == @intFromEnum(tls.HandshakeType.certificate_request)) {
+        if (msg[0] == @backingInt(tls.HandshakeType.certificate_request)) {
             if (self.certificate_requested) return error.UnexpectedMessage;
             const offered = parseCertificateRequest(msg[4..]) catch |err| return switch (err) {
                 error.MissingExtension => error.MissingExtension,
@@ -1943,7 +1936,7 @@ pub const Tls13Handshake = struct {
             return ._continue;
         }
 
-        if (msg[0] != @intFromEnum(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
+        if (msg[0] != @backingInt(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
 
         const body = msg[4..];
         if (body.len < 4) return error.DecodeError;
@@ -2048,7 +2041,7 @@ pub const Tls13Handshake = struct {
     fn clientProcessCertificateVerify(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
 
-        if (msg[0] != @intFromEnum(tls.HandshakeType.certificate_verify)) return error.UnexpectedMessage;
+        if (msg[0] != @backingInt(tls.HandshakeType.certificate_verify)) return error.UnexpectedMessage;
 
         if (!self.config.skip_cert_verify) {
             if (self.leaf_pub_key_len == 0) return error.BadCertificateVerify;
@@ -2061,7 +2054,7 @@ pub const Tls13Handshake = struct {
             const sig_algo = (@as(u16, body[0]) << 8) | @as(u16, body[1]);
             // RFC 8446 §4.4.3: one of the schemes we offered.
             for (client_signature_schemes) |offered| {
-                if (sig_algo == @intFromEnum(offered)) break;
+                if (sig_algo == @backingInt(offered)) break;
             } else return error.IllegalParameter;
             const sig_len = (@as(usize, body[2]) << 8) | @as(usize, body[3]);
             if (body.len < 4 + sig_len) return error.DecodeError;
@@ -2092,7 +2085,7 @@ pub const Tls13Handshake = struct {
     fn clientProcessFinished(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
 
-        if (msg[0] != @intFromEnum(tls.HandshakeType.finished)) return error.UnexpectedMessage;
+        if (msg[0] != @backingInt(tls.HandshakeType.finished)) return error.UnexpectedMessage;
 
         const body = msg[4..];
         if (body.len != 32) return error.BadFinished;
@@ -2148,7 +2141,7 @@ pub const Tls13Handshake = struct {
             pos += cv.len;
         } else {
             const empty_cert = [_]u8{
-                @intFromEnum(tls.HandshakeType.certificate),
+                @backingInt(tls.HandshakeType.certificate),
                 0, 0, 4, // length
                 0, // certificate_request_context length
                 0, 0, 0, // certificate_list length
@@ -2167,7 +2160,7 @@ pub const Tls13Handshake = struct {
 
         // Build Finished message: type(1) + length(3) + verify_data(32)
         var msg: [36]u8 = undefined;
-        msg[0] = @intFromEnum(tls.HandshakeType.finished);
+        msg[0] = @backingInt(tls.HandshakeType.finished);
         msg[1] = 0;
         msg[2] = 0;
         msg[3] = 32;
@@ -2190,7 +2183,7 @@ pub const Tls13Handshake = struct {
     fn serverProcessClientHello(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
 
-        if (msg[0] != @intFromEnum(tls.HandshakeType.client_hello)) return error.UnexpectedMessage;
+        if (msg[0] != @backingInt(tls.HandshakeType.client_hello)) return error.UnexpectedMessage;
 
         const body = msg[4..];
         if (body.len < 2 + 32 + 1) return error.DecodeError;
@@ -2249,7 +2242,7 @@ pub const Tls13Handshake = struct {
 
             if (ext_pos + elen > ext_data.len) break;
 
-            if (etype == @intFromEnum(tls.ExtensionType.key_share)) {
+            if (etype == @backingInt(tls.ExtensionType.key_share)) {
                 // client_shares_len(2) + [named_group(2) + key_len(2) + key(...)]
                 // Prefer X25519, fall back to secp256r1 (P-256)
                 if (elen >= 2) {
@@ -2261,10 +2254,10 @@ pub const Tls13Handshake = struct {
                         const kelen = readU16(ext_data[ext_pos + share_pos + 2 ..]);
                         share_pos += 4;
                         key_share_count += 1;
-                        if (group == @intFromEnum(tls.NamedGroup.x25519) and kelen == 32 and share_pos + 32 <= elen) {
+                        if (group == @backingInt(tls.NamedGroup.x25519) and kelen == 32 and share_pos + 32 <= elen) {
                             @memcpy(&self.peer_x25519_public, ext_data[ext_pos + share_pos ..][0..32]);
                             found_x25519 = true;
-                        } else if (group == @intFromEnum(tls.NamedGroup.secp256r1) and kelen == 65 and share_pos + 65 <= elen) {
+                        } else if (group == @backingInt(tls.NamedGroup.secp256r1) and kelen == 65 and share_pos + 65 <= elen) {
                             @memcpy(&self.peer_p256_public, ext_data[ext_pos + share_pos ..][0..65]);
                             found_p256 = true;
                         }
@@ -2275,19 +2268,19 @@ pub const Tls13Handshake = struct {
                         found_key_share = true;
                     }
                 }
-            } else if (etype == @intFromEnum(tls.ExtensionType.supported_groups)) {
+            } else if (etype == @backingInt(tls.ExtensionType.supported_groups)) {
                 var gp: usize = 2;
                 while (gp + 2 <= elen) : (gp += 2) {
                     const g = readU16(ext_data[ext_pos + gp ..]);
-                    if (g == @intFromEnum(tls.NamedGroup.x25519)) lists_x25519 = true;
-                    if (g == @intFromEnum(tls.NamedGroup.secp256r1)) lists_p256 = true;
+                    if (g == @backingInt(tls.NamedGroup.x25519)) lists_x25519 = true;
+                    if (g == @backingInt(tls.NamedGroup.secp256r1)) lists_p256 = true;
                 }
-            } else if (etype == @intFromEnum(tls.ExtensionType.quic_transport_parameters)) {
+            } else if (etype == @backingInt(tls.ExtensionType.quic_transport_parameters)) {
                 const tp_data = ext_data[ext_pos..][0..elen];
                 self.peer_transport_params = transport_params.TransportParams.decode(tp_data) catch {
                     return error.TransportParameterError;
                 };
-            } else if (etype == @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation)) {
+            } else if (etype == @backingInt(tls.ExtensionType.application_layer_protocol_negotiation)) {
                 // Parse client's ALPN list and try to match with our configured ALPNs
                 if (elen >= 2) {
                     const list_len = readU16(ext_data[ext_pos..]);
@@ -2314,15 +2307,15 @@ pub const Tls13Handshake = struct {
                         return error.NoApplicationProtocol;
                     }
                 }
-            } else if (etype == @intFromEnum(tls.ExtensionType.pre_shared_key)) {
+            } else if (etype == @backingInt(tls.ExtensionType.pre_shared_key)) {
                 // PSK extension must be the last one (RFC 8446 §4.2.11)
                 psk_ext_offset = ext_pos;
                 psk_ext_len = elen;
-            } else if (etype == @intFromEnum(tls.ExtensionType.early_data)) {
+            } else if (etype == @backingInt(tls.ExtensionType.early_data)) {
                 self.early_data_offered = true;
-            } else if (etype == @intFromEnum(tls.ExtensionType.server_name)) {
+            } else if (etype == @backingInt(tls.ExtensionType.server_name)) {
                 sni = parseServerNameExtension(ext_data[ext_pos..][0..elen]) catch return error.DecodeError;
-            } else if (etype == @intFromEnum(tls.ExtensionType.signature_algorithms)) {
+            } else if (etype == @backingInt(tls.ExtensionType.signature_algorithms)) {
                 if (elen < 2 or @as(usize, readU16(ext_data[ext_pos..])) + 2 != elen or elen % 2 != 0) return error.DecodeError;
                 sig_algs = ext_data[ext_pos + 2 ..][0 .. elen - 2];
             }
@@ -2420,7 +2413,7 @@ pub const Tls13Handshake = struct {
         var ch1_hash: [32]u8 = undefined;
         Sha256.hash(client_hello, &ch1_hash, .{});
         self.transcript = TranscriptHash.init();
-        self.transcript.update(&.{ @intFromEnum(tls.HandshakeType.message_hash), 0, 0, 32 });
+        self.transcript.update(&.{ @backingInt(tls.HandshakeType.message_hash), 0, 0, 32 });
         self.transcript.update(&ch1_hash);
 
         var buf: [128]u8 = undefined;
@@ -2613,7 +2606,7 @@ pub const Tls13Handshake = struct {
         );
 
         var msg: [36]u8 = undefined;
-        msg[0] = @intFromEnum(tls.HandshakeType.finished);
+        msg[0] = @backingInt(tls.HandshakeType.finished);
         msg[1] = 0;
         msg[2] = 0;
         msg[3] = 32;
@@ -2645,7 +2638,7 @@ pub const Tls13Handshake = struct {
     fn serverProcessClientFinished(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
 
-        if (msg[0] != @intFromEnum(tls.HandshakeType.finished)) return error.UnexpectedMessage;
+        if (msg[0] != @backingInt(tls.HandshakeType.finished)) return error.UnexpectedMessage;
 
         const body = msg[4..];
         if (body.len != 32) return error.BadFinished;
@@ -2676,7 +2669,7 @@ pub const Tls13Handshake = struct {
 
     fn serverProcessClientCertificate(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
-        if (msg[0] != @intFromEnum(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
+        if (msg[0] != @backingInt(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
         const auth = self.client_auth.?;
         var chain_buf: [max_client_chain][]const u8 = undefined;
         const chain = (try parseCertificateList(msg[4..], &chain_buf)) orelse {
@@ -2696,7 +2689,7 @@ pub const Tls13Handshake = struct {
 
     fn serverProcessClientCertificateVerify(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
-        if (msg[0] != @intFromEnum(tls.HandshakeType.certificate_verify)) return error.UnexpectedMessage;
+        if (msg[0] != @backingInt(tls.HandshakeType.certificate_verify)) return error.UnexpectedMessage;
         const body = msg[4..];
         if (body.len < 4) return error.DecodeError;
         const scheme = readU16(body);
@@ -2795,7 +2788,7 @@ pub const Tls13Handshake = struct {
         var nst: [256]u8 = undefined;
         var nst_pos: usize = 0;
 
-        nst[0] = @intFromEnum(tls.HandshakeType.new_session_ticket);
+        nst[0] = @backingInt(tls.HandshakeType.new_session_ticket);
         nst[1] = @intCast(nst_body_len >> 16);
         nst[2] = @intCast((nst_body_len >> 8) & 0xff);
         nst[3] = @intCast(nst_body_len & 0xff);
@@ -2824,7 +2817,7 @@ pub const Tls13Handshake = struct {
         // extensions: early_data with max_early_data_size = 0xffffffff
         writeU16(nst[nst_pos..], ext_data_len);
         nst_pos += 2;
-        writeU16(nst[nst_pos..], @intFromEnum(tls.ExtensionType.early_data));
+        writeU16(nst[nst_pos..], @backingInt(tls.ExtensionType.early_data));
         nst_pos += 2;
         writeU16(nst[nst_pos..], 4); // extension data length
         nst_pos += 2;
@@ -2975,7 +2968,7 @@ pub const Tls13Handshake = struct {
                 const elen = readU16(ext_buf[ext_pos..]);
                 ext_pos += 2;
                 if (ext_pos + elen > ext_buf.len) break;
-                if (etype == @intFromEnum(tls.ExtensionType.early_data) and elen >= 4) {
+                if (etype == @backingInt(tls.ExtensionType.early_data) and elen >= 4) {
                     max_early_data = std.mem.readInt(u32, ext_buf[ext_pos..][0..4], .big);
                 }
                 ext_pos += elen;
@@ -3061,15 +3054,15 @@ pub const Tls13Handshake = struct {
             ext_pos += 2;
             if (ext_pos + elen > ext_data.len) break;
 
-            if (etype == @intFromEnum(tls.ExtensionType.quic_transport_parameters)) {
+            if (etype == @backingInt(tls.ExtensionType.quic_transport_parameters)) {
                 const tp_data = ext_data[ext_pos..][0..elen];
                 self.peer_transport_params = transport_params.TransportParams.decode(tp_data) catch {
                     return error.TransportParameterError;
                 };
-            } else if (etype == @intFromEnum(tls.ExtensionType.early_data)) {
+            } else if (etype == @backingInt(tls.ExtensionType.early_data)) {
                 // Server accepted early data (0-RTT)
                 self.zero_rtt_accepted = true;
-            } else if (etype == @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation)) {
+            } else if (etype == @backingInt(tls.ExtensionType.application_layer_protocol_negotiation)) {
                 // RFC 7301 §3.1: exactly one protocol, and one we offered.
                 const d = ext_data[ext_pos..][0..elen];
                 if (d.len < 3 or readU16(d) != d.len - 2 or @as(usize, d[2]) + 3 != d.len) return error.DecodeError;
@@ -3139,15 +3132,15 @@ fn buildClientHello(buf: []u8, params: ClientHelloParams) ![]const u8 {
         // Offer only the specified cipher suite (e.g., for chacha20 interop test)
         writeU16(buf[pos..], 2);
         pos += 2;
-        writeU16(buf[pos..], @intFromEnum(cs));
+        writeU16(buf[pos..], @backingInt(cs));
         pos += 2;
     } else {
         // Offer both AES-128-GCM and ChaCha20-Poly1305
         writeU16(buf[pos..], 4);
         pos += 2;
-        writeU16(buf[pos..], @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256));
+        writeU16(buf[pos..], @backingInt(tls.CipherSuite.AES_128_GCM_SHA256));
         pos += 2;
-        writeU16(buf[pos..], @intFromEnum(tls.CipherSuite.CHACHA20_POLY1305_SHA256));
+        writeU16(buf[pos..], @backingInt(tls.CipherSuite.CHACHA20_POLY1305_SHA256));
         pos += 2;
     }
 
@@ -3162,10 +3155,10 @@ fn buildClientHello(buf: []u8, params: ClientHelloParams) ![]const u8 {
     pos += 2; // extensions length placeholder
 
     // supported_versions extension
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.supported_versions), 3);
+    pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.supported_versions), 3);
     buf[pos] = 2; // list length
     pos += 1;
-    writeU16(buf[pos..], @intFromEnum(tls.ProtocolVersion.tls_1_3));
+    writeU16(buf[pos..], @backingInt(tls.ProtocolVersion.tls_1_3));
     pos += 2;
 
     // key_share extension: X25519 and/or P-256, or none to let the server pick
@@ -3177,38 +3170,38 @@ fn buildClientHello(buf: []u8, params: ClientHelloParams) ![]const u8 {
             .secp256r1 => params.p256_pub,
             else => continue,
         };
-        writeU16(buf[pos..], @intFromEnum(group));
+        writeU16(buf[pos..], @backingInt(group));
         writeU16(buf[pos + 2 ..], @intCast(key.len));
         @memcpy(buf[pos + 4 ..][0..key.len], key);
         pos += 4 + key.len;
     }
     const shares_total: u16 = @intCast(pos - ks_at - 6);
-    _ = writeExtHeader(buf, ks_at, @intFromEnum(tls.ExtensionType.key_share), 2 + shares_total);
+    _ = writeExtHeader(buf, ks_at, @backingInt(tls.ExtensionType.key_share), 2 + shares_total);
     writeU16(buf[ks_at + 4 ..], shares_total);
 
     // signature_algorithms extension
     const sig_list_len: u16 = 2 * client_signature_schemes.len;
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.signature_algorithms), 2 + sig_list_len);
+    pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.signature_algorithms), 2 + sig_list_len);
     writeU16(buf[pos..], sig_list_len);
     pos += 2;
     for (client_signature_schemes) |scheme| {
-        writeU16(buf[pos..], @intFromEnum(scheme));
+        writeU16(buf[pos..], @backingInt(scheme));
         pos += 2;
     }
 
     // supported_groups extension
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.supported_groups), 2 + 4);
+    pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.supported_groups), 2 + 4);
     writeU16(buf[pos..], 4); // list length (2 groups x 2 bytes)
     pos += 2;
-    writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.x25519));
+    writeU16(buf[pos..], @backingInt(tls.NamedGroup.x25519));
     pos += 2;
-    writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.secp256r1));
+    writeU16(buf[pos..], @backingInt(tls.NamedGroup.secp256r1));
     pos += 2;
 
     // SNI extension
     if (server_name) |sni| {
         const sni_ext_len = 2 + 1 + 2 + sni.len; // server_name_list_len + type + host_name_len + host_name
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.server_name), sni_ext_len);
+        pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.server_name), sni_ext_len);
         const list_len: u16 = @intCast(1 + 2 + sni.len);
         writeU16(buf[pos..], list_len);
         pos += 2;
@@ -3226,7 +3219,7 @@ fn buildClientHello(buf: []u8, params: ClientHelloParams) ![]const u8 {
         for (alpn_list) |proto| {
             alpn_total += 1 + proto.len;
         }
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation), 2 + alpn_total);
+        pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.application_layer_protocol_negotiation), 2 + alpn_total);
         writeU16(buf[pos..], @intCast(alpn_total));
         pos += 2;
         for (alpn_list) |proto| {
@@ -3238,21 +3231,21 @@ fn buildClientHello(buf: []u8, params: ClientHelloParams) ![]const u8 {
     }
 
     // QUIC transport parameters extension (pre-encoded)
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.quic_transport_parameters), tp_encoded_data.len);
+    pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.quic_transport_parameters), tp_encoded_data.len);
     @memcpy(buf[pos..][0..tp_encoded_data.len], tp_encoded_data);
     pos += tp_encoded_data.len;
 
     // psk_key_exchange_modes extension (type=45) — always included so
     // servers know we support session tickets and can send NewSessionTicket.
     // modes_list_len(1) + mode(1)=0x01 (psk_dhe_ke)
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.psk_key_exchange_modes), 2);
+    pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.psk_key_exchange_modes), 2);
     buf[pos] = 1; // modes list length
     pos += 1;
     buf[pos] = 0x01; // psk_dhe_ke
     pos += 1;
 
     if (params.cookie) |cookie| {
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.cookie), 2 + cookie.len);
+        pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.cookie), 2 + cookie.len);
         writeU16(buf[pos..], @intCast(cookie.len));
         @memcpy(buf[pos + 2 ..][0..cookie.len], cookie);
         pos += 2 + cookie.len;
@@ -3263,7 +3256,7 @@ fn buildClientHello(buf: []u8, params: ClientHelloParams) ![]const u8 {
         // early_data extension (RFC 8446 §4.2.10) — empty payload in ClientHello
         // Tells the server we intend to send 0-RTT data; never after a retry.
         if (params.retry_transcript == null) {
-            pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.early_data), 0);
+            pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.early_data), 0);
         }
 
         // pre_shared_key extension (type=41) - MUST be last
@@ -3282,7 +3275,7 @@ fn buildClientHello(buf: []u8, params: ClientHelloParams) ![]const u8 {
         const binders_len: u16 = 1 + 32;
         const psk_ext_total: u16 = 2 + identities_len + 2 + binders_len;
 
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.pre_shared_key), psk_ext_total);
+        pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.pre_shared_key), psk_ext_total);
 
         // Identities
         writeU16(buf[pos..], identities_len);
@@ -3308,7 +3301,7 @@ fn buildClientHello(buf: []u8, params: ClientHelloParams) ![]const u8 {
         writeU16(buf[ext_start..], ext_len);
 
         const body_len: u24 = @intCast(pos - 4);
-        buf[0] = @intFromEnum(tls.HandshakeType.client_hello);
+        buf[0] = @backingInt(tls.HandshakeType.client_hello);
         buf[1] = @intCast(body_len >> 16);
         buf[2] = @intCast((body_len >> 8) & 0xff);
         buf[3] = @intCast(body_len & 0xff);
@@ -3337,7 +3330,7 @@ fn buildClientHello(buf: []u8, params: ClientHelloParams) ![]const u8 {
 
     // Fill in message header
     const body_len: u24 = @intCast(pos - 4);
-    buf[0] = @intFromEnum(tls.HandshakeType.client_hello);
+    buf[0] = @backingInt(tls.HandshakeType.client_hello);
     buf[1] = @intCast(body_len >> 16);
     buf[2] = @intCast((body_len >> 8) & 0xff);
     buf[3] = @intCast(body_len & 0xff);
@@ -3374,7 +3367,7 @@ fn buildServerHello(
     }
 
     // cipher_suite (use negotiated from ClientHello)
-    writeU16(buf[pos..], @intFromEnum(cipher_suite));
+    writeU16(buf[pos..], @backingInt(cipher_suite));
     pos += 2;
 
     // compression_method
@@ -3386,20 +3379,20 @@ fn buildServerHello(
     pos += 2; // extensions length placeholder
 
     // supported_versions
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.supported_versions), 2);
-    writeU16(buf[pos..], @intFromEnum(tls.ProtocolVersion.tls_1_3));
+    pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.supported_versions), 2);
+    writeU16(buf[pos..], @backingInt(tls.ProtocolVersion.tls_1_3));
     pos += 2;
 
     // key_share: the server's share, or in a HelloRetryRequest (no share)
     // just the group it selects
     if (key_share_data.len == 0) {
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.key_share), 2);
-        writeU16(buf[pos..], @intFromEnum(key_share_group));
+        pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.key_share), 2);
+        writeU16(buf[pos..], @backingInt(key_share_group));
         pos += 2;
     } else {
         const ks_len: u16 = @intCast(2 + 2 + key_share_data.len);
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.key_share), ks_len);
-        writeU16(buf[pos..], @intFromEnum(key_share_group));
+        pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.key_share), ks_len);
+        writeU16(buf[pos..], @backingInt(key_share_group));
         pos += 2;
         writeU16(buf[pos..], @intCast(key_share_data.len));
         pos += 2;
@@ -3409,7 +3402,7 @@ fn buildServerHello(
 
     // pre_shared_key extension (selected_identity = 0)
     if (using_psk) {
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.pre_shared_key), 2);
+        pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.pre_shared_key), 2);
         writeU16(buf[pos..], 0); // selected_identity = 0
         pos += 2;
     }
@@ -3420,7 +3413,7 @@ fn buildServerHello(
 
     // Fill in message header
     const body_len: u24 = @intCast(pos - 4);
-    buf[0] = @intFromEnum(tls.HandshakeType.server_hello);
+    buf[0] = @backingInt(tls.HandshakeType.server_hello);
     buf[1] = @intCast(body_len >> 16);
     buf[2] = @intCast((body_len >> 8) & 0xff);
     buf[3] = @intCast(body_len & 0xff);
@@ -3446,7 +3439,7 @@ fn buildEncryptedExtensionsFromEncoded(
         for (alpn_list) |proto| {
             alpn_total += 1 + proto.len;
         }
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation), 2 + alpn_total);
+        pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.application_layer_protocol_negotiation), 2 + alpn_total);
         writeU16(buf[pos..], @intCast(alpn_total));
         pos += 2;
         for (alpn_list) |proto| {
@@ -3458,13 +3451,13 @@ fn buildEncryptedExtensionsFromEncoded(
     }
 
     // QUIC transport parameters (pre-encoded)
-    pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.quic_transport_parameters), tp_encoded_data.len);
+    pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.quic_transport_parameters), tp_encoded_data.len);
     @memcpy(buf[pos..][0..tp_encoded_data.len], tp_encoded_data);
     pos += tp_encoded_data.len;
 
     // early_data extension (empty payload in EE, per RFC 8446 §4.2.10)
     if (include_early_data) {
-        pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.early_data), 0);
+        pos = writeExtHeader(buf, pos, @backingInt(tls.ExtensionType.early_data), 0);
     }
 
     // Fill in extensions length
@@ -3473,7 +3466,7 @@ fn buildEncryptedExtensionsFromEncoded(
 
     // Fill in message header
     const body_len: u24 = @intCast(pos - 4);
-    buf[0] = @intFromEnum(tls.HandshakeType.encrypted_extensions);
+    buf[0] = @backingInt(tls.HandshakeType.encrypted_extensions);
     buf[1] = @intCast(body_len >> 16);
     buf[2] = @intCast((body_len >> 8) & 0xff);
     buf[3] = @intCast(body_len & 0xff);
@@ -3520,7 +3513,7 @@ fn buildCertificate(buf: []u8, cert_chain: []const []const u8) ![]const u8 {
 
     // Fill in message header
     const body_len: u24 = @intCast(pos - 4);
-    buf[0] = @intFromEnum(tls.HandshakeType.certificate);
+    buf[0] = @backingInt(tls.HandshakeType.certificate);
     buf[1] = @intCast(body_len >> 16);
     buf[2] = @intCast((body_len >> 8) & 0xff);
     buf[3] = @intCast(body_len & 0xff);
@@ -3583,7 +3576,7 @@ fn buildCertificateVerify(
 
     var sig_storage: [rsa.max_signature_len]u8 = undefined;
     const sig = try signCertificateVerify(scheme, private_key_bytes, &sign_content, &sig_storage);
-    const sig_algo: u16 = @intFromEnum(scheme);
+    const sig_algo: u16 = @backingInt(scheme);
     const sig_len = sig.len;
 
     // Build message
@@ -3601,7 +3594,7 @@ fn buildCertificateVerify(
 
     // Fill in message header
     const body_len: u24 = @intCast(pos - 4);
-    buf[0] = @intFromEnum(tls.HandshakeType.certificate_verify);
+    buf[0] = @backingInt(tls.HandshakeType.certificate_verify);
     buf[1] = @intCast(body_len >> 16);
     buf[2] = @intCast((body_len >> 8) & 0xff);
     buf[3] = @intCast(body_len & 0xff);
@@ -3941,10 +3934,10 @@ test "TranscriptHash: basic usage" {
 test "KeySchedule: derive-secret produces known output for zeros" {
     // Verify early_secret matches the known value
     var ks = KeySchedule.init();
-    const zero_key: [32]u8 = .{0} ** 32;
+    const zero_key: [32]u8 = @splat(0);
 
     // early_secret should be HKDF-Extract(salt=0x00, IKM=0x00*32)
-    const expected_early = HkdfSha256.extract(&(.{0} ** 1), &zero_key);
+    const expected_early = HkdfSha256.extract(&@as([1]u8, @splat(0)), &zero_key);
     try std.testing.expectEqualSlices(u8, &expected_early, &ks.early_secret);
 
     // Derive handshake with a fake shared secret and transcript
@@ -3955,17 +3948,17 @@ test "KeySchedule: derive-secret produces known output for zeros" {
     ks.deriveHandshakeSecrets(&fake_shared, fake_transcript);
 
     // Verify secrets are not all-zero (sanity check)
-    try std.testing.expect(!std.mem.eql(u8, &ks.client_handshake_traffic_secret, &(.{0} ** 32)));
-    try std.testing.expect(!std.mem.eql(u8, &ks.server_handshake_traffic_secret, &(.{0} ** 32)));
+    try std.testing.expect(!std.mem.eql(u8, &ks.client_handshake_traffic_secret, &@as([32]u8, @splat(0))));
+    try std.testing.expect(!std.mem.eql(u8, &ks.server_handshake_traffic_secret, &@as([32]u8, @splat(0))));
 
     // Derive app secrets
     ks.deriveAppSecrets(fake_transcript);
-    try std.testing.expect(!std.mem.eql(u8, &ks.client_app_traffic_secret, &(.{0} ** 32)));
+    try std.testing.expect(!std.mem.eql(u8, &ks.client_app_traffic_secret, &@as([32]u8, @splat(0))));
 }
 
 test "KeySchedule: finished verify_data" {
-    const secret: [32]u8 = .{0x42} ** 32;
-    const transcript: [32]u8 = .{0x01} ** 32;
+    const secret: [32]u8 = @splat(0x42);
+    const transcript: [32]u8 = @splat(0x01);
     const vd = KeySchedule.computeFinishedVerifyData(secret, transcript);
 
     // Verify it's deterministic
@@ -3973,7 +3966,7 @@ test "KeySchedule: finished verify_data" {
     try std.testing.expectEqualSlices(u8, &vd, &vd2);
 
     // Different inputs produce different output
-    const vd3 = KeySchedule.computeFinishedVerifyData(secret, .{0x02} ** 32);
+    const vd3 = KeySchedule.computeFinishedVerifyData(secret, @splat(0x02));
     try std.testing.expect(!std.mem.eql(u8, &vd, &vd3));
 }
 
@@ -4012,7 +4005,7 @@ test "buildClientHello: produces valid message" {
     });
 
     // Check message type
-    try std.testing.expectEqual(@as(u8, @intFromEnum(tls.HandshakeType.client_hello)), msg[0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(tls.HandshakeType.client_hello)), msg[0]);
 
     // Check length consistency
     const body_len = (@as(usize, msg[1]) << 16) | (@as(usize, msg[2]) << 8) | @as(usize, msg[3]);
@@ -4034,7 +4027,7 @@ test "buildServerHello: produces valid message" {
     var buf: [512]u8 = undefined;
     const msg = try buildServerHello(&buf, &random, .x25519, &pub_key, &client_random, false, .aes_128_gcm_sha256);
 
-    try std.testing.expectEqual(@as(u8, @intFromEnum(tls.HandshakeType.server_hello)), msg[0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(tls.HandshakeType.server_hello)), msg[0]);
     const body_len = (@as(usize, msg[1]) << 16) | (@as(usize, msg[2]) << 8) | @as(usize, msg[3]);
     try std.testing.expectEqual(msg.len - 4, body_len);
 }
@@ -4166,7 +4159,7 @@ fn driveLoopback(client: *Tls13Handshake, server: *Tls13Handshake) !void {
 
 // PSK binder computation test
 test "PSK binder computation: deterministic and correct" {
-    const psk: [32]u8 = .{0x42} ** 32;
+    const psk: [32]u8 = @splat(0x42);
     var ks = KeySchedule.initWithPsk(psk);
 
     // early_secret should differ from zero-PSK init
@@ -4179,7 +4172,7 @@ test "PSK binder computation: deterministic and correct" {
     const binder_key = quic_crypto.hkdfExpandLabel(ks.early_secret, "res binder", &empty_hash, 32);
 
     // Compute binder for a fake partial transcript
-    const fake_transcript: [32]u8 = .{0x01} ** 32;
+    const fake_transcript: [32]u8 = @splat(0x01);
     const binder = KeySchedule.computeFinishedVerifyData(binder_key, fake_transcript);
 
     // Deterministic
@@ -4187,25 +4180,25 @@ test "PSK binder computation: deterministic and correct" {
     try std.testing.expectEqualSlices(u8, &binder, &binder2);
 
     // Different transcript produces different binder
-    const binder3 = KeySchedule.computeFinishedVerifyData(binder_key, .{0x02} ** 32);
+    const binder3 = KeySchedule.computeFinishedVerifyData(binder_key, @splat(0x02));
     try std.testing.expect(!std.mem.eql(u8, &binder, &binder3));
 }
 
 // Early key derivation test
 test "early key derivation: client_early_traffic_secret from PSK" {
-    const psk: [32]u8 = .{0xAA} ** 32;
+    const psk: [32]u8 = @splat(0xAA);
     var ks = KeySchedule.initWithPsk(psk);
 
-    const transcript: [32]u8 = .{0xBB} ** 32;
+    const transcript: [32]u8 = @splat(0xBB);
     ks.deriveEarlyDataSecret(transcript);
 
     // Should produce a non-zero secret
-    try std.testing.expect(!std.mem.eql(u8, &ks.client_early_traffic_secret, &(.{0} ** 32)));
+    try std.testing.expect(!std.mem.eql(u8, &ks.client_early_traffic_secret, &@as([32]u8, @splat(0))));
 
     // Derive QUIC keys from early traffic secret
     const keys = KeySchedule.deriveQuicKeys(ks.client_early_traffic_secret);
-    try std.testing.expect(!std.mem.eql(u8, &keys.key, &(.{0} ** 16)));
-    try std.testing.expect(!std.mem.eql(u8, &keys.iv, &(.{0} ** 12)));
+    try std.testing.expect(!std.mem.eql(u8, &keys.key, &@as([16]u8, @splat(0))));
+    try std.testing.expect(!std.mem.eql(u8, &keys.iv, &@as([12]u8, @splat(0))));
 }
 
 // Loopback PSK resumption test: full handshake → ticket → PSK handshake
@@ -4411,13 +4404,13 @@ test "server: a PSK identity longer than any ticket we issue falls back to a ful
 /// A ServerHello choosing x25519 and TLS_AES_128_GCM_SHA256, followed by
 /// `extra` extensions, with `ext_len` written as the extensions' length.
 fn testServerHello(buf: []u8, extra: []const u8, ext_len: ?u16) []const u8 {
-    const pub_key = X25519.recoverPublicKey(@splat(5)) catch unreachable;
+    const pub_key = X25519.recoverPublicKey(@splat(5));
     var w = io.fixedBufferStream(buf);
     const exts_len: u16 = @intCast(6 + 4 + 4 + 32 + extra.len);
     const body_len: u24 = @intCast(2 + 32 + 1 + 2 + 1 + 2 + exts_len);
-    w.writeByte(@intFromEnum(tls.HandshakeType.server_hello)) catch unreachable;
+    w.writeByte(@backingInt(tls.HandshakeType.server_hello)) catch unreachable;
     w.writeInt(u24, body_len, .big) catch unreachable;
-    w.writeAll(&([_]u8{ 0x03, 0x03 } ++ [_]u8{0x11} ** 32 ++ [_]u8{ 0, 0x13, 0x01, 0 })) catch unreachable;
+    w.writeAll(&([_]u8{ 0x03, 0x03 } ++ @as([32]u8, @splat(0x11)) ++ [_]u8{ 0, 0x13, 0x01, 0 })) catch unreachable;
     w.writeInt(u16, ext_len orelse exts_len, .big) catch unreachable;
     w.writeAll(&.{ 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04 }) catch unreachable; // supported_versions: TLS 1.3
     w.writeAll(&.{ 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 }) catch unreachable; // key_share: x25519
@@ -4533,8 +4526,8 @@ test "server: tickets from one key never share a keystream" {
 
 // NewSessionTicket roundtrip test
 test "NewSessionTicket: build and parse roundtrip" {
-    const psk: [32]u8 = .{0x55} ** 32;
-    const ticket_data = [_]u8{0xAA} ** 64;
+    const psk: [32]u8 = @splat(0x55);
+    const ticket_data: [64]u8 = @splat(0xAA);
 
     // Build a SessionTicket manually
     var original = SessionTicket{ .psk = psk };
@@ -4668,7 +4661,7 @@ test "client answers a CertificateRequest with an empty Certificate" {
 
     try std.testing.expectEqual(@as(usize, 8 + 36), out.len);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x0b, 0, 0, 4, 0, 0, 0, 0 }, out[0..8]);
-    try std.testing.expectEqual(@intFromEnum(tls.HandshakeType.finished), out[8]);
+    try std.testing.expectEqual(@backingInt(tls.HandshakeType.finished), out[8]);
 }
 
 test "client: an empty Certificate from the server ends the handshake" {
@@ -4699,7 +4692,7 @@ test "client: verification is on unless turned off, and fails closed without an 
     var msg_buf: [4200]u8 = undefined;
     const list_len = 3 + leaf.len + 2;
     const body_len = 1 + 3 + list_len;
-    msg_buf[0] = @intFromEnum(tls.HandshakeType.certificate);
+    msg_buf[0] = @backingInt(tls.HandshakeType.certificate);
     std.mem.writeInt(u24, msg_buf[1..4], @intCast(body_len), .big);
     msg_buf[4] = 0;
     std.mem.writeInt(u24, msg_buf[5..8], @intCast(list_len), .big);
@@ -4786,10 +4779,11 @@ test "the *Into constructors leave no bool to chance" {
             Tls13Handshake.initClientInto(hs, config, .{});
         }
 
-        inline for (@typeInfo(Tls13Handshake).@"struct".fields) |f| {
-            if (f.type == bool and !std.mem.eql(u8, f.name, "is_server")) {
-                if (comptime f.defaultValue()) |dflt| {
-                    try std.testing.expectEqual(dflt, @field(hs, f.name));
+        const info = @typeInfo(Tls13Handshake).@"struct";
+        inline for (info.field_names, info.field_types, info.field_attrs) |f_name, f_type, f_attrs| {
+            if (f_type == bool and !std.mem.eql(u8, f_name, "is_server")) {
+                if (comptime f_attrs.defaultValue(f_type)) |dflt| {
+                    try std.testing.expectEqual(dflt, @field(hs, f_name));
                 }
             }
         }
@@ -5087,7 +5081,7 @@ fn serverAnswer(cert: ServerCertificate, schemes: ?[6]tls.SignatureScheme) !void
     @memcpy(msg, ch);
     const at = std.mem.indexOf(u8, msg, &.{ 0x00, 0x0d, 0x00, 0x0e, 0x00, 0x0c }).?;
     if (schemes) |list| {
-        for (list, 0..) |scheme, i| std.mem.writeInt(u16, msg[at + 6 + 2 * i ..][0..2], @intFromEnum(scheme), .big);
+        for (list, 0..) |scheme, i| std.mem.writeInt(u16, msg[at + 6 + 2 * i ..][0..2], @backingInt(scheme), .big);
     } else {
         msg[at + 1] = 0xfa; // an unassigned extension type
     }
@@ -5358,7 +5352,7 @@ fn helloExtension(msg: []const u8, ext: tls.ExtensionType, server_hello: bool) ?
     pos += 2;
     while (pos + 4 <= end) {
         const len = readU16(msg[pos + 2 ..]);
-        if (readU16(msg[pos..]) == @intFromEnum(ext)) return pos + 4;
+        if (readU16(msg[pos..]) == @backingInt(ext)) return pos + 4;
         pos += 4 + len;
     }
     return null;
@@ -5406,11 +5400,11 @@ test "server: a ClientHello with no share in a group it supports gets a HelloRet
 
     var server: Tls13Handshake = undefined;
     const hrr = try testServerAnswer(&server, &certs, ch);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(tls.HandshakeType.server_hello)), hrr[0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(tls.HandshakeType.server_hello)), hrr[0]);
     try std.testing.expectEqualSlices(u8, &tls.hello_retry_request_sequence, hrr[6..38]);
     const sel = helloExtension(hrr, .key_share, true).?;
     try std.testing.expectEqual(@as(u16, 2), readU16(hrr[sel - 2 ..]));
-    try std.testing.expectEqual(@as(u16, @intFromEnum(tls.NamedGroup.x25519)), readU16(hrr[sel..]));
+    try std.testing.expectEqual(@as(u16, @backingInt(tls.NamedGroup.x25519)), readU16(hrr[sel..]));
 }
 
 test "server: a ClientHello with no group in common still fails" {
@@ -5498,9 +5492,9 @@ test "client: offers ecdsa_secp384r1_sha384, and takes a P-384 CertificateVerify
     const der = (try kp.sign(&content, null)).toDer(&der_buf);
 
     var cv: [8 + P384.Signature.der_encoded_length_max]u8 = undefined;
-    cv[0] = @intFromEnum(tls.HandshakeType.certificate_verify);
+    cv[0] = @backingInt(tls.HandshakeType.certificate_verify);
     std.mem.writeInt(u24, cv[1..4], @intCast(4 + der.len), .big);
-    writeU16(cv[4..], @intFromEnum(tls.SignatureScheme.ecdsa_secp384r1_sha384));
+    writeU16(cv[4..], @backingInt(tls.SignatureScheme.ecdsa_secp384r1_sha384));
     writeU16(cv[6..], @intCast(der.len));
     @memcpy(cv[8..][0..der.len], der);
     client.provideData(cv[0 .. 8 + der.len]);

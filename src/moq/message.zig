@@ -274,7 +274,7 @@ pub const Filter = struct {
 
     fn encode(self: Filter, buf: []u8) ![]const u8 {
         var fbs = io.fixedBufferStream(buf);
-        try wire.writeVarInt(&fbs, @intFromEnum(self.type));
+        try wire.writeVarInt(&fbs, @backingInt(self.type));
         if (self.start) |l| {
             try wire.writeVarInt(&fbs, l.group);
             try wire.writeVarInt(&fbs, l.object);
@@ -388,7 +388,7 @@ pub const Subscribe = struct {
             n += 1;
         }
         if (self.group_order) |v| {
-            out[n] = .{ .type = ParamType.GROUP_ORDER, .value = .{ .uint8 = @intFromEnum(v) } };
+            out[n] = .{ .type = ParamType.GROUP_ORDER, .value = .{ .uint8 = @backingInt(v) } };
             n += 1;
         }
         return out[0..n];
@@ -743,7 +743,7 @@ pub fn writeFetch(writer: anytype, f: Fetch, draft: version.Draft) !void {
     if (version.Rules.of(draft).required_request_id_delta) {
         try wire.writeVarInt(w, f.required_request_id_delta);
     }
-    try wire.writeVarInt(w, @intFromEnum(std.meta.activeTag(f.body)));
+    try wire.writeVarInt(w, @backingInt(std.meta.activeTag(f.body)));
     switch (f.body) {
         .standalone => |s| {
             try wire.writeTuple(w, s.track_namespace);
@@ -766,7 +766,7 @@ pub fn writeFetch(writer: anytype, f: Fetch, draft: version.Draft) !void {
         n += 1;
     }
     if (f.group_order) |v| {
-        params[n] = .{ .type = ParamType.GROUP_ORDER, .value = .{ .uint8 = @intFromEnum(v) } };
+        params[n] = .{ .type = ParamType.GROUP_ORDER, .value = .{ .uint8 = @backingInt(v) } };
         n += 1;
     }
     try writeParams(w, params[0..n]);
@@ -945,7 +945,7 @@ fn writeSubscribeNamespaceLike(writer: anytype, msg_type: u64, s: SubscribeNames
     try wire.writeVarInt(w, s.request_id);
     if (rules.required_request_id_delta) try wire.writeVarInt(w, s.required_request_id_delta);
     try wire.writeTuple(w, s.track_namespace_prefix);
-    if (rules.subscribe_namespace_options) try wire.writeVarInt(w, @intFromEnum(s.options));
+    if (rules.subscribe_namespace_options) try wire.writeVarInt(w, @backingInt(s.options));
 
     var params: [MAX_PARAMS]Param = undefined;
     var n: usize = 0;
@@ -1423,7 +1423,7 @@ test "PUBLISH_NAMESPACE has the request id, delta and parameter count" {
 test "a namespace has 1 to 32 fields and at most 4096 bytes" {
     // An empty one prefixes every namespace: a relay took it for a
     // wildcard owner of all of them.
-    const long = "x" ** 2049;
+    const long = &@as([2049]u8, @splat('x'));
     const cases = [_][]const []const u8{ &.{}, &.{ long, long } };
     var buf: [8192]u8 = undefined;
     var ns_buf: NamespaceBuf = undefined;
@@ -1543,9 +1543,9 @@ test "an undefined Subscription Filter type is a protocol violation, not a reque
     // private "LargestGroup", which §5.1.2 does not define
     // (facebookexperimental/moxygen#225).
     const payload = [_]u8{
-        0x00, 0x01, 0x0b, 'n',  'o',  'n',  'e',  'x',  'i', 's', 't',
-        'e',  'n',  't',  0x0d, 'n',  'o',  '-',  's',  'u', 'c', 'h',
-        '-',  't',  'r',  'a',  'c',  'k',  0x01, 0x21, 0x02, 0x80, 0xfa,
+        0x00, 0x01, 0x0b, 'n',  'o', 'n', 'e',  'x',  'i',  's',  't',
+        'e',  'n',  't',  0x0d, 'n', 'o', '-',  's',  'u',  'c',  'h',
+        '-',  't',  'r',  'a',  'c', 'k', 0x01, 0x21, 0x02, 0x80, 0xfa,
     };
     var ns_buf: NamespaceBuf = undefined;
     try testing.expectError(

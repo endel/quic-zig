@@ -70,7 +70,7 @@ pub fn write(writer: anytype, capsule_type: u64, value: []const u8) !void {
 
 /// Write a DATAGRAM capsule (type 0x00) containing an HTTP Datagram Payload.
 pub fn writeDatagram(writer: anytype, payload: []const u8) !void {
-    try write(writer, @intFromEnum(CapsuleType.datagram), payload);
+    try write(writer, @backingInt(CapsuleType.datagram), payload);
 }
 
 /// Iterator that parses sequential capsules from a byte buffer.

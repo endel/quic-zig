@@ -30,7 +30,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       # interop/runner/Dockerfile packages pre-built binaries; its COPY paths
       # are relative to the staging dir, as in interop/runner/build_image.sh.

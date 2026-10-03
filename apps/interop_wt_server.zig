@@ -79,7 +79,7 @@ const ConnState = struct {
             .bidi_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(alloc),
             .uni_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(alloc),
             .pending_gets = std.AutoHashMap(u64, []const u8).init(alloc),
-            .pending_dgram_replies = .{ .items = &.{}, .capacity = 0 },
+            .pending_dgram_replies = .empty,
         };
     }
 
@@ -137,7 +137,7 @@ pub fn main(_: std.process.Init.Minimal) !void {
     }
 
     // Parse server protocols
-    var server_protocols: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
+    var server_protocols: std.ArrayList([]const u8) = .empty;
     {
         var it = mem.splitScalar(u8, protocols_str, ' ');
         while (it.next()) |p| {
@@ -146,7 +146,7 @@ pub fn main(_: std.process.Init.Minimal) !void {
     }
 
     // Parse request file paths (for *-send tests)
-    var request_paths: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
+    var request_paths: std.ArrayList([]const u8) = .empty;
     {
         var it = mem.splitScalar(u8, requests_str, ' ');
         while (it.next()) |p| {
@@ -485,7 +485,7 @@ fn pollWtEvents(
                     };
                     wt.closeStream(stream_id);
                     // Track this bidi stream for reading response
-                    state.bidi_bufs.put(stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 }) catch {};
+                    state.bidi_bufs.put(stream_id, .empty) catch {};
                     state.pending_gets.put(stream_id, filename) catch {};
                     std.log.info("sent GET {s} on bidi stream {d}", .{ filename, stream_id });
                 }
@@ -590,12 +590,12 @@ fn pollWtEvents(
             .bidi_stream => |bs| {
                 std.log.info("WT bidi stream: session_id={d}, stream_id={d}", .{ bs.session_id, bs.stream_id });
                 // Register for data tracking
-                state.bidi_bufs.put(bs.stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 }) catch {};
+                state.bidi_bufs.put(bs.stream_id, .empty) catch {};
             },
 
             .uni_stream => |us| {
                 std.log.info("WT uni stream: session_id={d}, stream_id={d}", .{ us.session_id, us.stream_id });
-                state.uni_bufs.put(us.stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 }) catch {};
+                state.uni_bufs.put(us.stream_id, .empty) catch {};
             },
 
             .stream_data => |sd| {

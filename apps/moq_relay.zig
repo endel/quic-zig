@@ -112,11 +112,11 @@ const Track = struct {
     /// Moves on whenever the slot's publication changes, reuse included: a
     /// data stream feeds the cache only while the one it began in stands.
     gen: u32 = 0,
-    subs: [MAX_SUBS_PER_TRACK]Sub = [_]Sub{.{}} ** MAX_SUBS_PER_TRACK,
+    subs: [MAX_SUBS_PER_TRACK]Sub = @splat(.{}),
     sub_count: usize = 0,
 
     // Completed groups cached for late subscribers.
-    cached: [N_CACHED_GROUPS]CachedGroup = [_]CachedGroup{.{}} ** N_CACHED_GROUPS,
+    cached: [N_CACHED_GROUPS]CachedGroup = @splat(.{}),
     next_cache_idx: usize = 0,
     // The live group being assembled from the publisher's current stream.
     live: CachedGroup = .{},
@@ -235,10 +235,10 @@ const Client = struct {
     next_alias: u64 = 1,
     /// Requests the relay originates: odd, as the server's are.
     next_request_id: u64 = 1,
-    stream_ids: [MAX_STREAMS_PER_CLIENT]u64 = [_]u64{std.math.maxInt(u64)} ** MAX_STREAMS_PER_CLIENT,
-    stream_roles: [MAX_STREAMS_PER_CLIENT]StreamRole = [_]StreamRole{.unknown} ** MAX_STREAMS_PER_CLIENT,
-    stream_bufs: [MAX_STREAMS_PER_CLIENT]StreamBuf = [_]StreamBuf{.{}} ** MAX_STREAMS_PER_CLIENT,
-    fwd_states: [MAX_STREAMS_PER_CLIENT]FwdState = [_]FwdState{.{}} ** MAX_STREAMS_PER_CLIENT,
+    stream_ids: [MAX_STREAMS_PER_CLIENT]u64 = @splat(std.math.maxInt(u64)),
+    stream_roles: [MAX_STREAMS_PER_CLIENT]StreamRole = @splat(.unknown),
+    stream_bufs: [MAX_STREAMS_PER_CLIENT]StreamBuf = @splat(.{}),
+    fwd_states: [MAX_STREAMS_PER_CLIENT]FwdState = @splat(.{}),
 
     fn slotOf(self: *const Client, sid: u64) ?usize {
         return std.mem.indexOfScalar(u64, &self.stream_ids, sid);
@@ -311,8 +311,8 @@ const FwdState = struct {
     forwarded_pos: usize = 0, // byte offset in publisher stream (after subgroup header)
     track_idx: ?usize = null,
     track_gen: u32 = 0,
-    out_stream_ids: [MAX_SUBS_PER_TRACK]u64 = [_]u64{0} ** MAX_SUBS_PER_TRACK,
-    out_sub_idx: [MAX_SUBS_PER_TRACK]usize = [_]usize{0} ** MAX_SUBS_PER_TRACK,
+    out_stream_ids: [MAX_SUBS_PER_TRACK]u64 = @splat(0),
+    out_sub_idx: [MAX_SUBS_PER_TRACK]usize = @splat(0),
     out_count: usize = 0,
 };
 
@@ -372,12 +372,12 @@ const RelayHandler = struct {
     /// wakes on peer traffic.
     pub const poll_interval_ms: u64 = 50;
 
-    clients: [MAX_CLIENTS]Client = [_]Client{.{}} ** MAX_CLIENTS,
-    tracks: [MAX_TRACKS]Track = [_]Track{.{}} ** MAX_TRACKS,
+    clients: [MAX_CLIENTS]Client = @splat(.{}),
+    tracks: [MAX_TRACKS]Track = @splat(.{}),
     track_count: usize = 0,
-    namespaces: [MAX_NAMESPACES]AnnouncedNamespace = [_]AnnouncedNamespace{.{}} ** MAX_NAMESPACES,
-    pending: [MAX_PENDING_SUBS]PendingSub = [_]PendingSub{.{}} ** MAX_PENDING_SUBS,
-    ns_subs: [MAX_NAMESPACE_SUBS]NamespaceSub = [_]NamespaceSub{.{}} ** MAX_NAMESPACE_SUBS,
+    namespaces: [MAX_NAMESPACES]AnnouncedNamespace = @splat(.{}),
+    pending: [MAX_PENDING_SUBS]PendingSub = @splat(.{}),
+    ns_subs: [MAX_NAMESPACE_SUBS]NamespaceSub = @splat(.{}),
     ns_seq: u64 = 0,
 
     /// The loop frees the connection right after this fires, so the entry
@@ -543,7 +543,9 @@ const RelayHandler = struct {
 
         const ci = self.findOrCreateClient(session.entry) orelse {
             var live: usize = 0;
-            for (&self.clients) |*c| { if (c.active) live += 1; }
+            for (&self.clients) |*c| {
+                if (c.active) live += 1;
+            }
             std.debug.print("[relay] client table full ({d} active); refusing session\n", .{live});
             session.closeSession(session_id);
             return;

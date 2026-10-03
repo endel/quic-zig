@@ -361,8 +361,8 @@ test "PSS signatures verify with std's verifier, for every TLS hash" {
     inline for (.{ Sha256, Sha384, Sha512 }) |H| {
         const s = try key.signPss(H, "message", &sig);
         try testing.expectEqual(256, s.len);
-        try Certificate.rsa.PSSSignature.verify(256, s[0..256].*, "message", public, H);
-        try testing.expectError(error.InvalidSignature, Certificate.rsa.PSSSignature.verify(256, s[0..256].*, "massage", public, H));
+        try Certificate.rsa.PSSSignature.verify(256, s[0..256], "message", public, H);
+        try testing.expectError(error.InvalidSignature, Certificate.rsa.PSSSignature.verify(256, s[0..256], "massage", public, H));
     }
 }
 

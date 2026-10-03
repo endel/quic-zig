@@ -202,7 +202,7 @@ pub fn main() !void {
     var x25519_secret: [32]u8 = undefined;
     var x25519_public: [32]u8 = undefined;
     sys.randomBytes(&x25519_secret);
-    x25519_public = X25519.recoverPublicKey(x25519_secret) catch unreachable;
+    x25519_public = X25519.recoverPublicKey(x25519_secret);
 
     // AES-128-GCM
     var aes_key: [16]u8 = undefined;

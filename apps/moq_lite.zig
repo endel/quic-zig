@@ -393,7 +393,7 @@ fn Server(comptime proto: event_loop.Protocol) type {
 
         broadcast: []const u8 = "clock",
         track: []const u8 = "clock",
-        clients: [MAX_CLIENTS]ClientState = [_]ClientState{.{}} ** MAX_CLIENTS,
+        clients: [MAX_CLIENTS]ClientState = @splat(.{}),
         cur: ?*event_loop.Session = null,
         cur_idx: usize = 0,
 

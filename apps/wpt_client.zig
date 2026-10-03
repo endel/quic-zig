@@ -59,9 +59,9 @@ const Scenario = enum {
 
     fn fromId(id: []const u8) ?Scenario {
         var buf: [64]u8 = undefined;
-        inline for (@typeInfo(Scenario).@"enum".fields) |f| {
-            const candidate = @field(Scenario, f.name).idOf(&buf);
-            if (std.mem.eql(u8, candidate, id)) return @field(Scenario, f.name);
+        inline for (@typeInfo(Scenario).@"enum".field_names) |f_name| {
+            const candidate = @field(Scenario, f_name).idOf(&buf);
+            if (std.mem.eql(u8, candidate, id)) return @field(Scenario, f_name);
         }
         return null;
     }
@@ -463,7 +463,7 @@ const Runner = struct {
                 if (self.uni_done.items.len < 5) return;
                 // WebTransport gives no ordering guarantee across streams, so
                 // check the set, not the sequence.
-                var seen = [_]bool{false} ** 5;
+                var seen: [5]bool = @splat(false);
                 for (self.uni_done.items) |p| {
                     for (0..5) |i| {
                         var want: [16]u8 = undefined;
@@ -526,7 +526,6 @@ const Runner = struct {
         }
         self.pass("ok ({d}B)", .{got.len});
     }
-
 };
 
 fn isUni(stream_id: u64) bool {

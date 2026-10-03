@@ -365,53 +365,53 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
             const sw = &sfbs;
 
             // Always write qpack settings (even if 0, to be explicit)
-            try packet.writeVarInt(sw, @intFromEnum(SettingsId.qpack_max_table_capacity));
+            try packet.writeVarInt(sw, @backingInt(SettingsId.qpack_max_table_capacity));
             try packet.writeVarInt(sw, s.qpack_max_table_capacity);
 
-            try packet.writeVarInt(sw, @intFromEnum(SettingsId.qpack_blocked_streams));
+            try packet.writeVarInt(sw, @backingInt(SettingsId.qpack_blocked_streams));
             try packet.writeVarInt(sw, s.qpack_blocked_streams);
 
             if (s.max_field_section_size) |max_size| {
-                try packet.writeVarInt(sw, @intFromEnum(SettingsId.max_field_section_size));
+                try packet.writeVarInt(sw, @backingInt(SettingsId.max_field_section_size));
                 try packet.writeVarInt(sw, max_size);
             }
 
             if (s.enable_connect_protocol) {
-                try packet.writeVarInt(sw, @intFromEnum(SettingsId.enable_connect_protocol));
+                try packet.writeVarInt(sw, @backingInt(SettingsId.enable_connect_protocol));
                 try packet.writeVarInt(sw, 1);
             }
 
             if (s.h3_datagram) {
-                try packet.writeVarInt(sw, @intFromEnum(SettingsId.h3_datagram));
+                try packet.writeVarInt(sw, @backingInt(SettingsId.h3_datagram));
                 try packet.writeVarInt(sw, 1);
             }
 
             if (s.enable_webtransport) {
-                try packet.writeVarInt(sw, @intFromEnum(SettingsId.enable_webtransport));
+                try packet.writeVarInt(sw, @backingInt(SettingsId.enable_webtransport));
                 try packet.writeVarInt(sw, 1);
-                try packet.writeVarInt(sw, @intFromEnum(SettingsId.wt_enabled));
+                try packet.writeVarInt(sw, @backingInt(SettingsId.wt_enabled));
                 try packet.writeVarInt(sw, 1);
             }
             if (s.webtransport_max_sessions) |max_sessions| {
-                try packet.writeVarInt(sw, @intFromEnum(SettingsId.webtransport_max_sessions));
+                try packet.writeVarInt(sw, @backingInt(SettingsId.webtransport_max_sessions));
                 try packet.writeVarInt(sw, max_sessions);
             }
             if (s.wt_max_sessions_v13) |max_sessions| {
-                try packet.writeVarInt(sw, @intFromEnum(SettingsId.wt_max_sessions_v13));
+                try packet.writeVarInt(sw, @backingInt(SettingsId.wt_max_sessions_v13));
                 try packet.writeVarInt(sw, max_sessions);
             }
             // draft-13 §9.2 per-session WT credits. Default 0 = peer refuses to
             // open WT streams / send bytes. Required for Safari 26.4 bidi.
             if (s.wt_initial_max_data) |n| {
-                try packet.writeVarInt(sw, @intFromEnum(SettingsId.wt_initial_max_data));
+                try packet.writeVarInt(sw, @backingInt(SettingsId.wt_initial_max_data));
                 try packet.writeVarInt(sw, n);
             }
             if (s.wt_initial_max_streams_bidi) |n| {
-                try packet.writeVarInt(sw, @intFromEnum(SettingsId.wt_initial_max_streams_bidi));
+                try packet.writeVarInt(sw, @backingInt(SettingsId.wt_initial_max_streams_bidi));
                 try packet.writeVarInt(sw, n);
             }
             if (s.wt_initial_max_streams_uni) |n| {
-                try packet.writeVarInt(sw, @intFromEnum(SettingsId.wt_initial_max_streams_uni));
+                try packet.writeVarInt(sw, @backingInt(SettingsId.wt_initial_max_streams_uni));
                 try packet.writeVarInt(sw, n);
             }
 
@@ -490,7 +490,7 @@ pub fn write(frame: H3Frame, writer: anytype) !void {
 
 /// Type + length + one varint: the shape every §5.6 flow control capsule has.
 fn writeVarIntCapsule(writer: anytype, capsule: H3FrameType, value: u64) !void {
-    try packet.writeVarInt(writer, @intFromEnum(capsule));
+    try packet.writeVarInt(writer, @backingInt(capsule));
     try packet.writeVarInt(writer, packet.varIntLength(value));
     try packet.writeVarInt(writer, value);
 }
@@ -506,7 +506,7 @@ pub fn consumeFromBuf(buf: *std.ArrayList(u8), n: usize) void {
 
 /// Write a uni stream type byte to a writer.
 pub fn writeUniStreamType(writer: anytype, stream_type: UniStreamType) !void {
-    try packet.writeVarInt(writer, @intFromEnum(stream_type));
+    try packet.writeVarInt(writer, @backingInt(stream_type));
 }
 
 /// Read a uni stream type from a reader.

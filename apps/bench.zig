@@ -389,9 +389,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     std.debug.print("quic-zig bench: {d} conn × {d} req, {s} → 127.0.0.1:{d}\n", .{
-        config.num_connections, config.requests_per_conn,
-        if (config.zerortt) @as([]const u8, "0-RTT") else @as([]const u8, "1-RTT"),
-        config.port,
+        config.num_connections,                                                     config.requests_per_conn,
+        if (config.zerortt) @as([]const u8, "0-RTT") else @as([]const u8, "1-RTT"), config.port,
     });
 
     try runBench(alloc, config);

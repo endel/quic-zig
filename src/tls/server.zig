@@ -470,7 +470,7 @@ pub const Conn = struct {
 
     fn handleAlert(self: *Conn, payload: []const u8) Error!void {
         if (payload.len != 2) return error.DecodeError;
-        const desc: tls.Alert.Description = @enumFromInt(payload[1]);
+        const desc: tls.Alert.Description = @fromBackingInt(@intCast(payload[1]));
         switch (desc) {
             .close_notify => self.peer_closed = true,
             .user_canceled => {},
@@ -520,7 +520,7 @@ pub const Conn = struct {
     }
 
     fn queueAlert(self: *Conn, level: tls.Alert.Level, desc: tls.Alert.Description) Error!void {
-        const body = [2]u8{ @intFromEnum(level), @intFromEnum(desc) };
+        const body = [2]u8{ @backingInt(level), @backingInt(desc) };
         if (self.write_keys != null) {
             try self.sealRecord(.alert, &body);
         } else {
@@ -610,11 +610,11 @@ pub const Conn = struct {
 
         if (retry) {
             // RFC 8446 §4.1.4: the suite in the HelloRetryRequest stands.
-            if (!containsU16(ch.cipher_suites, @intFromEnum(self.suite))) return error.IllegalParameter;
+            if (!containsU16(ch.cipher_suites, @backingInt(self.suite))) return error.IllegalParameter;
             if (ch.cookie) return error.IllegalParameter; // we never send one
         } else {
             self.suite = for (config.cipher_suites) |cs| {
-                if (containsU16(ch.cipher_suites, @intFromEnum(cs))) break cs;
+                if (containsU16(ch.cipher_suites, @backingInt(cs))) break cs;
             } else return error.HandshakeFailure;
         }
 
@@ -646,7 +646,7 @@ pub const Conn = struct {
         const share = chosen orelse {
             if (retry) return error.IllegalParameter;
             const g = for (config.groups) |g| {
-                if (containsU16(client_groups, @intFromEnum(g))) break g;
+                if (containsU16(client_groups, @backingInt(g))) break g;
             } else return error.HandshakeFailure;
             return self.sendHelloRetryRequest(msg, ch, g);
         };
@@ -979,7 +979,7 @@ fn keyExchange(share: KeyShare, shared: *[32]u8, public_buf: *[65]u8) Error![]co
             if (share.key.len != X25519.public_length) return error.IllegalParameter;
             var seed: [X25519.seed_length]u8 = undefined;
             sys.randomBytes(&seed);
-            const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.InternalError;
+            const kp = X25519.KeyPair.generateDeterministic(seed);
             crypto.secureZero(u8, &seed);
             shared.* = X25519.scalarmult(kp.secret_key, share.key[0..32].*) catch return error.IllegalParameter;
             public_buf[0..32].* = kp.public_key;
@@ -1124,7 +1124,7 @@ fn findKeyShare(shares: []const u8, group: Group) ?KeyShare {
     while (p.rest() > 0) {
         const g = p.int(u16) catch return null;
         const key = p.vec(u16) catch return null;
-        if (g == @intFromEnum(group)) return .{ .group = group, .key = key };
+        if (g == @backingInt(group)) return .{ .group = group, .key = key };
     }
     return null;
 }
@@ -1153,7 +1153,7 @@ fn sealTicket(key: [16]u8, t: Ticket, out: *[max_ticket_len]u8) []const u8 {
     var n: usize = 0;
     plain[n] = ticket_version;
     n += 1;
-    mem.writeInt(u16, plain[n..][0..2], @intFromEnum(t.suite), .big);
+    mem.writeInt(u16, plain[n..][0..2], @backingInt(t.suite), .big);
     n += 2;
     mem.writeInt(i64, plain[n..][0..8], t.issued_s, .big);
     n += 8;
@@ -1201,7 +1201,7 @@ fn buildServerHello(b: *Builder, random: [32]u8, session_id: []const u8, suite: 
     try b.bytes(&random);
     try b.u8_(@intCast(session_id.len));
     try b.bytes(session_id);
-    try b.u16_(@intFromEnum(suite));
+    try b.u16_(@backingInt(suite));
     try b.u8_(0);
     const exts = try b.begin(u16);
     try b.u16_(ext.supported_versions);
@@ -1209,7 +1209,7 @@ fn buildServerHello(b: *Builder, random: [32]u8, session_id: []const u8, suite: 
     try b.u16_(tls13_version);
     try b.u16_(ext.key_share);
     const ks = try b.begin(u16);
-    try b.u16_(@intFromEnum(share.group));
+    try b.u16_(@backingInt(share.group));
     if (share.key) |key| {
         try b.u16_(@intCast(key.len));
         try b.bytes(key);
@@ -1274,7 +1274,7 @@ fn buildCertificateVerify(b: *Builder, cert: *const Certificate, scheme: tls.Sig
     const sig = try tls13.signCertificateVerify(scheme, cert.private_key_bytes, signed, &sig_buf);
     try b.u8_(hs_certificate_verify);
     const msg = try b.begin(u24);
-    try b.u16_(@intFromEnum(scheme));
+    try b.u16_(@backingInt(scheme));
     try b.u16_(@intCast(sig.len));
     try b.bytes(sig);
     try b.end(u24, msg);
@@ -1447,7 +1447,7 @@ test "an Ed25519 certificate is served to a client that accepts it" {
     var certs: TestCerts = undefined;
     try certs.load();
     const config: Config = .{ .certs = &certs.entries };
-    const ed = @intFromEnum(tls.SignatureScheme.ed25519);
+    const ed = @backingInt(tls.SignatureScheme.ed25519);
     {
         var conn = Conn.init(testing.allocator, &config);
         defer conn.deinit();
@@ -1495,9 +1495,9 @@ const MiniClient = struct {
     gpa: Allocator,
     suites: []const CipherSuite = &.{.aes_128_gcm_sha256},
     /// Groups to send a key share for; 0x0018 (secp384r1) gets a dummy share.
-    shares: []const u16 = &.{@intFromEnum(Group.x25519)},
-    groups: []const u16 = &.{ @intFromEnum(Group.x25519), @intFromEnum(Group.secp256r1) },
-    sig_algs: []const u16 = &.{@intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256)},
+    shares: []const u16 = &.{@backingInt(Group.x25519)},
+    groups: []const u16 = &.{ @backingInt(Group.x25519), @backingInt(Group.secp256r1) },
+    sig_algs: []const u16 = &.{@backingInt(tls.SignatureScheme.ecdsa_secp256r1_sha256)},
     versions: []const u16 = &.{tls13_version},
     sni: ?[]const u8 = null,
     alpn: []const []const u8 = &.{},
@@ -1542,7 +1542,7 @@ const MiniClient = struct {
     fn generateKeys(c: *MiniClient) void {
         var seed: [32]u8 = undefined;
         sys.randomBytes(&seed);
-        c.x25519 = X25519.KeyPair.generateDeterministic(seed) catch unreachable;
+        c.x25519 = X25519.KeyPair.generateDeterministic(seed);
         sys.randomBytes(&seed);
         c.p256 = EcdsaP256Sha256.KeyPair.generateDeterministic(seed) catch unreachable;
     }
@@ -1557,9 +1557,9 @@ const MiniClient = struct {
         sys.randomBytes(&random);
         try b.bytes(&random);
         try b.u8_(32);
-        try b.bytes(&([_]u8{0xab} ** 32));
+        try b.bytes(&@as([32]u8, @splat(0xab)));
         const cs = try b.begin(u16);
-        for (c.suites) |s| try b.u16_(@intFromEnum(s));
+        for (c.suites) |s| try b.u16_(@backingInt(s));
         try b.end(u16, cs);
         try b.bytes(&.{ 1, 0 });
         const exts = try b.begin(u16);
@@ -1591,15 +1591,15 @@ const MiniClient = struct {
         const one = [_]u16{only_group orelse 0};
         for (if (only_group != null) &one else c.shares) |g| {
             try b.u16_(g);
-            if (g == @intFromEnum(Group.x25519)) {
+            if (g == @backingInt(Group.x25519)) {
                 try b.u16_(32);
                 try b.bytes(&c.x25519.public_key);
-            } else if (g == @intFromEnum(Group.secp256r1)) {
+            } else if (g == @backingInt(Group.secp256r1)) {
                 try b.u16_(65);
                 try b.bytes(&c.p256.public_key.toUncompressedSec1());
             } else {
                 try b.u16_(97);
-                try b.bytes(&([_]u8{4} ** 97));
+                try b.bytes(&@as([97]u8, @splat(4)));
             }
         }
         try b.end(u16, ks_list);
@@ -1712,7 +1712,7 @@ const MiniClient = struct {
             }
             switch (ct) {
                 ct_alert => {
-                    if (content[1] == 0) c.server_closed = true else c.alert = @enumFromInt(content[1]);
+                    if (content[1] == 0) c.server_closed = true else c.alert = @fromBackingInt(@intCast(content[1]));
                 },
                 ct_app_data => try c.app_data.appendSlice(c.gpa, content),
                 ct_handshake => {
@@ -1742,7 +1742,7 @@ const MiniClient = struct {
                 _ = try p.int(u16);
                 const random = try p.take(32);
                 _ = try p.vec(u8);
-                c.suite = @enumFromInt(try p.int(u16));
+                c.suite = @fromBackingInt(@intCast(try p.int(u16)));
                 _ = try p.int(u8);
                 var exts: Parser = .{ .buf = try p.vec(u16) };
                 var group: u16 = 0;
@@ -1782,7 +1782,7 @@ const MiniClient = struct {
                 }
                 c.transcript.update(msg);
                 var shared: [32]u8 = undefined;
-                if (group == @intFromEnum(Group.x25519)) {
+                if (group == @backingInt(Group.x25519)) {
                     shared = try X25519.scalarmult(c.x25519.secret_key, key[0..32].*);
                 } else {
                     const point = try (try P256.fromSec1(key)).mul(c.p256.secret_key.bytes, .big);
@@ -1814,7 +1814,7 @@ const MiniClient = struct {
                 try c.leaf.appendSlice(c.gpa, try list.vec(u24));
             },
             hs_certificate_verify => {
-                const scheme: tls.SignatureScheme = @enumFromInt(try p.int(u16));
+                const scheme: tls.SignatureScheme = @fromBackingInt(@intCast(try p.int(u16)));
                 const sig = try p.vec(u16);
                 const context = "TLS 1.3, server CertificateVerify";
                 const th = c.transcript.peek();
@@ -1832,7 +1832,7 @@ const MiniClient = struct {
                     .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => try tls13.verifyCertificateVerifySignature(
                         pk,
                         std.meta.activeTag(leaf.pub_key_algo),
-                        @intFromEnum(scheme),
+                        @backingInt(scheme),
                         sig,
                         signed,
                     ),
@@ -1910,7 +1910,7 @@ fn expectAlert(conn: *const Conn, desc: tls.Alert.Description) !void {
     while (out.len > 7) out = out[5 + mem.readInt(u16, out[3..5], .big) ..];
     try testing.expectEqual(@as(usize, 7), out.len);
     try testing.expectEqual(ct_alert, out[0]);
-    try testing.expectEqual(@intFromEnum(desc), out[6]);
+    try testing.expectEqual(@backingInt(desc), out[6]);
 }
 
 test "HelloRetryRequest when the client's key share is for a group we refuse" {
@@ -1948,7 +1948,7 @@ test "HelloRetryRequest when the client shares only a group we do not implement"
     var client: MiniClient = .{
         .gpa = testing.allocator,
         .shares = &.{0x0018},
-        .groups = &.{ 0x0018, @intFromEnum(Group.x25519) },
+        .groups = &.{ 0x0018, @backingInt(Group.x25519) },
     };
     defer client.deinit();
     try client.handshake(&conn);
@@ -1963,7 +1963,7 @@ test "a second ClientHello with the wrong key share is rejected" {
     const config: Config = .{ .certs = &certs.entries, .groups = &.{.secp256r1} };
     var conn = Conn.init(testing.allocator, &config);
     defer conn.deinit();
-    var client: MiniClient = .{ .gpa = testing.allocator, .hrr_wrong_group = @intFromEnum(Group.x25519) };
+    var client: MiniClient = .{ .gpa = testing.allocator, .hrr_wrong_group = @backingInt(Group.x25519) };
     defer client.deinit();
     try testing.expectError(error.IllegalParameter, client.handshake(&conn));
     try expectAlert(&conn, .illegal_parameter);
@@ -2013,7 +2013,7 @@ test "a client that cannot verify our key type gets handshake_failure" {
     const config: Config = .{ .certs = &certs.entries };
     var conn = Conn.init(testing.allocator, &config);
     defer conn.deinit();
-    var client: MiniClient = .{ .gpa = testing.allocator, .sig_algs = &.{@intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha256)} };
+    var client: MiniClient = .{ .gpa = testing.allocator, .sig_algs = &.{@backingInt(tls.SignatureScheme.rsa_pss_rsae_sha256)} };
     defer client.deinit();
     try testing.expectError(error.HandshakeFailure, client.handshake(&conn));
     try expectAlert(&conn, .handshake_failure);
@@ -2027,9 +2027,9 @@ test "an RSA certificate signs with RSA-PSS, the hash taken from the client's of
     const S = tls.SignatureScheme;
     const cases = [_]struct { []const u16, S }{
         // Our preference, SHA-256, wins over the client's order.
-        .{ &.{ @intFromEnum(S.rsa_pss_rsae_sha512), @intFromEnum(S.rsa_pss_rsae_sha256) }, .rsa_pss_rsae_sha256 },
-        .{ &.{@intFromEnum(S.rsa_pss_rsae_sha384)}, .rsa_pss_rsae_sha384 },
-        .{ &.{ @intFromEnum(S.ecdsa_secp256r1_sha256), @intFromEnum(S.rsa_pss_rsae_sha512) }, .rsa_pss_rsae_sha512 },
+        .{ &.{ @backingInt(S.rsa_pss_rsae_sha512), @backingInt(S.rsa_pss_rsae_sha256) }, .rsa_pss_rsae_sha256 },
+        .{ &.{@backingInt(S.rsa_pss_rsae_sha384)}, .rsa_pss_rsae_sha384 },
+        .{ &.{ @backingInt(S.ecdsa_secp256r1_sha256), @backingInt(S.rsa_pss_rsae_sha512) }, .rsa_pss_rsae_sha512 },
     };
     for (cases) |c| {
         var conn = Conn.init(testing.allocator, &config);
@@ -2047,8 +2047,8 @@ test "an RSA certificate signs with RSA-PSS, the hash taken from the client's of
         var conn = Conn.init(testing.allocator, &config);
         defer conn.deinit();
         var client: MiniClient = .{ .gpa = testing.allocator, .sni = "rsa.test", .sig_algs = &.{
-            @intFromEnum(S.rsa_pkcs1_sha256),
-            @intFromEnum(S.rsa_pss_pss_sha256),
+            @backingInt(S.rsa_pkcs1_sha256),
+            @backingInt(S.rsa_pss_pss_sha256),
         } };
         defer client.deinit();
         try testing.expectError(error.HandshakeFailure, client.handshake(&conn));
@@ -2067,8 +2067,8 @@ test "among certificates for one name, the client's signature_algorithms decide"
         .{ .server_names = &.{"both.test"}, .cert = rsa_cert.cert },
     };
     const config: Config = .{ .certs = &entries };
-    const ecdsa = @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256);
-    const pss = @intFromEnum(tls.SignatureScheme.rsa_pss_rsae_sha256);
+    const ecdsa = @backingInt(tls.SignatureScheme.ecdsa_secp256r1_sha256);
+    const pss = @backingInt(tls.SignatureScheme.rsa_pss_rsae_sha256);
     const cases = [_]struct { ?[]const u8, []const u16, []const u8 }{
         .{ "both.test", &.{ecdsa}, certs.chains[0][0] },
         .{ "both.test", &.{pss}, rsa_cert.chain[0] },
@@ -2086,7 +2086,7 @@ test "among certificates for one name, the client's signature_algorithms decide"
     }
     var conn = Conn.init(testing.allocator, &config);
     defer conn.deinit();
-    var client: MiniClient = .{ .gpa = testing.allocator, .sni = "both.test", .sig_algs = &.{@intFromEnum(tls.SignatureScheme.ed25519)} };
+    var client: MiniClient = .{ .gpa = testing.allocator, .sni = "both.test", .sig_algs = &.{@backingInt(tls.SignatureScheme.ed25519)} };
     defer client.deinit();
     try testing.expectError(error.HandshakeFailure, client.handshake(&conn));
     try expectAlert(&conn, .handshake_failure);
@@ -2304,7 +2304,7 @@ test "mutated ClientHellos never crash the server" {
     var certs: TestCerts = undefined;
     try certs.load();
     const config: Config = .{ .certs = &certs.entries };
-    var proto: MiniClient = .{ .gpa = testing.allocator, .sni = "localhost", .alpn = &.{"h2"}, .shares = &.{ 0x0018, @intFromEnum(Group.x25519), @intFromEnum(Group.secp256r1) } };
+    var proto: MiniClient = .{ .gpa = testing.allocator, .sni = "localhost", .alpn = &.{"h2"}, .shares = &.{ 0x0018, @backingInt(Group.x25519), @backingInt(Group.secp256r1) } };
     defer proto.deinit();
     proto.generateKeys();
     var ch: std.ArrayList(u8) = .empty;
@@ -2355,7 +2355,7 @@ test "a ClientHello split across records, coalesced in one feed" {
 test "0-RTT the client sends anyway is skipped, before and after HelloRetryRequest" {
     var certs: TestCerts = undefined;
     try certs.load();
-    const junk = [_]u8{ ct_app_data, 3, 3, 0, 32 } ++ [_]u8{0x5a} ** 32;
+    const junk = [_]u8{ ct_app_data, 3, 3, 0, 32 } ++ @as([32]u8, @splat(0x5a));
     for ([_]bool{ false, true }) |hrr| {
         const config: Config = .{ .certs = &certs.entries, .groups = if (hrr) &.{.secp256r1} else &.{.x25519} };
         var conn = Conn.init(testing.allocator, &config);
@@ -2380,7 +2380,7 @@ test "0-RTT the client sends anyway is skipped, before and after HelloRetryReque
 test "early data ends with the HelloRetryRequest" {
     var certs: TestCerts = undefined;
     try certs.load();
-    const junk = [_]u8{ ct_app_data, 3, 3, 0, 32 } ++ [_]u8{0x5a} ** 32;
+    const junk = [_]u8{ ct_app_data, 3, 3, 0, 32 } ++ @as([32]u8, @splat(0x5a));
     const config: Config = .{ .certs = &certs.entries, .groups = &.{.secp256r1} };
     for ([_]bool{ false, true }) |offer_again| {
         var conn = Conn.init(testing.allocator, &config);
@@ -2395,7 +2395,7 @@ test "early data ends with the HelloRetryRequest" {
         client.early_data = offer_again;
         var ch2: std.ArrayList(u8) = .empty;
         defer ch2.deinit(testing.allocator);
-        try client.clientHello(&ch2, @intFromEnum(Group.secp256r1));
+        try client.clientHello(&ch2, @backingInt(Group.secp256r1));
         if (offer_again) {
             try testing.expectError(error.IllegalParameter, client.sendPlain(&conn, ct_handshake, ch2.items));
         } else {

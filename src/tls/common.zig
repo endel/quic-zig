@@ -33,35 +33,35 @@ pub const max_handshake_msg = 1 << 16;
 // RFC 8446 §5.5: AES-GCM is safe for 2^24.5 records per key; rotate well before.
 pub const key_update_after: u64 = 1 << 23;
 
-pub const hs_client_hello: u8 = @intFromEnum(tls.HandshakeType.client_hello);
-pub const hs_server_hello: u8 = @intFromEnum(tls.HandshakeType.server_hello);
-pub const hs_new_session_ticket: u8 = @intFromEnum(tls.HandshakeType.new_session_ticket);
-pub const hs_encrypted_extensions: u8 = @intFromEnum(tls.HandshakeType.encrypted_extensions);
-pub const hs_certificate: u8 = @intFromEnum(tls.HandshakeType.certificate);
-pub const hs_certificate_verify: u8 = @intFromEnum(tls.HandshakeType.certificate_verify);
-pub const hs_finished: u8 = @intFromEnum(tls.HandshakeType.finished);
-pub const hs_key_update: u8 = @intFromEnum(tls.HandshakeType.key_update);
-pub const hs_message_hash: u8 = @intFromEnum(tls.HandshakeType.message_hash);
+pub const hs_client_hello: u8 = @backingInt(tls.HandshakeType.client_hello);
+pub const hs_server_hello: u8 = @backingInt(tls.HandshakeType.server_hello);
+pub const hs_new_session_ticket: u8 = @backingInt(tls.HandshakeType.new_session_ticket);
+pub const hs_encrypted_extensions: u8 = @backingInt(tls.HandshakeType.encrypted_extensions);
+pub const hs_certificate: u8 = @backingInt(tls.HandshakeType.certificate);
+pub const hs_certificate_verify: u8 = @backingInt(tls.HandshakeType.certificate_verify);
+pub const hs_finished: u8 = @backingInt(tls.HandshakeType.finished);
+pub const hs_key_update: u8 = @backingInt(tls.HandshakeType.key_update);
+pub const hs_message_hash: u8 = @backingInt(tls.HandshakeType.message_hash);
 
-pub const ct_ccs: u8 = @intFromEnum(tls.ContentType.change_cipher_spec);
-pub const ct_alert: u8 = @intFromEnum(tls.ContentType.alert);
-pub const ct_handshake: u8 = @intFromEnum(tls.ContentType.handshake);
-pub const ct_app_data: u8 = @intFromEnum(tls.ContentType.application_data);
+pub const ct_ccs: u8 = @backingInt(tls.ContentType.change_cipher_spec);
+pub const ct_alert: u8 = @backingInt(tls.ContentType.alert);
+pub const ct_handshake: u8 = @backingInt(tls.ContentType.handshake);
+pub const ct_app_data: u8 = @backingInt(tls.ContentType.application_data);
 
 pub const ext = struct {
-    pub const server_name: u16 = @intFromEnum(tls.ExtensionType.server_name);
-    pub const supported_groups: u16 = @intFromEnum(tls.ExtensionType.supported_groups);
-    pub const signature_algorithms: u16 = @intFromEnum(tls.ExtensionType.signature_algorithms);
-    pub const alpn: u16 = @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation);
-    pub const pre_shared_key: u16 = @intFromEnum(tls.ExtensionType.pre_shared_key);
-    pub const psk_key_exchange_modes: u16 = @intFromEnum(tls.ExtensionType.psk_key_exchange_modes);
-    pub const early_data: u16 = @intFromEnum(tls.ExtensionType.early_data);
-    pub const supported_versions: u16 = @intFromEnum(tls.ExtensionType.supported_versions);
-    pub const cookie: u16 = @intFromEnum(tls.ExtensionType.cookie);
-    pub const key_share: u16 = @intFromEnum(tls.ExtensionType.key_share);
+    pub const server_name: u16 = @backingInt(tls.ExtensionType.server_name);
+    pub const supported_groups: u16 = @backingInt(tls.ExtensionType.supported_groups);
+    pub const signature_algorithms: u16 = @backingInt(tls.ExtensionType.signature_algorithms);
+    pub const alpn: u16 = @backingInt(tls.ExtensionType.application_layer_protocol_negotiation);
+    pub const pre_shared_key: u16 = @backingInt(tls.ExtensionType.pre_shared_key);
+    pub const psk_key_exchange_modes: u16 = @backingInt(tls.ExtensionType.psk_key_exchange_modes);
+    pub const early_data: u16 = @backingInt(tls.ExtensionType.early_data);
+    pub const supported_versions: u16 = @backingInt(tls.ExtensionType.supported_versions);
+    pub const cookie: u16 = @backingInt(tls.ExtensionType.cookie);
+    pub const key_share: u16 = @backingInt(tls.ExtensionType.key_share);
 };
 
-pub const tls13_version: u16 = @intFromEnum(tls.ProtocolVersion.tls_1_3);
+pub const tls13_version: u16 = @backingInt(tls.ProtocolVersion.tls_1_3);
 
 // ─── Per-suite primitives ────────────────────────────────────────────
 
@@ -180,7 +180,7 @@ pub fn sealInto(cs: CipherSuite, keys: *TrafficKeys, inner: tls.ContentType, con
     std.debug.assert(content.len <= max_plaintext);
     const pt = scratch[0 .. content.len + 1];
     @memcpy(pt[0..content.len], content);
-    pt[content.len] = @intFromEnum(inner);
+    pt[content.len] = @backingInt(inner);
     switch (cs) {
         inline else => |c| {
             const A = Suite(c).Aead;

@@ -72,7 +72,7 @@ const QueuedEvent = struct {
         const flags = if (self.event_type == .stream_data and n < self.payload().len) self.flags & ~@as(u8, 1) else self.flags;
 
         // Fixed header (24 bytes, little-endian)
-        out[0] = @intFromEnum(self.event_type);
+        out[0] = @backingInt(self.event_type);
         out[1] = flags;
         std.mem.writeInt(u16, out[2..4], 0, .little); // reserved
         std.mem.writeInt(u32, out[4..8], @intCast(n), .little);
@@ -208,7 +208,7 @@ pub const CApiHandler = struct {
                     // Cut short, it would name another resource.
                     if (self.client_to_entry.get(ev.client_id)) |entry| {
                         var session: event_loop.Session = .{ .entry = entry };
-                        session.resetRequest(ev.id1, @intFromEnum(quic.h3.H3Error.request_rejected));
+                        session.resetRequest(ev.id1, @backingInt(quic.h3.H3Error.request_rejected));
                     }
                     self.discard();
                 },
@@ -705,7 +705,7 @@ test "c_api: an event too big for the host's buffer doesn't stall the queue" {
         const n = qz_server_poll(&ws, &buf, buf.len);
         try testing.expect(n > 0);
         const len = std.mem.readInt(u32, buf[4..8], .little);
-        switch (@as(EventType, @enumFromInt(buf[0]))) {
+        switch (@as(EventType, @fromBackingInt(@intCast(buf[0])))) {
             .stream_data => {
                 try testing.expect(!fin);
                 try testing.expectEqual(n, HEADER_SIZE + 8 + len);

@@ -656,7 +656,7 @@ pub const H3Connection = struct {
     /// Reject a request with H3_REQUEST_REJECTED (RFC 9114 §4.1.1).
     /// Used during graceful shutdown for streams above the GOAWAY ID.
     pub fn rejectRequest(self: *H3Connection, stream_id: u64) void {
-        self.cancelRequest(stream_id, @intFromEnum(H3Error.request_rejected));
+        self.cancelRequest(stream_id, @backingInt(H3Error.request_rejected));
     }
 
     /// Send a PRIORITY_UPDATE frame on the control stream (RFC 9218).
@@ -687,7 +687,7 @@ pub const H3Connection = struct {
     /// Close the connection with an H3 error code (RFC 9114 §8).
     /// Sends APPLICATION_CLOSE via QUIC with the given error code.
     pub fn closeWithError(self: *H3Connection, h3_error: H3Error, reason: []const u8) void {
-        self.quic_conn.close(@intFromEnum(h3_error), reason);
+        self.quic_conn.close(@backingInt(h3_error), reason);
     }
 
     /// Drop per-stream bookkeeping for the streams QUIC is about to reclaim.
@@ -909,7 +909,7 @@ pub const H3Connection = struct {
                 self.peer_control_stream_id = stream_id;
                 // If there's remaining data, buffer it for SETTINGS parsing
                 if (remaining.len > 0) {
-                    var buf = std.ArrayList(u8){ .items = &.{}, .capacity = 0 };
+                    var buf: std.ArrayList(u8) = .empty;
                     try buf.appendSlice(self.allocator, remaining);
                     try self.stream_bufs.put(stream_id, buf);
                 }
@@ -950,7 +950,7 @@ pub const H3Connection = struct {
     /// stream type of its own.
     pub fn abandonUniStream(self: *H3Connection, stream_id: u64) void {
         const streams = &self.quic_conn.streams;
-        if (streams.recv_streams.get(stream_id)) |rs| rs.stopSending(@intFromEnum(H3Error.stream_creation_error));
+        if (streams.recv_streams.get(stream_id)) |rs| rs.stopSending(@backingInt(H3Error.stream_creation_error));
         streams.releaseRecvStream(stream_id);
     }
 
@@ -1297,7 +1297,7 @@ pub const H3Connection = struct {
         if (self.shutdown_state == .going_away_final or self.shutdown_state == .drain_complete) {
             if (self.local_goaway_id) |goaway_id| {
                 if (stream_mod.isClient(stream_id) and stream_mod.isBidi(stream_id) and stream_id >= goaway_id) {
-                    stream.send.reset(@intFromEnum(H3Error.request_rejected));
+                    stream.send.reset(@backingInt(H3Error.request_rejected));
                     return null;
                 }
             }
@@ -1744,7 +1744,6 @@ test "fieldsValid: rejects invalid name and value bytes at any offset" {
     try testing.expect(!H3Connection.fieldsValid(&.{.{ .name = ":path", .value = "/a\r\nx: y" }}));
 }
 
-
 test "validateRequestHeaders: valid GET" {
     const hdrs = [_]qpack.Header{
         .{ .name = ":method", .value = "GET" },
@@ -1771,8 +1770,8 @@ test "validateRequestHeaders: refuses what a proxy to HTTP/1 could be smuggled w
         &.{ authority, .{ .name = "host:evil", .value = "x" } },
         &.{ authority, .{ .name = "x(y)", .value = "x" } },
         &.{ authority, .{ .name = "a\"b", .value = "x" } },
-        &.{ .{ .name = ":authority", .value = "" } },
-        &.{ .{ .name = "host", .value = "" } },
+        &.{.{ .name = ":authority", .value = "" }},
+        &.{.{ .name = "host", .value = "" }},
         &.{ authority, .{ .name = "host", .value = "other.example" } },
         &.{ authority, .{ .name = ":protocol", .value = "websocket" } },
     };
@@ -1969,23 +1968,23 @@ test "validateResponseHeaders: uppercase header" {
 
 test "H3Error: all error codes defined" {
     // Verify all RFC 9114 §8.1 error codes are present and have correct values
-    try testing.expectEqual(@as(u64, 0x0100), @intFromEnum(H3Error.no_error));
-    try testing.expectEqual(@as(u64, 0x0101), @intFromEnum(H3Error.general_protocol_error));
-    try testing.expectEqual(@as(u64, 0x0102), @intFromEnum(H3Error.internal_error));
-    try testing.expectEqual(@as(u64, 0x0103), @intFromEnum(H3Error.stream_creation_error));
-    try testing.expectEqual(@as(u64, 0x0104), @intFromEnum(H3Error.closed_critical_stream));
-    try testing.expectEqual(@as(u64, 0x0105), @intFromEnum(H3Error.frame_unexpected));
-    try testing.expectEqual(@as(u64, 0x0106), @intFromEnum(H3Error.frame_error));
-    try testing.expectEqual(@as(u64, 0x0107), @intFromEnum(H3Error.excessive_load));
-    try testing.expectEqual(@as(u64, 0x0108), @intFromEnum(H3Error.id_error));
-    try testing.expectEqual(@as(u64, 0x0109), @intFromEnum(H3Error.settings_error));
-    try testing.expectEqual(@as(u64, 0x010a), @intFromEnum(H3Error.missing_settings));
-    try testing.expectEqual(@as(u64, 0x010b), @intFromEnum(H3Error.request_rejected));
-    try testing.expectEqual(@as(u64, 0x010c), @intFromEnum(H3Error.request_cancelled));
-    try testing.expectEqual(@as(u64, 0x010d), @intFromEnum(H3Error.request_incomplete));
-    try testing.expectEqual(@as(u64, 0x010e), @intFromEnum(H3Error.message_error));
-    try testing.expectEqual(@as(u64, 0x010f), @intFromEnum(H3Error.connect_error));
-    try testing.expectEqual(@as(u64, 0x0110), @intFromEnum(H3Error.version_fallback));
+    try testing.expectEqual(@as(u64, 0x0100), @backingInt(H3Error.no_error));
+    try testing.expectEqual(@as(u64, 0x0101), @backingInt(H3Error.general_protocol_error));
+    try testing.expectEqual(@as(u64, 0x0102), @backingInt(H3Error.internal_error));
+    try testing.expectEqual(@as(u64, 0x0103), @backingInt(H3Error.stream_creation_error));
+    try testing.expectEqual(@as(u64, 0x0104), @backingInt(H3Error.closed_critical_stream));
+    try testing.expectEqual(@as(u64, 0x0105), @backingInt(H3Error.frame_unexpected));
+    try testing.expectEqual(@as(u64, 0x0106), @backingInt(H3Error.frame_error));
+    try testing.expectEqual(@as(u64, 0x0107), @backingInt(H3Error.excessive_load));
+    try testing.expectEqual(@as(u64, 0x0108), @backingInt(H3Error.id_error));
+    try testing.expectEqual(@as(u64, 0x0109), @backingInt(H3Error.settings_error));
+    try testing.expectEqual(@as(u64, 0x010a), @backingInt(H3Error.missing_settings));
+    try testing.expectEqual(@as(u64, 0x010b), @backingInt(H3Error.request_rejected));
+    try testing.expectEqual(@as(u64, 0x010c), @backingInt(H3Error.request_cancelled));
+    try testing.expectEqual(@as(u64, 0x010d), @backingInt(H3Error.request_incomplete));
+    try testing.expectEqual(@as(u64, 0x010e), @backingInt(H3Error.message_error));
+    try testing.expectEqual(@as(u64, 0x010f), @backingInt(H3Error.connect_error));
+    try testing.expectEqual(@as(u64, 0x0110), @backingInt(H3Error.version_fallback));
 }
 
 test "H3 frame error: malformed SETTINGS detected" {
@@ -2041,8 +2040,8 @@ const protocol = @import("../quic/protocol.zig");
 // Create a minimal QUIC Connection suitable for H3 tests.
 // The `is_server` flag determines stream ID assignment (server bidi starts at 1, client at 0).
 fn createTestQuicConn(is_server: bool) quic_connection.Connection {
-    const dcid = "testdcid" ++ ([_]u8{0} ** 12);
-    const scid = "testscid" ++ ([_]u8{0} ** 12);
+    const dcid = "testdcid" ++ @as([12]u8, @splat(0));
+    const scid = "testscid" ++ @as([12]u8, @splat(0));
 
     var conn = quic_connection.Connection{
         .allocator = testing.allocator,
@@ -2289,7 +2288,7 @@ test "H3 integration: an unknown uni stream is abandoned, not re-read for a type
     try rs.handleStreamFrame(2, &.{0x00}, false);
     while (try h3.poll()) |_| {}
     try testing.expectEqual(@as(u64, 2), h3.peer_control_stream_id.?);
-    try testing.expectEqual(@as(?u64, @intFromEnum(H3Error.stream_creation_error)), rs.stop_sending_err);
+    try testing.expectEqual(@as(?u64, @backingInt(H3Error.stream_creation_error)), rs.stop_sending_err);
 }
 
 // ---- Group C: Control stream tests ----
@@ -2755,7 +2754,7 @@ test "H3 integration: invalid headers (missing :path) closes connection" {
 
     // Connection should be in closing state with H3_MESSAGE_ERROR
     try testing.expect(quic_conn.local_err != null);
-    try testing.expectEqual(@intFromEnum(H3Error.message_error), quic_conn.local_err.?.code);
+    try testing.expectEqual(@backingInt(H3Error.message_error), quic_conn.local_err.?.code);
 }
 
 test "H3 integration: SETTINGS on bidi stream returns H3FrameUnexpected" {
@@ -2786,7 +2785,7 @@ test "H3 integration: critical stream closure returns H3ClosedCriticalStream" {
 
     // Simulate peer resetting the control stream
     const ctrl_rs = quic_conn.streams.recv_streams.get(2).?;
-    ctrl_rs.reset_err = @intFromEnum(H3Error.no_error);
+    ctrl_rs.reset_err = @backingInt(H3Error.no_error);
 
     const result = h3.poll();
     try testing.expectError(error.H3ClosedCriticalStream, result);
@@ -3052,7 +3051,7 @@ test "H3: a header block QPACK cannot decode is refused, not decoded without its
 
     var tags: [8]std.meta.Tag(H3Event) = undefined;
     try testing.expectError(error.H3FrameError, pollTags(&h3, &tags));
-    try testing.expectEqual(@intFromEnum(H3Error.qpack_decompression_failed), quic_conn.local_err.?.code);
+    try testing.expectEqual(@backingInt(H3Error.qpack_decompression_failed), quic_conn.local_err.?.code);
 }
 
 test "H3: a request stream carries one request; nothing follows its trailers" {
@@ -3212,7 +3211,7 @@ test "H3 streaming: writes to a stopped stream fail instead of vanishing" {
     defer h3.deinit();
     try setupRequestStream(&quic_conn, &h3, true);
 
-    h3.cancelRequest(0, @intFromEnum(H3Error.internal_error));
+    h3.cancelRequest(0, @backingInt(H3Error.internal_error));
     try testing.expectError(error.StreamReset, h3.sendResponseData(0, "x"));
     try testing.expectError(error.StreamNotFound, h3.sendResponseData(40, "x"));
 }
@@ -3224,7 +3223,7 @@ test "H3 streaming: header sets past 4 KiB are encoded" {
     defer h3.deinit();
     try setupRequestStream(&quic_conn, &h3, true);
 
-    const cookie = "c" ** 6000;
+    const cookie = &@as([6000]u8, @splat('c'));
     var headers: [MAX_HEADERS]qpack.Header = undefined;
     headers[0] = .{ .name = ":status", .value = "200" };
     headers[1] = .{ .name = "set-cookie", .value = cookie };
@@ -3254,7 +3253,7 @@ test "H3 streaming: notifyWritable waits for credit and a drained buffer" {
     stream.send.send_offset = stream.send.write_offset;
     stream.send.send_window = stream.send.write_offset + 1000;
 
-    try h3.sendResponseData(0, &([_]u8{0} ** 600));
+    try h3.sendResponseData(0, &@as([600]u8, @splat(0)));
     try testing.expectEqual(@as(?u64, 603), h3.streamBufferedBytes(0));
 
     // 397 bytes of credit left and 603 unsent: 300 does not fit behind them.
@@ -3290,12 +3289,12 @@ test "H3 streaming: STOP_SENDING on a response is reported once" {
 
     // What the transport does on STOP_SENDING.
     const stream = quic_conn.streams.getStream(0).?;
-    stream.send.reset(@intFromEnum(H3Error.request_cancelled));
-    stream.send.peer_stop_sending = @intFromEnum(H3Error.request_cancelled);
+    stream.send.reset(@backingInt(H3Error.request_cancelled));
+    stream.send.peer_stop_sending = @backingInt(H3Error.request_cancelled);
 
     const ev = (try h3.poll()).?;
     try testing.expectEqual(@as(u64, 0), ev.request_cancelled.stream_id);
-    try testing.expectEqual(@intFromEnum(H3Error.request_cancelled), ev.request_cancelled.error_code);
+    try testing.expectEqual(@backingInt(H3Error.request_cancelled), ev.request_cancelled.error_code);
     try testing.expect(try h3.poll() == null);
 }
 
@@ -3307,9 +3306,9 @@ test "H3 streaming: RESET_STREAM on a request is reported once" {
     try setupRequestStream(&quic_conn, &h3, false);
 
     const stream = quic_conn.streams.getStream(0).?;
-    try stream.recv.handleResetStream(@intFromEnum(H3Error.request_cancelled), stream.recv.sorter.highestReceived());
-    stream.send.reset(@intFromEnum(H3Error.request_cancelled));
-    stream.send.peer_stop_sending = @intFromEnum(H3Error.request_cancelled);
+    try stream.recv.handleResetStream(@backingInt(H3Error.request_cancelled), stream.recv.sorter.highestReceived());
+    stream.send.reset(@backingInt(H3Error.request_cancelled));
+    stream.send.peer_stop_sending = @backingInt(H3Error.request_cancelled);
 
     const ev = (try h3.poll()).?;
     try testing.expectEqual(@as(u64, 0), ev.request_cancelled.stream_id);
@@ -3382,7 +3381,7 @@ test "H3 pauseBody: a paused stream leaves its data unread in QUIC" {
     try testing.expect((try h3.poll()).? == .headers);
     try h3.pauseBody(0);
 
-    var payload = [_]u8{7} ** 50;
+    var payload: [50]u8 = @splat(7);
     const d = buildDataFrame(&frame_buf, &payload);
     const stream = quic_conn.streams.getStream(0).?;
     try stream.recv.handleStreamFrame(n, frame_buf[0..d], false);
@@ -3417,7 +3416,7 @@ test "H3: a huge DATA frame is surfaced as it arrives and held to the stream win
     offset += hdr.len;
 
     // The first piece is surfaced without waiting for the rest of the frame.
-    const chunk = [_]u8{0x41} ** 16384;
+    const chunk: [16384]u8 = @splat(0x41);
     try stream.recv.handleStreamFrame(offset, &chunk, false);
     offset += chunk.len;
     const ev = (try h3.poll()).?;
@@ -3462,7 +3461,7 @@ test "H3: a HEADERS frame past the size cap is refused before it is buffered" {
     var hdr_buf: [16]u8 = undefined;
     try injectBidiStreamData(&quic_conn, 0, writeFrameHeaderBytes(&hdr_buf, 0x01, MAX_HEADERS_FRAME + 1), false);
     try testing.expectError(error.H3ExcessiveLoad, h3.poll());
-    try testing.expectEqual(@as(u64, @intFromEnum(H3Error.excessive_load)), quic_conn.local_err.?.code);
+    try testing.expectEqual(@as(u64, @backingInt(H3Error.excessive_load)), quic_conn.local_err.?.code);
 }
 
 test "H3: an unknown frame on a request stream is skipped as it arrives" {
@@ -3479,7 +3478,7 @@ test "H3: an unknown frame on a request stream is skipped as it arrives" {
     const hdr = writeFrameHeaderBytes(&hdr_buf, 0x21, 1 << 40); // reserved type
     try stream.recv.handleStreamFrame(offset, hdr, false);
     offset += hdr.len;
-    const chunk = [_]u8{0x42} ** 16384;
+    const chunk: [16384]u8 = @splat(0x42);
     for (0..16) |_| {
         try stream.recv.handleStreamFrame(offset, &chunk, false);
         offset += chunk.len;
@@ -3504,7 +3503,7 @@ test "H3: a request stream ending mid-frame is a frame error" {
     const hdr = writeFrameHeaderBytes(&frame_buf, 0x00, 100);
     try stream.recv.handleStreamFrame(offset, hdr, true);
     try testing.expectError(error.H3FrameError, h3.poll());
-    try testing.expectEqual(@as(u64, @intFromEnum(H3Error.frame_error)), quic_conn.local_err.?.code);
+    try testing.expectEqual(@as(u64, @backingInt(H3Error.frame_error)), quic_conn.local_err.?.code);
 }
 
 test "H3 control stream: unknown frames are skipped as they arrive, oversized SETTINGS refused" {
@@ -3521,7 +3520,7 @@ test "H3 control stream: unknown frames are skipped as they arrive, oversized SE
     const hdr = writeFrameHeaderBytes(&hdr_buf, 0x21, 1 << 40);
     try rs.handleStreamFrame(offset, hdr, false);
     offset += hdr.len;
-    const chunk = [_]u8{0x43} ** 16384;
+    const chunk: [16384]u8 = @splat(0x43);
     for (0..8) |_| {
         try rs.handleStreamFrame(offset, &chunk, false);
         offset += chunk.len;
@@ -3539,5 +3538,5 @@ test "H3 control stream: unknown frames are skipped as they arrive, oversized SE
     const settings = writeFrameHeaderBytes(buf[1..], 0x04, MAX_CONTROL_FRAME + 1);
     try injectUniStreamData(&quic_conn2, 2, buf[0 .. 1 + settings.len], false);
     try testing.expectError(error.H3ExcessiveLoad, h3b.poll());
-    try testing.expectEqual(@as(u64, @intFromEnum(H3Error.excessive_load)), quic_conn2.local_err.?.code);
+    try testing.expectEqual(@as(u64, @backingInt(H3Error.excessive_load)), quic_conn2.local_err.?.code);
 }

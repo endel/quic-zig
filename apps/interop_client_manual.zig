@@ -122,7 +122,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Parse request URLs from CLI args
     var args_iter = std.process.Args.Iterator.init(init.args);
     _ = args_iter.next(); // skip program name
-    var urls: std.ArrayList(ParsedUrl) = .{ .items = &.{}, .capacity = 0 };
+    var urls: std.ArrayList(ParsedUrl) = .empty;
     while (args_iter.next()) |arg| {
         if (parseUrl(arg)) |url| {
             try urls.append(alloc, url);
@@ -422,7 +422,7 @@ fn downloadH0(
         // 0-RTT: streams were already opened before handshake; register them for tracking
         for (urls, 0..) |url, idx| {
             const stream_id: u64 = @intCast(idx * 4); // client bidi stream IDs: 0, 4, 8, ...
-            try downloads.put(stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 });
+            try downloads.put(stream_id, .empty);
             try stream_paths.put(stream_id, url.path);
             std.log.info("H0: tracking 0-RTT stream {d} for {s}", .{ stream_id, url.path });
         }
@@ -432,7 +432,7 @@ fn downloadH0(
         while (next_url_idx < urls.len) {
             const url = urls[next_url_idx];
             const stream_id = h0c.sendRequest(url.path) catch break; // break on limit
-            try downloads.put(stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 });
+            try downloads.put(stream_id, .empty);
             try stream_paths.put(stream_id, url.path);
             next_url_idx += 1;
         }
@@ -469,7 +469,7 @@ fn downloadH0(
         while (next_url_idx < urls.len) {
             const url = urls[next_url_idx];
             const stream_id = h0c.sendRequest(url.path) catch break; // break on limit
-            downloads.put(stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 }) catch break;
+            downloads.put(stream_id, .empty) catch break;
             stream_paths.put(stream_id, url.path) catch break;
             next_url_idx += 1;
         }
@@ -596,7 +596,7 @@ fn downloadH3(
             std.log.err("H3: sendRequest error for {s}: {any}", .{ url.path, err });
             continue;
         };
-        try downloads.put(stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 });
+        try downloads.put(stream_id, .empty);
         try stream_paths.put(stream_id, url.path);
         std.log.info("H3: requested {s} on stream {d}", .{ url.path, stream_id });
     }

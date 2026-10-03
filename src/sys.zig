@@ -358,7 +358,7 @@ pub fn resolveHost(host: []const u8, port: u16) ResolveError!posix.sockaddr.stor
 
     var res: ?*std.c.addrinfo = null;
     const eai = std.c.getaddrinfo(host_z, service_z, &hints, &res);
-    if (eai != @as(std.c.EAI, @enumFromInt(0))) return error.UnknownHostName;
+    if (eai != @as(std.c.EAI, @fromBackingInt(@intCast(0)))) return error.UnknownHostName;
     defer if (res) |r| std.c.freeaddrinfo(r);
 
     const first = res orelse return error.UnknownHostName;
@@ -540,7 +540,7 @@ pub fn getenv(name: [*:0]const u8) ?[:0]const u8 {
 }
 
 fn unexpected(err: posix.E) error{Unexpected} {
-    if (builtin.mode == .Debug) {
+    if (builtin.mode == .debug) {
         std.log.warn("sys: unexpected errno: {t}", .{err});
     }
     return error.Unexpected;

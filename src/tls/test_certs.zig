@@ -376,7 +376,7 @@ pub const ClientCerts = struct {
     }
 
     pub fn certificate(self: *const ClientCerts, which: Which) tls13.ServerCertificate {
-        const i = @intFromEnum(which);
+        const i = @backingInt(which);
         if (which == .rsa) return .{ .cert_chain_der = &self.chains[i], .private_key_bytes = self.rsa_key, .private_key_algorithm = .rsa };
         return .{ .cert_chain_der = &self.chains[i], .private_key_bytes = self.ec_key };
     }

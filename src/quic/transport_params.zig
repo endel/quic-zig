@@ -35,13 +35,13 @@ pub const ParamId = enum(u64) {
 
 /// Server's Preferred Address (RFC 9000 §9.6, §18.2).
 pub const PreferredAddress = struct {
-    ipv4_addr: [4]u8 = .{0} ** 4,
+    ipv4_addr: [4]u8 = @splat(0),
     ipv4_port: u16 = 0,
-    ipv6_addr: [16]u8 = .{0} ** 16,
+    ipv6_addr: [16]u8 = @splat(0),
     ipv6_port: u16 = 0,
-    cid_buf: [20]u8 = .{0} ** 20,
+    cid_buf: [20]u8 = @splat(0),
     cid_len: u8 = 0,
-    stateless_reset_token: [16]u8 = .{0} ** 16,
+    stateless_reset_token: [16]u8 = @splat(0),
 
     pub fn hasIpv4(self: *const PreferredAddress) bool {
         return self.ipv4_port != 0;
@@ -122,7 +122,7 @@ pub const TransportParams = struct {
     /// chosen_version: the version used for this connection.
     /// available_versions: list of all supported versions (up to 8).
     version_info_chosen: ?u32 = null,
-    version_info_available: [8]u32 = .{0} ** 8,
+    version_info_available: [8]u32 = @splat(0),
     version_info_available_count: u8 = 0,
 
     /// Check if a version is listed in the peer's available versions.
@@ -138,20 +138,20 @@ pub const TransportParams = struct {
         // Helper to write a single parameter
         const Helper = struct {
             fn writeParam(w: anytype, id: ParamId, value: u64) !void {
-                try packet.writeVarInt(w, @intFromEnum(id));
+                try packet.writeVarInt(w, @backingInt(id));
                 const len = packet.varIntLength(value);
                 try packet.writeVarInt(w, len);
                 try packet.writeVarInt(w, value);
             }
 
             fn writeParamBytes(w: anytype, id: ParamId, data: []const u8) !void {
-                try packet.writeVarInt(w, @intFromEnum(id));
+                try packet.writeVarInt(w, @backingInt(id));
                 try packet.writeVarInt(w, data.len);
                 try w.writeAll(data);
             }
 
             fn writeParamEmpty(w: anytype, id: ParamId) !void {
-                try packet.writeVarInt(w, @intFromEnum(id));
+                try packet.writeVarInt(w, @backingInt(id));
                 try packet.writeVarInt(w, 0);
             }
         };
@@ -165,7 +165,7 @@ pub const TransportParams = struct {
         }
 
         if (self.stateless_reset_token) |token| {
-            try packet.writeVarInt(writer, @intFromEnum(ParamId.stateless_reset_token));
+            try packet.writeVarInt(writer, @backingInt(ParamId.stateless_reset_token));
             try packet.writeVarInt(writer, 16);
             try writer.writeAll(&token);
         }
@@ -211,7 +211,7 @@ pub const TransportParams = struct {
         }
 
         if (self.preferred_address) |pref| {
-            try packet.writeVarInt(writer, @intFromEnum(ParamId.preferred_address));
+            try packet.writeVarInt(writer, @backingInt(ParamId.preferred_address));
             // Length: 4+2 + 16+2 + 1+cid_len + 16 = 41 + cid_len
             const pref_len: u64 = 41 + @as(u64, pref.cid_len);
             try packet.writeVarInt(writer, pref_len);
@@ -263,7 +263,7 @@ pub const TransportParams = struct {
         if (self.version_info_chosen) |chosen| {
             const n = self.version_info_available_count;
             const param_len: u64 = 4 + @as(u64, n) * 4; // chosen(4) + available(n*4)
-            try packet.writeVarInt(writer, @intFromEnum(ParamId.version_information));
+            try packet.writeVarInt(writer, @backingInt(ParamId.version_information));
             try packet.writeVarInt(writer, param_len);
             try writer.writeInt(u32, chosen, .big);
             for (0..n) |i| {
@@ -285,7 +285,7 @@ pub const TransportParams = struct {
         const reader = &fbs;
         // RFC 9000 §7.4: each parameter we know at most once. Their IDs are
         // 0x00-0x11 and 0x20, bar min_ack_delay's.
-        var seen = std.StaticBitSet(0x21).initEmpty();
+        var seen = std.bit_set.Static(0x21).empty;
         var seen_min_ack_delay = false;
 
         while (fbs.seek < data.len) {
@@ -299,49 +299,49 @@ pub const TransportParams = struct {
             const value = data[fbs.seek..][0..param_len];
             fbs.seek += param_len;
 
-            if (param_id == @intFromEnum(ParamId.min_ack_delay)) {
+            if (param_id == @backingInt(ParamId.min_ack_delay)) {
                 if (seen_min_ack_delay) return error.TransportParameterError;
                 seen_min_ack_delay = true;
-            } else if (param_id <= @intFromEnum(ParamId.version_information) or
-                param_id == @intFromEnum(ParamId.max_datagram_frame_size))
+            } else if (param_id <= @backingInt(ParamId.version_information) or
+                param_id == @backingInt(ParamId.max_datagram_frame_size))
             {
                 if (seen.isSet(@intCast(param_id))) return error.TransportParameterError;
                 seen.set(@intCast(param_id));
             }
 
             switch (param_id) {
-                @intFromEnum(ParamId.original_destination_connection_id) => params.original_destination_connection_id = try readCid(value),
-                @intFromEnum(ParamId.max_idle_timeout) => params.max_idle_timeout = try readVarIntParam(value),
-                @intFromEnum(ParamId.stateless_reset_token) => {
+                @backingInt(ParamId.original_destination_connection_id) => params.original_destination_connection_id = try readCid(value),
+                @backingInt(ParamId.max_idle_timeout) => params.max_idle_timeout = try readVarIntParam(value),
+                @backingInt(ParamId.stateless_reset_token) => {
                     if (value.len != 16) return error.TransportParameterError;
                     params.stateless_reset_token = value[0..16].*;
                 },
-                @intFromEnum(ParamId.max_udp_payload_size) => {
+                @backingInt(ParamId.max_udp_payload_size) => {
                     params.max_udp_payload_size = try readVarIntParam(value);
                     if (params.max_udp_payload_size < 1200) return error.TransportParameterError;
                 },
-                @intFromEnum(ParamId.initial_max_data) => params.initial_max_data = try readVarIntParam(value),
-                @intFromEnum(ParamId.initial_max_stream_data_bidi_local) => params.initial_max_stream_data_bidi_local = try readVarIntParam(value),
-                @intFromEnum(ParamId.initial_max_stream_data_bidi_remote) => params.initial_max_stream_data_bidi_remote = try readVarIntParam(value),
-                @intFromEnum(ParamId.initial_max_stream_data_uni) => params.initial_max_stream_data_uni = try readVarIntParam(value),
-                @intFromEnum(ParamId.initial_max_streams_bidi) => params.initial_max_streams_bidi = try readVarIntParam(value),
-                @intFromEnum(ParamId.initial_max_streams_uni) => params.initial_max_streams_uni = try readVarIntParam(value),
-                @intFromEnum(ParamId.ack_delay_exponent) => params.ack_delay_exponent = try readVarIntParam(value),
-                @intFromEnum(ParamId.max_ack_delay) => params.max_ack_delay = try readVarIntParam(value),
-                @intFromEnum(ParamId.disable_active_migration) => {
+                @backingInt(ParamId.initial_max_data) => params.initial_max_data = try readVarIntParam(value),
+                @backingInt(ParamId.initial_max_stream_data_bidi_local) => params.initial_max_stream_data_bidi_local = try readVarIntParam(value),
+                @backingInt(ParamId.initial_max_stream_data_bidi_remote) => params.initial_max_stream_data_bidi_remote = try readVarIntParam(value),
+                @backingInt(ParamId.initial_max_stream_data_uni) => params.initial_max_stream_data_uni = try readVarIntParam(value),
+                @backingInt(ParamId.initial_max_streams_bidi) => params.initial_max_streams_bidi = try readVarIntParam(value),
+                @backingInt(ParamId.initial_max_streams_uni) => params.initial_max_streams_uni = try readVarIntParam(value),
+                @backingInt(ParamId.ack_delay_exponent) => params.ack_delay_exponent = try readVarIntParam(value),
+                @backingInt(ParamId.max_ack_delay) => params.max_ack_delay = try readVarIntParam(value),
+                @backingInt(ParamId.disable_active_migration) => {
                     if (value.len != 0) return error.TransportParameterError;
                     params.disable_active_migration = true;
                 },
-                @intFromEnum(ParamId.preferred_address) => params.preferred_address = try readPreferredAddress(value),
-                @intFromEnum(ParamId.active_connection_id_limit) => {
+                @backingInt(ParamId.preferred_address) => params.preferred_address = try readPreferredAddress(value),
+                @backingInt(ParamId.active_connection_id_limit) => {
                     params.active_connection_id_limit = try readVarIntParam(value);
                     if (params.active_connection_id_limit < 2) return error.TransportParameterError;
                 },
-                @intFromEnum(ParamId.initial_source_connection_id) => params.initial_source_connection_id = try readCid(value),
-                @intFromEnum(ParamId.retry_source_connection_id) => params.retry_source_connection_id = try readCid(value),
-                @intFromEnum(ParamId.max_datagram_frame_size) => params.max_datagram_frame_size = try readVarIntParam(value),
-                @intFromEnum(ParamId.min_ack_delay) => params.min_ack_delay = try readVarIntParam(value),
-                @intFromEnum(ParamId.version_information) => {
+                @backingInt(ParamId.initial_source_connection_id) => params.initial_source_connection_id = try readCid(value),
+                @backingInt(ParamId.retry_source_connection_id) => params.retry_source_connection_id = try readCid(value),
+                @backingInt(ParamId.max_datagram_frame_size) => params.max_datagram_frame_size = try readVarIntParam(value),
+                @backingInt(ParamId.min_ack_delay) => params.min_ack_delay = try readVarIntParam(value),
+                @backingInt(ParamId.version_information) => {
                     // A malformed one is skipped, as before; up to 8 versions kept.
                     if (value.len >= 4 and value.len % 4 == 0) {
                         params.version_info_chosen = std.mem.readInt(u32, value[0..4], .big);

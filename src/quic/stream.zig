@@ -19,7 +19,7 @@ pub const StreamType = enum(u2) {
 
 /// Returns the type of a stream from its ID.
 pub fn streamType(stream_id: u64) StreamType {
-    return @enumFromInt(@as(u2, @truncate(stream_id)));
+    return @fromBackingInt(@intCast(@as(u2, @truncate(stream_id))));
 }
 
 /// Returns true if the stream is bidirectional.
@@ -100,7 +100,7 @@ pub const FrameSorter = struct {
     pub fn init(allocator: Allocator) FrameSorter {
         return .{
             .allocator = allocator,
-            .chunks = .{ .items = &.{}, .capacity = 0 },
+            .chunks = .empty,
         };
     }
 
@@ -767,7 +767,7 @@ pub const SendStream = struct {
         return .{
             .stream_id = stream_id,
             .allocator = allocator,
-            .write_buffer = .{ .items = &.{}, .capacity = 0 },
+            .write_buffer = .empty,
             .acked_ranges = ranges.RangeSet.init(allocator),
         };
     }
@@ -780,11 +780,11 @@ pub const SendStream = struct {
     /// Give the buffer to the connection's spares, or free it.
     fn releaseBuffer(self: *SendStream) void {
         if (self.ledger) |l| if (l.giveSpare(self.write_buffer.allocatedSlice())) {
-            self.write_buffer = .{ .items = &.{}, .capacity = 0 };
+            self.write_buffer = .empty;
             return;
         };
         self.write_buffer.deinit(self.allocator);
-        self.write_buffer = .{ .items = &.{}, .capacity = 0 };
+        self.write_buffer = .empty;
     }
 
     /// Write data to the stream. Buffers it for later sending. Dropped once the
@@ -803,7 +803,7 @@ pub const SendStream = struct {
                 const items = self.write_buffer.items;
                 @memcpy(mem[0..items.len], items);
                 self.write_buffer.deinit(self.allocator);
-                self.write_buffer = .{ .items = mem[0..items.len], .capacity = mem.len };
+                self.write_buffer = .{ .items = mem[0..items.len], .capacity = mem.len, .pointer_stability = .{} };
             };
         }
         // Once the stream has buffered more than a few small writes, jump
@@ -860,7 +860,7 @@ pub const SendStream = struct {
             // the refill fault a fresh one in.
             if (self.ledger) |l| if (l.giveSpare(self.write_buffer.allocatedSlice())) {
                 self.buf_base += prefix;
-                self.write_buffer = .{ .items = &.{}, .capacity = 0 };
+                self.write_buffer = .empty;
                 return;
             };
             if (self.shrinkTo(prefix, RETAINED_CAPACITY)) return;
@@ -889,7 +889,7 @@ pub const SendStream = struct {
         const mem = self.allocator.alloc(u8, new_cap) catch return false;
         @memcpy(mem[0..live.len], live);
         self.write_buffer.deinit(self.allocator);
-        self.write_buffer = .{ .items = mem[0..live.len], .capacity = new_cap };
+        self.write_buffer = .{ .items = mem[0..live.len], .capacity = new_cap, .pointer_stability = .{} };
         self.buf_base += prefix;
         return true;
     }
@@ -2325,7 +2325,7 @@ test "FrameSorter: a FIN below data already received is FINAL_SIZE_ERROR" {
     // RFC 9000 4.5. Accepted, the stream delivered bytes past its end.
     var sorter = FrameSorter.init(testing.allocator);
     defer sorter.deinit();
-    try sorter.push(0, &([_]u8{0xab} ** 1000), false);
+    try sorter.push(0, &@as([1000]u8, @splat(0xab)), false);
     try testing.expectError(error.FinalSizeError, sorter.push(5, &.{}, true));
     try testing.expectError(error.FinalSizeError, sorter.push(500, "x", true));
     try sorter.push(1000, &.{}, true);
@@ -2830,7 +2830,7 @@ test "SendStream: retransmit queue overflow coalesces ranges" {
     defer ss.deinit();
 
     // Write enough data to cover all ranges
-    const data = "x" ** 2048;
+    const data = &@as([2048]u8, @splat('x'));
     try ss.writeData(data);
     // Simulate having sent all data
     ss.send_offset = 2048;
@@ -2861,7 +2861,7 @@ test "SendStream: contiguous ACK advances send offset after retransmit" {
     var ss = SendStream.init(testing.allocator, 0);
     defer ss.deinit();
 
-    const data = "x" ** 100;
+    const data = &@as([100]u8, @splat('x'));
     try ss.writeData(data);
     ss.send_offset = 20;
 
@@ -2883,7 +2883,7 @@ test "SendStream: ACK progress trims stale retransmit ranges" {
     var ss = SendStream.init(testing.allocator, 0);
     defer ss.deinit();
 
-    const data = "x" ** 100;
+    const data = &@as([100]u8, @splat('x'));
     try ss.writeData(data);
     ss.send_offset = 100;
     ss.queueRetransmit(0, 80, false);
@@ -3264,7 +3264,7 @@ test "collectClosedStreams: keeps an unacked stream for PTO" {
     sm.setMaxStreams(10, 10);
 
     const s = try sm.openBidiStream();
-    try s.send.writeData("x" ** 1000);
+    try s.send.writeData(&@as([1000]u8, @splat('x')));
     s.send.send_offset = 1000;
     s.send.fin_sent = true;
     try s.recv.handleStreamFrame(0, "", true);
@@ -3285,7 +3285,7 @@ test "disposeIfSettled: reclaims a closed stream once the last byte is acked" {
 
     const s = try sm.openBidiStream();
     const sid = s.stream_id;
-    try s.send.writeData("x" ** 100);
+    try s.send.writeData(&@as([100]u8, @splat('x')));
     s.send.send_offset = 100;
     s.send.fin_sent = true;
     try s.recv.handleStreamFrame(0, "", true);
@@ -3324,7 +3324,7 @@ test "disposeIfSettled: queues each stream once" {
 test "SendStream.isDisposable: every byte and the FIN acked, or RESET_STREAM queued" {
     var ss = SendStream.init(testing.allocator, 3);
     defer ss.deinit();
-    try ss.writeData("x" ** 10);
+    try ss.writeData(&@as([10]u8, @splat('x')));
     _ = ss.popStreamFrame(5).?;
     try ss.onAck(0, 5, false);
     try testing.expect(!ss.isDisposable()); // still open
@@ -3337,7 +3337,7 @@ test "SendStream.isDisposable: every byte and the FIN acked, or RESET_STREAM que
     // The FIN can be acked ahead of bytes a lost packet carried.
     var gap = SendStream.init(testing.allocator, 7);
     defer gap.deinit();
-    try gap.writeData("x" ** 10);
+    try gap.writeData(&@as([10]u8, @splat('x')));
     gap.close();
     _ = gap.popStreamFrame(5).?;
     _ = gap.popStreamFrame(100).?;
@@ -3346,7 +3346,7 @@ test "SendStream.isDisposable: every byte and the FIN acked, or RESET_STREAM que
 
     var reset = SendStream.init(testing.allocator, 11);
     defer reset.deinit();
-    try reset.writeData("x" ** 10);
+    try reset.writeData(&@as([10]u8, @splat('x')));
     reset.reset(1);
     try testing.expect(!reset.isDisposable()); // RESET_STREAM not out yet
     reset.reset_stream_sent = true;
@@ -3450,7 +3450,7 @@ test "SendStream: a closed stream stays unacked until the FIN itself is acked" {
     var ss = SendStream.init(testing.allocator, 0);
     defer ss.deinit();
 
-    try ss.writeData("x" ** 100);
+    try ss.writeData(&@as([100]u8, @splat('x')));
     ss.send_offset = 100;
     ss.close();
 
@@ -3468,7 +3468,7 @@ test "SendStream: a reset stream has nothing left to retransmit" {
     var ss = SendStream.init(testing.allocator, 0);
     defer ss.deinit();
 
-    try ss.writeData("x" ** 100);
+    try ss.writeData(&@as([100]u8, @splat('x')));
     ss.send_offset = 100;
     ss.close();
     try testing.expect(ss.hasUnackedData());
@@ -3481,7 +3481,7 @@ test "SendStream: a retransmit range never walks past MAX_STREAM_DATA" {
     var ss = SendStream.init(testing.allocator, 0);
     defer ss.deinit();
 
-    try ss.writeData("x" ** 200);
+    try ss.writeData(&@as([200]u8, @splat('x')));
     ss.send_window = 100;
 
     // Everything the window allows goes out.
@@ -3627,7 +3627,7 @@ test "SendStream: acked bytes are dropped and later offsets stay correct" {
     var ss = SendStream.init(testing.allocator, 0);
     defer ss.deinit();
 
-    const chunk = "x" ** 32768;
+    const chunk = &@as([32768]u8, @splat('x'));
     try ss.writeData(chunk);
     try ss.writeData(chunk);
     try ss.writeData("TAIL");
@@ -3650,7 +3650,7 @@ test "SendStream: a long transfer does not grow without bound" {
     defer ss.deinit();
 
     // 4 MB streamed in 8 KB chunks, acknowledged as it goes.
-    const chunk = "y" ** 8192;
+    const chunk = &@as([8192]u8, @splat('y'));
     var sent: u64 = 0;
     while (sent < 4 * 1024 * 1024) : (sent += chunk.len) {
         try ss.writeData(chunk);
@@ -3668,7 +3668,7 @@ test "SendStream: a lost packet whose bytes were since acked is not requeued" {
     var ss = SendStream.init(testing.allocator, 0);
     defer ss.deinit();
 
-    try ss.writeData("x" ** 200);
+    try ss.writeData(&@as([200]u8, @splat('x')));
     ss.send_offset = 200;
     try ss.onAck(0, 100, false);
 
@@ -3687,7 +3687,7 @@ test "SendStream: retransmission after compaction sends the right bytes" {
     var ss = SendStream.init(testing.allocator, 0);
     defer ss.deinit();
 
-    try ss.writeData("a" ** 65536);
+    try ss.writeData(&@as([65536]u8, @splat('a')));
     try ss.writeData("bbbbbbbbbb");
     ss.send_offset = ss.write_offset;
     try ss.onAck(0, 65536, false);
@@ -3703,7 +3703,7 @@ test "SendStream: compaction survives an ack past what was written" {
     var ss = SendStream.init(testing.allocator, 0);
     defer ss.deinit();
 
-    try ss.writeData("z" ** 70000);
+    try ss.writeData(&@as([70000]u8, @splat('z')));
     ss.send_offset = ss.write_offset;
     // A peer that acknowledges more than we sent must not underflow the
     // buffered-length arithmetic.

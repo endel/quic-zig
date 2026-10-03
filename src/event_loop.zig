@@ -675,17 +675,17 @@ pub fn Server(comptime Handler: type) type {
             "onWsUpgrade",        "onWsMessage",        "onWsClose",
         };
 
-        for (@typeInfo(Handler).@"struct".decls) |decl| {
-            if (decl.name.len >= 2 and decl.name[0] == 'o' and decl.name[1] == 'n') {
+        for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
+            if (decl_name.len >= 2 and decl_name[0] == 'o' and decl_name[1] == 'n') {
                 var found = false;
                 for (known) |k| {
-                    if (std.mem.eql(u8, decl.name, k)) {
+                    if (std.mem.eql(u8, decl_name, k)) {
                         found = true;
                         break;
                     }
                 }
                 if (!found) {
-                    @compileError("Handler has unrecognized callback '" ++ decl.name ++
+                    @compileError("Handler has unrecognized callback '" ++ decl_name ++
                         "'. Known callbacks: onRequest, onData, onRequestEnd, " ++
                         "onRequestCancelled, onConnectRequest, " ++
                         "onSessionReady, onStreamData, onDatagram, onSessionClosed, " ++
@@ -702,7 +702,7 @@ pub fn Server(comptime Handler: type) type {
         }
 
         if (@hasDecl(Handler, "onStreamData")) {
-            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params;
+            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types;
             if (params.len != 4 and params.len != 5) {
                 @compileError("onStreamData must have 4 params (self, session, stream_id, data) " ++
                     "or 5 params (self, session, stream_id, data, fin)");
@@ -712,17 +712,17 @@ pub fn Server(comptime Handler: type) type {
         if ((@hasDecl(Handler, "onWsMessage") or @hasDecl(Handler, "onWsClose")) and !@hasDecl(Handler, "onWsUpgrade")) {
             @compileError("onWsMessage and onWsClose need onWsUpgrade, which accepts the WebSockets they serve");
         }
-        if (@hasDecl(Handler, "onWsUpgrade") and @typeInfo(@TypeOf(Handler.onWsUpgrade)).@"fn".params.len != 3) {
+        if (@hasDecl(Handler, "onWsUpgrade") and @typeInfo(@TypeOf(Handler.onWsUpgrade)).@"fn".param_types.len != 3) {
             @compileError("onWsUpgrade must have 3 params (self, req: *WsRequest, path)");
         }
         if (@hasDecl(Handler, "onWsMessage")) {
-            const n = @typeInfo(@TypeOf(Handler.onWsMessage)).@"fn".params.len;
+            const n = @typeInfo(@TypeOf(Handler.onWsMessage)).@"fn".param_types.len;
             if (n != 3 and n != 4) {
                 @compileError("onWsMessage must have 3 params (self, ws: *WsConn, data) " ++
                     "or 4 params (self, ws, data, kind: WsMessageKind)");
             }
         }
-        if (@hasDecl(Handler, "onWsClose") and @typeInfo(@TypeOf(Handler.onWsClose)).@"fn".params.len != 4) {
+        if (@hasDecl(Handler, "onWsClose") and @typeInfo(@TypeOf(Handler.onWsClose)).@"fn".param_types.len != 4) {
             @compileError("onWsClose must have 4 params (self, ws: *WsConn, code: u16, reason)");
         }
     }
@@ -1176,7 +1176,7 @@ pub fn Server(comptime Handler: type) type {
             // Still handshaking: initProtocol sends GOAWAY(0) once it can.
             const h3c = entry.h3_conn orelse return;
             h3c.initiateShutdown() catch {
-                conn.close(@intFromEnum(h3.H3Error.no_error), "server shutdown");
+                conn.close(@backingInt(h3.H3Error.no_error), "server shutdown");
                 return;
             };
             entry.drain_final_goaway_at = now + conn.pkt_handler.rtt_stats.pto();
@@ -1200,7 +1200,7 @@ pub fn Server(comptime Handler: type) type {
                 if (now < (entry.drain_final_goaway_at orelse now)) return;
                 entry.drain_final_goaway_at = null;
                 h3c.completeShutdown() catch {
-                    conn.close(@intFromEnum(h3.H3Error.no_error), "server shutdown");
+                    conn.close(@backingInt(h3.H3Error.no_error), "server shutdown");
                     return;
                 };
             }
@@ -1215,7 +1215,7 @@ pub fn Server(comptime Handler: type) type {
                 if (send.hasUnackedData()) return;
                 if (send.reset_err != null and !send.reset_stream_sent) return;
             }
-            conn.close(@intFromEnum(h3.H3Error.no_error), "");
+            conn.close(@backingInt(h3.H3Error.no_error), "");
         }
 
         /// Initiate graceful shutdown. All active connections receive
@@ -1563,7 +1563,7 @@ pub fn Server(comptime Handler: type) type {
                 entry.h3_conn = null;
                 entry.h0_conn = null;
                 const code: h3.H3Error = if (err == error.StreamLimitError) .general_protocol_error else .internal_error;
-                entry.conn.close(@intFromEnum(code), "protocol setup failed");
+                entry.conn.close(@backingInt(code), "protocol setup failed");
                 return;
             };
 
@@ -1580,7 +1580,7 @@ pub fn Server(comptime Handler: type) type {
             // Finished its handshake after drain() began: it may send nothing.
             if (self.draining) {
                 if (entry.h3_conn) |h3c| {
-                    h3c.sendGoaway(0) catch entry.conn.close(@intFromEnum(h3.H3Error.no_error), "server shutdown");
+                    h3c.sendGoaway(0) catch entry.conn.close(@backingInt(h3.H3Error.no_error), "server shutdown");
                 } else {
                     entry.conn.close(0, "server shutdown");
                 }
@@ -1744,7 +1744,7 @@ pub fn Server(comptime Handler: type) type {
                 self.handler.onRequest(session, stream_id, headers);
             } else {
                 // Nobody will answer it, so say so instead of leaving it open.
-                session.resetRequest(stream_id, @intFromEnum(h3.H3Error.request_rejected));
+                session.resetRequest(stream_id, @backingInt(h3.H3Error.request_rejected));
             }
         }
 
@@ -1759,7 +1759,7 @@ pub fn Server(comptime Handler: type) type {
         fn dispatchStreamData(self: *Self, session: *Session, stream_id: u64, data: []const u8, fin: bool) void {
             if (!@hasDecl(Handler, "onStreamData")) return;
 
-            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params.len == 5) {
+            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types.len == 5) {
                 self.handler.onStreamData(session, stream_id, data, fin);
             } else if (data.len > 0) {
                 self.handler.onStreamData(session, stream_id, data);
@@ -1772,7 +1772,7 @@ pub fn Server(comptime Handler: type) type {
             defer self.forgetHeaders();
             if (!@hasDecl(Handler, "onConnectRequest")) return;
 
-            if (comptime @typeInfo(@TypeOf(Handler.onConnectRequest)).@"fn".params.len == 5) {
+            if (comptime @typeInfo(@TypeOf(Handler.onConnectRequest)).@"fn".param_types.len == 5) {
                 self.handler.onConnectRequest(session, session_id, path, headers);
             } else {
                 self.handler.onConnectRequest(session, session_id, path);
@@ -1783,7 +1783,7 @@ pub fn Server(comptime Handler: type) type {
             defer self.forgetHeaders();
             if (!@hasDecl(Handler, "onSessionReady")) return;
 
-            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".params.len == 4) {
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".param_types.len == 4) {
                 self.handler.onSessionReady(session, session_id, headers);
             } else {
                 self.handler.onSessionReady(session, session_id);
@@ -2519,17 +2519,17 @@ pub fn Client(comptime Handler: type) type {
             "onWritable",
         };
 
-        for (@typeInfo(Handler).@"struct".decls) |decl| {
-            if (decl.name.len >= 2 and decl.name[0] == 'o' and decl.name[1] == 'n') {
+        for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
+            if (decl_name.len >= 2 and decl_name[0] == 'o' and decl_name[1] == 'n') {
                 var found = false;
                 for (known) |k| {
-                    if (std.mem.eql(u8, decl.name, k)) {
+                    if (std.mem.eql(u8, decl_name, k)) {
                         found = true;
                         break;
                     }
                 }
                 if (!found) {
-                    @compileError("Handler has unrecognized callback '" ++ decl.name ++
+                    @compileError("Handler has unrecognized callback '" ++ decl_name ++
                         "'. Known client callbacks: onConnected, onPollComplete, " ++
                         "onHeaders, onData, onFinished, onSettings, onGoaway, onRequestCancelled, " ++
                         "onStreamData, " ++
@@ -2541,7 +2541,7 @@ pub fn Client(comptime Handler: type) type {
         }
 
         if (@hasDecl(Handler, "onStreamData")) {
-            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params;
+            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types;
             if (params.len != 4 and params.len != 5) {
                 @compileError("onStreamData must have 4 params (self, session, stream_id, data) " ++
                     "or 5 params (self, session, stream_id, data, fin)");
@@ -3070,7 +3070,7 @@ pub fn Client(comptime Handler: type) type {
                 self.wt_conn = null;
                 self.h3_conn = null;
                 const code: h3.H3Error = if (err == error.StreamLimitError) .general_protocol_error else .internal_error;
-                self.conn.close(@intFromEnum(code), "protocol setup failed");
+                self.conn.close(@backingInt(code), "protocol setup failed");
                 return;
             };
             self.protocol_initialized = true;
@@ -3202,7 +3202,7 @@ pub fn Client(comptime Handler: type) type {
         fn dispatchSessionReady(self: *Self, session: *ClientSession, session_id: u64, headers: []const qpack.Header) void {
             if (!@hasDecl(Handler, "onSessionReady")) return;
 
-            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".params.len == 4) {
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".param_types.len == 4) {
                 self.handler.onSessionReady(session, session_id, headers);
             } else {
                 self.handler.onSessionReady(session, session_id);
@@ -3212,7 +3212,7 @@ pub fn Client(comptime Handler: type) type {
         fn dispatchStreamData(self: *Self, session: *ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
             if (!@hasDecl(Handler, "onStreamData")) return;
 
-            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".params.len == 5) {
+            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types.len == 5) {
                 self.handler.onStreamData(session, stream_id, data, fin);
             } else if (data.len > 0) {
                 self.handler.onStreamData(session, stream_id, data);
@@ -3795,7 +3795,7 @@ test "Client: a datagram from elsewhere does not redirect the handshake" {
     to.in.sa.addr = std.mem.nativeToBig(u32, 0x7f000001);
     const spoofer = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
     defer sys.close(spoofer);
-    const junk = [_]u8{0x40} ** 64;
+    const junk: [64]u8 = @splat(0x40);
     _ = try sys.sendto(spoofer, &junk, 0, &to.any, to.getOsSockLen());
     for (0..20) |_| {
         try loop.run(.no_wait);
@@ -4056,7 +4056,7 @@ const CheckingClient = struct {
             if (std.mem.eql(u8, h.name, ":status") and h.value.len == 3) @memcpy(&self.status, h.value);
         }
         if (self.cancel_on_headers) {
-            session.h3_conn.?.cancelRequest(stream_id, @intFromEnum(H3Error.request_cancelled));
+            session.h3_conn.?.cancelRequest(stream_id, @backingInt(H3Error.request_cancelled));
         }
     }
 
@@ -4226,7 +4226,7 @@ test "e2e: a client abandoning a response reaches onRequestCancelled" {
 
     try runUntil(&e2e.loop, &server_handler, StallingServer.done, 10_000);
     try testing.expectEqual(client_handler.stream_id, server_handler.cancelled_stream);
-    try testing.expectEqual(@as(u64, @intFromEnum(H3Error.request_cancelled)), server_handler.cancel_code);
+    try testing.expectEqual(@as(u64, @backingInt(H3Error.request_cancelled)), server_handler.cancel_code);
 }
 
 /// A WebTransport listener that also serves plain requests.
@@ -4606,7 +4606,7 @@ test "e2e: drain() lets an in-flight response finish and turns new requests away
     // The final GOAWAY names the first request not served: the next one.
     try testing.expectEqual(@as(?u64, 4), client_handler.goaway_id);
     try testing.expect(client_handler.refused_locally);
-    try testing.expectEqual(@as(?u64, @intFromEnum(H3Error.request_rejected)), client_handler.late_reset_code);
+    try testing.expectEqual(@as(?u64, @backingInt(H3Error.request_rejected)), client_handler.late_reset_code);
     try testing.expectEqual(@as(u32, 1), server_handler.requests);
 }
 
@@ -5139,9 +5139,9 @@ test "Server: workers sharing a reset key send no resets unless they steer" {
 
     const addr = std.mem.zeroes(posix.sockaddr.storage);
     var out: [1500]u8 = undefined;
-    var pkt = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
+    var pkt = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
     try testing.expect(shared.conn_mgr.recvDatagram(&pkt, addr, addr, 0, &out) == .dropped);
-    pkt = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
+    pkt = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
     try testing.expect(own.conn_mgr.recvDatagram(&pkt, addr, addr, 0, &out) == .send_response);
 }
 
@@ -5322,7 +5322,7 @@ test "e2e: a server past retry_threshold makes a client retry, then serves it" {
 /// Server ids 1 and 2 under one QUIC-LB config, as a proxy's workers would
 /// share it.
 fn steerLbConfig(server_id: u8) quic_lb.Config {
-    var cfg: quic_lb.Config = .{ .config_id = 1, .server_id_len = 1, .nonce_len = 7, .key = [_]u8{0x5a} ** 16 };
+    var cfg: quic_lb.Config = .{ .config_id = 1, .server_id_len = 1, .nonce_len = 7, .key = @splat(0x5a) };
     cfg.server_id[0] = server_id;
     return cfg;
 }

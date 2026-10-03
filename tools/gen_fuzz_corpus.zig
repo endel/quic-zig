@@ -21,7 +21,7 @@ pub fn main() !void {
 
     // QUIC Long Header (Initial packet)
     writeCorpus(dir, "long_header_initial", &.{
-        0xc0,       // Long header, Initial type
+        0xc0, // Long header, Initial type
         0x00, 0x00, 0x00, 0x01, // Version 1
         0x08, // DCID len = 8
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // DCID
@@ -36,7 +36,7 @@ pub fn main() !void {
 
     // QUIC Short Header (1-RTT)
     writeCorpus(dir, "short_header_1rtt", &.{
-        0x40,       // Short header, fixed bit set
+        0x40, // Short header, fixed bit set
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // DCID (8 bytes)
         0x00, // Packet number
         0x01, // PING frame

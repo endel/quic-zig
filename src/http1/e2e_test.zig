@@ -421,7 +421,7 @@ const TestClient = struct {
         self.pos += pos + len;
         return .{
             .fin = b[0] & 0x80 != 0,
-            .opcode = @enumFromInt(@as(u4, @truncate(b[0]))),
+            .opcode = @fromBackingInt(@intCast(@as(u4, @truncate(b[0])))),
             .payload = b[pos..][0..len],
         };
     }
@@ -492,8 +492,8 @@ test "ws: a frame split across reads, then two frames in one read" {
         // Two masked frames built back to back, then cut mid-way through the
         // first: its head arrives alone, its tail with the whole second one.
         var frames: [2400]u8 = undefined;
-        const first = [_]u8{0x61} ** 1000;
-        const second = [_]u8{0x62} ** 1200;
+        const first: [1000]u8 = @splat(0x61);
+        const second: [1200]u8 = @splat(0x62);
         var n: usize = 0;
         n += maskedFrame(frames[n..], .binary, &first).len;
         n += maskedFrame(frames[n..], .binary, &second).len;
@@ -718,7 +718,7 @@ test "ws: over TLS, with ALPN http/1.1" {
     try h.upgrade(&c, "/tls", true);
     try testing.expectEqualStrings("http/1.1", c.tls.?.alpn().?);
 
-    const big = [_]u8{0x5a} ** 3000;
+    const big: [3000]u8 = @splat(0x5a);
     try c.sendFrame(.binary, true, &big);
     const echo = try h.frame(&c);
     try testing.expectEqualSlices(u8, &big, echo.payload);

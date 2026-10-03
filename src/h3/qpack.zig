@@ -1177,9 +1177,9 @@ test "QpackEncoder: repeated and new fields decode against a peer's dynamic tabl
             .{ .name = "x-new", .value = "zzz" },
         },
         &.{
-            .{ .name = "x-a", .value = "a" ** 100 },
-            .{ .name = "x-b", .value = "b" ** 100 },
-            .{ .name = "x-a", .value = "a" ** 100 },
+            .{ .name = "x-a", .value = &@as([100]u8, @splat('a')) },
+            .{ .name = "x-b", .value = &@as([100]u8, @splat('b')) },
+            .{ .name = "x-a", .value = &@as([100]u8, @splat('a')) },
         },
     };
     for (blocks) |headers| {
@@ -1372,7 +1372,7 @@ test "DynamicTable: insert entry larger than capacity fails" {
     dt.setCapacity(64); // small
 
     // 50-byte name+value+32 = 82 > 64 → EntryTooLarge
-    const big_name = "x" ** 40;
+    const big_name = &@as([40]u8, @splat('x'));
     try testing.expectError(
         error.EntryTooLarge,
         dt.insert(big_name, "value"),
@@ -1385,15 +1385,15 @@ test "DynamicTable: capacity is the only size limit" {
 
     // Names and values used to be capped at 128 and 512 bytes by their inline
     // buffers, so a long-but-legal header could not be indexed at all.
-    const long_name = "x" ** 200;
-    const long_value = "v" ** 600;
+    const long_name = &@as([200]u8, @splat('x'));
+    const long_value = &@as([600]u8, @splat('v'));
     try dt.insert(long_name, long_value);
     const e = dt.get(0).?;
     try testing.expectEqualStrings(long_name, e.name);
     try testing.expectEqualStrings(long_value, e.value);
 
     // What does not fit in the capacity is still rejected.
-    try testing.expectError(error.EntryTooLarge, dt.insert("n", "v" ** (DynamicTable.MAX_CAPACITY)));
+    try testing.expectError(error.EntryTooLarge, dt.insert("n", &@as([DynamicTable.MAX_CAPACITY]u8, @splat('v'))));
 }
 
 test "DynamicTable: arena is reused as entries are evicted" {
@@ -1407,7 +1407,7 @@ test "DynamicTable: arena is reused as entries are evicted" {
     while (i < 500) : (i += 1) {
         const name = try std.fmt.bufPrint(&buf, "header-{d}", .{i});
         var vbuf: [200]u8 = undefined;
-        const value = try std.fmt.bufPrint(&vbuf, "value-{d}-{s}", .{ i, "p" ** 100 });
+        const value = try std.fmt.bufPrint(&vbuf, "value-{d}-{s}", .{ i, &@as([100]u8, @splat('p')) });
         try dt.insert(name, value);
 
         // The newest entry must always read back exactly.
@@ -1460,7 +1460,8 @@ test "an encoder-stream Duplicate copies an entry out of the arena it writes to"
     // Insert With Literal Name: 01H0NNNN, 5-bit name length, then a string.
     try dec.processEncoderInstruction(&[_]u8{
         0x40 | 4, 'n', 'a', 'm', 'e',
-        5,        'v', 'a', 'l', 'u', 'e',
+        5,        'v', 'a', 'l', 'u',
+        'e',
     });
     try testing.expectEqual(@as(usize, 1), dec.dynamic.count);
 
@@ -1483,8 +1484,8 @@ test "QpackEncoder: header blocks past 4 KiB round-trip" {
 
     var headers: [100]Header = undefined;
     headers[0] = .{ .name = ":status", .value = "200" };
-    headers[1] = .{ .name = "cookie", .value = "a" ** 6000 };
-    headers[2] = .{ .name = "set-cookie", .value = "b" ** 3000 };
+    headers[1] = .{ .name = "cookie", .value = &@as([6000]u8, @splat('a')) };
+    headers[2] = .{ .name = "set-cookie", .value = &@as([3000]u8, @splat('b')) };
     for (headers[3..]) |*h| h.* = .{ .name = "x-filler", .value = "some value" };
 
     const buf = try testing.allocator.alloc(u8, maxEncodedLen(&headers));
@@ -1525,7 +1526,7 @@ test "QpackDecoder: an encoder-stream literal name length near usize max is reje
 test "QpackDecoder: encoder instructions split at every byte are applied once complete" {
     // Set Capacity, Insert With Literal Name, Insert With static Name
     // Reference (:authority) with a two-byte value length, Duplicate.
-    const long_value = "v" ** 200;
+    const long_value = &@as([200]u8, @splat('v'));
     const stream = set_capacity_4096 ++
         [_]u8{ 0x43, 'k', 'e', 'y', 0x05 } ++ "value".* ++
         [_]u8{ 0xc0, 0x7f, 200 - 127 } ++ long_value.* ++
@@ -1691,8 +1692,8 @@ test "QpackDecoder: encoder-stream name references and Duplicate index relativel
 }
 
 test "QpackDecoder: Huffman strings decoding past 4 KiB fit in scratch" {
-    const cookie = "session=" ++ "a" ** 5000;
-    const name = "x-" ++ "n" ** 4200;
+    const cookie = "session=" ++ &@as([5000]u8, @splat('a'));
+    const name = "x-" ++ &@as([4200]u8, @splat('n'));
     var block: [SCRATCH_SIZE]u8 = undefined;
     var pos: usize = 2;
     block[0] = 0x00;

@@ -174,7 +174,7 @@ pub fn Session(comptime Transport: type) type {
         setup_received: bool = false,
         peer_setup: msg.Setup = .{},
 
-        streams: [MAX_STREAMS]StreamState = [_]StreamState{.{}} ** MAX_STREAMS,
+        streams: [MAX_STREAMS]StreamState = @splat(.{}),
         hop_bufs: [MAX_EVENTS][msg.MAX_HOPS]u64 = undefined,
         /// The peer's SETUP path, copied: its stream's slot is reused.
         peer_path_buf: [512]u8 = undefined,
@@ -219,7 +219,7 @@ pub fn Session(comptime Transport: type) type {
             const sid = try self.transport.openUni();
             var buf: [512]u8 = undefined;
             var fbs = io.fixedBufferStream(&buf);
-            try msg.writeStreamType(&fbs, @intFromEnum(msg.DataType.setup));
+            try msg.writeStreamType(&fbs, @backingInt(msg.DataType.setup));
             try msg.writeSetup(&fbs, .{ .probe = self.probe_level, .path = self.path });
             try self.transport.write(sid, buf[0..fbs.seek]);
             self.transport.finish(sid);
@@ -231,7 +231,7 @@ pub fn Session(comptime Transport: type) type {
             _ = self.claim(sid, role) orelse return Error.TooManyStreams;
             var buf: [8]u8 = undefined;
             var fbs = io.fixedBufferStream(&buf);
-            try msg.writeStreamType(&fbs, @intFromEnum(kind));
+            try msg.writeStreamType(&fbs, @backingInt(kind));
             try self.transport.write(sid, buf[0..fbs.seek]);
             return sid;
         }
@@ -319,7 +319,7 @@ pub fn Session(comptime Transport: type) type {
             const sid = try self.transport.openUni();
             var buf: [64]u8 = undefined;
             var fbs = io.fixedBufferStream(&buf);
-            try msg.writeStreamType(&fbs, @intFromEnum(msg.DataType.group));
+            try msg.writeStreamType(&fbs, @backingInt(msg.DataType.group));
             try msg.writeGroup(&fbs, group);
             try self.transport.write(sid, buf[0..fbs.seek]);
             return sid;
@@ -690,7 +690,7 @@ test "the peer's SETUP completes the handshake" {
 
     var buf: [128]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
-    try msg.writeStreamType(&fbs, @intFromEnum(msg.DataType.setup));
+    try msg.writeStreamType(&fbs, @backingInt(msg.DataType.setup));
     try msg.writeSetup(&fbs, .{ .probe = .increase });
 
     try s.onPeerStream(3, false);
@@ -714,7 +714,7 @@ test "a subscribe stream carries the request then its updates" {
 
     var buf: [256]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
-    try msg.writeStreamType(&fbs, @intFromEnum(msg.ControlType.subscribe));
+    try msg.writeStreamType(&fbs, @backingInt(msg.ControlType.subscribe));
     try msg.writeSubscribe(&fbs, .{ .id = 3, .broadcast = "room", .track = "video", .priority = 7 });
     try msg.writeSubscribeUpdate(&fbs, .{ .priority = 9, .ordered = true });
 
@@ -800,7 +800,7 @@ test "a group's first read is forwarded whole, however large" {
     var s = TestSession.init(&t);
     var buf: [CONTROL_BUF_SIZE * 3]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
-    try msg.writeStreamType(&fbs, @intFromEnum(msg.DataType.group));
+    try msg.writeStreamType(&fbs, @backingInt(msg.DataType.group));
     try msg.writeGroup(&fbs, .{ .subscribe_id = 0, .sequence = 1 });
     const payload = CONTROL_BUF_SIZE * 2;
     @memset(buf[fbs.seek..][0..payload], 0x5a);
@@ -822,7 +822,7 @@ test "the peer's SETUP path outlives its stream's slot" {
     var s = TestSession.init(&t);
     var buf: [128]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
-    try msg.writeStreamType(&fbs, @intFromEnum(msg.DataType.setup));
+    try msg.writeStreamType(&fbs, @backingInt(msg.DataType.setup));
     try msg.writeSetup(&fbs, .{ .path = "/room" });
     var events: [8]Event = undefined;
     _ = try s.onStreamData(3, buf[0..fbs.seek], true, &events);
@@ -830,7 +830,7 @@ test "the peer's SETUP path outlives its stream's slot" {
     // The released slot is taken by the next stream.
     var other: [128]u8 = undefined;
     var ofbs = io.fixedBufferStream(&other);
-    try msg.writeStreamType(&ofbs, @intFromEnum(msg.DataType.group));
+    try msg.writeStreamType(&ofbs, @backingInt(msg.DataType.group));
     try msg.writeGroup(&ofbs, .{ .subscribe_id = 9, .sequence = 9 });
     @memset(other[ofbs.seek..][0..40], 'z');
     _ = try s.onStreamData(7, other[0 .. ofbs.seek + 40], false, &events);
@@ -845,7 +845,7 @@ test "frames arriving with the group header are not swallowed" {
 
     var buf: [128]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
-    try msg.writeStreamType(&fbs, @intFromEnum(msg.DataType.group));
+    try msg.writeStreamType(&fbs, @backingInt(msg.DataType.group));
     try msg.writeGroup(&fbs, .{ .subscribe_id = 1, .sequence = 0 });
     const header_len = fbs.seek;
     try msg.writeFrame(&fbs, .{ .timestamp_delta = 0, .payload = "first" });
@@ -871,7 +871,7 @@ test "a group stream names its subscription, then forwards bytes" {
 
     var hdr: [64]u8 = undefined;
     var hfbs = io.fixedBufferStream(&hdr);
-    try msg.writeStreamType(&hfbs, @intFromEnum(msg.DataType.group));
+    try msg.writeStreamType(&hfbs, @backingInt(msg.DataType.group));
     try msg.writeGroup(&hfbs, .{ .subscribe_id = 4, .sequence = 17 });
 
     try s.onPeerStream(7, false);
@@ -968,7 +968,7 @@ test "a track stream answers once and finishes" {
 
     var buf: [128]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
-    try msg.writeStreamType(&fbs, @intFromEnum(msg.ControlType.track));
+    try msg.writeStreamType(&fbs, @backingInt(msg.ControlType.track));
     try msg.writeTrack(&fbs, .{ .broadcast = "room", .track = "video" });
 
     try s.onPeerStream(9, true);
@@ -987,7 +987,7 @@ test "probe and goaway streams decode in both directions" {
 
     var buf: [128]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
-    try msg.writeStreamType(&fbs, @intFromEnum(msg.ControlType.probe));
+    try msg.writeStreamType(&fbs, @backingInt(msg.ControlType.probe));
     try msg.writeProbe(&fbs, .{ .bitrate = 2_000_000, .rtt_ms = 12 });
 
     try s.onPeerStream(11, true);
@@ -998,7 +998,7 @@ test "probe and goaway streams decode in both directions" {
 
     var gbuf: [128]u8 = undefined;
     var gfbs = io.fixedBufferStream(&gbuf);
-    try msg.writeStreamType(&gfbs, @intFromEnum(msg.ControlType.goaway));
+    try msg.writeStreamType(&gfbs, @backingInt(msg.ControlType.goaway));
     try msg.writeGoaway(&gfbs, .{ .uri = "https://other/moq" });
     try s.onPeerStream(13, true);
     n = try feedByByte(&s, 13, gbuf[0..gfbs.seek], &events);

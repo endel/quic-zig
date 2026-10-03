@@ -37,7 +37,7 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
         pub const mac_length = 16;
         pub const key_length = 16;
 
-        const pc_count = if (builtin.mode != .ReleaseSmall) 16 else 2;
+        const pc_count = if (builtin.mode != .small) 16 else 2;
         const agg_4_threshold = 22;
         const agg_8_threshold = 16;
         const agg_16_threshold = 328;
@@ -68,7 +68,7 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
             hx[0] = h;
             hx[1] = reduce(clsq128(hx[0])); // h^2
 
-            if (builtin.mode != .ReleaseSmall) {
+            if (builtin.mode != .small) {
                 hx[2] = reduce(clmul128(hx[1], h)); // h^3
                 hx[3] = reduce(clsq128(hx[1])); // h^4 = h^2^2
                 if (block_count >= agg_8_threshold) {
@@ -310,7 +310,7 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
 
             var i: usize = 0;
 
-            if (builtin.mode != .ReleaseSmall and msg.len >= agg_16_threshold * block_length) {
+            if (builtin.mode != .small and msg.len >= agg_16_threshold * block_length) {
                 // 16-blocks aggregated reduction
                 while (i + 256 <= msg.len) : (i += 256) {
                     var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[15 - 0]);
@@ -320,7 +320,7 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
                     }
                     acc = reduce(u);
                 }
-            } else if (builtin.mode != .ReleaseSmall and msg.len >= agg_8_threshold * block_length) {
+            } else if (builtin.mode != .small and msg.len >= agg_8_threshold * block_length) {
                 // 8-blocks aggregated reduction
                 while (i + 128 <= msg.len) : (i += 128) {
                     var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[7 - 0]);
@@ -330,7 +330,7 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
                     }
                     acc = reduce(u);
                 }
-            } else if (builtin.mode != .ReleaseSmall and msg.len >= agg_4_threshold * block_length) {
+            } else if (builtin.mode != .small and msg.len >= agg_4_threshold * block_length) {
                 // 4-blocks aggregated reduction
                 while (i + 64 <= msg.len) : (i += 64) {
                     var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[3 - 0]);
@@ -412,6 +412,12 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
             std.crypto.secureZero(Self, st[0..1]);
         }
 
+        pub fn finalResult(d: *Self) [mac_length]u8 {
+            var result: [mac_length]u8 = undefined;
+            d.final(&result);
+            return result;
+        }
+
         /// Compute the GHASH of a message.
         pub fn create(out: *[mac_length]u8, msg: []const u8, key: *const [key_length]u8) void {
             var st = Self.init(key);
@@ -420,4 +426,3 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
         }
     };
 }
-

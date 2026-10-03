@@ -92,6 +92,7 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Changed
 
+- **Breaking:** quic-zig now needs Zig 0.17.0; 0.16 no longer builds it.
 - **Breaking:** the event-loop `Client` now verifies servers against the
   platform's trust store by default (`ClientConfig.ca = .system`, loaded once
   per process), and a server whose chain ends at no trusted anchor is refused.

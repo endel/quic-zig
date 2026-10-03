@@ -134,7 +134,7 @@ fn runBulk(total: usize, c2s_loss: Link.Loss, s2c_loss: Link.Loss, one_way_ns: i
     defer sys.test_clock = null;
     var now = start;
 
-    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{ .qlog_dir = qlog_dir }, .{1} ** 16, .{2} ** 16);
+    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{ .qlog_dir = qlog_dir }, @splat(1), @splat(2));
     defer mgr.deinit();
 
     const client = try alloc.create(connection.Connection);
@@ -318,7 +318,7 @@ const Pair = struct {
     fn initTls(self: *Pair, server_tls: tls13.TlsConfig, server_config: connection.ConnectionConfig, client_config: connection.ConnectionConfig, client_tls: tls13.TlsConfig) !void {
         const alloc = testing.allocator;
         self.* = .{
-            .mgr = connection_manager.ConnectionManager.init(alloc, server_tls, server_config, .{1} ** 16, .{2} ** 16),
+            .mgr = connection_manager.ConnectionManager.init(alloc, server_tls, server_config, @splat(1), @splat(2)),
             .client = try alloc.create(connection.Connection),
         };
         errdefer {
@@ -372,7 +372,7 @@ test "stateless reset: a client whose server lost the connection drains" {
     p.mgr.removeConnection(p.mgr.entries.items[0]);
 
     const s = try p.client.openStream();
-    try s.send.writeData("x" ** 64);
+    try s.send.writeData(&@as([64]u8, @splat('x')));
     var buf: [MAX_DGRAM]u8 = undefined;
     var resp: [MAX_DGRAM]u8 = undefined;
     const n = try p.client.send(&buf);
@@ -429,7 +429,7 @@ test "handshake: the server holds 1-RTT packets until the client's Finished" {
     sys.test_clock = 1_000 * std.time.ns_per_s;
     defer sys.test_clock = null;
     const alloc = testing.allocator;
-    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, .{1} ** 16, .{2} ** 16);
+    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, @splat(1), @splat(2));
     defer mgr.deinit();
     const client = try alloc.create(connection.Connection);
     defer alloc.destroy(client);
@@ -609,7 +609,7 @@ test "handshake: 0-RTT sent before a HelloRetryRequest still arrives, as 1-RTT" 
     client_tls.session_ticket = &ticket;
     client_tls.key_share_groups = &.{};
     var p: Pair = .{
-        .mgr = connection_manager.ConnectionManager.init(alloc, server_tls, .{}, .{1} ** 16, .{2} ** 16),
+        .mgr = connection_manager.ConnectionManager.init(alloc, server_tls, .{}, @splat(1), @splat(2)),
         .client = try alloc.create(connection.Connection),
     };
     try connection.connectInto(p.client, alloc, "localhost", .{}, client_tls, null);

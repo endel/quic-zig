@@ -14,7 +14,7 @@ pub const Draft = enum(u8) {
     draft_18 = 18,
 
     pub fn number(self: Draft) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn alpn(self: Draft) []const u8 {
@@ -27,7 +27,7 @@ pub const Draft = enum(u8) {
     // The code a pre-draft-15 peer would negotiate with. Not on the wire
     // for the drafts we speak; kept because peers log and compare it.
     pub fn wireCode(self: Draft) u64 {
-        return 0xff00_0000 | @as(u64, @intFromEnum(self));
+        return 0xff00_0000 | @as(u64, @backingInt(self));
     }
 
     pub fn fromAlpn(token: []const u8) ?Draft {
@@ -104,7 +104,7 @@ pub fn alpnOffer(drafts: []const Draft, out: [][]const u8) [][]const u8 {
 }
 
 // Back-compat aliases for call sites that predate the version table.
-pub const DRAFT_NUMBER: u32 = @intFromEnum(DEFAULT);
+pub const DRAFT_NUMBER: u32 = @backingInt(DEFAULT);
 pub const WIRE_VERSION: u64 = 0xff00_0011;
 pub const ALPN: []const u8 = "moqt-17";
 

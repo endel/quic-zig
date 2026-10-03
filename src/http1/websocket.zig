@@ -31,7 +31,7 @@ pub const Opcode = enum(u4) {
     _,
 
     pub fn isControl(op: Opcode) bool {
-        return @intFromEnum(op) & 0x8 != 0;
+        return @backingInt(op) & 0x8 != 0;
     }
 };
 
@@ -247,7 +247,7 @@ fn parseHeaderAs(role: Role, buf: []const u8, max_payload: usize) Error!?Header 
     const b0 = buf[0];
     const b1 = buf[1];
     if (b0 & 0x70 != 0) return error.ProtocolError; // RSV1-3 without an extension
-    const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b0)));
+    const opcode: Opcode = @fromBackingInt(@intCast(@as(u4, @truncate(b0))));
     switch (opcode) {
         .continuation, .text, .binary, .close, .ping, .pong => {},
         _ => return error.ProtocolError,
@@ -297,7 +297,7 @@ fn parseHeaderAs(role: Role, buf: []const u8, max_payload: usize) Error!?Header 
 pub fn unmask(data: []u8, key: [4]u8) void {
     const lanes = 16;
     const V = @Vector(lanes, u8);
-    const pattern: V = @bitCast(key ** (lanes / 4));
+    const pattern: V = std.simd.repeat(lanes, key);
     var i: usize = 0;
     while (i + lanes <= data.len) : (i += lanes) {
         const chunk: V = data[i..][0..lanes].*;
@@ -312,7 +312,7 @@ pub const mask = unmask;
 
 /// Writes the header of an unmasked server frame; returns its bytes.
 pub fn writeFrameHeader(buf: *[10]u8, opcode: Opcode, fin: bool, len: usize) []const u8 {
-    buf[0] = @as(u8, if (fin) 0x80 else 0) | @as(u8, @intFromEnum(opcode));
+    buf[0] = @as(u8, if (fin) 0x80 else 0) | @as(u8, @backingInt(opcode));
     if (len < 126) {
         buf[1] = @intCast(len);
         return buf[0..2];
@@ -675,7 +675,7 @@ test "frame errors" {
     // Fragmented ping.
     try testing.expectError(error.ProtocolError, parseFrame(clientFrame(&buf, .ping, false, "x"), 100));
     // Control frame over 125 bytes.
-    try testing.expectError(error.ProtocolError, parseFrame(clientFrame(&buf, .ping, true, &([_]u8{0} ** 126)), 1000));
+    try testing.expectError(error.ProtocolError, parseFrame(clientFrame(&buf, .ping, true, &@as([126]u8, @splat(0))), 1000));
     // 64-bit length with the top bit set.
     var huge = [_]u8{ 0x82, 0xff, 0x80, 0, 0, 0, 0, 0, 0, 0 };
     try testing.expectError(error.ProtocolError, parseFrame(&huge, 100));
@@ -858,7 +858,7 @@ test "close frames" {
 
 test "close payload cuts the reason at a code point" {
     var p: [125]u8 = undefined;
-    const reason = "a" ** 122 ++ "é"; // 124 bytes; "é" straddles the 123-byte limit
+    const reason = &@as([122]u8, @splat('a')) ++ "é"; // 124 bytes; "é" straddles the 123-byte limit
     const out = closePayload(&p, 1000, reason);
     try testing.expectEqual(@as(usize, 2 + 122), out.len);
     try testing.expect(std.unicode.utf8ValidateSlice(out[2..]));

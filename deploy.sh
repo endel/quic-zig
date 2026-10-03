@@ -7,7 +7,7 @@
 # at /opt/quic-zig/zig-out/bin/wt-echo-server.
 #
 # Prerequisites:
-#   - Zig 0.16.0 in PATH (or ZIG env var pointing at the 0.16.0 binary).
+#   - Zig 0.17.0 in PATH (or ZIG env var pointing at the 0.17.0 binary).
 #   - SSH access to root@echo.web-transport.dev (or the DEPLOY_HOST below).
 #
 # Usage:

@@ -808,9 +808,9 @@ pub fn generateRetryToken(
 }
 
 pub const ValidatedToken = struct {
-    odcid_buf: [20]u8 = .{0} ** 20,
+    odcid_buf: [20]u8 = @splat(0),
     odcid_len: u8 = 0,
-    retry_scid_buf: [20]u8 = .{0} ** 20,
+    retry_scid_buf: [20]u8 = @splat(0),
     retry_scid_len: u8 = 0,
 
     pub fn getOdcid(self: *const ValidatedToken) []const u8 {
@@ -1220,8 +1220,8 @@ fn testIn6(ip: [16]u8, port: u16) posix.sockaddr.storage {
 
 test "tokens bind the whole client address, IPv4 on a dual-stack socket included" {
     const key: [crypto.key_len]u8 = @splat(3);
-    const v4 = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff };
-    const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1 } ++ [_]u8{0} ** 7;
+    const v4 = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff };
+    const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1 } ++ @as([7]u8, @splat(0));
     const pairs = [_][2]posix.sockaddr.storage{
         .{ testIn6(v4 ++ [_]u8{ 198, 51, 100, 7 }, 4433), testIn6(v4 ++ [_]u8{ 203, 0, 113, 9 }, 4433) },
         .{ testIn6(v6 ++ [_]u8{1}, 4433), testIn6(v6 ++ [_]u8{2}, 4433) },
@@ -1278,7 +1278,7 @@ test "Retry: integrity tag compute and verify" {
     const pkt_writer = &pkt_fbs;
 
     // First byte: Retry packet type
-    try pkt_writer.writeByte(@intFromEnum(PacketType.retry));
+    try pkt_writer.writeByte(@backingInt(PacketType.retry));
     // Version
     try pkt_writer.writeInt(u32, 0x00000001, ENDIAN);
     // DCID
@@ -1383,7 +1383,7 @@ test "Header.parse rejects a long header with the fixed bit clear" {
 }
 
 test "splitProtected rejects lengths the datagram cannot back" {
-    var buf = [_]u8{0} ** 64;
+    var buf = @as([64]u8, @splat(0));
     var fbs = io.fixedBufferStream(&buf);
     fbs.seek = 10;
 

@@ -8,7 +8,7 @@ const Connection = quic.connection.Connection;
 /// finish and reset streams, every byte of which stays unsent.
 pub fn conn() !*Connection {
     const alloc = std.testing.allocator;
-    const cid = [_]u8{1} ** 20;
+    const cid: [20]u8 = @splat(1);
     const c = try alloc.create(Connection);
     c.* = .{
         .allocator = alloc,

@@ -123,7 +123,7 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
         fn message(ctx: *anyopaque, ws: *WsConn, data: []const u8, kind: WsMessageKind) void {
             if (comptime !@hasDecl(H, "onWsMessage")) return;
             const h: *H = @ptrCast(@alignCast(ctx));
-            if (comptime @typeInfo(@TypeOf(H.onWsMessage)).@"fn".params.len == 4) {
+            if (comptime @typeInfo(@TypeOf(H.onWsMessage)).@"fn".param_types.len == 4) {
                 h.onWsMessage(ws, data, kind);
             } else {
                 h.onWsMessage(ws, data);

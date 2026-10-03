@@ -50,11 +50,11 @@ pub const PacketPacker = struct {
     is_server: bool,
 
     /// Source connection ID (owned buffer to avoid dangling slices).
-    scid_buf: [20]u8 = .{0} ** 20,
+    scid_buf: [20]u8 = @splat(0),
     scid_len: u8 = 0,
 
     /// Destination connection ID (owned buffer to avoid dangling slices).
-    dcid_buf: [20]u8 = .{0} ** 20,
+    dcid_buf: [20]u8 = @splat(0),
     dcid_len: u8 = 0,
 
     /// QUIC version.
@@ -327,7 +327,7 @@ pub const PacketPacker = struct {
         // For safety, ensure at least 4 bytes of plaintext regardless of PN length.
         const min_plaintext: usize = 4;
         if (effective_max < payload_start + min_plaintext) {
-            pkt_handler.next_pn[@intFromEnum(level)] -= 1;
+            pkt_handler.next_pn[@backingInt(level)] -= 1;
             return 0;
         }
 
@@ -521,38 +521,38 @@ pub const PacketPacker = struct {
             var uni_sched_buf: [stream_mod.StreamsMap.MAX_SCHEDULABLE]*stream_mod.SendStream = undefined;
             const uni_sched_count = streams.getScheduledUniStreams(&uni_sched_buf);
             if (uni_sched_count > 0) {
-            for (uni_sched_buf[0..uni_sched_count]) |s| {
-                if (fbs.seek + AEAD_TAG_LEN + 16 >= effective_max) break;
-                const retransmitting = s.hasRetransmitData();
-                if (conn_budget == 0 and !retransmitting) continue;
-                if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
-                const remaining_uni = effective_max - fbs.seek - AEAD_TAG_LEN;
-                const uni_header_overhead = streamFrameHeaderOverhead(s.stream_id, s.send_offset, remaining_uni);
-                if (remaining_uni <= uni_header_overhead) break;
-                const max_stream_data = if (retransmitting)
-                    remaining_uni - uni_header_overhead
-                else
-                    @min(remaining_uni - uni_header_overhead, conn_budget);
-                const prev_uni_offset = s.send_offset;
-                if (s.popStreamFrame(max_stream_data)) |stream_frame| {
-                    try stream_frame.write(writer);
-                    ack_eliciting = true;
-                    // Only count NEW data against connection flow control
-                    const new_bytes_uni = s.send_offset - prev_uni_offset;
-                    if (new_bytes_uni > 0) {
-                        conn_budget -= @min(conn_budget, new_bytes_uni);
-                        if (self.conn_flow_ctrl) |cfc| cfc.base.addBytesSent(new_bytes_uni);
+                for (uni_sched_buf[0..uni_sched_count]) |s| {
+                    if (fbs.seek + AEAD_TAG_LEN + 16 >= effective_max) break;
+                    const retransmitting = s.hasRetransmitData();
+                    if (conn_budget == 0 and !retransmitting) continue;
+                    if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
+                    const remaining_uni = effective_max - fbs.seek - AEAD_TAG_LEN;
+                    const uni_header_overhead = streamFrameHeaderOverhead(s.stream_id, s.send_offset, remaining_uni);
+                    if (remaining_uni <= uni_header_overhead) break;
+                    const max_stream_data = if (retransmitting)
+                        remaining_uni - uni_header_overhead
+                    else
+                        @min(remaining_uni - uni_header_overhead, conn_budget);
+                    const prev_uni_offset = s.send_offset;
+                    if (s.popStreamFrame(max_stream_data)) |stream_frame| {
+                        try stream_frame.write(writer);
+                        ack_eliciting = true;
+                        // Only count NEW data against connection flow control
+                        const new_bytes_uni = s.send_offset - prev_uni_offset;
+                        if (new_bytes_uni > 0) {
+                            conn_budget -= @min(conn_budget, new_bytes_uni);
+                            if (self.conn_flow_ctrl) |cfc| cfc.base.addBytesSent(new_bytes_uni);
+                        }
+                        // Record for retransmission tracking
+                        stream_frame_infos[stream_frame_info_count] = .{
+                            .stream_id = stream_frame.stream.stream_id,
+                            .offset = stream_frame.stream.offset,
+                            .length = stream_frame.stream.length,
+                            .fin = stream_frame.stream.fin,
+                        };
+                        stream_frame_info_count += 1;
                     }
-                    // Record for retransmission tracking
-                    stream_frame_infos[stream_frame_info_count] = .{
-                        .stream_id = stream_frame.stream.stream_id,
-                        .offset = stream_frame.stream.offset,
-                        .length = stream_frame.stream.length,
-                        .fin = stream_frame.stream.fin,
-                    };
-                    stream_frame_info_count += 1;
                 }
-            }
             } // send_streams.count() > 0
 
         }
@@ -592,7 +592,7 @@ pub const PacketPacker = struct {
             // Roll back the packet number we consumed — no packet will be sent.
             // This applies even with pad_target > 0: sending a padded Initial with
             // no ACK/CRYPTO content just wastes PNs and pushes the PTO forward.
-            const idx = @intFromEnum(level);
+            const idx = @backingInt(level);
             pkt_handler.next_pn[idx] -= 1;
             return 0; // Nothing to send
         }
@@ -894,7 +894,7 @@ test "PacketPacker: pack 1-RTT with stream data" {
     try testing.expect(out_buf[0] & 0x80 == 0);
 
     // Verify sent packet tracking
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     try testing.expectEqual(@as(usize, 1), pkt_handler.sent[app_idx].sent_packets.count());
 }
 
@@ -1079,7 +1079,7 @@ test "PacketPacker: coalesced Initial + Handshake" {
 
 test "PacketPacker: padding stays inside a buffer cut short by the amplification limit" {
     const keys = try testServerKeys();
-    const long_cid = [_]u8{0x5a} ** 20;
+    const long_cid: [20]u8 = @splat(0x5a);
     const cases = [_]struct { cid: []const u8, budget: usize }{
         .{ .cid = &.{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }, .budget = 300 },
         .{ .cid = &long_cid, .budget = 70 },
@@ -1095,7 +1095,7 @@ test "PacketPacker: padding stays inside a buffer cut short by the amplification
         var pending_frames = frame_mod.PendingFrameQueue{};
 
         try crypto_mgr.getStream(0).writeData("Initial crypto");
-        try crypto_mgr.getStream(2).writeData(&([_]u8{0xcc} ** 2000));
+        try crypto_mgr.getStream(2).writeData(&@as([2000]u8, @splat(0xcc)));
 
         var backing: [1500]u8 = @splat(0xee);
         const written = try packer.packCoalesced(
@@ -1157,7 +1157,7 @@ test "PacketPacker: HANDSHAKE_DONE frame packed in 1-RTT" {
     try testing.expect(!packer.send_handshake_done);
 
     // Sent packet should be tracked as ack-eliciting with handshake_done
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     try testing.expectEqual(@as(usize, 1), pkt_handler.sent[app_idx].sent_packets.count());
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
     const pkt = it.next().?;
@@ -1209,7 +1209,7 @@ test "PacketPacker: ecn_mark propagates to SentPacket" {
     try testing.expect(written > 0);
 
     // Check the sent packet has ecn_marked set
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
     const pkt = it.next().?;
     try testing.expect(pkt.ecn_marked);
@@ -1254,7 +1254,7 @@ test "PacketPacker: key_phase bit in short header" {
     // After header protection is applied, the key_phase bit is masked.
     // But the two packets should differ (different key phase + different content).
     // Just verify both produced output and used different PNs.
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     try testing.expectEqual(@as(u64, 2), pkt_handler.next_pn[app_idx]);
 }
 
@@ -1302,7 +1302,7 @@ test "PacketPacker: pending control frames in 1-RTT" {
     try testing.expectEqual(@as(?frame_mod.PendingControlFrame, null), pending_frames.pop());
 
     // Sent packet should be ack-eliciting
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
     const pkt = it.next().?;
     try testing.expect(pkt.ack_eliciting);
@@ -1348,7 +1348,7 @@ test "PacketPacker: stream frame info tracked in SentPacket" {
     );
 
     // Verify stream frame info was recorded in SentPacket
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
     const pkt = it.next().?;
     const sf = pkt.getStreamFrames();

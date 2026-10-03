@@ -54,7 +54,7 @@ const hs_certificate_verify = common.hs_certificate_verify;
 const hs_finished = common.hs_finished;
 const hs_key_update = common.hs_key_update;
 const hs_message_hash = common.hs_message_hash;
-const hs_certificate_request: u8 = @intFromEnum(tls.HandshakeType.certificate_request);
+const hs_certificate_request: u8 = @backingInt(tls.HandshakeType.certificate_request);
 const ct_ccs = common.ct_ccs;
 const ct_alert = common.ct_alert;
 const ct_handshake = common.ct_handshake;
@@ -432,7 +432,7 @@ pub const Conn = struct {
 
     fn handleAlert(self: *Conn, payload: []const u8) Error!void {
         if (payload.len != 2) return error.DecodeError;
-        const desc: tls.Alert.Description = @enumFromInt(payload[1]);
+        const desc: tls.Alert.Description = @fromBackingInt(@intCast(payload[1]));
         switch (desc) {
             .close_notify => self.peer_closed = true,
             .user_canceled => {},
@@ -479,7 +479,7 @@ pub const Conn = struct {
     }
 
     fn queueAlert(self: *Conn, level: tls.Alert.Level, desc: tls.Alert.Description) Error!void {
-        const body = [2]u8{ @intFromEnum(level), @intFromEnum(desc) };
+        const body = [2]u8{ @backingInt(level), @backingInt(desc) };
         if (self.write_keys != null) {
             try self.sealRecord(.alert, &body);
         } else {
@@ -591,7 +591,7 @@ pub const Conn = struct {
         try b.u8_(self.session_id.len);
         try b.bytes(&self.session_id);
         const suites = try b.begin(u16);
-        for (cfg.cipher_suites) |cs| try b.u16_(@intFromEnum(cs));
+        for (cfg.cipher_suites) |cs| try b.u16_(@backingInt(cs));
         try b.end(u16, suites);
         try b.bytes(&.{ 1, 0 }); // null compression only
 
@@ -613,7 +613,7 @@ pub const Conn = struct {
             try b.u16_(ext.supported_groups);
             const e = try b.begin(u16);
             const list = try b.begin(u16);
-            for (cfg.groups) |g| try b.u16_(@intFromEnum(g));
+            for (cfg.groups) |g| try b.u16_(@backingInt(g));
             try b.end(u16, list);
             try b.end(u16, e);
         }
@@ -621,7 +621,7 @@ pub const Conn = struct {
             try b.u16_(ext.signature_algorithms);
             const e = try b.begin(u16);
             const list = try b.begin(u16);
-            for (signature_schemes) |s| try b.u16_(@intFromEnum(s));
+            for (signature_schemes) |s| try b.u16_(@backingInt(s));
             try b.end(u16, list);
             try b.end(u16, e);
         }
@@ -629,7 +629,7 @@ pub const Conn = struct {
             try b.u16_(ext.key_share);
             const e = try b.begin(u16);
             const list = try b.begin(u16);
-            try b.u16_(@intFromEnum(self.group));
+            try b.u16_(@backingInt(self.group));
             try b.u16_(@intCast(public.len));
             try b.bytes(public);
             try b.end(u16, list);
@@ -671,7 +671,7 @@ pub const Conn = struct {
         defer crypto.secureZero(u8, &seed);
         switch (self.group) {
             .x25519 => {
-                const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.InternalError;
+                const kp = X25519.KeyPair.generateDeterministic(seed);
                 self.key_secret = kp.secret_key;
                 self.key_public[0..32].* = kp.public_key;
                 self.key_public_len = 32;
@@ -742,7 +742,7 @@ pub const Conn = struct {
         if (!mem.eql(u8, session_id, &self.session_id)) return error.IllegalParameter;
         if (compression != 0) return error.IllegalParameter;
         const suite = for (self.config.cipher_suites) |cs| {
-            if (@intFromEnum(cs) == suite_id) break cs;
+            if (@backingInt(cs) == suite_id) break cs;
         } else return error.IllegalParameter;
         if (self.hrr_seen and suite != self.suite) return error.IllegalParameter;
 
@@ -753,7 +753,7 @@ pub const Conn = struct {
             if (share_group) |id| {
                 // RFC 8446 §4.1.4: a group we offered, and not the one we sent.
                 const g = for (self.config.groups) |g| {
-                    if (@intFromEnum(g) == id) break g;
+                    if (@backingInt(g) == id) break g;
                 } else return error.IllegalParameter;
                 if (g == self.group) return error.IllegalParameter;
                 self.group = g;
@@ -779,7 +779,7 @@ pub const Conn = struct {
             return false;
         }
 
-        if (share_group != @intFromEnum(self.group)) return error.IllegalParameter;
+        if (share_group != @backingInt(self.group)) return error.IllegalParameter;
         const key = share_key orelse return error.MissingExtension;
         self.suite = suite;
         if (!self.hrr_seen) {
@@ -876,7 +876,7 @@ pub const Conn = struct {
         while (i < names.slice.end) {
             const gn = der.Element.parse(san, i) catch return error.BadCertificate;
             i = gn.slice.end;
-            if (@intFromEnum(gn.identifier.tag) == 7 and mem.eql(u8, san[gn.slice.start..gn.slice.end], want)) return;
+            if (@backingInt(gn.identifier.tag) == 7 and mem.eql(u8, san[gn.slice.start..gn.slice.end], want)) return;
         }
         return error.CertificateHostMismatch;
     }
@@ -987,7 +987,7 @@ pub const Conn = struct {
         const sig = try tls13.signCertificateVerify(scheme, cert.private_key_bytes, content[0 .. 64 + context.len + 1 + len], &sig_buf);
         try b.u8_(hs_certificate_verify);
         const cv = try b.begin(u24);
-        try b.u16_(@intFromEnum(scheme));
+        try b.u16_(@backingInt(scheme));
         try b.u16_(@intCast(sig.len));
         try b.bytes(sig);
         try b.end(u24, cv);
@@ -1353,7 +1353,7 @@ test "a TLS 1.2 ServerHello is protocol_version" {
     sh[79..81].* = .{ 0, 0 };
     client.consumeOutput(client.pendingOutput().len);
     try testing.expectError(error.ProtocolVersion, client.feed(&sh));
-    try testing.expectEqualSlices(u8, &.{ ct_alert, 3, 3, 0, 2, 2, @intFromEnum(tls.Alert.Description.protocol_version) }, client.pendingOutput());
+    try testing.expectEqualSlices(u8, &.{ ct_alert, 3, 3, 0, 2, 2, @backingInt(tls.Alert.Description.protocol_version) }, client.pendingOutput());
 }
 
 test "a server flight fed one byte at a time" {

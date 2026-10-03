@@ -2,15 +2,15 @@
     .name = .quic,
     .version = "0.5.0",
     .dependencies = .{
-        // endel/libxev tag quic-zig-2026-09-26-2: upstream plus the PRs in its
+        // endel/libxev tag quic-zig-2026-10-03: upstream plus the PRs in its
         // fork/patches. See "libxev" in CLAUDE.md before changing this.
         .libxev = .{
-            .url = "https://github.com/endel/libxev/archive/9d7f95fc3ec34ce0a5903127a6c2f3237c1d52d3.tar.gz",
-            .hash = "libxev-0.0.0-86vtc8zOFAACkm8W3tZUE9sSCSFDl7whPNXjgBdq5Ux0",
+            .url = "https://github.com/endel/libxev/archive/8cc9850dd27ee906a68e1cb94afb26bc775f7a92.tar.gz",
+            .hash = "libxev-0.0.0-86vtcxDQFAB8ZNfNHpyMZLeYdHEVlYX8Zi9vM9DNNXdT",
         },
     },
     .fingerprint = 0xc079525234abfc4c,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

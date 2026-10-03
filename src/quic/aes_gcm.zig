@@ -36,7 +36,7 @@ const RoundKeys = [Aes128.rounds + 1]Block;
 /// arm64: GHASH in vector registers. `ghash.zig` does its arithmetic on u128,
 /// which LLVM keeps in general registers, so every multiply moves operands
 /// across and back. Same multiply and reduction, on vectors.
-const vec_ghash = fast and builtin.cpu.arch == .aarch64 and builtin.mode != .ReleaseSmall;
+const vec_ghash = fast and builtin.cpu.arch == .aarch64 and builtin.mode != .small;
 /// Powers of H that `Ghash.init` computes: H, H^2, ... H^16.
 const pc_count = @typeInfo(@FieldType(Ghash, "hx")).array.len;
 /// Byte order of GHASH's big-endian 128-bit integers.

@@ -46,7 +46,7 @@ pub const PathValidationState = enum {
 };
 
 pub const PathValidator = struct {
-    challenge_data: [8]u8 = .{0} ** 8,
+    challenge_data: [8]u8 = @splat(0),
     state: PathValidationState = .idle,
     challenge_sent_time: i64 = 0,
     retries: u8 = 0,
@@ -130,10 +130,10 @@ pub const NetworkPath = struct {
 };
 
 pub const ConnectionIdEntry = struct {
-    cid_buf: [20]u8 = .{0} ** 20,
+    cid_buf: [20]u8 = @splat(0),
     cid_len: u8 = 0,
     seq_num: u64 = 0,
-    stateless_reset_token: [16]u8 = .{0} ** 16,
+    stateless_reset_token: [16]u8 = @splat(0),
     in_use: bool = false,
     occupied: bool = false,
 
@@ -145,7 +145,7 @@ pub const ConnectionIdEntry = struct {
 pub const ConnectionIdPool = struct {
     const MAX_POOL_SIZE: usize = 8;
 
-    entries: [MAX_POOL_SIZE]ConnectionIdEntry = .{ConnectionIdEntry{}} ** MAX_POOL_SIZE,
+    entries: [MAX_POOL_SIZE]ConnectionIdEntry = @splat(ConnectionIdEntry{}),
     /// Bumped whenever the set of entries changes, so the server's reset
     /// token index knows when to resync.
     generation: u32 = 0,
@@ -214,10 +214,10 @@ pub const ConnectionIdPool = struct {
 
 /// Tracks a locally-issued connection ID (RFC 9000 §5.1).
 pub const LocalCidEntry = struct {
-    cid_buf: [20]u8 = .{0} ** 20,
+    cid_buf: [20]u8 = @splat(0),
     cid_len: u8 = 0,
     seq_num: u64 = 0,
-    stateless_reset_token: [16]u8 = .{0} ** 16,
+    stateless_reset_token: [16]u8 = @splat(0),
     occupied: bool = false,
     retired: bool = false,
 
@@ -231,7 +231,7 @@ pub const LocalCidEntry = struct {
 pub const LocalCidPool = struct {
     pub const MAX_POOL_SIZE: usize = 8;
 
-    entries: [MAX_POOL_SIZE]LocalCidEntry = .{LocalCidEntry{}} ** MAX_POOL_SIZE,
+    entries: [MAX_POOL_SIZE]LocalCidEntry = @splat(LocalCidEntry{}),
     next_seq_num: u64 = 1,
     retire_prior_to: u64 = 0,
 
@@ -618,9 +618,9 @@ pub const Connection = struct {
     allocator: std.mem.Allocator,
 
     // Connection IDs
-    dcid: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
+    dcid: [packet.CONNECTION_ID_MAX_SIZE]u8 = @splat(0),
     dcid_len: u8 = 0,
-    scid: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
+    scid: [packet.CONNECTION_ID_MAX_SIZE]u8 = @splat(0),
     scid_len: u8 = 0,
 
     // TLS 1.3 handshake (null if not configured with TlsConfig)
@@ -675,7 +675,7 @@ pub const Connection = struct {
     local_cid_pool: LocalCidPool = .{},
 
     // Static key for deterministic stateless reset tokens (RFC 9000 §10.3)
-    static_reset_key: [16]u8 = .{0} ** 16,
+    static_reset_key: [16]u8 = @splat(0),
 
     // QUIC-LB CID encoding config (server-side, for load balancer routing)
     quic_lb_config: ?quic_lb.Config = null,
@@ -751,11 +751,11 @@ pub const Connection = struct {
     remembered_params: ?tls13.SessionTicket = null,
 
     // NEW_TOKEN received from server (client stores for reuse in future connections)
-    new_token_buf: [packet.TOKEN_MAX_LEN]u8 = .{0} ** packet.TOKEN_MAX_LEN,
+    new_token_buf: [packet.TOKEN_MAX_LEN]u8 = @splat(0),
     new_token_len: u8 = 0,
 
     // Token key for NEW_TOKEN generation (server, shared with retry_token_key)
-    token_key: [16]u8 = .{0} ** 16,
+    token_key: [16]u8 = @splat(0),
 
     // ECN validation: peer-reported ECN counts from ACK_ECN frames (RFC 9000 §13.4.2.1)
     // Track per-space to detect increases; only Application space matters in practice
@@ -792,7 +792,7 @@ pub const Connection = struct {
     /// The client has moved to the server's negotiated version; it moves once.
     version_negotiated: bool = false,
     // DCID used for initial key derivation (needed for v2 re-derivation)
-    initial_dcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
+    initial_dcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = @splat(0),
     initial_dcid_len: u8 = 0,
 
     // QLOG structured logging (optional, enabled via QLOGDIR)
@@ -812,10 +812,10 @@ pub const Connection = struct {
     close_trigger_count: u64 = 0,
 
     // Retry state (client-side)
-    odcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = .{0} ** packet.CONNECTION_ID_MAX_SIZE,
+    odcid_buf: [packet.CONNECTION_ID_MAX_SIZE]u8 = @splat(0),
     odcid_len: u8 = 0,
     retry_received: bool = false,
-    retry_token_buf: [256]u8 = .{0} ** 256,
+    retry_token_buf: [256]u8 = @splat(0),
     retry_token_len: u16 = 0,
 
     // Timing
@@ -966,7 +966,7 @@ pub const Connection = struct {
         @memcpy(conn.initial_dcid_buf[0..header.dcid.len], header.dcid);
 
         // Set up initial crypto keys (always use header.dcid for key derivation)
-        try conn.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].setupInitial(
+        try conn.pkt_num_spaces[@backingInt(packet.Epoch.initial)].setupInitial(
             header.dcid,
             header.version,
             is_server,
@@ -1109,7 +1109,7 @@ pub const Connection = struct {
 
         // No compatible version — close the connection
         std.log.info("VN: server does not support any of our versions, closing", .{});
-        self.closeWithTransportError(@intFromEnum(TransportError.version_negotiation_error), 0, "Version negotiation failed");
+        self.closeWithTransportError(@backingInt(TransportError.version_negotiation_error), 0, "Version negotiation failed");
     }
 
     /// Handle a Retry packet (client only).
@@ -1118,7 +1118,7 @@ pub const Connection = struct {
     pub fn handleRetryPacket(self: *Connection, header: *const packet.Header, raw_packet: []const u8) !void {
         // Only accept one Retry, only before handshake progresses
         if (self.retry_received or self.state != .first_flight) {
-            std.log.warn("ignoring Retry: retry_received={}, state={}", .{ self.retry_received, @intFromEnum(self.state) });
+            std.log.warn("ignoring Retry: retry_received={}, state={}", .{ self.retry_received, @backingInt(self.state) });
             return;
         }
 
@@ -1195,12 +1195,12 @@ pub const Connection = struct {
         space.crypto_open = saved_open;
 
         if (payload.len == 0) {
-            self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "empty packet payload");
+            self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0, "empty packet payload");
             return error.InvalidPacket;
         }
         // RFC 9000 §17.2: reserved bits MUST be zero after header protection removal
         if (header.reserved_bits_set) {
-            self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "reserved header bits are non-zero");
+            self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0, "reserved header bits are non-zero");
             return error.ProtocolViolation;
         }
 
@@ -1225,12 +1225,12 @@ pub const Connection = struct {
             }
             var frame_len: usize = undefined;
             const frame = Frame.parseSized(remaining, &frame_len) catch {
-                self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), 0, "frame encoding error");
+                self.closeWithTransportError(@backingInt(TransportError.frame_encoding_error), 0, "frame encoding error");
                 return error.ProtocolViolation;
             };
             // Enforce frame-in-correct-space (RFC 9000 §12.5)
             if (!frame.isAllowedIn(.zero_rtt)) {
-                self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.crypto), "frame not allowed in 0-RTT");
+                self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.crypto), "frame not allowed in 0-RTT");
                 return error.ProtocolViolation;
             }
             if (frame.isAckEliciting()) ack_eliciting = true;
@@ -1368,7 +1368,7 @@ pub const Connection = struct {
         }
 
         const enc_level = epochToEncLevel(epoch);
-        const space_idx = @intFromEnum(enc_level);
+        const space_idx = @backingInt(enc_level);
         const space = &self.pkt_num_spaces[space_idx];
         const has_keys = space.crypto_open != null and space.crypto_seal != null;
         std.log.debug("recv: using space {d} ({s}), has_keys={}", .{ space_idx, @tagName(enc_level), has_keys });
@@ -1411,13 +1411,13 @@ pub const Connection = struct {
         opened = true;
 
         if (payload.len == 0) {
-            self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "empty packet payload");
+            self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0, "empty packet payload");
             return error.InvalidPacket;
         }
 
         // RFC 9000 §17.2, §17.3: reserved bits MUST be zero after header protection removal
         if (header.reserved_bits_set) {
-            self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "reserved header bits are non-zero");
+            self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0, "reserved header bits are non-zero");
             return error.ProtocolViolation;
         }
 
@@ -1474,7 +1474,7 @@ pub const Connection = struct {
         }
 
         // Check for duplicate
-        if (self.pkt_handler.recv[@intFromEnum(enc_level)].isDuplicate(header.packet_number)) {
+        if (self.pkt_handler.recv[@backingInt(enc_level)].isDuplicate(header.packet_number)) {
             return; // Duplicate, ignore
         }
         // RFC 9000 §10.1: only a packet processed restarts the idle timer; a
@@ -1528,9 +1528,9 @@ pub const Connection = struct {
                 std.log.err("Failed to parse frame: {}", .{err});
                 // RFC 9000 §12.4: frame encoding errors
                 if (err == error.FrameEncodingError) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), 0, "unknown or malformed frame type");
+                    self.closeWithTransportError(@backingInt(TransportError.frame_encoding_error), 0, "unknown or malformed frame type");
                 } else {
-                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), 0, "frame encoding error");
+                    self.closeWithTransportError(@backingInt(TransportError.frame_encoding_error), 0, "frame encoding error");
                 }
                 return error.ProtocolViolation;
             };
@@ -1540,7 +1540,7 @@ pub const Connection = struct {
             // Enforce frame-in-correct-space (RFC 9000 §12.5)
             if (!frame.isAllowedIn(header.packet_type)) {
                 std.log.warn("frame {s} not allowed in {s} packet, closing", .{ @tagName(frame), @tagName(header.packet_type) });
-                self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "frame not allowed in this packet type");
+                self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0, "frame not allowed in this packet type");
                 return error.ProtocolViolation;
             }
 
@@ -1666,10 +1666,10 @@ pub const Connection = struct {
     /// Close for a RESET_STREAM the receive side refused (RFC 9000 4.5, 4.1).
     fn rejectResetStream(self: *Connection, err: anyerror) error{ FlowControlError, ProtocolViolation } {
         if (err == error.FlowControlError) {
-            self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM exceeds stream flow control");
+            self.closeWithTransportError(@backingInt(TransportError.flow_control_error), @backingInt(FrameType.reset_stream), "RESET_STREAM exceeds stream flow control");
             return error.FlowControlError;
         }
-        self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM final_size mismatch");
+        self.closeWithTransportError(@backingInt(TransportError.final_size_error), @backingInt(FrameType.reset_stream), "RESET_STREAM final_size mismatch");
         return error.ProtocolViolation;
     }
 
@@ -1679,15 +1679,15 @@ pub const Connection = struct {
         try self.chargeConnWindow(rs, offset + data.len, .stream);
         rs.handleStreamFrame(offset, data, fin) catch |err| switch (err) {
             error.FinalSizeError => {
-                self.closeWithTransportError(@intFromEnum(TransportError.final_size_error), @intFromEnum(FrameType.stream), "STREAM final_size mismatch");
+                self.closeWithTransportError(@backingInt(TransportError.final_size_error), @backingInt(FrameType.stream), "STREAM final_size mismatch");
                 return error.ProtocolViolation;
             },
             error.TooManyChunks => {
-                self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.stream), "too many reassembly gaps");
+                self.closeWithTransportError(@backingInt(TransportError.internal_error), @backingInt(FrameType.stream), "too many reassembly gaps");
                 return error.ProtocolViolation;
             },
             error.FlowControlError => {
-                self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(FrameType.stream), "STREAM exceeds stream flow control limit");
+                self.closeWithTransportError(@backingInt(TransportError.flow_control_error), @backingInt(FrameType.stream), "STREAM exceeds stream flow control limit");
                 return error.FlowControlError;
             },
             else => return err,
@@ -1724,7 +1724,7 @@ pub const Connection = struct {
             .ack => |ack| {
                 const enc_level = epochToEncLevel(epoch);
                 if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack.ack_ranges[0..ack.ack_range_count])) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.ack), "ACK for unsent packet");
+                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.ack), "ACK for unsent packet");
                     return error.ProtocolViolation;
                 }
                 const peer_tp = self.peer_params orelse transport_params.TransportParams{};
@@ -1868,10 +1868,10 @@ pub const Connection = struct {
             .ack_ecn => |ack| {
                 const enc_level = epochToEncLevel(epoch);
                 if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack.ack_ranges[0..ack.ack_range_count])) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.ack_ecn), "ACK for unsent packet");
+                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.ack_ecn), "ACK for unsent packet");
                     return error.ProtocolViolation;
                 }
-                const space_idx = @intFromEnum(enc_level);
+                const space_idx = @backingInt(enc_level);
                 const peer_tp = self.peer_params orelse transport_params.TransportParams{};
 
                 // RFC 9002 §7.8: snapshot app_limited BEFORE processing ACKs
@@ -2037,7 +2037,7 @@ pub const Connection = struct {
                 if (stream_mod.isLocal(rs.stream_id, self.is_server) and
                     (!stream_mod.isBidi(rs.stream_id) or self.streams.localNeverOpened(rs.stream_id)))
                 {
-                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM on send-only stream");
+                    self.closeWithTransportError(@backingInt(TransportError.stream_state_error), @backingInt(FrameType.reset_stream), "RESET_STREAM on send-only stream");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §3.2: RESET_STREAM opens a receive stream just as a
@@ -2048,7 +2048,7 @@ pub const Connection = struct {
                     else
                         self.streams.max_incoming_uni_streams;
                     if (rs.stream_id / 4 >= limit) {
-                        self.closeWithTransportError(@intFromEnum(TransportError.stream_limit_error), @intFromEnum(FrameType.reset_stream), "RESET_STREAM stream ID exceeds MAX_STREAMS limit");
+                        self.closeWithTransportError(@backingInt(TransportError.stream_limit_error), @backingInt(FrameType.reset_stream), "RESET_STREAM stream ID exceeds MAX_STREAMS limit");
                         return error.ProtocolViolation;
                     }
                     // An unheard-of uni stream is opened by the reset itself;
@@ -2086,12 +2086,12 @@ pub const Connection = struct {
             .stop_sending => |ss| {
                 // RFC 9000 §19.5: STOP_SENDING for a receive-only stream is STREAM_STATE_ERROR
                 if (!stream_mod.isLocal(ss.stream_id, self.is_server) and !stream_mod.isBidi(ss.stream_id)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stop_sending), "STOP_SENDING on receive-only stream");
+                    self.closeWithTransportError(@backingInt(TransportError.stream_state_error), @backingInt(FrameType.stop_sending), "STOP_SENDING on receive-only stream");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.5: STOP_SENDING for a locally-initiated stream not yet created
                 if (stream_mod.isLocal(ss.stream_id, self.is_server) and self.streams.localNeverOpened(ss.stream_id)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stop_sending), "STOP_SENDING for stream not yet created");
+                    self.closeWithTransportError(@backingInt(TransportError.stream_state_error), @backingInt(FrameType.stop_sending), "STOP_SENDING for stream not yet created");
                     return error.ProtocolViolation;
                 }
                 const sender: ?*stream_mod.SendStream = if (self.streams.getStream(ss.stream_id)) |s|
@@ -2105,12 +2105,12 @@ pub const Connection = struct {
             },
 
             .crypto => |crypto_frame| {
-                const level: u8 = @intFromEnum(epoch);
+                const level: u8 = @backingInt(epoch);
                 self.crypto_streams.handleCryptoFrame(level, crypto_frame.offset, crypto_frame.data) catch |err| switch (err) {
                     // RFC 9000 7.5: an oversized or heavily fragmented flight is
                     // refused rather than buffered for an unauthenticated peer.
                     error.CryptoBufferExceeded, error.TooManyChunks => {
-                        self.closeWithTransportError(@intFromEnum(TransportError.crypto_buffer_exceeded), @intFromEnum(FrameType.crypto), "CRYPTO buffer exceeded");
+                        self.closeWithTransportError(@backingInt(TransportError.crypto_buffer_exceeded), @backingInt(FrameType.crypto), "CRYPTO buffer exceeded");
                         return error.ProtocolViolation;
                     },
                     else => return err,
@@ -2121,11 +2121,11 @@ pub const Connection = struct {
             .new_token => |token| {
                 // RFC 9000 §19.7: server MUST NOT send NEW_TOKEN; client receiving it is valid
                 if (self.is_server) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.new_token), "server received NEW_TOKEN");
+                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.new_token), "server received NEW_TOKEN");
                     return error.ProtocolViolation;
                 }
                 if (token.len == 0) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), @intFromEnum(FrameType.new_token), "empty NEW_TOKEN");
+                    self.closeWithTransportError(@backingInt(TransportError.frame_encoding_error), @backingInt(FrameType.new_token), "empty NEW_TOKEN");
                     return error.ProtocolViolation;
                 }
                 if (token.len <= self.new_token_buf.len) {
@@ -2138,12 +2138,12 @@ pub const Connection = struct {
             .stream => |s| {
                 // RFC 9000 §19.8: STREAM on send-only stream is STREAM_STATE_ERROR
                 if (stream_mod.isLocal(s.stream_id, self.is_server) and !stream_mod.isBidi(s.stream_id)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stream), "STREAM on send-only stream");
+                    self.closeWithTransportError(@backingInt(TransportError.stream_state_error), @backingInt(FrameType.stream), "STREAM on send-only stream");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.8: STREAM for locally-initiated stream not yet created
                 if (stream_mod.isLocal(s.stream_id, self.is_server) and self.streams.localNeverOpened(s.stream_id)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.stream), "STREAM for locally-initiated stream not yet created");
+                    self.closeWithTransportError(@backingInt(TransportError.stream_state_error), @backingInt(FrameType.stream), "STREAM for locally-initiated stream not yet created");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §4.6: stream ID exceeding peer's MAX_STREAMS limit
@@ -2151,7 +2151,7 @@ pub const Connection = struct {
                     const stream_seq = s.stream_id / 4;
                     const limit = if (stream_mod.isBidi(s.stream_id)) self.streams.max_incoming_bidi_streams else self.streams.max_incoming_uni_streams;
                     if (!stream_mod.isLocal(s.stream_id, self.is_server) and stream_seq >= limit) {
-                        self.closeWithTransportError(@intFromEnum(TransportError.stream_limit_error), @intFromEnum(FrameType.stream), "stream ID exceeds MAX_STREAMS limit");
+                        self.closeWithTransportError(@backingInt(TransportError.stream_limit_error), @backingInt(FrameType.stream), "stream ID exceeds MAX_STREAMS limit");
                         return error.ProtocolViolation;
                     }
                 }
@@ -2200,12 +2200,12 @@ pub const Connection = struct {
             .max_stream_data => |msd| {
                 // RFC 9000 §19.10: MAX_STREAM_DATA on receive-only stream is STREAM_STATE_ERROR
                 if (!stream_mod.isLocal(msd.stream_id, self.is_server) and !stream_mod.isBidi(msd.stream_id)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.max_stream_data), "MAX_STREAM_DATA on receive-only stream");
+                    self.closeWithTransportError(@backingInt(TransportError.stream_state_error), @backingInt(FrameType.max_stream_data), "MAX_STREAM_DATA on receive-only stream");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.10: MAX_STREAM_DATA for locally-initiated stream not yet created
                 if (stream_mod.isLocal(msd.stream_id, self.is_server) and self.streams.localNeverOpened(msd.stream_id)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.stream_state_error), @intFromEnum(FrameType.max_stream_data), "MAX_STREAM_DATA for stream not yet created");
+                    self.closeWithTransportError(@backingInt(TransportError.stream_state_error), @backingInt(FrameType.max_stream_data), "MAX_STREAM_DATA for stream not yet created");
                     return error.ProtocolViolation;
                 }
                 // Update send window on bidi streams
@@ -2221,7 +2221,7 @@ pub const Connection = struct {
             .max_streams_bidi => |max| {
                 // RFC 9000 §19.11: MAX_STREAMS must not exceed 2^60
                 if (max > (1 << 60)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), @intFromEnum(FrameType.max_streams_bidi), "MAX_STREAMS_BIDI exceeds 2^60");
+                    self.closeWithTransportError(@backingInt(TransportError.frame_encoding_error), @backingInt(FrameType.max_streams_bidi), "MAX_STREAMS_BIDI exceeds 2^60");
                     return error.ProtocolViolation;
                 }
                 self.streams.setMaxStreams(max, self.streams.max_uni_streams);
@@ -2230,7 +2230,7 @@ pub const Connection = struct {
             .max_streams_uni => |max| {
                 // RFC 9000 §19.11: MAX_STREAMS must not exceed 2^60
                 if (max > (1 << 60)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), @intFromEnum(FrameType.max_streams_uni), "MAX_STREAMS_UNI exceeds 2^60");
+                    self.closeWithTransportError(@backingInt(TransportError.frame_encoding_error), @backingInt(FrameType.max_streams_uni), "MAX_STREAMS_UNI exceeds 2^60");
                     return error.ProtocolViolation;
                 }
                 self.streams.setMaxStreams(self.streams.max_bidi_streams, max);
@@ -2264,7 +2264,7 @@ pub const Connection = struct {
             .streams_blocked_bidi => |val| {
                 // RFC 9000 §19.14: STREAMS_BLOCKED must not exceed 2^60
                 if (val > (1 << 60)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.stream_limit_error), @intFromEnum(FrameType.streams_blocked_bidi), "STREAMS_BLOCKED_BIDI exceeds 2^60");
+                    self.closeWithTransportError(@backingInt(TransportError.stream_limit_error), @backingInt(FrameType.streams_blocked_bidi), "STREAMS_BLOCKED_BIDI exceeds 2^60");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §4.6: the peer wants streams it has no credit for.
@@ -2280,7 +2280,7 @@ pub const Connection = struct {
             .streams_blocked_uni => |val| {
                 // RFC 9000 §19.14: STREAMS_BLOCKED must not exceed 2^60
                 if (val > (1 << 60)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.stream_limit_error), @intFromEnum(FrameType.streams_blocked_uni), "STREAMS_BLOCKED_UNI exceeds 2^60");
+                    self.closeWithTransportError(@backingInt(TransportError.stream_limit_error), @backingInt(FrameType.streams_blocked_uni), "STREAMS_BLOCKED_UNI exceeds 2^60");
                     return error.ProtocolViolation;
                 }
                 // Same as the bidi case above.
@@ -2294,12 +2294,12 @@ pub const Connection = struct {
             .new_connection_id => |ncid| {
                 // RFC 9000 §19.15: Retire_Prior_To must not exceed Sequence_Number
                 if (ncid.retire_prior_to > ncid.seq_num) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), @intFromEnum(FrameType.new_connection_id), "NEW_CONNECTION_ID: retire_prior_to > seq_num");
+                    self.closeWithTransportError(@backingInt(TransportError.frame_encoding_error), @backingInt(FrameType.new_connection_id), "NEW_CONNECTION_ID: retire_prior_to > seq_num");
                     return error.ProtocolViolation;
                 }
                 // RFC 9000 §19.15: CID length of 0 is invalid (except for initial)
                 if (ncid.conn_id.len == 0) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.frame_encoding_error), @intFromEnum(FrameType.new_connection_id), "NEW_CONNECTION_ID: 0-byte connection ID");
+                    self.closeWithTransportError(@backingInt(TransportError.frame_encoding_error), @backingInt(FrameType.new_connection_id), "NEW_CONNECTION_ID: 0-byte connection ID");
                     return error.ProtocolViolation;
                 }
                 if (ncid.seq_num > self.peer_max_cid_seq) {
@@ -2339,7 +2339,7 @@ pub const Connection = struct {
                 const active = self.peer_cid_pool.count() +
                     @intFromBool(self.active_cid_seq == 0 and !self.peer_cid_pool.contains(0));
                 if (active > self.local_params.active_connection_id_limit) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.connection_id_limit_error), @intFromEnum(FrameType.new_connection_id), "more active connection IDs than our limit");
+                    self.closeWithTransportError(@backingInt(TransportError.connection_id_limit_error), @backingInt(FrameType.new_connection_id), "more active connection IDs than our limit");
                     return error.ProtocolViolation;
                 }
 
@@ -2353,7 +2353,7 @@ pub const Connection = struct {
                 // RFC 9000 §19.16: only a CID we issued, and not the one this
                 // very packet came on.
                 if (rcid.seq_num >= self.local_cid_pool.next_seq_num or self.current_dcid_seq == rcid.seq_num) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.retire_connection_id), "RETIRE_CONNECTION_ID for a CID not ours to retire");
+                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.retire_connection_id), "RETIRE_CONNECTION_ID for a CID not ours to retire");
                     return error.ProtocolViolation;
                 }
                 std.log.info("peer retired connection ID seq={d}", .{rcid.seq_num});
@@ -2409,7 +2409,7 @@ pub const Connection = struct {
             .handshake_done => {
                 // RFC 9000 §19.20: only server sends HANDSHAKE_DONE
                 if (self.is_server) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.handshake_done), "server received HANDSHAKE_DONE");
+                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.handshake_done), "server received HANDSHAKE_DONE");
                     return error.ProtocolViolation;
                 }
                 self.handshake_confirmed = true;
@@ -2454,11 +2454,11 @@ pub const Connection = struct {
             .ack_frequency => |af| {
                 // draft-ietf-quic-ack-frequency: update ACK generation parameters
                 if (!self.peer_supports_ack_freq) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY not negotiated");
+                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY not negotiated");
                     return error.ProtocolViolation;
                 }
                 if (af.request_max_ack_delay < (self.local_params.min_ack_delay orelse 0)) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY delay under min_ack_delay");
+                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY delay under min_ack_delay");
                     return error.ProtocolViolation;
                 }
                 const applied = self.pkt_handler.recv[2].applyAckFrequency(
@@ -2486,7 +2486,7 @@ pub const Connection = struct {
     fn checkDatagramAllowed(self: *Connection, len: usize) error{ProtocolViolation}!void {
         const max = self.local_params.max_datagram_frame_size orelse 0;
         if (max == 0 or len > max) {
-            self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.datagram), "DATAGRAM not advertised or too large");
+            self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.datagram), "DATAGRAM not advertised or too large");
             return error.ProtocolViolation;
         }
     }
@@ -2522,11 +2522,11 @@ pub const Connection = struct {
                 while (nst_iters < 10) : (nst_iters += 1) {
                     const action = hs.step() catch |err| {
                         // RFC 9001 §4.8: post-handshake TLS errors
-                        const tls_alert: u64 = @intFromEnum(switch (err) {
+                        const tls_alert: u64 = @backingInt(switch (err) {
                             error.UnexpectedMessage => tls.Alert.Description.unexpected_message,
                             else => tls.Alert.Description.internal_error,
                         });
-                        self.closeWithTransportError(TransportError.cryptoError(tls_alert), @intFromEnum(FrameType.crypto), "post-handshake TLS error");
+                        self.closeWithTransportError(TransportError.cryptoError(tls_alert), @backingInt(FrameType.crypto), "post-handshake TLS error");
                         return;
                     };
                     switch (action) {
@@ -2545,7 +2545,7 @@ pub const Connection = struct {
             return;
         }
 
-        std.log.info("advanceHandshake: state={}, iterations starting", .{@intFromEnum(hs.state)});
+        std.log.info("advanceHandshake: state={}, iterations starting", .{@backingInt(hs.state)});
 
         // RFC 9001 §4.1.3: TLS reads each level's CRYPTO data only while it
         // is at that level; the rest waits in its own stream.
@@ -2561,11 +2561,11 @@ pub const Connection = struct {
                 std.log.warn("TLS 1.3 handshake error: {}", .{err});
                 // RFC 9000 §7.4: TransportParameterError is a QUIC transport error, not TLS
                 if (err == error.TransportParameterError) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "transport parameter error");
+                    self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "transport parameter error");
                     return;
                 }
                 // RFC 9001 §4.8: map TLS errors to CRYPTO_ERROR (0x100 + TLS alert code)
-                const tls_alert: u64 = @intFromEnum(switch (err) {
+                const tls_alert: u64 = @backingInt(switch (err) {
                     error.BadCertificate => tls.Alert.Description.bad_certificate,
                     error.BadCertificateVerify => tls.Alert.Description.decrypt_error,
                     error.UnexpectedMessage => tls.Alert.Description.unexpected_message,
@@ -2581,7 +2581,7 @@ pub const Connection = struct {
                     error.IllegalParameter => tls.Alert.Description.illegal_parameter,
                     else => tls.Alert.Description.internal_error,
                 });
-                self.closeWithTransportError(TransportError.cryptoError(tls_alert), @intFromEnum(FrameType.crypto), "TLS handshake failure");
+                self.closeWithTransportError(TransportError.cryptoError(tls_alert), @backingInt(FrameType.crypto), "TLS handshake failure");
                 return;
             };
             std.log.info("advanceHandshake: step {d} produced action={s}", .{ iterations, @tagName(action) });
@@ -2590,7 +2590,7 @@ pub const Connection = struct {
             const next_level = hs.readLevel();
             if (next_level != level) {
                 if (hs.hasUnreadInput() or self.crypto_streams.getStream(level).hasReadable()) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.crypto), "CRYPTO data left at a superseded level");
+                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.crypto), "CRYPTO data left at a superseded level");
                     return;
                 }
                 level = next_level;
@@ -2600,7 +2600,7 @@ pub const Connection = struct {
             switch (action) {
                 .send_data => |sd| {
                     // Write the TLS handshake data to the appropriate crypto stream
-                    const cs_level: u8 = @intFromEnum(sd.level);
+                    const cs_level: u8 = @backingInt(sd.level);
                     const cs = self.crypto_streams.getStream(cs_level);
                     // Log hash of data being written to crypto stream for corruption debugging
                     var data_hash: [32]u8 = undefined;
@@ -2715,7 +2715,7 @@ pub const Connection = struct {
                     // 0-RTT data as 1-RTT. Queue retransmission of all in-flight
                     // application-space packets that carried stream data.
                     if (!self.is_server and !hs.zero_rtt_accepted) {
-                        const app_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
+                        const app_tracker = &self.pkt_handler.sent[@backingInt(ack_handler.EncLevel.application)];
                         var pkt_it = app_tracker.sent_packets.iterator();
                         while (pkt_it.next()) |pkt| {
                             if (pkt.getStreamFrames().len > 0) {
@@ -2938,13 +2938,13 @@ pub const Connection = struct {
     fn versionState(self: *const Connection) VersionState {
         return .{
             .version = self.version,
-            .initial_open = self.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].crypto_open,
+            .initial_open = self.pkt_num_spaces[@backingInt(packet.Epoch.initial)].crypto_open,
         };
     }
 
     fn restoreVersion(self: *Connection, s: VersionState) void {
         self.version = s.version;
-        self.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].crypto_open = s.initial_open;
+        self.pkt_num_spaces[@backingInt(packet.Epoch.initial)].crypto_open = s.initial_open;
         self.packer.version = s.version;
         if (self.tls13_hs) |hs| hs.config.quic_version = s.version;
     }
@@ -2960,7 +2960,7 @@ pub const Connection = struct {
 
         // Re-derive Initial keys with the new version's salt
         const dcid = self.initial_dcid_buf[0..self.initial_dcid_len];
-        const space = &self.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)];
+        const space = &self.pkt_num_spaces[@backingInt(packet.Epoch.initial)];
         if (self.is_server) {
             // Server: only switch seal keys to v2 (keep v1 open for client retransmissions)
             const saved_open = space.crypto_open;
@@ -3217,7 +3217,7 @@ pub const Connection = struct {
         if (frame_type == .stream and rs.reset_err != null) return;
         const fc = &self.conn_flow_ctrl.base;
         fc.addBytesReceived(fc.highest_received + (end - rs.conn_counted)) catch {
-            self.closeWithTransportError(@intFromEnum(TransportError.flow_control_error), @intFromEnum(frame_type), "data exceeds connection flow control limit");
+            self.closeWithTransportError(@backingInt(TransportError.flow_control_error), @backingInt(frame_type), "data exceeds connection flow control limit");
             return error.FlowControlError;
         };
         rs.conn_counted = end;
@@ -3238,11 +3238,11 @@ pub const Connection = struct {
     fn retirePeerCid(self: *Connection, seq: u64) error{ProtocolViolation}!void {
         if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq) != null) return;
         if (self.retiring_cids.items.len >= 2 * self.local_params.active_connection_id_limit) {
-            self.closeWithTransportError(@intFromEnum(TransportError.connection_id_limit_error), @intFromEnum(FrameType.new_connection_id), "too many connection IDs pending retirement");
+            self.closeWithTransportError(@backingInt(TransportError.connection_id_limit_error), @backingInt(FrameType.new_connection_id), "too many connection IDs pending retirement");
             return error.ProtocolViolation;
         }
         self.retiring_cids.append(self.allocator, seq) catch {
-            self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.new_connection_id), "out of memory");
+            self.closeWithTransportError(@backingInt(TransportError.internal_error), @backingInt(FrameType.new_connection_id), "out of memory");
             return error.ProtocolViolation;
         };
         self.pushReliable(.{ .retire_connection_id = seq });
@@ -3515,19 +3515,19 @@ pub const Connection = struct {
         if (bytes_written > 0) {
             // QLOG: packet_sent (log using the highest encryption level that was packed)
             if (self.qlog_writer) |*ql| {
-                const pkt_type_str: []const u8 = if (app_seal != null and self.pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.application)] > 0)
+                const pkt_type_str: []const u8 = if (app_seal != null and self.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.application)] > 0)
                     "1RTT"
-                else if (handshake_seal != null and self.pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.handshake)] > 0)
+                else if (handshake_seal != null and self.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.handshake)] > 0)
                     "handshake"
                 else
                     "initial";
                 // Use the last PN that was allocated
-                const enc_idx: usize = if (app_seal != null and self.pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.application)] > 0)
-                    @intFromEnum(ack_handler.EncLevel.application)
-                else if (handshake_seal != null and self.pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.handshake)] > 0)
-                    @intFromEnum(ack_handler.EncLevel.handshake)
+                const enc_idx: usize = if (app_seal != null and self.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.application)] > 0)
+                    @backingInt(ack_handler.EncLevel.application)
+                else if (handshake_seal != null and self.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.handshake)] > 0)
+                    @backingInt(ack_handler.EncLevel.handshake)
                 else
-                    @intFromEnum(ack_handler.EncLevel.initial);
+                    @backingInt(ack_handler.EncLevel.initial);
                 const pn = self.pkt_handler.next_pn[enc_idx] -| 1;
                 var frames_buf: [2048]u8 = undefined;
                 var frames_len: usize = 0;
@@ -3563,7 +3563,7 @@ pub const Connection = struct {
             // number space until ... its HANDSHAKE packets have been acknowledged."
             if (!self.is_server and self.handshake_confirmed and self.pkt_num_spaces[1].crypto_seal != null) {
                 if (!self.crypto_streams.getStream(1).hasData()) {
-                    const hs_tracker = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.handshake)];
+                    const hs_tracker = &self.pkt_handler.sent[@backingInt(ack_handler.EncLevel.handshake)];
                     if (hs_tracker.ack_eliciting_in_flight == 0) {
                         self.dropHandshakeKeys();
                     }
@@ -3573,7 +3573,7 @@ pub const Connection = struct {
             // Track packets sent with current keys for key update
             if (self.key_update) |*ku| {
                 if (app_seal != null) {
-                    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+                    const app_idx = @backingInt(ack_handler.EncLevel.application);
                     const pn = self.pkt_handler.next_pn[app_idx];
                     if (pn > 0) ku.onPacketSent(pn - 1);
                 }
@@ -3715,7 +3715,7 @@ pub const Connection = struct {
         {
             const base_pto = self.pkt_handler.rtt_stats.pto();
             var effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
-            const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+            const app_idx = @backingInt(ack_handler.EncLevel.application);
             if (self.handshake_confirmed and self.pkt_handler.sent[app_idx].ack_eliciting_in_flight > 0) {
                 const capped_pto_count = @min(self.pkt_handler.pto_count, 5);
                 const shift: u6 = @intCast(capped_pto_count);
@@ -3804,7 +3804,7 @@ pub const Connection = struct {
                 self.pkt_handler.pto_count += 1;
                 // Increment per-space PTO count for the space that triggered
                 if (self.pkt_handler.getPtoSpace()) |pto_space| {
-                    self.pkt_handler.sent[@intFromEnum(pto_space)].pto_count += 1;
+                    self.pkt_handler.sent[@backingInt(pto_space)].pto_count += 1;
                 }
 
                 // Force-arm ACKs so probes include acknowledgements.
@@ -3896,7 +3896,7 @@ pub const Connection = struct {
                     self.idle_pto_count = 0;
                 } else {
                     var has_stream_in_flight = false;
-                    const app_tracker2 = &self.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
+                    const app_tracker2 = &self.pkt_handler.sent[@backingInt(ack_handler.EncLevel.application)];
                     var pkt_it2 = app_tracker2.sent_packets.iterator();
                     while (pkt_it2.next()) |pkt| {
                         if (pkt.in_flight and pkt.getStreamFrames().len > 0) {
@@ -3975,25 +3975,25 @@ pub const Connection = struct {
         // RFC 9000 §7.3: initial_source_connection_id names the SCID the
         // peer's packets carried, or someone rewrote them in flight.
         const iscid = peer_tp.initial_source_connection_id orelse {
-            self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "missing initial_source_connection_id");
+            self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "missing initial_source_connection_id");
             return error.TransportParameterError;
         };
         if (!std.mem.eql(u8, iscid.slice(), self.peer_initial_scid[0..self.peer_initial_scid_len])) {
-            self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "initial_source_connection_id mismatch");
+            self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "initial_source_connection_id mismatch");
             return error.TransportParameterError;
         }
 
         // Validate numeric ranges (RFC 9000 §7.4, §18.2)
         if (peer_tp.max_udp_payload_size < 1200) {
-            self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "max_udp_payload_size below 1200");
+            self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "max_udp_payload_size below 1200");
             return error.TransportParameterError;
         }
         if (peer_tp.ack_delay_exponent > 20) {
-            self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "ack_delay_exponent exceeds 20");
+            self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "ack_delay_exponent exceeds 20");
             return error.TransportParameterError;
         }
         if (peer_tp.max_ack_delay >= 16384) {
-            self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "max_ack_delay exceeds 2^14");
+            self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "max_ack_delay exceeds 2^14");
             return error.TransportParameterError;
         }
 
@@ -4002,11 +4002,11 @@ pub const Connection = struct {
             // original_destination_connection_id must match the DCID we initially sent
             if (peer_tp.original_destination_connection_id) |*peer_odcid| {
                 if (!std.mem.eql(u8, peer_odcid.slice(), self.odcid_buf[0..self.odcid_len])) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "ODCID mismatch");
+                    self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "ODCID mismatch");
                     return error.TransportParameterError;
                 }
             } else {
-                self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "server must send ODCID");
+                self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "server must send ODCID");
                 return error.TransportParameterError;
             }
 
@@ -4014,16 +4014,16 @@ pub const Connection = struct {
             // If not, it must be absent
             if (self.retry_received) {
                 const rscid = peer_tp.retry_source_connection_id orelse {
-                    self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "retry_scid missing after Retry");
+                    self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "retry_scid missing after Retry");
                     return error.TransportParameterError;
                 };
                 if (!std.mem.eql(u8, rscid.slice(), self.retry_scid[0..self.retry_scid_len])) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "retry_scid mismatch");
+                    self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "retry_scid mismatch");
                     return error.TransportParameterError;
                 }
             } else {
                 if (peer_tp.retry_source_connection_id != null) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "retry_scid present without Retry");
+                    self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "retry_scid present without Retry");
                     return error.TransportParameterError;
                 }
             }
@@ -4033,7 +4033,7 @@ pub const Connection = struct {
             // The version in use is always one we offered.
             if (peer_tp.version_info_chosen) |chosen| {
                 if (chosen != self.version) {
-                    self.closeWithTransportError(@intFromEnum(TransportError.version_negotiation_error), @intFromEnum(FrameType.crypto), "Chosen Version differs from the negotiated one");
+                    self.closeWithTransportError(@backingInt(TransportError.version_negotiation_error), @backingInt(FrameType.crypto), "Chosen Version differs from the negotiated one");
                     return error.VersionNegotiationError;
                 }
             }
@@ -4042,19 +4042,19 @@ pub const Connection = struct {
         // Server-side: reject server-only params from client (RFC 9000 §18.2)
         if (self.is_server) {
             if (peer_tp.original_destination_connection_id != null) {
-                self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "client sent original_destination_connection_id");
+                self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "client sent original_destination_connection_id");
                 return error.TransportParameterError;
             }
             if (peer_tp.preferred_address != null) {
-                self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "client sent preferred_address");
+                self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "client sent preferred_address");
                 return error.TransportParameterError;
             }
             if (peer_tp.retry_source_connection_id != null) {
-                self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "client sent retry_source_connection_id");
+                self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "client sent retry_source_connection_id");
                 return error.TransportParameterError;
             }
             if (peer_tp.stateless_reset_token != null) {
-                self.closeWithTransportError(@intFromEnum(TransportError.transport_parameter_error), @intFromEnum(FrameType.crypto), "client sent stateless_reset_token");
+                self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "client sent stateless_reset_token");
                 return error.TransportParameterError;
             }
         }
@@ -4072,7 +4072,7 @@ pub const Connection = struct {
                 peer_tp.active_connection_id_limit < rp.active_connection_id_limit)
             {
                 self.closeWithTransportError(
-                    @intFromEnum(TransportError.transport_parameter_error),
+                    @backingInt(TransportError.transport_parameter_error),
                     0,
                     "0-RTT transport params reduced",
                 );
@@ -4808,7 +4808,7 @@ pub fn connectInto(
     std.log.info("connection.connect: dcid={any}, scid={any}", .{ dcid, scid });
 
     // Derive Initial encryption keys from the DCID we chose
-    try conn.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].setupInitial(
+    try conn.pkt_num_spaces[@backingInt(packet.Epoch.initial)].setupInitial(
         &dcid,
         conn.version,
         false, // client-side
@@ -4913,13 +4913,13 @@ test "connect: create client connection" {
     try std.testing.expect(cs.hasData());
 
     // Should have Initial encryption keys
-    const seal = conn.pkt_num_spaces[@intFromEnum(packet.Epoch.initial)].crypto_seal;
+    const seal = conn.pkt_num_spaces[@backingInt(packet.Epoch.initial)].crypto_seal;
     try std.testing.expect(seal != null);
 }
 
 test "Connection: init and basic state" {
-    const dcid_val = "dest1234" ++ ([_]u8{0} ** 12);
-    const scid_val = "src12345" ++ ([_]u8{0} ** 12);
+    const dcid_val = "dest1234" ++ @as([12]u8, @splat(0));
+    const scid_val = "src12345" ++ @as([12]u8, @splat(0));
 
     var conn = Connection{
         .allocator = std.testing.allocator,
@@ -4953,7 +4953,7 @@ test "Connection: init and basic state" {
 test "ConnectionIdPool: add and consume" {
     var pool = ConnectionIdPool{};
     const cid1 = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const token1 = [_]u8{0xAA} ** 16;
+    const token1: [16]u8 = @splat(0xAA);
     pool.addPeerCid(1, &cid1, token1);
 
     try std.testing.expectEqual(@as(usize, 1), pool.count());
@@ -4969,7 +4969,7 @@ test "ConnectionIdPool: add and consume" {
 
 test "ConnectionIdPool: retire prior to" {
     var pool = ConnectionIdPool{};
-    const token = [_]u8{0} ** 16;
+    const token: [16]u8 = @splat(0);
     pool.addPeerCid(0, &[_]u8{ 0x01, 0x02 }, token);
     pool.addPeerCid(1, &[_]u8{ 0x03, 0x04 }, token);
     pool.addPeerCid(2, &[_]u8{ 0x05, 0x06 }, token);
@@ -4985,7 +4985,7 @@ test "ConnectionIdPool: retire prior to" {
 
 test "ConnectionIdPool: remove by seq" {
     var pool = ConnectionIdPool{};
-    const token = [_]u8{0} ** 16;
+    const token: [16]u8 = @splat(0);
     pool.addPeerCid(5, &[_]u8{ 0x01, 0x02, 0x03 }, token);
     pool.addPeerCid(6, &[_]u8{ 0x04, 0x05, 0x06 }, token);
 
@@ -4996,7 +4996,7 @@ test "ConnectionIdPool: remove by seq" {
 
 test "ConnectionIdPool: pool full" {
     var pool = ConnectionIdPool{};
-    const token = [_]u8{0} ** 16;
+    const token: [16]u8 = @splat(0);
     var i: u64 = 0;
     while (i < ConnectionIdPool.MAX_POOL_SIZE + 2) : (i += 1) {
         pool.addPeerCid(i, &[_]u8{@intCast(i)}, token);
@@ -5019,7 +5019,7 @@ test "PathValidator: wrong response" {
     var validator = PathValidator{};
     _ = validator.startChallenge();
 
-    const wrong_data = [_]u8{0xFF} ** 8;
+    const wrong_data: [8]u8 = @splat(0xFF);
     try std.testing.expect(!validator.handleResponse(wrong_data));
     try std.testing.expectEqual(PathValidationState.pending, validator.state);
 }
@@ -5140,7 +5140,7 @@ test "DatagramQueue: full queue" {
 
 test "DatagramQueue: oversized datagram rejected" {
     var q = DatagramQueue{};
-    const big = [_]u8{0xAA} ** (DatagramQueue.MAX_DATAGRAM_SIZE + 1);
+    const big: [(DatagramQueue.MAX_DATAGRAM_SIZE + 1)]u8 = @splat(0xAA);
     try std.testing.expect(!q.push(&big));
     try std.testing.expect(q.isEmpty());
 }
@@ -5246,7 +5246,7 @@ test "sockaddrSameIp: different IPs" {
 
 test "isV4Mapped: IPv4-mapped IPv6" {
     // ::ffff:127.0.0.1
-    var addr_bytes = [_]u8{0} ** 16;
+    var addr_bytes: [16]u8 = @splat(0);
     addr_bytes[10] = 0xff;
     addr_bytes[11] = 0xff;
     addr_bytes[12] = 127;
@@ -5259,7 +5259,7 @@ test "isV4Mapped: IPv4-mapped IPv6" {
 
 test "isV4Mapped: regular IPv6 is not mapped" {
     // ::1 (loopback)
-    var addr_bytes = [_]u8{0} ** 16;
+    var addr_bytes: [16]u8 = @splat(0);
     addr_bytes[15] = 1;
     const addr = makeIpv6Addr(addr_bytes, 4433);
     try std.testing.expect(!isV4Mapped(&addr));
@@ -5276,7 +5276,7 @@ test "isEffectivelyV4: IPv4" {
 }
 
 test "isEffectivelyV4: IPv4-mapped IPv6" {
-    var addr_bytes = [_]u8{0} ** 16;
+    var addr_bytes: [16]u8 = @splat(0);
     addr_bytes[10] = 0xff;
     addr_bytes[11] = 0xff;
     addr_bytes[12] = 10;
@@ -5288,7 +5288,7 @@ test "isEffectivelyV4: IPv4-mapped IPv6" {
 }
 
 test "isEffectivelyV4: native IPv6 is not v4" {
-    var addr_bytes = [_]u8{0} ** 16;
+    var addr_bytes: [16]u8 = @splat(0);
     addr_bytes[0] = 0x20;
     addr_bytes[1] = 0x01;
     const addr = makeIpv6Addr(addr_bytes, 80);
@@ -5299,7 +5299,7 @@ test "sockaddrLen: IPv4 vs IPv6" {
     const v4 = makeIpv4Addr(127, 0, 0, 1, 80);
     try std.testing.expectEqual(@as(posix.socklen_t, @sizeOf(posix.sockaddr.in)), sockaddrLen(&v4));
 
-    var v6_bytes = [_]u8{0} ** 16;
+    var v6_bytes: [16]u8 = @splat(0);
     v6_bytes[15] = 1;
     const v6 = makeIpv6Addr(v6_bytes, 80);
     try std.testing.expectEqual(@as(posix.socklen_t, @sizeOf(posix.sockaddr.in6)), sockaddrLen(&v6));
@@ -5308,8 +5308,8 @@ test "sockaddrLen: IPv4 vs IPv6" {
 // --- Connection state and method tests ---
 
 fn testConnection(allocator: std.mem.Allocator) Connection {
-    const dcid_val = "dest1234" ++ ([_]u8{0} ** 12);
-    const scid_val = "src12345" ++ ([_]u8{0} ** 12);
+    const dcid_val = "dest1234" ++ @as([12]u8, @splat(0));
+    const scid_val = "src12345" ++ @as([12]u8, @splat(0));
     return Connection{
         .allocator = allocator,
         .is_server = true,
@@ -5359,10 +5359,10 @@ test "Connection: closeWithTransportError" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
 
-    conn.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), @intFromEnum(FrameType.crypto), "flow control");
+    conn.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.crypto), "flow control");
     try std.testing.expectEqual(State.closing, conn.state);
     try std.testing.expect(!conn.local_err.?.is_app);
-    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+    try std.testing.expectEqual(@as(u64, @backingInt(TransportError.protocol_violation)), conn.local_err.?.code);
 }
 
 test "Connection: state queries" {
@@ -5410,7 +5410,7 @@ test "Connection: DatagramTooLarge vs DatagramQueueFull" {
     conn.datagrams_enabled = true;
 
     // Too-large payload → permanent error
-    const big = [_]u8{0xAA} ** (DatagramQueue.MAX_DATAGRAM_SIZE + 1);
+    const big: [(DatagramQueue.MAX_DATAGRAM_SIZE + 1)]u8 = @splat(0xAA);
     try std.testing.expectError(error.DatagramTooLarge, conn.sendDatagram(&big));
 
     // Fill the queue → transient error
@@ -5559,9 +5559,9 @@ test "Connection: getEcnMark" {
 test "Connection: a datagram ending in the peer's reset token drains without sending" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
-    try conn.pkt_num_spaces[@intFromEnum(ack_handler.EncLevel.application)].setupInitial("dest1234", conn.version, true);
+    try conn.pkt_num_spaces[@backingInt(ack_handler.EncLevel.application)].setupInitial("dest1234", conn.version, true);
     conn.state = .connected;
-    const token = [_]u8{0xBB} ** 16;
+    const token: [16]u8 = @splat(0xBB);
     conn.peer_cid_pool.addPeerCid(0, conn.dcid[0..conn.dcid_len], token);
     const info: RecvInfo = .{ .to = undefined, .from = undefined, .datagram_size = 40 };
 
@@ -5591,9 +5591,9 @@ test "Connection: a datagram ending in the peer's reset token drains without sen
 test "Connection: a retired peer CID's reset token is no longer honoured" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
-    try conn.pkt_num_spaces[@intFromEnum(ack_handler.EncLevel.application)].setupInitial("dest1234", conn.version, true);
+    try conn.pkt_num_spaces[@backingInt(ack_handler.EncLevel.application)].setupInitial("dest1234", conn.version, true);
     conn.state = .connected;
-    const token = [_]u8{0xBB} ** 16;
+    const token: [16]u8 = @splat(0xBB);
     conn.peer_cid_pool.addPeerCid(0, conn.dcid[0..conn.dcid_len], token);
     conn.peer_cid_pool.retirePriorTo(1);
 
@@ -5609,7 +5609,7 @@ test "Connection: matchesStatelessReset with no tokens" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
 
-    const data = [_]u8{0xAA} ** 32;
+    const data: [32]u8 = @splat(0xAA);
     try std.testing.expect(!conn.matchesStatelessReset(&data));
 }
 
@@ -5618,7 +5618,7 @@ test "Connection: matchesStatelessReset with matching token" {
     defer conn.deinit();
 
     // Add a peer CID with a known reset token
-    const token = [_]u8{0xBB} ** 16;
+    const token: [16]u8 = @splat(0xBB);
     const cid = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
     conn.peer_cid_pool.addPeerCid(1, &cid, token);
 
@@ -5686,18 +5686,18 @@ test "acceptInto keeps its own copy of the ODCID and retry SCID" {
     // Both come from a Retry token decoded on route()'s stack.
     const local = makeIpv4Addr(0, 0, 0, 0, 443);
     const remote = makeIpv4Addr(192, 168, 1, 100, 12345);
-    const dcid = [_]u8{0x0d} ** 8;
+    const dcid: [8]u8 = @splat(0x0d);
     const header = packet.Header{ .packet_type = .initial, .version = protocol.SUPPORTED_VERSIONS[0], .dcid = &dcid, .scid = &dcid };
-    var odcid = [_]u8{0x0a} ** 8;
-    var retry_scid = [_]u8{0x0b} ** 8;
+    var odcid: [8]u8 = @splat(0x0a);
+    var retry_scid: [8]u8 = @splat(0x0b);
     const conn = try std.testing.allocator.create(Connection);
     defer std.testing.allocator.destroy(conn);
     try Connection.acceptInto(conn, std.testing.allocator, header, local, remote, true, .{}, null, &odcid, &retry_scid);
     defer conn.deinit();
     @memset(&odcid, 0);
     @memset(&retry_scid, 0);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x0a} ** 8), conn.local_params.original_destination_connection_id.?.slice());
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x0b} ** 8), conn.local_params.retry_source_connection_id.?.slice());
+    try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0x0a)), conn.local_params.original_destination_connection_id.?.slice());
+    try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0x0b)), conn.local_params.retry_source_connection_id.?.slice());
 }
 
 test "accept: a client may choose a zero-length SCID" {
@@ -6062,7 +6062,7 @@ test "a stream past the reassembly cap closes the connection" {
         .data = &payload,
     } }, .application, 0));
     try std.testing.expectEqual(
-        @as(u64, @intFromEnum(TransportError.internal_error)),
+        @as(u64, @backingInt(TransportError.internal_error)),
         conn.local_err.?.code,
     );
 }
@@ -6094,7 +6094,7 @@ test "a uni stream past the reassembly cap closes the connection" {
         .data = &payload,
     } }, .application, 0));
     try std.testing.expectEqual(
-        @as(u64, @intFromEnum(TransportError.internal_error)),
+        @as(u64, @backingInt(TransportError.internal_error)),
         conn.local_err.?.code,
     );
 }
@@ -6111,7 +6111,7 @@ test "CRYPTO past the buffer ceiling closes the connection" {
         .data = &payload,
     } }, .application, 0));
     try std.testing.expectEqual(
-        @as(u64, @intFromEnum(TransportError.crypto_buffer_exceeded)),
+        @as(u64, @backingInt(TransportError.crypto_buffer_exceeded)),
         conn.local_err.?.code,
     );
 }
@@ -6141,7 +6141,7 @@ test "RESET_STREAM reports the bytes sent as its final size, not the bytes writt
     conn.streams.setMaxStreams(10, 10);
 
     const s = try conn.streams.openBidiStream();
-    try s.send.writeData(&([_]u8{'x'} ** 100));
+    try s.send.writeData(&@as([100]u8, @splat('x')));
     _ = s.send.popStreamFrame(40).?;
     s.send.reset(5);
     conn.queueFlowControlUpdates();
@@ -6494,9 +6494,9 @@ test "Retry: one with no token, our own DCID, or a token too long is discarded" 
 
 test "a server keeps the first SCID its peer proved, and checks initial_source_connection_id against it" {
     // RFC 9000 7.2, 7.3. Any later Initial that decrypted replaced it.
-    const odcid = [_]u8{0x0d} ** 8;
-    const first = [_]u8{0xa1} ** 8;
-    const other = [_]u8{0xb2} ** 8;
+    const odcid: [8]u8 = @splat(0x0d);
+    const first: [8]u8 = @splat(0xa1);
+    const other: [8]u8 = @splat(0xb2);
     const addr = makeIpv4Addr(192, 0, 2, 7, 5000);
     const conn = try std.testing.allocator.create(Connection);
     defer std.testing.allocator.destroy(conn);
@@ -6531,13 +6531,13 @@ test "NEW_CONNECTION_ID past our active_connection_id_limit is CONNECTION_ID_LIM
     // RFC 9000 5.1.1. The pool silently dropped what did not fit instead.
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
-    var cid = [_]u8{0xab} ** 8;
+    var cid: [8]u8 = @splat(0xab);
     // The handshake DCID is one; seq 1 makes two, our limit.
-    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{1} ** 16 } }, .application, 0);
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = @splat(1) } }, .application, 0);
     try std.testing.expect(conn.local_err == null);
     cid[0] = 0xac;
-    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 2, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{2} ** 16 } }, .application, 0));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.connection_id_limit_error)), conn.local_err.?.code);
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 2, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = @splat(2) } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @backingInt(TransportError.connection_id_limit_error)), conn.local_err.?.code);
 }
 
 test "RETIRE_CONNECTION_ID for a CID never issued, or the one it came on, is PROTOCOL_VIOLATION" {
@@ -6555,7 +6555,7 @@ test "RETIRE_CONNECTION_ID for a CID never issued, or the one it came on, is PRO
         var buf: [1500]u8 = undefined;
         const n = try testFrameToward(&conn, .{ .retire_connection_id = 0 }, &buf);
         conn.handleDatagram(buf[0..n], .{ .to = conn.paths[0].local_addr, .from = conn.paths[0].peer_addr, .datagram_size = n });
-        try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+        try std.testing.expectEqual(@as(u64, @backingInt(TransportError.protocol_violation)), conn.local_err.?.code);
     }
 }
 
@@ -6568,7 +6568,7 @@ test "CRYPTO data past the ClientHello at the Initial level is PROTOCOL_VIOLATIO
     const cert = kp.public_key.toUncompressedSec1();
     const chain = [_][]const u8{&cert};
     const addr = makeIpv4Addr(192, 0, 2, 7, 5000);
-    const odcid = [_]u8{0x0d} ** 8;
+    const odcid: [8]u8 = @splat(0x0d);
     const conn = try std.testing.allocator.create(Connection);
     defer std.testing.allocator.destroy(conn);
     try Connection.acceptInto(conn, std.testing.allocator, .{ .packet_type = .initial, .version = protocol.SUPPORTED_VERSIONS[0], .dcid = &odcid, .scid = &odcid }, addr, addr, true, .{}, .{
@@ -6589,11 +6589,11 @@ test "CRYPTO data past the ClientHello at the Initial level is PROTOCOL_VIOLATIO
     const hello = client.out_buf[0..client.out_len];
     @memcpy(data[0..hello.len], hello);
     // A Finished that belongs at the Handshake level, sent at Initial.
-    const fake = [_]u8{ 0x14, 0, 0, 32 } ++ [_]u8{0x5a} ** 32;
+    const fake = [_]u8{ 0x14, 0, 0, 32 } ++ @as([32]u8, @splat(0x5a));
     @memcpy(data[hello.len..][0..fake.len], &fake);
     try conn.processFrame(&.{ .crypto = .{ .offset = 0, .data = data[0 .. hello.len + fake.len] } }, .initial, 0);
     try conn.advanceHandshake();
-    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+    try std.testing.expectEqual(@as(u64, @backingInt(TransportError.protocol_violation)), conn.local_err.?.code);
 }
 
 test "frames the RFCs rule out: an empty NEW_TOKEN, an unadvertised DATAGRAM, a reset of a stream never opened" {
@@ -6604,7 +6604,7 @@ test "frames the RFCs rule out: an empty NEW_TOKEN, an unadvertised DATAGRAM, a 
         try connectInto(conn, std.testing.allocator, "example.com", .{}, null, null);
         defer conn.deinit();
         try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_token = &.{} }, .application, 0));
-        try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.frame_encoding_error)), conn.local_err.?.code);
+        try std.testing.expectEqual(@as(u64, @backingInt(TransportError.frame_encoding_error)), conn.local_err.?.code);
     }
     {
         // RFC 9221 3: we never advertised max_datagram_frame_size.
@@ -6612,14 +6612,14 @@ test "frames the RFCs rule out: an empty NEW_TOKEN, an unadvertised DATAGRAM, a 
         defer conn.deinit();
         var d = "hi".*;
         try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .datagram_with_length = .{ .data = &d } }, .application, 0));
-        try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+        try std.testing.expectEqual(@as(u64, @backingInt(TransportError.protocol_violation)), conn.local_err.?.code);
     }
     {
         // RFC 9000 19.4: stream 1 is ours (server-initiated bidi) and unopened.
         var conn = testConnection(std.testing.allocator);
         defer conn.deinit();
         try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .reset_stream = .{ .stream_id = 1, .error_code = 0, .final_size = 0 } }, .application, 0));
-        try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.stream_state_error)), conn.local_err.?.code);
+        try std.testing.expectEqual(@as(u64, @backingInt(TransportError.stream_state_error)), conn.local_err.?.code);
     }
 }
 
@@ -6755,7 +6755,7 @@ test "a reset stream lets go of the data it buffered" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     conn.streams.setMaxIncomingStreams(10, 10);
-    var data = [_]u8{0xab} ** 1000;
+    var data: [1000]u8 = @splat(0xab);
     for ([_]u64{ 0, 2 }) |id| {
         try conn.processFrame(&.{ .stream = .{ .stream_id = id, .offset = 1, .length = data.len, .data = &data, .fin = false } }, .application, 0);
         try conn.processFrame(&.{ .reset_stream = .{ .stream_id = id, .error_code = 0, .final_size = 1 + data.len } }, .application, 0);
@@ -6877,8 +6877,8 @@ test "sendCapacity counts bytes written on every stream against MAX_DATA" {
 
     const a = try conn.streams.openUniStream();
     const b = try conn.streams.openBidiStream();
-    try a.writeData(&([_]u8{'a'} ** 300));
-    try b.send.writeData(&([_]u8{'b'} ** 500));
+    try a.writeData(&@as([300]u8, @splat('a')));
+    try b.send.writeData(&@as([500]u8, @splat('b')));
     try std.testing.expectEqual(@as(u64, 200), conn.sendCapacity());
     try std.testing.expectEqual(@as(?u64, 200), conn.streamSendCapacity(a.stream_id));
 
@@ -6887,7 +6887,7 @@ test "sendCapacity counts bytes written on every stream against MAX_DATA" {
     try std.testing.expectEqual(@as(u64, 200), conn.sendCapacity());
 
     // A write past it is buffered, not refused.
-    try b.send.writeData(&([_]u8{'b'} ** 400));
+    try b.send.writeData(&@as([400]u8, @splat('b')));
     try std.testing.expectEqual(@as(u64, 0), conn.sendCapacity());
 
     try conn.processFrame(&.{ .max_data = 2000 }, .application, 0);
@@ -6902,7 +6902,7 @@ test "streamSendCapacity is bounded by MAX_STREAM_DATA and ends with the stream"
     conn.conn_flow_ctrl.base.send_window = 1 << 20;
 
     const ss = try conn.streams.openUniStream();
-    try ss.writeData(&([_]u8{'x'} ** 40));
+    try ss.writeData(&@as([40]u8, @splat('x')));
     try std.testing.expectEqual(@as(?u64, 24), conn.streamSendCapacity(ss.stream_id));
 
     try conn.processFrame(&.{ .max_stream_data = .{ .stream_id = ss.stream_id, .max = 100 } }, .application, 0);
@@ -6920,7 +6920,7 @@ test "a reset gives back the credit its unsent bytes had claimed" {
     conn.conn_flow_ctrl.base.send_window = 1000;
 
     const ss = try conn.streams.openUniStream();
-    try ss.writeData(&([_]u8{'x'} ** 600));
+    try ss.writeData(&@as([600]u8, @splat('x')));
     _ = ss.popStreamFrame(100).?;
     try std.testing.expectEqual(@as(u64, 400), conn.sendCapacity());
 
@@ -6945,7 +6945,7 @@ test "a handshake-space PTO with nothing to resend still probes" {
 
     // Initial space: an ack-eliciting packet went out long ago and was acked,
     // so nothing is in flight and there is nothing queued to resend.
-    const initial = &conn.pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.initial)];
+    const initial = &conn.pkt_handler.sent[@backingInt(ack_handler.EncLevel.initial)];
     initial.last_ack_eliciting_sent_time = now - 10 * std.time.ns_per_s;
 
     try conn.onTimeout();
@@ -6968,7 +6968,7 @@ test "an ACK for a packet number never sent is a PROTOCOL_VIOLATION" {
     try std.testing.expect(conn.local_err == null);
 
     try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack = .{ .largest_ack = 2, .ack_delay = 0, .first_ack_range = 0, .ack_range_count = 0 } }, .application, 0));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+    try std.testing.expectEqual(@as(u64, @backingInt(TransportError.protocol_violation)), conn.local_err.?.code);
 }
 
 test "an ACK_ECN for a packet number never sent is a PROTOCOL_VIOLATION" {
@@ -6984,7 +6984,7 @@ test "an ACK_ECN for a packet number never sent is a PROTOCOL_VIOLATION" {
         .ecn_ect1 = 0,
         .ecn_ce = 0,
     } }, .initial, 0));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.protocol_violation)), conn.local_err.?.code);
+    try std.testing.expectEqual(@as(u64, @backingInt(TransportError.protocol_violation)), conn.local_err.?.code);
 }
 
 test "STREAM data past a bidi stream's window is a FLOW_CONTROL_ERROR" {
@@ -6993,12 +6993,12 @@ test "STREAM data past a bidi stream's window is a FLOW_CONTROL_ERROR" {
     conn.streams.setMaxIncomingStreams(10, 10);
     conn.streams.local_max_stream_data_bidi_remote = 100;
 
-    var ok = [_]u8{'a'} ** 100;
+    var ok: [100]u8 = @splat('a');
     try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = ok.len, .data = &ok, .fin = false } }, .application, 0);
 
     var over = [_]u8{'b'};
     try std.testing.expectError(error.FlowControlError, conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 100, .length = 1, .data = &over, .fin = false } }, .application, 0));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.flow_control_error)), conn.local_err.?.code);
+    try std.testing.expectEqual(@as(u64, @backingInt(TransportError.flow_control_error)), conn.local_err.?.code);
 }
 
 test "STREAM data past a uni stream's window is a FLOW_CONTROL_ERROR" {
@@ -7010,7 +7010,7 @@ test "STREAM data past a uni stream's window is a FLOW_CONTROL_ERROR" {
     // A far offset alone is enough: no byte below it has to arrive first.
     var over = [_]u8{'b'};
     try std.testing.expectError(error.FlowControlError, conn.processFrame(&.{ .stream = .{ .stream_id = 2, .offset = 100, .length = 1, .data = &over, .fin = false } }, .application, 0));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.flow_control_error)), conn.local_err.?.code);
+    try std.testing.expectEqual(@as(u64, @backingInt(TransportError.flow_control_error)), conn.local_err.?.code);
 }
 
 test "RESET_STREAM with a final size past the stream window is a FLOW_CONTROL_ERROR" {
@@ -7020,7 +7020,7 @@ test "RESET_STREAM with a final size past the stream window is a FLOW_CONTROL_ER
     conn.streams.local_max_stream_data_uni = 100;
 
     try std.testing.expectError(error.FlowControlError, conn.processFrame(&.{ .reset_stream = .{ .stream_id = 2, .error_code = 0, .final_size = 101 } }, .application, 0));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.flow_control_error)), conn.local_err.?.code);
+    try std.testing.expectEqual(@as(u64, @backingInt(TransportError.flow_control_error)), conn.local_err.?.code);
 }
 
 test "a peer uni stream keeps getting MAX_STREAM_DATA past its initial window" {
@@ -7034,7 +7034,7 @@ test "a peer uni stream keeps getting MAX_STREAM_DATA past its initial window" {
     var stream_max: u64 = conn.streams.local_max_stream_data_uni;
     var conn_max: u64 = conn.conn_flow_ctrl.base.receive_window;
     const total: u64 = 3 * 1024 * 1024;
-    var chunk = [_]u8{'u'} ** 1200;
+    var chunk: [1200]u8 = @splat('u');
     var off: u64 = 0;
     var read_total: u64 = 0;
     while (off < total) {
@@ -7067,7 +7067,7 @@ test "a closing server keeps to the amplification limit, and resends its close w
         var conn = testConnection(std.testing.allocator);
         defer conn.deinit();
         try conn.pkt_num_spaces[0].setupInitial(conn.scid[0..conn.scid_len], conn.version, true);
-        try conn.crypto_streams.getStream(0).writeData(&([_]u8{0xcc} ** 2000));
+        try conn.crypto_streams.getStream(0).writeData(&@as([2000]u8, @splat(0xcc)));
         conn.paths[0].is_validated = validated;
         conn.paths[0].bytes_received = 100;
         conn.closeWithTransportError(0x0a, 0, "bye");
@@ -7101,7 +7101,7 @@ test "a closing connection resends its close with exponential backoff, not per p
         .dcid = &.{},
         .scid = &.{},
     };
-    var junk = [_]u8{0} ** 8;
+    var junk: [8]u8 = @splat(0);
     var out: [1500]u8 = undefined;
     var resent: usize = 0;
     var i: usize = 0;
@@ -7142,7 +7142,7 @@ fn loseControlFrames(conn: *Connection, frames: []const frame_mod.PendingControl
             .enc_level = .application,
         });
     }
-    const largest = conn.pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.application)] - 1;
+    const largest = conn.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.application)] - 1;
     try conn.processFrame(&.{ .ack = .{ .largest_ack = largest, .ack_delay = 0, .first_ack_range = 2, .ack_range_count = 0 } }, .application, now + 1_000_000);
 }
 
@@ -7175,7 +7175,7 @@ test "a lost MAX_STREAM_DATA is resent at the current window, not the lost one" 
     conn.streams.setMaxIncomingStreams(10, 10);
     conn.streams.local_max_stream_data_uni = 1000;
 
-    var data = [_]u8{'x'} ** 1000;
+    var data: [1000]u8 = @splat('x');
     try conn.processFrame(&.{ .stream = .{ .stream_id = 2, .offset = 0, .length = data.len, .data = &data, .fin = false } }, .application, 0);
     const rs = conn.streams.recv_streams.get(2).?;
     while (rs.read()) |d| alloc.free(d);
@@ -7201,7 +7201,7 @@ test "a lost STOP_SENDING is not resent once the stream's final size is known" {
     defer conn.deinit();
     conn.streams.setMaxIncomingStreams(10, 10);
 
-    var data = [_]u8{'x'} ** 10;
+    var data: [10]u8 = @splat('x');
     try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = data.len, .data = &data, .fin = false } }, .application, 0);
     const stop: frame_mod.PendingControlFrame = .{ .stop_sending = .{ .stream_id = 0, .error_code = 3 } };
 
@@ -7222,7 +7222,7 @@ test "a RESET_STREAM that finds the queue full is queued on a later pass" {
     defer conn.deinit();
     conn.streams.setMaxStreams(10, 10);
 
-    while (conn.pending_frames.hasRoomFor(1)) conn.pending_frames.push(.{ .path_challenge = .{0} ** 8 });
+    while (conn.pending_frames.hasRoomFor(1)) conn.pending_frames.push(.{ .path_challenge = @splat(0) });
     const s = try conn.streams.openBidiStream();
     s.send.reset(4);
     conn.queueFlowControlUpdates();
@@ -7243,7 +7243,7 @@ test "a full window of unread in-order data is not mistaken for reassembly gaps"
 
     // What a paused consumer leaves behind: 5000 frames, far more than the
     // gap cap, none of them out of order.
-    var payload = [_]u8{'x'} ** 1200;
+    var payload: [1200]u8 = @splat('x');
     var i: u64 = 0;
     while (i < 5000) : (i += 1) {
         try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = i * payload.len, .length = payload.len, .fin = false, .data = &payload } }, .application, 0);
@@ -7293,14 +7293,14 @@ test "NEW_CONNECTION_ID: a new CID does not replace the DCID in use" {
     var before: [20]u8 = undefined;
     const before_len = conn.packer.dcid_len;
     @memcpy(before[0..before_len], conn.packer.dcid_buf[0..before_len]);
-    var cid = [_]u8{0xcd} ** 8;
-    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    var cid: [8]u8 = @splat(0xcd);
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = @splat(0) } }, .application, 0);
     try std.testing.expectEqualSlices(u8, before[0..before_len], conn.packer.dcid_buf[0..conn.packer.dcid_len]);
     try std.testing.expectEqual(@as(u64, 0), conn.dcid_seq);
 
     // Retiring seq 0 is what moves us.
-    var cid2 = [_]u8{0xef} ** 8;
-    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 2, .retire_prior_to = 1, .conn_id = &cid2, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    var cid2: [8]u8 = @splat(0xef);
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 2, .retire_prior_to = 1, .conn_id = &cid2, .stateless_reset_token = @splat(0) } }, .application, 0);
     try std.testing.expectEqualSlices(u8, &cid, conn.packer.dcid_buf[0..conn.packer.dcid_len]);
     try std.testing.expectEqual(@as(u64, 1), conn.dcid_seq);
 }
@@ -7308,9 +7308,9 @@ test "NEW_CONNECTION_ID: a new CID does not replace the DCID in use" {
 test "NEW_CONNECTION_ID: a huge Retire Prior To retires only the CIDs we hold" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
-    var cid = [_]u8{0xab} ** 8;
+    var cid: [8]u8 = @splat(0xab);
     const top: u64 = (1 << 62) - 1;
-    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = top, .retire_prior_to = top, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = top, .retire_prior_to = top, .conn_id = &cid, .stateless_reset_token = @splat(0) } }, .application, 0);
     try std.testing.expect(conn.local_err == null);
     try std.testing.expectEqual(top, conn.active_cid_seq);
     // Only the handshake DCID (seq 0) was ever issued to us.
@@ -7323,26 +7323,26 @@ test "NEW_CONNECTION_ID: a huge Retire Prior To retires only the CIDs we hold" {
 test "NEW_CONNECTION_ID: unacked retirements past twice the limit close the connection" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
-    var cid = [_]u8{0xab} ** 8;
+    var cid: [8]u8 = @splat(0xab);
     const limit = conn.local_params.active_connection_id_limit;
-    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 100, .retire_prior_to = 100, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 100, .retire_prior_to = 100, .conn_id = &cid, .stateless_reset_token = @splat(0) } }, .application, 0);
     // Late CIDs below Retire Prior To are retired on arrival; a retransmit
     // of one is not retired twice.
     var seq: u64 = 1;
     while (seq < 2 * limit) : (seq += 1) {
-        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
-        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = @splat(0) } }, .application, 0);
+        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = @splat(0) } }, .application, 0);
     }
     try std.testing.expect(conn.local_err == null);
     try std.testing.expectEqual(@as(usize, @intCast(2 * limit)), conn.retiring_cids.items.len);
 
     // An ACK frees a slot.
     conn.onRetireCidAcked(0);
-    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 50, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0);
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 50, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = @splat(0) } }, .application, 0);
     try std.testing.expect(conn.local_err == null);
 
-    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 51, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.connection_id_limit_error)), conn.local_err.?.code);
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 51, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = @splat(0) } }, .application, 0));
+    try std.testing.expectEqual(@as(u64, @backingInt(TransportError.connection_id_limit_error)), conn.local_err.?.code);
 }
 
 test "connection flow control: the window bounds the sum over streams" {
@@ -7364,7 +7364,7 @@ test "connection flow control: the window bounds the sum over streams" {
 
     // Each stream is well inside its own window, but the sum is not.
     try std.testing.expectError(error.FlowControlError, conn.processFrame(&.{ .stream = .{ .stream_id = 8, .offset = 0, .length = 1, .data = buf[0..1], .fin = false } }, .application, 0));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.flow_control_error)), conn.local_err.?.code);
+    try std.testing.expectEqual(@as(u64, @backingInt(TransportError.flow_control_error)), conn.local_err.?.code);
 }
 
 test "connection flow control: MAX_DATA is granted for data read, not data received" {
@@ -7409,7 +7409,7 @@ test "connection flow control: a repeated RESET_STREAM counts its final size onc
 /// A server Initial carrying a PING to `conn`'s client, labelled `version` and
 /// sealed with `seal`.
 fn testServerInitial(conn: *Connection, buf: []u8, version: u32, seal: *const quic_crypto.Seal) !usize {
-    const server_scid = [_]u8{0x5c} ** 8;
+    const server_scid: [8]u8 = @splat(0x5c);
     var handler = ack_handler.PacketHandler.init(std.testing.allocator);
     defer handler.deinit();
     var crypto_mgr = crypto_stream.CryptoStreamManager.init(std.testing.allocator);
@@ -7467,7 +7467,7 @@ test "a client closes when the server's Chosen Version isn't the one its packets
     try conn.validatePeerTransportParams(&tp);
     tp.version_info_chosen = protocol.QUIC_V1;
     try std.testing.expectError(error.VersionNegotiationError, conn.validatePeerTransportParams(&tp));
-    try std.testing.expectEqual(@intFromEnum(TransportError.version_negotiation_error), conn.local_err.?.code);
+    try std.testing.expectEqual(@backingInt(TransportError.version_negotiation_error), conn.local_err.?.code);
 }
 
 test "a connection still in its handshake after handshake_timeout closes" {
@@ -7475,7 +7475,7 @@ test "a connection still in its handshake after handshake_timeout closes" {
     // handshake trickling along could hold it open for good.
     const alloc = std.testing.allocator;
     const addr = makeIpv4Addr(192, 0, 2, 7, 5000);
-    const odcid = [_]u8{0x0d} ** 8;
+    const odcid: [8]u8 = @splat(0x0d);
     const client = try alloc.create(Connection);
     defer alloc.destroy(client);
     try connectInto(client, alloc, "example.com", .{}, null, null);

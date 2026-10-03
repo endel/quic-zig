@@ -29,7 +29,7 @@ pub const RangeSet = struct {
     pub fn init(allocator: Allocator) RangeSet {
         return .{
             .allocator = allocator,
-            .ranges = .{ .items = &.{}, .capacity = 0 },
+            .ranges = .empty,
         };
     }
 

@@ -155,7 +155,7 @@ pub const WebTransportConnection = struct {
     h3: *h3_conn.H3Connection,
     quic: *quic_connection.Connection,
     is_server: bool,
-    sessions: [MAX_SESSIONS]Session = .{Session{}} ** MAX_SESSIONS,
+    sessions: [MAX_SESSIONS]Session = @splat(Session{}),
     active_session_count: u32 = 0,
     /// Streams registered for a session not yet established: kept from the
     /// application, their data left unread, until it is (draft-13 §4.5).
@@ -612,7 +612,7 @@ pub const WebTransportConnection = struct {
         const stream = self.quic.streams.getStream(session_id) orelse return;
         var hdr_buf: [16]u8 = undefined;
         var hdr = io.fixedBufferStream(&hdr_buf);
-        packet.writeVarInt(&hdr, @intFromEnum(h3_frame.H3FrameType.data)) catch return;
+        packet.writeVarInt(&hdr, @backingInt(h3_frame.H3FrameType.data)) catch return;
         packet.writeVarInt(&hdr, capsule.len) catch return;
         stream.send.writeData(hdr.buffered()) catch return;
         stream.send.writeData(capsule) catch {};
@@ -913,7 +913,7 @@ pub const WebTransportConnection = struct {
     /// by the same disposal path.
     fn streamBuf(self: *WebTransportConnection, stream_id: u64) !*std.ArrayList(u8) {
         const gop = try self.stream_bufs.getOrPut(stream_id);
-        if (!gop.found_existing) gop.value_ptr.* = .{ .items = &.{}, .capacity = 0 };
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
         return gop.value_ptr;
     }
 
@@ -942,7 +942,7 @@ pub const WebTransportConnection = struct {
 
             // A DATA frame is the RFC 9297 container, not a capsule: drop the
             // header and what follows is the capsule stream itself.
-            if (header.frame_type == @intFromEnum(h3_frame.H3FrameType.data)) {
+            if (header.frame_type == @backingInt(h3_frame.H3FrameType.data)) {
                 h3_frame.consumeFromBuf(buf, header.header_len);
                 continue;
             }
@@ -977,7 +977,7 @@ pub const WebTransportConnection = struct {
     fn rejectCapsuleStream(self: *WebTransportConnection, session: *Session) void {
         if (session.state != .draining) return;
         if (self.quic.streams.getStream(session.session_id)) |s| {
-            s.send.reset(@intFromEnum(h3_conn.H3Error.message_error));
+            s.send.reset(@backingInt(h3_conn.H3Error.message_error));
         }
     }
 
@@ -1552,8 +1552,8 @@ pub const WebTransportConnection = struct {
                     // request is refused before the application sees it.
                     if (self.allocateSession(req.stream_id, .connecting) == null) {
                         if (self.quic.streams.getStream(req.stream_id)) |st| {
-                            st.send.reset(@intFromEnum(h3_conn.H3Error.request_rejected));
-                            st.recv.stopSending(@intFromEnum(h3_conn.H3Error.request_rejected));
+                            st.send.reset(@backingInt(h3_conn.H3Error.request_rejected));
+                            st.recv.stopSending(@backingInt(h3_conn.H3Error.request_rejected));
                         }
                         try self.h3.excluded_streams.put(req.stream_id, {});
                         return null;
@@ -1693,8 +1693,8 @@ const packet_packer = @import("../quic/packet_packer.zig");
 const protocol = @import("../quic/protocol.zig");
 
 fn createTestQuicConn(is_server: bool) quic_connection.Connection {
-    const dcid = "testdcid" ++ ([_]u8{0} ** 12);
-    const scid = "testscid" ++ ([_]u8{0} ** 12);
+    const dcid = "testdcid" ++ @as([12]u8, @splat(0));
+    const scid = "testscid" ++ @as([12]u8, @splat(0));
 
     var conn = quic_connection.Connection{
         .allocator = testing.allocator,
@@ -2409,7 +2409,6 @@ test "WT integration: client receives session_rejected on non-200" {
 
 // ---- Group F: Session close ----
 
-
 /// Unwrap a capsule written to a CONNECT stream. Asserts the DATA wrapper is
 /// there: sent bare, the peer ignores the capsule as an unknown H3 frame type.
 fn expectCapsulePayload(written: []const u8) ![]const u8 {
@@ -2796,7 +2795,7 @@ test "WT integration: a reset code outside the WebTransport range reports 0" {
     const stream = setup.quic_conn.streams.getStream(stream_id).?;
     // An H3-level code, not an application one: there is no app code to report,
     // and the peer still needs to hear the stream died.
-    try stream.recv.handleResetStream(@intFromEnum(h3_conn.H3Error.request_cancelled), 0);
+    try stream.recv.handleResetStream(@backingInt(h3_conn.H3Error.request_cancelled), 0);
 
     const ev = try pollFor(&setup.wt, .stream_reset);
     try testing.expectEqual(@as(u32, 0), ev.stream_reset.error_code);
@@ -2906,7 +2905,7 @@ test "WT: invalid session ID triggers H3_ID_ERROR on bidi stream" {
     // Connection should be closing with H3_ID_ERROR (RFC 9114 §8.1)
     try testing.expect(setup.quic_conn.local_err != null);
     try testing.expect(setup.quic_conn.local_err.?.is_app);
-    try testing.expectEqual(@intFromEnum(h3_conn.H3Error.id_error), setup.quic_conn.local_err.?.code);
+    try testing.expectEqual(@backingInt(h3_conn.H3Error.id_error), setup.quic_conn.local_err.?.code);
 }
 
 const Surfaced = struct { wt: bool = false, request: bool = false };
@@ -3035,7 +3034,7 @@ test "WT: a CONNECT past the session slots is rejected, never answered 200" {
         }
     }
     const extra = setup.quic_conn.streams.getStream(4 * MAX_SESSIONS).?;
-    try testing.expectEqual(@as(?u64, @intFromEnum(h3_conn.H3Error.request_rejected)), extra.send.reset_err);
+    try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.request_rejected)), extra.send.reset_err);
     try testing.expectEqual(@as(u32, MAX_SESSIONS), setup.wt.active_session_count);
 
     try testing.expectError(error.TooManySessions, setup.wt.acceptSession(4 * MAX_SESSIONS));
@@ -3062,7 +3061,7 @@ test "WT: invalid session ID triggers H3_ID_ERROR on uni stream" {
     // Connection should be closing with H3_ID_ERROR (RFC 9114 §8.1)
     try testing.expect(setup.quic_conn.local_err != null);
     try testing.expect(setup.quic_conn.local_err.?.is_app);
-    try testing.expectEqual(@intFromEnum(h3_conn.H3Error.id_error), setup.quic_conn.local_err.?.code);
+    try testing.expectEqual(@backingInt(h3_conn.H3Error.id_error), setup.quic_conn.local_err.?.code);
 }
 
 test "WT: a uni stream whose type does not parse is abandoned, not read again for one" {
@@ -3434,7 +3433,7 @@ test "WT backpressure: sendCapacity follows MAX_DATA, and a session wait fires w
     try testing.expectEqual(@as(u64, 100), setup.wt.sendCapacity(session_id));
 
     const stream_id = try setup.wt.openUniStream(session_id, null);
-    try setup.wt.sendStreamData(stream_id, &([_]u8{'x'} ** 200));
+    try setup.wt.sendStreamData(stream_id, &@as([200]u8, @splat('x')));
     try testing.expectEqual(@as(u64, 0), setup.wt.sendCapacity(session_id));
     try testing.expectEqual(@as(?u64, 0), setup.wt.streamSendCapacity(stream_id));
 

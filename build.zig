@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
             name: []const u8,
             path: []const u8,
             t: std.Build.ResolvedTarget,
-            opt: std.builtin.OptimizeMode,
+            opt: std.lang.Optimize,
             libc: ?bool,
             lib: *std.Build.Module,
         ) *std.Build.Step.Compile {
@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_interop_client_manual);
     const run_interop_client_manual = b.addRunArtifact(exe_interop_client_manual);
     run_interop_client_manual.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_interop_client_manual.addArgs(args);
+    run_interop_client_manual.addPassthruArgs();
     b.step("run-interop-client-manual", "Run interop runner client (manual event loop)")
         .dependOn(&run_interop_client_manual.step);
 
@@ -120,14 +120,14 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_client);
     const run_client = b.addRunArtifact(exe_client);
     run_client.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_client.addArgs(args);
+    run_client.addPassthruArgs();
     b.step("run-client", "Run QUIC client").dependOn(&run_client.step);
 
     const exe_h3_client = App.add(b, "h3-client", "apps/h3_client.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_h3_client);
     const run_h3_client = b.addRunArtifact(exe_h3_client);
     run_h3_client.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_h3_client.addArgs(args);
+    run_h3_client.addPassthruArgs();
     b.step("run-h3-client", "Run H3 client").dependOn(&run_h3_client.step);
 
     const exe_quic_server = App.add(b, "quic-server", "apps/quic_server.zig", target, optimize, need_libc, lib_mod);
@@ -140,14 +140,14 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_tls_echo);
     const run_tls_echo = b.addRunArtifact(exe_tls_echo);
     run_tls_echo.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_tls_echo.addArgs(args);
+    run_tls_echo.addPassthruArgs();
     b.step("run-tls-echo-server", "Run the TLS 1.3 over TCP echo / HTTP server").dependOn(&run_tls_echo.step);
 
     const exe_quic_client = App.add(b, "quic-client", "apps/quic_client.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_quic_client);
     const run_quic_client = b.addRunArtifact(exe_quic_client);
     run_quic_client.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_quic_client.addArgs(args);
+    run_quic_client.addPassthruArgs();
     b.step("run-quic-client", "Run raw QUIC echo client").dependOn(&run_quic_client.step);
 
     const exe_wt_server = App.add(b, "wt-server", "apps/wt_server.zig", target, optimize, need_libc, lib_mod);
@@ -172,7 +172,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_ws_echo);
     const run_ws_echo = b.addRunArtifact(exe_ws_echo);
     run_ws_echo.step.dependOn(b.getInstallStep());
-    if (b.args) |ws_args| run_ws_echo.addArgs(ws_args);
+    run_ws_echo.addPassthruArgs();
     b.step("run-ws-echo-server", "Run WebSocket + WebTransport echo server").dependOn(&run_ws_echo.step);
     // Just this binary, for tools/autobahn.sh: a full install is most of a CI run.
     b.step("ws-echo-server", "Build only ws-echo-server").dependOn(&b.addInstallArtifact(exe_ws_echo, .{}).step);
@@ -181,56 +181,56 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_moq_relay);
     const run_moq_relay = b.addRunArtifact(exe_moq_relay);
     run_moq_relay.step.dependOn(b.getInstallStep());
-    if (b.args) |moq_args| run_moq_relay.addArgs(moq_args);
+    run_moq_relay.addPassthruArgs();
     b.step("run-moq-relay", "Run MoQ Transport relay (WebTransport and QUIC, plus the browser demos)").dependOn(&run_moq_relay.step);
 
     const exe_moq_server = App.add(b, "moq-server", "apps/moq_server.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_moq_server);
     const run_moq_server = b.addRunArtifact(exe_moq_server);
     run_moq_server.step.dependOn(b.getInstallStep());
-    if (b.args) |moq_args| run_moq_server.addArgs(moq_args);
+    run_moq_server.addPassthruArgs();
     b.step("run-moq-server", "Run MoQ Transport server (raw QUIC)").dependOn(&run_moq_server.step);
 
     const exe_moq_lite = App.add(b, "moq-lite", "apps/moq_lite.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_moq_lite);
     const run_moq_lite = b.addRunArtifact(exe_moq_lite);
     run_moq_lite.step.dependOn(b.getInstallStep());
-    if (b.args) |moq_args| run_moq_lite.addArgs(moq_args);
+    run_moq_lite.addPassthruArgs();
     b.step("run-moq-lite", "Run the moq-lite client").dependOn(&run_moq_lite.step);
 
     const exe_moq_lite_relay = App.add(b, "moq-lite-relay", "apps/moq_lite_relay.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_moq_lite_relay);
     const run_moq_lite_relay = b.addRunArtifact(exe_moq_lite_relay);
     run_moq_lite_relay.step.dependOn(b.getInstallStep());
-    if (b.args) |moq_args| run_moq_lite_relay.addArgs(moq_args);
+    run_moq_lite_relay.addPassthruArgs();
     b.step("run-moq-lite-relay", "Run the moq-lite relay").dependOn(&run_moq_lite_relay.step);
 
     const exe_moq_test_client = App.add(b, "moq-test-client", "apps/moq_test_client.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_moq_test_client);
     const run_moq_test_client = b.addRunArtifact(exe_moq_test_client);
     run_moq_test_client.step.dependOn(b.getInstallStep());
-    if (b.args) |moq_args| run_moq_test_client.addArgs(moq_args);
+    run_moq_test_client.addPassthruArgs();
     b.step("run-moq-test-client", "Run the MoQ interop test client").dependOn(&run_moq_test_client.step);
 
     const exe_moq_client = App.add(b, "moq-client", "apps/moq_client.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_moq_client);
     const run_moq_client = b.addRunArtifact(exe_moq_client);
     run_moq_client.step.dependOn(b.getInstallStep());
-    if (b.args) |moq_args| run_moq_client.addArgs(moq_args);
+    run_moq_client.addPassthruArgs();
     b.step("run-moq-client", "Run MoQ Transport client (raw QUIC)").dependOn(&run_moq_client.step);
 
     const exe_wt_echo = App.add(b, "wt-echo-server", "apps/wt_echo_server.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_wt_echo);
     const run_wt_echo = b.addRunArtifact(exe_wt_echo);
     run_wt_echo.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_wt_echo.addArgs(args);
+    run_wt_echo.addPassthruArgs();
     b.step("run-wt-echo-server", "Run WebTransport echo server").dependOn(&run_wt_echo.step);
 
     const exe_wpt = App.add(b, "wpt-server", "apps/wpt_server.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_wpt);
     const run_wpt = b.addRunArtifact(exe_wpt);
     run_wpt.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_wpt.addArgs(args);
+    run_wpt.addPassthruArgs();
     b.step("run-wpt-server", "Run WPT WebTransport test server").dependOn(&run_wpt.step);
 
     const exe_wpt_client = App.add(b, "wpt-client", "apps/wpt_client.zig", target, optimize, need_libc, lib_mod);
@@ -242,7 +242,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_wpt_client);
     const run_wpt_client = b.addRunArtifact(exe_wpt_client);
     run_wpt_client.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_wpt_client.addArgs(args);
+    run_wpt_client.addPassthruArgs();
     b.step("run-wpt-client", "Run the WebTransport conformance client").dependOn(&run_wpt_client.step);
 
     const exe_interop_server = App.add(b, "interop-server", "apps/interop_server.zig", target, optimize, need_libc, lib_mod);
@@ -255,7 +255,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_interop_client);
     const run_interop_client = b.addRunArtifact(exe_interop_client);
     run_interop_client.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_interop_client.addArgs(args);
+    run_interop_client.addPassthruArgs();
     b.step("run-interop-client", "Run interop runner client").dependOn(&run_interop_client.step);
 
     const exe_interop_wt_server = App.add(b, "interop-wt-server", "apps/interop_wt_server.zig", target, optimize, need_libc, lib_mod);
@@ -294,20 +294,20 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_lb);
     const run_lb = b.addRunArtifact(exe_lb);
     run_lb.step.dependOn(b.getInstallStep());
-    if (b.args) |args_lb| run_lb.addArgs(args_lb);
+    run_lb.addPassthruArgs();
     b.step("run-quic-lb", "Run QUIC load balancer").dependOn(&run_lb.step);
 
     const exe_bench = App.add(b, "bench", "apps/bench.zig", target, optimize, need_libc, lib_mod);
     b.installArtifact(exe_bench);
     const run_bench = b.addRunArtifact(exe_bench);
     run_bench.step.dependOn(b.getInstallStep());
-    if (b.args) |args_b| run_bench.addArgs(args_b);
+    run_bench.addPassthruArgs();
     b.step("run-bench", "Run benchmark client").dependOn(&run_bench.step);
 
     // Crypto microbench — the primitives a handshake spends its time in.
     const exe_bench_crypto = App.add(b, "bench-crypto", "tools/bench_crypto.zig", target, optimize, need_libc, lib_mod);
     const run_bench_crypto = b.addRunArtifact(exe_bench_crypto);
-    if (b.args) |args_c| run_bench_crypto.addArgs(args_c);
+    run_bench_crypto.addPassthruArgs();
     b.step("bench-crypto", "Benchmark the handshake's crypto primitives").dependOn(&run_bench_crypto.step);
 
     // Codec microbench — pure CPU (parse/serialize loops), no sockets.

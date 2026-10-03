@@ -74,7 +74,7 @@ pub fn isSubgroupStreamType(t: u64, first_object: bool) bool {
     if ((t & SUBGROUP_BIT_SELECTOR) == 0) return false;
     // Reserved-id-mode must not be present.
     const mode: u2 = @truncate((t & SUBGROUP_MASK_ID_MODE) >> 1);
-    if (mode == @intFromEnum(SubgroupIdMode.reserved)) return false;
+    if (mode == @backingInt(SubgroupIdMode.reserved)) return false;
     const known: u64 = if (first_object) 0x7F else 0x3F;
     return (t & ~known) == 0;
 }

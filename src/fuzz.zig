@@ -1062,7 +1062,7 @@ test "QUIC packet headers survive a randomized sweep" {
 /// One encoded QUIC long or short header, chosen at random.
 fn seedPacketHeader(buf: []u8, rand: std.Random) ?usize {
     const cid = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
-    const token = [_]u8{0xaa} ** 24;
+    const token: [24]u8 = @splat(0xaa);
 
     var hdr = packet.Header{
         // v2 assigns the type bits differently, and version 0 is a version
@@ -1200,10 +1200,10 @@ fn seedFrame(buf: []u8, rand: std.Random) ?usize {
             .seq_num = 3,
             .retire_prior_to = 1,
             .conn_id = payload[0..8],
-            .stateless_reset_token = [_]u8{0x5a} ** 16,
+            .stateless_reset_token = @splat(0x5a),
         } },
         13 => .{ .retire_connection_id = .{ .seq_num = 3 } },
-        14 => .{ .path_challenge = [_]u8{0x11} ** 8 },
+        14 => .{ .path_challenge = @splat(0x11) },
         15 => .{ .connection_close = .{ .error_code = 0x0a, .frame_type = 0x08, .reason = &payload } },
         16 => .{ .datagram_with_length = .{ .data = &payload } },
         else => .{ .ack_frequency = .{
@@ -1331,7 +1331,7 @@ fn seedTransportParams(buf: []u8, rand: std.Random) ?usize {
     };
     if (rand.boolean()) p.original_destination_connection_id = .init(&cid);
     if (rand.boolean()) p.retry_source_connection_id = .init(&cid);
-    if (rand.boolean()) p.stateless_reset_token = [_]u8{0x5a} ** 16;
+    if (rand.boolean()) p.stateless_reset_token = @splat(0x5a);
     if (rand.boolean()) p.max_datagram_frame_size = rand.int(u16);
     if (rand.boolean()) p.min_ack_delay = rand.int(u16);
     if (rand.boolean()) {
@@ -1900,8 +1900,8 @@ test "fuzz: AES-128-GCM agrees with std" {
         .corpus = &.{
             // key, nonce, flip, AD length (LE u16), then AD and message
             "0123456789abcdef" ++ "nonce-000001" ++ "\x05" ++ "\x00\x00" ++ "m",
-            "0123456789abcdef" ++ "nonce-000002" ++ "\x2a" ++ "\x10\x00" ++ "a" ** 16 ++ "m" ** 200,
-            "0123456789abcdef" ++ "nonce-000003" ++ "\x7f" ++ "\x2c\x01" ++ "a" ** 300 ++ "m" ** 1400,
+            "0123456789abcdef" ++ "nonce-000002" ++ "\x2a" ++ "\x10\x00" ++ &@as([16]u8, @splat('a')) ++ &@as([200]u8, @splat('m')),
+            "0123456789abcdef" ++ "nonce-000003" ++ "\x7f" ++ "\x2c\x01" ++ &@as([300]u8, @splat('a')) ++ &@as([1400]u8, @splat('m')),
         },
     });
 }

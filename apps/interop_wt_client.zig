@@ -81,7 +81,7 @@ const EndpointGroup = struct {
 };
 
 fn groupByEndpoint(alloc: std.mem.Allocator, urls: []const ParsedUrl) !std.ArrayList(EndpointGroup) {
-    var groups: std.ArrayList(EndpointGroup) = .{ .items = &.{}, .capacity = 0 };
+    var groups: std.ArrayList(EndpointGroup) = .empty;
     for (urls) |url| {
         // path = "/endpoint/file.txt" or "/endpoint/" or "/endpoint"
         var path = url.path;
@@ -112,7 +112,7 @@ fn groupByEndpoint(alloc: std.mem.Allocator, urls: []const ParsedUrl) !std.Array
         if (!found) {
             var g = EndpointGroup{
                 .endpoint = ep_path,
-                .files = .{ .items = &.{}, .capacity = 0 },
+                .files = .empty,
             };
             if (filename.len > 0) {
                 try g.files.append(alloc, filename);
@@ -152,7 +152,7 @@ const SessionState = struct {
             .bidi_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(alloc),
             .uni_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(alloc),
             .pending_gets = std.AutoHashMap(u64, []const u8).init(alloc),
-            .pending_dgram_replies = .{ .items = &.{}, .capacity = 0 },
+            .pending_dgram_replies = .empty,
         };
     }
 
@@ -191,7 +191,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     // Parse client protocols
-    var client_protocols: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
+    var client_protocols: std.ArrayList([]const u8) = .empty;
     {
         var it = mem.splitScalar(u8, protocols_str, ' ');
         while (it.next()) |p| {
@@ -202,7 +202,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Parse request URLs from CLI args
     var args_iter = std.process.Args.Iterator.init(init.args);
     _ = args_iter.next(); // skip program name
-    var urls: std.ArrayList(ParsedUrl) = .{ .items = &.{}, .capacity = 0 };
+    var urls: std.ArrayList(ParsedUrl) = .empty;
     while (args_iter.next()) |arg| {
         if (parseUrl(arg)) |url| {
             try urls.append(alloc, url);
@@ -370,7 +370,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     // ---- Open WT sessions per endpoint group ----
-    var session_states: std.ArrayList(SessionState) = .{ .items = &.{}, .capacity = 0 };
+    var session_states: std.ArrayList(SessionState) = .empty;
     defer {
         for (session_states.items) |*s| s.deinit(alloc);
         session_states.deinit(alloc);
@@ -540,7 +540,7 @@ fn pollWtEvents(
                     };
                     wt.closeStream(stream_id);
                     // Track this bidi stream for reading response
-                    state.bidi_bufs.put(stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 }) catch {};
+                    state.bidi_bufs.put(stream_id, .empty) catch {};
                     state.pending_gets.put(stream_id, filename) catch {};
                     std.log.info("sent GET {s} on bidi stream {d}", .{ filename, stream_id });
                 }
@@ -599,12 +599,12 @@ fn pollWtEvents(
 
             .bidi_stream => |bs| {
                 std.log.info("WT bidi stream: session={d} stream={d}", .{ bs.session_id, bs.stream_id });
-                state.bidi_bufs.put(bs.stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 }) catch {};
+                state.bidi_bufs.put(bs.stream_id, .empty) catch {};
             },
 
             .uni_stream => |us| {
                 std.log.info("WT uni stream: session={d} stream={d}", .{ us.session_id, us.stream_id });
-                state.uni_bufs.put(us.stream_id, std.ArrayList(u8){ .items = &.{}, .capacity = 0 }) catch {};
+                state.uni_bufs.put(us.stream_id, .empty) catch {};
             },
 
             .stream_data => |sd| {

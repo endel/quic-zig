@@ -26,7 +26,7 @@ pub const Version = enum(u8) {
     }
 
     pub fn code(self: Version) u64 {
-        return 0xff0d_ad00 | @as(u64, @intFromEnum(self));
+        return 0xff0d_ad00 | @as(u64, @backingInt(self));
     }
 
     pub fn fromAlpn(token: []const u8) ?Version {

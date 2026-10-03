@@ -64,7 +64,7 @@ const MoqClientHandler = struct {
     group_id: u64 = 0,
     last_tick_ns: i128 = 0,
 
-    stream_roles: [256]StreamRole = [_]StreamRole{.unknown} ** 256,
+    stream_roles: [256]StreamRole = @splat(.unknown),
 
     fn setRole(self: *MoqClientHandler, sid: u64, role: StreamRole) void {
         if (sid < 256) self.stream_roles[@intCast(sid)] = role;
@@ -346,7 +346,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var draft: moq_version.Draft = moq_version.DEFAULT;
 
     // For multi-track subscribe: repeated --track flags accumulate here.
-    var track_names = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+    var track_names = std.ArrayList([]const u8).empty;
     defer track_names.deinit(alloc);
 
     var args = std.process.Args.Iterator.init(init.args);
@@ -393,7 +393,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     // Parse namespace: "moq-clock" → ["moq-clock"], "a,b" → ["a","b"]
-    var ns_list = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+    var ns_list = std.ArrayList([]const u8).empty;
     var ns_it = std.mem.splitScalar(u8, ns_str, ',');
     while (ns_it.next()) |part| {
         if (part.len > 0) try ns_list.append(alloc, part);

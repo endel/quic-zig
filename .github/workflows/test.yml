@@ -21,7 +21,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Build
         run: zig build
@@ -48,7 +48,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Autobahn (ws://)
         run: RESULTS_DIR=autobahn/ws ./tools/autobahn.sh

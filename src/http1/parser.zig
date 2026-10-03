@@ -350,7 +350,7 @@ test "smuggling defenses" {
 
 test "head size limit" {
     var hb: [16]Header = undefined;
-    const big = "GET / HTTP/1.1\r\nHost: a\r\nX: " ++ "a" ** 100;
+    const big = "GET / HTTP/1.1\r\nHost: a\r\nX: " ++ &@as([100]u8, @splat('a'));
     try testing.expectError(error.HeadTooLarge, parseRequest(big, &hb, .{ .max_head = 64 }));
 }
 

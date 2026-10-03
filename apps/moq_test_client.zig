@@ -415,7 +415,6 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             self.sess.cancelRequest(sid, moq_session.ResetCode.CANCELLED);
             self.cancelled = true;
         }
-
     };
 }
 

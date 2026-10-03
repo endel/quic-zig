@@ -141,7 +141,7 @@ fn encodeSetup(w: anytype, s: Setup) !void {
         try wire.writeVarInt(w, SetupParamType.PROBE);
         var vbuf: [8]u8 = undefined;
         var vfbs = io.fixedBufferStream(&vbuf);
-        try wire.writeVarInt(&vfbs, @intFromEnum(p));
+        try wire.writeVarInt(&vfbs, @backingInt(p));
         try wire.writeBytes(w, vbuf[0..vfbs.seek]);
     }
     if (s.path) |p| {
@@ -252,7 +252,7 @@ pub const AnnounceBroadcast = struct {
 };
 
 fn encodeAnnounceBroadcast(w: anytype, a: AnnounceBroadcast) !void {
-    try wire.writeVarInt(w, @intFromEnum(a.status));
+    try wire.writeVarInt(w, @backingInt(a.status));
     try wire.writeString(w, a.suffix);
     if (a.hops.len > MAX_HOPS) return Error.MalformedMessage;
     try wire.writeVarInt(w, a.hops.len);
@@ -381,7 +381,7 @@ pub const SubscribeResponse = union(ResponseType) {
 };
 
 pub fn writeSubscribeResponse(writer: anytype, r: SubscribeResponse) !void {
-    try wire.writeVarInt(writer, @intFromEnum(std.meta.activeTag(r)));
+    try wire.writeVarInt(writer, @backingInt(std.meta.activeTag(r)));
     var buf: [SCRATCH]u8 = undefined;
     var fbs = io.fixedBufferStream(&buf);
     switch (r) {
