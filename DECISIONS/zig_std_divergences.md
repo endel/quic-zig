@@ -13,7 +13,8 @@ what upstream has fixed. Second, it is the material for raising these points
 with the Zig project, which a person does, not an AI agent. See "Upstream
 contributions" in `CLAUDE.md`.
 
-- **Baseline:** Zig 0.16.0, the version this repo builds against.
+- **Baseline:** Zig 0.17.0, the version this repo builds against. Every
+  section was re-checked against it on 3 Oct 2026.
 - **Master:** each section says what Codeberg `ziglang/zig` master showed on
   24 Sep 2026, or the date it gives.
 - **Benchmark hardware:** arm64 figures are native runs on an Apple M-series
@@ -33,7 +34,7 @@ contributions" in `CLAUDE.md`.
 | 8 | Fixed-buffer reader/writer | `src/io_compat.zig` | kept our own stream | maybe: codegen observation |
 | 9 | `std.http.Server.WebSocket` | `src/http1/websocket.zig` | replacement: sans-IO codec | maybe: API scope |
 | 10 | GHASH on arm64 | `src/quic/aes_gcm.zig` (`ghashBlocks`) | GHASH in vector registers | yes: codegen |
-| 11 | Master compiles AES-GCM slower | `src/quic/aes_gcm.zig` (`xorBlock`) | explicit unaligned vector loads | yes: codegen regression |
+| 11 | 0.17 loads `[16]u8` as `u128` byte by byte | `src/quic/aes_gcm.zig` (`xorBlock`), `src/quic/ghash.zig` | `align(1)` pointer loads | yes: codegen regression |
 | 12 | ECDSA P-256 signing's k·G | `src/quic/ecdsa_p256.zig` | own signer: std's steps, fixed-base table | yes: perf |
 | 13 | Large allocations go straight to the kernel | `src/quic/stream.zig` (`SendLedger`) | send buffers kept for reuse | maybe: design question |
 
@@ -56,8 +57,9 @@ counted in 16-byte blocks. A QUIC packet is at most about 1500 bytes, 94
 blocks. A typical full packet is 1200–1452 bytes, 75–91 blocks. So most
 packets take the 4-way path.
 
-**Ours:** `src/quic/ghash.zig` is the 0.16.0 file with two lines changed:
-the `std` import, and `agg_8_threshold = 16`.
+**Ours:** `src/quic/ghash.zig` is std's file (0.17.0) with the `std`
+import, `agg_8_threshold = 16`, and block loads and stores through `align(1)`
+pointers instead of `mem.readInt`/`writeInt` (item 11).
 
 **Why:** GHASH is about two-thirds of AES-GCM's cost on a 1200-byte packet
 (CTR 167 ns, GHASH 366 ns on arm64). Folding 8 blocks per reduction from 16
@@ -76,8 +78,10 @@ the differential test (below) checks every aggregation width.
 multiply is slow (the file already uses Karatsuba on 32-bit x86 for that
 reason). Native x86 data across a few microarchitectures would settle it.
 
-**Master (24 Sep 2026):** still `agg_8_threshold = 84`. The only changes
-since 0.16 are syntax: `.ReleaseSmall` became `.small`, and `@splat`.
+**0.17.0 (3 Oct 2026):** still `agg_8_threshold = 84`. The only changes
+since 0.16 are `.ReleaseSmall` becoming `.small` and a new `finalResult`;
+our copy has both. The same source compiles slower on 0.17, though: see
+item 11.
 
 On arm64, packets no longer go through this file: see item 10. It still
 serves x86_64, and arm64 builds in ReleaseSmall.
@@ -141,10 +145,11 @@ use (`Aes128.initEnc`, `Ghash.init`); the AEAD wrappers are where that stops.
   build compiled it out of line (two callers), and h3-static lost 27% (see
   routez's `TODO/h3-per-request-latency.md`, 25 Sep 2026).
 
-**Master** (0.17.0-dev.2294, 24 Sep 2026): the same round form and the same
-tail loop as 0.16; the batch counter now wraps (`+%=`). An earlier version of
-this note described a master commit (`e339566922`) that batched the tail;
-master at dev.2294 does not do that.
+**0.17.0** (3 Oct 2026): the same round form as 0.16. `ctrSlice` no longer
+keeps a counter block between batches, and its counter wraps (`+%=`). It
+runs at half 0.16's speed on arm64 (item 11). An earlier version of this
+note described a master commit (`e339566922`) that batched the tail;
+0.17.0 does not do that.
 
 **Ours** (`aes_gcm.zig` `ctrFast`, when `crypto.core.aes.has_hardware_support`):
 - 8 blocks per step with the round keys copied to a local, so they stay in
@@ -194,16 +199,26 @@ signing:
 Everything else stays on `ff` (`src/quic/rsa.zig`), and every signature is
 checked against the public key before it is returned.
 
-**Numbers:** a 1024-bit modexp takes 1.55 ms through `ff` and 0.45 ms
-through `mont` (3.5×). Run `zig build bench-crypto` and compare the two
-modexp rows. A test checks `mont` against `ff` on random inputs.
+**Numbers:** a 1024-bit modexp took 1.55 ms through `ff` and 0.45 ms
+through `mont` (3.5×) on 0.16. On 0.17.0, `ff` got 2.7× faster and the gap
+shrank to 1.24× (median of 4, arm64, 3 Oct 2026):
+
+| 1024-bit modexp | 0.16.0 | 0.17.0 |
+|---|---|---|
+| `ff` | 1.72 ms | 0.64 ms |
+| `mont` | 0.50 ms | 0.51 ms |
+
+Run `zig build bench-crypto` and compare the two modexp rows. A test checks
+`mont` against `ff` on random inputs. Whether 24% on RSA signing still
+earns a second modexp is worth asking.
 
 **Upstream-shaped question:** could the multiply mitigation and the
 table-lookup mitigation be controlled separately? Could `ff` use full 64-bit
 limbs where the CPU multiplies in constant time? This is a design
 conversation more than a bug.
 
-**Master:** not re-checked for this page. Check before raising it.
+**0.17.0:** see the table above; `ff`'s design is unchanged. Check what
+made it faster before raising anything.
 
 ## 5. ECDSA signing makes you derive the public key
 
@@ -222,7 +237,7 @@ This depends on an **internal detail**: `KeyPair.signer` passing only
 we would produce bad signatures. The loopback handshake tests would catch
 that: the client always verifies CertificateVerify.
 
-**Master (24 Sep 2026):** unchanged. `signer` still calls
+**0.17.0 (3 Oct 2026):** unchanged. `signer` still calls
 `Signer.init(key_pair.secret_key, noise)`, and `Signer.init` is still
 private.
 
@@ -245,7 +260,7 @@ a panic in safe builds, and undefined behaviour in ReleaseFast.
 certificate with bounds-checked TLV reads. It runs on every certificate a
 peer sends, before `Certificate.parse`. `src/fuzz.zig` exercises the pair.
 
-**Master (24 Sep 2026):** `der.Element.parse` is unchanged from 0.16.
+**0.17.0 (3 Oct 2026):** `der.Element.parse` is unchanged from 0.16.
 
 **Upstream-shaped report:** bounds-check `der.Element.parse` and return a
 parse error. Raise it as a robustness issue with a minimal input. Don't put
@@ -347,26 +362,55 @@ registers around `pclmulqdq`, but that has not been measured.
 
 ---
 
-## 11. Zig master compiles AES-GCM slower on arm64
+## 11. Zig 0.17 loads a `[16]u8` as a `u128` byte by byte
 
-Measured 26 Sep 2026 with 0.17.0-dev.2294+71403f299 (LLVM 22.1.8) against
-0.16.0 (LLVM 21.1), same M1 Pro, 1200 B seal out of line:
+0.17.0 (LLVM 22.1.8) lowers `@bitCast` from `[16]u8` to `u128`, and so
+`mem.readInt(u128, ...)` and `mem.writeInt(u128, ...)`, to single-byte loads,
+shifts and ORs. `u64` is unaffected. `mem.readInt` itself did not change.
 
-| | 0.16.0 | master |
+```zig
+export fn load_be(p: *const [16]u8) u128 {
+    return std.mem.readInt(u128, p, .big);
+}
+```
+
+| ReleaseFast | 0.16.0 | 0.17.0 |
 |---|---|---|
-| std `Aes128Gcm` | 569 ns | 723 ns (+27%) |
-| `aes_gcm.Ctx` before `a34c55a` | 219 ns | 336 ns (+53%) |
-| `aes_gcm.Ctx` | 216 ns | 217 ns |
+| arm64, `readInt` | `ldp`, 2 `rev`: 7 instructions | 11 `ldrb`, `ldur`, shifts and `orr`s: 39 |
+| x86_64 (v3), `readInt` | 2 `movbe`: 6 | 51 |
+| x86_64 (v3), `writeInt` | 2 `movbe`: 6 | 62 |
 
-The cause in our code: `@as(V, @bitCast(src.*))` on a `*const [16]u8`
-compiled to sixteen `ldrb` and a chain of shifts and `orr`s instead of one
-`ldr q`, doubling CTR. An `align(1)` vector pointer is one load on both
-compilers (`xorBlock`). std's slowdown is probably the same pattern in
-`Block.fromBytes`/`xorBytes`; not confirmed. Master also names this CPU
-`apple_a14` where 0.16 says `apple_m1`, which made no difference here.
+A load through `*align(1) const u128`, or a `@Vector(16, u8)`, is still one
+or two instructions on both compilers.
 
-**Upstream-shaped report:** a codegen regression on aarch64: a bitcast of an
-unaligned `[16]u8` load to a 128-bit vector is lowered byte by byte.
+**What it costs std** (`Aes128Gcm`, arm64, median of 4, 3 Oct 2026):
+
+| `Aes128Gcm.encrypt` | 0.16.0 | 0.17.0 |
+|---|---|---|
+| 1200 B | 573–622 ns | 782–827 ns |
+| 16 KB, a TLS record | 4.3–4.8 µs | 8.6–8.8 µs |
+
+Both halves pay. GHASH reads every block with `readInt(u128)`: twice as long
+at 16 KB, and its hot loop went from 7 `ldrb` to 291. AES-GCM's CTR is
+`modes.ctr`, which writes a 128-bit big-endian counter per block with
+`writeInt(u128)`: twice as long at both sizes. The same CTR with GCM's
+32-bit counter (`ctrSlice(..., 12, 4)`) runs at 0.16's speed, and so does
+0.16's `ctrSlice` source compiled by 0.17.
+
+**What it cost us:** on 0.17.0-dev in September, `aes_gcm.zig`'s
+`@as(V, @bitCast(src.*))` on a `*const [16]u8` doubled CTR; since `a34c55a` it
+loads through an `align(1)` vector pointer (`xorBlock`). `ghash.zig`, which
+x86_64 packets use, read every block with `readInt(u128)`; since the 0.17
+port it loads through an `align(1)` `u128` pointer. `aes_gcm.Ctx` runs at the
+same speed on both compilers. TLS over TCP (`src/tls`) seals records with
+std's `Aes128Gcm`, so it pays std's cost: routez's HTTP/1.1-over-TLS 10 KB
+row lost 14% of its rate on 0.17 in a paired A/B.
+
+**Upstream-shaped report:** a codegen regression in 0.17.0 on aarch64 and
+x86_64: `@bitCast` between `[16]u8` and `u128` is lowered byte by byte,
+which makes `mem.readInt`/`writeInt(u128)` 6–10× longer. The function above
+is the whole reproduction. std's GHASH and `modes.ctr` are the visible
+casualties.
 
 ## 12. ECDSA P-256 signing multiplies the base point like any other point
 
@@ -395,8 +439,15 @@ TLS 1.3 handshakes: 1,428/s to 2,254/s. Tests check k·G against std's for
 300 scalars (1, 2, n − 1 and random) and signatures against std's, byte for
 byte, on 40 keys and messages, with and without noise.
 
-**Master (27 Sep 2026):** not re-checked. Check `pcurves/p256.zig` for a
-fixed-base comb before raising it.
+**0.17.0 (3 Oct 2026):** `basePoint.mul` is still `pcMul16`. std's field
+arithmetic got faster, and both signers with it (arm64, median of 4):
+
+| | 0.16.0 | 0.17.0 |
+|---|---|---|
+| std `Signer`, key prepared | 218 µs | 140 µs |
+| k·G off our table | 75 µs | 48 µs |
+
+Check `pcurves/p256.zig` for a fixed-base comb before raising it.
 
 **Upstream-shaped suggestion:** a precomputed fixed-base table for P-256's
 base point, used by `mul` when `is_base` is set, as `mulPublic` could too.
@@ -423,7 +474,7 @@ With three workers in one process, the cost is not only per thread: munmap
 takes the address space's lock for writing, and the other workers' page
 faults wait on it (`rwsem_down_write_slowpath` in a profile).
 
-**Master:** not re-checked.
+**0.17.0 (3 Oct 2026):** `SmpAllocator` unchanged.
 
 **Upstream-shaped question:** whether `SmpAllocator` should keep a few freed
 large blocks per thread, as glibc's malloc does below its trim threshold.
@@ -455,7 +506,8 @@ It is a memory-for-speed trade, so it is a design question, not a bug.
        <(sed '/^const htest/,$d' "$(zig env | sed -n 's/.*\.std_dir = "\(.*\)".*/\1/p')/crypto/ghash_polyval.zig")
   ```
 
-  It should show only the `std` import and `agg_8_threshold`.
+  It should show only the `std` import, `agg_8_threshold`, and the
+  `load`/`store` helpers that replace `mem.readInt`/`writeInt(u128)`.
 
 ## On a Zig upgrade
 
