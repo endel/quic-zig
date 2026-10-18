@@ -525,7 +525,7 @@ in CI). Details, API and caveats: [RFC6455_WEBSOCKET.md](RFC6455_WEBSOCKET.md).
 |---|---------|--------|-------|
 | — | JSON-SEQ (.sqlog) output format | ✅ Done | Per-connection files with ODCID naming |
 | — | transport:connection_started/closed | ✅ Done | |
-| — | transport:packet_sent/received | ✅ Done | With frame serialization (all 24+ types) |
+| — | transport:packet_sent/received | ✅ Done | With frame serialization (all 24+ types). packet_sent is one event per packet, coalesced ones included, logged as the packer seals it; sent PINGs and PADDING are not shown |
 | — | transport:packet_dropped | ✅ Done | |
 | — | recovery:metrics_updated | ✅ Done | RTT, cwnd, bytes_in_flight |
 | — | recovery:packet_lost | ✅ Done | |

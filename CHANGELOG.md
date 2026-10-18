@@ -144,6 +144,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- qlog traces now have a `packet_sent` event for every packet, under its own
+  type; coalesced packets and those sent while congestion-limited or closing
+  were missing.
 - A connection whose peer updated its keys a second time could stop dead,
   every later packet dropped. OpenSSL, which updates again as soon as it may,
   hit it from either side.

@@ -362,6 +362,41 @@ const Pair = struct {
     }
 };
 
+test "qlog: every packet the server sends is traced once, as its own type" {
+    // One event per datagram, numbered after the highest space with keys:
+    // coalesced packets went untraced, a Handshake packet sent once 1-RTT
+    // keys existed was logged as the last 1-RTT one, and a CONNECTION_CLOSE
+    // never appeared.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var p: Pair = undefined;
+    try p.initWith(.{ .qlog_dir = dir }, .{});
+    defer p.deinit();
+    for (0..10) |_| {
+        p.client.pending_frames.push(.ping);
+        _ = p.exchange();
+    }
+    const sconn = p.mgr.entries.items[0].conn;
+    sconn.close(0, "");
+    var buf: [MAX_DGRAM]u8 = undefined;
+    _ = try sconn.send(&buf);
+
+    // Written as it happens, so readable before the connection closes.
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{x}_server.sqlog", .{ dir, p.client.odcid_buf[0..p.client.odcid_len] });
+    const trace = try sys.readFileAlloc(testing.allocator, path, 1 << 20);
+    defer testing.allocator.free(trace);
+    const sent = "\"transport:packet_sent\",\"data\":{\"header\":{\"packet_type\":";
+    const handler = &sconn.pkt_handler;
+    var skipped: u64 = 0;
+    for (handler.skipped_pns) |pn| skipped += @intFromBool(pn != null);
+    try testing.expectEqual(handler.next_pn[0], std.mem.count(u8, trace, sent ++ "\"initial\""));
+    try testing.expectEqual(handler.next_pn[1], std.mem.count(u8, trace, sent ++ "\"handshake\""));
+    try testing.expectEqual(handler.next_pn[2] - skipped, std.mem.count(u8, trace, sent ++ "\"1RTT\""));
+}
+
 test "stateless reset: a client whose server lost the connection drains" {
     sys.test_clock = 1_000 * std.time.ns_per_s;
     defer sys.test_clock = null;

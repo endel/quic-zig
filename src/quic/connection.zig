@@ -3341,6 +3341,7 @@ pub const Connection = struct {
     pub fn sendAt(self: *Connection, out_buf: []u8, now: i64) !usize {
         // Draining/terminated: do not send anything
         if (self.state == .draining or self.state == .terminated) return 0;
+        self.packer.qlog_writer = if (self.qlog_writer) |*ql| ql else null;
 
         // Closing: retransmit saved close packet on each incoming packet (RFC 9000 §10.2.1)
         if (self.state == .closing) {
@@ -3436,11 +3437,6 @@ pub const Connection = struct {
                         self.mtu_discoverer.onProbeSent(result.pn, @intCast(probe_size), now);
                         self.paths[self.active_path_idx].bytes_sent += result.bytes_written;
                         self.total_packets_sent += 1;
-                        // This path returns before the packing below, which is
-                        // where every other packet is traced.
-                        if (self.qlog_writer) |*ql| {
-                            ql.packetSent(now, "1RTT", result.pn, result.bytes_written, "{\"frame_type\":\"ping\"}");
-                        }
                         return result.bytes_written;
                     }
                 }
@@ -3513,30 +3509,6 @@ pub const Connection = struct {
         }
 
         if (bytes_written > 0) {
-            // QLOG: packet_sent (log using the highest encryption level that was packed)
-            if (self.qlog_writer) |*ql| {
-                const pkt_type_str: []const u8 = if (app_seal != null and self.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.application)] > 0)
-                    "1RTT"
-                else if (handshake_seal != null and self.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.handshake)] > 0)
-                    "handshake"
-                else
-                    "initial";
-                // Use the last PN that was allocated
-                const enc_idx: usize = if (app_seal != null and self.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.application)] > 0)
-                    @backingInt(ack_handler.EncLevel.application)
-                else if (handshake_seal != null and self.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.handshake)] > 0)
-                    @backingInt(ack_handler.EncLevel.handshake)
-                else
-                    @backingInt(ack_handler.EncLevel.initial);
-                const pn = self.pkt_handler.next_pn[enc_idx] -| 1;
-                var frames_buf: [2048]u8 = undefined;
-                var frames_len: usize = 0;
-                if (self.pkt_handler.sent[enc_idx].sent_packets.get(pn)) |rec| {
-                    frames_len = qlog.QlogWriter.serializeSentFrames(rec, &frames_buf);
-                }
-                ql.packetSent(now, pkt_type_str, pn, bytes_written, frames_buf[0..frames_len]);
-            }
-
             self.pto_probe_pending -|= 1;
             self.paths[self.active_path_idx].bytes_sent += bytes_written;
             self.total_packets_sent += 1;

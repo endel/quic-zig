@@ -12,6 +12,7 @@ const crypto_stream = @import("crypto_stream.zig");
 const stream_mod = @import("stream.zig");
 const conn_mod = @import("connection.zig");
 const flow_control = @import("flow_control.zig");
+const qlog = @import("qlog.zig");
 
 /// Calculate the overhead of a STREAM frame header (type + stream_id + offset + length varints).
 /// This accounts for the LEN flag always being set.
@@ -81,6 +82,10 @@ pub const PacketPacker = struct {
 
     /// Connection-level flow controller (for send-side limit enforcement).
     conn_flow_ctrl: ?*flow_control.ConnectionFlowController = null,
+
+    /// Where each packet is traced as it is sealed, one event per packet.
+    /// Set by connection before packing.
+    qlog_writer: ?*qlog.QlogWriter = null,
 
     pub fn init(
         allocator: Allocator,
@@ -675,6 +680,7 @@ pub const PacketPacker = struct {
         }
         @memcpy(sent_pkt.control_frames[0..control_frame_count], control_frames[0..control_frame_count]);
         sent_pkt.control_frame_count = control_frame_count;
+        if (self.qlog_writer) |ql| ql.packetSentRecord(now, qlog.packetTypeStr(pkt_type), &sent_pkt);
         try pkt_handler.onPacketSent(sent_pkt);
 
         return total_packet_len;
@@ -742,6 +748,7 @@ pub const PacketPacker = struct {
         // Apply header protection (uses cached AES HP context when available)
         seal.applyHeaderProtection(buf[0..total_len], pn_offset, pn_len);
 
+        if (self.qlog_writer) |ql| ql.packetSent(now, "1RTT", pn, total_len, "{\"frame_type\":\"ping\"}");
         // Record as sent (in_flight but special — caller handles probe loss separately)
         try pkt_handler.onPacketSent(.{
             .pn = pn,

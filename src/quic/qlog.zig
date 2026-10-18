@@ -189,14 +189,19 @@ pub const QlogWriter = struct {
         self.emit(len);
     }
 
+    /// `packetSent` for a packet just sealed, with the frames its record
+    /// holds. Out of line, so the buffer stays off the packer's stack.
+    pub noinline fn packetSentRecord(self: *Self, now: i64, pkt_type: []const u8, pkt: *const ack_handler.SentPacket) void {
+        var frames: [2048]u8 = undefined;
+        const n = serializeSentFrames(pkt, &frames);
+        self.packetSent(now, pkt_type, pkt.pn, @intCast(pkt.size), frames[0..n]);
+    }
+
     // ── Frame serialization helpers ──────────────────────────────────────
 
     /// The frames a sent packet carried, as the contents of a qlog `frames`
-    /// array. Read back from the record the loss detector keeps, which holds
-    /// everything that would have to be resent: stream data, crypto, datagrams
-    /// and control frames. ACKs are not resent and so are not recorded, so a
-    /// sent packet's ACK does not appear here.
-    /// The frames a sent packet carried, as recorded for retransmission. Names
+    /// array, from the record the packer built for it: what would have to be
+    /// resent, plus its ACK. PINGs and PADDING leave no trace there. Names
     /// match `serializeFrame` so both events read alike.
     pub fn serializeSentFrames(pkt: *const ack_handler.SentPacket, out: []u8) usize {
         var w: Writer = .{ .out = out };
