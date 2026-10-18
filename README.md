@@ -164,7 +164,9 @@ own on a server's loop (`server.eventLoop()`) should stop re-arming once
 `send_buffer_size`, `max_connections` and `alpn` are on `Config` too, and
 `max_handshakes`: past that many connections still in their handshake (a
 quarter of `max_connections` by default), a new client must answer a Retry
-before it gets any state.
+before it gets any state. `max_handshakes_per_source` (a quarter of
+`max_handshakes`) bounds what one IPv4 address or IPv6 /64 holds even after
+it answers.
 
 ### HTTP/1.1 listener: static files and WebSockets
 

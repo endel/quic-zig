@@ -743,22 +743,27 @@ pub const TOKEN_MAX_LEN = TOKEN_NONCE_LEN + TOKEN_MAX_PLAINTEXT_LEN + TOKEN_TAG_
 
 const ADDR_BINDING_LEN = 2 + 16;
 
-/// The client address a token is bound to: port, then the IP as 16 bytes,
-/// IPv4 in its v4-mapped form so either socket family binds it the same way.
-fn addrBinding(addr: *const posix.sockaddr.storage) [ADDR_BINDING_LEN]u8 {
-    var out: [ADDR_BINDING_LEN]u8 = @splat(0);
+pub const v4_mapped_prefix = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff };
+
+/// The client's IP as 16 bytes, IPv4 in its v4-mapped form so either socket
+/// family gives the same bytes.
+pub fn mappedIp(addr: *const posix.sockaddr.storage) [16]u8 {
     const raw = std.mem.asBytes(addr);
     if (addr.family == posix.AF.INET6) {
-        const in6 = std.mem.bytesToValue(posix.sockaddr.in6, raw[0..@sizeOf(posix.sockaddr.in6)]);
-        out[0..2].* = @bitCast(in6.port);
-        out[2..18].* = in6.addr;
-    } else {
-        const in4 = std.mem.bytesToValue(posix.sockaddr.in, raw[0..@sizeOf(posix.sockaddr.in)]);
-        out[0..2].* = @bitCast(in4.port);
-        out[12..14].* = .{ 0xff, 0xff };
-        out[14..18].* = @bitCast(in4.addr);
+        return std.mem.bytesToValue(posix.sockaddr.in6, raw[0..@sizeOf(posix.sockaddr.in6)]).addr;
     }
-    return out;
+    const in4 = std.mem.bytesToValue(posix.sockaddr.in, raw[0..@sizeOf(posix.sockaddr.in)]);
+    return v4_mapped_prefix ++ @as([4]u8, @bitCast(in4.addr));
+}
+
+/// The client address a token is bound to: port, then `mappedIp`.
+fn addrBinding(addr: *const posix.sockaddr.storage) [ADDR_BINDING_LEN]u8 {
+    const raw = std.mem.asBytes(addr);
+    const port = if (addr.family == posix.AF.INET6)
+        std.mem.bytesToValue(posix.sockaddr.in6, raw[0..@sizeOf(posix.sockaddr.in6)]).port
+    else
+        std.mem.bytesToValue(posix.sockaddr.in, raw[0..@sizeOf(posix.sockaddr.in)]).port;
+    return @as([2]u8, @bitCast(port)) ++ mappedIp(addr);
 }
 
 pub fn generateRetryToken(
@@ -834,8 +839,13 @@ fn tokenFresh(timestamp: i64) bool {
     return timestamp <= now and timestamp >= now - TOKEN_MAX_AGE_NS;
 }
 
+/// The token's contents, if it is a fresh Retry token of ours for
+/// `client_addr` on an Initial to `dcid`. The client sends to the SCID its
+/// Retry gave (RFC 9000 7.2), so under any other DCID the token is a replay,
+/// good only for opening connections nobody was asked to prove.
 pub fn validateRetryToken(
     token_data: []const u8,
+    dcid: []const u8,
     client_addr: posix.sockaddr.storage,
     token_key: [crypto.key_len]u8,
 ) !?ValidatedToken {
@@ -873,6 +883,7 @@ pub fn validateRetryToken(
     result.retry_scid_len = pt_reader.takeByte() catch return null;
     if (result.retry_scid_len > 20) return null;
     _ = pt_reader.readSliceShort(result.retry_scid_buf[0..result.retry_scid_len]) catch return null;
+    if (!std.mem.eql(u8, result.getRetryScid(), dcid)) return null;
 
     // Read timestamp and check age
     const timestamp = pt_reader.takeInt(i64, ENDIAN) catch return null;
@@ -1148,7 +1159,7 @@ test "Retry token: generate and validate roundtrip" {
     const token_len = try generateRetryToken(&out, odcid, retry_scid, addr, token_key);
     try std.testing.expect(token_len > TOKEN_NONCE_LEN + TOKEN_TAG_LEN);
 
-    const validated = try validateRetryToken(out[0..token_len], addr, token_key);
+    const validated = try validateRetryToken(out[0..token_len], retry_scid, addr, token_key);
     try std.testing.expect(validated != null);
     const v = validated.?;
     try std.testing.expectEqualSlices(u8, odcid, v.getOdcid());
@@ -1173,8 +1184,20 @@ test "Retry token: wrong address rejected" {
     // Different address
     var addr2 = addr1;
     addr2.padding[2] = 10;
-    const validated = try validateRetryToken(out[0..token_len], addr2, token_key);
+    const validated = try validateRetryToken(out[0..token_len], retry_scid, addr2, token_key);
     try std.testing.expect(validated == null);
+}
+
+test "Retry token: good only on an Initial to the SCID its Retry gave" {
+    const token_key: [crypto.key_len]u8 = @splat(5);
+    const retry_scid = &[_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [TOKEN_MAX_LEN]u8 = undefined;
+    const token_len = try generateRetryToken(&out, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, retry_scid, addr, token_key);
+
+    try std.testing.expect(try validateRetryToken(out[0..token_len], retry_scid, addr, token_key) != null);
+    try std.testing.expect(try validateRetryToken(out[0..token_len], &.{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x19 }, addr, token_key) == null);
+    try std.testing.expect(try validateRetryToken(out[0..token_len], retry_scid[0..7], addr, token_key) == null);
 }
 
 // Retry token: wrong key should fail
@@ -1193,7 +1216,7 @@ test "Retry token: wrong key rejected" {
     // Different key
     var wrong_key: [crypto.key_len]u8 = undefined;
     sys.randomBytes(&wrong_key);
-    const validated = try validateRetryToken(out[0..token_len], addr, wrong_key);
+    const validated = try validateRetryToken(out[0..token_len], retry_scid, addr, wrong_key);
     try std.testing.expect(validated == null);
 }
 
@@ -1205,7 +1228,7 @@ test "Retry token: oversized token rejected" {
 
     var token: [200]u8 = undefined;
     sys.randomBytes(&token);
-    try std.testing.expect(try validateRetryToken(&token, addr, token_key) == null);
+    try std.testing.expect(try validateRetryToken(&token, &.{}, addr, token_key) == null);
 }
 
 fn testIn6(ip: [16]u8, port: u16) posix.sockaddr.storage {
@@ -1229,8 +1252,8 @@ test "tokens bind the whole client address, IPv4 on a dual-stack socket included
     for (pairs) |pair| {
         var out: [TOKEN_MAX_LEN]u8 = undefined;
         const retry_len = try generateRetryToken(&out, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 9, 9, 9, 9 }, pair[0], key);
-        try std.testing.expect(try validateRetryToken(out[0..retry_len], pair[0], key) != null);
-        try std.testing.expect(try validateRetryToken(out[0..retry_len], pair[1], key) == null);
+        try std.testing.expect(try validateRetryToken(out[0..retry_len], &.{ 9, 9, 9, 9 }, pair[0], key) != null);
+        try std.testing.expect(try validateRetryToken(out[0..retry_len], &.{ 9, 9, 9, 9 }, pair[1], key) == null);
 
         const new_len = try generateNewToken(&out, pair[0], key);
         try std.testing.expect(validateNewToken(out[0..new_len], pair[0], key));
@@ -1251,11 +1274,11 @@ test "a token sealed under our key but not as a Retry token is rejected, whateve
     var token: [TOKEN_NONCE_LEN + plaintext.len + TOKEN_TAG_LEN]u8 = undefined;
     token[0..TOKEN_NONCE_LEN].* = @splat(7);
     crypto.Aead.encrypt(token[TOKEN_NONCE_LEN..][0..plaintext.len], token[TOKEN_NONCE_LEN + plaintext.len ..][0..TOKEN_TAG_LEN], &plaintext, "", token[0..TOKEN_NONCE_LEN].*, key);
-    try std.testing.expect(try validateRetryToken(&token, addr, key) == null);
+    try std.testing.expect(try validateRetryToken(&token, &.{}, addr, key) == null);
 
     var new_token: [TOKEN_MAX_LEN]u8 = undefined;
     const n = try generateNewToken(&new_token, addr, key);
-    try std.testing.expect(try validateRetryToken(new_token[0..n], addr, key) == null);
+    try std.testing.expect(try validateRetryToken(new_token[0..n], &.{}, addr, key) == null);
 }
 
 test "a Version Negotiation packet's remainder is its version list" {

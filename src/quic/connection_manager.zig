@@ -43,6 +43,31 @@ fn randomSeed() u64 {
     return std.mem.readInt(u64, &b, .little);
 }
 
+/// What `max_handshakes_per_source` counts by: an IPv4 address, or an IPv6
+/// /64, the least a host is given, so moving between its own addresses
+/// earns it nothing.
+pub const SourceKey = [16]u8;
+
+/// IPv4 stays whole, whichever socket family it arrived on; under a /64
+/// every IPv4 client of a dual-stack socket would be one source.
+fn sourceKey(addr: *const posix.sockaddr.storage) SourceKey {
+    var key = packet.mappedIp(addr);
+    if (!std.mem.eql(u8, key[0..12], &packet.v4_mapped_prefix)) @memset(key[8..], 0);
+    return key;
+}
+
+pub const SourceKeyContext = struct {
+    seed: u64 = 0,
+
+    pub fn hash(self: SourceKeyContext, key: SourceKey) u64 {
+        return std.hash.Wyhash.hash(self.seed, &key);
+    }
+
+    pub fn eql(_: SourceKeyContext, a: SourceKey, b: SourceKey) bool {
+        return std.mem.eql(u8, &a, &b);
+    }
+};
+
 /// Hash/equality context for CidKey in HashMap.
 pub const CidKeyContext = struct {
     /// Random per manager: clients choose the DCIDs hashed, and under a
@@ -72,6 +97,9 @@ pub const ConnEntry = struct {
     /// Counted in `ConnectionManager.handshakes` until its handshake is done
     /// or it is removed.
     handshaking: bool = false,
+    /// While `handshaking`, the source charged for it under
+    /// `max_handshakes_per_source`; null when it proved no address.
+    source: ?SourceKey = null,
     /// Unique per manager, never reused.
     id: u64 = 0,
     h3_conn: ?*h3.H3Connection = null,
@@ -286,6 +314,16 @@ pub const ConnectionManager = struct {
     /// Half-open connections, as far as `route` has seen; see `openHandshakes`.
     handshakes: usize = 0,
 
+    /// Handshakes one source may hold open on an address it has proven,
+    /// with a Retry or NEW_TOKEN token. Retry stops spoofed floods, but a
+    /// host that answers every Retry would otherwise fill `max_connections`
+    /// alone; past this, its new Initials are dropped until one of its
+    /// handshakes ends. A source is an IPv4 address or an IPv6 /64.
+    max_handshakes_per_source: usize = DEFAULT_MAX_CONNECTIONS / 16,
+    /// Handshakes per source counted under `max_handshakes_per_source`.
+    /// Seeded like `cid_map`: IPv6 sources choose their keys too.
+    source_handshakes: std.HashMap(SourceKey, u32, SourceKeyContext, 80),
+
     /// When true, every new connection is answered with CONNECTION_REFUSED,
     /// as it is at `max_connections`. Set while a server drains.
     refuse_new: bool = false,
@@ -333,6 +371,7 @@ pub const ConnectionManager = struct {
             .allocator = allocator,
             .cid_map = std.HashMap(CidKey, *ConnEntry, CidKeyContext, 80).initContext(allocator, .{ .seed = randomSeed() }),
             .entries = .empty,
+            .source_handshakes = std.HashMap(SourceKey, u32, SourceKeyContext, 80).initContext(allocator, .{ .seed = randomSeed() }),
             .reset_lookup_key = lookup_key,
             .tls_config = tls_config,
             .conn_config = cc,
@@ -358,6 +397,7 @@ pub const ConnectionManager = struct {
         self.dead_entries.deinit(self.allocator);
         self.cid_map.deinit();
         self.reset_token_map.deinit(self.allocator);
+        self.source_handshakes.deinit();
     }
 
     fn resetKey(self: *const ConnectionManager, token: *const [16]u8) ResetKey {
@@ -390,10 +430,12 @@ pub const ConnectionManager = struct {
     /// them. O(1) per removal, amortised.
     fn noteRemovals(self: *ConnectionManager, n: usize) void {
         self.removed_since_rehash += n;
-        if (self.removed_since_rehash <= (self.cid_map.capacity() + self.reset_token_map.capacity()) / 4) return;
+        const capacity = self.cid_map.capacity() + self.reset_token_map.capacity() + self.source_handshakes.capacity();
+        if (self.removed_since_rehash <= capacity / 4) return;
         self.removed_since_rehash = 0;
         if (self.cid_map.capacity() > 0) self.cid_map.rehash();
         if (self.reset_token_map.capacity() > 0) self.reset_token_map.rehash(std.hash_map.AutoContext(ResetKey){});
+        if (self.source_handshakes.capacity() > 0) self.source_handshakes.rehash();
     }
 
     /// Mirror the peer CID pool's reset tokens into `reset_token_map`.
@@ -419,6 +461,10 @@ pub const ConnectionManager = struct {
 
     /// Accept a new incoming connection from an Initial packet.
     /// Heap-allocates the Connection for pointer stability (needed by H3Connection).
+    ///
+    /// An `odcid` means the address is proven, by a Retry or NEW_TOKEN token,
+    /// and charges the connection to its source: `error.SourceBusy` once that
+    /// source holds `max_handshakes_per_source`.
     pub fn acceptConnection(
         self: *ConnectionManager,
         header: packet.Header,
@@ -429,6 +475,12 @@ pub const ConnectionManager = struct {
     ) !*ConnEntry {
         if (self.entries.items.len >= self.max_connections) {
             return error.TooManyConnections;
+        }
+        // No Retry is left to ask of a proven address: this is its bound.
+        const source: ?SourceKey = if (odcid != null) sourceKey(&remote) else null;
+        if (source) |s| {
+            if ((self.source_handshakes.get(s) orelse 0) >= self.max_handshakes_per_source) return error.SourceBusy;
+            try self.source_handshakes.ensureUnusedCapacity(1);
         }
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         try self.dead_entries.ensureTotalCapacity(
@@ -474,6 +526,11 @@ pub const ConnectionManager = struct {
         self.entries.appendAssumeCapacity(entry);
         entry.handshaking = true;
         self.handshakes += 1;
+        if (source) |s| {
+            const n = self.source_handshakes.getOrPutAssumeCapacity(s);
+            n.value_ptr.* = if (n.found_existing) n.value_ptr.* + 1 else 1;
+            entry.source = s;
+        }
 
         return entry;
     }
@@ -553,10 +610,7 @@ pub const ConnectionManager = struct {
         entry.h3_conn = null;
         entry.h0_conn = null;
 
-        if (entry.handshaking) {
-            entry.handshaking = false;
-            self.handshakes -= 1;
-        }
+        self.endHandshake(entry);
 
         // Swap-remove from entries list
         var idx: usize = 0;
@@ -725,7 +779,7 @@ pub const ConnectionManager = struct {
                     (if (self.retry_threshold) |n| self.entries.items.len >= n else false) or
                     self.openHandshakes() >= self.max_handshakes;
                 if (token.len > 0) {
-                    retry_token = packet.validateRetryToken(token, from, self.retry_token_key) catch null;
+                    retry_token = packet.validateRetryToken(token, header.dcid, from, self.retry_token_key) catch null;
                     if (retry_token) |*vt| {
                         entry = self.acceptConnection(header, local, from, vt.getOdcid(), vt.getRetryScid()) catch
                             return .{ .dropped = {} };
@@ -802,9 +856,21 @@ pub const ConnectionManager = struct {
     /// 5.2.2), sealed with the Initial keys its own DCID derives, so the
     /// client fails fast instead of retransmitting into silence.
     fn noteHandshakeDone(self: *ConnectionManager, e: *ConnEntry) void {
-        if (e.handshaking and e.conn.state == .connected) {
-            e.handshaking = false;
-            self.handshakes -= 1;
+        if (e.handshaking and e.conn.state == .connected) self.endHandshake(e);
+    }
+
+    /// Takes `e` out of `handshakes`, and out of its source's count.
+    fn endHandshake(self: *ConnectionManager, e: *ConnEntry) void {
+        if (!e.handshaking) return;
+        e.handshaking = false;
+        self.handshakes -= 1;
+        const source = e.source orelse return;
+        e.source = null;
+        const n = self.source_handshakes.getPtr(source) orelse return;
+        n.* -= 1;
+        if (n.* == 0) {
+            _ = self.source_handshakes.remove(source);
+            self.noteRemovals(1);
         }
     }
 
@@ -1466,4 +1532,121 @@ test "past retry_threshold a new client gets Retry, and is served once it echoes
     try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .processed);
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
     try std.testing.expect(mgr.entries.items[0].conn.paths[0].is_validated);
+}
+
+fn testIn4(ip: [4]u8, port: u16) posix.sockaddr.storage {
+    var in4: posix.sockaddr.in = std.mem.zeroes(posix.sockaddr.in);
+    in4.family = posix.AF.INET;
+    in4.port = std.mem.nativeToBig(u16, port);
+    in4.addr = @bitCast(ip);
+    return connection.sockaddrToStorage(@ptrCast(&in4));
+}
+
+fn testIn6(ip: [16]u8, port: u16) posix.sockaddr.storage {
+    var in6: posix.sockaddr.in6 = std.mem.zeroes(posix.sockaddr.in6);
+    in6.family = posix.AF.INET6;
+    in6.port = std.mem.nativeToBig(u16, port);
+    in6.addr = ip;
+    return connection.sockaddrToStorage(@ptrCast(&in6));
+}
+
+fn destroyClient(alloc: Allocator, conn: *connection.Connection) void {
+    conn.deinit();
+    alloc.destroy(conn);
+}
+
+/// A client that answered the Retry `mgr` sent it at `from`; its Initial
+/// echoing the token is in `out`.
+fn retriedClient(alloc: Allocator, mgr: *ConnectionManager, from: posix.sockaddr.storage, out: []u8) !struct { conn: *connection.Connection, len: usize } {
+    const client = try clientInitial(alloc, out);
+    errdefer destroyClient(alloc, client.conn);
+    var reply: [1500]u8 = undefined;
+    const retry = switch (mgr.recvDatagram(out[0..client.len], from, from, 0, &reply)) {
+        .send_response => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    client.conn.handleDatagram(@constCast(retry), .{ .to = from, .from = from, .datagram_size = retry.len });
+    if (!client.conn.retry_received) return error.TestUnexpectedResult;
+    return .{ .conn = client.conn, .len = try client.conn.send(out) };
+}
+
+test "a Retry token admits only the connection its Retry was for" {
+    // Its DCID went unchecked, so one Retry let a client open connection
+    // after connection under fresh DCIDs.
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.require_retry = true;
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+    var buf: [1500]u8 = undefined;
+
+    const client = try retriedClient(alloc, &mgr, addr, &buf);
+    defer destroyClient(alloc, client.conn);
+    try std.testing.expect(mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out) == .processed);
+
+    const replay = try alloc.create(connection.Connection);
+    defer alloc.destroy(replay);
+    try connection.connectInto(replay, alloc, "example.com", .{}, null, client.conn.retry_token_buf[0..client.conn.retry_token_len]);
+    defer replay.deinit();
+    const n = try replay.send(&buf);
+    try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .dropped);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+}
+
+test "one source holds at most max_handshakes_per_source handshakes on a proven address" {
+    // Retry proves an address, not good faith: a host answering every Retry
+    // filled max_connections with handshakes it never finished, and every
+    // other client was refused.
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.require_retry = true;
+    mgr.max_handshakes_per_source = 2;
+    var out: [1500]u8 = undefined;
+    var buf: [1500]u8 = undefined;
+
+    var clients: [4]*connection.Connection = undefined;
+    var made: usize = 0;
+    defer for (clients[0..made]) |c| destroyClient(alloc, c);
+
+    // A port of its own each earns it nothing.
+    for (0..2) |i| {
+        const from = testIn4(.{ 198, 51, 100, 7 }, @intCast(1000 + i));
+        const c = try retriedClient(alloc, &mgr, from, &buf);
+        clients[made] = c.conn;
+        made += 1;
+        try std.testing.expect(mgr.recvDatagram(buf[0..c.len], from, from, 0, &out) == .processed);
+    }
+    const from = testIn4(.{ 198, 51, 100, 7 }, 1002);
+    var held: [1500]u8 = undefined;
+    const third = try retriedClient(alloc, &mgr, from, &held);
+    clients[made] = third.conn;
+    made += 1;
+    try std.testing.expect(mgr.recvDatagram(held[0..third.len], from, from, 0, &out) == .dropped);
+    try std.testing.expectEqual(@as(usize, 2), mgr.connectionCount());
+
+    const other = testIn4(.{ 203, 0, 113, 9 }, 1000);
+    const c = try retriedClient(alloc, &mgr, other, &buf);
+    clients[made] = c.conn;
+    made += 1;
+    try std.testing.expect(mgr.recvDatagram(buf[0..c.len], other, other, 0, &out) == .processed);
+
+    // A handshake that ends, here by removal, gives its source the place
+    // back, and the client turned away gets in on its retransmission.
+    mgr.removeConnection(mgr.entries.items[0]);
+    try std.testing.expect(mgr.recvDatagram(held[0..third.len], from, from, 0, &out) == .processed);
+    try std.testing.expectEqual(@as(usize, 3), mgr.connectionCount());
+}
+
+test "a source is an IPv4 address or an IPv6 /64, IPv4 on a dual-stack socket included" {
+    const net = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1 };
+    const elsewhere = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 2 };
+    const host: [8]u8 = @splat(0x11);
+    try std.testing.expectEqual(sourceKey(&testIn6(net ++ host, 1)), sourceKey(&testIn6(net ++ @as([8]u8, @splat(0x22)), 2)));
+    try std.testing.expect(!std.mem.eql(u8, &sourceKey(&testIn6(net ++ host, 1)), &sourceKey(&testIn6(elsewhere ++ host, 1))));
+
+    const v4 = [_]u8{ 198, 51, 100, 7 };
+    try std.testing.expectEqual(sourceKey(&testIn4(v4, 1)), sourceKey(&testIn6(packet.v4_mapped_prefix ++ v4, 2)));
+    try std.testing.expect(!std.mem.eql(u8, &sourceKey(&testIn6(packet.v4_mapped_prefix ++ v4, 1)), &sourceKey(&testIn6(packet.v4_mapped_prefix ++ [_]u8{ 198, 51, 100, 8 }, 1))));
 }

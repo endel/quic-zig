@@ -46,9 +46,9 @@
 | **8** | **Address Validation** | | |
 | 8.1 | Address Validation during Connection Establishment | ✅ Done | Anti-amplification 3:1 limit |
 | 8.1.1 | Token Construction | ✅ Done | AES-128-GCM encrypted tokens |
-| 8.1.2 | Address Validation Using Retry Packets | ✅ Done | Retry send + client handling; always, past `retry_threshold` live connections, past `max_handshakes` half-open ones (a quarter of `max_connections` by default), or via `setRequireRetry`. A new client's first Initial must decrypt before it gets any state |
+| 8.1.2 | Address Validation Using Retry Packets | ✅ Done | Retry send + client handling; always, past `retry_threshold` live connections, past `max_handshakes` half-open ones (a quarter of `max_connections` by default), or via `setRequireRetry`. A new client's first Initial must decrypt before it gets any state. One source (IPv4 address, IPv6 /64) holds at most `max_handshakes_per_source` handshakes on a proven address |
 | 8.1.3 | Address Validation for Future Connections | ✅ Done | NEW_TOKEN issuance + client reuse |
-| 8.1.4 | Address Validation Token Integrity | ✅ Done | AES-128-GCM + timestamp validation |
+| 8.1.4 | Address Validation Token Integrity | ✅ Done | AES-128-GCM + timestamp validation; a Retry token is valid only on an Initial to the SCID its Retry gave |
 | 8.2 | Path Validation | ✅ Done | PATH_CHALLENGE/RESPONSE state machine |
 | 8.2.1 | Initiating Path Validation | ✅ Done | 3 retries with PTO backoff |
 | 8.2.2 | Path Validation Responses | ✅ Done | Echoes 8-byte data |

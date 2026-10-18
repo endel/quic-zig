@@ -268,6 +268,12 @@ need a design decision. Thanks @notramo for suggesting it
   bound.
 - C API: the event queue had no bound, an event larger than the host's buffer
   stalled every client, and NULL handles were dereferenced.
+- One host that answers Retry could fill a server's connection table with
+  handshakes it never finished, and one Retry token opened any number of
+  connections. A source (an IPv4 address or IPv6 /64) now holds at most
+  `Config.max_handshakes_per_source` handshakes once its address is proven,
+  and a Retry token admits only the connection it was issued for. Thanks
+  @wallace0409 ([#45](https://github.com/endel/quic-zig/issues/45)).
 
 ## 0.5.0
 

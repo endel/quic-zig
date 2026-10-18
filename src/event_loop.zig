@@ -174,6 +174,13 @@ pub const Config = struct {
     /// `max_connections`.
     max_handshakes: ?usize = null,
 
+    /// Handshakes one source (an IPv4 address or an IPv6 /64) may hold open
+    /// once it has proven its address, so a host that answers every Retry
+    /// still cannot fill `max_connections` alone. Past it, that source's
+    /// new Initials are dropped until one of its handshakes ends. Null is a
+    /// quarter of `max_handshakes`.
+    max_handshakes_per_source: ?usize = null,
+
     /// Server-wide cap, per second, on each kind of reply sent without
     /// connection state: Version Negotiation, stateless reset and
     /// CONNECTION_REFUSED, budgeted separately. Each is triggerable with a
@@ -910,6 +917,7 @@ pub fn Server(comptime Handler: type) type {
             conn_mgr.retry_threshold = config.retry_threshold;
             conn_mgr.max_connections = config.max_connections;
             conn_mgr.max_handshakes = config.max_handshakes orelse @max(config.max_connections / 4, 1);
+            conn_mgr.max_handshakes_per_source = config.max_handshakes_per_source orelse @max(conn_mgr.max_handshakes / 4, 1);
             conn_mgr.reply_limits = .init(config.stateless_reply_rate);
             conn_mgr.steer_foreign = config.foreign_datagram != null;
             conn_mgr.reset_unknown = !(config.reuse_port and config.static_reset_key != null and config.foreign_datagram == null);
@@ -5239,33 +5247,33 @@ test "e2e: a client trusts only the system's roots by default, so a self-signed 
     try runUntil(&loop, &All{ .s = &server, .a = &refused, .b = &pinned }, All.stopped, 5000);
 }
 
-test "e2e: a finished handshake gives its place under max_handshakes back" {
+/// Serves two clients from 127.0.0.1 in turn under `config`, the first still
+/// connected while the second handshakes, so only the first's finished
+/// handshake, not its removal, can make room. Returns whether the second
+/// answered a Retry.
+fn serveSecondBesideFirst(config: Config) !bool {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
     var server_handler = HelloServer{};
-    var server = try Server(HelloServer).init(testing.allocator, &server_handler, .{
-        .port = 29466,
-        .tls_config = makeTestTlsConfig(),
-        .max_handshakes = 1,
-        .loop = &loop,
-    });
+    var server_config = config;
+    server_config.tls_config = makeTestTlsConfig();
+    server_config.loop = &loop;
+    var server = try Server(HelloServer).init(testing.allocator, &server_handler, server_config);
     defer server.deinit();
     server.start();
 
-    // The first stays connected: only its finished handshake, not its
-    // removal, can make room for the second.
     var first_handler = CheckingClient{};
-    var first = try Client(CheckingClient).init(testing.allocator, &first_handler, .{ .port = 29466, .skip_cert_verify = true, .loop = &loop });
+    var first = try Client(CheckingClient).init(testing.allocator, &first_handler, .{ .port = config.port, .skip_cert_verify = true, .loop = &loop });
     defer first.deinit();
     first.start();
     try runUntil(&loop, &first_handler, CheckingClient.done, 10_000);
 
     var second_handler = CheckingClient{};
-    var second = try Client(CheckingClient).init(testing.allocator, &second_handler, .{ .port = 29466, .skip_cert_verify = true, .loop = &loop });
+    var second = try Client(CheckingClient).init(testing.allocator, &second_handler, .{ .port = config.port, .skip_cert_verify = true, .loop = &loop });
     defer second.deinit();
     second.start();
     try runUntil(&loop, &second_handler, CheckingClient.done, 10_000);
-    try testing.expect(!second.conn.retry_received);
+    const retried = second.conn.retry_received;
 
     first.stop();
     second.stop();
@@ -5279,6 +5287,15 @@ test "e2e: a finished handshake gives its place under max_handshakes back" {
         }
     };
     try runUntil(&loop, &All{ .s = &server, .a = &first, .b = &second }, All.stopped, 5000);
+    return retried;
+}
+
+test "e2e: a finished handshake gives its place under max_handshakes back" {
+    try testing.expect(!try serveSecondBesideFirst(.{ .port = 29466, .max_handshakes = 1 }));
+}
+
+test "e2e: a finished handshake gives its source its place under max_handshakes_per_source back" {
+    try testing.expect(try serveSecondBesideFirst(.{ .port = 29468, .require_retry = true, .max_handshakes_per_source = 1 }));
 }
 
 test "e2e: a server past retry_threshold makes a client retry, then serves it" {
