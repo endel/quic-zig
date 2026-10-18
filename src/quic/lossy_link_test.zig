@@ -8,6 +8,8 @@ const testing = std.testing;
 const sys = @import("../sys.zig");
 const connection = @import("connection.zig");
 const connection_manager = @import("connection_manager.zig");
+const ack_handler = @import("ack_handler.zig");
+const congestion = @import("congestion.zig");
 const tls13 = @import("tls13.zig");
 const mtu = @import("mtu.zig");
 
@@ -360,7 +362,159 @@ const Pair = struct {
         };
         return any;
     }
+
+    /// The client sends one datagram and the server answers into the void,
+    /// so the client acknowledges nothing it sent. The server's datagram
+    /// count, or null if the client had nothing to send.
+    fn sendUnheard(self: *Pair) !?usize {
+        var buf: [MAX_DGRAM]u8 = undefined;
+        var resp: [MAX_DGRAM]u8 = undefined;
+        const n = try self.client.send(&buf);
+        if (n == 0) return null;
+        _ = self.mgr.recvDatagram(buf[0..n], self.c_addr, self.s_addr, 0, &resp);
+        var replies: usize = 0;
+        for (self.mgr.entries.items) |e| while (true) {
+            const m = e.conn.send(&buf) catch break;
+            if (m == 0) break;
+            replies += 1;
+        };
+        return replies;
+    }
 };
+
+test "ACK-only packets: a peer that never acknowledges them costs the server nothing" {
+    // Every packet sent was recorded for loss detection, which only reaches
+    // the largest packet acknowledged: a peer sending PINGs and never
+    // acknowledging the ACKs they earned grew the server's records until it
+    // ran out of memory.
+    var p: Pair = undefined;
+    try p.init();
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    const tracker = &sconn.pkt_handler.sent[@backingInt(ack_handler.EncLevel.application)];
+    const held = tracker.sent_packets.count();
+
+    var replies: usize = 0;
+    for (0..1000) |_| {
+        p.client.pending_frames.push(.ping);
+        // Its own PINGs go unacknowledged too, so its window fills.
+        replies += try p.sendUnheard() orelse break;
+    }
+    try testing.expect(replies >= 100);
+    try testing.expectEqual(held, tracker.sent_packets.count());
+}
+
+test "PATH_CHALLENGE: a peer that never acknowledges the responses can't grow the server's records" {
+    // PATH_RESPONSE goes out even when congestion-limited, so a peer
+    // challenging in every packet and acknowledging nothing kept the server
+    // sending, and recording, past its window. Within a large window, tiny
+    // responses made a record of every few dozen bytes of it.
+    for ([_]u64{ 0, 1000 }) |window_packets| {
+        var p: Pair = undefined;
+        try p.init();
+        defer p.deinit();
+        const sconn = p.mgr.entries.items[0].conn;
+        const mds = sconn.cc.max_datagram_size;
+        if (window_packets > 0) sconn.cc.congestion_window = window_packets * mds;
+        const tracker = &sconn.pkt_handler.sent[@backingInt(ack_handler.EncLevel.application)];
+
+        var replies: usize = 0;
+        for (0..5000) |i| {
+            var data: [8]u8 = undefined;
+            std.mem.writeInt(u64, &data, i, .little);
+            p.client.pending_frames.push(.{ .path_challenge = data });
+            // It ignores its own window, as an attacker would.
+            p.client.pkt_handler.bytes_in_flight = 0;
+            replies += try p.sendUnheard() orelse continue;
+        }
+        const window = sconn.cc.sendWindow();
+        try testing.expect(replies >= 100);
+        // Two datagrams of slack, and the packet that crossed it.
+        try testing.expect(sconn.pkt_handler.bytes_in_flight <= window + 3 * mds);
+        try testing.expect(tracker.sent_packets.count() <= ack_handler.maxTrackedPackets(window, mds));
+    }
+}
+
+test "PTO: probes a peer never acknowledges stop at the record limit" {
+    // A peer that kept the connection alive and acknowledged nothing got up
+    // to two more probes every PTO, and nothing ever released one.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    // An idle timeout of days stands in for the peer's packets keeping the
+    // connection open.
+    var p: Pair = undefined;
+    const days = 30 * std.time.ms_per_day;
+    try p.initWith(.{ .max_idle_timeout = days }, .{ .max_idle_timeout = days });
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    var buf: [MAX_DGRAM]u8 = undefined;
+    sconn.pending_frames.push(.ping);
+    for (0..20_000) |_| {
+        while (try sconn.send(&buf) > 0) {}
+        // A timer already due that fired without effect must not spin.
+        const now = sys.test_clock.?;
+        sys.test_clock = @max(now + std.time.ns_per_us, sconn.nextTimeoutNs() orelse break);
+        try sconn.onTimeout();
+    }
+    const held = sconn.pkt_handler.trackedPackets();
+    try testing.expect(held > 100);
+    try testing.expect(held <= ack_handler.maxTrackedPackets(sconn.cc.sendWindow(), sconn.cc.max_datagram_size));
+
+    // A probe still goes out at the limit, or a peer whose packets were lost
+    // would get nothing to answer; its ACK of that probe frees the rest.
+    sys.test_clock = @max(sys.test_clock.? + std.time.ns_per_us, sconn.nextTimeoutNs().?);
+    try sconn.onTimeout();
+    const m = try sconn.send(&buf);
+    try testing.expect(m > 0);
+    p.client.handleDatagram(buf[0..m], .{ .to = p.c_addr, .from = p.s_addr, .datagram_size = m });
+    sys.test_clock.? += 30 * std.time.ns_per_ms;
+    try p.client.onTimeout();
+    var resp: [MAX_DGRAM]u8 = undefined;
+    while (true) {
+        const n = try p.client.send(&buf);
+        if (n == 0) break;
+        _ = p.mgr.recvDatagram(buf[0..n], p.c_addr, p.s_addr, 0, &resp);
+    }
+    try testing.expect(sconn.pkt_handler.trackedPackets() < held);
+}
+
+test "migration: a new address gets its PATH_CHALLENGE with the old path's packets still held" {
+    // An IP change resets the window, and the old path's packets still
+    // filled it, and the record limit sized from it: the challenge waited,
+    // and the server's first packet to the new address carried only an ACK.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    var p: Pair = undefined;
+    try p.init();
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    const mds = sconn.cc.max_datagram_size;
+    sconn.cc.congestion_window = 2000 * mds;
+    var buf: [MAX_DGRAM]u8 = undefined;
+    for (0..1100) |_| {
+        sconn.pending_frames.push(.ping);
+        while (try sconn.send(&buf) > 0) {}
+        sys.test_clock.? += std.time.ns_per_ms;
+    }
+    const fresh = congestion.Cubic.init().sendWindow();
+    try testing.expect(sconn.pkt_handler.bytes_in_flight > fresh + 2 * mds);
+    try testing.expect(sconn.pkt_handler.trackedPackets() > ack_handler.maxTrackedPackets(fresh, mds));
+
+    var moved = addr(40000);
+    const in: *posix.sockaddr.in = @ptrCast(@alignCast(&moved));
+    in.addr = std.mem.nativeToBig(u32, 0x7f000002);
+    p.client.pending_frames.push(.ping);
+    const n = try p.client.send(&buf);
+    var resp: [MAX_DGRAM]u8 = undefined;
+    _ = p.mgr.recvDatagram(buf[0..n], moved, p.s_addr, 0, &resp);
+
+    const m = try sconn.send(&buf);
+    try testing.expect(m > 0);
+    p.client.handleDatagram(buf[0..m], .{ .to = moved, .from = p.s_addr, .datagram_size = m });
+    var answered = false;
+    for (p.client.pending_frames.items[0..p.client.pending_frames.len]) |f| answered = answered or f == .path_response;
+    try testing.expect(answered);
+}
 
 test "qlog: every packet the server sends is traced once, as its own type" {
     // One event per datagram, numbered after the highest space with keys:

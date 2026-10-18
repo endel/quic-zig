@@ -647,6 +647,10 @@ pub const Connection = struct {
     /// Reused by every ACK frame: a fresh one regrew its lists each time.
     ack_result: ack_handler.AckResult = .{},
     cc: congestion.Cubic = congestion.Cubic.init(),
+    /// The largest window the connection has had, which sizes the record
+    /// limit: a migration resets the window while the old path's packets
+    /// are still held.
+    max_send_window: u64 = 0,
     pacer: congestion.Pacer = congestion.Pacer.init(),
     conn_flow_ctrl: flow_control.ConnectionFlowController = undefined,
     streams: stream_mod.StreamsMap = undefined,
@@ -3403,9 +3407,14 @@ pub const Connection = struct {
         }
 
         // Check congestion window — only send ACKs + control frames when congestion-limited
-        // Exception: PTO probes MUST bypass congestion control (RFC 9002 §6.2.4)
+        // Exception: PTO probes MUST bypass congestion control (RFC 9002 §6.2.4);
+        // past the record limit they go out as bare PINGs.
         // DATAGRAM frames are subject to CC per RFC 9221 §5: "DATAGRAM frames SHOULD be
         // subject to congestion control" — they piggyback on CC-allowed packets only.
+        if (self.trackedFull()) {
+            if (self.pto_probe_pending > 0) return try self.sendBarePing(out_buf, now);
+            return try self.sendAckOnly(out_buf, now);
+        }
         if (self.pkt_handler.bytes_in_flight >= self.cc.sendWindow() and self.pto_probe_pending == 0) {
             // ACK-only packets bypass pacing (RFC 9002 §7.7)
             return try self.sendAckOnly(out_buf, now);
@@ -3561,12 +3570,42 @@ pub const Connection = struct {
     }
 
     /// Send ACK-only packets (when congestion limited).
+    /// Whether the loss detector holds all the records it may; see
+    /// `ack_handler.maxTrackedPackets`.
+    fn trackedFull(self: *Connection) bool {
+        self.max_send_window = @max(self.max_send_window, self.cc.sendWindow());
+        return self.pkt_handler.trackedPackets() >= ack_handler.maxTrackedPackets(self.max_send_window, self.cc.max_datagram_size);
+    }
+
+    /// The probe sent at the record limit: a PING that keeps no record, so
+    /// a peer that never answers gets nothing more to hold, while the ACK a
+    /// live one sends lets loss detection free the rest.
+    fn sendBarePing(self: *Connection, out_buf: []u8, now: i64) !usize {
+        const seal = self.appSeal() orelse return self.sendAckOnly(out_buf, now);
+        const send_buf = self.amplificationLimit(out_buf) orelse return 0;
+        self.pto_probe_pending -|= 1;
+        const n = try self.packer.packBarePing(send_buf, &self.pkt_handler, seal, now);
+        if (n > 0) {
+            self.paths[self.active_path_idx].bytes_sent += n;
+            self.total_packets_sent += 1;
+        }
+        return n;
+    }
+
     /// ACKs are NOT congestion-controlled per RFC 9000 §13.2.
     fn sendAckOnly(self: *Connection, out_buf: []u8, now: i64) !usize {
         // Piggyback flow control updates (MAX_DATA, MAX_STREAMS)
         self.queueControlForPacket();
 
         const send_buf = self.amplificationLimit(out_buf) orelse return 0;
+
+        // Path probes and credit may overrun the window, but only by this
+        // much: a peer acknowledging nothing never brings it back down. To a
+        // path not yet validated the 3x limit bounds them instead, and the
+        // fresh window there is still full of the old path's packets.
+        self.packer.urgent_allowed = !self.trackedFull() and
+            (!self.paths[self.active_path_idx].is_validated or
+                self.pkt_handler.bytes_in_flight < self.cc.sendWindow() + 2 * self.cc.max_datagram_size);
 
         // Gather seals at all encryption levels
         const initial_seal = self.levelSeal(0);

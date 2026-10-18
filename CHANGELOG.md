@@ -277,6 +277,8 @@ need a design decision. Thanks @notramo for suggesting it
   `Config.max_handshakes_per_source` handshakes once its address is proven,
   and a Retry token admits only the connection it was issued for. Thanks
   @wallace0409 ([#45](https://github.com/endel/quic-zig/issues/45)).
+- A peer that acknowledged nothing could run the server out of memory. Thanks
+  @wallace0409 ([#46](https://github.com/endel/quic-zig/issues/46)).
 
 ## 0.5.0
 

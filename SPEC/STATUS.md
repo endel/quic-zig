@@ -51,7 +51,7 @@
 | 8.1.4 | Address Validation Token Integrity | ✅ Done | AES-128-GCM + timestamp validation; a Retry token is valid only on an Initial to the SCID its Retry gave |
 | 8.2 | Path Validation | ✅ Done | PATH_CHALLENGE/RESPONSE state machine |
 | 8.2.1 | Initiating Path Validation | ✅ Done | 3 retries with PTO backoff |
-| 8.2.2 | Path Validation Responses | ✅ Done | Echoes 8-byte data |
+| 8.2.2 | Path Validation Responses | ✅ Done | Echoes 8-byte data. Sent past the congestion window, like receiver credit: by at most two datagrams on a validated path; to a new one the 3x limit bounds it |
 | 8.2.3 | Successful Path Validation | ✅ Done | Updates active path |
 | 8.2.4 | Failed Path Validation | ✅ Done | Reverts to previous path |
 | **9** | **Connection Migration** | | |
@@ -95,7 +95,7 @@
 | 13.2.1 | Sending ACK Frames | ✅ Done | max_ack_delay honored |
 | 13.2.2 | Acknowledgment Frequency | ✅ Done | Ack-elicit threshold = 2 |
 | 13.2.3 | Managing ACK Ranges | ✅ Done | RangeSet with descending order, capped at 64 ranges per space (oldest dropped; their gaps then read as duplicates) |
-| 13.2.4 | Limiting Ranges by Tracking ACK Frames | ✅ Done | ACK-of-ACK pruning via largest_acked in SentPacket |
+| 13.2.4 | Limiting Ranges by Tracking ACK Frames | ✅ Done | ACK-of-ACK pruning via largest_acked in ack-eliciting SentPackets. ACK-only packets aren't recorded, so pruning waits for the peer to acknowledge an ack-eliciting one; received ranges are capped at 64 |
 | 13.2.5 | Measuring and Reporting Host Delay | ✅ Done | ACK delay field |
 | 13.2.6 | ACK Frames and Packet Protection | ✅ Done | ACKs at correct encryption level |
 | 13.2.7 | PADDING Frames Consume Congestion Window | ✅ Done | Counted as in-flight bytes |
@@ -249,18 +249,18 @@
 |---|---------|--------|-------|
 | 4 | Generating Acknowledgments | ✅ Done | Ack-eliciting threshold, delay |
 | 5 | Estimating the Round-Trip Time | | |
-| 5.1 | Generating RTT Samples | ✅ Done | Latest RTT from ACK |
+| 5.1 | Generating RTT Samples | ✅ Done | Latest RTT from ACK, when the largest acknowledged is ack-eliciting |
 | 5.2 | Estimating min_rtt | ✅ Done | Lifetime minimum |
 | 5.3 | Estimating smoothed_rtt and rttvar | ✅ Done | EWMA + mean deviation |
 | 6 | Loss Detection | | |
-| 6.1 | Acknowledgment-Based Detection | ✅ Done | Packet + time thresholds |
+| 6.1 | Acknowledgment-Based Detection | ✅ Done | Packet + time thresholds. Packets not in flight get no record: nothing would ever release one |
 | 6.1.1 | Packet Threshold | ✅ Done | kPacketThreshold = 3 |
 | 6.1.2 | Time Threshold | ✅ Done | 9/8 × max(srtt, latest_rtt) |
 | 6.2 | Probe Timeout | | |
 | 6.2.1 | Computing PTO | ✅ Done | srtt + max(4×rttvar, 1ms) + ack_delay; no Application-space timer before handshake confirmation |
 | 6.2.2 | Handshakes and New Paths | ✅ Done | No ack_delay for Initial/Handshake. The client's anti-deadlock probe (6.2.2.1) is the handshake-space PTO, armed with nothing in flight and backed off like any other |
 | 6.2.3 | Speeding Up Handshake Completion | ✅ Done | |
-| 6.2.4 | Sending Probe Packets | ✅ Done | PTO probes prefer data retransmit; CRYPTO data is resent only while a packet carrying it is in flight, else the probe is a PING |
+| 6.2.4 | Sending Probe Packets | ✅ Done | PTO probes prefer data retransmit; CRYPTO data is resent only while a packet carrying it is in flight, else the probe is a PING. Probes bypass the congestion window. Past the record limit (the largest window so far in full-size packets, plus 1024) nothing else ack-eliciting goes out, and a probe is a bare PING that keeps no record |
 | 6.3 | Handling Retry Packets | ✅ Done | Reset RTT + congestion state |
 | 6.4 | Discarding Keys and Packet State | ✅ Done | Clear PN space on key discard |
 | 7 | Congestion Control | | |

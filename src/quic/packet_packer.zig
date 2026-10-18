@@ -87,6 +87,10 @@ pub const PacketPacker = struct {
     /// Set by connection before packing.
     qlog_writer: ?*qlog.QlogWriter = null,
 
+    /// Whether path probes and receiver credit may still go out when
+    /// `ack_only`. Set by connection before packing.
+    urgent_allowed: bool = true,
+
     pub fn init(
         allocator: Allocator,
         is_server: bool,
@@ -433,21 +437,21 @@ pub const PacketPacker = struct {
             }
 
             // 4. Pending control frames (only in 1-RTT)
-            // PATH_CHALLENGE/PATH_RESPONSE are always sent (path probing is exempt from CC).
-            // Receiver-credit frames must also be allowed through the congestion-limited
-            // path: otherwise a small control packet can fill cwnd and prevent MAX_DATA
-            // from unblocking a peer that is already stuck at the connection window.
+            // PATH_CHALLENGE/PATH_RESPONSE may go out past the window while
+            // `urgent_allowed`, and so may receiver credit: otherwise a small
+            // control packet can fill cwnd and prevent MAX_DATA from unblocking
+            // a peer that is already stuck at the connection window.
             if (level == .application) {
                 var remaining = pending_frames.len;
                 while (remaining > 0) : (remaining -= 1) {
                     const pcf = pending_frames.pop() orelse break;
-                    const is_urgent_control = switch (pcf) {
+                    const is_urgent_control = self.urgent_allowed and switch (pcf) {
                         .path_challenge, .path_response => true,
                         .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni => true,
                         else => false,
                     };
                     if (!is_urgent_control and ack_only) {
-                        // Re-queue non-probing frames when congestion-limited
+                        // Re-queue the rest when congestion-limited
                         pending_frames.requeue(pcf);
                         continue;
                     }
@@ -695,7 +699,34 @@ pub const PacketPacker = struct {
         pkt_handler: *ack_handler.PacketHandler,
         seal: *const crypto_mod.Seal,
         now: i64,
-    ) !struct { bytes_written: usize, pn: u64 } {
+    ) !Ping {
+        return self.packPing(buf, target_size, pkt_handler, seal, now, true);
+    }
+
+    pub const Ping = struct { bytes_written: usize, pn: u64 };
+
+    /// A small 1-RTT PING that keeps no loss-recovery record: not in flight,
+    /// so nothing waits for its ACK. The probe at the record limit.
+    pub fn packBarePing(
+        self: *PacketPacker,
+        buf: []u8,
+        pkt_handler: *ack_handler.PacketHandler,
+        seal: *const crypto_mod.Seal,
+        now: i64,
+    ) !usize {
+        return (try self.packPing(buf, 64, pkt_handler, seal, now, false)).bytes_written;
+    }
+
+    /// A 1-RTT PING padded to `target_size`.
+    fn packPing(
+        self: *PacketPacker,
+        buf: []u8,
+        target_size: usize,
+        pkt_handler: *ack_handler.PacketHandler,
+        seal: *const crypto_mod.Seal,
+        now: i64,
+        in_flight: bool,
+    ) !Ping {
         if (buf.len < target_size or target_size < 64) return .{ .bytes_written = 0, .pn = 0 };
 
         var tmp: [ABSOLUTE_MAX_PACKET_SIZE]u8 = undefined;
@@ -749,13 +780,13 @@ pub const PacketPacker = struct {
         seal.applyHeaderProtection(buf[0..total_len], pn_offset, pn_len);
 
         if (self.qlog_writer) |ql| ql.packetSent(now, "1RTT", pn, total_len, "{\"frame_type\":\"ping\"}");
-        // Record as sent (in_flight but special — caller handles probe loss separately)
+        // An MTU probe is in flight, but its loss is the caller's to handle.
         try pkt_handler.onPacketSent(.{
             .pn = pn,
             .time_sent = now,
             .size = @intCast(total_len),
             .ack_eliciting = true,
-            .in_flight = true,
+            .in_flight = in_flight,
             .enc_level = .application,
         });
 

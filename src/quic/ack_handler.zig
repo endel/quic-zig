@@ -369,6 +369,9 @@ pub const SentPacketTracker = struct {
         if (self.largest_sent == null or pkt.pn > self.largest_sent.?) {
             self.largest_sent = pkt.pn;
         }
+        // Not in flight: nothing to release or resend, and the peer need
+        // never acknowledge it.
+        if (!pkt.in_flight) return;
         if (pkt.ack_eliciting) {
             self.ack_eliciting_in_flight += 1;
             self.last_ack_eliciting_sent_time = pkt.time_sent;
@@ -485,6 +488,18 @@ pub const SentPacketTracker = struct {
         }
     }
 };
+
+/// Records past a full window of full-size packets that the loss detector
+/// may hold; see `maxTrackedPackets`.
+pub const TRACKED_PACKETS_SLACK: u64 = 1024;
+
+/// Records the loss detector may hold before nothing ack-eliciting goes out,
+/// PTO probes included: a full window of full-size packets, and room for
+/// smaller ones. The window bounds bytes, not records, so a peer that stops
+/// acknowledging could otherwise have small packets fill it a record at a time.
+pub fn maxTrackedPackets(window: u64, max_datagram_size: u64) u64 {
+    return window / @max(max_datagram_size, 1) + TRACKED_PACKETS_SLACK;
+}
 
 /// Received-packet ranges kept per space; the oldest go first. An ACK frame
 /// carries at most `MAX_ACK_RANGES` + 1 of them anyway.
@@ -764,6 +779,13 @@ pub const PacketHandler = struct {
         return false;
     }
 
+    /// Records held across the three spaces.
+    pub fn trackedPackets(self: *const PacketHandler) usize {
+        var n: usize = 0;
+        for (&self.sent) |*t| n += t.sent_packets.count();
+        return n;
+    }
+
     /// Return the largest packet number acknowledged by the peer for this level.
     pub fn getLargestAcked(self: *const PacketHandler, level: EncLevel) ?u64 {
         const idx = @backingInt(level);
@@ -875,16 +897,8 @@ pub const PacketHandler = struct {
             }
         }
 
-        const base_time = if (tracker.ack_eliciting_in_flight > 0) blk: {
-            const largest_sent = tracker.largest_sent orelse return null;
-            // Packet may have been removed from sent_packets after loss detection.
-            // Fall back to last_ack_eliciting_sent_time which is always maintained.
-            const sent_pkt = tracker.sent_packets.get(largest_sent) orelse
-                break :blk tracker.last_ack_eliciting_sent_time orelse return null;
-            break :blk sent_pkt.time_sent;
-        } else blk: {
-            break :blk tracker.last_ack_eliciting_sent_time.?;
-        };
+        // RFC 9002 6.2.1: from the last ack-eliciting packet, not the last sent.
+        const base_time = tracker.last_ack_eliciting_sent_time orelse return null;
 
         var pto_duration = if (idx == @backingInt(EncLevel.application))
             self.rtt_stats.pto()
