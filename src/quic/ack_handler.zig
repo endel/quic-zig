@@ -344,6 +344,9 @@ pub const SentPacketTracker = struct {
     /// Per-space PTO count (exponential backoff). Reset when ACK is received
     /// for this space. Separate from other spaces to allow independent backoff.
     pto_count: u32 = 0,
+    /// When this space's PTO last fired. Its deadline counts from here too
+    /// until a probe goes out: at the backoff cap a fire no longer moves it.
+    pto_fired_at: ?i64 = null,
 
     pub fn init(allocator: Allocator) SentPacketTracker {
         return .{ .allocator = allocator };
@@ -713,6 +716,10 @@ pub const PacketHandler = struct {
     bytes_in_flight: u64 = 0,
     pto_count: u32 = 0,
     next_pn: [3]u64 = .{ 0, 0, 0 },
+    /// A client keeps its PTO backoff through Initial ACKs: the server may not
+    /// have validated its address yet, and probing it as fast as at first
+    /// only adds to what it can't answer (RFC 9002 6.2.1).
+    is_client: bool = false,
 
     /// RFC 9000 21.4: the application space leaves the odd packet number
     /// unsent, so a peer acking what it never received (to inflate our
@@ -854,6 +861,7 @@ pub const PacketHandler = struct {
             }
         }
 
+        if (self.is_client and level == .initial) return;
         self.pto_count = 0;
         self.sent[idx].pto_count = 0;
     }
@@ -887,10 +895,14 @@ pub const PacketHandler = struct {
     }
 
     /// Compute PTO deadline for a single packet number space.
-    /// Returns null if the space should not arm PTO (no data, application space idle).
+    /// Returns null if the space should not arm PTO (no data, application space
+    /// idle or its handshake not `confirmed`).
     /// RFC 9002 §6.2.2.1: handshake spaces arm PTO even with no packets in flight.
-    pub fn spacePtoDeadline(self: *const PacketHandler, tracker: SentPacketTracker, idx: usize) ?i64 {
+    pub fn spacePtoDeadline(self: *const PacketHandler, tracker: SentPacketTracker, idx: usize, confirmed: bool) ?i64 {
         const is_handshake_space = (idx != @backingInt(EncLevel.application));
+        // RFC 9002 6.2.1: until then the peer may lack the keys to read a
+        // probe, or we the keys to read its ACK.
+        if (!is_handshake_space and !confirmed) return null;
         if (tracker.ack_eliciting_in_flight == 0) {
             if (!(is_handshake_space and tracker.last_ack_eliciting_sent_time != null)) {
                 return null;
@@ -898,7 +910,8 @@ pub const PacketHandler = struct {
         }
 
         // RFC 9002 6.2.1: from the last ack-eliciting packet, not the last sent.
-        const base_time = tracker.last_ack_eliciting_sent_time orelse return null;
+        const sent_at = tracker.last_ack_eliciting_sent_time orelse return null;
+        const base_time = @max(sent_at, tracker.pto_fired_at orelse sent_at);
 
         var pto_duration = if (idx == @backingInt(EncLevel.application))
             self.rtt_stats.pto()
@@ -914,7 +927,7 @@ pub const PacketHandler = struct {
         return base_time + pto_duration;
     }
 
-    pub fn getPtoTimeout(self: *const PacketHandler) ?i64 {
+    pub fn getPtoTimeout(self: *const PacketHandler, confirmed: bool) ?i64 {
         var earliest: ?i64 = null;
 
         for (self.sent, 0..) |tracker, idx| {
@@ -925,7 +938,7 @@ pub const PacketHandler = struct {
                 continue;
             }
 
-            const timeout = self.spacePtoDeadline(tracker, idx) orelse continue;
+            const timeout = self.spacePtoDeadline(tracker, idx, confirmed) orelse continue;
             if (earliest == null or timeout < earliest.?) {
                 earliest = timeout;
             }
@@ -965,13 +978,13 @@ pub const PacketHandler = struct {
     }
 
     /// Get the encryption level where PTO should fire (the one with earliest timeout).
-    pub fn getPtoSpace(self: *PacketHandler) ?EncLevel {
+    pub fn getPtoSpace(self: *PacketHandler, confirmed: bool) ?EncLevel {
         var earliest: ?i64 = null;
         var result: ?EncLevel = null;
 
         for (self.sent, 0..) |tracker, idx| {
             if (tracker.loss_time != null) continue;
-            const timeout = self.spacePtoDeadline(tracker, idx) orelse continue;
+            const timeout = self.spacePtoDeadline(tracker, idx, confirmed) orelse continue;
             if (earliest == null or timeout < earliest.?) {
                 earliest = timeout;
                 result = @fromBackingInt(@intCast(idx));
@@ -1099,6 +1112,29 @@ test "PacketHandler: integration" {
     try handler.onAckReceived(.initial, 0, 0, 3, &.{}, 0, ack_time, &result);
 
     try testing.expectEqual(@as(u64, 0), handler.bytes_in_flight);
+}
+
+test "PacketHandler: a client keeps its PTO backoff through Initial ACKs" {
+    // RFC 9002 6.2.1: only a Handshake ACK tells a client the server has
+    // validated its address. A server resets on any ACK.
+    for ([_]bool{ true, false }) |is_client| {
+        var handler = PacketHandler.init(testing.allocator);
+        defer handler.deinit();
+        handler.is_client = is_client;
+        const now: i64 = 1_000_000_000;
+        var result: AckResult = .{};
+        defer result.deinit(testing.allocator);
+        for ([_]EncLevel{ .initial, .handshake }) |level| {
+            const pn = handler.nextPacketNumber(level);
+            try handler.onPacketSent(.{ .pn = pn, .time_sent = now, .size = 1200, .ack_eliciting = true, .in_flight = true, .enc_level = level });
+            handler.pto_count = 3;
+            handler.sent[@backingInt(level)].pto_count = 3;
+            try handler.onAckReceived(level, pn, 0, 3, &.{}, 0, now + 50_000_000, &result);
+            const kept = is_client and level == .initial;
+            try testing.expectEqual(@as(u32, if (kept) 3 else 0), handler.pto_count);
+            try testing.expectEqual(@as(u32, if (kept) 3 else 0), handler.sent[@backingInt(level)].pto_count);
+        }
+    }
 }
 
 test "ReceivedPacketTracker: ECN counters and ACK_ECN generation" {

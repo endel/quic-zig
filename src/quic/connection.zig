@@ -3812,12 +3812,14 @@ pub const Connection = struct {
 
         // Check PTO — fire when any space has an expired deadline.
         // Loss detection and PTO can both fire in the same onTimeout() call.
-        if (self.pkt_handler.getPtoTimeout()) |pto_time| {
+        if (self.pkt_handler.getPtoTimeout(self.handshake_confirmed)) |pto_time| {
             if (now >= pto_time) {
                 self.pkt_handler.pto_count += 1;
                 // Increment per-space PTO count for the space that triggered
-                if (self.pkt_handler.getPtoSpace()) |pto_space| {
-                    self.pkt_handler.sent[@backingInt(pto_space)].pto_count += 1;
+                if (self.pkt_handler.getPtoSpace(self.handshake_confirmed)) |pto_space| {
+                    const tracker = &self.pkt_handler.sent[@backingInt(pto_space)];
+                    tracker.pto_count += 1;
+                    tracker.pto_fired_at = now;
                 }
 
                 // Force-arm ACKs so probes include acknowledgements.
@@ -3847,8 +3849,11 @@ pub const Connection = struct {
                 // without, the probe is a PING — the client's anti-deadlock
                 // probe (RFC 9002 §6.2.2.1).
                 {
+                    // A client with Handshake keys has had its ClientHello
+                    // answered; a server has them as soon as it sends its
+                    // ServerHello, which the client may never have seen.
                     const has_hs_keys = self.pkt_num_spaces[1].crypto_seal != null;
-                    if (!has_hs_keys and self.pkt_num_spaces[0].crypto_seal != null and self.pkt_handler.cryptoInFlight(.initial)) {
+                    if ((self.is_server or !has_hs_keys) and self.pkt_num_spaces[0].crypto_seal != null and self.pkt_handler.cryptoInFlight(.initial)) {
                         self.queueCryptoRetransmission(.initial);
                     }
                     if (self.pkt_num_spaces[1].crypto_seal != null and self.pkt_handler.cryptoInFlight(.handshake)) {
@@ -3925,7 +3930,7 @@ pub const Connection = struct {
                     // without ever probing: 22365 fires in 10 s of
                     // handshakecorruption. Letting the app space stay quiet is
                     // deliberate, so that a delivered connection can idle out.
-                    const in_handshake_space = if (self.pkt_handler.getPtoSpace()) |sp|
+                    const in_handshake_space = if (self.pkt_handler.getPtoSpace(self.handshake_confirmed)) |sp|
                         sp != .application
                     else
                         false;
@@ -3939,7 +3944,7 @@ pub const Connection = struct {
                 // PTO fire for burst loss resilience. With burst_to_client=3, a single
                 // probe can be wiped; 2 probes double the chance of getting through.
                 self.pto_probe_pending = 2;
-                if (self.pkt_handler.getPtoSpace()) |space| {
+                if (self.pkt_handler.getPtoSpace(self.handshake_confirmed)) |space| {
                     std.log.debug("PTO fired: count={d}, space={s}, has_data={}", .{ self.pkt_handler.pto_count, @tagName(space), has_data });
                 }
             }
@@ -4378,7 +4383,7 @@ pub const Connection = struct {
             var pto_earliest: ?i64 = null;
             for (self.pkt_handler.sent, 0..) |tracker, idx| {
                 if (tracker.loss_time != null) continue; // handled above
-                const deadline = self.pkt_handler.spacePtoDeadline(tracker, idx) orelse continue;
+                const deadline = self.pkt_handler.spacePtoDeadline(tracker, idx, self.handshake_confirmed) orelse continue;
                 if (pto_earliest == null or deadline < pto_earliest.?) {
                     pto_earliest = deadline;
                 }
@@ -4808,6 +4813,7 @@ pub fn connectInto(
 
         .local_params = local_params,
     };
+    conn.pkt_handler.is_client = true;
 
     // Set connection IDs
     conn.scid_len = 8;

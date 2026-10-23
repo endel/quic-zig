@@ -478,6 +478,168 @@ test "PTO: probes a peer never acknowledges stop at the record limit" {
     try testing.expect(sconn.pkt_handler.trackedPackets() < held);
 }
 
+/// A server connection opened by one client Initial, from a client never
+/// heard from again.
+const HalfOpen = struct {
+    mgr: connection_manager.ConnectionManager,
+    client: *connection.Connection,
+
+    fn init(self: *HalfOpen, server_tls: tls13.TlsConfig) !void {
+        const alloc = testing.allocator;
+        self.* = .{
+            .mgr = connection_manager.ConnectionManager.init(alloc, server_tls, .{}, @splat(1), @splat(2)),
+            .client = try alloc.create(connection.Connection),
+        };
+        errdefer {
+            alloc.destroy(self.client);
+            self.mgr.deinit();
+        }
+        try connection.connectInto(self.client, alloc, "localhost", .{}, clientTls(), null);
+        self.client.paths[0].peer_addr = addr(4433);
+        self.client.paths[0].local_addr = addr(40000);
+        var buf: [MAX_DGRAM]u8 = undefined;
+        var resp: [MAX_DGRAM]u8 = undefined;
+        const n = try self.client.send(&buf);
+        _ = self.mgr.recvDatagram(buf[0..n], addr(40000), addr(4433), 0, &resp);
+    }
+
+    fn deinit(self: *HalfOpen) void {
+        self.client.deinit();
+        testing.allocator.destroy(self.client);
+        self.mgr.deinit();
+    }
+
+    fn server(self: *HalfOpen) *connection.Connection {
+        return self.mgr.entries.items[0].conn;
+    }
+};
+
+/// What tickAndSend does with a due connection: onTimeout() again while a
+/// deadline has passed, to fire every space that expired.
+fn timeoutPass(conn: *connection.Connection, now: i64) !void {
+    for (0..8) |_| {
+        try conn.onTimeout();
+        const next = conn.nextTimeoutNsAt(now) orelse return;
+        if (next > now) return;
+    }
+}
+
+test "PTO: an expiry at the backoff cap fires each handshake space once" {
+    // At the cap a fire no longer moved its space's deadline, so one expiry
+    // fired up to 8 times and pto_count ran ahead of the probes sent.
+    const start: i64 = 1_000 * std.time.ns_per_s;
+    sys.test_clock = start;
+    defer sys.test_clock = null;
+    var h: HalfOpen = undefined;
+    try h.init(serverTls());
+    defer h.deinit();
+    const sconn = h.server();
+    var buf: [MAX_DGRAM]u8 = undefined;
+    // The server's replies are all lost; past 6 s its probes are at the cap.
+    var fires: usize = 0;
+    while (sys.test_clock.? - start < 9 * std.time.ns_per_s) {
+        while (try sconn.send(&buf) > 0) {}
+        const now = sconn.nextTimeoutNs() orelse break;
+        sys.test_clock = now;
+        const before = sconn.pkt_handler.pto_count;
+        try timeoutPass(sconn, now);
+        try testing.expect(sconn.pkt_handler.pto_count - before <= 2);
+        fires += sconn.pkt_handler.pto_count - before;
+    }
+    try testing.expect(fires >= 10);
+}
+
+test "PTO: a server out of amplification budget waits instead of spinning" {
+    // Its flight is over 3x the client's Initial, so probes can't go out, and
+    // the deadline, counted from the last packet sent, stayed in the past once
+    // backed off to the cap: every pass fired again, a busy loop until the
+    // handshake timeout. One spoofed Initial was enough.
+    const S = struct {
+        var secret_key_bytes: [32]u8 = undefined;
+        var pub_key_bytes: [65]u8 = undefined;
+        var intermediate: [6000]u8 = @splat(0x30);
+        var cert_chain: [2][]const u8 = undefined;
+        var alpn: [1][]const u8 = .{"bulk"};
+    };
+    const kp = EcdsaP256Sha256.KeyPair.generate(testing.io);
+    S.secret_key_bytes = kp.secret_key.toBytes();
+    S.pub_key_bytes = kp.public_key.toUncompressedSec1();
+    S.cert_chain = .{ &S.pub_key_bytes, &S.intermediate };
+
+    const start: i64 = 1_000 * std.time.ns_per_s;
+    sys.test_clock = start;
+    defer sys.test_clock = null;
+    var h: HalfOpen = undefined;
+    try h.init(.{ .cert_chain_der = &S.cert_chain, .private_key_bytes = &S.secret_key_bytes, .alpn = &S.alpn });
+    defer h.deinit();
+    const sconn = h.server();
+    const budget = 3 * sconn.paths[0].bytes_received;
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var passes: usize = 0;
+    while (!sconn.isClosed()) : (passes += 1) {
+        try testing.expect(passes < 100);
+        while (try sconn.send(&buf) > 0) {}
+        const now = @max(sconn.nextTimeoutNs() orelse break, sys.test_clock.? + std.time.ns_per_us);
+        sys.test_clock = now;
+        try timeoutPass(sconn, now);
+    }
+    try testing.expect(sconn.paths[0].bytes_sent > budget - 100 and sconn.paths[0].bytes_sent <= budget);
+    try testing.expect(sys.test_clock.? - start >= 10 * std.time.ns_per_s);
+}
+
+test "PTO: a client sends no Application Data probe before the handshake is confirmed" {
+    // RFC 9002 6.2.1. Its 1-RTT data goes out with its Finished, and until
+    // HANDSHAKE_DONE it is the Handshake PTO that probes, resending both.
+    const alloc = testing.allocator;
+    const start: i64 = 1_000 * std.time.ns_per_s;
+    sys.test_clock = start;
+    defer sys.test_clock = null;
+    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, @splat(1), @splat(2));
+    defer mgr.deinit();
+    const client = try alloc.create(connection.Connection);
+    defer alloc.destroy(client);
+    try connection.connectInto(client, alloc, "localhost", .{}, clientTls(), null);
+    defer client.deinit();
+    client.paths[0].peer_addr = addr(4433);
+    client.paths[0].local_addr = addr(40000);
+
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var resp: [MAX_DGRAM]u8 = undefined;
+    const n = try client.send(&buf);
+    _ = mgr.recvDatagram(buf[0..n], addr(40000), addr(4433), 0, &resp);
+    while (true) {
+        const m = try mgr.entries.items[0].conn.send(&buf);
+        if (m == 0) break;
+        client.handleDatagram(buf[0..m], .{ .to = addr(40000), .from = addr(4433), .datagram_size = m });
+    }
+    try testing.expect(client.isEstablished() and !client.handshake_confirmed);
+    const s = try client.openStream();
+    try s.send.writeData("sent with the Finished");
+
+    // Everything the client sends from here on is lost.
+    const app = @backingInt(ack_handler.EncLevel.application);
+    while (sys.test_clock.? - start < 3 * std.time.ns_per_s) {
+        while (try client.send(&buf) > 0) {}
+        sys.test_clock = client.nextTimeoutNs() orelse break;
+        try client.onTimeout();
+    }
+    try testing.expect(client.pkt_handler.sent[app].ack_eliciting_in_flight > 0);
+    try testing.expectEqual(@as(u32, 0), client.pkt_handler.sent[app].pto_count);
+    try testing.expect(client.pkt_handler.sent[@backingInt(ack_handler.EncLevel.handshake)].pto_count > 0);
+}
+
+test "PTO: a server's probes carry its ServerHello" {
+    // Both probes of a PTO resend the server's in-flight CRYPTO. The first
+    // left the ServerHello out, as a client with Handshake keys may; a server
+    // has them before its client has seen any. Losing the second then cost a
+    // round trip. The client's own retransmissions are lost too, so only the
+    // server's probes can help.
+    const c2s: Link.Loss = .{ .periodic = .{ .period = 1 << 60, .burst = 3, .phase = (1 << 60) - 1 } };
+    const r = try runBulk(1000, c2s, .{ .periodic = .{ .period = 2, .burst = 1 } }, 50 * ms, 10 * std.time.ns_per_s);
+    try testing.expect(r.finished);
+    try testing.expect(r.elapsed_ns <= 400 * ms);
+}
+
 test "migration: a new address gets its PATH_CHALLENGE with the old path's packets still held" {
     // An IP change resets the window, and the old path's packets still
     // filled it, and the record limit sized from it: the challenge waited,
