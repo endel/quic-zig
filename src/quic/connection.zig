@@ -1557,7 +1557,7 @@ pub const Connection = struct {
             }
 
             // Track frames for QLOG
-            if (qlog_frame_count < qlog_frames.len) {
+            if (self.qlog_writer != null and qlog_frame_count < qlog_frames.len) {
                 qlog_frames[qlog_frame_count] = frame;
                 qlog_frame_count += 1;
             }
