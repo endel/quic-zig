@@ -37,6 +37,7 @@ contributions" in `CLAUDE.md`.
 | 11 | 0.17 loads `[16]u8` as `u128` byte by byte | `src/quic/aes_gcm.zig` (`xorBlock`), `src/quic/ghash.zig` | `align(1)` pointer loads | yes: codegen regression |
 | 12 | ECDSA P-256 signing's k·G | `src/quic/ecdsa_p256.zig` | own signer: std's steps, fixed-base table | yes: perf |
 | 13 | Large allocations go straight to the kernel | `src/quic/stream.zig` (`SendLedger`) | send buffers kept for reuse | maybe: design question |
+| 14 | `std.os.linux.getauxval` under libc | `src/sys.zig` (`hwcap`) | `std.c.getauxval` instead | no: fixed on master |
 
 Not a std divergence, but related: std picks the AES and GHASH
 implementation at **compile time** from the target's CPU features.
@@ -479,6 +480,26 @@ faults wait on it (`rwsem_down_write_slowpath` in a profile).
 **Upstream-shaped question:** whether `SmpAllocator` should keep a few freed
 large blocks per thread, as glibc's malloc does below its trim threshold.
 It is a memory-for-speed trade, so it is a design question, not a bug.
+
+## 14. `std.os.linux.getauxval` answers 0 under libc
+
+**std 0.17.0:** with libc linked, `std.os.linux.getauxval` reads a pointer to
+the auxiliary vector that only Zig's own `_start` records. libc's `_start`
+calls Zig's C `main` instead, so the pointer stays null and every key reads
+0. The vDSO is found through the same call, so `std.os.linux.clock_gettime`
+is a syscall every time under libc too.
+
+**Ours:** `sys.cpuHasAes` reads `AT_HWCAP` through `std.c.getauxval` when
+libc is linked. Before, it always said no on arm64 Linux, and the warning
+`Server.start` gives for a build without the AES instructions never fired: a
+relay built without `-Dcpu` ran ChaCha20 in software, 31% of the server's
+samples, in silence. Our clock reads already go through `std.c`; libxev's
+epoll backend didn't, and its fix is the fork's `libc-clock` branch.
+
+**Master (22 Oct 2026):** reported as ziglang/zig#36203 and fixed by
+292edd2440 (7 Oct 2026, after 0.17.0), which moves the vector into
+compiler_rt. `std.os.linux.getauxval` is now a compile error under libc, so
+the `std.c` branch stays after the upgrade. Nothing to raise.
 
 ## Verifying the copies still match std
 

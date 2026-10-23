@@ -517,12 +517,20 @@ pub fn cpuHasAes() bool {
             return ecx & (aesni | avx) == aesni | avx;
         },
         .aarch64 => return switch (builtin.os.tag) {
-            .linux => std.os.linux.getauxval(std.elf.AT.HWCAP) & (1 << 3) != 0, // HWCAP_AES
+            .linux => hwcap() & std.os.linux.HWCAP.AES != 0,
             .macos, .ios, .tvos, .watchos, .visionos => true, // every Apple silicon CPU
             else => false,
         },
         else => return false,
     }
+}
+
+/// AT_HWCAP. Under libc it has to come from libc: Zig 0.17's
+/// `std.os.linux.getauxval` reads a vector only Zig's own `_start` records,
+/// so there it answers 0 for every key (master makes it a compile error).
+fn hwcap() usize {
+    const getauxval = if (builtin.link_libc) std.c.getauxval else std.os.linux.getauxval;
+    return getauxval(std.elf.AT.HWCAP);
 }
 
 /// Return a single random integer of the given type (replaces
@@ -901,4 +909,20 @@ test "realtimeSeconds is wall clock, not uptime" {
     try std.testing.expect(now > 1_767_225_600); // 2026-01-01
     try std.testing.expect(now < 4_102_444_800); // 2100-01-01
     try std.testing.expect(now > @divTrunc(nanoTimestamp(), std.time.ns_per_s));
+}
+
+test "cpuHasAes sees the AES this CPU has" {
+    // A build that uses the instructions only runs where they exist.
+    if (std.crypto.core.aes.has_hardware_support) try std.testing.expect(cpuHasAes());
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .aarch64) return;
+    // The kernel's answer, read without getauxval.
+    const auxv = try readFileAlloc(std.testing.allocator, "/proc/self/auxv", 4096);
+    defer std.testing.allocator.free(auxv);
+    var i: usize = 0;
+    while (i + 16 <= auxv.len) : (i += 16) {
+        if (std.mem.readInt(u64, auxv[i..][0..8], .little) != std.elf.AT.HWCAP) continue;
+        const aes = std.mem.readInt(u64, auxv[i + 8 ..][0..8], .little) & std.os.linux.HWCAP.AES != 0;
+        return std.testing.expectEqual(aes, cpuHasAes());
+    }
+    return error.TestUnexpectedResult;
 }
