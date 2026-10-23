@@ -10,8 +10,9 @@
 //! without locks.
 //!
 //! Requests: `Upgrade: websocket` goes to `onWsUpgrade` when the handler has
-//! it; GET and HEAD are served from `static_dir` (404 without one); other
-//! methods get 405. Request bodies are not supported.
+//! it; other GET and HEAD requests to `onHttpRequest`, if it has that, then
+//! to `static_dir` if it didn't answer (404 without one); other methods get
+//! 405. Request bodies are not supported.
 //!
 //! A WebSocket can move to a listener on another loop and thread
 //! (`WsConn.handOver`, `onWsHandover`, `Server.adopt`): servers that share a
@@ -41,6 +42,7 @@ pub const WsRequest = conn_mod.WsRequest;
 pub const WsAcceptOptions = conn_mod.AcceptOptions;
 pub const WsSendError = conn_mod.SendError;
 pub const WsHandover = conn_mod.WsHandover;
+pub const HttpRequest = conn_mod.HttpRequest;
 pub const WsHandoverError = conn_mod.HandoverError;
 pub const WsMessageKind = websocket.MessageKind;
 pub const WsCloseCode = websocket.CloseCode;
@@ -118,11 +120,14 @@ pub const Handlers = struct {
     close: *const fn (ctx: *anyopaque, ws: *WsConn, code: u16, reason: []const u8) void,
     /// Null when the handler hands no WebSocket over.
     handover: ?*const fn (ctx: *anyopaque, h: WsHandover) void = null,
+    /// Null when the handler answers no plain request.
+    request: ?*const fn (ctx: *anyopaque, req: *HttpRequest, target: []const u8) void = null,
 };
 
 /// Binds a handler's optional `onWsUpgrade(self, req, path)`,
 /// `onWsMessage(self, ws, data[, kind])`, `onWsClose(self, ws, code,
-/// reason)` and `onWsHandover(self, handover)`.
+/// reason)`, `onWsHandover(self, handover)` and `onHttpRequest(self, req,
+/// target)`.
 pub fn handlersFor(comptime H: type, handler: *H) Handlers {
     const S = struct {
         fn upgrade(ctx: *anyopaque, req: *WsRequest, path: []const u8) void {
@@ -144,6 +149,9 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
         fn handover(ctx: *anyopaque, h: WsHandover) void {
             H.onWsHandover(@ptrCast(@alignCast(ctx)), h);
         }
+        fn request(ctx: *anyopaque, req: *HttpRequest, target: []const u8) void {
+            H.onHttpRequest(@ptrCast(@alignCast(ctx)), req, target);
+        }
     };
     return .{
         .ctx = handler,
@@ -151,6 +159,7 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
         .message = S.message,
         .close = S.close,
         .handover = if (@hasDecl(H, "onWsHandover")) S.handover else null,
+        .request = if (@hasDecl(H, "onHttpRequest")) S.request else null,
     };
 }
 

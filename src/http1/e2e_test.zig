@@ -107,6 +107,10 @@ const EchoHandler = struct {
         self.handed_busy = h.conn.sock.reading or h.conn.sock.writing;
     }
 
+    pub fn onHttpRequest(_: *EchoHandler, req: *event_loop.HttpRequest, target: []const u8) void {
+        if (std.mem.eql(u8, target, "/hello")) req.respond(200, "text/plain", "hi there");
+    }
+
     pub fn onConnectRequest(self: *EchoHandler, session: *event_loop.Session, session_id: u64, _: []const u8) void {
         session.acceptSession(session_id) catch return;
         if (self.wt_sessions < self.wt_session_ids.len) {
@@ -1016,4 +1020,25 @@ test "ws: a server that stops while a WebSocket waits to move closes it there" {
     try testing.expectEqual(@as(u16, 1001), h.handler.close_code);
     for (0..20) |_| try h.step();
     try testing.expect(h.handler.handed == null);
+}
+
+test "http1: onHttpRequest answers what it takes; the rest goes to the static files" {
+    var h: Harness = undefined;
+    try h.init(29482, .{ .tls = false, .static_dir = "src/http1" });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+
+    try c.send("GET /hello HTTP/1.1\r\nHost: a\r\n\r\n");
+    const head = try h.head(&c);
+    try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, head, "Content-Type: text/plain\r\n") != null);
+    try testing.expectEqualStrings("hi there", try h.bytes(&c, 8));
+
+    // Same connection: HEAD has no body, and an unanswered path is a file.
+    try c.send("HEAD /hello HTTP/1.1\r\nHost: a\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, try h.head(&c), "Content-Length: 8\r\n") != null);
+    try c.send("GET /missing.txt HTTP/1.1\r\nHost: a\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, try h.head(&c), "HTTP/1.1 404 "));
 }

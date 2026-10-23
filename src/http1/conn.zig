@@ -245,6 +245,39 @@ pub const WsRequest = struct {
     }
 };
 
+/// A GET or HEAD request that isn't an upgrade, valid only during the
+/// handler's `onHttpRequest`. Unanswered, it goes to the static files.
+pub const HttpRequest = struct {
+    conn: *Conn,
+    head: *const parser.RequestHead,
+    answered: bool = false,
+
+    /// A request header, matched case-insensitively.
+    pub fn header(self: *const HttpRequest, name: []const u8) ?[]const u8 {
+        return self.head.get(name);
+    }
+
+    /// Answers with `body` (left out for HEAD), all of it queued now.
+    pub fn respond(self: *HttpRequest, status: u16, content_type: []const u8, body: []const u8) void {
+        if (self.answered) return;
+        self.answered = true;
+        const c = self.conn;
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        const head = blk: {
+            w.print("HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n", .{
+                status, parser.reason(status), content_type, body.len,
+            }) catch break :blk null;
+            c.writeCommonHeaders(&w, !c.keep_alive) catch break :blk null;
+            w.writeAll("\r\n") catch break :blk null;
+            break :blk w.buffered();
+        } orelse return c.respond(500, "Internal server error", .close, null);
+        c.output(head);
+        if (!c.head_only) c.output(body);
+        c.responseDone();
+    }
+};
+
 pub const Conn = struct {
     server: *Server,
     sock: socket.Socket(Conn),
@@ -572,6 +605,12 @@ pub const Conn = struct {
         } else if (head.hasBody()) {
             self.respond(400, "Unexpected request body", .close, null);
         } else {
+            const h = self.server.handlers;
+            if (h.request) |onRequest| {
+                var req: HttpRequest = .{ .conn = self, .head = head };
+                onRequest(h.ctx, &req, head.target);
+                if (req.answered) return parsed.len;
+            }
             self.serveStatic(head.target);
         }
         return parsed.len;

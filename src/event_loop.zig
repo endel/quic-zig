@@ -58,6 +58,8 @@ pub const WsAcceptOptions = http1.WsAcceptOptions;
 pub const WsSendError = http1.WsSendError;
 /// A WebSocket on its way to another server; see `WsConn.handOver`.
 pub const WsHandover = http1.WsHandover;
+/// A plain GET or HEAD on the HTTP/1.1 listener, for `onHttpRequest`.
+pub const HttpRequest = http1.HttpRequest;
 pub const WsMessageKind = http1.WsMessageKind;
 pub const WsCloseCode = http1.WsCloseCode;
 
@@ -167,10 +169,10 @@ pub const Config = struct {
 
     /// An HTTP/1.1 listener on TCP beside QUIC on UDP, on the same port by
     /// default (TCP and UDP are separate namespaces) and the same loop:
-    /// static files from `static_dir`, WebSockets through the handler's
-    /// `onWsUpgrade` / `onWsMessage` / `onWsClose`, TLS with the QUIC
-    /// certificates, and Alt-Svc advertising HTTP/3. Required when the
-    /// handler declares `onWsUpgrade`.
+    /// the handler's `onHttpRequest` and static files from `static_dir`,
+    /// WebSockets through its `onWsUpgrade` / `onWsMessage` / `onWsClose`,
+    /// TLS with the QUIC certificates, and Alt-Svc advertising HTTP/3.
+    /// Required when the handler declares `onWsUpgrade`.
     http1: ?Http1Config = null,
 
     /// ALPN protocols offered in the handshake when the server loads its
@@ -769,6 +771,7 @@ pub fn Server(comptime Handler: type) type {
             "onRequestCancelled", "onConnectionClosed", "onQuicConnected",
             "onWsUpgrade",        "onWsMessage",        "onWsClose",
             "onPass",             "onHandover",         "onWsHandover",
+            "onHttpRequest",
         };
 
         for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
@@ -788,7 +791,8 @@ pub fn Server(comptime Handler: type) type {
                         "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
                         "onStopSending, onWritable, onPollComplete, onConnectionClosed, " ++
                         "onQuicConnected, onH0Request, onH0Data, onH0Finished, " ++
-                        "onWsUpgrade, onWsMessage, onWsClose, onPass, onHandover, onWsHandover");
+                        "onWsUpgrade, onWsMessage, onWsClose, onPass, onHandover, onWsHandover, " ++
+                        "onHttpRequest");
                 }
             }
         }
@@ -829,6 +833,9 @@ pub fn Server(comptime Handler: type) type {
         }
         if (@hasDecl(Handler, "onWsHandover") and @TypeOf(Handler.onWsHandover) != fn (*Handler, WsHandover) void) {
             @compileError("onWsHandover must be fn (self: *Handler, handover: WsHandover) void");
+        }
+        if (@hasDecl(Handler, "onHttpRequest") and @TypeOf(Handler.onHttpRequest) != fn (*Handler, *HttpRequest, []const u8) void) {
+            @compileError("onHttpRequest must be fn (self: *Handler, req: *HttpRequest, target: []const u8) void");
         }
     }
 
