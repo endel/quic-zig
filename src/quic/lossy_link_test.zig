@@ -317,6 +317,15 @@ test "lossy link: an upload survives periodic loss bursts in both directions" {
     try testing.expect(r.finished);
 }
 
+test "lossy link: with netcode's ACK settings, an upload over a 50 ms RTT takes no longer than today" {
+    // About 780-880 ms either way. Holding a full packet owed for the whole
+    // 60 ms, as for small ones, made it ~1040-1090: the sender's window was
+    // still small and waited on it.
+    const r = try runBulkWith(.{ .max_ack_delay = 60, .ack_bytes_threshold = 2000 }, 4 << 20, .none, .none, 25 * ms, 60 * std.time.ns_per_s);
+    try testing.expect(r.finished);
+    try testing.expect(r.elapsed_ns < 950 * ms);
+}
+
 test "lossy link: with a byte threshold, a full-size upload still draws an ACK every two packets" {
     // It takes 2 ms either way; waiting for the alarm instead, ~120 ms.
     const r = try runBulkWith(.{ .max_ack_delay = 60, .ack_bytes_threshold = 2000 }, 4 << 20, .none, .none, 100 * std.time.ns_per_us, 60 * std.time.ns_per_s);

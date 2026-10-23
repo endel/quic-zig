@@ -576,18 +576,21 @@ pub const ConnectionConfig = struct {
     /// transport parameter (RFC 9000 18.2); the delayed-ACK alarm keeps to
     /// it. The peer adds it to its PTO (RFC 9002 6.2.1), so a longer delay
     /// saves ACK-only packets but makes a peer whose last packet was lost
-    /// wait that much longer to resend it, and can stall a peer's upload
-    /// that long while its congestion window is small. An ACK_FREQUENCY
-    /// frame from the peer overrides it.
+    /// wait that much longer to resend it, and, without
+    /// `ack_bytes_threshold`, can stall a peer's upload that long while its
+    /// congestion window is small. An ACK_FREQUENCY frame from the peer
+    /// overrides it.
     max_ack_delay: u14 = 25,
     /// Payload bytes the ack-eliciting packets since our last ACK must add
     /// up to, besides RFC 9000 13.2.2's two packets, before an ACK goes out
     /// at once. Small packets then wait for data to ride on, or for
     /// `max_ack_delay`, while full-size ones still draw an ACK every two, as
     /// RFC 5681 counts full-sized segments: two 1200-byte datagrams carry
-    /// over 2300 bytes of payload, so 2000 keeps that. 0 counts packets
-    /// alone. An ACK_FREQUENCY frame from the peer replaces it with the
-    /// peer's threshold.
+    /// over 2300 bytes of payload, so 2000 keeps that. Once half of it is
+    /// owed, about a full packet, the ACK waits no longer than QUIC's
+    /// default 25 ms, so a bulk sender's odd packet out doesn't hold its
+    /// window for `max_ack_delay`. 0 counts packets alone. An ACK_FREQUENCY
+    /// frame from the peer replaces it with the peer's threshold.
     ack_bytes_threshold: u32 = 0,
 };
 

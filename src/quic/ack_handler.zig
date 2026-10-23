@@ -595,11 +595,20 @@ pub const ReceivedPacketTracker = struct {
                 self.ack_queued = true;
                 self.ack_alarm = null;
             } else {
-                if (self.ack_alarm == null) {
-                    self.ack_alarm = now + @max(self.max_ack_delay_ns - ACK_ALARM_LEAD, 0);
-                }
+                const at = now + @max(self.alarmDelay() - ACK_ALARM_LEAD, 0);
+                if (self.ack_alarm == null or at < self.ack_alarm.?) self.ack_alarm = at;
             }
         }
+    }
+
+    /// How long the ACK owed may wait. Under the byte threshold, once about
+    /// a full packet is owed, no longer than QUIC's default: a bulk sender
+    /// whose window is still small waits on it, while the small packets the
+    /// longer delay is for never add up to that much.
+    fn alarmDelay(self: *const ReceivedPacketTracker) i64 {
+        if (self.ack_bytes_threshold > 0 and self.ack_eliciting_bytes >= self.ack_bytes_threshold / 2)
+            return @min(self.max_ack_delay_ns, DEFAULT_MAX_ACK_DELAY);
+        return self.max_ack_delay_ns;
     }
 
     /// Whether `pn`, the new largest, leaves packets missing below it: the
@@ -1118,6 +1127,41 @@ test "ReceivedPacketTracker: with a byte threshold, two small packets wait for t
     try testing.expect(!tracker.ack_queued);
     try tracker.onPacketReceived(5, true, now + 5, 0, 1160);
     try testing.expect(tracker.ack_queued);
+}
+
+test "ReceivedPacketTracker: with a byte threshold, a full packet owed waits no longer than QUIC's default delay" {
+    var tracker = ReceivedPacketTracker.init(testing.allocator);
+    defer tracker.deinit();
+    tracker.ack_bytes_threshold = 2000;
+    tracker.max_ack_delay_ns = 60 * std.time.ns_per_ms;
+    const ms = std.time.ns_per_ms;
+    const now: i64 = 1_000_000_000;
+    const short = DEFAULT_MAX_ACK_DELAY - ACK_ALARM_LEAD;
+    const long = 60 * ms - ACK_ALARM_LEAD;
+
+    try tracker.onPacketReceived(0, true, now, 0, 40);
+    try testing.expectEqual(@as(?i64, now + long), tracker.ack_alarm);
+    // A full-size one after it pulls the alarm in.
+    try tracker.onPacketReceived(1, true, now + 10 * ms, 0, 1160);
+    try testing.expect(!tracker.ack_queued);
+    try testing.expectEqual(@as(?i64, now + 10 * ms + short), tracker.ack_alarm);
+
+    tracker.onAckSent();
+    try tracker.onPacketReceived(2, true, now + 20 * ms, 0, 1160);
+    try testing.expectEqual(@as(?i64, now + 20 * ms + short), tracker.ack_alarm);
+
+    // Never past what we advertise.
+    tracker.onAckSent();
+    tracker.max_ack_delay_ns = 10 * ms;
+    try tracker.onPacketReceived(3, true, now + 30 * ms, 0, 1160);
+    try testing.expectEqual(@as(?i64, now + 30 * ms + 10 * ms - ACK_ALARM_LEAD), tracker.ack_alarm);
+
+    // Without the byte threshold, size doesn't matter.
+    tracker.onAckSent();
+    tracker.max_ack_delay_ns = 60 * ms;
+    tracker.ack_bytes_threshold = 0;
+    try tracker.onPacketReceived(4, true, now + 40 * ms, 0, 1160);
+    try testing.expectEqual(@as(?i64, now + 40 * ms + long), tracker.ack_alarm);
 }
 
 test "ReceivedPacketTracker: an ACK_FREQUENCY threshold replaces the byte threshold" {
