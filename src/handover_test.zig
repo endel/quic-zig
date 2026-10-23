@@ -516,11 +516,17 @@ const Fixture = struct {
                 if (sent == total) cs.closeStream(id);
             }
             if (!moved and sent >= move_at) {
-                switch (how) {
-                    .stream => try self.move("move"),
-                    .datagram => try cs.sendDatagram(self.handler.session_id.?, "move"),
-                }
-                moved = true;
+                moved = switch (how) {
+                    .stream => blk: {
+                        try self.move("move");
+                        break :blk true;
+                    },
+                    // Queued behind the per-step datagrams on a busy host: next step.
+                    .datagram => if (cs.sendDatagram(self.handler.session_id.?, "move")) |_| true else |err| switch (err) {
+                        error.DatagramQueueFull => false,
+                        else => return err,
+                    },
+                };
             }
             var dg: [16]u8 = undefined;
             std.mem.writeInt(u32, dg[0..4], seq, .little);
