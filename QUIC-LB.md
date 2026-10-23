@@ -164,6 +164,13 @@ it, finds it in `MovedCids`, and is steered to the new owner; one that
 reaches the new owner before the connection does is dropped, not reset. The
 old CIDs leave `MovedCids` when the peer retires them or the connection closes.
 
+A WebSocket on the HTTP/1.1 listener moves the same way, with no CIDs to
+rotate: a TCP connection stays on its socket, whichever loop polls it. From
+`onWsMessage`, `ws.handOver()`; once no read or write of it is in flight, the
+old worker calls `onWsHandover(handover)`; the new one's
+`http1_server.adopt(handover)` serves it on, TLS session, unread input and
+unsent output included.
+
 ## Limitations
 
 - Initial packets from new clients have random DCIDs (not QUIC-LB encoded) — the LB uses round-robin for these

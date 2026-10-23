@@ -56,6 +56,8 @@ pub const WsRequest = http1.WsRequest;
 pub const WsConn = http1.WsConn;
 pub const WsAcceptOptions = http1.WsAcceptOptions;
 pub const WsSendError = http1.WsSendError;
+/// A WebSocket on its way to another server; see `WsConn.handOver`.
+pub const WsHandover = http1.WsHandover;
 pub const WsMessageKind = http1.WsMessageKind;
 pub const WsCloseCode = http1.WsCloseCode;
 
@@ -751,6 +753,8 @@ pub fn Server(comptime Handler: type) type {
     const serves_raw_quic = Handler.protocol == .webtransport and
         @hasDecl(Handler, "raw_quic") and Handler.raw_quic;
     comptime {
+        // Each callback-like decl is checked against every known name.
+        @setEvalBranchQuota(10_000);
         if (!@hasDecl(Handler, "protocol")) {
             @compileError("Handler must declare 'pub const protocol: event_loop.Protocol'");
         }
@@ -764,7 +768,7 @@ pub fn Server(comptime Handler: type) type {
             "onH0Finished",       "onWritable",         "onRequestEnd",
             "onRequestCancelled", "onConnectionClosed", "onQuicConnected",
             "onWsUpgrade",        "onWsMessage",        "onWsClose",
-            "onPass",             "onHandover",
+            "onPass",             "onHandover",         "onWsHandover",
         };
 
         for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
@@ -784,7 +788,7 @@ pub fn Server(comptime Handler: type) type {
                         "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
                         "onStopSending, onWritable, onPollComplete, onConnectionClosed, " ++
                         "onQuicConnected, onH0Request, onH0Data, onH0Finished, " ++
-                        "onWsUpgrade, onWsMessage, onWsClose, onPass, onHandover");
+                        "onWsUpgrade, onWsMessage, onWsClose, onPass, onHandover, onWsHandover");
                 }
             }
         }
@@ -801,8 +805,8 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
-        if ((@hasDecl(Handler, "onWsMessage") or @hasDecl(Handler, "onWsClose")) and !@hasDecl(Handler, "onWsUpgrade")) {
-            @compileError("onWsMessage and onWsClose need onWsUpgrade, which accepts the WebSockets they serve");
+        if ((@hasDecl(Handler, "onWsMessage") or @hasDecl(Handler, "onWsClose") or @hasDecl(Handler, "onWsHandover")) and !@hasDecl(Handler, "onWsUpgrade")) {
+            @compileError("onWsMessage, onWsClose and onWsHandover need onWsUpgrade, which accepts the WebSockets they serve");
         }
         if (@hasDecl(Handler, "onWsUpgrade") and @typeInfo(@TypeOf(Handler.onWsUpgrade)).@"fn".param_types.len != 3) {
             @compileError("onWsUpgrade must have 3 params (self, req: *WsRequest, path)");
@@ -822,6 +826,9 @@ pub fn Server(comptime Handler: type) type {
         }
         if (@hasDecl(Handler, "onHandover") and @TypeOf(Handler.onHandover) != fn (*Handler, Handover) void) {
             @compileError("onHandover must be fn (self: *Handler, handover: Handover) void");
+        }
+        if (@hasDecl(Handler, "onWsHandover") and @TypeOf(Handler.onWsHandover) != fn (*Handler, WsHandover) void) {
+            @compileError("onWsHandover must be fn (self: *Handler, handover: WsHandover) void");
         }
     }
 

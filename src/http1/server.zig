@@ -12,6 +12,10 @@
 //! Requests: `Upgrade: websocket` goes to `onWsUpgrade` when the handler has
 //! it; GET and HEAD are served from `static_dir` (404 without one); other
 //! methods get 405. Request bodies are not supported.
+//!
+//! A WebSocket can move to a listener on another loop and thread
+//! (`WsConn.handOver`, `onWsHandover`, `Server.adopt`): servers that share a
+//! port under `reuse_port` send each to the one that serves its peer.
 
 const std = @import("std");
 const posix = std.posix;
@@ -36,6 +40,8 @@ pub const WsConn = conn_mod.WsConn;
 pub const WsRequest = conn_mod.WsRequest;
 pub const WsAcceptOptions = conn_mod.AcceptOptions;
 pub const WsSendError = conn_mod.SendError;
+pub const WsHandover = conn_mod.WsHandover;
+pub const WsHandoverError = conn_mod.HandoverError;
 pub const WsMessageKind = websocket.MessageKind;
 pub const WsCloseCode = websocket.CloseCode;
 pub const mimeType = conn_mod.mimeType;
@@ -110,11 +116,13 @@ pub const Handlers = struct {
     upgrade: ?*const fn (ctx: *anyopaque, req: *WsRequest, path: []const u8) void,
     message: *const fn (ctx: *anyopaque, ws: *WsConn, data: []const u8, kind: WsMessageKind) void,
     close: *const fn (ctx: *anyopaque, ws: *WsConn, code: u16, reason: []const u8) void,
+    /// Null when the handler hands no WebSocket over.
+    handover: ?*const fn (ctx: *anyopaque, h: WsHandover) void = null,
 };
 
 /// Binds a handler's optional `onWsUpgrade(self, req, path)`,
-/// `onWsMessage(self, ws, data[, kind])` and `onWsClose(self, ws, code,
-/// reason)`.
+/// `onWsMessage(self, ws, data[, kind])`, `onWsClose(self, ws, code,
+/// reason)` and `onWsHandover(self, handover)`.
 pub fn handlersFor(comptime H: type, handler: *H) Handlers {
     const S = struct {
         fn upgrade(ctx: *anyopaque, req: *WsRequest, path: []const u8) void {
@@ -133,12 +141,16 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
             if (comptime !@hasDecl(H, "onWsClose")) return;
             H.onWsClose(@ptrCast(@alignCast(ctx)), ws, code, reason);
         }
+        fn handover(ctx: *anyopaque, h: WsHandover) void {
+            H.onWsHandover(@ptrCast(@alignCast(ctx)), h);
+        }
     };
     return .{
         .ctx = handler,
         .upgrade = if (@hasDecl(H, "onWsUpgrade")) S.upgrade else null,
         .message = S.message,
         .close = S.close,
+        .handover = if (@hasDecl(H, "onWsHandover")) S.handover else null,
     };
 }
 
@@ -265,6 +277,8 @@ pub const Server = struct {
     /// each open WebSocket's handler hears `onWsClose(1001)`.
     pub fn deinit(self: *Server) void {
         if (self.started) {
+            // A WebSocket on its way out stays, and closes with the rest.
+            self.stopping = true;
             // Deferred closes that will not get another loop iteration.
             self.timers.runDeferred();
             while (self.conns) |c| {
@@ -274,6 +288,24 @@ pub const Server = struct {
             self.timers.deinit();
         }
         sys.close(self.listen_fd);
+    }
+
+    /// Take in a WebSocket another server let go of (`WsConn.handOver`) and
+    /// serve it from here on: messages it sent behind the one that moved
+    /// it, and every later one, go to this server's handler, from a later
+    /// loop iteration than this call. On this server's loop thread.
+    /// `max_connections` doesn't apply: it was admitted where it began. A
+    /// stopping server discards it (`WsHandover.discard`) and errors.
+    pub fn adopt(self: *Server, h: WsHandover) error{Stopping}!*WsConn {
+        if (!self.started or self.stopping) {
+            h.discard();
+            return error.Stopping;
+        }
+        const c = h.conn;
+        c.moveTo(self);
+        self.link(c);
+        self.ws_count += 1;
+        return &c.ws;
     }
 
     /// The TCP port the listener is bound to.
@@ -337,6 +369,10 @@ pub const Server = struct {
             sys.close(fd);
             return;
         };
+        self.link(c);
+    }
+
+    fn link(self: *Server, c: *Conn) void {
         c.next = self.conns;
         if (self.conns) |h| h.prev = c;
         self.conns = c;

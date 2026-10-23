@@ -41,6 +41,11 @@ const EchoHandler = struct {
     close_reason_len: usize = 0,
     send_after_close: ?event_loop.WsSendError = null,
     flood_result: ?event_loop.WsSendError = null,
+    flood_sent: usize = 0,
+    /// What "move" let go of, for the test to adopt or discard.
+    handed: ?event_loop.WsHandover = null,
+    /// A read or write of it was still in flight on this loop then.
+    handed_busy: bool = false,
     wt_session_ids: [4]u64 = @splat(0),
     wt_sessions: usize = 0,
 
@@ -69,17 +74,20 @@ const EchoHandler = struct {
             };
             return;
         }
-        if (std.mem.eql(u8, data, "flood")) {
+        if (std.mem.startsWith(u8, data, "flood")) {
             var chunk: [16 * 1024]u8 = undefined;
             @memset(&chunk, 'f');
             for (0..4096) |_| {
                 ws.send(&chunk) catch |err| {
                     self.flood_result = err;
-                    return;
+                    break;
                 };
+                self.flood_sent += 1;
             }
+            if (std.mem.endsWith(u8, data, "move")) ws.handOver() catch unreachable;
             return;
         }
+        if (std.mem.eql(u8, data, "move")) return ws.handOver() catch unreachable;
         switch (kind) {
             .binary => ws.send(data) catch {},
             .text => ws.sendText(data) catch {},
@@ -92,6 +100,11 @@ const EchoHandler = struct {
         self.close_reason_len = @min(reason.len, self.close_reason_buf.len);
         @memcpy(self.close_reason_buf[0..self.close_reason_len], reason[0..self.close_reason_len]);
         if (self.ws == ws) self.ws = null;
+    }
+
+    pub fn onWsHandover(self: *EchoHandler, h: event_loop.WsHandover) void {
+        self.handed = h;
+        self.handed_busy = h.conn.sock.reading or h.conn.sock.writing;
     }
 
     pub fn onConnectRequest(self: *EchoHandler, session: *event_loop.Session, session_id: u64, _: []const u8) void {
@@ -246,6 +259,57 @@ const Harness = struct {
         while (!c.tls.?.handshakeComplete()) {
             c.poll();
             if (c.eof) return error.EndOfStream;
+            if (sys.nanoTimestamp() > deadline) return error.Timeout;
+            try self.step();
+        }
+    }
+};
+
+/// Two servers, each on a loop of its own as two workers' would be: a
+/// WebSocket the first lets go of is adopted by the second at once.
+const Pair = struct {
+    a: Harness,
+    b: Harness,
+    adopted: u32,
+
+    fn init(self: *Pair, port: u16, h1: event_loop.Http1Config) !void {
+        self.adopted = 0;
+        try self.a.init(port, h1);
+        errdefer self.a.deinit();
+        try self.b.init(port + 1, h1);
+    }
+
+    fn deinit(self: *Pair) void {
+        self.b.deinit();
+        self.a.deinit();
+    }
+
+    fn step(self: *Pair) !void {
+        try self.a.loop.run(.no_wait);
+        if (self.a.handler.handed) |h| {
+            self.a.handler.handed = null;
+            try testing.expect(!self.a.handler.handed_busy);
+            self.b.handler.ws = try self.b.server.http1_server.?.adopt(h);
+            self.adopted += 1;
+        }
+        try self.b.loop.run(.no_wait);
+        sys.sleepNs(50 * std.time.ns_per_us);
+    }
+
+    fn frame(self: *Pair, c: *TestClient) !ServerFrame {
+        const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
+        while (true) {
+            c.poll();
+            if (try c.takeFrame()) |f| return f;
+            if (c.eof) return error.EndOfStream;
+            if (sys.nanoTimestamp() > deadline) return error.Timeout;
+            try self.step();
+        }
+    }
+
+    fn closesOnB(self: *Pair, n: u32) !void {
+        const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
+        while (self.b.handler.closes < n) {
             if (sys.nanoTimestamp() > deadline) return error.Timeout;
             try self.step();
         }
@@ -819,4 +883,137 @@ test "ws: a WebTransport client and a WebSocket client share one handler and loo
     // One counter for both: the WebSocket's id is no session's.
     try testing.expectEqual(@as(usize, 1), h.handler.wt_sessions);
     try testing.expect(h.handler.ws_id != h.handler.wt_session_ids[0]);
+}
+
+test "ws: handed over to a server on another loop, with the message behind the move" {
+    for ([_]bool{ false, true }) |use_tls| {
+        var p: Pair = undefined;
+        try p.init(if (use_tls) 29472 else 29470, .{ .tls = use_tls });
+        defer p.deinit();
+        var c: TestClient = .{};
+        defer c.deinit();
+        try p.a.upgrade(&c, "/", use_tls);
+        try c.sendFrame(.binary, true, "before");
+        try testing.expectEqualStrings("before", (try p.frame(&c)).payload);
+
+        // In one write, so the first server reads both and delivers one.
+        var frames: [64]u8 = undefined;
+        var n = maskedFrame(&frames, .binary, "move").len;
+        n += maskedFrame(frames[n..], .binary, "behind").len;
+        try c.send(frames[0..n]);
+        try testing.expectEqualStrings("behind", (try p.frame(&c)).payload);
+        try testing.expectEqual(@as(u32, 1), p.adopted);
+        try testing.expectEqual(p.a.handler.ws_id, p.b.handler.ws.?.id());
+        try c.sendFrame(.binary, true, "after");
+        try testing.expectEqualStrings("after", (try p.frame(&c)).payload);
+        try testing.expectEqual(@as(usize, 0), p.a.server.http1_server.?.conn_count);
+        try testing.expectEqual(@as(usize, 1), p.b.server.http1_server.?.ws_count);
+        // Its ping timer went with it.
+        try testing.expect(p.a.server.http1_server.?.timers.head == null);
+        try testing.expect(p.b.server.http1_server.?.timers.head != null);
+
+        var cp: [125]u8 = undefined;
+        try c.sendFrame(.close, true, websocket.closePayload(&cp, 1000, ""));
+        try testing.expectEqual(@as(?u16, 1000), (try p.frame(&c)).closeCode());
+        try p.closesOnB(1);
+        try testing.expectEqual(@as(u32, 0), p.a.handler.closes);
+    }
+}
+
+test "ws: a handover waits out a write in flight, and the new server sends the rest" {
+    // Asked for with a write in flight, or once the flood drained enough for
+    // the next message to be read. `Pair.step` checks nothing was in flight
+    // when it moved.
+    for ([_]bool{ true, false }) |at_once| {
+        var p: Pair = undefined;
+        try p.init(29474, .{ .tls = false });
+        defer p.deinit();
+        var c: TestClient = .{};
+        defer c.deinit();
+        try p.a.upgrade(&c, "/", false);
+        if (at_once) {
+            try c.sendFrame(.binary, true, "flood, move");
+        } else {
+            try c.sendFrame(.binary, true, "flood");
+            try c.sendFrame(.binary, true, "move");
+        }
+        try c.sendFrame(.binary, true, "behind");
+        try expectFloodThenBehind(&p, &c);
+        try testing.expect(p.a.handler.flood_result != null);
+    }
+}
+
+fn expectFloodThenBehind(p: *Pair, c: *TestClient) !void {
+    var floods: usize = 0;
+    while (true) {
+        const f = try p.frame(c);
+        if (f.payload.len != 16 * 1024) {
+            try testing.expectEqualStrings("behind", f.payload);
+            break;
+        }
+        floods += 1;
+    }
+    try testing.expectEqual(p.a.handler.flood_sent, floods);
+    try testing.expectEqual(@as(u32, 1), p.adopted);
+}
+
+test "ws: a peer that drops while handed over is closed by the new server" {
+    var p: Pair = undefined;
+    try p.init(29480, .{ .tls = false });
+    defer p.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try p.a.upgrade(&c, "/", false);
+    try c.sendFrame(.binary, true, "move");
+    c.abort();
+    try p.closesOnB(1);
+    try testing.expectEqual(@as(u16, 1006), p.b.handler.close_code);
+    try testing.expectEqual(@as(u32, 1), p.adopted);
+    try testing.expectEqual(@as(u32, 0), p.a.handler.closes);
+}
+
+test "ws: handOver only from onWsMessage; a discarded handover ends the connection" {
+    var h: Harness = undefined;
+    try h.init(29478, .{ .tls = false });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try h.upgrade(&c, "/", false);
+    try testing.expectError(error.NotInMessage, h.handler.ws.?.handOver());
+
+    try c.sendFrame(.binary, true, "move");
+    const W = struct {
+        fn done(hh: *Harness) bool {
+            return hh.handler.handed != null;
+        }
+    };
+    try h.spinUntil(&h, W.done);
+    try testing.expectEqual(@as(usize, 0), h.server.http1_server.?.conn_count);
+    h.handler.handed.?.discard();
+    try h.eof(&c);
+    try testing.expectEqual(@as(u32, 0), h.handler.closes);
+}
+
+test "ws: a server that stops while a WebSocket waits to move closes it there" {
+    var h: Harness = undefined;
+    try h.init(29479, .{ .tls = false });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try h.upgrade(&c, "/", false);
+    try c.sendFrame(.binary, true, "move");
+    // The loop iteration that reads the move lets go of it on a later one.
+    const conn = h.server.http1_server.?.conns.?;
+    const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
+    while (conn.phase != .moving) {
+        if (sys.nanoTimestamp() > deadline) return error.Timeout;
+        c.poll();
+        try h.loop.run(.no_wait);
+    }
+
+    h.server.stop();
+    try h.handlerCloses(1);
+    try testing.expectEqual(@as(u16, 1001), h.handler.close_code);
+    for (0..20) |_| try h.step();
+    try testing.expect(h.handler.handed == null);
 }

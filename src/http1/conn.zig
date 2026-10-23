@@ -47,6 +47,9 @@ const Phase = enum {
     ws_closing,
     /// Flushing, lingering or aborting; nothing more is read or written.
     closing,
+    /// A WebSocket handed over (`WsConn.handOver`), waiting for its socket
+    /// to come off the loop.
+    moving,
 };
 
 pub const SendError = error{
@@ -97,6 +100,18 @@ pub const WsConn = struct {
         return self.conn().sendMessage(.text, data);
     }
 
+    /// Move this WebSocket, with its TLS session, unread input and unsent
+    /// output, to a `Server` on another loop: another thread's, on the same
+    /// port. Only from `onWsMessage`, whose message is then the last this
+    /// server delivers. Once no read or write of it is in flight here, the
+    /// handler's `onWsHandover` gets it, on this thread, to pass to the new
+    /// server's, where `Server.adopt` takes it in. Don't use this handle
+    /// again: sends fail meanwhile, and no `onWsClose` comes here unless the
+    /// server stops first.
+    pub fn handOver(self: *WsConn) HandoverError!void {
+        return self.conn().handOver();
+    }
+
     /// Starts the closing handshake. `onWsClose` follows once the peer
     /// answers, or with 1006 when it doesn't within 5 s; never from inside
     /// this call. A code a peer may not receive (1005, 1006, 1015, or
@@ -115,6 +130,36 @@ pub const WsConn = struct {
 
     pub fn peerAddress(self: *const WsConn) *const posix.sockaddr.storage {
         return &self.constConn().peer;
+    }
+};
+
+pub const HandoverError = error{
+    /// The handler has no `onWsHandover`.
+    HandoverNotConfigured,
+    /// Not called from `onWsMessage`.
+    NotInMessage,
+    /// The WebSocket is closing or gone.
+    Closed,
+};
+
+/// A WebSocket on its way from one server to another: from the old one's
+/// `onWsHandover` to the new one's `Server.adopt`. It must reach exactly one
+/// `adopt`, or `discard`.
+pub const WsHandover = struct {
+    conn: *Conn,
+
+    /// The WebSocket's id, which it keeps on the new server.
+    pub fn id(self: WsHandover) u64 {
+        return self.conn.ws.ws_id;
+    }
+
+    /// Free a WebSocket no server will adopt, with no Close frame: the peer
+    /// sees its TCP connection end.
+    pub fn discard(self: WsHandover) void {
+        const c = self.conn;
+        c.sock.closeFd();
+        c.sock.freeBuffers();
+        c.free();
     }
 };
 
@@ -216,6 +261,10 @@ pub const Conn = struct {
     phase: Phase = .head,
     deadline: timers.Deadline = .{ .callback = onDeadline },
     processing: bool = false,
+    /// Inside the handler's `onWsMessage`.
+    in_message: bool = false,
+    /// Adopted: reads what the old server left unread, then reads on.
+    resume_cb: timers.Deferred = .{ .callback = onResume },
 
     // The request being answered.
     keep_alive: bool = true,
@@ -257,8 +306,12 @@ pub const Conn = struct {
     }
 
     fn destroy(self: *Conn) void {
-        const gpa = self.server.alloc;
         self.server.timers.clear(&self.deadline);
+        self.free();
+    }
+
+    fn free(self: *Conn) void {
+        const gpa = self.sock.alloc;
         self.closeFile();
         self.ws.decoder.deinit(gpa);
         if (self.tls) |t| {
@@ -291,7 +344,7 @@ pub const Conn = struct {
             };
             self.flushTls();
             self.process();
-            if (t.peerClosed()) self.onSocketEof();
+            if (t.peerClosed() and self.phase != .moving) self.onSocketEof();
             return;
         }
         if (self.in.items.len > self.in_pos) {
@@ -316,21 +369,43 @@ pub const Conn = struct {
             .head => self.enterClosing(.graceful),
             // A WebSocket that ends without a Close frame is abnormal (1006).
             .static_body, .ws_open, .ws_closing => self.finish(websocket.CloseCode.abnormal, .abort),
+            // A failed write: the new server reads the end.
+            .moving => {},
         }
     }
 
     pub fn onSocketWritable(self: *Conn) void {
         switch (self.phase) {
             .static_body => self.pumpFile(),
-            // Output drained after afterInput paused for it: read again, and
-            // answer what was left buffered.
+            // Output drained after afterInput paused for it: answer what was
+            // left buffered, then read again. In that order, so a message
+            // that hands the WebSocket over finds no read armed.
             .head, .ws_open, .ws_closing => {
                 if (!self.sock.read_paused) return;
-                self.sock.resumeRead();
+                self.sock.read_paused = false;
                 if (self.unreadLen() > 0) self.process();
+                self.sock.startReading();
             },
-            .closing => {},
+            .closing, .moving => {},
         }
+    }
+
+    /// A WebSocket handed over has its socket off the loop: it leaves for
+    /// the handler's `onWsHandover`.
+    pub fn onSocketParked(self: *Conn) void {
+        if (self.phase != .moving or self.server.stopping) return;
+        self.server.removeConn(self);
+        self.server.ws_count -= 1;
+        const h = self.server.handlers;
+        h.handover.?(h.ctx, .{ .conn = self });
+    }
+
+    fn onResume(d: *timers.Deferred) void {
+        const self: *Conn = @alignCast(@fieldParentPtr("resume_cb", d));
+        if (!self.sock.isOpen()) return;
+        if (self.unreadLen() > 0) self.process();
+        if (self.tls) |t| if (t.peerClosed()) return self.onSocketEof();
+        self.sock.startReading();
     }
 
     pub fn onSocketClosed(self: *Conn) void {
@@ -347,6 +422,8 @@ pub const Conn = struct {
             .ws_open => self.onPingTimer(),
             // No Close answered ours; the connection ends abnormally.
             .ws_closing => self.finish(websocket.CloseCode.abnormal, .abort),
+            // Cleared by handOver.
+            .moving => {},
             // Handshake, idle keep-alive, a stalled response, or linger.
             .head, .static_body, .closing => self.finish(websocket.CloseCode.abnormal, .abort),
         }
@@ -440,7 +517,7 @@ pub const Conn = struct {
             const used = switch (self.phase) {
                 .head => self.processHead(buf[pos..]),
                 .ws_open, .ws_closing => self.processFrame(buf[pos..]),
-                .static_body, .closing => null,
+                .static_body, .closing, .moving => null,
             } orelse break;
             pos += used;
         }
@@ -538,6 +615,8 @@ pub const Conn = struct {
                 // §5.5.1: after our Close, data frames are discarded.
                 if (self.phase == .ws_open and !self.ws.notified) {
                     const h = self.server.handlers;
+                    self.in_message = true;
+                    defer self.in_message = false;
                     h.message(h.ctx, &self.ws, m.data, m.kind);
                 }
             },
@@ -634,6 +713,30 @@ pub const Conn = struct {
         if (!self.sock.isOpen()) return error.Closed;
     }
 
+    fn handOver(self: *Conn) HandoverError!void {
+        if (self.server.handlers.handover == null) return error.HandoverNotConfigured;
+        if (!self.in_message) return error.NotInMessage;
+        if (self.ws.notified or self.phase != .ws_open or !self.sock.isOpen()) return error.Closed;
+        self.phase = .moving;
+        self.server.timers.clear(&self.deadline);
+        self.sock.park();
+    }
+
+    /// `Server.adopt`: serve on `server`, on its loop's thread.
+    pub fn moveTo(self: *Conn, server: *Server) void {
+        self.server = server;
+        if (self.tls) |t| if (server.tlsConfig()) |tc| {
+            t.config = tc;
+        };
+        self.sock.rebind(server.loop, &server.timers);
+        self.phase = .ws_open;
+        const ping_ms = server.config.websocket.ping_interval_ms;
+        if (ping_ms > 0) server.timers.set(&self.deadline, ping_ms);
+        // After the handler has the WebSocket: what the old server left
+        // unread comes after the message that moved it.
+        server.timers.defer_(&self.resume_cb);
+    }
+
     fn closeWebSocket(self: *Conn, code: u16, reason: []const u8) void {
         if (self.ws.notified or self.phase != .ws_open) return;
         const send_code = if (websocket.isValidCloseCode(code)) code else websocket.CloseCode.normal;
@@ -648,7 +751,7 @@ pub const Conn = struct {
     /// connection goes. The frame is written directly when the socket has
     /// room; nothing waits for it.
     pub fn shutdown(self: *Conn) void {
-        if (self.phase == .ws_open and !self.ws.close_sent) {
+        if ((self.phase == .ws_open or self.phase == .moving) and !self.ws.close_sent) {
             var p: [125]u8 = undefined;
             self.sendFrame(.close, websocket.closePayload(&p, websocket.CloseCode.going_away, ""));
             self.ws.close_sent = true;
@@ -661,7 +764,7 @@ pub const Conn = struct {
         return switch (self.phase) {
             .head => self.unreadLen() == 0,
             .static_body => false,
-            .ws_open, .ws_closing, .closing => true,
+            .ws_open, .ws_closing, .closing, .moving => true,
         };
     }
 
