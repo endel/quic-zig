@@ -854,6 +854,9 @@ pub const WebTransportConnection = struct {
         // 8. Poll H3 for events (settings, connect requests, responses)
         if (try self.pollH3Events()) |event| return event;
 
+        // Credit the steps above earned the peer (a WT_*_BLOCKED answered,
+        // a stream opened) goes now: null tells a server nothing is pending.
+        self.flushFlowControl();
         return null;
     }
 
@@ -1540,12 +1543,11 @@ pub const WebTransportConnection = struct {
         return std.mem.eql(u8, token, "webtransport") or std.mem.eql(u8, token, "webtransport-h3");
     }
 
-    /// Poll H3 events and translate to WT events.
+    /// Poll H3 events and translate to WT events. One with no WebTransport
+    /// meaning is taken and the next looked at: null has to mean H3 holds
+    /// nothing more, as a server polls again only when something new arrives.
     fn pollH3Events(self: *WebTransportConnection) !?WtEvent {
-        const event = try self.h3.poll();
-        if (event == null) return null;
-
-        switch (event.?) {
+        while (try self.h3.poll()) |event| switch (event) {
             .connect_request => |req| {
                 if (isWebTransportProtocol(req.protocol)) {
                     // Register as a connecting session; past our slots the
@@ -1556,7 +1558,7 @@ pub const WebTransportConnection = struct {
                             st.recv.stopSending(@backingInt(h3_conn.H3Error.request_rejected));
                         }
                         try self.h3.excluded_streams.put(req.stream_id, {});
-                        return null;
+                        continue;
                     }
                     self.active_session_count += 1;
                     // Exclude this stream from H3 bidi processing
@@ -1656,8 +1658,7 @@ pub const WebTransportConnection = struct {
                 }
             },
             .writable => |sid| return .{ .writable = .{ .session_id = sid, .stream_id = sid } },
-        }
-
+        };
         return null;
     }
 };
@@ -2309,6 +2310,30 @@ test "WT integration: server receives connect_request from H3" {
         },
         else => return error.UnexpectedEvent,
     }
+}
+
+test "WT: a CONNECT behind the peer's SETTINGS comes out of the same poll" {
+    // A poll that took SETTINGS and returned null left the CONNECT for the
+    // next packet, which a server that polls only on news may never get.
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, true);
+    defer wt.deinit();
+
+    var ctrl: [128]u8 = undefined;
+    const ctrl_len = buildWtControlPayload(&ctrl);
+    try (try quic_conn.streams.getOrCreateRecvStream(2)).handleStreamFrame(0, ctrl[0..ctrl_len], false);
+    var req: [512]u8 = undefined;
+    const req_len = buildConnectRequest(&req, "/wt");
+    try (try quic_conn.streams.getOrCreateStream(0)).recv.handleStreamFrame(0, req[0..req_len], false);
+
+    const ev = (try wt.poll()) orelse return error.ExpectedConnectRequest;
+    try testing.expect(ev == .connect_request);
+    try testing.expect(h3.peer_settings_received);
 }
 
 test "WT integration: webtransport-h3 opens a session too" {
