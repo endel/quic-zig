@@ -2104,7 +2104,9 @@ pub fn Server(comptime Handler: type) type {
             const deadline = earliest orelse return floor;
             const delta_ns = deadline - now;
             if (delta_ns <= 0) return 1; // overdue — fire on next tick
-            const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
+            // Rounded up: a timer short of the deadline finds nothing due and
+            // is re-armed at 0 ms, polling without waiting until it comes.
+            const ms: u64 = @intCast(@divFloor(delta_ns - 1, std.time.ns_per_ms) + 1);
             return if (floor) |f| @min(ms, f) else ms;
         }
     };
@@ -3487,7 +3489,8 @@ pub fn Client(comptime Handler: type) type {
             const deadline = self.conn.nextTimeoutNsAt(now) orelse return floor;
             const delta_ns = deadline - now;
             if (delta_ns <= 0) return 1;
-            const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
+            // Rounded up, as the server's: rounded down, it fires early, then again.
+            const ms: u64 = @intCast(@divFloor(delta_ns - 1, std.time.ns_per_ms) + 1);
             const clamped = if (floor) |f| @min(ms, f) else ms;
             return if (clamped == 0) 1 else clamped;
         }
