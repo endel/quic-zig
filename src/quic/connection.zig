@@ -17,7 +17,6 @@ const TransportError = frame_mod.TransportError;
 const ack_handler = @import("ack_handler.zig");
 const congestion = @import("congestion.zig");
 const flow_control = @import("flow_control.zig");
-const rtt = @import("rtt.zig");
 const stream_mod = @import("stream.zig");
 const crypto_stream = @import("crypto_stream.zig");
 const transport_params = @import("transport_params.zig");
@@ -2987,13 +2986,7 @@ pub const Connection = struct {
                                     const challenge = self.paths[candidate_idx].validator.startChallenge();
                                     self.pending_frames.push(.{ .path_challenge = challenge });
 
-                                    // Reset CC/RTT/MTU/ECN for new IP
-                                    self.cc = congestion.Cubic.init();
-                                    self.pacer = congestion.Pacer.init();
-                                    self.pkt_handler.rtt_stats = rtt.RttStats{};
-                                    self.mtu_discoverer.reset();
-                                    self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
-                                    self.ecn_validator.reset();
+                                    self.resetPathEstimates();
 
                                     const migrating_to_v4 = !current_is_v4 and pref.hasIpv4();
                                     std.log.info("preferred_address: migrating from {s} to {s} port {d}", .{
@@ -3813,12 +3806,7 @@ pub const Connection = struct {
         const old_path = &self.paths[1 - candidate_idx];
         const same_ip = sockaddrSameIp(&new_peer_addr, &old_path.peer_addr);
         if (!same_ip) {
-            self.cc = congestion.Cubic.init();
-            self.pacer = congestion.Pacer.init();
-            self.pkt_handler.rtt_stats = rtt.RttStats{};
-            self.mtu_discoverer.reset();
-            self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
-            self.ecn_validator.reset();
+            self.resetPathEstimates();
             std.log.info("migration: IP changed, reset CC, RTT, MTU and ECN", .{});
         } else {
             // NAT rebinding (port-only change): keep CC and MTU, but the new
@@ -3830,6 +3818,18 @@ pub const Connection = struct {
             self.cc.enterRecoveryForMigration(now);
             std.log.info("migration: port-only change (NAT rebinding), preserving CC", .{});
         }
+    }
+
+    /// A new peer IP: congestion control, RTT, MTU and ECN start over (RFC
+    /// 9000 9.4). max_ack_delay stays: it is the peer's transport parameter,
+    /// or what we asked it for, not an estimate of the path.
+    fn resetPathEstimates(self: *Connection) void {
+        self.cc = congestion.Cubic.init();
+        self.pacer = congestion.Pacer.init();
+        self.pkt_handler.rtt_stats = .{ .max_ack_delay = self.pkt_handler.rtt_stats.max_ack_delay };
+        self.mtu_discoverer.reset();
+        self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
+        self.ecn_validator.reset();
     }
 
     /// Check for timeouts and maintenance tasks.

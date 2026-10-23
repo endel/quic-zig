@@ -12,6 +12,7 @@ const ack_handler = @import("ack_handler.zig");
 const congestion = @import("congestion.zig");
 const tls13 = @import("tls13.zig");
 const mtu = @import("mtu.zig");
+const transport_params = @import("transport_params.zig");
 
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
@@ -969,6 +970,51 @@ test "migration: a new address gets its PATH_CHALLENGE with the old path's packe
     var answered = false;
     for (p.client.pending_frames.queued()) |f| answered = answered or f == .path_response;
     try testing.expect(answered);
+}
+
+test "migration: a new IP starts the RTT over but keeps the peer's max_ack_delay" {
+    // RFC 9000 9.4 resets the RTT estimator, not the peer's transport
+    // parameter: back at the 25 ms default, a peer at 60 drew spurious PTOs.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    var p: Pair = undefined;
+    try p.initWith(.{}, .{ .max_ack_delay = 60 });
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    try testing.expectEqual(60 * ms, sconn.pkt_handler.rtt_stats.max_ack_delay);
+
+    var moved = addr(40000);
+    const in: *posix.sockaddr.in = @ptrCast(@alignCast(&moved));
+    in.addr = std.mem.nativeToBig(u32, 0x7f000002);
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var resp: [MAX_DGRAM]u8 = undefined;
+    p.client.pending_frames.push(.ping);
+    const n = try p.client.send(&buf);
+    _ = p.mgr.recvDatagram(buf[0..n], moved, p.s_addr, 0, &resp);
+    try testing.expect(!sconn.pkt_handler.rtt_stats.has_measurement);
+    try testing.expectEqual(60 * ms, sconn.pkt_handler.rtt_stats.max_ack_delay);
+}
+
+test "migration: a client moving to the server's preferred address keeps its max_ack_delay" {
+    // RFC 9000 9.6: the move starts the RTT over, as 9.4 has it, right after
+    // the server's transport parameters set max_ack_delay. Pair.init would
+    // wait for a confirmation that never comes here: the harness delivers
+    // the server's packets from its old address, which the moved client drops.
+    var pref: transport_params.PreferredAddress = .{ .ipv4_addr = .{ 127, 0, 0, 2 }, .ipv4_port = 4434, .cid_len = 8 };
+    @memcpy(pref.cid_buf[0..8], "prefcid1");
+    var p: Pair = .{
+        .mgr = connection_manager.ConnectionManager.init(testing.allocator, serverTls(), .{ .max_ack_delay = 60, .preferred_address = pref }, @splat(1), @splat(2)),
+        .client = try testing.allocator.create(connection.Connection),
+    };
+    try connection.connectInto(p.client, testing.allocator, "localhost", .{}, clientTls(), null);
+    defer p.deinit();
+    p.client.paths[0].peer_addr = p.s_addr;
+    p.client.paths[0].local_addr = p.c_addr;
+    while (p.client.peer_params == null and p.exchange()) {}
+
+    const path = &p.client.paths[p.client.active_path_idx].peer_addr;
+    try testing.expectEqual(@as(u16, 4434), std.mem.bigToNative(u16, @as(*const posix.sockaddr.in, @ptrCast(@alignCast(path))).port));
+    try testing.expectEqual(60 * ms, p.client.pkt_handler.rtt_stats.max_ack_delay);
 }
 
 test "qlog: every packet the server sends is traced once, as its own type" {

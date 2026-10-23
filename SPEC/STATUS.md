@@ -61,7 +61,7 @@
 | 9.3.1 | Peer Address Spoofing | ✅ Done | Path validation + amplification limits prevent spoofed address attacks |
 | 9.3.2 | On-Path Address Spoofing | ✅ Done | Path validation detects on-path spoofing per spec |
 | 9.3.3 | Off-Path Packet Forwarding | ✅ Done | Path validation + non-probing frame detection |
-| 9.4 | Loss Detection and Congestion Control | ✅ Done | CC/RTT reset on IP change |
+| 9.4 | Loss Detection and Congestion Control | ✅ Done | CC/RTT reset on IP change, the preferred address's included; the peer's max_ack_delay is kept |
 | 9.5 | Privacy Implications of Connection Migration | ✅ Done | Fresh CID consumed on migration |
 | 9.6 | Server's Preferred Address | ✅ Done | PreferredAddress struct, encode/decode, client migration |
 | 9.6.1 | Communicating a Preferred Address | ✅ Done | Server sends via transport params (ConnectionConfig.preferred_address) |
