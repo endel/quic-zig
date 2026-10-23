@@ -127,6 +127,10 @@ pub const Config = struct {
     /// `ConnectionConfig.ack_bytes_threshold` for every connection. Ignored
     /// when `conn_config` is set.
     ack_bytes_threshold: u32 = 0,
+    /// `ConnectionConfig.request_ack_frequency` for every connection: ask
+    /// clients that support it for fewer ACKs. Ignored when `conn_config`
+    /// is set.
+    request_ack_frequency: bool = true,
 
     // Advanced: provide pre-built TLS and connection configs directly.
     // When tls_config is set, cert_path/key_path are ignored.
@@ -907,6 +911,7 @@ pub fn Server(comptime Handler: type) type {
                     .token_key = retry_token_key,
                     .max_ack_delay = config.max_ack_delay,
                     .ack_bytes_threshold = config.ack_bytes_threshold,
+                    .request_ack_frequency = config.request_ack_frequency,
                 };
                 if (Handler.protocol == .webtransport or Handler.protocol == .quic) {
                     cc.max_datagram_frame_size = config.max_datagram_frame_size;
@@ -6229,6 +6234,24 @@ test "e2e: a server's longer max_ack_delay reaches its client, and small packets
     var server_ack = AckWatch{ .conn = sconn };
     try runUntil(&e2e.loop, &server_ack, AckWatch.sent, 1_000);
     try testing.expect(server_ack.at - first > 25 * ms);
+}
+
+test "e2e: a server asks its client for fewer ACKs, unless told not to" {
+    for ([_]bool{ true, false }, [_]u16{ 29514, 29515 }) |request, port| {
+        var h = EchoOnAsk{};
+        var client_handler = QuicIdleClient{};
+        var e2e: E2e(EchoOnAsk, QuicIdleClient) = undefined;
+        try e2e.initServer(port, &h, &client_handler, .{ .request_ack_frequency = request }, null);
+        defer e2e.deinit();
+        const Asked = struct {
+            fn f(c: *Client(QuicIdleClient)) bool {
+                return c.conn.isEstablished() and c.conn.handshake_confirmed;
+            }
+        };
+        try runUntil(&e2e.loop, &e2e.client, Asked.f, 10_000);
+        // The ACK_FREQUENCY rides with HANDSHAKE_DONE.
+        try testing.expectEqual(@as(u32, if (request) 11 else 2), e2e.client.conn.pkt_handler.recv[2].ack_eliciting_threshold);
+    }
 }
 
 test "e2e: a client and server that both offer QUIC v2 finish the handshake in it" {

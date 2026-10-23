@@ -434,7 +434,8 @@ test "ACK-only packets: a peer that never acknowledges them costs the server not
         replies += try p.sendUnheard() orelse break;
     }
     try testing.expect(replies >= 100);
-    try testing.expectEqual(held, tracker.sent_packets.count());
+    // The PINGs acknowledge what the server sent past the handshake.
+    try testing.expect(tracker.sent_packets.count() <= held);
 }
 
 test "ACK-only packets: a one-way flow of datagrams draws one per two packets" {
@@ -528,6 +529,98 @@ test "transport parameters: each end advertises its max_ack_delay, min_ack_delay
     try testing.expectEqual(@as(i64, 0), p.client.pkt_handler.recv[2].max_ack_delay_ns);
     // draft-ietf-quic-ack-frequency forbids a min_ack_delay over max_ack_delay.
     try testing.expect(from_client.min_ack_delay.? <= from_client.max_ack_delay * 1000);
+}
+
+test "ACK_FREQUENCY: a server asks its client for fewer ACKs; a client never asks" {
+    // draft-ietf-quic-ack-frequency. quic-zig advertises min_ack_delay at
+    // both ends, so either could ask: a client asking would replace the
+    // server's own ACK policy.
+    for ([_]bool{ true, false }) |request| {
+        var p: Pair = undefined;
+        try p.initWith(.{ .request_ack_frequency = request }, .{});
+        defer p.deinit();
+        const sconn = p.mgr.entries.items[0].conn;
+        const client_acks = &p.client.pkt_handler.recv[2];
+        try testing.expectEqual(@as(u32, if (request) 11 else 2), client_acks.ack_eliciting_threshold);
+        try testing.expectEqual(25 * std.time.ns_per_ms, client_acks.max_ack_delay_ns);
+        try testing.expectEqual(@as(u32, 2), sconn.pkt_handler.recv[2].ack_eliciting_threshold);
+    }
+}
+
+/// A Pair whose handshake's last packets were acknowledged, numbering
+/// without the skips that read as gaps, on the virtual clock.
+fn settledPair(p: *Pair, server_config: connection.ConnectionConfig, client_config: connection.ConnectionConfig) !*connection.Connection {
+    try p.initWith(server_config, client_config);
+    errdefer p.deinit();
+    sys.test_clock.? += 25 * std.time.ns_per_ms;
+    while (p.exchange()) {}
+    const sconn = p.mgr.entries.items[0].conn;
+    sconn.pkt_handler.skip_pn = std.math.maxInt(u64);
+    try testing.expectEqual(@as(u64, 0), sconn.pkt_handler.bytes_in_flight);
+    return sconn;
+}
+
+test "ACK_FREQUENCY: the packet that fills the server's window asks for its ACK at once" {
+    // draft-ietf-quic-ack-frequency 8.1.1. The client waits for 11 packets,
+    // more than the window holds: without IMMEDIATE_ACK the transfer would
+    // stall until its max_ack_delay. Only the packet crossing the window
+    // asks, full-size (its frame still fits) or small, also when it crosses
+    // inside its AEAD tag; without our request, none.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    const Case = struct { request: bool = true, small: bool = true, in_tag: bool = false };
+    for ([_]Case{ .{ .small = false }, .{}, .{ .in_tag = true }, .{ .request = false } }) |c| {
+        const config: connection.ConnectionConfig = .{ .max_datagram_frame_size = 1200, .request_ack_frequency = c.request };
+        var p: Pair = undefined;
+        const sconn = try settledPair(&p, config, config);
+        defer p.deinit();
+        sconn.cc.congestion_window = 8 * sconn.cc.max_datagram_size; // below the pacer's burst
+        // Only an IMMEDIATE_ACK could draw an ACK here.
+        p.client.pkt_handler.recv[2].ack_eliciting_threshold = 100;
+
+        if (!c.small) {
+            const s = try sconn.openStream();
+            try s.send.writeData(&@as([16 << 10]u8, @splat('x')));
+        }
+        var buf: [MAX_DGRAM]u8 = undefined;
+        var full = false;
+        while (!full) {
+            if (c.small) try sconn.sendDatagram(&@as([100]u8, @splat('x')));
+            const n = try sconn.send(&buf);
+            try testing.expect(n > 0 and n <= sconn.packer.max_packet_size);
+            full = sconn.pkt_handler.bytes_in_flight >= sconn.cc.sendWindow();
+            p.client.handleDatagram(buf[0..n], .{ .to = p.c_addr, .from = p.s_addr, .datagram_size = n });
+            try testing.expectEqual(full and c.request, p.client.pkt_handler.recv[2].ack_queued);
+            // The next packet, as large, crosses 8 bytes before its end.
+            if (c.in_tag and !full) sconn.cc.congestion_window = sconn.pkt_handler.bytes_in_flight + n - 8;
+        }
+    }
+}
+
+test "ACK_FREQUENCY: a PTO probe asks for its ACK at once" {
+    // draft-ietf-quic-ack-frequency 7. The client got the packet and its ACK
+    // was lost: the probe adds no gap to answer, so without IMMEDIATE_ACK it
+    // waits out the client's max_ack_delay on top of the PTO.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    var p: Pair = undefined;
+    const sconn = try settledPair(&p, .{}, .{});
+    defer p.deinit();
+
+    const s = try sconn.openStream();
+    try s.send.writeData("hello");
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var n = try sconn.send(&buf);
+    p.client.handleDatagram(buf[0..n], .{ .to = p.c_addr, .from = p.s_addr, .datagram_size = n });
+    sys.test_clock = p.client.pkt_handler.recv[2].ack_alarm.?;
+    try testing.expect(try p.client.send(&buf) > 0); // the ACK, lost
+
+    sys.test_clock = sconn.nextTimeoutNs().?;
+    _ = try sconn.fireTimers();
+    try testing.expect(sconn.pto_probe_pending > 0);
+    n = try sconn.send(&buf);
+    p.client.handleDatagram(buf[0..n], .{ .to = p.c_addr, .from = p.s_addr, .datagram_size = n });
+    try testing.expect(p.client.pkt_handler.recv[2].ack_queued);
 }
 
 test "PATH_CHALLENGE: a peer that never acknowledges the responses can't grow the server's records" {
@@ -1092,6 +1185,10 @@ test "key update: a peer's second update right after its first is still read" {
         const sconn = p.mgr.entries.items[0].conn;
         const initiator = if (client_initiates) p.client else sconn;
         const responder = if (client_initiates) sconn else p.client;
+        // An update waits for an ACK, which the handshake's last packets
+        // get from the alarm.
+        sys.test_clock.? += 25 * std.time.ns_per_ms;
+        while (p.exchange()) {}
         try testing.expect(initiator.initiateKeyUpdate());
         try testing.expect(try sendAndRead(&p, initiator, responder, "first"));
         try testing.expect(initiator.initiateKeyUpdate());
@@ -1110,6 +1207,10 @@ test "key update: a peer's next update after a quiet spell is still read" {
         const sconn = p.mgr.entries.items[0].conn;
         const initiator = if (client_initiates) p.client else sconn;
         const responder = if (client_initiates) sconn else p.client;
+        // An update waits for an ACK, which the handshake's last packets
+        // get from the alarm.
+        sys.test_clock.? += 25 * std.time.ns_per_ms;
+        while (p.exchange()) {}
         try testing.expect(initiator.initiateKeyUpdate());
         try testing.expect(try sendAndRead(&p, initiator, responder, "first"));
         sys.test_clock.? += 10 * std.time.ns_per_s;

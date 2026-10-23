@@ -219,7 +219,7 @@ pub const QlogWriter = struct {
         if (pkt.has_handshake_done) w.frame("\"handshake_done\"", .{});
         if (pkt.has_datagram) w.frame("\"datagram\"", .{});
         for (pkt.getControlFrames()) |cf| switch (cf) {
-            .max_data, .new_token => w.frame("\"{s}\"", .{@tagName(cf)}),
+            .max_data, .new_token, .ack_frequency => w.frame("\"{s}\"", .{@tagName(cf)}),
             .max_stream_data => |id| w.frame("\"max_stream_data\",\"stream_id\":{d}", .{id}),
             .max_streams_bidi => w.frame("\"max_streams\",\"stream_type\":\"bidirectional\"", .{}),
             .max_streams_uni => w.frame("\"max_streams\",\"stream_type\":\"unidirectional\"", .{}),

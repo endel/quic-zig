@@ -592,6 +592,16 @@ pub const ConnectionConfig = struct {
     /// window for `max_ack_delay`. 0 counts packets alone. An ACK_FREQUENCY
     /// frame from the peer replaces it with the peer's threshold.
     ack_bytes_threshold: u32 = 0,
+    /// Servers only: ask a client that advertises min_ack_delay
+    /// (draft-ietf-quic-ack-frequency: quinn and quic-zig do, browsers
+    /// don't) to acknowledge every 11th ack-eliciting packet rather than
+    /// every 2nd. That spares the client's ACK-only packets and our reading
+    /// them. The client keeps the max_ack_delay it advertised, so our PTO
+    /// doesn't change. The packet that fills our congestion window, and
+    /// each PTO probe, carries IMMEDIATE_ACK, so a transfer waiting on the
+    /// window isn't held back. A client never asks: it would replace the
+    /// server's own ACK policy.
+    request_ack_frequency: bool = true,
 };
 
 /// The min_ack_delay we advertise (draft-ietf-quic-ack-frequency), in µs:
@@ -599,6 +609,10 @@ pub const ConnectionConfig = struct {
 fn minAckDelayUs(max_ack_delay_ms: u14) u64 {
     return @min(1000, @as(u64, max_ack_delay_ms) * 1000);
 }
+
+/// The Ack-Eliciting Threshold `request_ack_frequency` asks for: an ACK after
+/// more than this many ack-eliciting packets.
+const ACK_FREQUENCY_THRESHOLD: u64 = 10;
 
 /// An idle timeout in nanoseconds. The wire allows 2^62 ms, past what i64
 /// nanoseconds hold, and deadlines add it to the clock: capped at 2^32 ms
@@ -788,8 +802,8 @@ pub const Connection = struct {
     app_frames: bool = false,
 
     // draft-ietf-quic-ack-frequency
-    peer_supports_ack_freq: bool = false,
-    ack_freq_send_seq: u64 = 0,
+    ack_freq_send_seq: u64 = 0, // > 0 once we asked: IMMEDIATE_ACK is then ours to send
+    ack_freq_wanted: bool = false, // ConnectionConfig.request_ack_frequency, on a server
 
     // 0-RTT (early data) keys
     early_data_open: ?quic_crypto.Open = null, // Server: decrypt 0-RTT packets
@@ -1112,6 +1126,23 @@ pub const Connection = struct {
         const app = &self.pkt_handler.recv[@backingInt(ack_handler.EncLevel.application)];
         app.max_ack_delay_ns = @as(i64, config.max_ack_delay) * std.time.ns_per_ms;
         app.ack_bytes_threshold = config.ack_bytes_threshold;
+        self.ack_freq_wanted = self.is_server and config.request_ack_frequency;
+    }
+
+    /// Asks the peer to acknowledge less often (draft-ietf-quic-ack-frequency
+    /// 4). Its own max_ack_delay stays: a longer one would add to our PTO
+    /// (7), and with it to recovering a lost last packet.
+    fn requestAckFrequency(self: *Connection) void {
+        const peer = self.peer_params orelse return;
+        if (peer.min_ack_delay == null) return;
+        self.pushReliable(.{ .ack_frequency = .{
+            .sequence_number = self.ack_freq_send_seq,
+            .ack_eliciting_threshold = ACK_FREQUENCY_THRESHOLD,
+            // Never under its min_ack_delay, which may not exceed it.
+            .request_max_ack_delay = peer.max_ack_delay * std.time.us_per_ms,
+            .reordering_threshold = 1,
+        } });
+        self.ack_freq_send_seq += 1;
     }
 
     pub fn deinit(self: *Connection) void {
@@ -2542,8 +2573,9 @@ pub const Connection = struct {
             },
 
             .ack_frequency => |af| {
-                // draft-ietf-quic-ack-frequency: update ACK generation parameters
-                if (!self.peer_supports_ack_freq) {
+                // draft-ietf-quic-ack-frequency 3: allowed by OUR min_ack_delay,
+                // whether or not the peer advertised its own.
+                if (self.local_params.min_ack_delay == null) {
                     self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY not negotiated");
                     return error.ProtocolViolation;
                 }
@@ -2824,13 +2856,6 @@ pub const Connection = struct {
                         // Server must send HANDSHAKE_DONE to the client (RFC 9001 Section 4.1.2)
                         self.packer.send_handshake_done = true;
                         self.handshake_done_pending = true;
-
-                        // draft-ietf-quic-ack-frequency: disabled for now.
-                        // Sending ACK_FREQUENCY changes the browser's ACK behavior,
-                        // which can negatively impact datagram latency in ping-pong patterns.
-                        // The RFC 9000 default (ACK every 2 ack-eliciting packets) works well
-                        // for interactive workloads. Re-enable for bulk transfer scenarios.
-                        // if (self.peer_supports_ack_freq) { ... }
                     }
                     // Client: Keep Handshake keys until HANDSHAKE_DONE received (RFC 9001 §4.9.2)
                     // This allows the client to ACK server's Handshake retransmissions under loss
@@ -2923,10 +2948,8 @@ pub const Connection = struct {
                             peer_tp.initial_max_data,
                         });
 
-                        // draft-ietf-quic-ack-frequency: detect peer support
-                        if (peer_tp.min_ack_delay != null) {
-                            self.peer_supports_ack_freq = true;
-                        }
+                        // draft-ietf-quic-ack-frequency, if the peer supports it
+                        if (self.ack_freq_wanted) self.requestAckFrequency();
 
                         // Client: migrate to server's preferred address (RFC 9000 §9.6)
                         if (!self.is_server) {
@@ -3412,6 +3435,11 @@ pub const Connection = struct {
                 else
                     continue,
                 .new_token => self.newTokenFrame() orelse continue,
+                // draft-ietf-quic-ack-frequency 4: another, with the next sequence number.
+                .ack_frequency => {
+                    self.requestAckFrequency();
+                    continue;
+                },
             };
             self.pushReliable(frame);
         }
@@ -3474,6 +3502,7 @@ pub const Connection = struct {
             }
 
             // First time: build close packet at best available encryption level
+            self.packer.window_left = null;
             const app_seal: ?*const quic_crypto.Seal = if (self.key_update) |*ku|
                 &ku.current_seal
             else
@@ -3602,6 +3631,14 @@ pub const Connection = struct {
 
         self.packer.conn_flow_ctrl = &self.conn_flow_ctrl;
         self.packer.ecn_mark = self.ecn_validator.shouldMark();
+        // Once the peer was asked for fewer ACKs, the packet that fills the
+        // window, or a probe, asks for one at once.
+        self.packer.window_left = if (self.ack_freq_send_seq == 0)
+            null
+        else if (self.pto_probe_pending > 0)
+            0
+        else
+            self.cc.sendWindow() -| self.pkt_handler.bytes_in_flight;
 
         const bytes_written = try self.packer.packCoalesced(
             send_buf,
@@ -6466,7 +6503,6 @@ test "an ACK Delay no clock could produce is clamped, not overflowed" {
 test "ACK_FREQUENCY: a huge max ack delay is capped, one under our min_ack_delay refused" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
-    conn.peer_supports_ack_freq = true;
     conn.local_params.min_ack_delay = 1000;
 
     try conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = 1 << 60, .reordering_threshold = 1 } }, .application, 0);
@@ -6474,6 +6510,58 @@ test "ACK_FREQUENCY: a huge max ack delay is capped, one under our min_ack_delay
     try conn.pkt_handler.recv[2].onPacketReceived(0, true, std.math.maxInt(i64) / 2, 0, 0);
 
     try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 1, .ack_eliciting_threshold = 2, .request_max_ack_delay = 999, .reordering_threshold = 1 } }, .application, 0));
+}
+
+test "ACK_FREQUENCY: ours to accept once we advertise min_ack_delay, whatever the peer advertised" {
+    // draft-ietf-quic-ack-frequency 3: the parameter says what its sender
+    // accepts. A peer without one of its own was refused.
+    const af: Frame = .{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 9, .request_max_ack_delay = 30_000, .reordering_threshold = 1 } };
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.local_params.min_ack_delay = 1000;
+    try conn.processFrame(&af, .application, 0);
+    try std.testing.expectEqual(@as(u32, 10), conn.pkt_handler.recv[2].ack_eliciting_threshold);
+    try std.testing.expectEqual(30 * std.time.ns_per_ms, conn.pkt_handler.recv[2].max_ack_delay_ns);
+
+    var unadvertised = testConnection(std.testing.allocator);
+    defer unadvertised.deinit();
+    unadvertised.peer_params = .{ .min_ack_delay = 1000 };
+    try std.testing.expectError(error.ProtocolViolation, unadvertised.processFrame(&af, .application, 0));
+}
+
+test "ACK_FREQUENCY: a peer with a min_ack_delay is asked for fewer ACKs, keeping its max_ack_delay" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.requestAckFrequency();
+    conn.peer_params = .{ .max_ack_delay = 40 };
+    conn.requestAckFrequency();
+    try std.testing.expectEqual(@as(?frame_mod.PendingControlFrame, null), conn.pending_frames.pop());
+    try std.testing.expectEqual(@as(u64, 0), conn.ack_freq_send_seq);
+
+    conn.peer_params.?.min_ack_delay = 1000;
+    const pto = conn.pkt_handler.rtt_stats.max_ack_delay;
+    conn.requestAckFrequency();
+    const af = conn.pending_frames.pop().?.ack_frequency;
+    try std.testing.expectEqual(@as(u64, 0), af.sequence_number);
+    try std.testing.expectEqual(ACK_FREQUENCY_THRESHOLD, af.ack_eliciting_threshold);
+    try std.testing.expectEqual(@as(u64, 40_000), af.request_max_ack_delay);
+    try std.testing.expectEqual(@as(u64, 1), af.reordering_threshold);
+    try std.testing.expectEqual(pto, conn.pkt_handler.rtt_stats.max_ack_delay);
+}
+
+test "ACK_FREQUENCY: a lost one is asked again, with the next sequence number" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.peer_params = .{ .max_ack_delay = 25, .min_ack_delay = 1000 };
+    conn.requestAckFrequency();
+    const sent = conn.pending_frames.pop().?;
+    try loseControlFrames(&conn, &.{sent});
+    var again: ?frame_mod.PendingControlFrame = null;
+    while (conn.pending_frames.pop()) |f| {
+        if (f == .ack_frequency) again = f;
+    }
+    try std.testing.expectEqual(@as(u64, 1), again.?.ack_frequency.sequence_number);
+    try std.testing.expectEqual(sent.ack_frequency.request_max_ack_delay, again.?.ack_frequency.request_max_ack_delay);
 }
 
 test "transport parameters: a min_ack_delay above the max_ack_delay is TRANSPORT_PARAMETER_ERROR" {

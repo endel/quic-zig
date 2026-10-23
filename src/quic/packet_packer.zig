@@ -103,6 +103,12 @@ pub const PacketPacker = struct {
     /// `ack_only`. Set by connection before packing.
     urgent_allowed: bool = true,
 
+    /// Bytes the congestion window has left, once the peer was asked to
+    /// acknowledge less often (ACK_FREQUENCY); 0 for a PTO probe. The 1-RTT
+    /// packet that fills it carries IMMEDIATE_ACK. Set by connection before
+    /// packing.
+    window_left: ?u64 = null,
+
     pub fn init(
         allocator: Allocator,
         is_server: bool,
@@ -277,9 +283,12 @@ pub const PacketPacker = struct {
 
         // We build the packet in a temporary buffer, then encrypt into buf
         var tmp: [ABSOLUTE_MAX_PACKET_SIZE]u8 = undefined;
+        // A packet that may fill the window keeps a byte for IMMEDIATE_ACK.
+        const window_left: ?u64 = if (level == .application and !zero_rtt and !ack_only) self.window_left else null;
+        const imm_room: usize = if (window_left) |left| @intFromBool(left <= self.max_packet_size) else 0;
         // Account for output buffer size: encrypted output = fbs.seek + AEAD_TAG_LEN
-        const effective_max = @min(self.max_packet_size, @min(tmp.len, buf.len -| AEAD_TAG_LEN));
-        var fbs = io.fixedBufferStream(tmp[0..effective_max]);
+        const effective_max = @min(self.max_packet_size, @min(tmp.len, buf.len -| AEAD_TAG_LEN)) - imm_room;
+        var fbs = io.fixedBufferStream(tmp[0 .. effective_max + imm_room]);
         const writer = &fbs;
 
         // Get packet number and encode it
@@ -621,6 +630,13 @@ pub const PacketPacker = struct {
             }
             pkt_handler.onAckSent(level);
             ack_largest_sent = largestAck(ack_frame);
+        }
+
+        // 8. IMMEDIATE_ACK when this packet leaves the window full: the
+        // peer's raised threshold would otherwise hold the ACK we wait on
+        // (draft-ietf-quic-ack-frequency 8.1.1, and 7 for PTO probes).
+        if (imm_room > 0 and ack_eliciting and fbs.seek + 1 + AEAD_TAG_LEN >= window_left.?) {
+            try writer.writeByte(0x1f); // IMMEDIATE_ACK frame
         }
 
         // Note: RFC 9002 loss detection deadlock prevention is handled by the PTO

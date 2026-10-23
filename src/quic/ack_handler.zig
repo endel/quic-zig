@@ -75,9 +75,10 @@ pub const SentControlFrame = union(enum) {
     new_connection_id: u64,
     retire_connection_id: u64,
     new_token: void,
+    ack_frequency: void,
 
     /// The record for a queued frame, or null for one that is never repeated
-    /// (PING, PATH_*, CONNECTION_CLOSE, ACK_FREQUENCY, IMMEDIATE_ACK).
+    /// (PING, PATH_*, CONNECTION_CLOSE, IMMEDIATE_ACK).
     pub fn from(pcf: frame_mod.PendingControlFrame) ?SentControlFrame {
         return switch (pcf) {
             .max_data => .max_data,
@@ -93,7 +94,8 @@ pub const SentControlFrame = union(enum) {
             .new_connection_id => |n| .{ .new_connection_id = n.seq_num },
             .retire_connection_id => |seq| .{ .retire_connection_id = seq },
             .new_token => .new_token,
-            .ping, .path_challenge, .path_response, .connection_close, .ack_frequency, .immediate_ack => null,
+            .ack_frequency => .ack_frequency,
+            .ping, .path_challenge, .path_response, .connection_close, .immediate_ack => null,
         };
     }
 };

@@ -99,7 +99,7 @@
 | 13.2.5 | Measuring and Reporting Host Delay | ✅ Done | ACK delay field |
 | 13.2.6 | ACK Frames and Packet Protection | ✅ Done | ACKs at correct encryption level |
 | 13.2.7 | PADDING Frames Consume Congestion Window | ✅ Done | Counted as in-flight bytes |
-| 13.3 | Retransmission of Information | ✅ Done | STREAM, CRYPTO and HANDSHAKE_DONE are resent from the lost packet's record, and so are control frames: credit (MAX_*) at its current value, BLOCKED only while still blocked, RESET_STREAM rebuilt from the record, STOP_SENDING until the stream's final size is known, NEW_CONNECTION_ID while the CID is live, a fresh NEW_TOKEN. PING, PATH_* and ACK_FREQUENCY are not resent — see [RFC9000_3.md](RFC9000_3.md) |
+| 13.3 | Retransmission of Information | ✅ Done | STREAM, CRYPTO and HANDSHAKE_DONE are resent from the lost packet's record, and so are control frames: credit (MAX_*) at its current value, BLOCKED only while still blocked, RESET_STREAM rebuilt from the record, STOP_SENDING until the stream's final size is known, NEW_CONNECTION_ID while the CID is live, a fresh NEW_TOKEN, ACK_FREQUENCY again with the next sequence number. PING and PATH_* are not resent — see [RFC9000_3.md](RFC9000_3.md) |
 | 13.4 | Explicit Congestion Notification | ✅ Done | IP-level ECT(0) marking + reading via recvmsg |
 | 13.4.1 | Reporting ECN Counts | ✅ Done | ACK_ECN frames with counters |
 | 13.4.2 | ECN Validation | ✅ Done | Full validation state machine (ecn.zig) |
@@ -547,12 +547,12 @@ https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/
 | § | Section | Status | Notes |
 |---|---------|--------|-------|
 | — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize; frames packed after it in a packet are read too (picoquic puts HANDSHAKE_DONE there) |
-| — | IMMEDIATE_ACK frame (0x1f) | ✅ Done | Parse, serialize, triggers immediate ACK |
+| — | IMMEDIATE_ACK frame (0x1f) | ✅ Done | Parse, serialize, triggers immediate ACK. Once we sent ACK_FREQUENCY, the packet that fills the congestion window (§8.1.1) and each PTO probe (§7) carry one |
 | — | min_ack_delay transport parameter (0xff04de1b) | ✅ Done | Advertised by both client and server: 1 ms, or max_ack_delay if that is lower. A peer's above its max_ack_delay is TRANSPORT_PARAMETER_ERROR |
 | — | Dynamic ACK thresholds | ✅ Done | ack_eliciting_threshold (an ACK after more than it: 1 is every second packet), max_ack_delay, reordering_threshold |
 | — | Sequence number tracking | ✅ Done | Obsolete ACK_FREQUENCY frames ignored |
-| — | Negotiation via min_ack_delay | ✅ Done | Only send ACK_FREQUENCY if peer advertises support |
-| — | Server sends ACK_FREQUENCY | ❌ Missing | Disabled; the send site runs before the peer's transport parameters are read, so it could never fire |
+| — | Negotiation via min_ack_delay | ✅ Done | ACK_FREQUENCY goes only to a peer that advertised it, and is accepted whenever we advertised ours, whatever the peer did (§3) |
+| — | Server sends ACK_FREQUENCY | ✅ Done | With HANDSHAKE_DONE, to a client that advertises min_ack_delay (quinn and quic-zig do, no browser does): threshold 10, the client's own max_ack_delay, so our PTO is unchanged, reorder 1. Sent again if lost. `ConnectionConfig.request_ack_frequency` turns it off. A client never asks |
 
 ### Summary — ACK Frequency: ✅ Complete (7/7)
 
