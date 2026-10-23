@@ -3,6 +3,7 @@
 // plaintext and encrypted (4-pass Feistel / single-pass AES-ECB) modes.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sys = @import("../sys.zig");
 const crypto = std.crypto;
 const Aes128 = crypto.core.aes.Aes128;
@@ -106,6 +107,103 @@ pub fn extractServerId(config: *const Config, cid: []const u8, out: []u8) bool {
 /// Extract the config_id (bits 7-5) from the first octet of a CID.
 pub fn extractConfigId(first_octet: u8) u3 {
     return @intCast(first_octet >> 5);
+}
+
+// --- Kernel steering ---
+
+/// A classic BPF instruction (`struct sock_filter`).
+pub const SockFilter = extern struct { code: u16, jt: u8, jf: u8, k: u32 };
+
+const bpf = struct {
+    const ld_len = 0x80; // BPF_LD | BPF_W | BPF_LEN
+    const ldb = 0x30; // BPF_LD | BPF_B | BPF_ABS
+    const and_k = 0x54; // BPF_ALU | BPF_AND | BPF_K
+    const jeq = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+    const jge = 0x35;
+    const jset = 0x45;
+    const ret_k = 0x06;
+    const ret_a = 0x16;
+
+    fn op(code: u16, k: u32) SockFilter {
+        return .{ .code = code, .jt = 0, .jf = 0, .k = k };
+    }
+
+    /// A jump at `at` to `t` when true, `f` when false.
+    fn jump(code: u16, k: u32, at: u8, t: u8, f: u8) SockFilter {
+        return .{ .code = code, .jt = t - at - 1, .jf = f - at - 1, .k = k };
+    }
+};
+
+/// The program `steerReuseportGroup` attaches, for a group whose sockets,
+/// in bind order, are the servers with ids 0 to `servers` - 1: the index
+/// of the socket a datagram's DCID names, or past the group's end, which
+/// leaves it to the kernel's 4-tuple hash. Only a DCID with this config's
+/// length and first octet counts, so a client's random first DCID is
+/// hashed as it would be without a program, and so is anything too short
+/// to read. Needs plaintext CIDs and a one-byte server id: the kernel
+/// can't decrypt.
+pub fn reuseportProgram(config: *const Config, servers: usize) error{Unsteerable}![20]SockFilter {
+    if (config.key != null or config.server_id_len != 1 or servers == 0 or servers > 256) return error.Unsteerable;
+    const cid_len = cidLength(config);
+    // Without the length in it, the first octet's low bits are random.
+    const mask: u32 = if (config.encode_length) 0xff else 0xe0;
+    const first: u32 = @as(u32, config.config_id) << 5 | if (config.encode_length) cid_len - 1 else 0;
+    const n: u32 = @intCast(servers);
+    const long = 9;
+    const by_id = 18;
+    const hash = 19;
+    return .{
+        bpf.op(bpf.ld_len, 0),
+        bpf.jump(bpf.jge, 3, 1, 2, hash),
+        bpf.op(bpf.ldb, 0),
+        bpf.jump(bpf.jset, 0x80, 3, long, 4),
+        // Short header: the DCID starts at byte 1.
+        bpf.op(bpf.ldb, 1),
+        bpf.op(bpf.and_k, mask),
+        bpf.jump(bpf.jeq, first, 6, 7, hash),
+        bpf.op(bpf.ldb, 2),
+        bpf.jump(bpf.jge, n, 8, hash, by_id),
+        // Long header: version, then the DCID's length at byte 5.
+        bpf.op(bpf.ld_len, 0),
+        bpf.jump(bpf.jge, 8, 10, 11, hash),
+        bpf.op(bpf.ldb, 5),
+        bpf.jump(bpf.jeq, cid_len, 12, 13, hash),
+        bpf.op(bpf.ldb, 6),
+        bpf.op(bpf.and_k, mask),
+        bpf.jump(bpf.jeq, first, 15, 16, hash),
+        bpf.op(bpf.ldb, 7),
+        bpf.jump(bpf.jge, n, 17, hash, by_id),
+        bpf.op(bpf.ret_a, 0),
+        bpf.op(bpf.ret_k, 0xffff_ffff),
+    };
+}
+
+pub const SteerError = error{ Unsteerable, Unsupported, PermissionDenied, Refused };
+
+/// Linux: have the kernel deliver each datagram reaching the SO_REUSEPORT
+/// group `fd` is in to the socket of the server its DCID names
+/// (`reuseportProgram`) instead of by 4-tuple hash, so the packets of a
+/// connection that moved to another server, handed over or migrated, need
+/// no forwarding. The servers' sockets must be bound in id order, id 0
+/// first, and only theirs: the kernel numbers the group in bind order. One
+/// call serves the whole group, sockets bound later included. Needs no
+/// privilege (Linux 4.5+).
+///
+/// Closing a socket moves the group's last into its place, so close them
+/// last first, or have `Config.foreign_datagram` pass on what the moved
+/// one gets meanwhile.
+pub fn steerReuseportGroup(fd: std.posix.socket_t, config: *const Config, servers: usize) SteerError!void {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    const posix = std.posix;
+    const prog = try reuseportProgram(config, servers);
+    const fprog: extern struct { len: u16, filter: [*]const SockFilter } = .{ .len = prog.len, .filter = &prog };
+    const rc = posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.ATTACH_REUSEPORT_CBPF, @ptrCast(&fprog), @sizeOf(@TypeOf(fprog)));
+    return switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        .PERM, .ACCES => error.PermissionDenied,
+        .NOPROTOOPT => error.Unsupported,
+        else => error.Refused,
+    };
 }
 
 // --- Internal cipher functions ---
@@ -437,4 +535,200 @@ test "a config past a 20-byte CID is refused, and never overruns a decode" {
     try std.testing.expectError(error.InvalidQuicLbConfig, validate(&.{ .config_id = 0, .server_id_len = 1, .nonce_len = 3 }));
     try validate(&.{ .config_id = 0, .server_id_len = 15, .nonce_len = 4 });
     try validate(&.{ .config_id = 6, .server_id_len = 1, .nonce_len = 18 });
+}
+
+/// Runs a classic BPF program on `pkt` as the kernel would: a load past its
+/// end ends the program with 0.
+fn runFilter(prog: []const SockFilter, pkt: []const u8) u32 {
+    var a: u32 = 0;
+    var pc: usize = 0;
+    while (true) : (pc += 1) {
+        const i = prog[pc];
+        switch (i.code) {
+            bpf.ld_len => a = @intCast(pkt.len),
+            bpf.ldb => a = if (i.k < pkt.len) pkt[i.k] else return 0,
+            bpf.and_k => a &= i.k,
+            bpf.jeq, bpf.jge, bpf.jset => {
+                const taken = switch (i.code) {
+                    bpf.jeq => a == i.k,
+                    bpf.jge => a >= i.k,
+                    else => a & i.k != 0,
+                };
+                pc += if (taken) i.jt else i.jf;
+            },
+            bpf.ret_k => return i.k,
+            bpf.ret_a => return a,
+            else => unreachable,
+        }
+    }
+}
+
+fn workerConfig(id: u8) Config {
+    var cfg: Config = .{ .config_id = 0, .server_id_len = 1, .nonce_len = 6 };
+    cfg.server_id[0] = id;
+    return cfg;
+}
+
+/// A short-header packet to `dcid`, or a long-header one: a v1 Initial.
+fn steeringPacket(buf: []u8, long: bool, dcid: []const u8) []u8 {
+    var n: usize = 0;
+    if (long) {
+        @memcpy(buf[0..6], &[_]u8{ 0xc0, 0, 0, 0, 1, @intCast(dcid.len) });
+        n = 6;
+    } else {
+        buf[0] = 0x40;
+        n = 1;
+    }
+    @memcpy(buf[n..][0..dcid.len], dcid);
+    n += dcid.len;
+    @memset(buf[n..][0..24], 0xee);
+    return buf[0 .. n + 24];
+}
+
+test "reuseportProgram: a DCID of ours picks its server's socket, anything else the hash" {
+    const prog = try reuseportProgram(&workerConfig(0), 4);
+    const hash: u32 = 0xffff_ffff;
+    var buf: [64]u8 = undefined;
+    var cid: [8]u8 = undefined;
+
+    for (0..4) |w| {
+        generateCid(&workerConfig(@intCast(w)), &cid);
+        try std.testing.expectEqual(@as(u32, @intCast(w)), runFilter(&prog, steeringPacket(&buf, false, &cid)));
+        try std.testing.expectEqual(@as(u32, @intCast(w)), runFilter(&prog, steeringPacket(&buf, true, &cid)));
+    }
+    // Ids past the group, CIDs not ours: a client's first DCID, another
+    // length, another first octet.
+    generateCid(&workerConfig(4), &cid);
+    try std.testing.expectEqual(hash, runFilter(&prog, steeringPacket(&buf, false, &cid)));
+    try std.testing.expectEqual(hash, runFilter(&prog, steeringPacket(&buf, true, &cid)));
+    const client_dcid = [_]u8{ 0x5a, 1, 2, 3, 4, 5, 6, 7 };
+    try std.testing.expectEqual(hash, runFilter(&prog, steeringPacket(&buf, true, &client_dcid)));
+    try std.testing.expectEqual(hash, runFilter(&prog, steeringPacket(&buf, false, &client_dcid)));
+    const longer = [_]u8{ 0x07, 1, 2, 3, 4, 5, 6, 7, 8 };
+    try std.testing.expectEqual(hash, runFilter(&prog, steeringPacket(&buf, true, &longer)));
+    try std.testing.expectEqual(@as(u32, 1), runFilter(&prog, steeringPacket(&buf, false, &longer)));
+    // Too short to read: hashed, not socket 0.
+    try std.testing.expectEqual(hash, runFilter(&prog, ""));
+    try std.testing.expectEqual(hash, runFilter(&prog, &.{ 0x40, 0x07 }));
+    try std.testing.expectEqual(hash, runFilter(&prog, &.{ 0xc0, 0, 0, 0, 1, 8, 0x07 }));
+    try std.testing.expectEqual(@as(u32, 3), runFilter(&prog, &.{ 0x40, 0x07, 3 }));
+    try std.testing.expectEqual(@as(u32, 3), runFilter(&prog, &.{ 0xc0, 0, 0, 0, 1, 8, 0x07, 3 }));
+}
+
+test "reuseportProgram: without the length in the first octet only its config bits count; unreadable configs are refused" {
+    var cfg: Config = .{ .config_id = 2, .server_id_len = 1, .nonce_len = 7, .encode_length = false };
+    const prog = try reuseportProgram(&cfg, 2);
+    try std.testing.expectEqual(@as(u32, 1), runFilter(&prog, &.{ 0x40, 0b010_10101, 1 }));
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), runFilter(&prog, &.{ 0x40, 0b011_00111, 1 }));
+
+    try std.testing.expectError(error.Unsteerable, reuseportProgram(&workerConfig(0), 0));
+    try std.testing.expectError(error.Unsteerable, reuseportProgram(&workerConfig(0), 257));
+    cfg.server_id_len = 2;
+    try std.testing.expectError(error.Unsteerable, reuseportProgram(&cfg, 2));
+    cfg.server_id_len = 1;
+    cfg.key = @splat(1);
+    try std.testing.expectError(error.Unsteerable, reuseportProgram(&cfg, 2));
+}
+
+test "steerReuseportGroup: the kernel delivers by server id, in bind order, and hashes the rest" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const posix = std.posix;
+    const net = @import("../sockaddr.zig");
+    const n = 3;
+
+    var group: [n]posix.socket_t = undefined;
+    var bound: usize = 0;
+    defer for (group[0..bound]) |fd| sys.close(fd);
+    var port: u16 = 0;
+    while (bound < n) : (bound += 1) {
+        const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+        group[bound] = fd;
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&@as(c_int, 1)));
+        const addr = try net.Address.parseIp4("127.0.0.1", port);
+        try sys.bind(fd, &addr.any, addr.getOsSockLen());
+        if (port == 0) {
+            var got: net.Address = undefined;
+            var len: posix.socklen_t = @sizeOf(net.Address);
+            try sys.getsockname(fd, &got.any, &len);
+            port = got.getPort();
+        }
+    }
+    try steerReuseportGroup(group[0], &workerConfig(0), n);
+
+    // From many source ports, so the hash spreads them.
+    const clients = 16;
+    var from: [clients]posix.socket_t = undefined;
+    var from_port: [clients]u16 = undefined;
+    var opened: usize = 0;
+    defer for (from[0..opened]) |fd| sys.close(fd);
+    const to = try net.Address.parseIp4("127.0.0.1", port);
+    var buf: [64]u8 = undefined;
+    var cid: [8]u8 = undefined;
+    const client_dcid = [_]u8{ 0x5a, 0, 1, 2, 3, 4, 5, 6 };
+    while (opened < clients) : (opened += 1) {
+        const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+        from[opened] = fd;
+        const c: u8 = @intCast(opened);
+        for (0..5) |kind| {
+            const pkt = switch (kind) {
+                0, 1, 3 => blk: {
+                    const id: u8 = switch (kind) {
+                        0 => c % n,
+                        1 => (c + 1) % n,
+                        else => 200,
+                    };
+                    generateCid(&workerConfig(id), &cid);
+                    break :blk steeringPacket(&buf, kind == 1, &cid);
+                },
+                2 => steeringPacket(&buf, true, &client_dcid),
+                else => buf[0..2],
+            };
+            // The kind rides in the last byte; the stub is told by its length.
+            if (kind == 4) @memcpy(pkt, &[_]u8{ 0x40, 0x07 }) else pkt[pkt.len - 1] = @intCast(kind);
+            _ = try sys.sendto(fd, pkt, 0, &to.any, to.getOsSockLen());
+        }
+        var a: net.Address = undefined;
+        var a_len: posix.socklen_t = @sizeOf(net.Address);
+        try sys.getsockname(fd, &a.any, &a_len);
+        from_port[opened] = a.getPort();
+    }
+
+    // where[client][kind]: the group socket it reached.
+    var where: [clients][5]?usize = @splat(@splat(null));
+    var got: usize = 0;
+    const deadline = sys.nanoTimestamp() + 2 * std.time.ns_per_s;
+    while (got < clients * 5 and sys.nanoTimestamp() < deadline) {
+        for (group, 0..) |fd, s| {
+            var src: posix.sockaddr.storage = undefined;
+            var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            const len = sys.recvfrom(fd, &buf, 0, @ptrCast(&src), &src_len) catch continue;
+            const src_port = std.mem.bigToNative(u16, @as(*const posix.sockaddr.in, @ptrCast(&src)).port);
+            const c = std.mem.indexOfScalar(u16, &from_port, src_port) orelse return error.TestUnexpectedResult;
+            const kind: usize = if (len == 2) 4 else buf[len - 1];
+            where[c][kind] = s;
+            got += 1;
+        }
+        sys.sleepNs(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, clients * 5), got);
+
+    var hashed_to: [n]bool = @splat(false);
+    for (where, 0..) |w, c| {
+        try std.testing.expectEqual(c % n, w[0].?);
+        try std.testing.expectEqual((c + 1) % n, w[1].?);
+        // The rest go where the client's 4-tuple hashes, together.
+        try std.testing.expectEqual(w[2].?, w[3].?);
+        try std.testing.expectEqual(w[2].?, w[4].?);
+        hashed_to[w[2].?] = true;
+    }
+    try std.testing.expect(std.mem.count(bool, &hashed_to, &.{true}) > 1);
+}
+
+test "steerReuseportGroup: a socket in no reuseport group is refused with an error" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const posix = std.posix;
+    const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(fd);
+    try std.testing.expectError(error.Refused, steerReuseportGroup(fd, &workerConfig(0), 2));
+    try std.testing.expectError(error.Unsteerable, steerReuseportGroup(fd, &workerConfig(0), 0));
 }

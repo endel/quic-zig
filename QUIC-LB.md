@@ -126,6 +126,21 @@ Initials are never steered: whichever worker receives one accepts the
 connection. A datagram handed over is never handed on again by its id, so a
 CID nobody owns gets a stateless reset from the worker it was steered to.
 
+On Linux the kernel can do the steering: `quic_lb.steerReuseportGroup(fd,
+&config, n)` attaches a classic BPF program to the port's SO_REUSEPORT group
+(SO_ATTACH_REUSEPORT_CBPF, Linux 4.5+, no privilege needed), and each
+datagram whose DCID is one of ours goes straight to the socket of the worker
+it names. The hook then only sees what the program can't place.
+
+- The group numbers its sockets in bind order: give the workers server ids
+  0 to n-1 and bind their sockets in that order. Closing a socket moves the
+  group's last into its slot, so close them last first.
+- Short headers are read at the CID's offset; long headers only when the
+  DCID has our length and first octet, so a new client's random DCID is
+  spread by the 4-tuple hash as before.
+- It needs plaintext CIDs and a one-byte server id, and is refused
+  otherwise.
+
 ### Handing a connection to another worker
 
 A worker can give a live connection away, streams, datagrams and
