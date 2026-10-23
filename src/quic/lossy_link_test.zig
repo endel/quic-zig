@@ -512,7 +512,7 @@ test "migration: a new address gets its PATH_CHALLENGE with the old path's packe
     try testing.expect(m > 0);
     p.client.handleDatagram(buf[0..m], .{ .to = moved, .from = p.s_addr, .datagram_size = m });
     var answered = false;
-    for (p.client.pending_frames.items[0..p.client.pending_frames.len]) |f| answered = answered or f == .path_response;
+    for (p.client.pending_frames.queued()) |f| answered = answered or f == .path_response;
     try testing.expect(answered);
 }
 
@@ -772,7 +772,7 @@ test "handshake: a client that sends no key share is asked for one, and connects
     defer p.deinit();
     const sconn = p.mgr.entries.items[0].conn;
     try testing.expect(p.client.tls13_hs.?.hrr_seen);
-    try testing.expect(sconn.tls13_hs.?.hrr_seen);
+    try testing.expect(sconn.isEstablished()); // a server lets its handshake state go
     try testing.expect(try sendAndRead(&p, p.client, sconn, "after a retry"));
 }
 

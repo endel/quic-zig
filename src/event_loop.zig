@@ -793,6 +793,7 @@ pub fn Server(comptime Handler: type) type {
         /// loop decodes one header block at a time and never holds the
         /// resulting slices past the poll that produced them.
         qpack_scratch: [qpack.SCRATCH_SIZE]u8,
+        qpack_headers: [h3.MAX_HEADERS]qpack.Header,
 
         /// Optional second socket for preferred_address (connectionmigration).
         /// When the server advertises a preferred_address on a different port,
@@ -974,6 +975,7 @@ pub fn Server(comptime Handler: type) type {
                 .batch = ecn_socket.SendBatch.init(sockfd),
                 .recv_buf = undefined,
                 .qpack_scratch = undefined,
+                .qpack_headers = undefined,
                 .out_buf = undefined,
                 .owned_tls = owned_tls,
                 .preferred = preferred,
@@ -1624,6 +1626,7 @@ pub fn Server(comptime Handler: type) type {
                     h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
                     entry.h3_conn = h3c;
                     h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.headers_buf = &self.qpack_headers;
                     h3c.local_settings = .{
                         .enable_connect_protocol = true,
                         .h3_datagram = true,
@@ -1655,6 +1658,7 @@ pub fn Server(comptime Handler: type) type {
                     h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
                     entry.h3_conn = h3c;
                     h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.headers_buf = &self.qpack_headers;
                     try h3c.initConnection();
                 },
                 .h0 => {
@@ -2629,6 +2633,7 @@ pub fn Client(comptime Handler: type) type {
         /// loop decodes one header block at a time and never holds the
         /// resulting slices past the poll that produced them.
         qpack_scratch: [qpack.SCRATCH_SIZE]u8,
+        qpack_headers: [h3.MAX_HEADERS]qpack.Header,
 
         // Single QUIC connection
         conn: *connection.Connection,
@@ -2790,6 +2795,7 @@ pub fn Client(comptime Handler: type) type {
                 .batch = ecn_socket.SendBatch.init(sockfd),
                 .recv_buf = undefined,
                 .qpack_scratch = undefined,
+                .qpack_headers = undefined,
                 .conn = conn_ptr,
                 .remote_addr = remote_addr,
                 .h3_conn = null,
@@ -3124,6 +3130,7 @@ pub fn Client(comptime Handler: type) type {
                     h3c.* = h3.H3Connection.init(self.allocator, self.conn, false);
                     self.h3_conn = h3c;
                     h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.headers_buf = &self.qpack_headers;
                     h3c.local_settings = .{
                         .enable_connect_protocol = true,
                         .h3_datagram = true,
@@ -3158,6 +3165,7 @@ pub fn Client(comptime Handler: type) type {
                     h3c.* = h3.H3Connection.init(self.allocator, self.conn, false);
                     self.h3_conn = h3c;
                     h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.headers_buf = &self.qpack_headers;
                     try h3c.initConnection();
                 },
                 .quic, .h0 => {},

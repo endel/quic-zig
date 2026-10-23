@@ -337,22 +337,21 @@ pub const LocalCidPool = struct {
     }
 };
 
-/// Fixed-capacity queue for QUIC DATAGRAM frames (RFC 9221).
-/// Supports optional max-age expiry and configurable high water mark.
+/// Queue of QUIC DATAGRAM payloads (RFC 9221), at most `max_items` of them,
+/// with optional max-age expiry and a high water mark. Entries lie end to end
+/// in one buffer, allocated on first push and reset whenever the queue
+/// empties: an unused queue costs nothing, and one that drains every pass
+/// holds only what a pass queues.
 pub const DatagramQueue = struct {
-    pub const DEFAULT_MAX_ITEMS: usize = limits.datagram_static_items;
+    pub const DEFAULT_MAX_ITEMS: usize = limits.datagram_queue_items;
     pub const MAX_DATAGRAM_SIZE: usize = 1200;
+    /// Each entry: u16 length, i64 push time, then the payload.
+    const header_len = 10;
 
-    allocator: ?std.mem.Allocator = null,
-    bufs_static: [DEFAULT_MAX_ITEMS][MAX_DATAGRAM_SIZE]u8 = undefined,
-    lens_static: [DEFAULT_MAX_ITEMS]usize = @splat(0),
-    times_static: [DEFAULT_MAX_ITEMS]i64 = @splat(0),
-    bufs_dynamic: ?[][MAX_DATAGRAM_SIZE]u8 = null,
-    lens_dynamic: ?[]usize = null,
-    times_dynamic: ?[]i64 = null,
-    max_items: usize = DEFAULT_MAX_ITEMS,
+    bytes: std.ArrayList(u8) = .empty,
+    /// Where the oldest entry starts in `bytes`.
     head: usize = 0,
-    tail: usize = 0,
+    max_items: usize = DEFAULT_MAX_ITEMS,
     count: usize = 0,
 
     /// Max age in nanoseconds. Datagrams older than this are dropped on read.
@@ -362,79 +361,72 @@ pub const DatagramQueue = struct {
     /// High water mark (max queued items). null = use max_items (default).
     high_water_mark: ?usize = null,
 
-    /// Resize the queue to a custom capacity (must be called before use).
-    pub fn resize(self: *DatagramQueue, alloc: std.mem.Allocator, capacity: usize) !void {
-        if (capacity <= DEFAULT_MAX_ITEMS) return; // static buffer is enough
-        self.allocator = alloc;
-        self.bufs_dynamic = try alloc.alloc([MAX_DATAGRAM_SIZE]u8, capacity);
-        self.lens_dynamic = try alloc.alloc(usize, capacity);
-        self.times_dynamic = try alloc.alloc(i64, capacity);
-        @memset(self.lens_dynamic.?, 0);
-        @memset(self.times_dynamic.?, 0);
-        self.max_items = capacity;
-    }
-
-    pub fn deinitQueue(self: *DatagramQueue) void {
-        if (self.allocator) |alloc| {
-            if (self.bufs_dynamic) |b| alloc.free(b);
-            if (self.lens_dynamic) |l| alloc.free(l);
-            if (self.times_dynamic) |t| alloc.free(t);
-        }
-    }
-
-    fn getBuf(self: *DatagramQueue, idx: usize) *[MAX_DATAGRAM_SIZE]u8 {
-        if (self.bufs_dynamic) |b| return &b[idx];
-        return &self.bufs_static[idx];
-    }
-
-    fn getLen(self: *DatagramQueue, idx: usize) *usize {
-        if (self.lens_dynamic) |l| return &l[idx];
-        return &self.lens_static[idx];
-    }
-
-    fn getTime(self: *DatagramQueue, idx: usize) *i64 {
-        if (self.times_dynamic) |t| return &t[idx];
-        return &self.times_static[idx];
+    pub fn deinitQueue(self: *DatagramQueue, gpa: std.mem.Allocator) void {
+        self.bytes.deinit(gpa);
     }
 
     fn effectiveCapacity(self: *const DatagramQueue) usize {
         return self.high_water_mark orelse self.max_items;
     }
 
-    pub fn push(self: *DatagramQueue, data: []const u8) bool {
+    fn headLen(self: *const DatagramQueue) usize {
+        return std.mem.readInt(u16, self.bytes.items[self.head..][0..2], .little);
+    }
+
+    fn headTime(self: *const DatagramQueue) i64 {
+        return std.mem.readInt(i64, self.bytes.items[self.head + 2 ..][0..8], .little);
+    }
+
+    /// False when full, too large, or out of memory.
+    pub fn push(self: *DatagramQueue, gpa: std.mem.Allocator, data: []const u8) bool {
         if (self.count >= self.effectiveCapacity() or data.len > MAX_DATAGRAM_SIZE) return false;
-        @memcpy(self.getBuf(self.tail)[0..data.len], data);
-        self.getLen(self.tail).* = data.len;
-        self.getTime(self.tail).* = @intCast(sys.nanoTimestamp());
-        self.tail = (self.tail + 1) % self.max_items;
+        const need = header_len + data.len;
+        // Reuse the room pops left at the front before growing.
+        if (self.head > 0 and self.bytes.items.len + need > self.bytes.capacity) {
+            const rest = self.bytes.items.len - self.head;
+            @memmove(self.bytes.items[0..rest], self.bytes.items[self.head..]);
+            self.bytes.items.len = rest;
+            self.head = 0;
+        }
+        const e = self.bytes.addManyAsSlice(gpa, need) catch return false;
+        std.mem.writeInt(u16, e[0..2], @intCast(data.len), .little);
+        // Only an age limit reads the stamp; the clock read showed up per datagram.
+        std.mem.writeInt(i64, e[2..10], if (self.max_age_ns != null) @intCast(sys.nanoTimestamp()) else 0, .little);
+        @memcpy(e[header_len..], data);
         self.count += 1;
         return true;
     }
 
+    /// Set the age limit; entries already queued count their age from `now`.
+    pub fn setMaxAge(self: *DatagramQueue, max_age_ns: ?i64, now: i64) void {
+        if (self.max_age_ns == null and max_age_ns != null) {
+            var at = self.head;
+            for (0..self.count) |_| {
+                std.mem.writeInt(i64, self.bytes.items[at + 2 ..][0..8], now, .little);
+                at += header_len + std.mem.readInt(u16, self.bytes.items[at..][0..2], .little);
+            }
+        }
+        self.max_age_ns = max_age_ns;
+    }
+
     pub fn pop(self: *DatagramQueue, out: []u8) ?usize {
-        if (self.count == 0) return null;
-        const len = self.getLen(self.head).*;
-        if (out.len < len) return null;
-        @memcpy(out[0..len], self.getBuf(self.head)[0..len]);
-        self.head = (self.head + 1) % self.max_items;
-        self.count -= 1;
-        return len;
+        const data = self.peekData() orelse return null;
+        if (out.len < data.len) return null;
+        @memcpy(out[0..data.len], data);
+        self.consume();
+        return data.len;
     }
 
     /// Pop the next non-expired datagram, dropping any expired entries.
     /// Returns null if queue is empty or all remaining entries are expired.
     pub fn popSkipExpired(self: *DatagramQueue, out: []u8, now: i64) ?usize {
-        const max_age = self.max_age_ns orelse return self.pop(out);
-        while (self.count > 0) {
-            const age = now - self.getTime(self.head).*;
-            if (age <= max_age) {
-                return self.pop(out);
-            }
-            // Expired — skip this entry
-            self.head = (self.head + 1) % self.max_items;
-            self.count -= 1;
-        }
-        return null;
+        self.dropExpired(now);
+        return self.pop(out);
+    }
+
+    fn dropExpired(self: *DatagramQueue, now: i64) void {
+        const max_age = self.max_age_ns orelse return;
+        while (self.count > 0 and now - self.headTime() > max_age) self.consume();
     }
 
     pub fn isEmpty(self: *const DatagramQueue) bool {
@@ -452,38 +444,32 @@ pub const DatagramQueue = struct {
     /// Peek at the length of the next datagram without removing it.
     pub fn peekLen(self: *DatagramQueue) ?usize {
         if (self.count == 0) return null;
-        return self.getLen(self.head).*;
+        return self.headLen();
     }
 
-    /// Return a slice into the ring buffer entry without copying.
-    /// The slice is valid until the next pop() or consume() call.
+    /// Return a slice into the queue's buffer without copying.
+    /// The slice is valid until the next push(), pop() or consume() call.
     pub fn peekData(self: *DatagramQueue) ?[]const u8 {
         if (self.count == 0) return null;
-        const len = self.getLen(self.head).*;
-        return self.getBuf(self.head)[0..len];
+        return self.bytes.items[self.head + header_len ..][0..self.headLen()];
     }
 
     /// Peek at next non-expired datagram, consuming any expired entries.
     /// Returns null if queue is empty or all remaining entries are expired.
     pub fn peekDataSkipExpired(self: *DatagramQueue, now: i64) ?[]const u8 {
-        const max_age = self.max_age_ns orelse return self.peekData();
-        while (self.count > 0) {
-            const age = now - self.getTime(self.head).*;
-            if (age <= max_age) {
-                return self.peekData();
-            }
-            // Expired — skip this entry
-            self.head = (self.head + 1) % self.max_items;
-            self.count -= 1;
-        }
-        return null;
+        self.dropExpired(now);
+        return self.peekData();
     }
 
     /// Advance past the head entry (after peekData was used).
     pub fn consume(self: *DatagramQueue) void {
         if (self.count == 0) return;
-        self.head = (self.head + 1) % self.max_items;
+        self.head += header_len + self.headLen();
         self.count -= 1;
+        if (self.count == 0) {
+            self.bytes.items.len = 0;
+            self.head = 0;
+        }
     }
 };
 
@@ -582,24 +568,28 @@ const UNDECRYPTABLE_MAX_PKTS = limits.undecryptable_max_pkts;
 const UNDECRYPTABLE_BUF_LEN = limits.undecryptable_buf_len;
 
 const UndecryptablePackets = struct {
-    buf: [UNDECRYPTABLE_BUF_LEN]u8 = undefined,
+    /// Allocated for the first packet held and freed once they are replayed:
+    /// most connections never hold one, and none past their handshake.
+    buf: ?*[UNDECRYPTABLE_BUF_LEN]u8 = null,
     off: [UNDECRYPTABLE_MAX_PKTS]u32 = undefined,
     plen: [UNDECRYPTABLE_MAX_PKTS]u16 = undefined,
     info: RecvInfo = undefined,
     used: u32 = 0,
     count: u8 = 0,
 
-    fn reset(self: *UndecryptablePackets) void {
-        self.used = 0;
-        self.count = 0;
+    fn reset(self: *UndecryptablePackets, gpa: std.mem.Allocator) void {
+        if (self.buf) |b| gpa.destroy(b);
+        self.* = .{};
     }
 
     /// Store a raw packet to replay later. Bounded; excess silently dropped
     /// (RFC 9001 §4.1.4 allows dropping when the buffer is full).
-    fn push(self: *UndecryptablePackets, bytes: []const u8, rinfo: RecvInfo) void {
+    fn push(self: *UndecryptablePackets, gpa: std.mem.Allocator, bytes: []const u8, rinfo: RecvInfo) void {
         if (self.count >= UNDECRYPTABLE_MAX_PKTS) return;
         if (self.used + bytes.len > UNDECRYPTABLE_BUF_LEN) return;
-        @memcpy(self.buf[self.used..][0..bytes.len], bytes);
+        const buf = self.buf orelse (gpa.create([UNDECRYPTABLE_BUF_LEN]u8) catch return);
+        self.buf = buf;
+        @memcpy(buf[self.used..][0..bytes.len], bytes);
         self.off[self.count] = self.used;
         self.plen[self.count] = @intCast(bytes.len);
         if (self.count == 0) self.info = rinfo;
@@ -625,10 +615,16 @@ pub const Connection = struct {
 
     // TLS 1.3 handshake (null if not configured with TlsConfig)
     /// Heap-allocated: the handshake state is ~52 KB, which by value made it
-    /// the single largest member of Connection. It cannot be released early —
-    /// advanceHandshake still reads it after handshake_confirmed to process
-    /// NewSessionTicket — so this buys size, not lifetime.
+    /// the single largest member of Connection. A client keeps it to read
+    /// NewSessionTicket after the handshake; a server, which has nothing left
+    /// to read, lets it go once the handshake completes (`releaseHandshake`).
     tls13_hs: ?*tls13.Tls13Handshake = null,
+    /// What a released handshake leaves for `negotiatedAlpn`, `peerCertificate`
+    /// and `clientAuth`.
+    alpn_buf: [32]u8 = undefined,
+    alpn_len: u8 = 0,
+    peer_cert: ?[]u8 = null,
+    client_auth: ?*const tls13.ClientAuth = null,
 
     // Network paths (active + candidate for migration)
     paths: [2]NetworkPath = .{ std.mem.zeroes(NetworkPath), std.mem.zeroes(NetworkPath) },
@@ -859,6 +855,7 @@ pub const Connection = struct {
 
         conn.* = Connection{
             .allocator = allocator,
+            .pending_frames = .{ .allocator = allocator },
             .version = header.version,
             .is_server = is_server,
             .paths = .{ initial_path, std.mem.zeroes(NetworkPath) },
@@ -1027,10 +1024,8 @@ pub const Connection = struct {
         conn.handshake_timeout_ns = idleTimeoutNs(config.handshake_timeout);
 
         // Resize datagram queues if configured larger than default
-        if (config.datagram_queue_capacity > DatagramQueue.DEFAULT_MAX_ITEMS) {
-            try conn.datagram_recv_queue.resize(allocator, config.datagram_queue_capacity);
-            try conn.datagram_send_queue.resize(allocator, config.datagram_queue_capacity);
-        }
+        conn.datagram_recv_queue.max_items = config.datagram_queue_capacity;
+        conn.datagram_send_queue.max_items = config.datagram_queue_capacity;
     }
 
     /// Convenience wrapper for callers with stack to spare.
@@ -1056,6 +1051,8 @@ pub const Connection = struct {
             self.allocator.destroy(hs);
             self.tls13_hs = null;
         }
+        if (self.peer_cert) |cert| self.allocator.free(cert);
+        self.peer_cert = null;
         if (self.qlog_writer) |*ql| {
             const now: i64 = @intCast(sys.nanoTimestamp());
             ql.connectionClosed(now, "application", 0);
@@ -1066,8 +1063,10 @@ pub const Connection = struct {
         self.pkt_handler.deinit();
         self.streams.deinit();
         self.crypto_streams.deinit();
-        self.datagram_recv_queue.deinitQueue();
-        self.datagram_send_queue.deinitQueue();
+        self.undecryptable.reset(self.allocator);
+        self.pending_frames.deinit();
+        self.datagram_recv_queue.deinitQueue(self.allocator);
+        self.datagram_send_queue.deinitQueue(self.allocator);
         self.control_retry.deinit(self.allocator);
         self.retiring_cids.deinit(self.allocator);
     }
@@ -1263,7 +1262,7 @@ pub const Connection = struct {
     fn bufferUndecryptable(self: *Connection, header: *packet.Header, fbs: anytype, info: RecvInfo, what: []const u8) void {
         if (self.replaying_undecryptable) return;
         const bytes = currentPacketBytes(header, fbs) orelse return;
-        self.undecryptable.push(bytes, info);
+        self.undecryptable.push(self.allocator, bytes, info);
         std.log.info("recv: buffered undecryptable {s} packet ({d} bytes; {d} queued)", .{ what, bytes.len, self.undecryptable.count });
     }
 
@@ -1278,18 +1277,20 @@ pub const Connection = struct {
         std.log.info("replaying {d} buffered undecryptable packet(s)", .{n});
         // Don't re-credit received bytes on replay (anti-amplification:
         // keeps the server conservative — RFC 9000 §8.1).
-        var rinfo = self.undecryptable.info;
+        // Taken out first: a replayed packet may finish the handshake, and
+        // that resets the queue under us.
+        var held = self.undecryptable;
+        self.undecryptable = .{};
+        defer held.reset(self.allocator);
+        var rinfo = held.info;
         rinfo.datagram_size = 0;
         self.replaying_undecryptable = true;
         defer self.replaying_undecryptable = false;
         for (0..n) |i| {
-            const off = self.undecryptable.off[i];
-            const len = self.undecryptable.plen[i];
-            var rfbs = io.fixedBufferStream(self.undecryptable.buf[off..][0..len]);
+            var rfbs = io.fixedBufferStream(held.buf.?[held.off[i]..][0..held.plen[i]]);
             var h = packet.Header.parse(&rfbs, self.scid_len) catch continue;
             self.recv(&h, &rfbs, rinfo) catch continue;
         }
-        self.undecryptable.reset();
     }
 
     /// Replay buffered packets if a read key was just installed. Safe to call
@@ -2435,7 +2436,7 @@ pub const Connection = struct {
                     if (self.datagram_recv_callback) |cb| {
                         cb(d.data, self.datagram_recv_ctx);
                     } else {
-                        if (!self.datagram_recv_queue.push(d.data)) {
+                        if (!self.datagram_recv_queue.push(self.allocator, d.data)) {
                             self.datagrams_dropped_incoming += 1;
                         }
                     }
@@ -2448,7 +2449,7 @@ pub const Connection = struct {
                     if (self.datagram_recv_callback) |cb| {
                         cb(d.data, self.datagram_recv_ctx);
                     } else {
-                        if (!self.datagram_recv_queue.push(d.data)) {
+                        if (!self.datagram_recv_queue.push(self.allocator, d.data)) {
                             self.datagrams_dropped_incoming += 1;
                         }
                     }
@@ -2710,7 +2711,7 @@ pub const Connection = struct {
                     if (self.is_server) {
                         self.pending_replay_undecryptable = true;
                     } else {
-                        self.undecryptable.reset();
+                        self.undecryptable.reset(self.allocator);
                         self.pending_replay_undecryptable = false;
                     }
 
@@ -2923,6 +2924,7 @@ pub const Connection = struct {
                     // Start PMTUD now that the handshake is complete
                     if (!self.disable_pmtud) self.mtu_discoverer.start();
 
+                    if (self.is_server) self.releaseHandshake();
                     break;
                 },
                 ._continue => continue,
@@ -4124,7 +4126,7 @@ pub const Connection = struct {
         if (!self.datagrams_enabled) return error.DatagramsNotEnabled;
         if (data.len > DatagramQueue.MAX_DATAGRAM_SIZE) return error.DatagramTooLarge;
         if (self.datagram_send_queue.isFull()) return error.DatagramQueueFull;
-        _ = self.datagram_send_queue.push(data);
+        if (!self.datagram_send_queue.push(self.allocator, data)) return error.OutOfMemory;
     }
 
     /// Returns true if the datagram send queue is full.
@@ -4204,34 +4206,54 @@ pub const Connection = struct {
     /// has got that far. A server that advertises several — two MoQ drafts,
     /// say — needs this to know which one it is speaking.
     pub fn negotiatedAlpn(self: *const Connection) []const u8 {
-        const hs = self.tls13_hs orelse return "";
+        const hs = self.tls13_hs orelse return self.alpn_buf[0..self.alpn_len];
         return hs.negotiatedAlpn();
     }
 
     /// Server: the client's verified certificate (DER leaf); see
     /// `Tls13Handshake.peerCertificate`.
     pub fn peerCertificate(self: *const Connection) ?[]const u8 {
-        const hs = self.tls13_hs orelse return null;
+        const hs = self.tls13_hs orelse return self.peer_cert;
         return hs.peerCertificate();
     }
 
     /// Server: the client-auth policy the handshake ran under, from the
     /// certificate entry SNI selected; null when none asked for a certificate.
     pub fn clientAuth(self: *const Connection) ?*const tls13.ClientAuth {
-        const hs = self.tls13_hs orelse return null;
+        const hs = self.tls13_hs orelse return self.client_auth;
         return hs.client_auth;
     }
 
+    /// Free a finished server handshake, keeping what the accessors above
+    /// still answer: 52 KB a connection otherwise held for its lifetime.
+    fn releaseHandshake(self: *Connection) void {
+        const hs = self.tls13_hs orelse return;
+        const alpn = hs.negotiatedAlpn();
+        if (alpn.len > self.alpn_buf.len) return;
+        @memcpy(self.alpn_buf[0..alpn.len], alpn);
+        self.alpn_len = @intCast(alpn.len);
+        self.client_auth = hs.client_auth;
+        // Its allocator is ours (acceptInto), so the certificate can move.
+        self.peer_cert = hs.peer_cert;
+        hs.peer_cert = null;
+        hs.deinit();
+        self.allocator.destroy(hs);
+        self.tls13_hs = null;
+    }
+
     pub fn recvDatagram(self: *Connection, buf: []u8) ?usize {
-        const now: i64 = @intCast(sys.nanoTimestamp());
-        return self.datagram_recv_queue.popSkipExpired(buf, now);
+        const q = &self.datagram_recv_queue;
+        // Polled per connection per pass, mostly empty: no clock without an age limit.
+        if (q.max_age_ns == null) return q.pop(buf);
+        return q.popSkipExpired(buf, @intCast(sys.nanoTimestamp()));
     }
 
     /// Zero-copy datagram receive: returns a slice into the internal ring buffer.
     /// Caller MUST call consumeDatagram() after processing the data.
     pub fn peekDatagram(self: *Connection) ?[]const u8 {
-        const now: i64 = @intCast(sys.nanoTimestamp());
-        return self.datagram_recv_queue.peekDataSkipExpired(now);
+        const q = &self.datagram_recv_queue;
+        if (q.max_age_ns == null) return q.peekData();
+        return q.peekDataSkipExpired(@intCast(sys.nanoTimestamp()));
     }
 
     /// Advance past the datagram returned by peekDatagram().
@@ -4241,12 +4263,12 @@ pub const Connection = struct {
 
     /// Set max age for incoming datagrams (milliseconds). null = no limit.
     pub fn setIncomingDatagramMaxAge(self: *Connection, max_age_ms: ?u64) void {
-        self.datagram_recv_queue.max_age_ns = if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null;
+        self.datagram_recv_queue.setMaxAge(if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null, @intCast(sys.nanoTimestamp()));
     }
 
     /// Set max age for outgoing datagrams (milliseconds). null = no limit.
     pub fn setOutgoingDatagramMaxAge(self: *Connection, max_age_ms: ?u64) void {
-        self.datagram_send_queue.max_age_ns = if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null;
+        self.datagram_send_queue.setMaxAge(if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null, @intCast(sys.nanoTimestamp()));
     }
 
     /// Set high water mark for incoming datagram queue (count).
@@ -4769,6 +4791,7 @@ pub fn connectInto(
 
     conn.* = Connection{
         .allocator = allocator,
+        .pending_frames = .{ .allocator = allocator },
         .version = protocol.SUPPORTED_VERSIONS[0],
         .is_server = false,
         .state = .first_flight,
@@ -4892,10 +4915,8 @@ pub fn connectInto(
     }
 
     // Resize datagram queues if configured larger than default
-    if (config.datagram_queue_capacity > DatagramQueue.DEFAULT_MAX_ITEMS) {
-        try conn.datagram_recv_queue.resize(allocator, config.datagram_queue_capacity);
-        try conn.datagram_send_queue.resize(allocator, config.datagram_queue_capacity);
-    }
+    conn.datagram_recv_queue.max_items = config.datagram_queue_capacity;
+    conn.datagram_send_queue.max_items = config.datagram_queue_capacity;
 
     return;
 }
@@ -4939,6 +4960,7 @@ test "Connection: init and basic state" {
 
     var conn = Connection{
         .allocator = std.testing.allocator,
+        .pending_frames = .{ .allocator = std.testing.allocator },
         .is_server = true,
         .dcid = dcid_val.*,
         .dcid_len = 8,
@@ -5113,15 +5135,16 @@ test "LocalCidPool: pool full" {
 // --- DatagramQueue tests ---
 
 test "DatagramQueue: push and pop" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     try std.testing.expect(q.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), q.queueLen());
     try std.testing.expect(!q.isFull());
 
     const data1 = "hello";
     const data2 = "world!";
-    try std.testing.expect(q.push(data1));
-    try std.testing.expect(q.push(data2));
+    try std.testing.expect(q.push(std.testing.allocator, data1));
+    try std.testing.expect(q.push(std.testing.allocator, data2));
     try std.testing.expect(!q.isEmpty());
     try std.testing.expectEqual(@as(usize, 2), q.queueLen());
 
@@ -5141,58 +5164,63 @@ test "DatagramQueue: push and pop" {
 }
 
 test "DatagramQueue: full queue" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     // Fill the queue (MAX_ITEMS = 32)
     var i: usize = 0;
     while (i < DatagramQueue.DEFAULT_MAX_ITEMS) : (i += 1) {
         try std.testing.expect(!q.isFull());
-        try std.testing.expect(q.push("data"));
+        try std.testing.expect(q.push(std.testing.allocator, "data"));
     }
     // Queue full — push should fail
     try std.testing.expect(q.isFull());
     try std.testing.expectEqual(@as(usize, DatagramQueue.DEFAULT_MAX_ITEMS), q.queueLen());
-    try std.testing.expect(!q.push("overflow"));
+    try std.testing.expect(!q.push(std.testing.allocator, "overflow"));
 }
 
 test "DatagramQueue: oversized datagram rejected" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     const big: [(DatagramQueue.MAX_DATAGRAM_SIZE + 1)]u8 = @splat(0xAA);
-    try std.testing.expect(!q.push(&big));
+    try std.testing.expect(!q.push(std.testing.allocator, &big));
     try std.testing.expect(q.isEmpty());
 }
 
 test "DatagramQueue: pop with small buffer" {
-    var q = DatagramQueue{};
-    try std.testing.expect(q.push("hello"));
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
+    try std.testing.expect(q.push(std.testing.allocator, "hello"));
     var small_buf: [2]u8 = undefined;
     // Buffer too small — should return null
     try std.testing.expect(q.pop(&small_buf) == null);
 }
 
 test "DatagramQueue: high water mark limits push" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     q.high_water_mark = 3;
 
-    try std.testing.expect(q.push("one"));
-    try std.testing.expect(q.push("two"));
-    try std.testing.expect(q.push("three"));
+    try std.testing.expect(q.push(std.testing.allocator, "one"));
+    try std.testing.expect(q.push(std.testing.allocator, "two"));
+    try std.testing.expect(q.push(std.testing.allocator, "three"));
     // At high water mark — push should fail
-    try std.testing.expect(!q.push("four"));
+    try std.testing.expect(!q.push(std.testing.allocator, "four"));
     try std.testing.expect(q.isFull());
     try std.testing.expectEqual(@as(usize, 3), q.queueLen());
 
     // Pop one, then push succeeds again
     var buf: [1200]u8 = undefined;
     _ = q.pop(&buf);
-    try std.testing.expect(q.push("four"));
+    try std.testing.expect(q.push(std.testing.allocator, "four"));
 }
 
 test "DatagramQueue: max age expiry on pop" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     q.max_age_ns = 10_000_000; // 10ms
 
-    try std.testing.expect(q.push("old"));
-    try std.testing.expect(q.push("new"));
+    try std.testing.expect(q.push(std.testing.allocator, "old"));
+    try std.testing.expect(q.push(std.testing.allocator, "new"));
 
     // Both datagrams are fresh — popSkipExpired should return first
     const now: i64 = @intCast(sys.nanoTimestamp());
@@ -5203,13 +5231,57 @@ test "DatagramQueue: max age expiry on pop" {
 }
 
 test "DatagramQueue: peekDataSkipExpired with no max age" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     // No max_age set — behaves like peekData
-    try std.testing.expect(q.push("data"));
+    try std.testing.expect(q.push(std.testing.allocator, "data"));
     const now: i64 = @intCast(sys.nanoTimestamp());
     const peeked = q.peekDataSkipExpired(now);
     try std.testing.expect(peeked != null);
     try std.testing.expectEqualSlices(u8, "data", peeked.?);
+}
+
+test "DatagramQueue: keeps order across sizes as pops free the front" {
+    var q: DatagramQueue = .{ .max_items = 8 };
+    defer q.deinitQueue(std.testing.allocator);
+    var payload: [DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+    var buf: [DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
+    var pushed: usize = 0;
+    var popped: usize = 0;
+    // Sizes cycle 1..1200; three in, two out, until 500 have gone through.
+    while (popped < 500) {
+        for (0..3) |_| {
+            const n = 1 + (pushed * 37) % DatagramQueue.MAX_DATAGRAM_SIZE;
+            if (q.push(std.testing.allocator, payload[0..n])) pushed += 1;
+        }
+        for (0..2) |_| {
+            const len = q.pop(&buf) orelse break;
+            try std.testing.expectEqual(1 + (popped * 37) % DatagramQueue.MAX_DATAGRAM_SIZE, len);
+            try std.testing.expectEqualSlices(u8, payload[0..len], buf[0..len]);
+            popped += 1;
+        }
+    }
+}
+
+test "DatagramQueue: a queue drained each pass stays the size of one pass" {
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
+    var buf: [64]u8 = undefined;
+    for (0..1000) |_| {
+        for (0..4) |_| try std.testing.expect(q.push(std.testing.allocator, &buf));
+        while (q.pop(&buf)) |_| {}
+    }
+    try std.testing.expect(q.bytes.capacity < 4 * (DatagramQueue.header_len + buf.len) * 2);
+}
+
+test "DatagramQueue: an age limit set late counts from when it was set" {
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
+    try std.testing.expect(q.push(std.testing.allocator, "early"));
+    q.setMaxAge(10_000_000, 1_000_000_000);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, 5), q.popSkipExpired(&buf, 1_005_000_000));
 }
 
 // --- Address utility function tests ---
@@ -5328,6 +5400,7 @@ fn testConnection(allocator: std.mem.Allocator) Connection {
     const scid_val = "src12345" ++ @as([12]u8, @splat(0));
     return Connection{
         .allocator = allocator,
+        .pending_frames = .{ .allocator = allocator },
         .is_server = true,
         .dcid = dcid_val.*,
         .dcid_len = 8,
@@ -5476,7 +5549,7 @@ test "Connection: datagram receive" {
     try std.testing.expect(conn.recvDatagram(&buf) == null);
 
     // Simulate receiving a datagram (push to recv queue)
-    try std.testing.expect(conn.datagram_recv_queue.push("incoming data"));
+    try std.testing.expect(conn.datagram_recv_queue.push(std.testing.allocator, "incoming data"));
 
     const len = conn.recvDatagram(&buf).?;
     try std.testing.expectEqualSlices(u8, "incoming data", buf[0..len]);
@@ -6273,7 +6346,8 @@ test "0-RTT: a replayed packet is processed once" {
     defer streams.deinit();
     var pending: frame_mod.PendingFrameQueue = .{};
     var dq: DatagramQueue = .{};
-    try std.testing.expect(dq.push("once"));
+    defer dq.deinitQueue(std.testing.allocator);
+    try std.testing.expect(dq.push(std.testing.allocator, "once"));
     var buf: [1500]u8 = undefined;
     const n = try packer.packCoalesced(&buf, &handler, &crypto_mgr, &streams, &pending, null, &client_keys[1], null, null, 0, &dq, false);
     try std.testing.expect(n > 0);

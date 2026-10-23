@@ -1476,7 +1476,8 @@ test "PacketPacker: control frames past one packet wait for the next" {
 
     // More RESET_STREAMs than one packet may record, and more NEW_TOKENs
     // than one packet can hold: none may be lost to a full packet.
-    var pending_frames = frame_mod.PendingFrameQueue{};
+    var pending_frames = frame_mod.PendingFrameQueue{ .allocator = testing.allocator };
+    defer pending_frames.deinit();
     var id: u64 = 0;
     while (id < 10) : (id += 1) {
         try testing.expect(pending_frames.tryPush(.{ .reset_stream = .{ .stream_id = id * 4 + 2, .error_code = 0, .final_size = 0 } }));

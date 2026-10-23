@@ -15,6 +15,8 @@ const WT_BIDI_STREAM_TYPE: u64 = 0x41;
 
 /// Maximum number of concurrent WebTransport sessions.
 pub const MAX_SESSIONS: usize = 4;
+/// Longest close reason a CLOSE_WEBTRANSPORT_SESSION capsule may carry.
+const max_close_reason = 1024;
 
 /// WebTransport error codes (draft-ietf-webtrans-http3).
 pub const WEBTRANSPORT_SESSION_GONE: u64 = 0x170d7b68;
@@ -77,8 +79,10 @@ pub const Session = struct {
     state: SessionState = .closed,
     occupied: bool = false,
     close_error_code: u32 = 0,
-    close_reason_buf: [1024]u8 = undefined,
-    close_reason_len: u16 = 0,
+    /// Our close's reason or the peer's, at most `max_close_reason` bytes.
+    /// Kept until the slot is next taken: the session_closed event that
+    /// reports it points here.
+    close_reason: []u8 = &.{},
     /// Bytes still to discard from an over-long capsule; see MAX_CAPSULE_PAYLOAD.
     capsule_skip: u64 = 0,
     /// draft-13 §5.3-§5.6 session flow control, sized by `allocateSession`
@@ -172,10 +176,6 @@ pub const WebTransportConnection = struct {
     // per new stream — same pattern as quic-go's nextStreamToAccept.
     next_peer_bidi_to_examine: u64 = 0,
 
-    // Persistent buffer for datagram polling — avoids heap allocation per datagram.
-    // Valid until the next pollDatagrams() call.
-    dgram_poll_buf: [quic_connection.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined,
-
     // Buffered data for WT streams (data after type prefix, or data read before poll)
     stream_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
 
@@ -221,6 +221,7 @@ pub const WebTransportConnection = struct {
     }
 
     pub fn deinit(self: *WebTransportConnection) void {
+        for (&self.sessions) |*s| self.allocator.free(s.close_reason);
         // Free all buffered stream data
         var buf_it = self.stream_bufs.iterator();
         while (buf_it.next()) |entry| {
@@ -255,6 +256,7 @@ pub const WebTransportConnection = struct {
     fn allocateSession(self: *WebTransportConnection, session_id: u64, state: SessionState) ?*Session {
         for (&self.sessions) |*s| {
             if (!s.occupied) {
+                self.allocator.free(s.close_reason);
                 s.* = .{
                     .session_id = session_id,
                     .state = state,
@@ -631,7 +633,7 @@ pub const WebTransportConnection = struct {
         if (session.state == .draining or session.state == .closed) return;
 
         // Truncate reason to spec limit (1024 bytes)
-        const truncated_reason = if (reason.len > 1024) reason[0..1024] else reason;
+        const truncated_reason = reason[0..@min(reason.len, max_close_reason)];
 
         // Send CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
         var frame_buf: [1100]u8 = undefined;
@@ -646,9 +648,7 @@ pub const WebTransportConnection = struct {
         // Store our close code/reason so pollSessionStreams reports it correctly
         // when the draining state is finalized
         session.close_error_code = error_code;
-        const reason_copy_len: u16 = @intCast(@min(truncated_reason.len, session.close_reason_buf.len));
-        @memcpy(session.close_reason_buf[0..reason_copy_len], truncated_reason[0..reason_copy_len]);
-        session.close_reason_len = reason_copy_len;
+        self.setCloseReason(session, truncated_reason);
 
         session.state = .draining;
 
@@ -702,6 +702,11 @@ pub const WebTransportConnection = struct {
         if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
             recv_stream.stopSending(h3_code);
         }
+    }
+
+    fn setCloseReason(self: *WebTransportConnection, session: *Session, reason: []const u8) void {
+        self.allocator.free(session.close_reason);
+        session.close_reason = self.allocator.dupe(u8, reason[0..@min(reason.len, max_close_reason)]) catch &.{};
     }
 
     /// Mark a session as fully closed and release its slot.
@@ -878,12 +883,11 @@ pub const WebTransportConnection = struct {
             if (stream.recv.finished and session.state == .draining) {
                 const sid = session.session_id;
                 const code = session.close_error_code;
-                const reason_len = session.close_reason_len;
                 self.finalizeSession(session);
                 return .{ .session_closed = .{
                     .session_id = sid,
                     .error_code = code,
-                    .reason = session.close_reason_buf[0..reason_len],
+                    .reason = session.close_reason,
                 } };
             }
             // In the active state a FIN on the CONNECT stream recv side is
@@ -990,9 +994,7 @@ pub const WebTransportConnection = struct {
             .close_webtransport_session => |cls| {
                 const sid = session.session_id;
                 session.close_error_code = cls.error_code;
-                const copy_len: u16 = @intCast(@min(cls.reason.len, session.close_reason_buf.len));
-                @memcpy(session.close_reason_buf[0..copy_len], cls.reason[0..copy_len]);
-                session.close_reason_len = copy_len;
+                self.setCloseReason(session, cls.reason);
 
                 // Send our own FIN (echo close) if we haven't already
                 if (session.state == .active) {
@@ -1006,7 +1008,7 @@ pub const WebTransportConnection = struct {
                 return .{ .session_closed = .{
                     .session_id = sid,
                     .error_code = cls.error_code,
-                    .reason = session.close_reason_buf[0..copy_len],
+                    .reason = session.close_reason,
                 } };
             },
             .drain_webtransport_session => {
@@ -1054,13 +1056,14 @@ pub const WebTransportConnection = struct {
 
     /// Check for incoming QUIC DATAGRAM frames and demux by quarter_stream_id.
     pub fn pollDatagrams(self: *WebTransportConnection) ?WtEvent {
-        // Pop datagram into persistent member buffer — one copy, no heap allocation.
-        // The slice is valid until the next pollDatagrams() call.
-        const dgram_len = self.quic.recvDatagram(&self.dgram_poll_buf) orelse return null;
-        if (dgram_len == 0) return null;
+        // Read in place: the bytes stay put until the next datagram arrives,
+        // which is after the caller is done with this one.
+        const dgram = self.quic.peekDatagram() orelse return null;
+        self.quic.consumeDatagram();
+        if (dgram.len == 0) return null;
 
         // Parse quarter_stream_id
-        var fbs = io.fixedBufferStream(self.dgram_poll_buf[0..dgram_len]);
+        var fbs = io.fixedBufferStream(dgram);
         const reader = &fbs;
         const quarter_id = packet.readVarInt(reader) catch return null;
         const session_id = quarter_id * 4;
@@ -1068,7 +1071,7 @@ pub const WebTransportConnection = struct {
         if (self.sessionActive(session_id)) {
             return .{ .datagram = .{
                 .session_id = session_id,
-                .data = self.dgram_poll_buf[fbs.seek..dgram_len],
+                .data = dgram[fbs.seek..],
             } };
         }
 
@@ -1626,12 +1629,11 @@ pub const WebTransportConnection = struct {
                     if (session.state == .draining) {
                         const sid = session.session_id;
                         const code = session.close_error_code;
-                        const reason_len = session.close_reason_len;
                         self.finalizeSession(session);
                         return .{ .session_closed = .{
                             .session_id = sid,
                             .error_code = code,
-                            .reason = session.close_reason_buf[0..reason_len],
+                            .reason = session.close_reason,
                         } };
                     }
                 } else if (self.is_server) {
@@ -1672,9 +1674,10 @@ test "Session: basic init" {
 }
 
 test "DatagramQueue used by WT" {
-    var q = quic_connection.DatagramQueue{};
+    var q: quic_connection.DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     const data = "hello";
-    try std.testing.expect(q.push(data));
+    try std.testing.expect(q.push(std.testing.allocator, data));
     var buf: [1200]u8 = undefined;
     const len = q.pop(&buf).?;
     try std.testing.expectEqual(@as(usize, 5), len);
@@ -2266,7 +2269,7 @@ test "WT integration: poll receives datagram demuxed by session" {
     var fbs = io.fixedBufferStream(&dgram_buf);
     packet.writeVarInt(&fbs, quarter_id) catch unreachable;
     fbs.writeAll("hello dgram") catch unreachable;
-    try testing.expect(setup.quic_conn.datagram_recv_queue.push(dgram_buf[0..fbs.seek]));
+    try testing.expect(setup.quic_conn.datagram_recv_queue.push(testing.allocator, dgram_buf[0..fbs.seek]));
 
     const ev = try setup.wt.poll();
     try testing.expect(ev != null);

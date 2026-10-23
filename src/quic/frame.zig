@@ -898,9 +898,43 @@ pub const PendingControlFrame = union(enum) {
 /// CONNECTION_CLOSE always gets in: one slot is held back for it.
 pub const PendingFrameQueue = struct {
     const capacity = @import("limits.zig").pending_frames;
+    /// Held inline. The full `capacity` is 12 KB and few connections ever
+    /// queue more than a handshake's worth, so the rest is allocated when one
+    /// first does. Without `allocator` the queue holds only these.
+    const inline_capacity = 16;
 
-    items: [capacity]PendingControlFrame = undefined,
+    inline_items: [inline_capacity]PendingControlFrame = undefined,
+    heap: ?*[capacity]PendingControlFrame = null,
+    allocator: ?std.mem.Allocator = null,
     len: u8 = 0,
+
+    pub fn deinit(self: *PendingFrameQueue) void {
+        if (self.heap) |h| self.allocator.?.destroy(h);
+        self.heap = null;
+    }
+
+    fn slots(self: *PendingFrameQueue) []PendingControlFrame {
+        return if (self.heap) |h| h else &self.inline_items;
+    }
+
+    /// What is queued, oldest first.
+    pub fn queued(self: *PendingFrameQueue) []PendingControlFrame {
+        return self.slots()[0..self.len];
+    }
+
+    fn limit(self: *const PendingFrameQueue) usize {
+        return if (self.heap != null or self.allocator != null) capacity else inline_capacity;
+    }
+
+    /// Room for the item at `len`: moves to the heap when inline is full.
+    fn ensureSlot(self: *PendingFrameQueue) bool {
+        if (self.len < self.slots().len) return true;
+        const gpa = self.allocator orelse return false;
+        const h = gpa.create([capacity]PendingControlFrame) catch return false;
+        @memcpy(h[0..self.len], self.inline_items[0..self.len]);
+        self.heap = h;
+        return true;
+    }
 
     /// Queue `frame`, dropping it if the queue is full; see `tryPush`.
     pub fn push(self: *PendingFrameQueue, frame: PendingControlFrame) void {
@@ -909,14 +943,14 @@ pub const PendingFrameQueue = struct {
 
     /// Whether `n` new, unmerged frames would fit.
     pub fn hasRoomFor(self: *const PendingFrameQueue, n: usize) bool {
-        return self.len + n < capacity;
+        return self.len + n < self.limit();
     }
 
     /// Put back a frame just popped. Never fails: `pop` freed its slot.
     pub fn requeue(self: *PendingFrameQueue, frame: PendingControlFrame) void {
         if (self.tryPush(frame)) return;
-        if (self.len < capacity) {
-            self.items[self.len] = frame;
+        if (self.len < self.slots().len) {
+            self.slots()[self.len] = frame;
             self.len += 1;
         }
     }
@@ -924,37 +958,38 @@ pub const PendingFrameQueue = struct {
     /// Queue `frame`, merging it into a queued frame of the same kind where
     /// one exists. False if it did not fit.
     pub fn tryPush(self: *PendingFrameQueue, frame: PendingControlFrame) bool {
+        const items = self.slots();
         var i: u8 = 0;
         while (i < self.len) : (i += 1) {
             switch (frame) {
-                .ping => switch (self.items[i]) {
+                .ping => switch (items[i]) {
                     .ping => return true,
                     else => {},
                 },
-                .immediate_ack => switch (self.items[i]) {
+                .immediate_ack => switch (items[i]) {
                     .immediate_ack => return true,
                     else => {},
                 },
                 // Only the latest challenge is answered, so a flood of them
                 // takes one slot, not the queue; a validator whose challenge
                 // goes unanswered sends another (RFC 9000 §8.2.1).
-                .path_response => switch (self.items[i]) {
+                .path_response => switch (items[i]) {
                     .path_response => {
-                        self.items[i] = frame;
+                        items[i] = frame;
                         return true;
                     },
                     else => {},
                 },
-                .max_data => |new_max| switch (self.items[i]) {
+                .max_data => |new_max| switch (items[i]) {
                     .max_data => |old_max| {
-                        self.items[i] = .{ .max_data = @max(old_max, new_max) };
+                        items[i] = .{ .max_data = @max(old_max, new_max) };
                         return true;
                     },
                     else => {},
                 },
-                .max_stream_data => |new_msd| switch (self.items[i]) {
+                .max_stream_data => |new_msd| switch (items[i]) {
                     .max_stream_data => |old_msd| if (old_msd.stream_id == new_msd.stream_id) {
-                        self.items[i] = .{ .max_stream_data = .{
+                        items[i] = .{ .max_stream_data = .{
                             .stream_id = new_msd.stream_id,
                             .max = @max(old_msd.max, new_msd.max),
                         } };
@@ -962,30 +997,30 @@ pub const PendingFrameQueue = struct {
                     },
                     else => {},
                 },
-                .max_streams_bidi => |new_max| switch (self.items[i]) {
+                .max_streams_bidi => |new_max| switch (items[i]) {
                     .max_streams_bidi => |old_max| {
-                        self.items[i] = .{ .max_streams_bidi = @max(old_max, new_max) };
+                        items[i] = .{ .max_streams_bidi = @max(old_max, new_max) };
                         return true;
                     },
                     else => {},
                 },
-                .max_streams_uni => |new_max| switch (self.items[i]) {
+                .max_streams_uni => |new_max| switch (items[i]) {
                     .max_streams_uni => |old_max| {
-                        self.items[i] = .{ .max_streams_uni = @max(old_max, new_max) };
+                        items[i] = .{ .max_streams_uni = @max(old_max, new_max) };
                         return true;
                     },
                     else => {},
                 },
-                .data_blocked => |new_limit| switch (self.items[i]) {
+                .data_blocked => |new_limit| switch (items[i]) {
                     .data_blocked => |old_limit| {
-                        self.items[i] = .{ .data_blocked = @max(old_limit, new_limit) };
+                        items[i] = .{ .data_blocked = @max(old_limit, new_limit) };
                         return true;
                     },
                     else => {},
                 },
-                .stream_data_blocked => |new_sdb| switch (self.items[i]) {
+                .stream_data_blocked => |new_sdb| switch (items[i]) {
                     .stream_data_blocked => |old_sdb| if (old_sdb.stream_id == new_sdb.stream_id) {
-                        self.items[i] = .{ .stream_data_blocked = .{
+                        items[i] = .{ .stream_data_blocked = .{
                             .stream_id = new_sdb.stream_id,
                             .limit = @max(old_sdb.limit, new_sdb.limit),
                         } };
@@ -993,16 +1028,16 @@ pub const PendingFrameQueue = struct {
                     },
                     else => {},
                 },
-                .streams_blocked_bidi => |new_limit| switch (self.items[i]) {
+                .streams_blocked_bidi => |new_limit| switch (items[i]) {
                     .streams_blocked_bidi => |old_limit| {
-                        self.items[i] = .{ .streams_blocked_bidi = @max(old_limit, new_limit) };
+                        items[i] = .{ .streams_blocked_bidi = @max(old_limit, new_limit) };
                         return true;
                     },
                     else => {},
                 },
-                .streams_blocked_uni => |new_limit| switch (self.items[i]) {
+                .streams_blocked_uni => |new_limit| switch (items[i]) {
                     .streams_blocked_uni => |old_limit| {
-                        self.items[i] = .{ .streams_blocked_uni = @max(old_limit, new_limit) };
+                        items[i] = .{ .streams_blocked_uni = @max(old_limit, new_limit) };
                         return true;
                     },
                     else => {},
@@ -1011,14 +1046,15 @@ pub const PendingFrameQueue = struct {
             }
         }
         const is_close = frame == .connection_close;
-        if (self.len < capacity - 1 or (is_close and self.len < capacity)) {
-            self.items[self.len] = frame;
+        const cap = self.limit();
+        if ((self.len < cap - 1 or (is_close and self.len < cap)) and self.ensureSlot()) {
+            self.slots()[self.len] = frame;
             self.len += 1;
             return true;
         }
         if (is_close) {
             // Nothing queued matters once we are closing.
-            self.items[self.len - 1] = frame;
+            self.slots()[self.len - 1] = frame;
             return true;
         }
         return false;
@@ -1026,12 +1062,13 @@ pub const PendingFrameQueue = struct {
 
     pub fn pop(self: *PendingFrameQueue) ?PendingControlFrame {
         if (self.len == 0) return null;
-        const item = self.items[0];
+        const items = self.slots();
+        const item = items[0];
         self.len -= 1;
         // Shift remaining items
         var i: u8 = 0;
         while (i < self.len) : (i += 1) {
-            self.items[i] = self.items[i + 1];
+            items[i] = items[i + 1];
         }
         return item;
     }
@@ -1625,7 +1662,8 @@ test "frame body longer than the datagram is rejected, not sliced" {
 }
 
 test "PendingFrameQueue: full refuses new frames but always admits CONNECTION_CLOSE" {
-    var q = PendingFrameQueue{};
+    var q = PendingFrameQueue{ .allocator = std.testing.allocator };
+    defer q.deinit();
     var i: u64 = 0;
     while (q.tryPush(.{ .reset_stream = .{ .stream_id = i * 4, .error_code = 0, .final_size = 0 } })) i += 1;
     try std.testing.expect(!q.hasRoomFor(1));
@@ -1634,7 +1672,7 @@ test "PendingFrameQueue: full refuses new frames but always admits CONNECTION_CL
     // The reserved slot, then eviction: a close is never lost.
     try std.testing.expect(q.tryPush(.{ .connection_close = .{ .error_code = 1, .frame_type = 0, .is_app = false } }));
     try std.testing.expect(q.tryPush(.{ .connection_close = .{ .error_code = 2, .frame_type = 0, .is_app = false } }));
-    try std.testing.expect(q.items[q.len - 1] == .connection_close);
+    try std.testing.expect(q.queued()[q.len - 1] == .connection_close);
 
     // A popped frame can always be put back.
     const f = q.pop().?;
