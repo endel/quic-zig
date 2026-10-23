@@ -310,6 +310,28 @@ pub fn build(b: *std.Build) void {
     run_bench_crypto.addPassthruArgs();
     b.step("bench-crypto", "Benchmark the handshake's crypto primitives").dependOn(&run_bench_crypto.step);
 
+    // In-process connection bench. It needs the virtual clock only test builds
+    // have, so it's a test binary, and always ReleaseFast.
+    const bench_quic = b.addTest(.{
+        .name = "bench-quic",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench_quic.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = need_libc,
+            .imports = &.{.{ .name = "quic", .module = b.createModule(.{
+                .root_source_file = b.path("src/lib.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .link_libc = need_libc,
+            }) }},
+        }),
+    });
+    // Run plainly: the test runner protocol would take its stdout.
+    const run_bench_quic = std.Build.Step.Run.create(b, "run bench-quic");
+    run_bench_quic.addArtifactArg(bench_quic);
+    b.step("bench-quic", "Benchmark a connection's CPU cost per round of traffic, in process").dependOn(&run_bench_quic.step);
+
     // Codec microbench — pure CPU (parse/serialize loops), no sockets.
     // Used to track perf of the fixedBufferStream shim vs. std.Io native.
     const exe_bench_codec = App.add(b, "bench-codec", "apps/bench_codec.zig", target, optimize, need_libc, lib_mod);
