@@ -113,6 +113,9 @@ port with `Config.reuse_port`, needs no separate load balancer: the kernel
 spreads new connections across workers, and QUIC-LB CIDs steer the rest.
 
 - Give every worker the same `Config.quic_lb` with its own `server_id`.
+- Give them one `tls_config` (its session-ticket key), `retry_token_key`
+  (Retry and NEW_TOKEN tokens) and `http1.ticket_key`: a client's next
+  connection lands on whichever worker the kernel picks.
 - Set `Config.foreign_datagram` on each. When a Handshake or 1-RTT datagram's
   DCID is unknown to the worker that received it but decodes to another
   worker's id — a client whose NAT rebound, say — the hook gets the bytes,
@@ -123,8 +126,53 @@ spreads new connections across workers, and QUIC-LB CIDs steer the rest.
   has the same address.
 
 Initials are never steered: whichever worker receives one accepts the
-connection. A datagram handed over is never handed on again, so a CID nobody
-owns gets a stateless reset from the worker it was steered to.
+connection. A datagram handed over is never handed on again by its id, so a
+CID nobody owns gets a stateless reset from the worker it was steered to.
+
+On Linux the kernel can do the steering: `quic_lb.steerReuseportGroup(fd,
+&config, n)` attaches a classic BPF program to the port's SO_REUSEPORT group
+(SO_ATTACH_REUSEPORT_CBPF, Linux 4.5+, no privilege needed), and each
+datagram whose DCID is one of ours goes straight to the socket of the worker
+it names. The hook then only sees what the program can't place.
+
+- The group numbers its sockets in bind order: give the workers server ids
+  0 to n-1 and bind their sockets in that order. Closing a socket moves the
+  group's last into its slot, so close them last first.
+- Short headers are read at the CID's offset; long headers only when the
+  DCID has our length and first octet, so a new client's random DCID is
+  spread by the 4-tuple hash as before.
+- It needs plaintext CIDs and a one-byte server id, and is refused
+  otherwise.
+
+### Handing a connection to another worker
+
+A worker can give a live connection away, streams, datagrams and
+WebTransport sessions as they stand: a game server moves a client to the
+worker that runs its room. Every worker shares one `Config.moved_cids` (and
+`static_reset_key`, `tls_config` and the QUIC-LB config but its id), and the
+handler declares `onHandover`.
+
+1. `session.handOver(to)` on the old worker. At the end of the pass, after its
+   sends, the server detaches the connection, records its CIDs in `MovedCids`
+   as `to`'s, and calls `onHandover(handover)`.
+2. The handler queues the `Handover` for the new worker's thread — in the same
+   ordered queue as the datagrams `foreign_datagram` steers there, so the
+   connection always arrives before its packets.
+3. The new worker calls `adopt(handover)`. It gives the peer CIDs carrying its
+   own id with Retire Prior To past the old ones (RFC 9000 §5.1.2); the peer
+   switches to them within a round trip.
+
+Meanwhile a packet still on an old CID lands on a worker that does not know
+it, finds it in `MovedCids`, and is steered to the new owner; one that
+reaches the new owner before the connection does is dropped, not reset. The
+old CIDs leave `MovedCids` when the peer retires them or the connection closes.
+
+A WebSocket on the HTTP/1.1 listener moves the same way, with no CIDs to
+rotate: a TCP connection stays on its socket, whichever loop polls it. From
+`onWsMessage`, `ws.handOver()`; once no read or write of it is in flight, the
+old worker calls `onWsHandover(handover)`; the new one's
+`http1_server.adopt(handover)` serves it on, TLS session, unread input and
+unsent output included.
 
 ## Limitations
 

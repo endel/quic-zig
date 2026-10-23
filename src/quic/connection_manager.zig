@@ -170,6 +170,13 @@ pub const ConnEntry = struct {
     /// Where it sits in `mgr.timers`, while it has a `deadline` there.
     timer_slot: u32 = no_slot,
 
+    /// Asked to move to another server at the end of the pass; see
+    /// `ConnectionManager.requestHandover`. Nothing more of it is polled.
+    handing_over: bool = false,
+    /// Some of its CIDs are in `MovedCids`: a handover took them along, and
+    /// the peer has yet to retire them.
+    cids_moved: bool = false,
+
     /// Tell the owner there is data to send; see `wake_fn`. A write raises
     /// no event, so this asks for a send, not a poll.
     pub fn wake(self: *ConnEntry) void {
@@ -312,6 +319,108 @@ pub const ReplyLimits = struct {
     }
 };
 
+/// A QUIC-LB server id: `quic_lb.Config.server_id_len` bytes.
+pub const ServerId = struct {
+    bytes: [15]u8 = @splat(0),
+    len: u8 = 0,
+
+    pub fn init(id: []const u8) ServerId {
+        var out: ServerId = .{ .len = @intCast(id.len) };
+        @memcpy(out.bytes[0..id.len], id);
+        return out;
+    }
+
+    pub fn slice(self: *const ServerId) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+/// A lock held for a map lookup at most: std keeps its mutex behind `Io`.
+const SpinLock = struct {
+    held: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *SpinLock) void {
+        var spins: u32 = 0;
+        while (self.held.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            spins += 1;
+            // Its holder may have been preempted.
+            if (spins % 64 == 0) std.Thread.yield() catch {} else std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.held.store(false, .release);
+    }
+};
+
+/// The CIDs of connections that moved from one server to another (see
+/// `ConnectionManager.detach`), shared by every server on the port. A packet
+/// still carrying the old server's CID, wherever it lands, is steered to the
+/// connection's new owner rather than reset. A CID goes once the peer
+/// retires it or the connection closes, so each handover holds a few for
+/// about a round trip.
+///
+/// Thread-safe. Looked up only for a DCID that names the receiving server
+/// but matches none of its connections.
+pub const MovedCids = struct {
+    allocator: Allocator,
+    lock: SpinLock = .{},
+    map: std.HashMapUnmanaged(CidKey, ServerId, CidKeyContext, 80) = .empty,
+    ctx: CidKeyContext,
+    removed_since_rehash: usize = 0,
+
+    pub fn init(allocator: Allocator) MovedCids {
+        return .{ .allocator = allocator, .ctx = .{ .seed = randomSeed() } };
+    }
+
+    pub fn deinit(self: *MovedCids) void {
+        self.map.deinit(self.allocator);
+    }
+
+    /// CIDs held, for tests and metrics.
+    pub fn count(self: *MovedCids) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.map.count();
+    }
+
+    fn put(self: *MovedCids, key: CidKey, owner: ServerId) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        // Unrecorded, the CID's packets are reset like any unknown one's.
+        self.map.putContext(self.allocator, key, owner, self.ctx) catch {};
+    }
+
+    fn get(self: *MovedCids, key: CidKey) ?ServerId {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.map.getContext(key, self.ctx);
+    }
+
+    /// Drop the CIDs a detached `entry` took along, once no server will
+    /// adopt it, so their packets draw stateless resets.
+    pub fn abandon(self: *MovedCids, entry: *ConnEntry) void {
+        std.debug.assert(entry.mgr == null);
+        if (!entry.cids_moved) return;
+        entry.cids_moved = false;
+        for (&entry.conn.local_cid_pool.entries) |*c| {
+            if (c.occupied) self.remove(CidKey.fromSlice(c.getCid()));
+        }
+    }
+
+    fn remove(self: *MovedCids, key: CidKey) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.map.removeContext(key, self.ctx)) return;
+        // Every entry is removed in time, so tombstones are all it would fill with.
+        self.removed_since_rehash += 1;
+        if (self.removed_since_rehash > self.map.capacity() / 4) {
+            self.removed_since_rehash = 0;
+            self.map.rehash(self.ctx);
+        }
+    }
+};
+
 /// Manages multiple QUIC connections, routing packets by DCID.
 pub const ConnectionManager = struct {
     pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
@@ -412,6 +521,16 @@ pub const ConnectionManager = struct {
     /// itself stays untouched for the connection that then decrypts it.
     initial_scratch: std.ArrayList(u8) = .empty,
 
+    /// Shared with the servers connections move between; see `MovedCids`.
+    /// Set, with `conn_config.quic_lb` and `steer_foreign`, for a server
+    /// whose connections may be handed over.
+    moved: ?*MovedCids = null,
+    /// The server can let a connection go: it has `moved` and a handler to
+    /// give the connection to.
+    can_hand_over: bool = false,
+    /// Entries `requestHandover` named, detached once the pass is over.
+    handovers: std.ArrayList(PendingHandover) = .empty,
+
     pub fn init(
         allocator: Allocator,
         tls_config: tls13.TlsConfig,
@@ -457,6 +576,7 @@ pub const ConnectionManager = struct {
         self.cid_map.deinit();
         self.reset_token_map.deinit(self.allocator);
         self.source_handshakes.deinit();
+        self.handovers.deinit(self.allocator);
     }
 
     fn resetKey(self: *const ConnectionManager, token: *const [16]u8) ResetKey {
@@ -621,6 +741,7 @@ pub const ConnectionManager = struct {
                 continue;
             }
             self.unrouteCid(key, entry);
+            if (entry.cids_moved) if (self.moved) |m| m.remove(key);
             entry.removeRegisteredCid(key);
             removed += 1;
         }
@@ -663,6 +784,8 @@ pub const ConnectionManager = struct {
     /// that any stale Session pointers safely see wt_conn == null instead
     /// of accessing freed memory.
     pub fn removeConnection(self: *ConnectionManager, entry: *ConnEntry) void {
+        self.forgetMoved(entry);
+        self.cancelHandover(entry);
         // Unregister all CIDs from the routing map
         for (entry.registered_cids[0..entry.registered_cid_count]) |key| self.unrouteCid(key, entry);
         if (entry.initial_dcid.len > 0) self.unrouteCid(entry.initial_dcid, entry);
@@ -724,6 +847,111 @@ pub const ConnectionManager = struct {
         entry.conn.deinit();
         self.allocator.destroy(entry.conn);
         self.allocator.destroy(entry);
+    }
+
+    /// A connection on its way to the server with QUIC-LB id `to`.
+    pub const PendingHandover = struct { entry: *ConnEntry, to: ServerId };
+
+    /// Have `entry` detached at the end of the pass (`detach`), for the server
+    /// whose QUIC-LB id is `to` to adopt. Needs `moved`.
+    pub fn requestHandover(self: *ConnectionManager, entry: *ConnEntry, to: []const u8) !void {
+        if (self.moved == null) return error.HandoverNeedsMovedCids;
+        const lb = &(self.conn_config.quic_lb orelse return error.HandoverNeedsMovedCids);
+        if (to.len != lb.server_id_len) return error.InvalidServerId;
+        if (std.mem.eql(u8, to, lb.server_id[0..lb.server_id_len])) return error.InvalidServerId;
+        if (entry.mgr != self) return error.NotConnected;
+        if (entry.handing_over) return;
+        try self.handovers.append(self.allocator, .{ .entry = entry, .to = .init(to) });
+        entry.handing_over = true;
+    }
+
+    fn cancelHandover(self: *ConnectionManager, entry: *ConnEntry) void {
+        if (!entry.handing_over) return;
+        entry.handing_over = false;
+        for (self.handovers.items, 0..) |h, i| if (h.entry == entry) {
+            _ = self.handovers.orderedRemove(i);
+            return;
+        };
+    }
+
+    /// Take `entry` out of this manager, whole, for the server whose QUIC-LB
+    /// id is `to` to `adopt` on its own thread: out of routing, the pass
+    /// structures and the counts, but not freed. Its CIDs go into `moved`,
+    /// so their packets are steered to `to` until the peer retires them.
+    ///
+    /// Call between passes; nothing on this thread may touch the entry after.
+    pub fn detach(self: *ConnectionManager, entry: *ConnEntry, to: ServerId) void {
+        self.cancelHandover(entry);
+        self.syncCids(entry); // what is routed is then what the pool holds
+        const keys = entry.registered_cids[0..entry.registered_cid_count];
+        // Before it goes, so a packet steered meanwhile reaches `to` and is
+        // dropped there, never reset: see `movedTo`.
+        if (self.moved) |m| {
+            for (keys) |key| m.put(key, to);
+            entry.cids_moved = keys.len > 0;
+        }
+        for (keys) |key| self.unrouteCid(key, entry);
+        if (entry.initial_dcid.len > 0) self.unrouteCid(entry.initial_dcid, entry);
+        self.noteRemovals(keys.len + 1);
+        self.dropResetKeys(entry);
+        entry.registered_cid_count = 0;
+        entry.initial_dcid = .{};
+        entry.cid_pool_gen = null;
+        entry.reset_pool_gen = null;
+        self.endHandshake(entry);
+
+        if (entry.queued) {
+            if (std.mem.indexOfScalar(*ConnEntry, self.to_visit.items, entry)) |i| _ = self.to_visit.orderedRemove(i);
+            entry.queued = false;
+        }
+        self.setDeadline(entry, null);
+        entry.mgr = null;
+        if (std.mem.indexOfScalar(*ConnEntry, self.entries.items, entry)) |i| _ = self.entries.swapRemove(i);
+        // A stale Session on this thread then wakes nobody.
+        entry.wake_fn = null;
+        entry.repoll_fn = null;
+        entry.wake_ctx = null;
+    }
+
+    /// Take in an entry another manager `detach`ed: routed by every CID its
+    /// pool holds, and visited on the next pass. Its CIDs must be as long as
+    /// ours. On error the entry is still nobody's.
+    pub fn adopt(self: *ConnectionManager, entry: *ConnEntry) !void {
+        std.debug.assert(entry.mgr == null);
+        for (&entry.conn.local_cid_pool.entries) |*c| {
+            if (c.occupied and !c.retired and c.cid_len != self.local_cid_len) return error.CidLengthMismatch;
+        }
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        try self.dead_entries.ensureTotalCapacity(self.allocator, self.entries.items.len + self.dead_entries.items.len + 1);
+        try self.to_visit.ensureTotalCapacity(self.allocator, self.entries.items.len + 1);
+        try self.timers.ensureTotalCapacity(self.allocator, self.entries.items.len + 1);
+        self.entries.appendAssumeCapacity(entry);
+        entry.mgr = self;
+        entry.queued = false;
+        entry.timer_slot = no_slot;
+        entry.deadline = null;
+        self.syncCids(entry);
+        entry.mark(true);
+    }
+
+    /// Drop `entry`'s CIDs from `moved`, once it closes.
+    fn forgetMoved(self: *ConnectionManager, entry: *ConnEntry) void {
+        if (!entry.cids_moved) return;
+        entry.cids_moved = false;
+        const m = self.moved orelse return;
+        for (entry.registered_cids[0..entry.registered_cid_count]) |key| m.remove(key);
+    }
+
+    /// Where a handover took the connection `dcid` names, if one did: the
+    /// new owner's id, or "" when that is us and the connection is still on
+    /// its way here — its packet is dropped, not reset.
+    fn movedTo(self: *ConnectionManager, dcid: []const u8) ?[]const u8 {
+        const m = self.moved orelse return null;
+        const owner = m.get(CidKey.fromSlice(dcid)) orelse return null;
+        const lb = &(self.conn_config.quic_lb orelse return null);
+        if (std.mem.eql(u8, owner.slice(), lb.server_id[0..lb.server_id_len])) return "";
+        @memcpy(self.foreign_id[0..owner.len], owner.slice());
+        return self.foreign_id[0..owner.len];
     }
 
     fn enqueue(self: *ConnectionManager, e: *ConnEntry) void {
@@ -834,9 +1062,9 @@ pub const ConnectionManager = struct {
         send_response: []const u8,
         /// Datagram was unroutable or invalid; no action needed.
         dropped: void,
-        /// Its DCID names another server (see `steer_foreign`); nothing was
-        /// processed. The QUIC-LB server id it decoded to, valid until the
-        /// next call.
+        /// Its DCID names another server (see `steer_foreign`), or a
+        /// connection a handover took there (`moved`); nothing was
+        /// processed. That server's QUIC-LB id, valid until the next call.
         foreign: []const u8,
     };
 
@@ -857,8 +1085,9 @@ pub const ConnectionManager = struct {
     }
 
     /// `recvDatagram` for a datagram another server already reported as
-    /// `foreign` and handed to us: never reported as foreign again, so a
-    /// DCID nobody owns cannot bounce between servers.
+    /// `foreign` and handed to us: reported as foreign again only when a
+    /// handover moved its connection on (`moved`), so a DCID nobody owns
+    /// cannot bounce between servers.
     pub fn recvHandedOver(
         self: *ConnectionManager,
         bytes: []u8,
@@ -918,10 +1147,10 @@ pub const ConnectionManager = struct {
             if (entry == null) {
                 // Initials open a connection wherever they land, and 0-RTT
                 // carries the client's own DCID, which encodes nothing.
-                if (steer and current_entry == null and
-                    (header.packet_type == .one_rtt or header.packet_type == .handshake))
-                {
-                    if (self.foreignServerId(header.dcid)) |id| return .{ .foreign = id };
+                if (current_entry == null and (header.packet_type == .one_rtt or header.packet_type == .handshake)) {
+                    if (steer) if (self.foreignServerId(header.dcid)) |id| return .{ .foreign = id };
+                    // A CID of ours, or one steered here, whose connection moved on.
+                    if (self.movedTo(header.dcid)) |id| return if (id.len > 0) .{ .foreign = id } else .{ .dropped = {} };
                 }
                 if (header.packet_type != .initial) {
                     // Short-header for unknown CID: stateless reset (RFC 9000 §10.3)
@@ -971,10 +1200,14 @@ pub const ConnectionManager = struct {
                         // Valid NEW_TOKEN — the address is proven already
                         entry = self.acceptConnection(header, local, from, header.dcid, null) catch
                             return .{ .dropped = {} };
-                    } else if (need_retry) {
+                    } else if (need_retry and !packet.isNewTokenSized(token)) {
+                        // An invalid Retry token: its client takes no second Retry.
                         return .{ .dropped = {} };
                     }
-                } else if (need_retry) {
+                }
+                // No token, or a NEW_TOKEN one that no longer holds, which
+                // counts as none (RFC 9000 8.1.3).
+                if (entry == null and need_retry) {
                     var retry_scid: [8]u8 = undefined;
                     sys.randomBytes(&retry_scid);
 
@@ -1831,6 +2064,94 @@ test "an Initial is accepted locally even when its DCID decodes to another serve
     try std.testing.expectEqual(@as(u8, 1), id[0]);
 }
 
+test "detach takes a connection out of one manager whole, and adopt routes it in another" {
+    const alloc = std.testing.allocator;
+    var moved = MovedCids.init(alloc);
+    defer moved.deinit();
+    var a = steeringManager(alloc, 1);
+    defer a.deinit();
+    var b = steeringManager(alloc, 2);
+    defer b.deinit();
+    a.moved = &moved;
+    b.moved = &moved;
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+    var buf: [64]u8 = undefined;
+
+    const e = try acceptTest(&a, 1);
+    a.setDeadline(e, 100);
+    const cid = CidKey.fromSlice(e.conn.local_cid_pool.entries[0].getCid());
+    try a.requestHandover(e, &.{2});
+    try std.testing.expectError(error.InvalidServerId, a.requestHandover(e, &.{1}));
+    a.detach(e, .init(&.{2}));
+    try std.testing.expectEqual(@as(usize, 0), a.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), a.to_visit.items.len);
+    try std.testing.expectEqual(@as(usize, 0), a.timers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), a.handovers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), a.cid_map.count());
+    try std.testing.expectEqual(@as(usize, 0), a.handshakes);
+
+    // Its old CID, which names server 1, goes to 2. At 2, before the
+    // connection gets there, it is dropped: a reset would end it.
+    switch (a.recvDatagram(shortPacket(&buf, cid.getSlice()), addr, addr, 0, &out)) {
+        .foreign => |id| try std.testing.expectEqualSlices(u8, &.{2}, id),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(b.recvHandedOver(shortPacket(&buf, cid.getSlice()), addr, addr, 0, &out) == .dropped);
+    // Steered back to 1 by its id, it goes on to 2.
+    switch (a.recvHandedOver(shortPacket(&buf, cid.getSlice()), addr, addr, 0, &out)) {
+        .foreign => |id| try std.testing.expectEqualSlices(u8, &.{2}, id),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try b.adopt(e);
+    try std.testing.expectEqual(e, b.findByDcid(cid.getSlice()).?);
+    try std.testing.expect(e.queued and e.mgr == &b);
+    try expectTimersSound(&b);
+
+    // Retired by the peer: no longer routed, no longer moved.
+    e.conn.local_cid_pool.retireBySeq(0);
+    b.syncCids(e);
+    try std.testing.expect(b.findByDcid(cid.getSlice()) == null);
+    try std.testing.expectEqual(@as(usize, 0), moved.count());
+}
+
+test "a connection closing on its new server takes its moved CIDs along" {
+    const alloc = std.testing.allocator;
+    var moved = MovedCids.init(alloc);
+    defer moved.deinit();
+    var a = steeringManager(alloc, 1);
+    defer a.deinit();
+    var b = steeringManager(alloc, 2);
+    defer b.deinit();
+    a.moved = &moved;
+    b.moved = &moved;
+
+    const e = try acceptTest(&a, 1);
+    a.detach(e, .init(&.{2}));
+    try std.testing.expectEqual(@as(usize, 1), moved.count());
+    try b.adopt(e);
+    b.removeConnection(e);
+    b.freeDeadEntries();
+    try std.testing.expectEqual(@as(usize, 0), moved.count());
+}
+
+test "a handover asked for a connection that then closes is forgotten" {
+    const alloc = std.testing.allocator;
+    var moved = MovedCids.init(alloc);
+    defer moved.deinit();
+    var a = steeringManager(alloc, 1);
+    defer a.deinit();
+    a.moved = &moved;
+
+    const e = try acceptTest(&a, 1);
+    try a.requestHandover(e, &.{2});
+    a.removeConnection(e);
+    a.freeDeadEntries();
+    try std.testing.expectEqual(@as(usize, 0), a.handovers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), moved.count());
+}
+
 test "past max_handshakes a new client gets Retry, and is served once it echoes the token" {
     // Half-open connections had no cap of their own: valid Initials from
     // spoofed sources, which never finish, filled max_connections and locked
@@ -1977,6 +2298,37 @@ test "a Retry token admits only the connection its Retry was for" {
     defer replay.deinit();
     const n = try replay.send(&buf);
     try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .dropped);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+}
+
+test "a NEW_TOKEN token that no longer holds counts as none: a Retry when one is demanded, else served unproven" {
+    // RFC 9000 8.1.3. Dropping it left a client back after a restart, which
+    // drew a new key, to wait out its handshake whenever load asked for Retry.
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    const from = testIn4(.{ 198, 51, 100, 7 }, 1000);
+    var stale: [packet.TOKEN_MAX_LEN]u8 = undefined;
+    const stale_len = try packet.generateNewToken(&stale, from, @splat(9)); // another run's key
+    var buf: [1500]u8 = undefined;
+    var out: [1500]u8 = undefined;
+
+    for ([_]bool{ true, false }) |demanded| {
+        mgr.require_retry = demanded;
+        const client = try alloc.create(connection.Connection);
+        defer destroyClient(alloc, client);
+        try connection.connectInto(client, alloc, "example.com", .{}, null, stale[0..stale_len]);
+        const n = try client.send(&buf);
+        switch (mgr.recvDatagram(buf[0..n], from, from, 0, &out)) {
+            .send_response => |retry| {
+                try std.testing.expect(demanded);
+                client.handleDatagram(@constCast(retry), .{ .to = from, .from = from, .datagram_size = retry.len });
+                try std.testing.expect(client.retry_received);
+            },
+            .processed => try std.testing.expect(!demanded),
+            else => return error.TestUnexpectedResult,
+        }
+    }
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
 }
 

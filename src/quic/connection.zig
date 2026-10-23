@@ -229,6 +229,10 @@ pub const LocalCidEntry = struct {
 /// Seq 0 = initial SCID. New CIDs issued via issueNewCid().
 pub const LocalCidPool = struct {
     pub const MAX_POOL_SIZE: usize = 8;
+    /// The most CIDs a peer is kept supplied with, whatever its limit: half
+    /// the pool, so `Connection.rotateLocalCids` always has room for a full
+    /// set beside the old ones the peer has yet to retire.
+    pub const issue_limit: usize = MAX_POOL_SIZE / 2;
 
     entries: [MAX_POOL_SIZE]LocalCidEntry = @splat(LocalCidEntry{}),
     next_seq_num: u64 = 1,
@@ -339,6 +343,16 @@ pub const LocalCidPool = struct {
         var n: usize = 0;
         for (&self.entries) |*entry| {
             if (entry.occupied and !entry.retired) n += 1;
+        }
+        return n;
+    }
+
+    /// Active entries the peer may go on using: those below Retire Prior To
+    /// still route until it retires them, but it may not pick them.
+    pub fn liveCount(self: *const LocalCidPool) usize {
+        var n: usize = 0;
+        for (&self.entries) |*entry| {
+            if (entry.occupied and !entry.retired and entry.seq_num >= self.retire_prior_to) n += 1;
         }
         return n;
     }
@@ -2480,13 +2494,8 @@ pub const Connection = struct {
                 self.local_cid_pool.retireBySeq(rcid.seq_num);
 
                 // Issue a replacement CID to stay at the peer's limit
-                const peer_limit = if (self.peer_params) |pp| pp.active_connection_id_limit else 2;
-                if (self.local_cid_pool.activeCount() < peer_limit) {
-                    const maybe_entry = if (self.quic_lb_config) |*lb_cfg|
-                        self.local_cid_pool.issueNewCidLb(lb_cfg, self.static_reset_key)
-                    else
-                        self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key);
-                    if (maybe_entry) |entry| {
+                if (self.local_cid_pool.liveCount() < self.wantedLocalCids()) {
+                    if (self.issueLocalCid()) |entry| {
                         self.pushReliable(self.newConnectionIdFrame(entry));
                         std.log.info("issued replacement NEW_CONNECTION_ID seq={d}", .{entry.seq_num});
                     }
@@ -3004,18 +3013,10 @@ pub const Connection = struct {
                     }
 
                     // Issue NEW_CONNECTION_ID frames up to peer's active_connection_id_limit (RFC 9000 §5.1)
-                    {
-                        const peer_limit = if (self.peer_params) |pp| pp.active_connection_id_limit else 2;
-                        while (self.local_cid_pool.activeCount() < peer_limit) {
-                            const maybe_entry = if (self.quic_lb_config) |*lb_cfg|
-                                self.local_cid_pool.issueNewCidLb(lb_cfg, self.static_reset_key)
-                            else
-                                self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key);
-                            if (maybe_entry) |entry| {
-                                self.pushReliable(self.newConnectionIdFrame(entry));
-                                std.log.info("issued NEW_CONNECTION_ID seq={d}, cid_len={d}", .{ entry.seq_num, entry.cid_len });
-                            } else break; // pool full
-                        }
+                    while (self.local_cid_pool.liveCount() < self.wantedLocalCids()) {
+                        const entry = self.issueLocalCid() orelse break; // pool full
+                        self.pushReliable(self.newConnectionIdFrame(entry));
+                        std.log.info("issued NEW_CONNECTION_ID seq={d}, cid_len={d}", .{ entry.seq_num, entry.cid_len });
                     }
 
                     // Server: issue NEW_TOKEN for client address validation (RFC 9000 §8.1.3)
@@ -3355,6 +3356,43 @@ pub const Connection = struct {
         rs.conn_counted = end;
     }
 
+    /// How many of our CIDs the peer is kept supplied with (RFC 9000 §5.1.1).
+    fn wantedLocalCids(self: *const Connection) usize {
+        const peer_limit = if (self.peer_params) |pp| pp.active_connection_id_limit else 2;
+        return @min(peer_limit, LocalCidPool.issue_limit);
+    }
+
+    /// One more CID of ours, QUIC-LB encoded when configured; null with the
+    /// pool full.
+    fn issueLocalCid(self: *Connection) ?*const LocalCidEntry {
+        if (self.quic_lb_config) |*lb| return self.local_cid_pool.issueNewCidLb(lb, self.static_reset_key);
+        return self.local_cid_pool.issueNewCid(self.scid_len, self.static_reset_key);
+    }
+
+    /// Give the peer a fresh set of our CIDs, issued under `lb` from now on,
+    /// and retire every earlier one with Retire Prior To (RFC 9000 §5.1.2):
+    /// the peer must switch to the new ones and retire the old. For a
+    /// connection that moved to a server with another QUIC-LB server id, so
+    /// its packets come to be steered there. The old CIDs keep routing until
+    /// the peer retires them. False, and nothing changed but `lb`, when the
+    /// pool had no room for a new CID.
+    pub fn rotateLocalCids(self: *Connection, lb: ?quic_lb.Config) bool {
+        self.quic_lb_config = lb;
+        const pool = &self.local_cid_pool;
+        const first = pool.next_seq_num;
+        var issued: usize = 0;
+        while (issued < self.wantedLocalCids()) : (issued += 1) {
+            _ = self.issueLocalCid() orelse break;
+        }
+        if (issued == 0) return false;
+        // Raised before the frames are built: each carries it.
+        pool.retire_prior_to = first;
+        for (&pool.entries) |*e| {
+            if (e.occupied and !e.retired and e.seq_num >= first) self.pushReliable(self.newConnectionIdFrame(e));
+        }
+        return true;
+    }
+
     /// Queue a frame the peer must eventually see, holding it back if the
     /// queue is full rather than dropping it.
     fn pushReliable(self: *Connection, frame: frame_mod.PendingControlFrame) void {
@@ -3422,6 +3460,8 @@ pub const Connection = struct {
                     break :blk .{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = ss.error_code } };
                 },
                 .new_connection_id => |seq| blk: {
+                    // One a rotation has since retired is not worth handing out.
+                    if (seq < self.local_cid_pool.retire_prior_to) continue;
                     for (&self.local_cid_pool.entries) |*e| {
                         if (e.occupied and !e.retired and e.seq_num == seq) break :blk self.newConnectionIdFrame(e);
                     }
@@ -7689,6 +7729,60 @@ test "NEW_CONNECTION_ID: unacked retirements past twice the limit close the conn
 
     try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 51, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = @splat(0) } }, .application, 0));
     try std.testing.expectEqual(@as(u64, @backingInt(TransportError.connection_id_limit_error)), conn.local_err.?.code);
+}
+
+test "rotateLocalCids: a fresh set under the new server id, retiring every earlier CID" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.peer_params = .{ .active_connection_id_limit = 8 };
+    conn.local_cid_pool.registerInitialCid(conn.scid[0..conn.scid_len], null);
+    // What the handshake hands out: the peer's limit, held to half the pool.
+    while (conn.local_cid_pool.liveCount() < conn.wantedLocalCids()) _ = conn.issueLocalCid().?;
+    try std.testing.expectEqual(LocalCidPool.issue_limit, conn.local_cid_pool.activeCount());
+    while (conn.pending_frames.pop()) |_| {}
+
+    var lb: quic_lb.Config = .{ .config_id = 0, .server_id_len = 1, .nonce_len = 6 };
+    lb.server_id[0] = 7;
+    try std.testing.expect(conn.rotateLocalCids(lb));
+
+    const first: u64 = LocalCidPool.issue_limit;
+    try std.testing.expectEqual(first, conn.local_cid_pool.retire_prior_to);
+    var announced: usize = 0;
+    while (conn.pending_frames.pop()) |f| {
+        const ncid = f.new_connection_id;
+        try std.testing.expect(ncid.seq_num >= first);
+        try std.testing.expectEqual(first, ncid.retire_prior_to);
+        var id: [1]u8 = undefined;
+        try std.testing.expect(quic_lb.extractServerId(&lb, ncid.cid_buf[0..ncid.cid_len], &id));
+        try std.testing.expectEqual(@as(u8, 7), id[0]);
+        announced += 1;
+    }
+    try std.testing.expectEqual(LocalCidPool.issue_limit, announced);
+    // The old ones route until the peer retires them; it may not pick them.
+    try std.testing.expectEqual(2 * LocalCidPool.issue_limit, conn.local_cid_pool.activeCount());
+    try std.testing.expectEqual(LocalCidPool.issue_limit, conn.local_cid_pool.liveCount());
+
+    // Their retirement asks for no replacement: the peer holds a full set.
+    conn.current_dcid_seq = first;
+    for (0..first) |seq| try conn.processFrame(&.{ .retire_connection_id = .{ .seq_num = seq } }, .application, 0);
+    try std.testing.expect(conn.pending_frames.pop() == null);
+    try std.testing.expectEqual(LocalCidPool.issue_limit, conn.local_cid_pool.activeCount());
+}
+
+test "rotateLocalCids: a lost NEW_CONNECTION_ID the rotation retired is not sent again" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.local_cid_pool.registerInitialCid(conn.scid[0..conn.scid_len], null);
+    const old = conn.issueLocalCid().?.seq_num;
+    while (conn.pending_frames.pop()) |_| {}
+    try std.testing.expect(conn.rotateLocalCids(null));
+    while (conn.pending_frames.pop()) |_| {}
+
+    var pkt: ack_handler.SentPacket = .{ .pn = 0, .time_sent = 0, .size = 0, .ack_eliciting = true, .in_flight = true, .enc_level = .application };
+    pkt.control_frames[0] = .{ .new_connection_id = old };
+    pkt.control_frame_count = 1;
+    conn.requeueLostControlFrames(&pkt);
+    try std.testing.expect(conn.pending_frames.pop() == null);
 }
 
 test "connection flow control: the window bounds the sum over streams" {

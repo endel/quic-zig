@@ -897,10 +897,12 @@ pub fn validateRetryToken(
 
 // NEW_TOKEN token format (RFC 9000 §8.1.3):
 // nonce(12) || AES-128-GCM-encrypt(plaintext) || tag(16)
-// Plaintext: timestamp_ns(8) + addr_binding(18) = 26 bytes
+// Plaintext: timestamp_ns(8) + mappedIp(16) = 24 bytes
 // Distinguishable from Retry tokens by shorter ciphertext.
-const NEW_TOKEN_PLAINTEXT_LEN: usize = 8 + ADDR_BINDING_LEN;
-const NEW_TOKEN_MAX_LEN: usize = TOKEN_NONCE_LEN + NEW_TOKEN_PLAINTEXT_LEN + TOKEN_TAG_LEN; // 54
+// The IP without the port (RFC 9000 8.1.4): the client's next connection
+// comes from a port of its own, and under SO_REUSEPORT often to another server.
+const NEW_TOKEN_PLAINTEXT_LEN: usize = 8 + 16;
+const NEW_TOKEN_MAX_LEN: usize = TOKEN_NONCE_LEN + NEW_TOKEN_PLAINTEXT_LEN + TOKEN_TAG_LEN; // 52
 
 pub fn generateNewToken(
     out: []u8,
@@ -918,7 +920,7 @@ pub fn generateNewToken(
     const pt_writer = &pt_fbs;
     const now: i64 = @intCast(sys.nanoTimestamp());
     try pt_writer.writeInt(i64, now, ENDIAN);
-    try pt_writer.writeAll(&addrBinding(&client_addr));
+    try pt_writer.writeAll(&mappedIp(&client_addr));
 
     var ciphertext_buf: [NEW_TOKEN_PLAINTEXT_LEN]u8 = undefined;
     var tag: [TOKEN_TAG_LEN]u8 = undefined;
@@ -935,6 +937,12 @@ pub fn generateNewToken(
     @memcpy(out[TOKEN_NONCE_LEN + NEW_TOKEN_PLAINTEXT_LEN ..][0..TOKEN_TAG_LEN], &tag);
 
     return NEW_TOKEN_MAX_LEN;
+}
+
+/// A NEW_TOKEN token's size, which no Retry token of ours has (those carry
+/// a DCID of at least 8 bytes): an invalid one is told apart by it.
+pub fn isNewTokenSized(token: []const u8) bool {
+    return token.len == NEW_TOKEN_MAX_LEN;
 }
 
 pub fn validateNewToken(
@@ -964,8 +972,8 @@ pub fn validateNewToken(
     const timestamp = pt_reader.takeInt(i64, ENDIAN) catch return false;
     if (!tokenFresh(timestamp)) return false;
 
-    const bound = pt_reader.takeArray(ADDR_BINDING_LEN) catch return false;
-    if (!std.mem.eql(u8, bound, &addrBinding(&client_addr))) return false;
+    const bound = pt_reader.takeArray(16) catch return false;
+    if (!std.mem.eql(u8, bound, &mappedIp(&client_addr))) return false;
 
     return true;
 }
@@ -1241,23 +1249,37 @@ fn testIn6(ip: [16]u8, port: u16) posix.sockaddr.storage {
     return storage;
 }
 
-test "tokens bind the whole client address, IPv4 on a dual-stack socket included" {
+fn testIn4(ip: [4]u8, port: u16) posix.sockaddr.storage {
+    var in4: posix.sockaddr.in = std.mem.zeroes(posix.sockaddr.in);
+    in4.family = posix.AF.INET;
+    in4.port = std.mem.nativeToBig(u16, port);
+    in4.addr = @bitCast(ip);
+    var storage = std.mem.zeroes(posix.sockaddr.storage);
+    @memcpy(std.mem.asBytes(&storage)[0..@sizeOf(posix.sockaddr.in)], std.mem.asBytes(&in4));
+    return storage;
+}
+
+test "Retry tokens bind the whole client address, NEW_TOKEN tokens its IP; IPv4 on a dual-stack socket included" {
     const key: [crypto.key_len]u8 = @splat(3);
     const v4 = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff };
     const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1 } ++ @as([7]u8, @splat(0));
-    const pairs = [_][2]posix.sockaddr.storage{
-        .{ testIn6(v4 ++ [_]u8{ 198, 51, 100, 7 }, 4433), testIn6(v4 ++ [_]u8{ 203, 0, 113, 9 }, 4433) },
-        .{ testIn6(v6 ++ [_]u8{1}, 4433), testIn6(v6 ++ [_]u8{2}, 4433) },
+    // An address, another IP, the same IP from another port.
+    const sets = [_][3]posix.sockaddr.storage{
+        .{ testIn6(v4 ++ [_]u8{ 198, 51, 100, 7 }, 4433), testIn6(v4 ++ [_]u8{ 203, 0, 113, 9 }, 4433), testIn6(v4 ++ [_]u8{ 198, 51, 100, 7 }, 50123) },
+        .{ testIn6(v6 ++ [_]u8{1}, 4433), testIn6(v6 ++ [_]u8{2}, 4433), testIn6(v6 ++ [_]u8{1}, 50123) },
+        .{ testIn4(.{ 198, 51, 100, 7 }, 4433), testIn4(.{ 203, 0, 113, 9 }, 4433), testIn4(.{ 198, 51, 100, 7 }, 50123) },
     };
-    for (pairs) |pair| {
+    for (sets) |set| {
         var out: [TOKEN_MAX_LEN]u8 = undefined;
-        const retry_len = try generateRetryToken(&out, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 9, 9, 9, 9 }, pair[0], key);
-        try std.testing.expect(try validateRetryToken(out[0..retry_len], &.{ 9, 9, 9, 9 }, pair[0], key) != null);
-        try std.testing.expect(try validateRetryToken(out[0..retry_len], &.{ 9, 9, 9, 9 }, pair[1], key) == null);
+        const retry_len = try generateRetryToken(&out, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 9, 9, 9, 9 }, set[0], key);
+        try std.testing.expect(try validateRetryToken(out[0..retry_len], &.{ 9, 9, 9, 9 }, set[0], key) != null);
+        try std.testing.expect(try validateRetryToken(out[0..retry_len], &.{ 9, 9, 9, 9 }, set[1], key) == null);
+        try std.testing.expect(try validateRetryToken(out[0..retry_len], &.{ 9, 9, 9, 9 }, set[2], key) == null);
 
-        const new_len = try generateNewToken(&out, pair[0], key);
-        try std.testing.expect(validateNewToken(out[0..new_len], pair[0], key));
-        try std.testing.expect(!validateNewToken(out[0..new_len], pair[1], key));
+        const new_len = try generateNewToken(&out, set[0], key);
+        try std.testing.expect(validateNewToken(out[0..new_len], set[0], key));
+        try std.testing.expect(!validateNewToken(out[0..new_len], set[1], key));
+        try std.testing.expect(validateNewToken(out[0..new_len], set[2], key));
     }
 }
 

@@ -14,6 +14,8 @@
 //!   - `onSocketClosed(owner)`: the fd is closed and no callback will follow;
 //!     the owner may free itself. Always called from a deferred callback,
 //!     never from inside `write` or `abort`.
+//!   - `onSocketParked(owner)`: after `park`, no read or write is left on
+//!     the loop, so the socket may move to another (`rebind`). Deferred too.
 //!
 //! A trimmed port of routez's `net/socket.zig`: no connect, sendfile, relay
 //! or corking.
@@ -54,10 +56,13 @@ pub fn Socket(comptime Owner: type) type {
         read_c: xev.Completion = .{},
         write_c: xev.Completion = .{},
         closed_cb: timers.Deferred = .{ .callback = onDeferredClose },
+        parked_cb: timers.Deferred = .{ .callback = onDeferredParked },
 
         reading: bool = false,
         read_paused: bool = false,
         writing: bool = false,
+        /// Leaving this loop: nothing more is armed on it while open.
+        parked: bool = false,
 
         /// Slice being written by the kernel; never appended to while `writing`.
         active: std.ArrayList(u8) = .empty,
@@ -101,7 +106,7 @@ pub fn Socket(comptime Owner: type) type {
         }
 
         pub fn startReading(self: *Self) void {
-            if (self.reading or self.read_paused) return;
+            if (self.reading or self.read_paused or self.held()) return;
             if (self.state == .closing or self.state == .closed) return;
             self.reading = true;
             self.tcp.read(self.loop, &self.read_c, .{ .slice = self.readBuf() }, Self, self, onRead);
@@ -131,6 +136,7 @@ pub fn Socket(comptime Owner: type) type {
                     .closing, .closed => {},
                 }
                 self.maybeFinishClose();
+                self.maybeParked();
                 return .disarm;
             };
             switch (self.state) {
@@ -142,8 +148,9 @@ pub fn Socket(comptime Owner: type) type {
                 self.maybeFinishClose();
                 return .disarm;
             }
-            if (self.read_paused and self.state != .lingering) {
+            if ((self.read_paused or self.parked) and self.state != .lingering) {
                 self.reading = false;
+                self.maybeParked();
                 return .disarm;
             }
             return .rearm;
@@ -218,7 +225,7 @@ pub fn Socket(comptime Owner: type) type {
         }
 
         fn kickWrite(self: *Self) void {
-            if (self.writing) return;
+            if (self.writing or self.held()) return;
             if (self.state == .closing or self.state == .closed or self.state == .lingering) return;
             if (self.active_off >= self.active.items.len) {
                 self.active.clearRetainingCapacity();
@@ -244,6 +251,7 @@ pub fn Socket(comptime Owner: type) type {
                 self.dropOutput();
                 if (self.state == .open) Owner.onSocketEof(self.owner) else self.abort();
                 self.maybeFinishClose();
+                self.maybeParked();
                 return .disarm;
             };
             self.active_off += n;
@@ -254,7 +262,38 @@ pub fn Socket(comptime Owner: type) type {
             }
             self.kickWrite();
             if (self.state == .open and self.buffered() < low_water) Owner.onSocketWritable(self.owner);
+            self.maybeParked();
             return .disarm;
+        }
+
+        /// Arm nothing more on this loop, and have `onSocketParked` run once
+        /// no read or write is in flight. Writes still queue meanwhile.
+        pub fn park(self: *Self) void {
+            self.parked = true;
+            self.maybeParked();
+        }
+
+        fn held(self: *const Self) bool {
+            return self.parked and self.state == .open;
+        }
+
+        fn maybeParked(self: *Self) void {
+            if (!self.held() or self.reading or self.writing) return;
+            self.timers.defer_(&self.parked_cb);
+        }
+
+        fn onDeferredParked(d: *timers.Deferred) void {
+            const self: *Self = @fieldParentPtr("parked_cb", d);
+            Owner.onSocketParked(self.owner);
+        }
+
+        /// Serve a parked socket from `loop`, on its thread, from now on:
+        /// what is queued goes out. Reading waits for `startReading`.
+        pub fn rebind(self: *Self, loop: *xev.Loop, t: *timers.Timers) void {
+            self.loop = loop;
+            self.timers = t;
+            self.parked = false;
+            self.kickWrite();
         }
 
         /// Send what is queued, then close gracefully.

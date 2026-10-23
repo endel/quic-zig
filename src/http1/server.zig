@@ -10,8 +10,13 @@
 //! without locks.
 //!
 //! Requests: `Upgrade: websocket` goes to `onWsUpgrade` when the handler has
-//! it; GET and HEAD are served from `static_dir` (404 without one); other
-//! methods get 405. Request bodies are not supported.
+//! it; other GET and HEAD requests to `onHttpRequest`, if it has that, then
+//! to `static_dir` if it didn't answer (404 without one); other methods get
+//! 405. Request bodies are not supported.
+//!
+//! A WebSocket can move to a listener on another loop and thread
+//! (`WsConn.handOver`, `onWsHandover`, `Server.adopt`): servers that share a
+//! port under `reuse_port` send each to the one that serves its peer.
 
 const std = @import("std");
 const posix = std.posix;
@@ -36,6 +41,9 @@ pub const WsConn = conn_mod.WsConn;
 pub const WsRequest = conn_mod.WsRequest;
 pub const WsAcceptOptions = conn_mod.AcceptOptions;
 pub const WsSendError = conn_mod.SendError;
+pub const WsHandover = conn_mod.WsHandover;
+pub const HttpRequest = conn_mod.HttpRequest;
+pub const WsHandoverError = conn_mod.HandoverError;
 pub const WsMessageKind = websocket.MessageKind;
 pub const WsCloseCode = websocket.CloseCode;
 pub const mimeType = conn_mod.mimeType;
@@ -55,6 +63,11 @@ pub const Config = struct {
     tls: bool = true,
     /// Open TCP connections past which new ones are closed on accept.
     max_connections: u32 = 4096,
+    /// Seals TLS session tickets; keep it apart from the QUIC server's. Null
+    /// draws one only this listener holds: listeners on one port
+    /// (`reuse_port`) should share a key, or a client the kernel hands to
+    /// another of them can't resume its session there.
+    ticket_key: ?[16]u8 = null,
     /// Time for the TLS handshake and the first request head.
     handshake_timeout_ms: u32 = 10_000,
     /// How long an idle connection waits for its next request.
@@ -110,11 +123,16 @@ pub const Handlers = struct {
     upgrade: ?*const fn (ctx: *anyopaque, req: *WsRequest, path: []const u8) void,
     message: *const fn (ctx: *anyopaque, ws: *WsConn, data: []const u8, kind: WsMessageKind) void,
     close: *const fn (ctx: *anyopaque, ws: *WsConn, code: u16, reason: []const u8) void,
+    /// Null when the handler hands no WebSocket over.
+    handover: ?*const fn (ctx: *anyopaque, h: WsHandover) void = null,
+    /// Null when the handler answers no plain request.
+    request: ?*const fn (ctx: *anyopaque, req: *HttpRequest, target: []const u8) void = null,
 };
 
 /// Binds a handler's optional `onWsUpgrade(self, req, path)`,
-/// `onWsMessage(self, ws, data[, kind])` and `onWsClose(self, ws, code,
-/// reason)`.
+/// `onWsMessage(self, ws, data[, kind])`, `onWsClose(self, ws, code,
+/// reason)`, `onWsHandover(self, handover)` and `onHttpRequest(self, req,
+/// target)`.
 pub fn handlersFor(comptime H: type, handler: *H) Handlers {
     const S = struct {
         fn upgrade(ctx: *anyopaque, req: *WsRequest, path: []const u8) void {
@@ -133,12 +151,20 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
             if (comptime !@hasDecl(H, "onWsClose")) return;
             H.onWsClose(@ptrCast(@alignCast(ctx)), ws, code, reason);
         }
+        fn handover(ctx: *anyopaque, h: WsHandover) void {
+            H.onWsHandover(@ptrCast(@alignCast(ctx)), h);
+        }
+        fn request(ctx: *anyopaque, req: *HttpRequest, target: []const u8) void {
+            H.onHttpRequest(@ptrCast(@alignCast(ctx)), req, target);
+        }
     };
     return .{
         .ctx = handler,
         .upgrade = if (@hasDecl(H, "onWsUpgrade")) S.upgrade else null,
         .message = S.message,
         .close = S.close,
+        .handover = if (@hasDecl(H, "onWsHandover")) S.handover else null,
+        .request = if (@hasDecl(H, "onHttpRequest")) S.request else null,
     };
 }
 
@@ -185,9 +211,9 @@ pub const Server = struct {
             .listen_file = xev.File.initFd(fd),
             .certs = if (config.tls) opts.certs else null,
             // Our own key: a QUIC ticket must not resume a TCP session.
-            .ticket_key = undefined,
+            .ticket_key = config.ticket_key orelse undefined,
         };
-        sys.randomBytes(&self.ticket_key);
+        if (config.ticket_key == null) sys.randomBytes(&self.ticket_key);
         if (config.alt_svc) {
             const v = std.fmt.bufPrint(&self.alt_svc_buf, "h3=\":{d}\"; ma=86400", .{opts.quic_port}) catch "";
             self.alt_svc_len = @intCast(v.len);
@@ -265,6 +291,8 @@ pub const Server = struct {
     /// each open WebSocket's handler hears `onWsClose(1001)`.
     pub fn deinit(self: *Server) void {
         if (self.started) {
+            // A WebSocket on its way out stays, and closes with the rest.
+            self.stopping = true;
             // Deferred closes that will not get another loop iteration.
             self.timers.runDeferred();
             while (self.conns) |c| {
@@ -274,6 +302,24 @@ pub const Server = struct {
             self.timers.deinit();
         }
         sys.close(self.listen_fd);
+    }
+
+    /// Take in a WebSocket another server let go of (`WsConn.handOver`) and
+    /// serve it from here on: messages it sent behind the one that moved
+    /// it, and every later one, go to this server's handler, from a later
+    /// loop iteration than this call. On this server's loop thread.
+    /// `max_connections` doesn't apply: it was admitted where it began. A
+    /// stopping server discards it (`WsHandover.discard`) and errors.
+    pub fn adopt(self: *Server, h: WsHandover) error{Stopping}!*WsConn {
+        if (!self.started or self.stopping) {
+            h.discard();
+            return error.Stopping;
+        }
+        const c = h.conn;
+        c.moveTo(self);
+        self.link(c);
+        self.ws_count += 1;
+        return &c.ws;
     }
 
     /// The TCP port the listener is bound to.
@@ -337,6 +383,10 @@ pub const Server = struct {
             sys.close(fd);
             return;
         };
+        self.link(c);
+    }
+
+    fn link(self: *Server, c: *Conn) void {
         c.next = self.conns;
         if (self.conns) |h| h.prev = c;
         self.conns = c;
