@@ -404,6 +404,39 @@ test "ACK-only packets: a peer that never acknowledges them costs the server not
     try testing.expectEqual(held, tracker.sent_packets.count());
 }
 
+test "ACK-only packets: a one-way flow of datagrams draws one per two packets" {
+    // RFC 9000 13.2.2. The server is visited after every packet, as its
+    // event loop does, and has nothing to send back.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    const config: connection.ConnectionConfig = .{ .max_datagram_frame_size = 1200, .disable_pmtud = true };
+    var p: Pair = undefined;
+    try p.initWith(config, config);
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    const sent = sconn.total_packets_sent;
+
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var resp: [MAX_DGRAM]u8 = undefined;
+    const inputs = 20;
+    for (0..inputs) |_| {
+        sys.test_clock.? += std.time.ns_per_ms;
+        try p.client.sendDatagram("input");
+        const n = try p.client.send(&buf);
+        try testing.expect(n > 0);
+        _ = p.mgr.recvDatagram(buf[0..n], p.c_addr, p.s_addr, 0, &resp);
+        while (true) {
+            const m = try sconn.send(&buf);
+            if (m == 0) break;
+            p.client.handleDatagram(buf[0..m], .{ .to = p.c_addr, .from = p.s_addr, .datagram_size = m });
+        }
+    }
+    // One more for the packet number the client skips (RFC 9000 21.4):
+    // a gap is acknowledged at once.
+    try testing.expect(sconn.total_packets_sent - sent <= inputs / 2 + 1);
+    try testing.expectEqual(@as(u32, 0), p.client.pkt_handler.sent[2].ack_eliciting_in_flight);
+}
+
 test "PATH_CHALLENGE: a peer that never acknowledges the responses can't grow the server's records" {
     // PATH_RESPONSE goes out even when congestion-limited, so a peer
     // challenging in every packet and acknowledging nothing kept the server
@@ -889,6 +922,9 @@ fn sendAndRead(p: *Pair, sender: *connection.Connection, receiver: *connection.C
     try s.send.writeData(data);
     s.send.close();
     var i: usize = 0;
+    while (i < 50 and p.exchange()) : (i += 1) {}
+    // A lone packet is acknowledged once max_ack_delay is up.
+    sys.test_clock.? += 25 * std.time.ns_per_ms;
     while (i < 50 and p.exchange()) : (i += 1) {}
     const r = receiver.streams.getStream(s.stream_id) orelse return false;
     var got: usize = 0;

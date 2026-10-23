@@ -6083,6 +6083,98 @@ test "e2e: a server's passes go through what is active, not every connection" {
     try testing.expect(e2e.server.conn_mgr.recv_time == null);
 }
 
+/// Answers a datagram saying "echo" with one of its own; others get nothing.
+const EchoOnAsk = struct {
+    pub const protocol: Protocol = .quic;
+    datagrams: u32 = 0,
+
+    pub fn onDatagram(self: *@This(), s: *Session, _: u64, data: []const u8) void {
+        self.datagrams += 1;
+        if (std.mem.eql(u8, data, "echo")) s.sendQuicDatagram("back") catch {};
+    }
+};
+
+/// When `conn` has acknowledged all it received, as the test loop sees it:
+/// no earlier than its ACK went.
+const AckWatch = struct {
+    conn: *connection.Connection,
+    at: i64 = 0,
+
+    fn sent(self: *@This()) bool {
+        if (self.conn.pkt_handler.recv[2].hasUnackedAckEliciting()) return false;
+        self.at = sys.nanoTimestamp();
+        return true;
+    }
+
+    fn delay(self: *const @This()) i64 {
+        return self.at - self.conn.pkt_handler.recv[2].largest_received_time;
+    }
+};
+
+fn nothingInFlight(c: *connection.Connection) bool {
+    return c.pkt_handler.sent[2].ack_eliciting_in_flight == 0;
+}
+
+test "e2e: a lone packet with nothing to answer is acknowledged on its receiver's timer, within max_ack_delay" {
+    var h = EchoOnAsk{};
+    var client_handler = QuicIdleClient{};
+    var e2e: E2e(EchoOnAsk, QuicIdleClient) = undefined;
+    try e2e.init(29512, &h, &client_handler);
+    defer e2e.deinit();
+    try testing.expect(!e2e.server.visitsAll());
+
+    const Quiet = struct {
+        fn f(s: *Server(EchoOnAsk)) bool {
+            const m = &s.conn_mgr;
+            if (m.connectionCount() != 1 or m.to_visit.items.len > 0) return false;
+            return m.entries.items[0].conn.isEstablished() and quietEntry(m.entries.items[0]);
+        }
+    };
+    try runUntil(&e2e.loop, &e2e.server, Quiet.f, 10_000);
+    const sconn = e2e.server.conn_mgr.entries.items[0].conn;
+    const cconn = e2e.client.conn;
+    const max_ack_delay: i64 = @intCast(sconn.local_params.max_ack_delay * std.time.ns_per_ms);
+    // A skipped packet number leaves a gap, which is acknowledged at once.
+    sconn.pkt_handler.skip_pn = std.math.maxInt(u64);
+    cconn.pkt_handler.skip_pn = std.math.maxInt(u64);
+    // Kept through ACKs, unlike pto_count.
+    const server_pto = sconn.pkt_handler.sent[2].pto_fired_at;
+    const client_pto = cconn.pkt_handler.sent[2].pto_fired_at;
+    var cs = e2e.client.clientSession();
+
+    // Server side: the visit that reads it has nothing to send, so only the
+    // deadline it leaves in the heap brings the ACK.
+    const received = sconn.total_packets_received;
+    try cs.sendDatagram(0, "quiet");
+    try runUntilCount(&e2e.loop, &h.datagrams, 1, 3_000);
+    try testing.expect(sconn.pkt_handler.recv[2].hasUnackedAckEliciting());
+    var server_ack = AckWatch{ .conn = sconn };
+    try runUntil(&e2e.loop, &server_ack, AckWatch.sent, 1_000);
+    try testing.expectEqual(received + 1, sconn.total_packets_received);
+    try testing.expect(server_ack.delay() <= max_ack_delay);
+
+    // Client side: the echo carries the server's ACK, and the client owes
+    // one for the echo that only its own timer sends.
+    try runUntil(&e2e.loop, cconn, nothingInFlight, 1_000);
+    const client_received = cconn.total_packets_received;
+    try cs.sendDatagram(0, "echo");
+    const Echoed = struct {
+        fn f(c: *connection.Connection) bool {
+            return c.pkt_handler.recv[2].hasUnackedAckEliciting();
+        }
+    };
+    try runUntil(&e2e.loop, cconn, Echoed.f, 3_000);
+    var client_ack = AckWatch{ .conn = cconn };
+    try runUntil(&e2e.loop, &client_ack, AckWatch.sent, 1_000);
+    try testing.expectEqual(client_received + 1, cconn.total_packets_received);
+    try testing.expect(client_ack.delay() <= max_ack_delay);
+
+    // Neither side waited long enough on an ACK to probe for it.
+    try runUntil(&e2e.loop, sconn, nothingInFlight, 1_000);
+    try testing.expectEqual(server_pto, sconn.pkt_handler.sent[2].pto_fired_at);
+    try testing.expectEqual(client_pto, cconn.pkt_handler.sent[2].pto_fired_at);
+}
+
 test "e2e: a client and server that both offer QUIC v2 finish the handshake in it" {
     var server_handler = HelloServer{};
     var client_handler = CheckingClient{};

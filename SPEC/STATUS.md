@@ -91,8 +91,8 @@
 | 12.5 | Frames and Number Spaces | ✅ Done | Frame-in-wrong-space enforcement |
 | **13** | **Packetization and Reliability** | | |
 | 13.1 | Packet Processing | ✅ Done | Decrypt→parse→process pipeline |
-| 13.2 | Generating Acknowledgments | ✅ Done | ACK generation with delay |
-| 13.2.1 | Sending ACK Frames | ✅ Done | max_ack_delay honored |
+| 13.2 | Generating Acknowledgments | ✅ Done | ACK generation with delay. A 1-RTT ACK not yet due rides behind other frames and never goes alone; Initial and Handshake packets are acknowledged at once |
+| 13.2.1 | Sending ACK Frames | ✅ Done | max_ack_delay honored: the alarm is set 1 ms short of it, so a timer firing late still lands within what we advertise (§18.2). A packet out of order or past a gap is acknowledged at once |
 | 13.2.2 | Acknowledgment Frequency | ✅ Done | Ack-elicit threshold = 2 |
 | 13.2.3 | Managing ACK Ranges | ✅ Done | RangeSet with descending order, capped at 64 ranges per space (oldest dropped; their gaps then read as duplicates) |
 | 13.2.4 | Limiting Ranges by Tracking ACK Frames | ✅ Done | ACK-of-ACK pruning via largest_acked in ack-eliciting SentPackets. ACK-only packets aren't recorded, so pruning waits for the peer to acknowledge an ack-eliciting one; received ranges are capped at 64 |

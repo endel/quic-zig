@@ -39,6 +39,18 @@ const MAX_PN_LEN: usize = 4;
 /// Header protection sample length.
 const SAMPLE_LEN: usize = crypto_mod.SAMPLE_LEN;
 
+/// What STREAM frames leave free for an ACK held to ride behind them: an
+/// ACK_ECN with 4-byte packet numbers and counts, and two gaps.
+const ACK_BEHIND_DATA_ROOM: usize = 32;
+
+fn largestAck(ack_frame: Frame) ?u64 {
+    return switch (ack_frame) {
+        .ack => |a| a.largest_ack,
+        .ack_ecn => |a| a.largest_ack,
+        else => null,
+    };
+}
+
 /// The packet packer assembles outgoing QUIC packets.
 ///
 /// It handles:
@@ -352,27 +364,28 @@ pub const PacketPacker = struct {
         var control_frames: [ack_handler.MAX_CONTROL_FRAMES_PER_PACKET]ack_handler.SentControlFrame = undefined;
         var control_frame_count: u8 = 0;
 
+        const ack_delay_exp: u64 = 3;
+        // Held in step 1, sent in step 7.
+        var ack_behind_data = false;
+
         // 0-RTT packets only contain STREAM and DATAGRAM frames — skip ACK, CRYPTO, control
         if (!zero_rtt) {
-            // 1. ACK frame (always first if pending)
-            // Force ACK generation only when it can piggyback on non-ACK data.
-            // ACK-only packets bypass congestion control; forcing one on every
-            // congestion-limited poll can create an ACK-only send loop that
-            // never drains bytes_in_flight or returns quiescent state to the
-            // application. In ack_only mode, honor the normal ACK queue/alarm.
-            const ack_delay_exp: u64 = 3;
-            const ack_frame_opt: ?Frame = if (!ack_only and pkt_handler.hasUnackedAckEliciting(level))
+            // 1. ACK frame, first when due.
+            // Initial and Handshake are acknowledged at once (RFC 9000
+            // 13.2.1). A 1-RTT ACK not yet due only rides behind other
+            // frames: alone it would be a packet per packet received. Not in
+            // ack_only mode, where ACK-only packets bypass congestion control
+            // and forcing them can loop without draining bytes_in_flight.
+            const ack_frame_opt: ?Frame = if (level != .application and !ack_only and pkt_handler.hasUnackedAckEliciting(level))
                 pkt_handler.getAckFrameForced(level, now, ack_delay_exp)
             else
                 pkt_handler.getAckFrame(level, now, ack_delay_exp);
             if (ack_frame_opt) |ack_frame| {
                 // Record the largest_ack for ACK-of-ACK pruning (RFC 9000 §13.2.4)
-                switch (ack_frame) {
-                    .ack => |a| ack_largest_sent = a.largest_ack,
-                    .ack_ecn => |a| ack_largest_sent = a.largest_ack,
-                    else => {},
-                }
+                ack_largest_sent = largestAck(ack_frame);
                 try ack_frame.write(writer);
+            } else {
+                ack_behind_data = level == .application and !ack_only and pkt_handler.hasUnackedAckEliciting(level);
             }
 
             // 2. CRYPTO frames
@@ -485,6 +498,8 @@ pub const PacketPacker = struct {
         var stream_frame_info_count: u8 = 0;
 
         if (level == .application and !ack_only) {
+            // Streams split anywhere, so they leave room for the held ACK.
+            const stream_max = if (ack_behind_data) effective_max -| ACK_BEHIND_DATA_ROOM else effective_max;
             // Connection-level flow control budget for this packet
             var conn_budget: u64 = if (self.conn_flow_ctrl) |cfc| cfc.sendWindowSize() else std.math.maxInt(u64);
 
@@ -492,11 +507,11 @@ pub const PacketPacker = struct {
             var sched_buf: [stream_mod.StreamsMap.MAX_SCHEDULABLE]*stream_mod.Stream = undefined;
             const sched_count = streams.getScheduledStreams(&sched_buf);
             for (sched_buf[0..sched_count]) |s| {
-                if (fbs.seek + AEAD_TAG_LEN + 16 >= effective_max) break;
+                if (fbs.seek + AEAD_TAG_LEN + 16 >= stream_max) break;
                 const retransmitting = s.send.hasRetransmitData();
                 if (conn_budget == 0 and !retransmitting) continue;
                 if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
-                const remaining = effective_max - fbs.seek - AEAD_TAG_LEN;
+                const remaining = stream_max - fbs.seek - AEAD_TAG_LEN;
                 const header_overhead = streamFrameHeaderOverhead(s.send.stream_id, s.send.send_offset, remaining);
                 if (remaining <= header_overhead) break;
                 const max_stream_data = if (retransmitting)
@@ -530,11 +545,11 @@ pub const PacketPacker = struct {
             const uni_sched_count = streams.getScheduledUniStreams(&uni_sched_buf);
             if (uni_sched_count > 0) {
                 for (uni_sched_buf[0..uni_sched_count]) |s| {
-                    if (fbs.seek + AEAD_TAG_LEN + 16 >= effective_max) break;
+                    if (fbs.seek + AEAD_TAG_LEN + 16 >= stream_max) break;
                     const retransmitting = s.hasRetransmitData();
                     if (conn_budget == 0 and !retransmitting) continue;
                     if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
-                    const remaining_uni = effective_max - fbs.seek - AEAD_TAG_LEN;
+                    const remaining_uni = stream_max - fbs.seek - AEAD_TAG_LEN;
                     const uni_header_overhead = streamFrameHeaderOverhead(s.stream_id, s.send_offset, remaining_uni);
                     if (remaining_uni <= uni_header_overhead) break;
                     const max_stream_data = if (retransmitting)
@@ -587,6 +602,20 @@ pub const PacketPacker = struct {
                     has_datagram = true;
                 }
             }
+        }
+
+        // 7. The ACK held in step 1, if anything else went in. Without the
+        // room, the threshold or the alarm sends it later.
+        if (ack_behind_data and ack_eliciting) ack: {
+            const ack_frame = pkt_handler.peekAckFrame(level, now, ack_delay_exp) orelse break :ack;
+            const mark = fbs.seek;
+            const fits = if (ack_frame.write(writer)) |_| fbs.seek + AEAD_TAG_LEN <= effective_max else |_| false;
+            if (!fits) {
+                fbs.seek = mark;
+                break :ack;
+            }
+            pkt_handler.onAckSent(level);
+            ack_largest_sent = largestAck(ack_frame);
         }
 
         // Note: RFC 9002 loss detection deadlock prevention is handled by the PTO
@@ -1506,4 +1535,128 @@ test "PacketPacker: control frames past one packet wait for the next" {
     }
     try testing.expectEqual(@as(usize, 10), resets);
     try testing.expectEqual(@as(usize, 20), tokens);
+}
+
+/// A server's 1-RTT side holding one ack-eliciting packet it has not
+/// acknowledged, received at t=1000.
+const AckRig = struct {
+    packer: PacketPacker,
+    pkt_handler: ack_handler.PacketHandler,
+    crypto_mgr: crypto_stream.CryptoStreamManager,
+    streams: stream_mod.StreamsMap,
+    pending_frames: frame_mod.PendingFrameQueue = .{},
+    dq: conn_mod.DatagramQueue = .{},
+
+    fn init(self: *AckRig) !void {
+        const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+        self.* = .{
+            .packer = PacketPacker.init(testing.allocator, true, &[_]u8{0x01}, dcid, 0x00000001),
+            .pkt_handler = ack_handler.PacketHandler.init(testing.allocator),
+            .crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator),
+            .streams = stream_mod.StreamsMap.init(testing.allocator, true),
+        };
+        self.streams.setMaxStreams(10, 10);
+        self.streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+        try self.pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0);
+    }
+
+    fn deinit(self: *AckRig) void {
+        self.dq.deinitQueue(testing.allocator);
+        self.streams.deinit();
+        self.crypto_mgr.deinit();
+        self.pkt_handler.deinit();
+    }
+
+    fn pack(self: *AckRig, out: []u8, now: i64) !usize {
+        const keys = try testServerKeys();
+        return self.packer.packCoalesced(out, &self.pkt_handler, &self.crypto_mgr, &self.streams, &self.pending_frames, null, null, null, &keys.seal, now, &self.dq, false);
+    }
+
+    /// The largest packet number the last packet sent acknowledged, if any.
+    /// Only packets in flight leave a record to read it from.
+    fn lastAcked(self: *AckRig) ?u64 {
+        const last = self.pkt_handler.next_pn[2] - 1;
+        var it = self.pkt_handler.sent[2].sent_packets.iterator();
+        while (it.next()) |p| if (p.pn == last) return p.largest_acked;
+        unreachable;
+    }
+};
+
+test "PacketPacker: an ACK not yet due makes no packet of its own" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var out: [1500]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try rig.pack(&out, 1000));
+    try testing.expectEqual(@as(u64, 0), rig.pkt_handler.next_pn[2]);
+    try testing.expect(rig.pkt_handler.hasUnackedAckEliciting(.application));
+
+    // Its alarm sends it alone.
+    const alarm = rig.pkt_handler.recv[2].ack_alarm.?;
+    try testing.expect(try rig.pack(&out, alarm) > 0);
+    try testing.expect(!rig.pkt_handler.hasUnackedAckEliciting(.application));
+}
+
+test "PacketPacker: an ACK not yet due rides on a datagram" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    try testing.expect(rig.dq.push(testing.allocator, "state"));
+    var out: [1500]u8 = undefined;
+    try testing.expect(try rig.pack(&out, 1000) > 0);
+    try testing.expectEqual(@as(?u64, 0), rig.lastAcked());
+    try testing.expect(!rig.pkt_handler.hasUnackedAckEliciting(.application));
+    try testing.expectEqual(@as(?i64, null), rig.pkt_handler.recv[2].ack_alarm);
+    try testing.expectEqual(@as(u64, 1), rig.pkt_handler.next_pn[2]);
+}
+
+test "PacketPacker: a stream filling the packet leaves the ACK room" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const s = try rig.streams.getOrCreateStream(0);
+    const body: [4000]u8 = @splat('x');
+    try s.send.writeData(&body);
+    var out: [1500]u8 = undefined;
+    const first = try rig.pack(&out, 1000);
+    try testing.expect(first > 0 and first <= rig.packer.max_packet_size);
+    try testing.expectEqual(@as(?u64, 0), rig.lastAcked());
+    // Nothing more owed: the next packet is all stream data.
+    const second = try rig.pack(&out, 1000);
+    try testing.expectEqual(rig.packer.max_packet_size, second);
+    try testing.expectEqual(@as(?u64, null), rig.lastAcked());
+}
+
+test "PacketPacker: Initial packets are acknowledged at once" {
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, &[_]u8{0x01}, dcid, 0x00000001);
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    try pkt_handler.recv[0].onPacketReceived(0, true, 1000, 0);
+
+    const keys = try testClientKeys();
+    var out: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(&out, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &keys.seal, null, null, null, 1000, null, false);
+    try testing.expect(written > 0);
+    try testing.expect(!pkt_handler.hasUnackedAckEliciting(.initial));
+}
+
+test "PacketPacker: a datagram filling the packet leaves the ACK for later" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    // 1174 bytes of plaintext past a 10-byte header: the frame takes 1173.
+    const big: [1170]u8 = @splat('s');
+    try testing.expect(rig.dq.push(testing.allocator, &big));
+    var out: [1500]u8 = undefined;
+    const written = try rig.pack(&out, 1000);
+    try testing.expect(written > 0 and written <= rig.packer.max_packet_size);
+    try testing.expect(rig.dq.isEmpty());
+    try testing.expectEqual(@as(?u64, null), rig.lastAcked());
+    try testing.expect(rig.pkt_handler.hasUnackedAckEliciting(.application));
 }
