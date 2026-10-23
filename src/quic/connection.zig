@@ -1263,7 +1263,7 @@ pub const Connection = struct {
         if (self.replaying_undecryptable) return;
         const bytes = currentPacketBytes(header, fbs) orelse return;
         self.undecryptable.push(self.allocator, bytes, info);
-        std.log.info("recv: buffered undecryptable {s} packet ({d} bytes; {d} queued)", .{ what, bytes.len, self.undecryptable.count });
+        std.log.debug("recv: buffered undecryptable {s} packet ({d} bytes; {d} queued)", .{ what, bytes.len, self.undecryptable.count });
     }
 
     /// Replay packets that were buffered because their keys weren't installed
@@ -1274,7 +1274,7 @@ pub const Connection = struct {
     fn replayUndecryptable(self: *Connection) void {
         const n = self.undecryptable.count;
         if (n == 0) return;
-        std.log.info("replaying {d} buffered undecryptable packet(s)", .{n});
+        std.log.debug("replaying {d} buffered undecryptable packet(s)", .{n});
         // Don't re-credit received bytes on replay (anti-amplification:
         // keeps the server conservative — RFC 9000 §8.1).
         // Taken out first: a replayed packet may finish the handshake, and
@@ -1808,7 +1808,7 @@ pub const Connection = struct {
 
                     // Check if this is an MTU probe loss — don't trigger CC
                     if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {
-                        std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
+                        std.log.debug("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
                         has_non_probe_loss = true;
                         if (earliest_lost_sent_time == null or pkt.time_sent < earliest_lost_sent_time.?) {
@@ -1951,7 +1951,7 @@ pub const Connection = struct {
                     if (pkt.has_datagram) self.datagrams_lost_outgoing += 1;
 
                     if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {
-                        std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
+                        std.log.debug("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
                         has_non_probe_loss = true;
                         if (earliest_lost_sent_time_ecn == null or pkt.time_sent < earliest_lost_sent_time_ecn.?) {
@@ -2023,7 +2023,7 @@ pub const Connection = struct {
 
                 // If valid and CE count increased, treat as congestion event
                 if (ecn_valid and ack.ecn_ce > self.peer_ecn_ce[space_idx]) {
-                    std.log.info("ECN: CE count increased {d} -> {d}, congestion signal", .{ self.peer_ecn_ce[space_idx], ack.ecn_ce });
+                    std.log.debug("ECN: CE count increased {d} -> {d}, congestion signal", .{ self.peer_ecn_ce[space_idx], ack.ecn_ce });
                     self.cc.onCongestionEvent(now, now);
                 }
                 self.peer_ecn_ect0[space_idx] = ack.ecn_ect0;
@@ -2550,7 +2550,7 @@ pub const Connection = struct {
             return;
         }
 
-        std.log.info("advanceHandshake: state={}, iterations starting", .{@backingInt(hs.state)});
+        std.log.debug("advanceHandshake: state={}, iterations starting", .{@backingInt(hs.state)});
 
         // RFC 9001 §4.1.3: TLS reads each level's CRYPTO data only while it
         // is at that level; the rest waits in its own stream.
@@ -2589,7 +2589,7 @@ pub const Connection = struct {
                 self.closeWithTransportError(TransportError.cryptoError(tls_alert), @backingInt(FrameType.crypto), "TLS handshake failure");
                 return;
             };
-            std.log.info("advanceHandshake: step {d} produced action={s}", .{ iterations, @tagName(action) });
+            std.log.debug("advanceHandshake: step {d} produced action={s}", .{ iterations, @tagName(action) });
 
             // Moving to a new level: nothing may be left of the old one.
             const next_level = hs.readLevel();
@@ -2610,7 +2610,7 @@ pub const Connection = struct {
                     // Log hash of data being written to crypto stream for corruption debugging
                     var data_hash: [32]u8 = undefined;
                     std.crypto.hash.sha2.Sha256.hash(sd.data, &data_hash, .{});
-                    std.log.info("advanceHandshake: writing {d} bytes to level {}, first4={x:0>2}{x:0>2}{x:0>2}{x:0>2}, sha256={x}", .{
+                    std.log.debug("advanceHandshake: writing {d} bytes to level {}, first4={x:0>2}{x:0>2}{x:0>2}{x:0>2}, sha256={x}", .{
                         sd.data.len,
                         cs_level,
                         sd.data[0],
@@ -3940,7 +3940,7 @@ pub const Connection = struct {
                 // probe can be wiped; 2 probes double the chance of getting through.
                 self.pto_probe_pending = 2;
                 if (self.pkt_handler.getPtoSpace()) |space| {
-                    std.log.info("PTO fired: count={d}, space={s}, has_data={}", .{ self.pkt_handler.pto_count, @tagName(space), has_data });
+                    std.log.debug("PTO fired: count={d}, space={s}, has_data={}", .{ self.pkt_handler.pto_count, @tagName(space), has_data });
                 }
             }
         }
