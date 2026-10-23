@@ -546,13 +546,13 @@ https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/
 
 | § | Section | Status | Notes |
 |---|---------|--------|-------|
-| — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize, send after handshake; frames packed after it in a packet are read too (picoquic puts HANDSHAKE_DONE there) |
+| — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize; frames packed after it in a packet are read too (picoquic puts HANDSHAKE_DONE there) |
 | — | IMMEDIATE_ACK frame (0x1f) | ✅ Done | Parse, serialize, triggers immediate ACK |
 | — | min_ack_delay transport parameter (0xff04de1b) | ✅ Done | Advertised by both client and server |
 | — | Dynamic ACK thresholds | ✅ Done | ack_eliciting_threshold, max_ack_delay, reordering_threshold |
 | — | Sequence number tracking | ✅ Done | Obsolete ACK_FREQUENCY frames ignored |
 | — | Negotiation via min_ack_delay | ✅ Done | Only send ACK_FREQUENCY if peer advertises support |
-| — | Server sends ACK_FREQUENCY | ✅ Done | threshold=10, max_delay=25ms, reorder=1 after handshake |
+| — | Server sends ACK_FREQUENCY | ❌ Missing | Disabled; the send site runs before the peer's transport parameters are read, so it could never fire |
 
 ### Summary — ACK Frequency: ✅ Complete (7/7)
 
