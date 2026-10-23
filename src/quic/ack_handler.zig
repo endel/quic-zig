@@ -624,7 +624,8 @@ pub const ReceivedPacketTracker = struct {
     pub fn applyAckFrequency(self: *ReceivedPacketTracker, seq: u64, threshold: u64, max_delay_us: u64, reorder_threshold: u64) bool {
         if (self.ack_frequency_seq > 0 and seq < self.ack_frequency_seq) return false;
         self.ack_frequency_seq = seq + 1; // store next expected (> current)
-        self.ack_eliciting_threshold = @intCast(@max(1, @min(threshold, 256)));
+        // An ACK after MORE than `threshold` packets: 1 is RFC 9000's every second.
+        self.ack_eliciting_threshold = @as(u32, @min(threshold, 255)) + 1;
         self.ack_bytes_threshold = 0; // the peer's threshold stands alone
         // Capped where the max_ack_delay transport parameter's range ends (2^14 ms).
         self.max_ack_delay_ns = @as(i64, @min(max_delay_us, (1 << 14) * 1000)) * 1000;
@@ -1168,10 +1169,25 @@ test "ReceivedPacketTracker: an ACK_FREQUENCY threshold replaces the byte thresh
     var tracker = ReceivedPacketTracker.init(testing.allocator);
     defer tracker.deinit();
     tracker.ack_bytes_threshold = 2000;
-    try testing.expect(tracker.applyAckFrequency(0, 2, 25_000, 1));
+    try testing.expect(tracker.applyAckFrequency(0, 1, 25_000, 1));
     try tracker.onPacketReceived(0, true, 1000, 0, 40);
     try tracker.onPacketReceived(1, true, 2000, 0, 40);
     try testing.expect(tracker.ack_queued);
+}
+
+test "ReceivedPacketTracker: an ACK_FREQUENCY threshold of N acknowledges after N + 1 packets" {
+    // draft-ietf-quic-ack-frequency 4: 1 is RFC 9000's every second packet.
+    for ([_]u64{ 0, 1, 10 }) |threshold| {
+        var tracker = ReceivedPacketTracker.init(testing.allocator);
+        defer tracker.deinit();
+        try testing.expect(tracker.applyAckFrequency(0, threshold, 25_000, 1));
+        for (0..threshold) |pn| {
+            try tracker.onPacketReceived(pn, true, 1000, 0, 40);
+            try testing.expect(!tracker.ack_queued);
+        }
+        try tracker.onPacketReceived(threshold, true, 1000, 0, 40);
+        try testing.expect(tracker.ack_queued);
+    }
 }
 
 test "ReceivedPacketTracker: immediate ACK on reorder" {
