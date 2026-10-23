@@ -599,6 +599,7 @@ pub const Session = struct {
 
     pub fn readStream(self: *Session, stream_id: u64) ?[]const u8 {
         const stream = self.entry.conn.streams.getStream(stream_id) orelse return null;
+        self.entry.needs_visit = true; // the read frees flow-control credit to announce
         return stream.recv.read();
     }
 
@@ -1117,6 +1118,8 @@ pub fn Server(comptime Handler: type) type {
                         conn.getEcnMark(),
                     );
                 }
+                // What it sent armed timers rescheduleTimer reads from the cache.
+                entry.deadline = conn.nextTimeoutNs();
             }
             self.batch.flush();
             if (self.preferred) |*p| p.batch.flush();
@@ -1508,8 +1511,21 @@ pub fn Server(comptime Handler: type) type {
             return &self.batch;
         }
 
+        /// A handler with `onPollComplete` expects it for every connection on
+        /// every pass. Without one, a pass looks only at connections that
+        /// received, were written to or have a deadline due, so a pass costs
+        /// what is active rather than everything connected.
+        const sparse_passes = !@hasDecl(Handler, "onPollComplete");
+
+        fn visitsAll(self: *const Self) bool {
+            return !sparse_passes or self.draining or self.stopping;
+        }
+
         fn processConnections(self: *Self) void {
+            const all = self.visitsAll();
             for (self.conn_mgr.entries.items) |entry| {
+                // Due timers alone are tickAndSend's; events need a packet or the app.
+                if (!all and !entry.needs_visit) continue;
                 const conn = entry.conn;
 
                 // Initialize protocol layer once handshake completes
@@ -1922,9 +1938,21 @@ pub fn Server(comptime Handler: type) type {
             // One clock read for the pass: a deadline check does not need a
             // fresher now than this, and reading it per connection showed up.
             const pass_now_ns: i64 = sys.nanoTimestamp();
+            // Send times share a read across connections too, refreshed every
+            // `packets_per_clock_read` packets or connections with nothing to send.
+            var now_ns: i64 = pass_now_ns;
+            var clock_uses: usize = 1;
+            const all = self.visitsAll();
             var i: usize = 0;
             while (i < self.conn_mgr.entries.items.len) {
                 const entry = self.conn_mgr.entries.items[i];
+                // Untouched since its last visit, an entry's cached deadline is exact.
+                const deadline = if (all or entry.needs_visit) entry.conn.nextTimeoutNsAt(pass_now_ns) else entry.deadline;
+                const due = if (deadline) |first| first <= pass_now_ns else false;
+                if (!all and !entry.needs_visit and !due) {
+                    i += 1;
+                    continue;
+                }
 
                 // Call onTimeout() in a loop to fire ALL expired PTO deadlines.
                 // quic-go fires PTO for each space independently; without this loop,
@@ -1936,17 +1964,15 @@ pub fn Server(comptime Handler: type) type {
                 // no deadline of its own and relies on being looked at each pass.
                 // Otherwise onTimeout does nothing, and reaching it costs a call
                 // and a clock read for every connection on every pass.
-                const due = if (entry.conn.nextTimeoutNs()) |first| first <= pass_now_ns else false;
                 if (due or entry.conn.close_when_idle) {
                     var timeout_iter: usize = 0;
                     while (timeout_iter < 8) : (timeout_iter += 1) {
                         entry.conn.onTimeout() catch {};
                         if (entry.conn.isClosed()) break;
                         // Check if there are more expired timeouts
-                        const next = entry.conn.nextTimeoutNs();
-                        if (next == null) break;
-                        const now_ns: i64 = sys.nanoTimestamp();
-                        if (next.? > now_ns) break;
+                        now_ns = sys.nanoTimestamp();
+                        const next = entry.conn.nextTimeoutNsAt(now_ns) orelse break;
+                        if (next > now_ns) break;
                     }
                 }
                 if (entry.conn.isClosed()) {
@@ -1970,12 +1996,13 @@ pub fn Server(comptime Handler: type) type {
                 const batch = self.batchForConn(conn);
                 const max_burst_packets = 1000;
                 var send_count: usize = 0;
-                var now_ns: i64 = undefined;
                 conn.beginBurst();
                 defer conn.endBurst();
                 while (send_count < max_burst_packets) : (send_count += 1) {
                     const buf = batch.reserve();
-                    if (send_count % packets_per_clock_read == 0 or batch.count == 0) now_ns = sys.nanoTimestamp();
+                    // An empty batch mid-burst was just flushed, and the syscall took time.
+                    if (clock_uses % packets_per_clock_read == 0 or (send_count > 0 and batch.count == 0)) now_ns = sys.nanoTimestamp();
+                    clock_uses += 1;
                     const bytes_written = conn.sendAt(buf, now_ns) catch break;
                     if (bytes_written == 0) break;
                     const send_addr = conn.peerAddress();
@@ -1987,6 +2014,9 @@ pub fn Server(comptime Handler: type) type {
                     );
                 }
 
+                entry.deadline = conn.nextTimeoutNsAt(now_ns);
+                // close_when_idle waits on its streams with no deadline: keep looking.
+                entry.needs_visit = conn.close_when_idle;
                 i += 1;
             }
 
@@ -2041,8 +2071,9 @@ pub fn Server(comptime Handler: type) type {
             const now: i64 = sys.nanoTimestamp();
             var earliest: ?i64 = null;
 
+            const all = self.visitsAll();
             for (self.conn_mgr.entries.items) |entry| {
-                if (entry.conn.nextTimeoutNs()) |deadline| {
+                if (if (all) entry.conn.nextTimeoutNsAt(now) else entry.deadline) |deadline| {
                     if (earliest == null or deadline < earliest.?) {
                         earliest = deadline;
                     }
@@ -3338,10 +3369,9 @@ pub fn Client(comptime Handler: type) type {
                         break;
                     };
                     if (conn.isClosed()) break;
-                    const next = conn.nextTimeoutNs();
-                    if (next == null) break;
                     const now_ns: i64 = sys.nanoTimestamp();
-                    if (next.? > now_ns) break;
+                    const next = conn.nextTimeoutNsAt(now_ns) orelse break;
+                    if (next > now_ns) break;
                 }
             }
 
@@ -3415,8 +3445,8 @@ pub fn Client(comptime Handler: type) type {
 
         fn computeNextTimeoutMs(self: *Self) ?u64 {
             const floor: ?u64 = if (@hasDecl(Handler, "poll_interval_ms")) Handler.poll_interval_ms else null;
-            const deadline = self.conn.nextTimeoutNs() orelse return floor;
             const now: i64 = sys.nanoTimestamp();
+            const deadline = self.conn.nextTimeoutNsAt(now) orelse return floor;
             const delta_ns = deadline - now;
             if (delta_ns <= 0) return 1;
             const ms: u64 = @intCast(@divFloor(delta_ns, 1_000_000));
@@ -4128,6 +4158,42 @@ test "e2e: onConnectionClosed fires once, before the entry goes" {
     e2e.deinit();
     try testing.expectEqual(@as(u32, 1), server_handler.closed_count);
     try testing.expect(server_handler.closed_id_matched);
+}
+
+/// No onPollComplete, so its passes skip connections with nothing new.
+const IdleServer = struct {
+    pub const protocol: Protocol = .quic;
+    closed: u32 = 0,
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.closed += 1;
+    }
+};
+
+const SilentClient = struct {
+    pub const protocol: Protocol = .quic;
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+};
+
+test "e2e: a connection that falls silent times out though no pass is asked to look at it" {
+    var client_handler = SilentClient{};
+    var server_handler = IdleServer{};
+    var e2e: E2e(IdleServer, SilentClient) = undefined;
+    try e2e.initWith(29491, &server_handler, &client_handler, .{ .max_idle_timeout = 200 }, null);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &e2e.server, struct {
+        fn f(s: *Server(IdleServer)) bool {
+            const items = s.conn_mgr.entries.items;
+            return items.len == 1 and items[0].conn.isEstablished();
+        }
+    }.f, 5000);
+    // Nothing is sent after the handshake: only the cached deadline brings it up.
+    try runUntil(&e2e.loop, &server_handler, struct {
+        fn f(h: *IdleServer) bool {
+            return h.closed == 1;
+        }
+    }.f, 3000);
+    try testing.expectEqual(@as(usize, 0), e2e.server.conn_mgr.connectionCount());
 }
 
 /// Echoes how much request body arrived, once the request is complete.

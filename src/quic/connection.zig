@@ -4286,9 +4286,6 @@ pub const Connection = struct {
         return false;
     }
 
-    /// Compute the next timeout deadline (nanosecond timestamp) without side effects.
-    /// Returns null if the connection is terminated and needs no timer.
-    /// Used by event loop to schedule the global timer.
     /// When a connection still in its handshake gives up on it; null once
     /// the handshake is done or the limit is off.
     fn handshakeDeadline(self: *const Connection) ?i64 {
@@ -4296,7 +4293,16 @@ pub const Connection = struct {
         return self.creation_time +| self.handshake_timeout_ns;
     }
 
+    /// Compute the next timeout deadline (nanosecond timestamp) without side effects.
+    /// Returns null if the connection is terminated and needs no timer.
+    /// Used by event loop to schedule the global timer.
     pub fn nextTimeoutNs(self: *const Connection) ?i64 {
+        return self.nextTimeoutNsAt(@intCast(sys.nanoTimestamp()));
+    }
+
+    /// `nextTimeoutNs` at `now`, a `sys.nanoTimestamp()` the caller read: an
+    /// event loop asks every connection each pass, and one read serves them all.
+    pub fn nextTimeoutNsAt(self: *const Connection, now: i64) ?i64 {
         if (self.state == .terminated) return null;
 
         var earliest: ?i64 = null;
@@ -4379,7 +4385,6 @@ pub const Connection = struct {
         // Pacer: if the pacer has bandwidth set (active transfer), include its
         // next-send time so the event loop wakes up promptly to send more data.
         if (self.pacer.bandwidth_shifted > 0 and self.state == .connected) {
-            const now: i64 = @intCast(sys.nanoTimestamp());
             const delay = self.pacer.delayAt(now);
             if (delay > 0) {
                 const pacer_deadline = now + delay;

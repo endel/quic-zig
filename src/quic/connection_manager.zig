@@ -144,13 +144,23 @@ pub const ConnEntry = struct {
     reset_key_count: u8 = 0,
     reset_pool_gen: ?u32 = null,
 
+    /// Something for the owner's next pass to look at: a packet arrived, or
+    /// the application queued, read or resumed data. A pass may skip an
+    /// entry without it whose `deadline` has not come.
+    needs_visit: bool = true,
+    /// `conn.nextTimeoutNsAt` as of the owner's last visit; it only changes
+    /// when something sets `needs_visit`.
+    deadline: ?i64 = null,
+
     /// Tell the owner there is data to send; see `wake_fn`.
     pub fn wake(self: *ConnEntry) void {
+        self.needs_visit = true;
         if (self.wake_fn) |f| f(self.wake_ctx orelse return);
     }
 
     /// Ask the owner for another poll pass; see `repoll_fn`.
     pub fn repoll(self: *ConnEntry) void {
+        self.needs_visit = true;
         if (self.repoll_fn) |f| f(self.wake_ctx orelse return);
     }
 
@@ -823,6 +833,7 @@ pub const ConnectionManager = struct {
             const dg_size: u64 = if (current_entry == null) bytes.len else 0;
             current_entry = e;
             const recv_info: connection.RecvInfo = .{ .to = local, .from = from, .ecn = ecn_val, .datagram_size = dg_size };
+            e.needs_visit = true;
             e.conn.recv(&header, &fbs, recv_info) catch |err| {
                 if (err == error.UndecryptablePacket and pkt_start == 0) _ = e.conn.handleStatelessReset(bytes);
                 break;
