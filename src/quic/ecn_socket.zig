@@ -238,12 +238,13 @@ pub fn mapV4ToV6(storage: *posix.sockaddr.storage) void {
 
 /// Batch sender that collects outgoing packets and flushes them together.
 ///
-/// On Linux a run of packets to one address leaves in one `sendmmsg`, and each
-/// stretch of it GSO can take (same-sized packets, then at most one shorter) is
-/// a single message carrying `UDP_SEGMENT`, so the kernel does the splitting:
-/// one skb for the stretch, which is what nginx's `quic_gso` buys. Where
-/// UDP_SEGMENT is unavailable every packet is its own message. Other platforms
-/// send one `sendmsg` per packet.
+/// On Linux the batch leaves in one `sendmmsg` per ECN mark, each message to
+/// its own address, and each stretch to one address that GSO can take
+/// (same-sized packets, then at most one shorter) is a single message carrying
+/// `UDP_SEGMENT`, so the kernel does the splitting: one skb for the stretch,
+/// which is what nginx's `quic_gso` buys. Where UDP_SEGMENT is unavailable
+/// every packet is its own message. Other platforms send one `sendmsg` per
+/// packet.
 pub const SendBatch = struct {
     const MAX_BATCH: usize = 64;
     /// GSO needs every segment but the last to be the same size, and the whole
@@ -314,16 +315,13 @@ pub const SendBatch = struct {
             self.count = 0;
             self.data_len = 0;
         }
-        // Packets that share a destination and an ECN mark go out together:
-        // changing the mark is a setsockopt, and a segmented send carries one
-        // address. A connection's burst is one run, which is the case that pays.
+        // Packets that share an ECN mark go out together: changing the mark is
+        // a setsockopt. A server sends one packet to each of many peers a pass,
+        // and those runs of one cost a syscall apiece when split by address.
         var start: usize = 0;
         while (start < self.count) {
             var end = start + 1;
-            while (end < self.count and
-                self.ecn_marks[end] == self.ecn_marks[start] and
-                self.sameAddr(start, end)) : (end += 1)
-            {}
+            while (end < self.count and self.ecn_marks[end] == self.ecn_marks[start]) : (end += 1) {}
             if (self.ecn_marks[start] != self.current_ecn) {
                 self.current_ecn = self.ecn_marks[start];
                 setEcnMark(self.sockfd, self.current_ecn) catch {};
@@ -427,15 +425,16 @@ pub const SendBatch = struct {
         }
     }
 
-    /// Where a GSO send starting at `from` has to stop: packets the size of
-    /// the first, then at most one shorter, within the length limit.
+    /// Where a GSO send starting at `from` has to stop: packets to its address
+    /// the size of the first, then at most one shorter, within the length
+    /// limit.
     fn segmentEnd(self: *const SendBatch, from: usize, to: usize) usize {
         const seg = self.lengths[from];
         var total: usize = seg;
         var i = from + 1;
         while (i < to) : (i += 1) {
             const len = self.lengths[i];
-            if (len > seg or total + len > max_gso_bytes) break;
+            if (len > seg or total + len > max_gso_bytes or !self.sameAddr(from, i)) break;
             total += len;
             if (len < seg) return i + 1;
         }
@@ -524,6 +523,7 @@ test "recvmsgEcn returns WouldBlock on empty socket" {
 
 test "SendBatch.segmentEnd: equal packets and one shorter last" {
     var b = SendBatch.init(0);
+    @memset(&b.addr_lens, 0); // one address for all
     const cases = [_]struct { lens: []const u32, from: usize, want: usize }{
         // All the same size: the whole run.
         .{ .lens = &.{ 1436, 1436, 1436 }, .from = 0, .want = 3 },
@@ -540,6 +540,9 @@ test "SendBatch.segmentEnd: equal packets and one shorter last" {
     // The datagram's 16-bit length caps it: 45 x 1436 fits, 46 does not.
     for (0..50) |i| b.lengths[i] = 1436;
     try std.testing.expectEqual(@as(usize, 45), b.segmentEnd(0, 50));
+    // Another address ends it.
+    b.addr_lens[3] = 16;
+    try std.testing.expectEqual(@as(usize, 3), b.segmentEnd(0, 50));
 }
 
 test "SendBatch: a run with odd packets in it arrives whole and in order" {
@@ -581,4 +584,49 @@ test "SendBatch: a run with odd packets in it arrives whole and in order" {
         got += 1;
     }
     try std.testing.expectEqual(sizes.len, got);
+}
+
+test "SendBatch: packets for two peers, interleaved, each arrive whole and in order" {
+    if (comptime !is_linux) return error.SkipZigTest;
+    var rx: [2]posix.socket_t = undefined;
+    var to: [2]posix.sockaddr.storage = undefined;
+    var to_len: [2]posix.socklen_t = @splat(@sizeOf(posix.sockaddr.storage));
+    for (&rx, &to, &to_len) |*fd, *addr, *len| {
+        fd.* = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+        const any = try net.Address.parseIp4("127.0.0.1", 0);
+        try sys.bind(fd.*, &any.any, any.getOsSockLen());
+        try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(fd.*, @ptrCast(addr), len));
+    }
+    defer for (rx) |fd| sys.close(fd);
+
+    const tx = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(tx);
+    var batch = SendBatch.init(tx);
+    // Peer 0 gets a segmentable pair; the rest alternate one packet each.
+    const peers = [_]usize{ 0, 0, 1, 0, 1, 1, 0 };
+    for (peers, 0..) |p, i| {
+        const slot = batch.reserve();
+        @memset(slot[0..300], @intCast(i));
+        batch.commit(300, @ptrCast(&to[p]), to_len[p], 0);
+    }
+    batch.flush();
+
+    var buf: [1500]u8 = undefined;
+    for (rx, 0..) |fd, p| {
+        var tries: usize = 0;
+        for (peers, 0..) |want_peer, i| {
+            if (want_peer != p) continue;
+            const r = while (tries < 1000) : (tries += 1) {
+                break recvmsgEcn(fd, &buf) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        sys.sleepNs(std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return err,
+                };
+            } else return error.Timeout;
+            try std.testing.expectEqual(@as(usize, 300), r.bytes_read);
+            try std.testing.expectEqual(@as(u8, @intCast(i)), buf[0]);
+        }
+    }
 }
