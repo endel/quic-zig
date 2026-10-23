@@ -2220,13 +2220,7 @@ pub fn Server(comptime Handler: type) type {
                 }
             } else earliest = self.conn_mgr.nextDeadline(); // only draining sets drain_final_goaway_at
             if (self.handlerDeadline()) |deadline| {
-                if (earliest == null or deadline <= earliest.?) {
-                    earliest = deadline;
-                    // Epoll's loop counts a timer from the time it read before
-                    // its last wait, so from a socket callback this one would
-                    // fire early. Read after `now`, it fires at the deadline.
-                    if (comptime xev.backend == .epoll) self.eventLoop().update_now();
-                }
+                if (earliest == null or deadline < earliest.?) earliest = deadline;
             }
 
             // A handler with its own deadlines — a publisher on a tick, a
@@ -5593,8 +5587,9 @@ const PassAfter = struct {
 };
 
 test "e2e: an onPass deadline set after a long wait is not woken for early" {
-    // Epoll's loop counted the timer from the time it read before waiting,
-    // so a deadline set in a socket callback after a 30 ms wait fired at once.
+    // libxev's epoll loop counted the timer from the time it read before
+    // waiting (until mitchellh/libxev#255), so a deadline set in a socket
+    // callback after a 30 ms wait fired at once.
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
     var handler = PassAfter{};
