@@ -250,6 +250,46 @@ fn stashString(raw: []const u8, is_huffman: bool, scratch: []u8, scratch_pos: *u
     return dst[0..n];
 }
 
+/// RFC 9114 4.2.2's measure of a field section, counted down as it decodes:
+/// each field line costs its name and value plus 32 bytes. Strings decode
+/// only into what is left, so an oversized section stops at the field that
+/// crosses the limit — before copying the rest, or expanding a Huffman
+/// string past it.
+const SectionBudget = struct {
+    left: usize,
+
+    fn take(self: *SectionBudget, n: usize) error{FieldSectionTooLarge}!void {
+        if (n > self.left) return error.FieldSectionTooLarge;
+        self.left -= n;
+    }
+
+    /// `decodeString`, charged.
+    fn string(self: *SectionBudget, data: []const u8, pos: *usize, scratch: []u8, scratch_pos: *usize) ![]const u8 {
+        const s = decodeString(data, pos, self.room(scratch, scratch_pos.*), scratch_pos) catch |err| switch (err) {
+            error.BufferTooSmall => return error.FieldSectionTooLarge,
+            else => |e| return e,
+        };
+        self.left -= s.len;
+        return s;
+    }
+
+    /// `stashString`, charged.
+    fn stash(self: *SectionBudget, raw: []const u8, is_huffman: bool, scratch: []u8, scratch_pos: *usize) ![]const u8 {
+        const s = stashString(raw, is_huffman, self.room(scratch, scratch_pos.*), scratch_pos) catch |err| switch (err) {
+            error.BufferTooSmall => return error.FieldSectionTooLarge,
+            else => |e| return e,
+        };
+        self.left -= s.len;
+        return s;
+    }
+
+    /// Scratch up to where the budget runs out. Every byte stashed is
+    /// charged, so this never reaches past the end of `scratch`.
+    fn room(self: *const SectionBudget, scratch: []u8, scratch_pos: usize) []u8 {
+        return scratch[0 .. scratch_pos + self.left];
+    }
+};
+
 // ── Dynamic Table (RFC 9204 §3.2) ──────────────────────────────────────
 
 /// Entry overhead per RFC 9204 §3.2.1: name.len + value.len + 32.
@@ -578,6 +618,12 @@ pub const QpackDecoder = struct {
     /// Returns the number of headers decoded.
     /// Decoded `Header` names/values are copied into `scratch` and point there;
     /// they stay valid only until the next decode using the same buffer.
+    ///
+    /// `scratch.len` is also the limit on the section's size as RFC 9114
+    /// 4.2.2 measures it, name and value plus 32 bytes per field: past it,
+    /// `error.FieldSectionTooLarge`, and past `headers_buf.len` fields,
+    /// `error.TooManyHeaders`. Both stop decoding where the limit is
+    /// crossed, and both are the message's fault rather than the table's.
     pub fn decode(
         self: *QpackDecoder,
         data: []const u8,
@@ -691,6 +737,17 @@ pub const QpackDecoder = struct {
         self.instruction_len = pos;
     }
 
+    /// Emit a Stream Cancellation (RFC 9204 4.4.2) for a stream whose field
+    /// sections will not all be decoded, so the encoder stops waiting on
+    /// their acknowledgements and can evict what they reference.
+    pub fn cancelStream(self: *QpackDecoder, stream_id: u64) void {
+        var pos = self.instruction_len;
+        if (pos + 8 > self.instruction_buf.len) return;
+        // Stream Cancellation: 01XXXXXX — 6-bit stream ID
+        encodeInteger(&self.instruction_buf, &pos, stream_id, 6, 0x40) catch return;
+        self.instruction_len = pos;
+    }
+
     /// Get pending decoder instructions and clear the buffer.
     pub fn getInstructions(self: *QpackDecoder) []const u8 {
         const result = self.instruction_buf[0..self.instruction_len];
@@ -742,9 +799,11 @@ pub fn decodeBlock(
     }
 
     var count: usize = 0;
+    var budget: SectionBudget = .{ .left = scratch.len };
 
     while (pos < data.len) {
         if (count >= headers_buf.len) return error.TooManyHeaders;
+        try budget.take(ENTRY_OVERHEAD);
 
         const first = data[pos];
 
@@ -752,18 +811,18 @@ pub fn decodeBlock(
             // Indexed static: 11NNNNNN
             const index = try decodeInteger(data, &pos, 6);
             if (index >= static_table.len) return error.InvalidIndex;
-            headers_buf[count] = .{
-                .name = static_table[index].name,
-                .value = static_table[index].value,
-            };
+            const e = static_table[index];
+            // One byte on the wire and no scratch: only the budget bounds these.
+            try budget.take(e.name.len + e.value.len);
+            headers_buf[count] = .{ .name = e.name, .value = e.value };
             count += 1;
         } else if (first & 0xc0 == 0x80) {
             // Indexed dynamic: 10NNNNNN (T=0, relative index from base)
             const rel_idx = try decodeInteger(data, &pos, 6);
             const entry = try (dec orelse return error.InvalidIndex).fieldRef(ric, relativeToAbsolute(base, rel_idx));
             // Copy name/value from dynamic entry into scratch
-            const name = try stashString(entry.name, false, scratch, &scratch_pos);
-            const value = try stashString(entry.value, false, scratch, &scratch_pos);
+            const name = try budget.stash(entry.name, false, scratch, &scratch_pos);
+            const value = try budget.stash(entry.value, false, scratch, &scratch_pos);
             headers_buf[count] = .{ .name = name, .value = value };
             count += 1;
         } else if (first & 0xc0 == 0x40) {
@@ -773,7 +832,8 @@ pub fn decodeBlock(
             if (is_static) {
                 const index = try decodeInteger(data, &pos, 4);
                 if (index >= static_table.len) return error.InvalidIndex;
-                const value = try decodeString(data, &pos, scratch, &scratch_pos);
+                try budget.take(static_table[index].name.len);
+                const value = try budget.string(data, &pos, scratch, &scratch_pos);
                 headers_buf[count] = .{
                     .name = static_table[index].name,
                     .value = value,
@@ -782,8 +842,8 @@ pub fn decodeBlock(
             } else {
                 const rel_idx = try decodeInteger(data, &pos, 4);
                 const entry = try (dec orelse return error.InvalidIndex).fieldRef(ric, relativeToAbsolute(base, rel_idx));
-                const name = try stashString(entry.name, false, scratch, &scratch_pos);
-                const value = try decodeString(data, &pos, scratch, &scratch_pos);
+                const name = try budget.stash(entry.name, false, scratch, &scratch_pos);
+                const value = try budget.string(data, &pos, scratch, &scratch_pos);
                 headers_buf[count] = .{ .name = name, .value = value };
                 count += 1;
             }
@@ -792,25 +852,25 @@ pub fn decodeBlock(
             const is_name_huffman = (first & 0x08) != 0;
             const name_len = try decodeInteger(data, &pos, 3);
             if (name_len > data.len - pos) return error.BufferTooShort;
-            const name = try stashString(data[pos..][0..name_len], is_name_huffman, scratch, &scratch_pos);
+            const name = try budget.stash(data[pos..][0..name_len], is_name_huffman, scratch, &scratch_pos);
             pos += name_len;
-            const value = try decodeString(data, &pos, scratch, &scratch_pos);
+            const value = try budget.string(data, &pos, scratch, &scratch_pos);
             headers_buf[count] = .{ .name = name, .value = value };
             count += 1;
         } else if (first & 0xf0 == 0x10) {
             // Post-base indexed: 0001NNNN
             const post_idx = try decodeInteger(data, &pos, 4);
             const entry = try (dec orelse return error.InvalidIndex).fieldRef(ric, std.math.add(u64, base, post_idx) catch null);
-            const name = try stashString(entry.name, false, scratch, &scratch_pos);
-            const value = try stashString(entry.value, false, scratch, &scratch_pos);
+            const name = try budget.stash(entry.name, false, scratch, &scratch_pos);
+            const value = try budget.stash(entry.value, false, scratch, &scratch_pos);
             headers_buf[count] = .{ .name = name, .value = value };
             count += 1;
         } else if (first & 0xf0 == 0x00) {
             // Literal with post-base name ref: 0000NNNN
             const post_idx = try decodeInteger(data, &pos, 3);
             const entry = try (dec orelse return error.InvalidIndex).fieldRef(ric, std.math.add(u64, base, post_idx) catch null);
-            const name = try stashString(entry.name, false, scratch, &scratch_pos);
-            const value = try decodeString(data, &pos, scratch, &scratch_pos);
+            const name = try budget.stash(entry.name, false, scratch, &scratch_pos);
+            const value = try budget.string(data, &pos, scratch, &scratch_pos);
             headers_buf[count] = .{ .name = name, .value = value };
             count += 1;
         } else {
@@ -1738,7 +1798,77 @@ test "QpackDecoder: Huffman strings decoding past 4 KiB fit in scratch" {
     try testing.expectEqualStrings(cookie, out[0].value);
     try testing.expectEqualStrings(name, out[1].name);
 
-    // Scratch too small for the decoded value is reported as such.
+    // A section larger than the scratch it decodes into is too large.
     var small: [4096]u8 = undefined;
-    try testing.expectError(error.BufferTooSmall, decoder.decode(block[0..pos], &out, &small, 0));
+    try testing.expectError(error.FieldSectionTooLarge, decoder.decode(block[0..pos], &out, &small, 0));
+}
+
+test "QpackDecoder: references to one large entry stop at the field section limit" {
+    // FoxIO's "header accordion": one 4 KiB insert, then one-byte references
+    // that each copy the whole entry out.
+    var decoder = QpackDecoder{};
+    decoder.setCapacity(4096);
+    try decoder.processEncoderInstruction(&set_capacity_4096);
+    var insert: [4100]u8 = undefined;
+    var ipos: usize = 0;
+    try encodeInteger(&insert, &ipos, 1, 5, 0x40);
+    try putByte(&insert, &ipos, 'x');
+    try encodeString(&insert, &ipos, &@as([4000]u8, @splat('a')));
+    try decoder.processEncoderInstruction(insert[0..ipos]);
+
+    // RIC 1, Base 1, then Indexed Field Line relative 0 over and over.
+    var block: [2 + 1000]u8 = undefined;
+    block[0] = 0x02;
+    block[1] = 0x00;
+    @memset(block[2..], 0x80);
+    var out: [1000]Header = undefined;
+    // Four copies are 4 * (1 + 4000 + 32) = 16132 bytes; a fifth crosses SCRATCH_SIZE.
+    try testing.expectEqual(@as(usize, 4), try decoder.decode(block[0..6], &out, &test_scratch, 0));
+    try testing.expectError(error.FieldSectionTooLarge, decoder.decode(block[0..7], &out, &test_scratch, 0));
+    try testing.expectError(error.FieldSectionTooLarge, decoder.decode(&block, &out, &test_scratch, 0));
+}
+
+test "QpackDecoder: each field line costs its name, its value and 32 bytes" {
+    // Static index 58 is one byte on the wire and needs no scratch, so only
+    // the RFC 9114 4.2.2 measure can bound a section of them.
+    const e = static_table[58];
+    const fit = SCRATCH_SIZE / (e.name.len + e.value.len + ENTRY_OVERHEAD);
+    var block: [2 + fit + 1]u8 = undefined;
+    block[0] = 0x00;
+    block[1] = 0x00;
+    @memset(block[2..], 0xc0 | 58);
+    var out: [fit + 1]Header = undefined;
+    var decoder = QpackDecoder{};
+    try testing.expectEqual(fit, try decoder.decode(block[0 .. 2 + fit], &out, &test_scratch, 0));
+    try testing.expectError(error.FieldSectionTooLarge, decoder.decode(&block, &out, &test_scratch, 0));
+}
+
+test "QpackDecoder: a literal is not decoded past the field section limit" {
+    var decoder = QpackDecoder{};
+    var out: [4]Header = undefined;
+    var block: [512]u8 = undefined;
+    block[0] = 0x00;
+    block[1] = 0x00;
+
+    // Plain: "x" and 80 bytes fit 100 bytes of scratch, not with the 32.
+    var pos: usize = 2;
+    try encodeInteger(&block, &pos, 1, 3, 0x20);
+    try putByte(&block, &pos, 'x');
+    try encodeString(&block, &pos, &@as([80]u8, @splat('v')));
+    var scratch: [150]u8 = undefined;
+    try testing.expectError(error.FieldSectionTooLarge, decoder.decode(block[0..pos], &out, scratch[0..100], 0));
+    try testing.expectEqual(@as(usize, 1), try decoder.decode(block[0..pos], &out, scratch[0..113], 0));
+
+    // Huffman: 200 bytes from 125 on the wire. Decoding stops where the
+    // budget does, short of the end of the scratch.
+    var huff: [256]u8 = undefined;
+    const n = try huffman.encode(&@as([200]u8, @splat('a')), &huff);
+    pos = 2;
+    try encodeInteger(&block, &pos, 0, 4, 0x50); // :authority
+    try encodeInteger(&block, &pos, n, 7, 0x80);
+    try putBytes(&block, &pos, huff[0..n]);
+    @memset(&scratch, 0xee);
+    try testing.expectError(error.FieldSectionTooLarge, decoder.decode(block[0..pos], &out, &scratch, 0));
+    const left = scratch.len - ENTRY_OVERHEAD - ":authority".len;
+    try testing.expect(std.mem.allEqual(u8, scratch[left..], 0xee));
 }

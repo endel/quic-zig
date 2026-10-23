@@ -103,6 +103,37 @@ Caveats:
 - Leading or trailing whitespace in values is accepted.
 - Connection-specific fields other than `te` are not rejected.
 
+### §4.2.2 Header Size Constraints — ✅ Done
+
+`SETTINGS_MAX_FIELD_SECTION_SIZE` is always advertised: `qpack.SCRATCH_SIZE`
+(16 KiB), or a smaller value set in `local_settings` before
+`initConnection()`. The decoder holds every section to the advertised figure
+by §4.2.2's measure (name + value + 32 bytes per field), counted as each
+field decodes, so an oversized section stops at the field that crosses the
+limit. `MAX_HEADERS` (128) caps the field count, and `MAX_HEADERS_FRAME`
+(64 KiB) the encoded frame.
+
+Crossing any of the three fails the stream, not the connection:
+
+- A request the server has not surfaced yet is answered `431` with FIN,
+  and the rest of it stopped with `STOP_SENDING(H3_NO_ERROR)` (§4.1).
+- Anything else (a response, trailers) is cancelled with
+  `H3_EXCESSIVE_LOAD` both ways and surfaced as `request_cancelled`.
+- If the peer has inserted into our dynamic table, a Stream Cancellation
+  goes out on the decoder stream (RFC 9204 §4.4.2).
+
+This is the "header accordion" amplification (FoxIO, Oct 2026): one-byte
+static or dynamic references that decode to far more than they cost on the
+wire. Decoded fields were already confined to the 16 KiB scratch and 128
+slots, so memory never grew, but the limit went unadvertised, left out the
+per-field overhead, and an oversized section closed the whole connection
+with `QPACK_DECOMPRESSION_FAILED`. quic-go (CVE-2025-64702) and quiche
+(0.29.3) were fixed with the same measure; quic-go answers 431 as we do,
+quiche closes the connection with `H3_EXCESSIVE_LOAD`.
+
+Not done: our own sends are not checked against the peer's
+`SETTINGS_MAX_FIELD_SECTION_SIZE` (§4.2.2 SHOULD NOT).
+
 ## §4.3 HTTP Control Data — ✅ Done
 
 Pseudo-header validation lives in `validateRequestHeaders` and
@@ -288,7 +319,7 @@ Server Push is not implemented.
 - Supported identifiers:
   - `QPACK_MAX_TABLE_CAPACITY` (0x01) — advertised 4096 by default.
     The peer's value is unused: our QPACK encoder is static-only.
-  - `MAX_FIELD_SECTION_SIZE` (0x06) — optional.
+  - `MAX_FIELD_SECTION_SIZE` (0x06) — advertised and enforced; see §4.2.2.
   - `QPACK_BLOCKED_STREAMS` (0x07) — advertised as 0 (no blocked
     streams supported; see caveats).
   - `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08, RFC 9220).
@@ -366,8 +397,8 @@ Informational.
   need blocked-stream bookkeeping which is not implemented. This is
   only visible if a peer actually emits out-of-order header blocks.
 - **Decoded header count per frame capped at `MAX_HEADERS = 128`**,
-  and decoded names + values at `qpack.SCRATCH_SIZE` (16 KiB). Over-large
-  header lists close the connection with QPACK_DECOMPRESSION_FAILED.
+  and the section at `SETTINGS_MAX_FIELD_SECTION_SIZE` (16 KiB by
+  §4.2.2's measure). A request over either is answered 431; see §4.2.2.
 - **Trailers are dropped.** A HEADERS frame after the head with no
   pseudo-headers is taken as trailers, on requests and responses alike;
   nothing surfaces them yet.

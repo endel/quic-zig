@@ -1409,6 +1409,44 @@ test "HTTP/3 frame, QPACK and Huffman decoders survive a randomized sweep" {
     }
 }
 
+test "QPACK field sections never decode past the scratch they are given" {
+    // Static and dynamic references cost a byte each on the wire, and a
+    // table entry can be 4 KB: RFC 9114 4.2.2's measure is what bounds them.
+    var prng = std.Random.DefaultPrng.init(0x34323231);
+    const rand = prng.random();
+
+    var dec = qpack.QpackDecoder{};
+    dec.setCapacity(4096);
+    // Capacity 4096, then "x" with a 4000-byte value and "y: z".
+    try dec.processEncoderInstruction(&.{ 0x3f, 0xe1, 0x1f, 0x41, 'x', 0x7f, 0xa1, 0x1e });
+    try dec.processEncoderInstruction(&@as([4000]u8, @splat('a')));
+    try dec.processEncoderInstruction(&.{ 0x41, 'y', 0x01, 'z' });
+
+    var block: [2048]u8 = undefined;
+    var headers: [256]qpack.Header = undefined;
+    var scratch: [qpack.SCRATCH_SIZE]u8 = undefined;
+    for (0..SWEEP_ITERATIONS) |_| {
+        const len = 2 + rand.uintLessThan(usize, block.len - 2);
+        rand.bytes(block[0..len]);
+        // Required Insert Count 0 or 2, Base 2; then mostly references.
+        block[0] = if (rand.boolean()) 0x00 else 0x03;
+        block[1] = 0x00;
+        for (block[2..len]) |*b| switch (rand.uintLessThan(u8, 4)) {
+            0 => {},
+            1 => b.* = 0xc0 | rand.uintLessThan(u8, 63),
+            else => b.* = 0x80 | rand.uintLessThan(u8, 2),
+        };
+        const room = scratch[0..rand.uintLessThan(usize, scratch.len + 1)];
+        const slots = headers[0..rand.uintLessThan(usize, headers.len + 1)];
+        _ = dec.getInstructions();
+
+        const count = dec.decode(block[0..len], slots, room, 0) catch continue;
+        var size: usize = 0;
+        for (slots[0..count]) |h| size += h.name.len + h.value.len + 32;
+        try testing.expect(size <= room.len);
+    }
+}
+
 /// One encoded HTTP/3 frame, chosen at random.
 fn seedH3Frame(buf: []u8, rand: std.Random) ?usize {
     const body = [_]u8{ 0x00, 0x00, 0xc1, 0xd1, 0xd7 };
