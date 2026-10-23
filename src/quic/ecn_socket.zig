@@ -1,6 +1,7 @@
 const std = @import("std");
 const sys = @import("../sys.zig");
 const net = @import("../sockaddr.zig");
+const BASE_PLPMTU = @import("mtu.zig").BASE_PLPMTU;
 const posix = std.posix;
 const builtin = @import("builtin");
 
@@ -520,7 +521,13 @@ pub const SendBatch = struct {
             // A kernel or socket without UDP_SEGMENT will keep saying so, so
             // stop asking. Either way, what is left goes out a packet at a time.
             switch (posix.errno(rc)) {
-                .INVAL, .NOPROTOOPT, .OPNOTSUPP => self.gso = false,
+                .NOPROTOOPT, .OPNOTSUPP => self.gso = false,
+                // Kernels without 6.14's fix also say EINVAL for a segment
+                // over the interface MTU, as a PMTU probe leading a stretch
+                // is: only a refused segment every path carries rules GSO out.
+                .INVAL => if (self.lengths[starts[sent]] <= BASE_PLPMTU) {
+                    self.gso = false;
+                },
                 else => {},
             }
             return self.sendMany(starts[sent], to);
@@ -784,6 +791,58 @@ test "SendBatch: packets for two peers, interleaved, each arrive whole and in or
             } else return error.Timeout;
             try std.testing.expectEqual(@as(usize, 300), r.bytes_read);
             try std.testing.expectEqual(@as(u8, @intCast(i)), buf[0]);
+        }
+    }
+}
+
+test "SendBatch: a refused segment larger than every path carries leaves GSO on" {
+    if (comptime !is_linux) return error.SkipZigTest;
+    const rx = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(rx);
+    const any = try net.Address.parseIp4("127.0.0.1", 0);
+    try sys.bind(rx, &any.any, any.getOsSockLen());
+    var to: posix.sockaddr.storage = undefined;
+    var to_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(rx, @ptrCast(&to), &to_len));
+
+    const tx = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(tx);
+    // Every segmented send now fails with EINVAL, which is also what kernels
+    // before 6.14 say to a segment larger than the interface MTU.
+    const on: c_int = 1;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.setsockopt(tx, posix.SOL.SOCKET, linux.SO.NO_CHECK, std.mem.asBytes(&on), @sizeOf(c_int)));
+    var batch = SendBatch.init(tx);
+
+    const phases = [_]struct { sizes: []const usize, gso: bool }{
+        // A PMTU probe leading a stretch.
+        .{ .sizes = &.{ 1400, 1000 }, .gso = true },
+        .{ .sizes = &.{ 1200, 1200, 60 }, .gso = false },
+    };
+    var buf: [1500]u8 = undefined;
+    var tag: u8 = 0;
+    for (phases) |phase| {
+        for (phase.sizes, 0..) |len, i| {
+            const slot = batch.reserve();
+            @memset(slot[0..len], tag + @as(u8, @intCast(i)));
+            batch.commit(len, @ptrCast(&to), to_len, 0);
+        }
+        batch.flush();
+        try std.testing.expectEqual(phase.gso, batch.gso);
+        // Either way the packets go out, one per message.
+        var tries: usize = 0;
+        for (phase.sizes) |len| {
+            const r = while (tries < 1000) : (tries += 1) {
+                break recvmsgEcn(rx, &buf) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        sys.sleepNs(std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return err,
+                };
+            } else return error.Timeout;
+            try std.testing.expectEqual(len, r.bytes_read);
+            try std.testing.expectEqual(tag, buf[0]);
+            tag += 1;
         }
     }
 }
