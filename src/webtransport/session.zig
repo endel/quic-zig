@@ -518,13 +518,10 @@ pub const WebTransportConnection = struct {
     /// Send a QUIC DATAGRAM carrying WT session data.
     /// Format: quarter_stream_id (varint) + payload.
     pub fn sendDatagram(self: *WebTransportConnection, session_id: u64, data: []const u8) !void {
-        const quarter_id = session_id / 4;
-        var dgram_buf: [quic_connection.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
-        var fbs = io.fixedBufferStream(&dgram_buf);
-        const w = &fbs;
-        try packet.writeVarInt(w, quarter_id);
-        try w.writeAll(data);
-        try self.quic.sendDatagram(fbs.buffered());
+        var quarter_id: [8]u8 = undefined;
+        var fbs = io.fixedBufferStream(&quarter_id);
+        try packet.writeVarInt(&fbs, session_id / 4);
+        try self.quic.sendDatagramParts(&.{ fbs.buffered(), data });
     }
 
     /// Returns connection-level statistics (matches browser WebTransport.getStats()).

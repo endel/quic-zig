@@ -379,8 +379,15 @@ pub const DatagramQueue = struct {
 
     /// False when full, too large, or out of memory.
     pub fn push(self: *DatagramQueue, gpa: std.mem.Allocator, data: []const u8) bool {
-        if (self.count >= self.effectiveCapacity() or data.len > MAX_DATAGRAM_SIZE) return false;
-        const need = header_len + data.len;
+        return self.pushParts(gpa, &.{data});
+    }
+
+    /// `push` of the parts one after another, copied in once.
+    pub fn pushParts(self: *DatagramQueue, gpa: std.mem.Allocator, parts: []const []const u8) bool {
+        var len: usize = 0;
+        for (parts) |p| len += p.len;
+        if (self.count >= self.effectiveCapacity() or len > MAX_DATAGRAM_SIZE) return false;
+        const need = header_len + len;
         // Reuse the room pops left at the front before growing.
         if (self.head > 0 and self.bytes.items.len + need > self.bytes.capacity) {
             const rest = self.bytes.items.len - self.head;
@@ -389,10 +396,14 @@ pub const DatagramQueue = struct {
             self.head = 0;
         }
         const e = self.bytes.addManyAsSlice(gpa, need) catch return false;
-        std.mem.writeInt(u16, e[0..2], @intCast(data.len), .little);
+        std.mem.writeInt(u16, e[0..2], @intCast(len), .little);
         // Only an age limit reads the stamp; the clock read showed up per datagram.
         std.mem.writeInt(i64, e[2..10], if (self.max_age_ns != null) @intCast(sys.nanoTimestamp()) else 0, .little);
-        @memcpy(e[header_len..], data);
+        var at: usize = header_len;
+        for (parts) |p| {
+            @memcpy(e[at..][0..p.len], p);
+            at += p.len;
+        }
         self.count += 1;
         return true;
     }
@@ -4130,10 +4141,18 @@ pub const Connection = struct {
     /// Returns error.DatagramsNotEnabled, error.DatagramTooLarge (permanent — reduce payload),
     /// or error.DatagramQueueFull (transient — retry after sending).
     pub fn sendDatagram(self: *Connection, data: []const u8) !void {
+        return self.sendDatagramParts(&.{data});
+    }
+
+    /// `sendDatagram` of the parts one after another, as one datagram: a
+    /// header goes in front without first copying the payload behind it.
+    pub fn sendDatagramParts(self: *Connection, parts: []const []const u8) !void {
         if (!self.datagrams_enabled) return error.DatagramsNotEnabled;
-        if (data.len > DatagramQueue.MAX_DATAGRAM_SIZE) return error.DatagramTooLarge;
+        var len: usize = 0;
+        for (parts) |p| len += p.len;
+        if (len > DatagramQueue.MAX_DATAGRAM_SIZE) return error.DatagramTooLarge;
         if (self.datagram_send_queue.isFull()) return error.DatagramQueueFull;
-        if (!self.datagram_send_queue.push(self.allocator, data)) return error.OutOfMemory;
+        if (!self.datagram_send_queue.pushParts(self.allocator, parts)) return error.OutOfMemory;
     }
 
     /// Returns true if the datagram send queue is full.
