@@ -63,6 +63,11 @@ pub const Config = struct {
     tls: bool = true,
     /// Open TCP connections past which new ones are closed on accept.
     max_connections: u32 = 4096,
+    /// Seals TLS session tickets; keep it apart from the QUIC server's. Null
+    /// draws one only this listener holds: listeners on one port
+    /// (`reuse_port`) should share a key, or a client the kernel hands to
+    /// another of them can't resume its session there.
+    ticket_key: ?[16]u8 = null,
     /// Time for the TLS handshake and the first request head.
     handshake_timeout_ms: u32 = 10_000,
     /// How long an idle connection waits for its next request.
@@ -206,9 +211,9 @@ pub const Server = struct {
             .listen_file = xev.File.initFd(fd),
             .certs = if (config.tls) opts.certs else null,
             // Our own key: a QUIC ticket must not resume a TCP session.
-            .ticket_key = undefined,
+            .ticket_key = config.ticket_key orelse undefined,
         };
-        sys.randomBytes(&self.ticket_key);
+        if (config.ticket_key == null) sys.randomBytes(&self.ticket_key);
         if (config.alt_svc) {
             const v = std.fmt.bufPrint(&self.alt_svc_buf, "h3=\":{d}\"; ma=86400", .{opts.quic_port}) catch "";
             self.alt_svc_len = @intCast(v.len);

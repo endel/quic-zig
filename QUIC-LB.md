@@ -113,6 +113,9 @@ port with `Config.reuse_port`, needs no separate load balancer: the kernel
 spreads new connections across workers, and QUIC-LB CIDs steer the rest.
 
 - Give every worker the same `Config.quic_lb` with its own `server_id`.
+- Give them one `tls_config` (its session-ticket key), `retry_token_key`
+  (Retry and NEW_TOKEN tokens) and `http1.ticket_key`: a client's next
+  connection lands on whichever worker the kernel picks.
 - Set `Config.foreign_datagram` on each. When a Handshake or 1-RTT datagram's
   DCID is unknown to the worker that received it but decodes to another
   worker's id — a client whose NAT rebound, say — the hook gets the bytes,

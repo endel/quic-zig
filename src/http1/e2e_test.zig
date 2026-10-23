@@ -797,6 +797,22 @@ test "ws: over TLS, with ALPN http/1.1" {
     try h.handlerCloses(1);
 }
 
+test "http1: listeners given one ticket key seal tickets with it; others draw their own" {
+    // Equal keys are what lets one resume another's session: see tls/server.zig.
+    const key: [16]u8 = @splat(0x4b);
+    var shared: Pair = undefined;
+    try shared.init(29453, .{ .ticket_key = key });
+    defer shared.deinit();
+    try testing.expectEqual(key, shared.a.server.http1_server.?.tlsConfig().?.ticket_key.?);
+    try testing.expectEqual(key, shared.b.server.http1_server.?.tlsConfig().?.ticket_key.?);
+
+    var own: Pair = undefined;
+    try own.init(29455, .{});
+    defer own.deinit();
+    const a = own.a.server.http1_server.?.tlsConfig().?.ticket_key.?;
+    try testing.expect(!std.mem.eql(u8, &a, &own.b.server.http1_server.?.tlsConfig().?.ticket_key.?));
+}
+
 test "http1: static files with keep-alive, HEAD, 404 and 403 on the WebSocket listener" {
     var h: Harness = undefined;
     try h.init(29448, .{ .tls = false, .static_dir = "src/http1" });
