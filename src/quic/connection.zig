@@ -3108,6 +3108,7 @@ pub const Connection = struct {
                 .error_code = ss.reset_err.?,
                 .final_size = ss.send_offset,
             } });
+            if (!ss.reset_stream_sent) self.framesStillDue();
         }
     }
 
@@ -3125,10 +3126,10 @@ pub const Connection = struct {
     }
 
     /// Packets sent from here to `endBurst` share one flow-control scan,
-    /// the first `send`'s. The scan walks every stream; between the sends of
-    /// a burst nothing it reads changes but through the packer, and what
-    /// the packer changes (a stream finishing, a limit reached) can wait
-    /// for the next burst.
+    /// the first `send`'s. The scan can walk every stream; between the
+    /// sends of a burst nothing it reads changes but through the packer,
+    /// and what the packer changes (a stream finishing, a limit reached)
+    /// can wait for the next burst.
     pub fn beginBurst(self: *Connection) void {
         self.burst = .fresh;
     }
@@ -3160,11 +3161,21 @@ pub const Connection = struct {
         // and MAX_STREAMS updates can fire.
         self.streams.collectClosedStreams();
 
+        // What streams raised since the last scan. Without a ledger no stream
+        // has been made through the map to raise anything, so look anyway.
+        const ledger = self.streams.send_ledger;
+        const credit_due = if (ledger) |l| l.credit_due else true;
+        const frames_due = if (ledger) |l| l.frames_due else true;
+        if (ledger) |l| {
+            l.credit_due = false;
+            l.frames_due = false;
+        }
+
         // MAX_DATA grows only with what the consumer took or a reset abandoned.
         // With every byte charged already credited, no stream has any to give.
         const conn_fc = &self.conn_flow_ctrl.base;
         var credit: u64 = 0;
-        if (conn_fc.bytes_read != conn_fc.highest_received) {
+        if (credit_due and conn_fc.bytes_read != conn_fc.highest_received) {
             credit = self.streams.takeConnCredit();
             self.conn_flow_ctrl.addBytesRead(credit);
         }
@@ -3219,6 +3230,10 @@ pub const Connection = struct {
             self.pending_frames.push(.{ .data_blocked = limit });
         }
 
+        // RESET_STREAM, STOP_SENDING and STREAM_DATA_BLOCKED come due only
+        // where a stream raises `frames_due`; one the queue turns away
+        // raises it again.
+        if (!frames_due) return;
         {
             // One walk of the bidi streams for both directions' frames.
             var stream_it = self.streams.streams.valueIterator();
@@ -3260,6 +3275,12 @@ pub const Connection = struct {
             .stream_id = rs.stream_id,
             .error_code = rs.stop_sending_err.?,
         } });
+        if (!rs.stop_sending_sent) self.framesStillDue();
+    }
+
+    /// Bring the next scan back for a frame the queue had no room for.
+    fn framesStillDue(self: *Connection) void {
+        if (self.streams.send_ledger) |l| l.frames_due = true;
     }
 
     /// RFC 9000 4.1: the connection window bounds the sum over streams of each
@@ -7552,6 +7573,149 @@ test "connection flow control: a repeated RESET_STREAM counts its final size onc
 
     try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.highest_received);
     try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.bytes_read);
+}
+
+/// The control frames queued, by kind. Drains the queue.
+const Queued = struct { reset_stream: u8 = 0, stop_sending: u8 = 0, stream_data_blocked: u8 = 0, max_stream_data: u8 = 0 };
+
+fn drainQueued(conn: *Connection) Queued {
+    var q: Queued = .{};
+    while (conn.pending_frames.pop()) |f| switch (f) {
+        .reset_stream => q.reset_stream += 1,
+        .stop_sending => q.stop_sending += 1,
+        .stream_data_blocked => q.stream_data_blocked += 1,
+        .max_stream_data => q.max_stream_data += 1,
+        else => {},
+    };
+    return q;
+}
+
+test "flow control scan: streams are walked only once one raises a flag" {
+    // State set behind the stream methods' backs is not looked for.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    const s = try conn.streams.openBidiStream();
+    conn.queueFlowControlUpdates();
+    s.send.reset_err = 5;
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u8, 0), drainQueued(&conn).reset_stream);
+
+    (try conn.streams.openBidiStream()).recv.stopSending(7);
+    conn.queueFlowControlUpdates();
+    const q = drainQueued(&conn);
+    try std.testing.expectEqual(@as(u8, 1), q.stop_sending);
+    try std.testing.expectEqual(@as(u8, 1), q.reset_stream);
+    try std.testing.expect(!conn.streams.send_ledger.?.frames_due);
+}
+
+test "flow control scan: each send-side frame coming due brings the next scan" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    // Our bidi streams get 4 bytes of window, our uni ones none.
+    conn.streams.setPeerInitialMaxStreamData(1000, 4, 0);
+    const bidi = try conn.streams.openBidiStream();
+    const uni = try conn.streams.openUniStream();
+    conn.queueFlowControlUpdates();
+
+    // A write with the window already reached.
+    try uni.writeData("x");
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).stream_data_blocked);
+
+    // A send reaching the window with bytes left.
+    try bidi.send.writeData("0123456789");
+    _ = bidi.send.popStreamFrame(100).?;
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).stream_data_blocked);
+
+    // Our reset, and the one a peer's STOP_SENDING makes.
+    bidi.send.reset(1);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).reset_stream);
+    try conn.processFrame(&.{ .stop_sending = .{ .stream_id = uni.stream_id, .error_code = 2 } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).reset_stream);
+}
+
+test "flow control scan: each receive-side credit brings the next scan" {
+    const alloc = std.testing.allocator;
+    var conn = testConnection(alloc);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    conn.streams.local_max_stream_data_bidi_remote = 100;
+    const fc = &conn.conn_flow_ctrl.base;
+    var data: [100]u8 = @splat('d');
+
+    // A read past a quarter of the window.
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = 80, .data = data[0..80], .fin = false } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 0), fc.bytes_read);
+    const rs = &conn.streams.getStream(0).?.recv;
+    while (rs.read()) |d| alloc.free(d);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 80), fc.bytes_read);
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).max_stream_data);
+
+    // The same on a stream we opened.
+    conn.streams.setMaxStreams(10, 10);
+    conn.streams.local_max_stream_data_bidi_local = 100;
+    const ours = try conn.streams.openBidiStream();
+    try conn.processFrame(&.{ .stream = .{ .stream_id = ours.stream_id, .offset = 0, .length = 80, .data = data[0..80], .fin = false } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    while (ours.recv.read()) |d| alloc.free(d);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 160), fc.bytes_read);
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).max_stream_data);
+
+    // Bytes read and kept, as HTTP/3 keeps a frame, then let go of.
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 80, .length = 100, .data = &data, .fin = false } }, .application, 0);
+    const kept = rs.read().?;
+    defer alloc.free(kept);
+    rs.retained += kept.len;
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 160), fc.bytes_read);
+    rs.release(kept.len);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 260), fc.bytes_read);
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).max_stream_data);
+
+    // A peer's reset hands back its final size.
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 4, .offset = 0, .length = 10, .data = data[0..10], .fin = false } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    try conn.processFrame(&.{ .reset_stream = .{ .stream_id = 4, .error_code = 1, .final_size = 30 } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 290), fc.bytes_read);
+
+    // A stream reclaimed with bytes never read hands those back.
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 8, .offset = 0, .length = 20, .data = data[0..20], .fin = true } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    const done = conn.streams.getStream(8).?;
+    done.send.close();
+    _ = done.send.popStreamFrame(100).?;
+    try done.send.onAck(0, 0, true);
+    conn.streams.closeIfDone(done);
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(conn.streams.getStream(8) == null);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 310), fc.bytes_read);
+}
+
+test "a STOP_SENDING that finds the queue full is queued on a later pass" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    while (conn.pending_frames.hasRoomFor(1)) conn.pending_frames.push(.{ .path_challenge = @splat(0) });
+    const s = try conn.streams.openBidiStream();
+    s.recv.stopSending(4);
+    conn.queueFlowControlUpdates();
+    try std.testing.expect(!s.recv.stop_sending_sent);
+
+    _ = conn.pending_frames.pop();
+    conn.queueFlowControlUpdates();
+    try std.testing.expect(s.recv.stop_sending_sent);
 }
 
 /// A server Initial carrying a PING to `conn`'s client, labelled `version` and

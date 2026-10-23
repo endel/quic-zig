@@ -130,13 +130,20 @@ const Result = struct {
 /// arrives. Stops when the server has read the FIN, a connection closes, or
 /// `limit_ns` of virtual time has passed.
 fn runBulk(total: usize, c2s_loss: Link.Loss, s2c_loss: Link.Loss, one_way_ns: i64, limit_ns: i64) !Result {
+    return runBulkWith(.{}, total, c2s_loss, s2c_loss, one_way_ns, limit_ns);
+}
+
+/// `runBulk` with the server's connection config.
+fn runBulkWith(server_config: connection.ConnectionConfig, total: usize, c2s_loss: Link.Loss, s2c_loss: Link.Loss, one_way_ns: i64, limit_ns: i64) !Result {
     const alloc = testing.allocator;
     const start: i64 = 1_000 * std.time.ns_per_s;
     sys.test_clock = start;
     defer sys.test_clock = null;
     var now = start;
 
-    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{ .qlog_dir = qlog_dir }, @splat(1), @splat(2));
+    var config = server_config;
+    config.qlog_dir = qlog_dir;
+    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), config, @splat(1), @splat(2));
     defer mgr.deinit();
 
     const client = try alloc.create(connection.Connection);
@@ -274,6 +281,16 @@ test "lossy link: an upload past the stream window gets MAX_STREAM_DATA" {
     // 16 MiB against the 6 MiB initial stream window: without the server
     // re-granting credit as it reads, the upload stalls and never finishes.
     const r = try runBulk(16 << 20, .none, .none, 10 * ms, 60 * std.time.ns_per_s);
+    try testing.expect(r.finished);
+}
+
+test "lossy link: an upload read as it comes goes through many stream and connection windows" {
+    // Each read has to bring the next MAX_STREAM_DATA and MAX_DATA, or the
+    // upload stalls at a window and never finishes.
+    const r = try runBulkWith(.{
+        .initial_max_data = 64 << 10,
+        .initial_max_stream_data_bidi_remote = 16 << 10,
+    }, 1 << 20, .none, .none, 10 * ms, 60 * std.time.ns_per_s);
     try testing.expect(r.finished);
 }
 

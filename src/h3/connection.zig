@@ -1558,7 +1558,7 @@ pub const H3Connection = struct {
     /// flow control credit them.
     fn consumeRequestBytes(_: *H3Connection, rs: ?*stream_mod.ReceiveStream, buf: *std.ArrayList(u8), n: usize) void {
         h3_frame.consumeFromBuf(buf, n);
-        if (rs) |r| r.retained -|= n;
+        if (rs) |r| r.release(n);
     }
 
     /// Discard what is buffered of a skipped frame. True once it is gone.

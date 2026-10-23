@@ -497,7 +497,9 @@ pub const PacketPacker = struct {
         var stream_frame_infos: [ack_handler.MAX_STREAM_FRAMES_PER_PACKET]ack_handler.StreamFrameInfo = undefined;
         var stream_frame_info_count: u8 = 0;
 
-        if (level == .application and !ack_only) {
+        // Without `send_due` no stream has anything to pack: skip the walk.
+        const send_due = if (streams.send_ledger) |l| l.send_due else true;
+        if (level == .application and !ack_only and send_due) {
             // Streams split anywhere, so they leave room for the held ACK.
             const stream_max = if (ack_behind_data) effective_max -| ACK_BEHIND_DATA_ROOM else effective_max;
             // Connection-level flow control budget for this packet
@@ -578,6 +580,9 @@ pub const PacketPacker = struct {
                 }
             } // send_streams.count() > 0
 
+            if (sched_count == 0 and uni_sched_count == 0) {
+                if (streams.send_ledger) |l| l.send_due = false;
+            }
         }
 
         // 6. DATAGRAM frames (RFC 9221) — subject to congestion control (RFC 9221 §5)
@@ -1659,4 +1664,40 @@ test "PacketPacker: a datagram filling the packet leaves the ACK for later" {
     try testing.expect(rig.dq.isEmpty());
     try testing.expectEqual(@as(?u64, null), rig.lastAcked());
     try testing.expect(rig.pkt_handler.hasUnackedAckEliciting(.application));
+}
+
+test "PacketPacker: streams are walked only while one may have something to send" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var out: [1500]u8 = undefined;
+    const s = try rig.streams.getOrCreateStream(0);
+    const ledger = rig.streams.send_ledger.?;
+
+    // Bytes slipped in behind the stream's methods raise nothing: not found.
+    try s.send.write_buffer.appendSlice(testing.allocator, "hidden");
+    s.send.write_offset += 6;
+    try testing.expectEqual(@as(usize, 0), try rig.pack(&out, 1000));
+    try testing.expectEqual(@as(u64, 0), s.send.send_offset);
+
+    // A close raises it, and the walk finds them with the FIN.
+    s.send.close();
+    try testing.expect(try rig.pack(&out, 1000) > 0);
+    try testing.expect(s.send.fin_sent and s.send.send_offset == 6);
+    // A walk finding nothing lowers it again.
+    try testing.expectEqual(@as(usize, 0), try rig.pack(&out, 1000));
+    try testing.expect(!ledger.send_due);
+
+    // A write raises it.
+    const w = try rig.streams.getOrCreateStream(4);
+    try w.send.writeData("abc");
+    try testing.expect(try rig.pack(&out, 1000) > 0);
+    try testing.expectEqual(@as(u64, 3), w.send.send_offset);
+    _ = try rig.pack(&out, 1000);
+    try testing.expect(!ledger.send_due);
+
+    // So does a loss.
+    w.send.queueRetransmit(0, 3, false);
+    try testing.expect(try rig.pack(&out, 1000) > 0);
+    try testing.expect(!w.send.hasRetransmitData());
 }
