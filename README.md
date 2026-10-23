@@ -433,6 +433,12 @@ Produces binaries in `zig-out/bin/`:
 | `interop-client` | QUIC Interop Runner client endpoint |
 | `interop-wt-server` | QUIC Interop Runner WebTransport server |
 
+Hardware AES is chosen when the binary is built, not when it runs. A build
+for another machine (`-Dtarget=x86_64-linux-gnu`) targets a baseline CPU
+without AES instructions, so TLS falls back to ChaCha20 in software; the
+server warns about it at startup. Name the deployment CPU, e.g.
+`-Dcpu=x86_64_v3+aes+pclmul` or `-Dcpu=neoverse_n1`.
+
 ## Running Tests
 
 ```bash

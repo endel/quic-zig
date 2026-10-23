@@ -1023,6 +1023,9 @@ pub fn Server(comptime Handler: type) type {
 
         /// Register watchers and start the event loop. Call once before tick().
         pub fn start(self: *Self) void {
+            if (!std.crypto.core.aes.has_hardware_support and sys.cpuHasAes()) {
+                log.warn("built without the AES instructions this CPU has, so TLS uses ChaCha20 in software: build with -Dcpu=native, or a CPU model that has AES", .{});
+            }
             const loop = self.eventLoop();
             // Register socket readability watch
             self.file.poll(loop, &self.poll_completion, .read, Self, self, onReadable);

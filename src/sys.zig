@@ -494,6 +494,37 @@ pub fn nanoTimestamp() i64 {
     return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
 }
 
+/// Whether this CPU has what `std.crypto.core.aes.has_hardware_support`
+/// asks of the build target, checked at run time: a build for a generic
+/// CPU goes without AES instructions even where the hardware has them.
+pub fn cpuHasAes() bool {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            var eax: u32 = undefined;
+            var ebx: u32 = undefined;
+            var ecx: u32 = undefined;
+            var edx: u32 = undefined;
+            asm volatile ("cpuid"
+                : [_] "={eax}" (eax),
+                  [_] "={ebx}" (ebx),
+                  [_] "={ecx}" (ecx),
+                  [_] "={edx}" (edx),
+                : [_] "{eax}" (@as(u32, 1)),
+                  [_] "{ecx}" (@as(u32, 0)),
+            );
+            const aesni = 1 << 25;
+            const avx = 1 << 28;
+            return ecx & (aesni | avx) == aesni | avx;
+        },
+        .aarch64 => return switch (builtin.os.tag) {
+            .linux => std.os.linux.getauxval(std.elf.AT.HWCAP) & (1 << 3) != 0, // HWCAP_AES
+            .macos, .ios, .tvos, .watchos, .visionos => true, // every Apple silicon CPU
+            else => false,
+        },
+        else => return false,
+    }
+}
+
 /// Return a single random integer of the given type (replaces
 /// `std.crypto.random.int(T)` for small integer types).
 pub fn randomInt(comptime T: type) T {
