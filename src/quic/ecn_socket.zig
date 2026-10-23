@@ -660,6 +660,9 @@ test "RecvBatch: datagrams from two senders arrive whole, in order, with their s
     defer batch.deinit(std.testing.allocator);
     var seen: usize = 0;
     while (seen < total) {
+        // macOS loopback delivers after sendto returns, not before.
+        var pfd = [_]std.c.pollfd{.{ .fd = rx, .events = posix.POLL.IN, .revents = 0 }};
+        try std.testing.expectEqual(@as(c_int, 1), std.c.poll(&pfd, 1, 5_000));
         const got = try batch.recv(rx, RecvBatch.capacity);
         for (batch.results[0..got], 0..) |r, k| {
             const i = seen + k;
