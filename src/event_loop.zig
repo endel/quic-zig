@@ -2133,16 +2133,37 @@ fn openUdpSocket(config: Config, port: u16) !struct { posix.socket_t, net.Addres
     if (config.reuse_port) {
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&@as(c_int, 1)));
     }
-    if (config.recv_buffer_size) |n| {
-        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&@as(c_int, @intCast(@min(n, std.math.maxInt(c_int))))));
-    }
-    if (config.send_buffer_size) |n| {
-        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&@as(c_int, @intCast(@min(n, std.math.maxInt(c_int))))));
-    }
+    if (config.recv_buffer_size) |n| try setBufferSize(fd, .recv, n);
+    if (config.send_buffer_size) |n| try setBufferSize(fd, .send, n);
 
     try sys.bind(fd, &addr.any, addr.getOsSockLen());
     ecn_socket.enableEcnRecv(fd) catch {};
     return .{ fd, addr };
+}
+
+/// Ask for `n` bytes of socket buffer, and say so when less is granted.
+/// Linux clamps the request to `net.core.rmem_max` / `wmem_max` without an
+/// error, unless the process may force it (CAP_NET_ADMIN), and the drops
+/// that follow are silent too.
+fn setBufferSize(fd: posix.socket_t, comptime which: enum { recv, send }, n: u32) !void {
+    const opt = if (which == .recv) posix.SO.RCVBUF else posix.SO.SNDBUF;
+    const v: c_int = @intCast(@min(n, std.math.maxInt(c_int)));
+    try posix.setsockopt(fd, posix.SOL.SOCKET, opt, std.mem.asBytes(&v));
+    if (builtin.target.os.tag != .linux or bufferSize(fd, opt) >= n) return;
+    const force: u32 = if (which == .recv) 33 else 32; // SO_RCVBUFFORCE, SO_SNDBUFFORCE
+    posix.setsockopt(fd, posix.SOL.SOCKET, force, std.mem.asBytes(&v)) catch {};
+    const got = bufferSize(fd, opt);
+    // Linux reports twice what it grants: half of it is bookkeeping.
+    if (got < n) log.warn("UDP {s} buffer is {d} KB, not the {d} KB asked for: raise net.core.{s}mem_max", .{
+        @tagName(which), @divTrunc(got, 2048), @divTrunc(n, 1024), if (which == .recv) "r" else "w",
+    });
+}
+
+fn bufferSize(fd: posix.socket_t, opt: u32) u32 {
+    var v: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(fd, posix.SOL.SOCKET, opt, @ptrCast(&v), &len) != 0) return 0;
+    return @intCast(@max(v, 0));
 }
 
 /// Receive-queue delay, summarised rather than kept per datagram: the question
