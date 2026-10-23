@@ -50,6 +50,18 @@ inline fn loadBlock(b: *const [16]u8) V {
     return @bitCast(@shuffle(u8, @as(@Vector(16, u8), b.*), undefined, reversed));
 }
 
+/// Copy a block's tail, at most 16 bytes, in fixed-size moves: @memcpy of a
+/// runtime length is a call into compiler_rt, which costs more than the copy.
+inline fn copyTail(dst: []u8, src: []const u8) void {
+    var o: usize = 0;
+    inline for (.{ 16, 8, 4, 2, 1 }) |w| {
+        if (dst.len & w != 0) {
+            dst[o..][0..w].* = src[o..][0..w].*;
+            o += w;
+        }
+    }
+}
+
 inline fn pmullLo(x: V, y: V) V {
     return asm ("pmull %[o].1q, %[x].1d, %[y].1d"
         : [o] "=w" (-> V),
@@ -109,7 +121,7 @@ fn ghashBlocks(hx: *const [pc_count]V, acc0: V, msg: []const u8, extra: ?V) V {
                 inline for (0..k - 1) |j| b[j] = loadBlock(msg[i + 16 * j ..][0..16]);
                 const last = i + 16 * (k - 1);
                 var buf: [16]u8 = @splat(0);
-                @memcpy(buf[0 .. msg.len - last], msg[last..]);
+                copyTail(buf[0 .. msg.len - last], msg[last..]);
                 b[k - 1] = loadBlock(&buf);
             }
             if (extra) |e| {
@@ -239,9 +251,9 @@ pub const Ctx = struct {
                     const last = i + 16 * (k - 1);
                     const r = src.len - last;
                     var buf: [16]u8 = @splat(0);
-                    @memcpy(buf[0..r], src[last..]);
+                    copyTail(buf[0..r], src[last..]);
                     xorBlock(&buf, &buf, ks[k - 1]);
-                    @memcpy(dst[last..][0..r], buf[0..r]);
+                    copyTail(dst[last..][0..r], &buf);
                 }
                 return if (mask) @bitCast(ks[k]) else undefined;
             },
