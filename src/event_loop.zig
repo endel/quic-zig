@@ -383,7 +383,7 @@ pub const Session = struct {
 
     pub fn sendStreamData(self: *Session, stream_id: u64, data: []const u8) !void {
         defer self.entry.wake();
-        errdefer self.entry.needs_poll = true; // a poll writes the WT_DATA_BLOCKED a refusal owes
+        errdefer self.entry.mark(true); // a poll writes the WT_DATA_BLOCKED a refusal owes
         if (self.entry.wt_conn) |wtc| {
             try wtc.sendStreamData(stream_id, data);
         }
@@ -414,7 +414,7 @@ pub const Session = struct {
     }
 
     pub fn openBidiStream(self: *Session, session_id: u64, send_order: ?i64) !u64 {
-        errdefer self.entry.needs_poll = true; // a poll writes the WT_STREAMS_BLOCKED a refusal owes
+        errdefer self.entry.mark(true); // a poll writes the WT_STREAMS_BLOCKED a refusal owes
         if (self.entry.wt_conn) |wtc| {
             return try wtc.openBidiStream(session_id, send_order);
         }
@@ -422,7 +422,7 @@ pub const Session = struct {
     }
 
     pub fn openUniStream(self: *Session, session_id: u64, send_order: ?i64) !u64 {
-        errdefer self.entry.needs_poll = true; // a poll writes the WT_STREAMS_BLOCKED a refusal owes
+        errdefer self.entry.mark(true); // a poll writes the WT_STREAMS_BLOCKED a refusal owes
         if (self.entry.wt_conn) |wtc| {
             return try wtc.openUniStream(session_id, send_order);
         }
@@ -602,8 +602,9 @@ pub const Session = struct {
 
     pub fn readStream(self: *Session, stream_id: u64) ?[]const u8 {
         const stream = self.entry.conn.streams.getStream(stream_id) orelse return null;
-        self.entry.needs_visit = true; // the read frees flow-control credit to announce
-        self.entry.needs_poll = true; // and may take the FIN, which a poll reports
+        // The read frees flow-control credit to announce, and may take the
+        // FIN, which a poll reports.
+        self.entry.mark(true);
         return stream.recv.read();
     }
 
@@ -783,6 +784,9 @@ pub fn Server(comptime Handler: type) type {
         /// Connections polled for events so far, one per connection per pass
         /// that looked. Writes alone add nothing; see `wantsPoll`.
         polls: u64 = 0,
+        /// Entries the passes have gone through, skipped ones included: on a
+        /// sparse server, what is active rather than what is connected.
+        examined: u64 = 0,
         /// What the handler's last `onPass` returned; see `runOnPass`.
         pass_deadline: ?i64 = null,
         /// The earliest `wakeAt` no pass has reached yet.
@@ -1143,7 +1147,7 @@ pub fn Server(comptime Handler: type) type {
                     );
                 }
                 // What it sent armed timers rescheduleTimer reads from the cache.
-                entry.deadline = conn.nextTimeoutNs();
+                self.conn_mgr.setDeadline(entry, conn.nextTimeoutNs());
             }
             self.batch.flush();
             if (self.preferred) |*p| p.batch.flush();
@@ -1557,11 +1561,17 @@ pub fn Server(comptime Handler: type) type {
         /// A handler with `onPollComplete` expects it for every connection on
         /// every pass. Without one, a pass looks only at connections that
         /// received, were written to or have a deadline due, so a pass costs
-        /// what is active rather than everything connected.
+        /// what is active rather than everything connected: those are the
+        /// manager's `to_visit` and the due end of its `timers`.
         const sparse_passes = !@hasDecl(Handler, "onPollComplete");
 
         fn visitsAll(self: *const Self) bool {
             return !sparse_passes or self.draining or self.stopping;
+        }
+
+        /// The entries a pass goes through.
+        fn passList(self: *Self) *std.ArrayList(*ConnEntry) {
+            return if (self.visitsAll()) &self.conn_mgr.entries else &self.conn_mgr.to_visit;
         }
 
         /// Whether a visit has to poll `entry`'s protocol layers. A write alone
@@ -1581,7 +1591,12 @@ pub fn Server(comptime Handler: type) type {
 
         fn processConnections(self: *Self) void {
             const all = self.visitsAll();
-            for (self.conn_mgr.entries.items) |entry| {
+            const list = self.passList();
+            // By index: a handler marking another entry appends it.
+            var i: usize = 0;
+            while (i < list.items.len) : (i += 1) {
+                const entry = list.items[i];
+                self.examined += 1;
                 // Due timers alone are tickAndSend's; events need a packet or the app.
                 if (!all and !entry.needs_visit and !entry.needs_poll) continue;
                 const conn = entry.conn;
@@ -2041,11 +2056,19 @@ pub fn Server(comptime Handler: type) type {
             var now_ns: i64 = pass_now_ns;
             var clock_uses: usize = 1;
             const all = self.visitsAll();
+            if (!all) {
+                self.conn_mgr.queueDue(pass_now_ns);
+                self.conn_mgr.orderVisits();
+            }
+            const list = self.passList();
             var i: usize = 0;
-            while (i < self.conn_mgr.entries.items.len) {
-                const entry = self.conn_mgr.entries.items[i];
-                // Untouched since its last visit, an entry's cached deadline is exact.
-                const deadline = if (all or entry.needs_visit) entry.conn.nextTimeoutNsAt(pass_now_ns) else entry.deadline;
+            while (i < list.items.len) {
+                const entry = list.items[i];
+                self.examined += 1;
+                // As of its last visit. A packet since can have brought a timer
+                // forward: the deadline this visit stores is then overdue, and
+                // the next pass takes it.
+                const deadline = if (all) entry.conn.nextTimeoutNsAt(pass_now_ns) else entry.deadline;
                 const due = if (deadline) |first| first <= pass_now_ns else false;
                 if (!all and !entry.needs_visit and !due) {
                     i += 1;
@@ -2112,11 +2135,12 @@ pub fn Server(comptime Handler: type) type {
                     );
                 }
 
-                entry.deadline = conn.nextTimeoutNsAt(now_ns);
+                self.conn_mgr.setDeadline(entry, conn.nextTimeoutNsAt(now_ns));
                 // close_when_idle waits on its streams with no deadline: keep looking.
                 entry.needs_visit = conn.close_when_idle;
                 i += 1;
             }
+            self.conn_mgr.settleVisits();
 
             self.batch.flush();
             if (self.preferred) |*p| p.batch.flush();
@@ -2169,17 +2193,18 @@ pub fn Server(comptime Handler: type) type {
             const now: i64 = sys.nanoTimestamp();
             var earliest: ?i64 = null;
 
-            const all = self.visitsAll();
-            for (self.conn_mgr.entries.items) |entry| {
-                if (if (all) entry.conn.nextTimeoutNsAt(now) else entry.deadline) |deadline| {
-                    if (earliest == null or deadline < earliest.?) {
-                        earliest = deadline;
+            if (self.visitsAll()) {
+                for (self.conn_mgr.entries.items) |entry| {
+                    if (entry.conn.nextTimeoutNsAt(now)) |deadline| {
+                        if (earliest == null or deadline < earliest.?) {
+                            earliest = deadline;
+                        }
+                    }
+                    if (entry.drain_final_goaway_at) |deadline| {
+                        if (earliest == null or deadline < earliest.?) earliest = deadline;
                     }
                 }
-                if (entry.drain_final_goaway_at) |deadline| {
-                    if (earliest == null or deadline < earliest.?) earliest = deadline;
-                }
-            }
+            } else earliest = self.conn_mgr.nextDeadline(); // only draining sets drain_final_goaway_at
             if (self.handlerDeadline()) |deadline| {
                 if (earliest == null or deadline <= earliest.?) {
                     earliest = deadline;
@@ -4331,6 +4356,9 @@ test "e2e: a connection that falls silent times out though no pass is asked to l
         }
     }.f, 8000);
     try testing.expectEqual(@as(usize, 0), e2e.server.conn_mgr.connectionCount());
+    // Gone from what a pass goes through, and from the timers.
+    try testing.expectEqual(@as(usize, 0), e2e.server.conn_mgr.to_visit.items.len);
+    try testing.expectEqual(@as(?i64, null), e2e.server.conn_mgr.nextDeadline());
 }
 
 /// Echoes how much request body arrived, once the request is complete.
@@ -5898,6 +5926,120 @@ test "e2e: raw-QUIC datagrams and stream data reach a handler with nothing else 
     try runUntilCount(&e2e.loop, &h.data, 3, 3000);
     cs.closeQuicStream(id);
     try runUntilCount(&e2e.loop, &h.fins, 1, 3000);
+}
+
+/// `runUntil` over two loops at once.
+fn runUntil2(a: *xev.Loop, b: *xev.Loop, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool, timeout_ms: i64) !void {
+    const deadline = sys.nanoTimestamp() + timeout_ms * std.time.ns_per_ms;
+    while (!done(ctx)) {
+        if (sys.nanoTimestamp() > deadline) return error.Timeout;
+        try a.run(.no_wait);
+        try b.run(.no_wait);
+        sys.sleepNs(50 * std.time.ns_per_us);
+    }
+}
+
+/// Keeps the connection that says "b", and writes to it whenever another
+/// says "go": a write from one connection's callback to another.
+const CrossTimer = struct {
+    pub const protocol: Protocol = .quic;
+    b: ?Session = null,
+
+    pub fn onDatagram(self: *@This(), s: *Session, _: u64, data: []const u8) void {
+        if (std.mem.eql(u8, data, "b")) self.b = s.*;
+        if (std.mem.eql(u8, data, "go")) if (self.b) |*b| b.sendQuicDatagram("x") catch {};
+    }
+
+    fn hasB(self: *@This()) bool {
+        return self.b != null;
+    }
+};
+
+/// No timer before a second from now: nothing in flight, no ACK owed.
+fn quietEntry(e: *ConnEntry) bool {
+    const next = e.conn.nextTimeoutNs() orelse return true;
+    return next > sys.nanoTimestamp() + std.time.ns_per_s;
+}
+
+fn ptoFired(e: *ConnEntry) bool {
+    return e.conn.pkt_handler.pto_count > 0;
+}
+
+test "e2e: a write from another connection's callback arms the timer it starts" {
+    var h = CrossTimer{};
+    var a_handler = QuicIdleClient{};
+    var e2e: E2e(CrossTimer, QuicIdleClient) = undefined;
+    try e2e.init(29510, &h, &a_handler);
+    defer e2e.deinit();
+    // B runs a loop of its own, so it can fall silent while A and the server go on.
+    var b_handler = QuicIdleClient{};
+    var b = try Client(QuicIdleClient).init(testing.allocator, &b_handler, .{ .port = 29510, .skip_cert_verify = true });
+    defer b.deinit();
+    b.start();
+
+    try runUntil2(&e2e.loop, b.eventLoop(), &b_handler, QuicIdleClient.ready, 10_000);
+    var bs = b.clientSession();
+    try bs.sendDatagram(0, "b");
+    try runUntil2(&e2e.loop, b.eventLoop(), &h, CrossTimer.hasB, 5_000);
+    const entry = h.b.?.entry;
+    try runUntil2(&e2e.loop, b.eventLoop(), entry, quietEntry, 5_000);
+
+    // B stops answering. A's datagram makes the server write to B from A's
+    // callback, and that write's probe timer has to reach the loop's.
+    var as = e2e.client.clientSession();
+    try as.sendDatagram(0, "go");
+    try runUntil(&e2e.loop, entry, ptoFired, 5_000);
+}
+
+test "e2e: a server's passes go through what is active, not every connection" {
+    var h = QuicCounter{};
+    var a_handler = QuicIdleClient{};
+    var e2e: E2e(QuicCounter, QuicIdleClient) = undefined;
+    try e2e.init(29511, &h, &a_handler);
+    defer e2e.deinit();
+
+    const C = Client(QuicIdleClient);
+    const idle_count = 16;
+    var idle_handlers: [idle_count]QuicIdleClient = @splat(.{});
+    var idle: [idle_count]C = undefined;
+    for (&idle, &idle_handlers, 0..) |*c, *ih, i| {
+        c.* = try C.init(testing.allocator, ih, .{ .port = 29511, .skip_cert_verify = true, .loop = &e2e.loop });
+        errdefer for (idle[0..i]) |*prev| prev.deinit();
+        c.start();
+    }
+    defer {
+        for (&idle) |*c| c.stop();
+        const Stopped = struct {
+            fn f(cs: []C) bool {
+                for (cs) |*c| if (!c.isStopped()) return false;
+                return true;
+            }
+        };
+        runUntil(&e2e.loop, @as([]C, &idle), Stopped.f, 5_000) catch @panic("did not stop");
+        for (&idle) |*c| c.deinit();
+    }
+
+    const Quiet = struct {
+        fn f(s: *Server(QuicCounter)) bool {
+            const m = &s.conn_mgr;
+            if (m.connectionCount() != idle_count + 1 or m.to_visit.items.len > 0) return false;
+            for (m.entries.items) |e| if (!e.conn.isEstablished() or !quietEntry(e)) return false;
+            return true;
+        }
+    };
+    try runUntil(&e2e.loop, &e2e.server, Quiet.f, 10_000);
+
+    const before = e2e.server.examined;
+    var cs = e2e.client.clientSession();
+    const datagrams = 20;
+    for (1..datagrams + 1) |n| {
+        try cs.sendDatagram(0, "d");
+        try runUntilCount(&e2e.loop, &h.datagrams, @intCast(n), 3_000);
+    }
+    try runFor(&e2e.loop, 100); // and the ACKs that follow
+    // Going through all 17 would be at least two passes of 17 a datagram.
+    try testing.expect(e2e.server.examined - before < datagrams * (idle_count + 1));
+    try testing.expectEqual(idle_count + 1, e2e.server.conn_mgr.timers.items.len);
 }
 
 test "e2e: a client and server that both offer QUIC v2 finish the handshake in it" {

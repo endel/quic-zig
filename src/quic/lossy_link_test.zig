@@ -777,10 +777,17 @@ test "stateless reset: the server drains a connection its client reset" {
     @memcpy(reset[reset.len - stateless_reset.TOKEN_LEN ..], &token);
 
     var resp: [MAX_DGRAM]u8 = undefined;
-    const sconn = p.mgr.entries.items[0].conn;
+    const entry = p.mgr.entries.items[0];
+    const sconn = entry.conn;
+    // As a pass leaves it, with nothing to look at.
+    entry.needs_visit = false;
+    entry.needs_poll = false;
+    p.mgr.settleVisits();
     try testing.expect(p.mgr.recvDatagram(&reset, p.c_addr, p.s_addr, 0, &resp) == .processed);
     try testing.expect(sconn.isDraining());
     try testing.expect(sconn.received_stateless_reset);
+    // Draining ends on a deadline only a visit puts in the timers.
+    try testing.expect(entry.queued and entry.needs_visit);
 }
 
 const packet = @import("packet.zig");

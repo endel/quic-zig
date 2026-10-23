@@ -324,6 +324,10 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = .ReleaseFast,
                 .link_libc = need_libc,
+                .imports = &.{.{ .name = "xev", .module = b.dependency("libxev", .{
+                    .target = target,
+                    .optimize = .ReleaseFast,
+                }).module("xev") }},
             }) }},
         }),
     });
