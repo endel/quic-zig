@@ -4118,6 +4118,11 @@ pub const Connection = struct {
             self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "max_ack_delay exceeds 2^14");
             return error.TransportParameterError;
         }
+        // draft-ietf-quic-ack-frequency 3 (µs against ms).
+        if ((peer_tp.min_ack_delay orelse 0) > peer_tp.max_ack_delay * std.time.us_per_ms) {
+            self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "min_ack_delay above max_ack_delay");
+            return error.TransportParameterError;
+        }
 
         // Client-side: validate ODCID and retry_scid transport params (RFC 9000 §7.3)
         if (!self.is_server) {
@@ -6469,6 +6474,16 @@ test "ACK_FREQUENCY: a huge max ack delay is capped, one under our min_ack_delay
     try conn.pkt_handler.recv[2].onPacketReceived(0, true, std.math.maxInt(i64) / 2, 0, 0);
 
     try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 1, .ack_eliciting_threshold = 2, .request_max_ack_delay = 999, .reordering_threshold = 1 } }, .application, 0));
+}
+
+test "transport parameters: a min_ack_delay above the max_ack_delay is TRANSPORT_PARAMETER_ERROR" {
+    // draft-ietf-quic-ack-frequency 3; one is in µs, the other in ms.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    var tp: transport_params.TransportParams = .{ .initial_source_connection_id = .init(conn.peer_initial_scid[0..conn.peer_initial_scid_len]), .max_ack_delay = 25, .min_ack_delay = 25_000 };
+    try conn.validatePeerTransportParams(&tp);
+    tp.min_ack_delay = 25_001;
+    try std.testing.expectError(error.TransportParameterError, conn.validatePeerTransportParams(&tp));
 }
 
 test "0-RTT: a replayed packet is processed once" {
