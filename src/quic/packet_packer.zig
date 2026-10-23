@@ -383,8 +383,7 @@ pub const PacketPacker = struct {
             };
             const cs = crypto_mgr.getStream(crypto_level_idx);
             const remaining_space = effective_max -| (fbs.seek + AEAD_TAG_LEN + 4);
-            // Checked first: past the handshake there is never any, and building
-            // the 576-byte ?Frame to say so cost 5.6% of the 10 KB HTTP/3 row.
+            // Checked first: past the handshake there is never any.
             if (remaining_space > 0 and cs.hasData()) {
                 if (cs.popCryptoFrame(remaining_space)) |crypto_frame| {
                     try crypto_frame.write(writer);

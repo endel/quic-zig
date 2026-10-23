@@ -1160,28 +1160,21 @@ fn seedFrame(buf: []u8, rand: std.Random) ?usize {
     const f: frame.Frame = switch (rand.uintLessThan(u8, 18)) {
         0 => .{ .padding = rand.uintLessThan(usize, 16) },
         1 => .ping,
-        // The ACK ranges live in a fixed array the field defaults leave
-        // undefined, so these two need filling in rather than a literal.
-        2 => blk: {
-            var a = frame.Frame{ .ack = .{ .largest_ack = 40, .ack_delay = 3, .first_ack_range = 2 } };
-            a.ack.ack_range_count = 2;
-            a.ack.ack_ranges[0] = .{ .start = 20, .end = 30 };
-            a.ack.ack_ranges[1] = .{ .start = 5, .end = 10 };
-            break :blk a;
-        },
-        3 => blk: {
-            var a = frame.Frame{ .ack_ecn = .{
-                .largest_ack = 40,
-                .ack_delay = 3,
-                .first_ack_range = 2,
-                .ecn_ect0 = 1,
-                .ecn_ect1 = 0,
-                .ecn_ce = 2,
-            } };
-            a.ack_ecn.ack_range_count = 1;
-            a.ack_ecn.ack_ranges[0] = .{ .start = 20, .end = 30 };
-            break :blk a;
-        },
+        2 => .{ .ack = .{
+            .largest_ack = 40,
+            .ack_delay = 3,
+            .first_ack_range = 2,
+            .ack_ranges = .{ .list = &.{ .{ .start = 20, .end = 30 }, .{ .start = 5, .end = 10 } } },
+        } },
+        3 => .{ .ack_ecn = .{
+            .largest_ack = 40,
+            .ack_delay = 3,
+            .first_ack_range = 2,
+            .ack_ranges = .{ .list = &.{.{ .start = 20, .end = 30 }} },
+            .ecn_ect0 = 1,
+            .ecn_ect1 = 0,
+            .ecn_ce = 2,
+        } },
         4 => .{ .reset_stream = .{ .stream_id = stream_id, .error_code = 7, .final_size = big } },
         5 => .{ .stop_sending = .{ .stream_id = stream_id, .error_code = 7 } },
         6 => .{ .crypto = .{ .offset = big, .data = &payload } },

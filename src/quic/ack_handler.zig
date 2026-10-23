@@ -668,16 +668,8 @@ pub const ReceivedPacketTracker = struct {
         self.ack_alarm = null;
         self.ack_eliciting_since_last_ack = 0;
 
-        // Populate additional ACK ranges from received range set
-        var ack_ranges: [MAX_ACK_RANGES]AckRange = undefined;
-        var ack_range_count: u8 = 0;
-        if (recv_ranges.len > 1) {
-            for (recv_ranges[1..]) |r| {
-                if (ack_range_count >= MAX_ACK_RANGES) break;
-                ack_ranges[ack_range_count] = .{ .start = r.start, .end = r.end };
-                ack_range_count += 1;
-            }
-        }
+        // Valid until the next packet is received, so write the frame first.
+        const ack_ranges: frame_mod.AckRanges = .{ .list = recv_ranges[1..@min(recv_ranges.len, MAX_ACK_RANGES + 1)] };
 
         // Use ACK_ECN when any ECN counter is non-zero (RFC 9000 §13.4.2)
         if (self.ecn_ect0 > 0 or self.ecn_ect1 > 0 or self.ecn_ce > 0) {
@@ -686,7 +678,6 @@ pub const ReceivedPacketTracker = struct {
                     .largest_ack = largest,
                     .ack_delay = ack_delay_encoded,
                     .first_ack_range = first_ack_range,
-                    .ack_range_count = ack_range_count,
                     .ack_ranges = ack_ranges,
                     .ecn_ect0 = self.ecn_ect0,
                     .ecn_ect1 = self.ecn_ect1,
@@ -700,7 +691,6 @@ pub const ReceivedPacketTracker = struct {
                 .largest_ack = largest,
                 .ack_delay = ack_delay_encoded,
                 .first_ack_range = first_ack_range,
-                .ack_range_count = ack_range_count,
                 .ack_ranges = ack_ranges,
             },
         };

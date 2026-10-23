@@ -277,12 +277,14 @@ pub const QlogWriter = struct {
             .ping => std.fmt.bufPrint(out, "{{\"frame_type\":\"ping\"}}", .{}) catch return 0,
             .ack => |ack| blk: {
                 var tmp: [512]u8 = undefined;
-                const ranges_len = serializeAckRanges(ack.largest_ack, ack.first_ack_range, ack.ack_ranges[0..ack.ack_range_count], &tmp);
+                var ranges_buf: [frame_mod.MAX_ACK_RANGES]frame_mod.AckRange = undefined;
+                const ranges_len = serializeAckRanges(ack.largest_ack, ack.first_ack_range, ack.ack_ranges.slice(&ranges_buf), &tmp);
                 break :blk std.fmt.bufPrint(out, "{{\"frame_type\":\"ack\",\"ack_delay\":{d},\"acked_ranges\":[{s}]}}", .{ ack.ack_delay, tmp[0..ranges_len] }) catch return 0;
             },
             .ack_ecn => |ack| blk: {
                 var tmp: [512]u8 = undefined;
-                const ranges_len = serializeAckRanges(ack.largest_ack, ack.first_ack_range, ack.ack_ranges[0..ack.ack_range_count], &tmp);
+                var ranges_buf: [frame_mod.MAX_ACK_RANGES]frame_mod.AckRange = undefined;
+                const ranges_len = serializeAckRanges(ack.largest_ack, ack.first_ack_range, ack.ack_ranges.slice(&ranges_buf), &tmp);
                 break :blk std.fmt.bufPrint(out, "{{\"frame_type\":\"ack\",\"ack_delay\":{d},\"acked_ranges\":[{s}],\"ect0\":{d},\"ect1\":{d},\"ce\":{d}}}", .{ ack.ack_delay, tmp[0..ranges_len], ack.ecn_ect0, ack.ecn_ect1, ack.ecn_ce }) catch return 0;
             },
             .crypto => |c| std.fmt.bufPrint(out, "{{\"frame_type\":\"crypto\",\"offset\":{d},\"length\":{d}}}", .{ c.offset, c.data.len }) catch return 0,
@@ -408,7 +410,6 @@ test "QlogWriter.serializeFrame - ack" {
         .largest_ack = 10,
         .ack_delay = 25,
         .first_ack_range = 3,
-        .ack_range_count = 0,
     } }, &buf);
     try std.testing.expectEqualStrings("{\"frame_type\":\"ack\",\"ack_delay\":25,\"acked_ranges\":[[7,10]]}", buf[0..len]);
 }

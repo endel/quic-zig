@@ -81,16 +81,62 @@ pub const TransportError = enum(u64) {
     }
 };
 
-/// ACK range: represents a contiguous range of acknowledged packet numbers.
-pub const AckRange = struct {
-    /// Smallest packet number in this range.
-    start: u64,
-    /// Largest packet number in this range.
-    end: u64,
-};
+/// ACK range: a contiguous range of acknowledged packet numbers. The same
+/// type the receiver tracks them in, so an outgoing ACK can point at those.
+pub const AckRange = @import("ranges.zig").Range;
 
-/// Maximum number of additional ACK ranges stored inline (avoids allocation).
+/// Most ranges past the first that an ACK frame carries or is read for.
 pub const MAX_ACK_RANGES: usize = 32;
+
+/// An ACK frame's ranges past the first, largest first. Held by reference,
+/// not inline, so that a `Frame` stays small enough to copy for free.
+pub const AckRanges = union(enum) {
+    /// The ranges themselves, for a frame we build.
+    list: []const AckRange,
+    /// A parsed frame's wire encoding, already validated.
+    wire: struct {
+        bytes: []const u8,
+        /// Ranges to read: at most MAX_ACK_RANGES, though `bytes` holds all.
+        count: u8,
+        /// The first range's smallest packet number, which the next one's gap counts from.
+        below: u64,
+    },
+
+    pub const none: AckRanges = .{ .list = &.{} };
+
+    /// The ranges, decoding a parsed frame's into `buf`.
+    pub fn slice(self: AckRanges, buf: *[MAX_ACK_RANGES]AckRange) []const AckRange {
+        switch (self) {
+            .list => |l| return l,
+            .wire => |w| {
+                var stream = io.fixedBufferStream(w.bytes);
+                var smallest = w.below;
+                for (buf[0..w.count]) |*r| {
+                    const gap = packet.readVarInt(&stream) catch unreachable;
+                    const len = packet.readVarInt(&stream) catch unreachable;
+                    r.end = smallest - gap - 2;
+                    r.start = r.end - len;
+                    smallest = r.start;
+                }
+                return buf[0..w.count];
+            },
+        }
+    }
+
+    fn write(self: AckRanges, writer: anytype, largest_ack: u64, first_ack_range: u64) !void {
+        var buf: [MAX_ACK_RANGES]AckRange = undefined;
+        const list = self.slice(&buf);
+        try packet.writeVarInt(writer, list.len);
+        try packet.writeVarInt(writer, first_ack_range);
+        // Absolute ranges back to the wire's gap/length pairs.
+        var prev_smallest = largest_ack -| first_ack_range;
+        for (list) |r| {
+            try packet.writeVarInt(writer, prev_smallest -| r.end -| 2);
+            try packet.writeVarInt(writer, r.end - r.start);
+            prev_smallest = r.start;
+        }
+    }
+};
 
 pub const Frame = union(FrameType) {
     padding: usize,
@@ -101,16 +147,14 @@ pub const Frame = union(FrameType) {
         largest_ack: u64,
         ack_delay: u64,
         first_ack_range: u64,
-        ack_range_count: u8 = 0,
-        ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
+        ack_ranges: AckRanges = .none,
     },
 
     ack_ecn: struct {
         largest_ack: u64,
         ack_delay: u64,
         first_ack_range: u64,
-        ack_range_count: u8 = 0,
-        ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
+        ack_ranges: AckRanges = .none,
         ecn_ect0: u64,
         ecn_ect1: u64,
         ecn_ce: u64,
@@ -259,26 +303,25 @@ pub const Frame = union(FrameType) {
                 // FRAME_ENCODING_ERROR, not something to clamp into range.
                 if (first_ack_range > largest_ack) return error.FrameEncodingError;
 
-                // Parse additional ACK ranges, computing absolute PN ranges
-                var additional_ranges: [MAX_ACK_RANGES]AckRange = undefined;
-                var range_count: u8 = 0;
-                var smallest = largest_ack - first_ack_range;
-
+                // Validate every range, including the ones past our cap;
+                // AckRanges.slice decodes them again unchecked.
+                const below = largest_ack - first_ack_range;
+                const ranges_start = stream.seek;
+                var smallest = below;
                 var i: u64 = 0;
                 while (i < ack_range_count) : (i += 1) {
                     const gap = try packet.readVarInt(reader);
                     const ack_range_len = try packet.readVarInt(reader);
-                    // Validate every range, including the ones past our cap.
                     if (smallest < gap +| 2) return error.FrameEncodingError;
                     const range_largest = smallest - gap - 2;
                     if (ack_range_len > range_largest) return error.FrameEncodingError;
-                    const range_smallest = range_largest - ack_range_len;
-                    if (range_count < MAX_ACK_RANGES) {
-                        additional_ranges[range_count] = .{ .start = range_smallest, .end = range_largest };
-                        range_count += 1;
-                    }
-                    smallest = range_smallest;
+                    smallest = range_largest - ack_range_len;
                 }
+                const additional_ranges: AckRanges = .{ .wire = .{
+                    .bytes = bytes[ranges_start..stream.seek],
+                    .count = @intCast(@min(ack_range_count, MAX_ACK_RANGES)),
+                    .below = below,
+                } };
 
                 var ecn_ect0: u64 = 0;
                 var ecn_ect1: u64 = 0;
@@ -295,7 +338,6 @@ pub const Frame = union(FrameType) {
                             .largest_ack = largest_ack,
                             .ack_delay = ack_delay,
                             .first_ack_range = first_ack_range,
-                            .ack_range_count = range_count,
                             .ack_ranges = additional_ranges,
                             .ecn_ect0 = ecn_ect0,
                             .ecn_ect1 = ecn_ect1,
@@ -308,7 +350,6 @@ pub const Frame = union(FrameType) {
                             .largest_ack = largest_ack,
                             .ack_delay = ack_delay,
                             .first_ack_range = first_ack_range,
-                            .ack_range_count = range_count,
                             .ack_ranges = additional_ranges,
                         },
                     };
@@ -533,36 +574,14 @@ pub const Frame = union(FrameType) {
                 try packet.writeVarInt(writer, 0x02);
                 try packet.writeVarInt(writer, ack.largest_ack);
                 try packet.writeVarInt(writer, ack.ack_delay);
-                try packet.writeVarInt(writer, @as(u64, ack.ack_range_count));
-                try packet.writeVarInt(writer, ack.first_ack_range);
-
-                // Convert absolute ranges back to gap/ack_range wire format
-                var prev_smallest = ack.largest_ack -| ack.first_ack_range;
-                for (ack.ack_ranges[0..ack.ack_range_count]) |r| {
-                    const gap = prev_smallest -| r.end -| 2;
-                    const ack_range_len = r.end - r.start;
-                    try packet.writeVarInt(writer, gap);
-                    try packet.writeVarInt(writer, ack_range_len);
-                    prev_smallest = r.start;
-                }
+                try ack.ack_ranges.write(writer, ack.largest_ack, ack.first_ack_range);
             },
 
             .ack_ecn => |ack| {
                 try packet.writeVarInt(writer, 0x03);
                 try packet.writeVarInt(writer, ack.largest_ack);
                 try packet.writeVarInt(writer, ack.ack_delay);
-                try packet.writeVarInt(writer, @as(u64, ack.ack_range_count));
-                try packet.writeVarInt(writer, ack.first_ack_range);
-
-                var prev_smallest = ack.largest_ack -| ack.first_ack_range;
-                for (ack.ack_ranges[0..ack.ack_range_count]) |r| {
-                    const gap = prev_smallest -| r.end -| 2;
-                    const ack_range_len = r.end - r.start;
-                    try packet.writeVarInt(writer, gap);
-                    try packet.writeVarInt(writer, ack_range_len);
-                    prev_smallest = r.start;
-                }
-
+                try ack.ack_ranges.write(writer, ack.largest_ack, ack.first_ack_range);
                 try packet.writeVarInt(writer, ack.ecn_ect0);
                 try packet.writeVarInt(writer, ack.ecn_ect1);
                 try packet.writeVarInt(writer, ack.ecn_ce);
@@ -1213,8 +1232,35 @@ test "ACK ranges reaching below packet number 0 are FRAME_ENCODING_ERROR" {
     // The same range ending exactly at 0 is fine.
     var ok = [_]u8{ 0x02, 0x0a, 0x00, 0x01, 0x03, 0x01, 0x04 };
     const f = try Frame.parse(&ok);
-    try std.testing.expectEqual(@as(u64, 0), f.ack.ack_ranges[0].start);
-    try std.testing.expectEqual(@as(u64, 4), f.ack.ack_ranges[0].end);
+    var buf: [MAX_ACK_RANGES]AckRange = undefined;
+    const ranges = f.ack.ack_ranges.slice(&buf);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(u64, 0), ranges[0].start);
+    try std.testing.expectEqual(@as(u64, 4), ranges[0].end);
+}
+
+test "a parsed ACK reads its first MAX_ACK_RANGES ranges, and writes back as many" {
+    // largest 1000, first range [1000,1000], then 40 single-packet ranges two apart.
+    var wire: [64 + 2 * 40]u8 = undefined;
+    var out = io.fixedBufferStream(&wire);
+    for ([_]u64{ 0x02, 1000, 0, 40, 0 }) |v| try packet.writeVarInt(&out, v);
+    for (0..2 * 40) |_| try packet.writeVarInt(&out, 0);
+
+    const f = try Frame.parse(out.buffered());
+    try std.testing.expect(@sizeOf(Frame) <= 128);
+    var buf: [MAX_ACK_RANGES]AckRange = undefined;
+    const ranges = f.ack.ack_ranges.slice(&buf);
+    try std.testing.expectEqual(MAX_ACK_RANGES, ranges.len);
+    for (ranges, 0..) |r, i| {
+        const pn = 1000 - 2 * (i + 1);
+        try std.testing.expectEqual(AckRange{ .start = pn, .end = pn }, r);
+    }
+
+    var again: [256]u8 = undefined;
+    var w = io.fixedBufferStream(&again);
+    try f.write(&w);
+    const g = try Frame.parse(w.buffered());
+    try std.testing.expectEqualSlices(AckRange, ranges, g.ack.ack_ranges.slice(&buf));
 }
 
 test "parse reset_stream frame" {

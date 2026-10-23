@@ -1728,7 +1728,9 @@ pub const Connection = struct {
 
             .ack => |ack| {
                 const enc_level = epochToEncLevel(epoch);
-                if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack.ack_ranges[0..ack.ack_range_count])) {
+                var ranges_buf: [frame_mod.MAX_ACK_RANGES]frame_mod.AckRange = undefined;
+                const ack_ranges = ack.ack_ranges.slice(&ranges_buf);
+                if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack_ranges)) {
                     self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.ack), "ACK for unsent packet");
                     return error.ProtocolViolation;
                 }
@@ -1746,7 +1748,7 @@ pub const Connection = struct {
                     ack.largest_ack,
                     ack.ack_delay,
                     @intCast(peer_tp.ack_delay_exponent),
-                    ack.ack_ranges[0..ack.ack_range_count],
+                    ack_ranges,
                     ack.first_ack_range,
                     now,
                     &self.ack_result,
@@ -1872,7 +1874,9 @@ pub const Connection = struct {
 
             .ack_ecn => |ack| {
                 const enc_level = epochToEncLevel(epoch);
-                if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack.ack_ranges[0..ack.ack_range_count])) {
+                var ranges_buf: [frame_mod.MAX_ACK_RANGES]frame_mod.AckRange = undefined;
+                const ack_ranges = ack.ack_ranges.slice(&ranges_buf);
+                if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack_ranges)) {
                     self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.ack_ecn), "ACK for unsent packet");
                     return error.ProtocolViolation;
                 }
@@ -1888,7 +1892,7 @@ pub const Connection = struct {
                     ack.largest_ack,
                     ack.ack_delay,
                     @intCast(peer_tp.ack_delay_exponent),
-                    ack.ack_ranges[0..ack.ack_range_count],
+                    ack_ranges,
                     ack.first_ack_range,
                     now,
                     &self.ack_result,
@@ -7057,10 +7061,10 @@ test "an ACK for a packet number never sent is a PROTOCOL_VIOLATION" {
     // Two packets sent: 0 and 1. Acking 1 is fine, acking 2 is not.
     _ = conn.pkt_handler.nextPacketNumber(.application);
     _ = conn.pkt_handler.nextPacketNumber(.application);
-    try conn.processFrame(&.{ .ack = .{ .largest_ack = 1, .ack_delay = 0, .first_ack_range = 1, .ack_range_count = 0 } }, .application, 0);
+    try conn.processFrame(&.{ .ack = .{ .largest_ack = 1, .ack_delay = 0, .first_ack_range = 1 } }, .application, 0);
     try std.testing.expect(conn.local_err == null);
 
-    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack = .{ .largest_ack = 2, .ack_delay = 0, .first_ack_range = 0, .ack_range_count = 0 } }, .application, 0));
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack = .{ .largest_ack = 2, .ack_delay = 0, .first_ack_range = 0 } }, .application, 0));
     try std.testing.expectEqual(@as(u64, @backingInt(TransportError.protocol_violation)), conn.local_err.?.code);
 }
 
@@ -7072,7 +7076,6 @@ test "an ACK_ECN for a packet number never sent is a PROTOCOL_VIOLATION" {
         .largest_ack = 0,
         .ack_delay = 0,
         .first_ack_range = 0,
-        .ack_range_count = 0,
         .ecn_ect0 = 0,
         .ecn_ect1 = 0,
         .ecn_ce = 0,
@@ -7236,7 +7239,7 @@ fn loseControlFrames(conn: *Connection, frames: []const frame_mod.PendingControl
         });
     }
     const largest = conn.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.application)] - 1;
-    try conn.processFrame(&.{ .ack = .{ .largest_ack = largest, .ack_delay = 0, .first_ack_range = 2, .ack_range_count = 0 } }, .application, now + 1_000_000);
+    try conn.processFrame(&.{ .ack = .{ .largest_ack = largest, .ack_delay = 0, .first_ack_range = 2 } }, .application, now + 1_000_000);
 }
 
 test "a lost RESET_STREAM is rebuilt from its record after the uni stream is freed" {
