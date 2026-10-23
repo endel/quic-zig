@@ -234,10 +234,14 @@ pub const LocalCidPool = struct {
     entries: [MAX_POOL_SIZE]LocalCidEntry = @splat(LocalCidEntry{}),
     next_seq_num: u64 = 1,
     retire_prior_to: u64 = 0,
+    /// Bumped whenever the set of entries changes, so the server's routing
+    /// map knows when to resync.
+    generation: u32 = 0,
 
     /// Register the initial SCID as sequence number 0.
     /// If static_key is provided, compute a deterministic reset token; otherwise random.
     pub fn registerInitialCid(self: *LocalCidPool, cid: []const u8, static_key: ?[16]u8) void {
+        self.generation +%= 1;
         self.entries[0] = LocalCidEntry{
             .occupied = true,
             .retired = false,
@@ -254,6 +258,7 @@ pub const LocalCidPool = struct {
 
     /// Register the preferred_address CID at sequence number 1 (RFC 9000 §5.1.1).
     pub fn registerPreferredCid(self: *LocalCidPool, cid: []const u8, reset_token: [16]u8) void {
+        self.generation +%= 1;
         // Find a free slot for seq 1
         for (&self.entries) |*entry| {
             if (!entry.occupied) {
@@ -273,6 +278,7 @@ pub const LocalCidPool = struct {
     /// Issue a new CID with the given length. Returns the entry or null if pool full.
     /// If static_key is provided, compute a deterministic reset token; otherwise random.
     pub fn issueNewCid(self: *LocalCidPool, cid_len: u8, static_key: ?[16]u8) ?*const LocalCidEntry {
+        self.generation +%= 1;
         // Find a free slot
         for (&self.entries) |*entry| {
             if (!entry.occupied) {
@@ -296,6 +302,7 @@ pub const LocalCidPool = struct {
     /// Issue a new CID using QUIC-LB encoding. Returns the entry or null if pool full.
     /// If static_key is provided, compute a deterministic reset token; otherwise random.
     pub fn issueNewCidLb(self: *LocalCidPool, lb_config: *const quic_lb.Config, static_key: ?[16]u8) ?*const LocalCidEntry {
+        self.generation +%= 1;
         for (&self.entries) |*entry| {
             if (!entry.occupied) {
                 entry.occupied = true;
@@ -318,6 +325,7 @@ pub const LocalCidPool = struct {
 
     /// Mark an entry as retired by sequence number.
     pub fn retireBySeq(self: *LocalCidPool, seq: u64) void {
+        self.generation +%= 1;
         for (&self.entries) |*entry| {
             if (entry.occupied and entry.seq_num == seq) {
                 entry.occupied = false;
@@ -787,7 +795,8 @@ pub const Connection = struct {
     // Connection state
     got_peer_conn_id: bool = false,
     /// Sequence number of our CID the 1-RTT packet being processed came on,
-    /// which the peer may not retire in that packet (RFC 9000 §19.16).
+    /// which the peer may not retire in that packet (RFC 9000 §19.16). Looked
+    /// up only ahead of a RETIRE_CONNECTION_ID frame.
     current_dcid_seq: ?u64 = null,
     /// The SCID of the first long-header packet from the peer that
     /// decrypted: what initial_source_connection_id must name (RFC 9000 §7.3).
@@ -1525,11 +1534,6 @@ pub const Connection = struct {
         }
 
         self.current_dcid_seq = null;
-        if (header.packet_type == .one_rtt) {
-            for (&self.local_cid_pool.entries) |*e| {
-                if (e.occupied and std.mem.eql(u8, e.getCid(), header.dcid)) self.current_dcid_seq = e.seq_num;
-            }
-        }
 
         // Process all frames from the decrypted payload
         var ack_eliciting = false;
@@ -1580,6 +1584,12 @@ pub const Connection = struct {
                 qlog_frame_count += 1;
             }
 
+            // Only this frame asks, so the scan isn't paid per packet.
+            if (frame == .retire_connection_id and header.packet_type == .one_rtt) {
+                for (&self.local_cid_pool.entries) |*e| {
+                    if (e.occupied and std.mem.eql(u8, e.getCid(), header.dcid)) self.current_dcid_seq = e.seq_num;
+                }
+            }
             try self.processFrame(&frame, epoch, now);
 
             remaining = remaining[frame_len..];

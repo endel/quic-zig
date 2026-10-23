@@ -135,6 +135,8 @@ pub const ConnEntry = struct {
     /// one per LocalCidPool slot.
     registered_cids: [connection.LocalCidPool.MAX_POOL_SIZE]CidKey = @splat(.{}),
     registered_cid_count: u8 = 0,
+    /// The pool's `generation` when `syncCids` last routed all of it.
+    cid_pool_gen: ?u32 = null,
     /// The DCID the client chose for its first Initial, which it keeps using
     /// until it learns ours. Not in LocalCidPool.
     initial_dcid: CidKey = .{},
@@ -597,8 +599,13 @@ pub const ConnectionManager = struct {
     /// The pool can hand a retired CID's slot to its replacement before this
     /// runs, so what the entry registered is checked against the pool's active
     /// CIDs rather than read off the pool's retired flags.
+    ///
+    /// Runs for every packet, so it does nothing until the pool's generation
+    /// moves, or while a CID it could not route last time is still waiting.
     pub fn syncCids(self: *ConnectionManager, entry: *ConnEntry) void {
+        defer self.syncResetTokens(entry);
         const pool = &entry.conn.local_cid_pool;
+        if (entry.cid_pool_gen == pool.generation) return;
 
         var removed: usize = 0;
         var i: usize = 0;
@@ -613,19 +620,23 @@ pub const ConnectionManager = struct {
             removed += 1;
         }
 
+        var unrouted: usize = 0;
         for (&pool.entries) |*cid_entry| {
             if (!cid_entry.occupied or cid_entry.retired or cid_entry.cid_len == 0) continue;
             const key = CidKey.fromSlice(cid_entry.getCid());
             if (entry.hasRegisteredCid(key)) continue;
+            unrouted += 1;
             // Untracked, a map entry would outlive the connection.
             if (entry.registered_cid_count == entry.registered_cids.len) break;
             const slot = self.cid_map.getOrPut(key) catch continue;
             if (slot.found_existing and slot.value_ptr.* != entry) continue; // another connection's
             slot.value_ptr.* = entry;
             entry.addRegisteredCid(key);
+            unrouted -= 1;
         }
         self.noteRemovals(removed);
-        self.syncResetTokens(entry);
+        // One left out is tried again with the next packet.
+        entry.cid_pool_gen = if (unrouted == 0) pool.generation else null;
     }
 
     fn poolHasActive(pool: *const connection.LocalCidPool, key: CidKey) bool {
@@ -1327,6 +1338,57 @@ test "a CID the peer retires stops routing, and none outlive the connection" {
     mgr.removeConnection(e);
     mgr.freeDeadEntries();
     try std.testing.expectEqual(@as(usize, 0), mgr.cid_map.count());
+}
+
+test "every change to a CID pool reaches routing, and a CID another connection holds is retried" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    const a = try acceptTest(&mgr, 1);
+    const b = try acceptTest(&mgr, 2);
+    mgr.syncCids(b);
+
+    // Each CID the pool has held routes to `a` exactly while it is active.
+    const pool = &a.conn.local_cid_pool;
+    const preferred: [8]u8 = @splat(0x5a);
+    const initial: [8]u8 = @splat(0x6b);
+    var held: [16]CidKey = undefined;
+    var n_held: usize = 0;
+    for (0..6) |step| {
+        switch (step) {
+            0 => {},
+            1 => pool.registerPreferredCid(&preferred, @splat(0)),
+            2 => _ = pool.issueNewCid(8, null),
+            3 => _ = pool.issueNewCidLb(&lbConfig(1), null),
+            4 => pool.retireBySeq(0),
+            5 => pool.registerInitialCid(&initial, null),
+            else => unreachable,
+        }
+        for (&pool.entries) |*c| {
+            if (!c.occupied) continue;
+            const key = CidKey.fromSlice(c.getCid());
+            for (held[0..n_held]) |k| {
+                if (CidKeyContext.eql(.{}, k, key)) break;
+            } else {
+                held[n_held] = key;
+                n_held += 1;
+            }
+        }
+        mgr.syncCids(a);
+        for (held[0..n_held]) |key| {
+            try std.testing.expectEqual(ConnectionManager.poolHasActive(pool, key), mgr.findByDcid(key.getSlice()) == a);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), n_held);
+
+    // Handed one of `a`'s CIDs, `b` leaves it to `a`, and takes it with its
+    // next packet once `a` is gone, though its own pool hasn't changed since.
+    b.conn.local_cid_pool.registerPreferredCid(&preferred, @splat(0));
+    mgr.syncCids(b);
+    try std.testing.expect(mgr.findByDcid(&preferred) == a);
+    mgr.removeConnection(a);
+    mgr.syncCids(b);
+    try std.testing.expect(mgr.findByDcid(&preferred) == b);
 }
 
 fn acceptTest(mgr: *ConnectionManager, n: u64) !*ConnEntry {
