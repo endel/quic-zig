@@ -78,11 +78,14 @@ pub const H3Event = union(enum) {
 };
 
 /// Maximum number of headers we'll decode from a single HEADERS frame. The
-/// decoded bytes are bounded separately by `qpack.SCRATCH_SIZE`.
+/// decoded bytes are bounded separately, by the SETTINGS_MAX_FIELD_SECTION_SIZE
+/// we advertise (at most `qpack.SCRATCH_SIZE`). A section past either limit
+/// fails its stream: a request is answered 431, a response is cancelled.
 pub const MAX_HEADERS: usize = 128;
 
 /// Largest HEADERS frame we will buffer to decode. Decoded fields are capped
-/// at `qpack.SCRATCH_SIZE`; this bounds the encoded frame held meanwhile.
+/// at `qpack.SCRATCH_SIZE`; this bounds the encoded frame held meanwhile. A
+/// larger one is refused like an oversized section, before it is buffered.
 pub const MAX_HEADERS_FRAME: u64 = 64 * 1024;
 
 /// Largest SETTINGS or PRIORITY_UPDATE frame accepted on the control stream.
@@ -104,6 +107,8 @@ const FrameStep = union(enum) {
     progressed,
     /// The frame is not all there yet.
     need_more,
+    /// The request stream is refused; nothing more is read from it.
+    refused,
 };
 
 /// A `notifyWritable` request waiting on a request stream.
@@ -282,6 +287,10 @@ pub const H3Connection = struct {
         const cap = &self.local_settings.qpack_max_table_capacity;
         cap.* = @min(cap.*, qpack.DynamicTable.MAX_CAPACITY);
         self.qpack_decoder.setCapacity(@intCast(cap.*));
+        // RFC 9114 4.2.2: tell the peer where decoding stops. Any section
+        // within it fits the scratch.
+        const fss = &self.local_settings.max_field_section_size;
+        fss.* = @min(fss.* orelse qpack.SCRATCH_SIZE, qpack.SCRATCH_SIZE);
 
         // Send SETTINGS frame on control stream
         var settings_buf: [128]u8 = undefined;
@@ -969,6 +978,7 @@ pub const H3Connection = struct {
                         .event => |ev| return ev,
                         .progressed => continue,
                         .need_more => {},
+                        .refused => unreachable, // request streams only
                     }
                 }
             }
@@ -1328,6 +1338,7 @@ pub const H3Connection = struct {
                         .event => |ev| return ev,
                         .progressed => continue,
                         .need_more => {},
+                        .refused => return null,
                     }
                 }
             }
@@ -1391,14 +1402,13 @@ pub const H3Connection = struct {
                 return .progressed;
             },
             .headers => {
-                if (hdr.length > MAX_HEADERS_FRAME) {
-                    self.closeWithError(.excessive_load, "HEADERS frame too large");
-                    return error.H3ExcessiveLoad;
-                }
+                if (hdr.length > MAX_HEADERS_FRAME) return self.refuseHeaderSection(stream_id, rs, buf);
                 const total = hdr.len + @as(usize, @intCast(hdr.length));
                 if (buf.items.len < total) return .need_more;
-                const ev = try self.handleHeadersFrame(stream_id, rs, buf, buf.items[hdr.len..total], total) orelse
-                    return .progressed;
+                const ev = self.handleHeadersFrame(stream_id, rs, buf, buf.items[hdr.len..total], total) catch |err| switch (err) {
+                    error.FieldSectionTooLarge, error.TooManyHeaders => return self.refuseHeaderSection(stream_id, rs, buf),
+                    else => |e| return e,
+                } orelse return .progressed;
                 return .{ .event = ev };
             },
             // Unknown, reserved and unsupported frames are dropped as they
@@ -1422,10 +1432,17 @@ pub const H3Connection = struct {
         frame_len: usize,
     ) !?H3Event {
         const scratch = try self.qpackScratch();
+        // Decoding stops at the size our SETTINGS gave the peer.
+        const limit: usize = @intCast(@min(self.local_settings.max_field_section_size orelse scratch.len, scratch.len));
         // RFC 9204 §2.2.3: a block that does not decode fails the connection;
         // decoding around its dynamic references would drop fields.
-        const hdr_count = self.qpack_decoder.decode(qpack_data, &self.headers_buf, scratch, stream_id) catch {
+        const hdr_count = self.qpack_decoder.decode(qpack_data, &self.headers_buf, scratch[0..limit], stream_id) catch |err| {
             self.consumeRequestBytes(rs, buf, frame_len);
+            switch (err) {
+                // The message is too large, not undecodable: the stream's problem.
+                error.FieldSectionTooLarge, error.TooManyHeaders => return err,
+                else => {},
+            }
             self.closeWithError(.qpack_decompression_failed, "QPACK decode failure");
             return error.H3FrameError;
         };
@@ -1512,6 +1529,35 @@ pub const H3Connection = struct {
             .stream_id = stream_id,
             .headers = hdrs,
         } };
+    }
+
+    /// RFC 9114 4.2.2: a header section past what we decode fails its stream,
+    /// not the connection. A server answers a request it has not surfaced
+    /// with 431 and stops reading it; anything else — a response, trailers —
+    /// is cancelled and reported as `request_cancelled`.
+    fn refuseHeaderSection(self: *H3Connection, stream_id: u64, rs: *stream_mod.ReceiveStream, buf: *std.ArrayList(u8)) !FrameStep {
+        // The rest of the buffer is the refused message's.
+        self.consumeRequestBytes(rs, buf, buf.items.len);
+        buf.clearAndFree(self.allocator);
+        // RFC 9204 4.4.2: with nothing inserted there is nothing to release.
+        if (self.qpack_decoder.dynamic.insert_count > 0) {
+            self.qpack_decoder.cancelStream(stream_id);
+            self.flushDecoderInstructions() catch {};
+        }
+
+        const code = @backingInt(H3Error.excessive_load);
+        if (!self.is_server or self.headers_received_streams.contains(stream_id)) {
+            self.cancelRequest(stream_id, code);
+            const ev = try self.reportCancelled(stream_id, code) orelse return .refused;
+            return .{ .event = ev };
+        }
+        try self.finished_streams.put(stream_id, {});
+        // RFC 9114 4.1: the response is complete without the rest of the
+        // request, so H3_NO_ERROR asks the client to stop sending it.
+        rs.stopSending(@backingInt(H3Error.no_error));
+        self.sendResponse(stream_id, &.{.{ .name = ":status", .value = "431" }}, null) catch
+            self.cancelRequest(stream_id, code);
+        return .refused;
     }
 
     /// Move one more QUIC chunk into the stream's H3 buffer. False when QUIC
@@ -3460,8 +3506,9 @@ test "H3: a HEADERS frame past the size cap is refused before it is buffered" {
 
     var hdr_buf: [16]u8 = undefined;
     try injectBidiStreamData(&quic_conn, 0, writeFrameHeaderBytes(&hdr_buf, 0x01, MAX_HEADERS_FRAME + 1), false);
-    try testing.expectError(error.H3ExcessiveLoad, h3.poll());
-    try testing.expectEqual(@as(u64, @backingInt(H3Error.excessive_load)), quic_conn.local_err.?.code);
+    try testing.expect((try h3.poll()) == null);
+    try expectRefusedWith431(&quic_conn, 0);
+    try testing.expectEqual(@as(usize, 0), h3.stream_bufs.get(0).?.capacity);
 }
 
 test "H3: an unknown frame on a request stream is skipped as it arrives" {
@@ -3539,4 +3586,173 @@ test "H3 control stream: unknown frames are skipped as they arrive, oversized SE
     try injectUniStreamData(&quic_conn2, 2, buf[0 .. 1 + settings.len], false);
     try testing.expectError(error.H3ExcessiveLoad, h3b.poll());
     try testing.expectEqual(@as(u64, @backingInt(H3Error.excessive_load)), quic_conn2.local_err.?.code);
+}
+
+// A HEADERS frame carrying `headers`, allocated: big sections are the point.
+fn allocHeadersFrame(headers: []const qpack.Header) ![]u8 {
+    const block = try testing.allocator.alloc(u8, qpack.maxEncodedLen(headers));
+    defer testing.allocator.free(block);
+    const n = try qpack.encodeHeaders(headers, block);
+    var hdr: [16]u8 = undefined;
+    return std.mem.concat(testing.allocator, u8, &.{ writeFrameHeaderBytes(&hdr, 0x01, n), block[0..n] });
+}
+
+const get_with_cookie = [_]qpack.Header{
+    .{ .name = ":method", .value = "GET" },
+    .{ .name = ":scheme", .value = "https" },
+    .{ .name = ":path", .value = "/" },
+    .{ .name = ":authority", .value = "example.com" },
+    .{ .name = "cookie", .value = &@as([qpack.SCRATCH_SIZE]u8, @splat('c')) },
+};
+
+// The response a refused request got: just `:status`, then FIN.
+fn expectRefusedWith431(quic_conn: *quic_connection.Connection, stream_id: u64) !void {
+    const stream = quic_conn.streams.getStream(stream_id).?;
+    const r = try h3_frame.parse(stream.send.write_buffer.items);
+    try testing.expectEqual(stream.send.write_buffer.items.len, r.consumed);
+    var decoded: [4]qpack.Header = undefined;
+    var scratch: [64]u8 = undefined;
+    const count = try qpack.decodeHeaders(r.frame.headers, &decoded, &scratch);
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqualStrings(":status", decoded[0].name);
+    try testing.expectEqualStrings("431", decoded[0].value);
+    try testing.expect(stream.send.fin_queued);
+    // RFC 9114 4.1: a complete response, so the rest of the request is
+    // stopped with H3_NO_ERROR.
+    try testing.expectEqual(@as(?u64, @backingInt(H3Error.no_error)), stream.recv.stop_sending_err);
+    try testing.expect(quic_conn.local_err == null);
+}
+
+test "H3: a request past SETTINGS_MAX_FIELD_SECTION_SIZE gets 431 and the connection lives" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    const hf = try allocHeadersFrame(&get_with_cookie);
+    defer testing.allocator.free(hf);
+    var data_buf: [16]u8 = undefined;
+    const data_len = buildDataFrame(&data_buf, "body");
+    const req = try std.mem.concat(testing.allocator, u8, &.{ hf, data_buf[0..data_len] });
+    defer testing.allocator.free(req);
+    try injectBidiStreamData(&quic_conn, 0, req, true);
+
+    try testing.expect((try h3.poll()) == null);
+    try expectRefusedWith431(&quic_conn, 0);
+    // Not read again: no event for the DATA behind it, or for its FIN.
+    try testing.expect((try h3.poll()) == null);
+
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+    try injectBidiStreamData(&quic_conn, 4, req_buf[0..req_len], false);
+    const ev = (try h3.poll()).?;
+    try testing.expectEqual(@as(u64, 4), ev.headers.stream_id);
+}
+
+test "H3: more field lines than MAX_HEADERS get 431" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var headers: [MAX_HEADERS + 1]qpack.Header = undefined;
+    @memcpy(headers[0..4], get_with_cookie[0..4]);
+    for (headers[4..]) |*h| h.* = .{ .name = "x-a", .value = "b" };
+    const hf = try allocHeadersFrame(&headers);
+    defer testing.allocator.free(hf);
+    try injectBidiStreamData(&quic_conn, 0, hf, true);
+
+    try testing.expect((try h3.poll()) == null);
+    try expectRefusedWith431(&quic_conn, 0);
+}
+
+test "H3: SETTINGS advertise the field section size the decoder holds requests to" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    // The event loop replaces local_settings whole; the limit still goes out.
+    h3.local_settings = .{ .enable_connect_protocol = true };
+    try h3.initConnection();
+    const ctrl = h3.local_control_stream.?.write_buffer.items;
+    const sent = try h3_frame.parse(ctrl[1..]);
+    try testing.expectEqual(@as(?u64, qpack.SCRATCH_SIZE), sent.frame.settings.max_field_section_size);
+}
+
+test "H3: a smaller SETTINGS_MAX_FIELD_SECTION_SIZE is the one enforced" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.max_field_section_size = 1024;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var headers = get_with_cookie;
+    headers[4].value = headers[4].value[0..1024];
+    const hf = try allocHeadersFrame(&headers);
+    defer testing.allocator.free(hf);
+    try injectBidiStreamData(&quic_conn, 0, hf, true);
+    try testing.expect((try h3.poll()) == null);
+    try expectRefusedWith431(&quic_conn, 0);
+}
+
+test "H3: a refused section's dynamic references are released with a Stream Cancellation" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Encoder stream: capacity 4096, then "x" with a 4000-byte value.
+    var enc: [4200]u8 = undefined;
+    var fbs = io.fixedBufferStream(&enc);
+    try fbs.writeAll(&.{ 0x02, 0x3f, 0xe1, 0x1f, 0x41, 'x', 0x7f, 0xa1, 0x1e });
+    try fbs.writeAll(&@as([4000]u8, @splat('a')));
+    try injectUniStreamData(&quic_conn, 6, fbs.buffered(), false);
+    try testing.expect((try h3.poll()) == null);
+    try testing.expectEqual(@as(u64, 1), h3.qpack_decoder.dynamic.insert_count);
+
+    // RIC 1, Base 1, five references to it: 20 KB from seven bytes.
+    var hdr: [16]u8 = undefined;
+    const block = [_]u8{ 0x02, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80 };
+    const req = try std.mem.concat(testing.allocator, u8, &.{ writeFrameHeaderBytes(&hdr, 0x01, block.len), &block });
+    defer testing.allocator.free(req);
+    try injectBidiStreamData(&quic_conn, 0, req, true);
+
+    try testing.expect((try h3.poll()) == null);
+    try expectRefusedWith431(&quic_conn, 0);
+    // Stream type, then Stream Cancellation for stream 0 (RFC 9204 4.4.2).
+    try testing.expectEqualSlices(u8, &.{ 0x03, 0x40 }, h3.local_qpack_dec_stream.?.write_buffer.items);
+}
+
+test "H3 client: a response past the limit cancels its request, not the connection" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+    const sid = try h3.sendRequest(get_with_cookie[0..4], null);
+
+    const resp = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "set-cookie", .value = get_with_cookie[4].value },
+    };
+    const hf = try allocHeadersFrame(&resp);
+    defer testing.allocator.free(hf);
+    try injectBidiStreamData(&quic_conn, sid, hf, true);
+
+    const ev = (try h3.poll()).?;
+    try testing.expectEqual(sid, ev.request_cancelled.stream_id);
+    try testing.expectEqual(@as(u64, @backingInt(H3Error.excessive_load)), ev.request_cancelled.error_code);
+    try testing.expect(quic_conn.local_err == null);
+    const stream = quic_conn.streams.getStream(sid).?;
+    try testing.expectEqual(@as(?u64, @backingInt(H3Error.excessive_load)), stream.recv.stop_sending_err);
+    try testing.expect((try h3.poll()) == null);
 }
