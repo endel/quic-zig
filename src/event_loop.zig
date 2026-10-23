@@ -1133,6 +1133,12 @@ pub fn Server(comptime Handler: type) type {
             return self.shared_loop orelse &self.own_loop;
         }
 
+        /// The UDP port the server is bound to: the one the kernel picked for
+        /// `Config.port` 0.
+        pub fn port(self: *const Self) u16 {
+            return connection.sockaddrPort(&self.local_addr);
+        }
+
         /// Register watchers and start the event loop. Call once before tick().
         pub fn start(self: *Self) void {
             if (!std.crypto.core.aes.has_hardware_support and sys.cpuHasAes()) {
@@ -1717,9 +1723,7 @@ pub fn Server(comptime Handler: type) type {
         /// have the preferred port, so we send from the preferred socket.
         fn batchForConn(self: *Self, conn: *connection.Connection) *ecn_socket.SendBatch {
             if (self.preferred) |*p| {
-                const local = conn.localAddress();
-                const port = connection.sockaddrPort(local);
-                if (port == p.port) return &p.batch;
+                if (connection.sockaddrPort(conn.localAddress()) == p.port) return &p.batch;
             }
             return &self.batch;
         }
@@ -2425,7 +2429,7 @@ fn openUdpSocket(config: Config, port: u16) !struct { posix.socket_t, net.Addres
     try sys.bind(fd, &addr.any, addr.getOsSockLen());
     ecn_socket.enableEcnRecv(fd) catch {};
     ecn_socket.setDontFragment(fd);
-    return .{ fd, addr };
+    return .{ fd, try boundAddress(fd) }; // port 0 is the kernel's pick
 }
 
 /// Ask for `n` bytes of socket buffer, and say so when less is granted.
@@ -4765,8 +4769,18 @@ test "Server: serves on a socket it is given" {
     var b = try S.init(testing.allocator, &handler, .{ .socket = fd, .port = 1 });
     defer b.deinit();
     try testing.expectEqual(fd, b.sockfd);
-    const local: *const posix.sockaddr.in = @ptrCast(@alignCast(&b.local_addr));
-    try testing.expectEqual(@as(u16, 29416), std.mem.bigToNative(u16, local.port));
+    try testing.expectEqual(@as(u16, 29416), b.port());
+}
+
+test "Server: port 0 takes one the kernel picks, which port() names for siblings to join" {
+    var handler = TestH3Handler{};
+    const S = Server(TestH3Handler);
+    var a = try S.init(testing.allocator, &handler, .{ .port = 0, .reuse_port = true });
+    defer a.deinit();
+    try testing.expect(a.port() != 0);
+    var b = try S.init(testing.allocator, &handler, .{ .port = a.port(), .reuse_port = true });
+    defer b.deinit();
+    try testing.expectEqual(a.port(), b.port());
 }
 
 test "Server and Client sockets send with DF set, IPv4 and dual-stack" {
