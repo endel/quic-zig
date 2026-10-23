@@ -882,6 +882,11 @@ pub fn Server(comptime Handler: type) type {
         /// Entries the passes have gone through, skipped ones included: on a
         /// sparse server, what is active rather than what is connected.
         examined: u64 = 0,
+        /// Socket and timer wakeups served, and the time their passes took,
+        /// the handler's callbacks included: how busy the loop is with this
+        /// server.
+        passes: u64 = 0,
+        pass_ns: u64 = 0,
         /// What the handler's last `onPass` returned; see `runOnPass`.
         pass_deadline: ?i64 = null,
         /// The earliest `wakeAt` no pass has reached yet.
@@ -1549,6 +1554,7 @@ pub fn Server(comptime Handler: type) type {
         /// One pass over everything: read, dispatch, send, reap. Shared by
         /// the timer and wakeup callbacks.
         fn service(self: *Self) void {
+            const began = sys.nanoTimestamp();
             self.in_callback = true;
             _ = self.recvAllPackets();
             self.processConnections();
@@ -1556,12 +1562,18 @@ pub fn Server(comptime Handler: type) type {
             self.tickAndSend();
             self.endPass();
             self.endCallback();
+            self.timePass(began);
 
             if (self.stopping and self.allConnectionsClosed()) {
                 self.finishStop(null);
                 return;
             }
             self.rescheduleTimer();
+        }
+
+        fn timePass(self: *Self, began: i64) void {
+            self.passes += 1;
+            self.pass_ns += @intCast(@max(sys.nanoTimestamp() - began, 0));
         }
 
         // ---- Internal callbacks ----
@@ -1577,6 +1589,7 @@ pub fn Server(comptime Handler: type) type {
             _ = r catch return .rearm;
             const self = self_opt orelse return .disarm;
             if (self.halted) return halted_poll_action;
+            const began = sys.nanoTimestamp();
             self.in_callback = true;
 
             // Process loop: receive → dispatch events → send responses.
@@ -1596,6 +1609,7 @@ pub fn Server(comptime Handler: type) type {
                 if (iterations > 0 and !received) break;
             }
             self.endCallback();
+            self.timePass(began);
 
             if (self.stopping and self.allConnectionsClosed()) {
                 self.finishStop(c);

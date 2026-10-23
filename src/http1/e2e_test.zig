@@ -887,6 +887,7 @@ test "ws: a WebTransport client and a WebSocket client share one handler and loo
     // One counter for both: the WebSocket's id is no session's.
     try testing.expectEqual(@as(usize, 1), h.handler.wt_sessions);
     try testing.expect(h.handler.ws_id != h.handler.wt_session_ids[0]);
+    try testing.expect(h.server.passes > 0 and h.server.pass_ns > 0);
 }
 
 test "ws: handed over to a server on another loop, with the message behind the move" {
