@@ -120,6 +120,14 @@ pub const Config = struct {
     /// or a token is only good at the server that issued it.
     retry_threshold: ?usize = null,
 
+    /// `ConnectionConfig.max_ack_delay` for every connection: how long a
+    /// client's packet may wait for our ACK. Ignored when `conn_config` is
+    /// set.
+    max_ack_delay: u14 = 25,
+    /// `ConnectionConfig.ack_bytes_threshold` for every connection. Ignored
+    /// when `conn_config` is set.
+    ack_bytes_threshold: u32 = 0,
+
     // Advanced: provide pre-built TLS and connection configs directly.
     // When tls_config is set, cert_path/key_path are ignored.
     tls_config: ?tls13.TlsConfig = null,
@@ -895,7 +903,11 @@ pub fn Server(comptime Handler: type) type {
 
             // Connection config
             var conn_config: connection.ConnectionConfig = if (config.conn_config) |cc| cc else blk: {
-                var cc: connection.ConnectionConfig = .{ .token_key = retry_token_key };
+                var cc: connection.ConnectionConfig = .{
+                    .token_key = retry_token_key,
+                    .max_ack_delay = config.max_ack_delay,
+                    .ack_bytes_threshold = config.ack_bytes_threshold,
+                };
                 if (Handler.protocol == .webtransport or Handler.protocol == .quic) {
                     cc.max_datagram_frame_size = config.max_datagram_frame_size;
                 }
@@ -4088,14 +4100,26 @@ fn E2e(comptime ServerHandler: type, comptime ClientHandler: type) type {
             server_conn: ?connection.ConnectionConfig,
             client_conn: ?connection.ConnectionConfig,
         ) !void {
+            return self.initServer(port, sh, ch, .{ .conn_config = server_conn }, client_conn);
+        }
+
+        /// `initWith` taking the server's whole `Config`; its port, TLS and
+        /// loop are set here.
+        fn initServer(
+            self: *Self,
+            port: u16,
+            sh: *ServerHandler,
+            ch: *ClientHandler,
+            server_config: Config,
+            client_conn: ?connection.ConnectionConfig,
+        ) !void {
             self.loop = try xev.Loop.init(.{});
             errdefer self.loop.deinit();
-            self.server = try Server(ServerHandler).init(testing.allocator, sh, .{
-                .port = port,
-                .tls_config = makeTestTlsConfig(),
-                .conn_config = server_conn,
-                .loop = &self.loop,
-            });
+            var sc = server_config;
+            sc.port = port;
+            sc.tls_config = makeTestTlsConfig();
+            sc.loop = &self.loop;
+            self.server = try Server(ServerHandler).init(testing.allocator, sh, sc);
             errdefer self.server.deinit();
             self.client = try Client(ClientHandler).init(testing.allocator, ch, .{
                 .port = port,
@@ -6157,6 +6181,43 @@ test "e2e: a lone packet with nothing to answer is acknowledged on its receiver'
     try runUntil(&e2e.loop, sconn, nothingInFlight, 1_000);
     try testing.expectEqual(server_pto, sconn.pkt_handler.sent[2].pto_fired_at);
     try testing.expectEqual(client_pto, cconn.pkt_handler.sent[2].pto_fired_at);
+}
+
+test "e2e: a server's longer max_ack_delay reaches its client, and small packets wait for it" {
+    var h = EchoOnAsk{};
+    var client_handler = QuicIdleClient{};
+    var e2e: E2e(EchoOnAsk, QuicIdleClient) = undefined;
+    try e2e.initServer(29513, &h, &client_handler, .{ .max_ack_delay = 60, .ack_bytes_threshold = 2000 }, null);
+    defer e2e.deinit();
+
+    const Quiet = struct {
+        fn f(s: *Server(EchoOnAsk)) bool {
+            const m = &s.conn_mgr;
+            if (m.connectionCount() != 1 or m.to_visit.items.len > 0) return false;
+            return m.entries.items[0].conn.isEstablished() and quietEntry(m.entries.items[0]);
+        }
+    };
+    try runUntil(&e2e.loop, &e2e.server, Quiet.f, 10_000);
+    const sconn = e2e.server.conn_mgr.entries.items[0].conn;
+    const cconn = e2e.client.conn;
+    const ms: i64 = std.time.ns_per_ms;
+    // The client's PTO allows for it.
+    try testing.expectEqual(@as(u64, 60), cconn.peer_params.?.max_ack_delay);
+    try testing.expectEqual(60 * ms, cconn.pkt_handler.rtt_stats.max_ack_delay);
+    sconn.pkt_handler.skip_pn = std.math.maxInt(u64);
+    cconn.pkt_handler.skip_pn = std.math.maxInt(u64);
+    var cs = e2e.client.clientSession();
+
+    // Two packets would draw an ACK at once; these are too small to.
+    const first = sys.nanoTimestamp();
+    try cs.sendDatagram(0, "one");
+    try runUntilCount(&e2e.loop, &h.datagrams, 1, 3_000);
+    try cs.sendDatagram(0, "two");
+    try runUntilCount(&e2e.loop, &h.datagrams, 2, 3_000);
+    // The alarm's own timing is pinned on lossy_link_test's virtual clock.
+    var server_ack = AckWatch{ .conn = sconn };
+    try runUntil(&e2e.loop, &server_ack, AckWatch.sent, 1_000);
+    try testing.expect(server_ack.at - first > 25 * ms);
 }
 
 test "e2e: a client and server that both offer QUIC v2 finish the handshake in it" {

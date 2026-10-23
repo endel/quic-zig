@@ -317,6 +317,13 @@ test "lossy link: an upload survives periodic loss bursts in both directions" {
     try testing.expect(r.finished);
 }
 
+test "lossy link: with a byte threshold, a full-size upload still draws an ACK every two packets" {
+    // It takes 2 ms either way; waiting for the alarm instead, ~120 ms.
+    const r = try runBulkWith(.{ .max_ack_delay = 60, .ack_bytes_threshold = 2000 }, 4 << 20, .none, .none, 100 * std.time.ns_per_us, 60 * std.time.ns_per_s);
+    try testing.expect(r.finished);
+    try testing.expect(r.elapsed_ns < 10 * ms);
+}
+
 const stateless_reset = @import("stateless_reset.zig");
 
 /// A connected client and server, handshake done and CIDs exchanged.
@@ -452,6 +459,66 @@ test "ACK-only packets: a one-way flow of datagrams draws one per two packets" {
     // a gap is acknowledged at once.
     try testing.expect(sconn.total_packets_sent - sent <= inputs / 2 + 1);
     try testing.expectEqual(@as(u32, 0), p.client.pkt_handler.sent[2].ack_eliciting_in_flight);
+}
+
+test "ACK-only packets: with a byte threshold, small datagrams wait for the alarm" {
+    // The server has nothing to send back, so the ACK goes alone, once.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    const config: connection.ConnectionConfig = .{ .max_datagram_frame_size = 1200, .disable_pmtud = true };
+    var server_config = config;
+    server_config.max_ack_delay = 60;
+    server_config.ack_bytes_threshold = 2000;
+    var p: Pair = undefined;
+    try p.initWith(server_config, config);
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    for (0..3) |_| {
+        sys.test_clock.? += 70 * std.time.ns_per_ms;
+        while (p.exchange()) {}
+    }
+    // A gap would be acknowledged at once.
+    p.client.pkt_handler.skip_pn = std.math.maxInt(u64);
+    const sent = sconn.total_packets_sent;
+
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var resp: [MAX_DGRAM]u8 = undefined;
+    const first = sys.test_clock.? + std.time.ns_per_ms;
+    for (0..20) |_| {
+        sys.test_clock.? += std.time.ns_per_ms;
+        try p.client.sendDatagram("input");
+        const n = try p.client.send(&buf);
+        _ = p.mgr.recvDatagram(buf[0..n], p.c_addr, p.s_addr, 0, &resp);
+        try testing.expectEqual(@as(usize, 0), try sconn.send(&buf));
+    }
+    try testing.expectEqual(sent, sconn.total_packets_sent);
+    // Set by the first, 1 ms short of the 60 advertised.
+    const alarm = sconn.pkt_handler.recv[2].ack_alarm.?;
+    try testing.expectEqual(first + 59 * std.time.ns_per_ms, alarm);
+
+    sys.test_clock = alarm;
+    _ = try sconn.fireTimers();
+    try testing.expect(try sconn.send(&buf) > 0);
+    try testing.expectEqual(@as(u64, 0), sconn.pkt_handler.recv[2].ack_eliciting_bytes);
+    try testing.expectEqual(sent + 1, sconn.total_packets_sent);
+}
+
+test "transport parameters: each end advertises its max_ack_delay, min_ack_delay never above it" {
+    var p: Pair = undefined;
+    try p.initWith(.{ .max_ack_delay = 60 }, .{ .max_ack_delay = 0 });
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    const ms_ns: i64 = std.time.ns_per_ms;
+
+    try testing.expectEqual(@as(u64, 60), p.client.peer_params.?.max_ack_delay);
+    try testing.expectEqual(60 * ms_ns, p.client.pkt_handler.rtt_stats.max_ack_delay);
+    try testing.expectEqual(60 * ms_ns, sconn.pkt_handler.recv[2].max_ack_delay_ns);
+
+    const from_client = sconn.peer_params.?;
+    try testing.expectEqual(@as(u64, 0), from_client.max_ack_delay);
+    try testing.expectEqual(@as(i64, 0), p.client.pkt_handler.recv[2].max_ack_delay_ns);
+    // draft-ietf-quic-ack-frequency forbids a min_ack_delay over max_ack_delay.
+    try testing.expect(from_client.min_ack_delay.? <= from_client.max_ack_delay * 1000);
 }
 
 test "PATH_CHALLENGE: a peer that never acknowledges the responses can't grow the server's records" {

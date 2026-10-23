@@ -571,7 +571,31 @@ pub const ConnectionConfig = struct {
     // Key deriving our stateless reset tokens (server). Must be the key the
     // ConnectionManager signs its resets with, or they never match.
     static_reset_key: ?[16]u8 = null,
+    /// Milliseconds we may hold the ACK for a peer's 1-RTT packet while
+    /// waiting for data it can ride on, advertised as the max_ack_delay
+    /// transport parameter (RFC 9000 18.2); the delayed-ACK alarm keeps to
+    /// it. The peer adds it to its PTO (RFC 9002 6.2.1), so a longer delay
+    /// saves ACK-only packets but makes a peer whose last packet was lost
+    /// wait that much longer to resend it, and can stall a peer's upload
+    /// that long while its congestion window is small. An ACK_FREQUENCY
+    /// frame from the peer overrides it.
+    max_ack_delay: u14 = 25,
+    /// Payload bytes the ack-eliciting packets since our last ACK must add
+    /// up to, besides RFC 9000 13.2.2's two packets, before an ACK goes out
+    /// at once. Small packets then wait for data to ride on, or for
+    /// `max_ack_delay`, while full-size ones still draw an ACK every two, as
+    /// RFC 5681 counts full-sized segments: two 1200-byte datagrams carry
+    /// over 2300 bytes of payload, so 2000 keeps that. 0 counts packets
+    /// alone. An ACK_FREQUENCY frame from the peer replaces it with the
+    /// peer's threshold.
+    ack_bytes_threshold: u32 = 0,
 };
+
+/// The min_ack_delay we advertise (draft-ietf-quic-ack-frequency), in µs:
+/// 1 ms, but never above max_ack_delay, which the draft forbids.
+fn minAckDelayUs(max_ack_delay_ms: u14) u64 {
+    return @min(1000, @as(u64, max_ack_delay_ms) * 1000);
+}
 
 /// An idle timeout in nanoseconds. The wire allows 2^62 ms, past what i64
 /// nanoseconds hold, and deadlines add it to the clock: capped at 2^32 ms
@@ -958,7 +982,8 @@ pub const Connection = struct {
             .initial_max_streams_bidi = config.initial_max_streams_bidi,
             .initial_max_streams_uni = config.initial_max_streams_uni,
             .max_datagram_frame_size = config.max_datagram_frame_size,
-            .min_ack_delay = 1000, // 1ms minimum ACK delay (draft-ietf-quic-ack-frequency)
+            .max_ack_delay = config.max_ack_delay,
+            .min_ack_delay = minAckDelayUs(config.max_ack_delay),
             // Server's preferred address (RFC 9000 §9.6) — only for servers, must not coexist with disable_active_migration
             .preferred_address = if (is_server and config.preferred_address != null) config.preferred_address else null,
         };
@@ -971,6 +996,7 @@ pub const Connection = struct {
         }
 
         conn.local_params = local_params;
+        conn.applyAckConfig(config);
         conn.enable_v2 = config.enable_v2;
         conn.disable_pmtud = config.disable_pmtud;
 
@@ -1075,6 +1101,14 @@ pub const Connection = struct {
         var conn: Connection = undefined;
         try acceptInto(&conn, allocator, header, local, remote, is_server, config, tls_config, odcid, retry_scid);
         return conn;
+    }
+
+    /// Holds 1-RTT ACKs to the max_ack_delay the transport parameters
+    /// advertise, with `config`'s byte threshold.
+    fn applyAckConfig(self: *Connection, config: ConnectionConfig) void {
+        const app = &self.pkt_handler.recv[@backingInt(ack_handler.EncLevel.application)];
+        app.max_ack_delay_ns = @as(i64, config.max_ack_delay) * std.time.ns_per_ms;
+        app.ack_bytes_threshold = config.ack_bytes_threshold;
     }
 
     pub fn deinit(self: *Connection) void {
@@ -1272,7 +1306,7 @@ pub const Connection = struct {
             try self.processFrame(&frame, .application, now);
             remaining = remaining[frame_len..];
         }
-        try self.pkt_handler.onPacketReceived(.application, header.packet_number, ack_eliciting, now, info.ecn);
+        try self.pkt_handler.onPacketReceived(.application, header.packet_number, ack_eliciting, now, info.ecn, payload.len);
         if (header.packet_number + 1 > self.pkt_num_spaces[2].next_packet_number) {
             self.pkt_num_spaces[2].next_packet_number = header.packet_number + 1;
         }
@@ -1611,7 +1645,7 @@ pub const Connection = struct {
         }
 
         // Record receipt for ACK generation
-        try self.pkt_handler.onPacketReceived(enc_level, header.packet_number, ack_eliciting, now, info.ecn);
+        try self.pkt_handler.onPacketReceived(enc_level, header.packet_number, ack_eliciting, now, info.ecn, payload.len);
 
         // Update expected packet number for correct decoding of subsequent packets
         // (critical for coalesced packets where multiple packets share a datagram)
@@ -4883,7 +4917,8 @@ pub fn connectInto(
         .initial_max_streams_bidi = config.initial_max_streams_bidi,
         .initial_max_streams_uni = config.initial_max_streams_uni,
         .max_datagram_frame_size = config.max_datagram_frame_size,
-        .min_ack_delay = 1000, // 1ms minimum ACK delay (draft-ietf-quic-ack-frequency)
+        .max_ack_delay = config.max_ack_delay,
+        .min_ack_delay = minAckDelayUs(config.max_ack_delay),
         .initial_source_connection_id = .init(&scid),
     };
 
@@ -4914,6 +4949,7 @@ pub fn connectInto(
         .local_params = local_params,
     };
     conn.pkt_handler.is_client = true;
+    conn.applyAckConfig(config);
 
     // Set connection IDs
     conn.scid_len = 8;
@@ -6427,7 +6463,7 @@ test "ACK_FREQUENCY: a huge max ack delay is capped, one under our min_ack_delay
 
     try conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = 1 << 60, .reordering_threshold = 1 } }, .application, 0);
     conn.pkt_handler.recv[2].ack_alarm = null;
-    try conn.pkt_handler.recv[2].onPacketReceived(0, true, std.math.maxInt(i64) / 2, 0);
+    try conn.pkt_handler.recv[2].onPacketReceived(0, true, std.math.maxInt(i64) / 2, 0, 0);
 
     try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 1, .ack_eliciting_threshold = 2, .request_max_ack_delay = 999, .reordering_threshold = 1 } }, .application, 0));
 }

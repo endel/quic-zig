@@ -92,8 +92,8 @@
 | **13** | **Packetization and Reliability** | | |
 | 13.1 | Packet Processing | ✅ Done | Decrypt→parse→process pipeline |
 | 13.2 | Generating Acknowledgments | ✅ Done | ACK generation with delay. A 1-RTT ACK not yet due rides behind other frames and never goes alone; Initial and Handshake packets are acknowledged at once |
-| 13.2.1 | Sending ACK Frames | ✅ Done | max_ack_delay honored: the alarm is set 1 ms short of it, so a timer firing late still lands within what we advertise (§18.2). A packet out of order or past a gap is acknowledged at once |
-| 13.2.2 | Acknowledgment Frequency | ✅ Done | Ack-elicit threshold = 2 |
+| 13.2.1 | Sending ACK Frames | ✅ Done | max_ack_delay honored: the alarm is set 1 ms short of it, so a timer firing late still lands within what we advertise (§18.2). 25 ms unless `ConnectionConfig.max_ack_delay` says otherwise. A packet out of order or past a gap is acknowledged at once |
+| 13.2.2 | Acknowledgment Frequency | ✅ Done | Ack-elicit threshold = 2. `ConnectionConfig.ack_bytes_threshold` (off by default) also requires that many ack-eliciting payload bytes: small packets wait for data to ride on or for the alarm, full-size ones are still acknowledged every two, as the RFC 5681 rule this SHOULD cites counts full-sized segments. An ACK_FREQUENCY frame replaces it |
 | 13.2.3 | Managing ACK Ranges | ✅ Done | RangeSet with descending order, capped at 64 ranges per space (oldest dropped; their gaps then read as duplicates) |
 | 13.2.4 | Limiting Ranges by Tracking ACK Frames | ✅ Done | ACK-of-ACK pruning via largest_acked in ack-eliciting SentPackets. ACK-only packets aren't recorded, so pruning waits for the peer to acknowledge an ack-eliciting one; received ranges are capped at 64 |
 | 13.2.5 | Measuring and Reporting Host Delay | ✅ Done | ACK delay field |
@@ -548,7 +548,7 @@ https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/
 |---|---------|--------|-------|
 | — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize; frames packed after it in a packet are read too (picoquic puts HANDSHAKE_DONE there) |
 | — | IMMEDIATE_ACK frame (0x1f) | ✅ Done | Parse, serialize, triggers immediate ACK |
-| — | min_ack_delay transport parameter (0xff04de1b) | ✅ Done | Advertised by both client and server |
+| — | min_ack_delay transport parameter (0xff04de1b) | ✅ Done | Advertised by both client and server: 1 ms, or max_ack_delay if that is lower |
 | — | Dynamic ACK thresholds | ✅ Done | ack_eliciting_threshold, max_ack_delay, reordering_threshold |
 | — | Sequence number tracking | ✅ Done | Obsolete ACK_FREQUENCY frames ignored |
 | — | Negotiation via min_ack_delay | ✅ Done | Only send ACK_FREQUENCY if peer advertises support |

@@ -1031,8 +1031,8 @@ test "PacketPacker: ack_only skips stream data but sends receiver credit" {
     try s.send.writeData("This data should be skipped");
 
     // Register 2 received packets to trigger immediate ACK (ACK_ELICITING_THRESHOLD=2)
-    try pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0);
-    try pkt_handler.recv[2].onPacketReceived(1, true, 1000, 0);
+    try pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0, 0);
+    try pkt_handler.recv[2].onPacketReceived(1, true, 1000, 0, 0);
 
     const keys = try testClientKeys();
 
@@ -1078,7 +1078,7 @@ test "PacketPacker: ack_only does not force sub-threshold ACKs" {
 
     // One ack-eliciting packet arms a delayed ACK, but it is below the immediate
     // ACK threshold. ACK-only packing must not force an immediate packet.
-    try pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0);
+    try pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0, 0);
 
     const keys = try testClientKeys();
 
@@ -1562,7 +1562,7 @@ const AckRig = struct {
         };
         self.streams.setMaxStreams(10, 10);
         self.streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
-        try self.pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0);
+        try self.pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0, 0);
     }
 
     fn deinit(self: *AckRig) void {
@@ -1642,7 +1642,7 @@ test "PacketPacker: Initial packets are acknowledged at once" {
     var streams = stream_mod.StreamsMap.init(testing.allocator, false);
     defer streams.deinit();
     var pending_frames = frame_mod.PendingFrameQueue{};
-    try pkt_handler.recv[0].onPacketReceived(0, true, 1000, 0);
+    try pkt_handler.recv[0].onPacketReceived(0, true, 1000, 0, 0);
 
     const keys = try testClientKeys();
     var out: [1500]u8 = undefined;
