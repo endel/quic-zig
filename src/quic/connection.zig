@@ -528,6 +528,11 @@ pub const RecvInfo = struct {
     // Size of the UDP datagram (for amplification limit accounting).
     // Set to the datagram size for the first packet; 0 for subsequent coalesced packets.
     datagram_size: u64 = 0,
+    /// When the datagram was read (`sys.nanoTimestamp()`), if the caller has
+    /// it: spares a clock read per packet. Null reads the clock. It must not
+    /// predate a wait the datagram wasn't queued through, or RTT samples and
+    /// ack delays are skewed by it.
+    now: ?i64 = null,
 };
 
 /// Configuration for a QUIC connection.
@@ -1311,6 +1316,7 @@ pub const Connection = struct {
         defer held.reset(self.allocator);
         var rinfo = held.info;
         rinfo.datagram_size = 0;
+        rinfo.now = null; // read long before
         self.replaying_undecryptable = true;
         defer self.replaying_undecryptable = false;
         for (0..n) |i| {
@@ -1455,7 +1461,7 @@ pub const Connection = struct {
             return error.ProtocolViolation;
         }
 
-        const now: i64 = @intCast(sys.nanoTimestamp());
+        const now: i64 = info.now orelse sys.nanoTimestamp();
 
         // RFC 9000 §8.1: Receipt of a Handshake packet from the client confirms
         // address ownership (client derived keys → it processed our Initial).

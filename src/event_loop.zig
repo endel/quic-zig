@@ -1461,11 +1461,14 @@ pub fn Server(comptime Handler: type) type {
             var n: usize = 0;
             while (n < max_recv_per_pass) {
                 const got = self.recv_batch.recv(sockfd, max_recv_per_pass - n) catch break;
+                // One clock read a batch: each of its datagrams had arrived by then.
+                self.conn_mgr.recv_time = sys.nanoTimestamp();
                 for (self.recv_batch.results[0..got], 0..) |*recv_result, i| {
                     self.dispatchDatagram(self.recv_batch.datagram(i), recv_result, local_addr, replies);
                 }
                 n += got;
             }
+            self.conn_mgr.recv_time = null;
             // The rest on the next pass, without waiting for another edge.
             if (n == max_recv_per_pass) self.armWake();
 
@@ -6040,6 +6043,8 @@ test "e2e: a server's passes go through what is active, not every connection" {
     // Going through all 17 would be at least two passes of 17 a datagram.
     try testing.expect(e2e.server.examined - before < datagrams * (idle_count + 1));
     try testing.expectEqual(idle_count + 1, e2e.server.conn_mgr.timers.items.len);
+    // No read's time is left for a datagram routed later to take.
+    try testing.expect(e2e.server.conn_mgr.recv_time == null);
 }
 
 test "e2e: a client and server that both offer QUIC v2 finish the handshake in it" {

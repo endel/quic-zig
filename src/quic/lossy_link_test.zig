@@ -806,7 +806,8 @@ fn shortHeaderStart(bytes: []u8) !usize {
 }
 
 test "handshake: the server holds 1-RTT packets until the client's Finished" {
-    // RFC 9001 5.7: before it, the client is not authenticated.
+    // RFC 9001 5.7: before it, the client is not authenticated. Held, they
+    // are stamped when they are read in the end, not when they arrived.
     sys.test_clock = 1_000 * std.time.ns_per_s;
     defer sys.test_clock = null;
     const alloc = testing.allocator;
@@ -855,6 +856,7 @@ test "handshake: the server holds 1-RTT packets until the client's Finished" {
         if (lens[count] == 0) break;
     }
     // 1-RTT parts first: the server must not act on them yet.
+    mgr.recv_time = sys.test_clock.?;
     for (dgrams[0..count], lens[0..count]) |*d, n| {
         const at = try shortHeaderStart(d[0..n]);
         if (at < n) _ = mgr.recvDatagram(d[at..n], c_addr, s_addr, 0, &resp);
@@ -862,12 +864,22 @@ test "handshake: the server holds 1-RTT packets until the client's Finished" {
     try testing.expect(sconn.streams.getStream(s.stream_id) == null);
 
     // The Finished completes the handshake, and what was held is read then.
+    sys.test_clock.? += std.time.ns_per_s;
+    mgr.recv_time = sys.test_clock.? - 2 * std.time.ns_per_ms;
     for (dgrams[0..count], lens[0..count]) |*d, n| {
         const at = try shortHeaderStart(d[0..n]);
         if (at > 0) _ = mgr.recvDatagram(d[0..at], c_addr, s_addr, 0, &resp);
     }
     try testing.expect(sconn.isEstablished());
     try testing.expect(sconn.streams.getStream(s.stream_id) != null);
+    try testing.expectEqual(sys.test_clock.?, sconn.last_packet_received_time);
+
+    // Read at a time its reader gives, a packet is stamped with that.
+    try s.send.writeData("after");
+    const n = try client.send(&buf);
+    mgr.recv_time = sys.test_clock.? - std.time.ns_per_ms;
+    _ = mgr.recvDatagram(buf[0..n], c_addr, s_addr, 0, &resp);
+    try testing.expectEqual(mgr.recv_time.?, sconn.last_packet_received_time);
 }
 
 /// Sends `data` on a new stream from `sender`, runs the pair until quiet, and

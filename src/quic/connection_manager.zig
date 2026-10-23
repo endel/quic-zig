@@ -397,6 +397,11 @@ pub const ConnectionManager = struct {
     steer_foreign: bool = false,
     foreign_id: [15]u8 = undefined,
 
+    /// `RecvInfo.now` for the datagrams being routed: when they were read,
+    /// if their reader knows. A server's loop sets it for each batch it
+    /// reads and clears it after; null has each packet read the clock.
+    recv_time: ?i64 = null,
+
     // Deferred free queue: entries invalidated by removeConnection are held
     // here until freeDeadEntries() is called after all event processing.
     // acceptConnection reserves a slot for every entry it creates, so
@@ -1001,7 +1006,7 @@ pub const ConnectionManager = struct {
             // to avoid double-counting in amplification limit calculations.
             const dg_size: u64 = if (current_entry == null) bytes.len else 0;
             current_entry = e;
-            const recv_info: connection.RecvInfo = .{ .to = local, .from = from, .ecn = ecn_val, .datagram_size = dg_size };
+            const recv_info: connection.RecvInfo = .{ .to = local, .from = from, .ecn = ecn_val, .datagram_size = dg_size, .now = self.recv_time };
             e.mark(false);
             e.conn.recv(&header, &fbs, recv_info) catch |err| {
                 if (err == error.UndecryptablePacket and pkt_start == 0) _ = e.conn.handleStatelessReset(bytes);
