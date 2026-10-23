@@ -740,6 +740,13 @@ pub const Connection = struct {
     datagram_recv_callback: ?*const fn (data: []const u8, ctx: ?*anyopaque) void = null,
     datagram_recv_ctx: ?*anyopaque = null,
 
+    /// A frame arrived that the layers above may act on: anything but the
+    /// transport's own ACK, PADDING, PING, CID and path bookkeeping, or a
+    /// DATAGRAM already handed to `datagram_recv_callback`. The server loop
+    /// polls a connection's protocol layers only on this or the
+    /// application's say-so (`ConnEntry.needs_poll`), and clears it then.
+    app_frames: bool = false,
+
     // draft-ietf-quic-ack-frequency
     peer_supports_ack_freq: bool = false,
     ack_freq_send_seq: u64 = 0,
@@ -1733,6 +1740,14 @@ pub const Connection = struct {
 
     /// Process a single frame.
     pub fn processFrame(self: *Connection, frame: *const Frame, epoch: packet.Epoch, now: i64) !void {
+        switch (frame.*) { // see app_frames
+            .padding, .ping, .ack, .ack_ecn, .new_connection_id, .retire_connection_id => {},
+            .path_challenge, .path_response, .ack_frequency, .immediate_ack => {},
+            .datagram, .datagram_with_length => if (self.datagram_recv_callback == null) {
+                self.app_frames = true; // queued for a poll to read
+            },
+            else => self.app_frames = true,
+        }
         switch (frame.*) {
             .padding => {},
             .ping => {},

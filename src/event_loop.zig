@@ -383,6 +383,7 @@ pub const Session = struct {
 
     pub fn sendStreamData(self: *Session, stream_id: u64, data: []const u8) !void {
         defer self.entry.wake();
+        errdefer self.entry.needs_poll = true; // a poll writes the WT_DATA_BLOCKED a refusal owes
         if (self.entry.wt_conn) |wtc| {
             try wtc.sendStreamData(stream_id, data);
         }
@@ -399,7 +400,7 @@ pub const Session = struct {
     }
 
     pub fn acceptSession(self: *Session, session_id: u64) !void {
-        defer self.entry.wake();
+        defer self.entry.repoll(); // streams held for it, and its first credit, wait on a poll
         if (self.entry.wt_conn) |wtc| {
             try wtc.acceptSession(session_id);
         }
@@ -413,6 +414,7 @@ pub const Session = struct {
     }
 
     pub fn openBidiStream(self: *Session, session_id: u64, send_order: ?i64) !u64 {
+        errdefer self.entry.needs_poll = true; // a poll writes the WT_STREAMS_BLOCKED a refusal owes
         if (self.entry.wt_conn) |wtc| {
             return try wtc.openBidiStream(session_id, send_order);
         }
@@ -420,6 +422,7 @@ pub const Session = struct {
     }
 
     pub fn openUniStream(self: *Session, session_id: u64, send_order: ?i64) !u64 {
+        errdefer self.entry.needs_poll = true; // a poll writes the WT_STREAMS_BLOCKED a refusal owes
         if (self.entry.wt_conn) |wtc| {
             return try wtc.openUniStream(session_id, send_order);
         }
@@ -434,14 +437,14 @@ pub const Session = struct {
     }
 
     pub fn closeSession(self: *Session, session_id: u64) void {
-        defer self.entry.wake();
+        defer self.entry.repoll(); // with the peer's FIN already in, the close is reported now
         if (self.entry.wt_conn) |wtc| {
             wtc.closeSession(session_id);
         }
     }
 
     pub fn closeSessionWithError(self: *Session, session_id: u64, error_code: u32, reason: []const u8) !void {
-        defer self.entry.wake();
+        defer self.entry.repoll(); // with the peer's FIN already in, the close is reported now
         if (self.entry.wt_conn) |wtc| {
             try wtc.closeSessionWithError(session_id, error_code, reason);
         }
@@ -472,7 +475,7 @@ pub const Session = struct {
     }
 
     pub fn acceptSessionWithHeaders(self: *Session, session_id: u64, extra_headers: []const qpack.Header) !void {
-        defer self.entry.wake();
+        defer self.entry.repoll(); // see acceptSession
         if (self.entry.wt_conn) |wtc| {
             try wtc.acceptSessionWithHeaders(session_id, extra_headers);
         }
@@ -600,6 +603,7 @@ pub const Session = struct {
     pub fn readStream(self: *Session, stream_id: u64) ?[]const u8 {
         const stream = self.entry.conn.streams.getStream(stream_id) orelse return null;
         self.entry.needs_visit = true; // the read frees flow-control credit to announce
+        self.entry.needs_poll = true; // and may take the FIN, which a poll reports
         return stream.recv.read();
     }
 
@@ -772,6 +776,9 @@ pub fn Server(comptime Handler: type) type {
         /// close streams from onStreamData, which would invalidate an
         /// iterator over the stream maps.
         quic_poll_ids: std.ArrayList(u64),
+        /// Connections polled for events so far, one per connection per pass
+        /// that looked. Writes alone add nothing; see `wantsPoll`.
+        polls: u64 = 0,
         /// A stopped server on a shared loop: every completion is cancelled or
         /// on its way off the loop, and nothing may re-arm.
         halted: bool,
@@ -1532,24 +1539,46 @@ pub fn Server(comptime Handler: type) type {
             return !sparse_passes or self.draining or self.stopping;
         }
 
+        /// Whether a visit has to poll `entry`'s protocol layers. A write alone
+        /// does not: it only needs sending.
+        fn wantsPoll(entry: *const ConnEntry) bool {
+            if (entry.needs_poll or entry.conn.app_frames) return true;
+            // Through the handshake, its last pass included, and once closing.
+            if (!entry.h3_initialized or !entry.conn.isEstablished()) return true;
+            // These can come true with no frame: our own sends drain a backlog,
+            // a lower layer reclaims a held stream's session.
+            if (entry.wt_conn) |wtc| {
+                if (wtc.writable_waits.items.len > 0 or wtc.held_streams.count() > 0) return true;
+            }
+            if (entry.h3_conn) |h3c| if (h3c.writable_waits.items.len > 0) return true;
+            return false;
+        }
+
         fn processConnections(self: *Self) void {
             const all = self.visitsAll();
             for (self.conn_mgr.entries.items) |entry| {
                 // Due timers alone are tickAndSend's; events need a packet or the app.
-                if (!all and !entry.needs_visit) continue;
+                if (!all and !entry.needs_visit and !entry.needs_poll) continue;
                 const conn = entry.conn;
+                const poll = all or wantsPoll(entry);
 
                 // Initialize protocol layer once handshake completes
                 if (conn.isEstablished() and !entry.h3_initialized) {
                     self.initProtocol(entry);
                 }
 
-                // Poll events and dispatch to handler
-                switch (Handler.protocol) {
-                    .webtransport => if (entry.raw_quic) self.pollQuicEvents(entry) else self.pollWtEvents(entry),
-                    .h3 => self.pollH3Events(entry),
-                    .h0 => self.pollH0Events(entry),
-                    .quic => self.pollQuicEvents(entry),
+                if (poll) {
+                    // Cleared first: a handler asking for another poll gets one.
+                    entry.needs_poll = false;
+                    conn.app_frames = false;
+                    entry.needs_visit = true; // what polling queues goes out this pass
+                    self.polls += 1;
+                    switch (Handler.protocol) {
+                        .webtransport => if (entry.raw_quic) self.pollQuicEvents(entry) else self.pollWtEvents(entry),
+                        .h3 => self.pollH3Events(entry),
+                        .h0 => self.pollH0Events(entry),
+                        .quic => self.pollQuicEvents(entry),
+                    }
                 }
 
                 // Remove streams that were queued for disposal during this cycle.
@@ -5223,6 +5252,421 @@ test "e2e: a WebTransport client pauses a server stream the same way" {
     try runUntil(&e2e.loop, &client_handler.sink, WtSink.done, 20_000);
     try testing.expectEqual(PAUSE_BODY, client_handler.sink.bytes);
     try testing.expect(client_handler.sink.ok);
+}
+
+/// Runs `loop` for `ms`, so that what is in flight lands.
+fn runFor(loop: *xev.Loop, ms: i64) !void {
+    const until = sys.nanoTimestamp() + ms * std.time.ns_per_ms;
+    while (sys.nanoTimestamp() < until) {
+        try loop.run(.no_wait);
+        sys.sleepNs(50 * std.time.ns_per_us);
+    }
+}
+
+/// Runs `loop` until the counter at `p` reaches `want`.
+fn runUntilCount(loop: *xev.Loop, p: anytype, want: @TypeOf(p.*), timeout_ms: i64) !void {
+    const Reached = struct {
+        p: @TypeOf(p),
+        want: @TypeOf(p.*),
+        fn done(self: *const @This()) bool {
+            return self.p.* >= self.want;
+        }
+    };
+    try runUntil(loop, &Reached{ .p = p, .want = want }, Reached.done, timeout_ms);
+}
+
+/// Keeps its one session and the stream its client opens, for a test to
+/// write to from outside any callback, as a game server's tick does.
+const WtTicker = struct {
+    pub const protocol: Protocol = .webtransport;
+    session: ?Session = null,
+    session_id: u64 = 0,
+    stream_id: ?u64 = null,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.session = session.*;
+        self.session_id = session_id;
+    }
+    pub fn onBidiStream(self: *@This(), _: *Session, _: u64, stream_id: u64) void {
+        self.stream_id = stream_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onDatagram(_: *@This(), _: *Session, _: u64, _: []const u8) void {}
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.session = null;
+    }
+
+    fn hasStream(self: *@This()) bool {
+        return self.stream_id != null;
+    }
+};
+
+/// Opens one stream for the server to answer on, and counts what comes back.
+const WtTickClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    datagrams: u32 = 0,
+    stream_bytes: usize = 0,
+
+    pub fn onSessionReady(_: *@This(), session: *ClientSession, session_id: u64) void {
+        const id = session.openBidiStream(session_id, null) catch unreachable;
+        session.sendStreamData(id, "hi") catch unreachable;
+    }
+    pub fn onDatagram(self: *@This(), _: *ClientSession, _: u64, _: []const u8) void {
+        self.datagrams += 1;
+    }
+    pub fn onStreamData(self: *@This(), _: *ClientSession, _: u64, data: []const u8, _: bool) void {
+        self.stream_bytes += data.len;
+    }
+};
+
+test "e2e: writes alone do not poll a WebTransport connection for events" {
+    var client_handler = WtTickClient{};
+    var server_handler = WtTicker{};
+    var e2e: E2e(WtTicker, WtTickClient) = undefined;
+    try e2e.init(29500, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, WtTicker.hasStream, 10_000);
+    try runFor(&e2e.loop, 200); // the handshake's tail settles
+    const polls = e2e.server.polls;
+
+    // Each tick's writes go out on a pass of their own; only ACKs come back.
+    const ticks = 20;
+    const state = "state";
+    var s = server_handler.session.?;
+    for (0..ticks) |_| {
+        try s.sendDatagram(server_handler.session_id, "tick");
+        try s.sendStreamData(server_handler.stream_id.?, state);
+        try e2e.loop.run(.no_wait);
+    }
+    try runUntilCount(&e2e.loop, &client_handler.stream_bytes, ticks * state.len, 5000);
+    try runFor(&e2e.loop, 100); // and their ACKs land
+    try testing.expect(client_handler.datagrams > 0);
+    try testing.expectEqual(polls, e2e.server.polls);
+}
+
+/// Counts the events that reach it, and answers each datagram with one: what
+/// came with a datagram arrives on a pass that also wrote to its connection.
+const WtEventCounter = struct {
+    pub const protocol: Protocol = .webtransport;
+    datagrams: u32 = 0,
+    data: usize = 0,
+    fins: u32 = 0,
+    resets: u32 = 0,
+    reset_code: u32 = 0,
+    stops: u32 = 0,
+    stop_code: u32 = 0,
+    closed: u32 = 0,
+    close_code: u32 = 0,
+
+    pub fn onConnectRequest(_: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+    }
+    pub fn onStreamData(self: *@This(), _: *Session, _: u64, data: []const u8, fin: bool) void {
+        self.data += data.len;
+        if (fin) self.fins += 1;
+    }
+    pub fn onStreamReset(self: *@This(), _: *Session, _: u64, _: u64, code: u32) void {
+        self.resets += 1;
+        self.reset_code = code;
+    }
+    pub fn onStopSending(self: *@This(), _: *Session, _: u64, _: u64, code: u32) void {
+        self.stops += 1;
+        self.stop_code = code;
+    }
+    pub fn onSessionClosed(self: *@This(), _: *Session, _: u64, code: u32, _: []const u8) void {
+        self.closed += 1;
+        self.close_code = code;
+    }
+    pub fn onDatagram(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        self.datagrams += 1;
+        session.sendDatagram(session_id, "echo") catch {};
+    }
+};
+
+/// Does nothing of its own: the test drives it through `clientSession()`.
+const WtIdleClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    session_id: ?u64 = null,
+
+    pub fn onSessionReady(self: *@This(), _: *ClientSession, session_id: u64) void {
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    pub fn onDatagram(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+
+    fn ready(self: *@This()) bool {
+        return self.session_id != null;
+    }
+};
+
+test "e2e: WebTransport events arrive alone or on a pass that also wrote to the connection" {
+    for ([_]bool{ false, true }, [_]u16{ 29501, 29502 }) |with_write, port| {
+        var client_handler = WtIdleClient{};
+        var h = WtEventCounter{};
+        var e2e: E2e(WtEventCounter, WtIdleClient) = undefined;
+        try e2e.init(port, &h, &client_handler);
+        defer e2e.deinit();
+
+        try runUntil(&e2e.loop, &client_handler, WtIdleClient.ready, 10_000);
+        try runFor(&e2e.loop, 100);
+        const sid = client_handler.session_id.?;
+        var cs = e2e.client.clientSession();
+        // Each frame goes alone or shares a packet with a datagram.
+        const Next = struct {
+            fn write(c: *ClientSession, session_id: u64, on: bool) !void {
+                if (on) try c.sendDatagram(session_id, "w");
+            }
+        };
+
+        try Next.write(&cs, sid, with_write);
+        const bidi = try cs.openBidiStream(sid, null);
+        try cs.sendStreamData(bidi, "abc");
+        try runUntilCount(&e2e.loop, &h.data, 3, 3000);
+
+        try Next.write(&cs, sid, with_write);
+        cs.closeStream(bidi); // a bare FIN
+        try runUntilCount(&e2e.loop, &h.fins, 1, 3000);
+
+        const uni = try cs.openUniStream(sid, null);
+        try cs.sendStreamData(uni, "u");
+        try runUntilCount(&e2e.loop, &h.data, 4, 3000);
+        try Next.write(&cs, sid, with_write);
+        cs.resetStream(uni, 7); // RESET_STREAM alone: a uni stream has no receive side to stop
+        try runUntilCount(&e2e.loop, &h.resets, 1, 3000);
+        try testing.expectEqual(@as(u32, 7), h.reset_code);
+
+        try Next.write(&cs, sid, with_write);
+        cs.stopSending(bidi, 9);
+        try runUntilCount(&e2e.loop, &h.stops, 1, 3000);
+        try testing.expectEqual(@as(u32, 9), h.stop_code);
+
+        try Next.write(&cs, sid, with_write);
+        try cs.closeSessionWithError(sid, 42, "bye");
+        try runUntilCount(&e2e.loop, &h.closed, 1, 3000);
+        try testing.expectEqual(@as(u32, 42), h.close_code);
+
+        try testing.expectEqual(@as(u32, if (with_write) 5 else 0), h.datagrams);
+    }
+}
+
+test "e2e: a WT_STREAMS_BLOCKED is answered with nothing more from the peer" {
+    var client_handler = WtIdleClient{};
+    var h = WtEventCounter{};
+    var e2e: E2e(WtEventCounter, WtIdleClient) = undefined;
+    try e2e.init(29506, &h, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, WtIdleClient.ready, 10_000);
+    const sid = client_handler.session_id.?;
+    const limit = &e2e.client.wt_conn.?.getSession(sid).?.fc.bidi;
+    const Limit = struct {
+        fn granted(l: *wt_fc.StreamLimit) bool {
+            return l.max_send != null;
+        }
+        fn regranted(l: *wt_fc.StreamLimit) bool {
+            return (l.max_send orelse 0) > 0;
+        }
+    };
+    try runUntil(&e2e.loop, limit, Limit.granted, 3000);
+    try runFor(&e2e.loop, 100);
+
+    // As if the grant had been lost: the client is refused, and says so.
+    limit.max_send = 0;
+    var cs = e2e.client.clientSession();
+    try testing.expectError(error.WtStreamLimitReached, cs.openBidiStream(sid, null));
+    cs.sendKeepAlive(); // a pass for the client to send its WT_STREAMS_BLOCKED on
+    try runUntil(&e2e.loop, limit, Limit.regranted, 3000);
+}
+
+const cross_body: [1000]u8 = @splat('x');
+
+/// Sends `cross_body` and a FIN on one stream once its session is up.
+const WtOneShot = struct {
+    pub const protocol: Protocol = .webtransport;
+
+    pub fn onSessionReady(_: *@This(), session: *ClientSession, session_id: u64) void {
+        const id = session.openBidiStream(session_id, null) catch unreachable;
+        session.sendStreamData(id, &cross_body) catch unreachable;
+        session.closeStream(id);
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+};
+
+/// Pauses the first client's stream, and resumes it from the callback that
+/// delivers the next client's data, after the first one's turn in the pass.
+const WtCrossResume = struct {
+    pub const protocol: Protocol = .webtransport;
+    held: ?Session = null,
+    held_stream: u64 = 0,
+    held_bytes: usize = 0,
+    held_fins: u32 = 0,
+
+    pub fn onConnectRequest(_: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+    }
+    pub fn onBidiStream(self: *@This(), session: *Session, _: u64, stream_id: u64) void {
+        if (self.held != null) return;
+        session.pauseStream(stream_id) catch unreachable;
+        self.held = session.*;
+        self.held_stream = stream_id;
+    }
+    pub fn onStreamData(self: *@This(), session: *Session, _: u64, data: []const u8, fin: bool) void {
+        const h = &(self.held orelse return);
+        if (h.entry == session.entry) {
+            self.held_bytes += data.len;
+            if (fin) self.held_fins += 1;
+            return;
+        }
+        h.resumeStream(self.held_stream);
+    }
+    pub fn onConnectionClosed(self: *@This(), session: *Session) void {
+        const h = self.held orelse return;
+        if (h.entry == session.entry) self.held = null;
+    }
+
+    fn holding(self: *@This()) bool {
+        return self.held != null;
+    }
+};
+
+test "e2e: a stream resumed from a later connection's callback is delivered without a packet" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    const S = Server(WtCrossResume);
+    const C = Client(WtOneShot);
+    var sh = WtCrossResume{};
+    var server = try S.init(testing.allocator, &sh, .{ .port = 29503, .tls_config = makeTestTlsConfig(), .loop = &loop });
+    server.start();
+
+    var ha = WtOneShot{};
+    var a = try C.init(testing.allocator, &ha, .{ .port = 29503, .skip_cert_verify = true, .loop = &loop });
+    a.start();
+    try runUntil(&loop, &sh, WtCrossResume.holding, 5000);
+    try runFor(&loop, 100); // the whole body is in, held back
+    try testing.expectEqual(@as(usize, 0), sh.held_bytes);
+
+    var hb = WtOneShot{};
+    var b = try C.init(testing.allocator, &hb, .{ .port = 29503, .skip_cert_verify = true, .loop = &loop });
+    b.start();
+    // A, done sending, has nothing more to say: no packet of its own brings the poll.
+    try runUntilCount(&loop, &sh.held_fins, 1, 3000);
+    try testing.expectEqual(cross_body.len, sh.held_bytes);
+
+    a.stop();
+    b.stop();
+    server.stop();
+    const All = struct {
+        s: *S,
+        a: *C,
+        b: *C,
+        fn done(x: *const @This()) bool {
+            return x.s.isStopped() and x.a.isStopped() and x.b.isStopped();
+        }
+    };
+    try runUntil(&loop, &All{ .s = &server, .a = &a, .b = &b }, All.done, 5000);
+    a.deinit();
+    b.deinit();
+    server.deinit();
+}
+
+/// Opens its stream to the client straight from onConnectRequest, as netcode
+/// does, and has no onPollComplete: only onWritable brings it back to write.
+const WtSparseDownloadServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    up: WtPump = .{},
+    writable: u32 = 0,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        if (!self.up.open(session, session_id)) unreachable;
+    }
+    pub fn onWritable(self: *@This(), session: *Session, _: u64, _: ?u64) void {
+        self.writable += 1;
+        self.up.pump(session);
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+};
+
+const WtCollector = struct {
+    pub const protocol: Protocol = .webtransport;
+    sink: WtSink = .{},
+
+    pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64) void {}
+    pub fn onBidiStream(self: *@This(), _: *ClientSession, _: u64, stream_id: u64) void {
+        self.sink.stream_id = stream_id;
+    }
+    pub fn onStreamData(self: *@This(), _: *ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
+        self.sink.data(stream_id, data, fin);
+    }
+};
+
+test "e2e: a WebTransport server held to its client's window is woken to write the rest" {
+    var client_handler = WtCollector{};
+    var server_handler = WtSparseDownloadServer{};
+    var e2e: E2e(WtSparseDownloadServer, WtCollector) = undefined;
+    try e2e.initWith(29504, &server_handler, &client_handler, null, .{
+        .initial_max_stream_data_bidi_remote = PAUSE_WINDOW,
+        .max_datagram_frame_size = 65536, // WebTransport needs DATAGRAM
+    });
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler.sink, WtSink.done, 20_000);
+    try testing.expectEqual(PAUSE_BODY, client_handler.sink.bytes);
+    try testing.expect(client_handler.sink.ok);
+    try testing.expect(server_handler.writable > 0);
+}
+
+const QuicCounter = struct {
+    pub const protocol: Protocol = .quic;
+    datagrams: u32 = 0,
+    data: usize = 0,
+    fins: u32 = 0,
+
+    pub fn onDatagram(self: *@This(), _: *Session, _: u64, _: []const u8) void {
+        self.datagrams += 1;
+    }
+    pub fn onStreamData(self: *@This(), _: *Session, _: u64, data: []const u8, fin: bool) void {
+        self.data += data.len;
+        if (fin) self.fins += 1;
+    }
+};
+
+const QuicIdleClient = struct {
+    pub const protocol: Protocol = .quic;
+    connected: bool = false,
+
+    pub fn onConnected(self: *@This(), _: *ClientSession) void {
+        self.connected = true;
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+
+    fn ready(self: *@This()) bool {
+        return self.connected;
+    }
+};
+
+test "e2e: raw-QUIC datagrams and stream data reach a handler with nothing else in the packet" {
+    var client_handler = QuicIdleClient{};
+    var h = QuicCounter{};
+    var e2e: E2e(QuicCounter, QuicIdleClient) = undefined;
+    try e2e.init(29505, &h, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, QuicIdleClient.ready, 10_000);
+    try runFor(&e2e.loop, 100);
+    var cs = e2e.client.clientSession();
+
+    // No zero-copy callback here: the datagram waits in the queue for a poll.
+    try cs.sendDatagram(0, "d");
+    try runUntilCount(&e2e.loop, &h.datagrams, 1, 3000);
+
+    const id = try cs.openStream();
+    try cs.writeStream(id, "abc");
+    try runUntilCount(&e2e.loop, &h.data, 3, 3000);
+    cs.closeQuicStream(id);
+    try runUntilCount(&e2e.loop, &h.fins, 1, 3000);
 }
 
 test "e2e: a client and server that both offer QUIC v2 finish the handshake in it" {

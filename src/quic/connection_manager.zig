@@ -148,11 +148,17 @@ pub const ConnEntry = struct {
     /// the application queued, read or resumed data. A pass may skip an
     /// entry without it whose `deadline` has not come.
     needs_visit: bool = true,
+    /// The next visit must also poll the protocol layers for events: the
+    /// application did something that can surface one with nothing new on
+    /// the wire. Frames say so through `Connection.app_frames` instead. Kept
+    /// until a poll, so it outlasts a pass that had already gone by.
+    needs_poll: bool = true,
     /// `conn.nextTimeoutNsAt` as of the owner's last visit; it only changes
     /// when something sets `needs_visit`.
     deadline: ?i64 = null,
 
-    /// Tell the owner there is data to send; see `wake_fn`.
+    /// Tell the owner there is data to send; see `wake_fn`. A write raises
+    /// no event, so this asks for a send, not a poll.
     pub fn wake(self: *ConnEntry) void {
         self.needs_visit = true;
         if (self.wake_fn) |f| f(self.wake_ctx orelse return);
@@ -161,6 +167,7 @@ pub const ConnEntry = struct {
     /// Ask the owner for another poll pass; see `repoll_fn`.
     pub fn repoll(self: *ConnEntry) void {
         self.needs_visit = true;
+        self.needs_poll = true;
         if (self.repoll_fn) |f| f(self.wake_ctx orelse return);
     }
 
