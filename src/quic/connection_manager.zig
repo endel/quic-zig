@@ -337,6 +337,9 @@ pub const ConnectionManager = struct {
     /// When true, every new connection is answered with CONNECTION_REFUSED,
     /// as it is at `max_connections`. Set while a server drains.
     refuse_new: bool = false,
+    /// Connections refused at `max_connections` since the last warning.
+    refused_full: u64 = 0,
+    refused_full_warned_at: ?i64 = null,
 
     /// Budgets for stateless replies; see `ReplyLimits`.
     reply_limits: ReplyLimits = .{},
@@ -778,6 +781,7 @@ pub const ConnectionManager = struct {
                 }
 
                 if (self.refuse_new or self.entries.items.len >= self.max_connections) {
+                    if (!self.refuse_new) self.noteFull();
                     return self.refuse(header, out_buf);
                 }
 
@@ -861,6 +865,17 @@ pub const ConnectionManager = struct {
         if (!quic_lb.extractServerId(lb, dcid, &self.foreign_id)) return null;
         if (std.mem.eql(u8, self.foreign_id[0..n], lb.server_id[0..n])) return null;
         return self.foreign_id[0..n];
+    }
+
+    /// A full server turns clients away without them knowing why, so say
+    /// so, at most every 10 s.
+    fn noteFull(self: *ConnectionManager) void {
+        self.refused_full += 1;
+        const now = sys.nanoTimestamp();
+        if (self.refused_full_warned_at) |at| if (now - at < 10 * std.time.ns_per_s) return;
+        std.log.warn("max_connections ({d}) reached: refused {d} new connection(s)", .{ self.max_connections, self.refused_full });
+        self.refused_full = 0;
+        self.refused_full_warned_at = now;
     }
 
     /// Answer an Initial we will not serve with CONNECTION_REFUSED (RFC 9000
