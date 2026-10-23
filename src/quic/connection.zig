@@ -1374,14 +1374,16 @@ pub const Connection = struct {
         // Initial keys come from public inputs, so the header proves nothing:
         // a client moves only for an Initial that opens under the new
         // version's keys, and only once.
-        var prior: ?VersionState = null;
+        var prior: VersionState = undefined; // not an optional: null is 800 bytes zeroed per packet
+        var switched = false;
         var opened = false;
-        defer if (prior) |p| {
-            if (opened) self.version_negotiated = true else self.restoreVersion(p);
+        defer if (switched) {
+            if (opened) self.version_negotiated = true else self.restoreVersion(prior);
         };
         if (!self.is_server and self.enable_v2 and header.version != 0 and header.version != self.version) {
             if (header.packet_type != .initial or self.version_negotiated or !protocol.isSupportedVersion(header.version)) return;
             prior = self.versionState();
+            switched = true;
             try self.switchVersion(header.version);
         }
 
