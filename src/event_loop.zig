@@ -685,6 +685,7 @@ pub fn Server(comptime Handler: type) type {
             "onH0Finished",       "onWritable",         "onRequestEnd",
             "onRequestCancelled", "onConnectionClosed", "onQuicConnected",
             "onWsUpgrade",        "onWsMessage",        "onWsClose",
+            "onPass",
         };
 
         for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
@@ -704,7 +705,7 @@ pub fn Server(comptime Handler: type) type {
                         "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
                         "onStopSending, onWritable, onPollComplete, onConnectionClosed, " ++
                         "onQuicConnected, onH0Request, onH0Data, onH0Finished, " ++
-                        "onWsUpgrade, onWsMessage, onWsClose");
+                        "onWsUpgrade, onWsMessage, onWsClose, onPass");
                 }
             }
         }
@@ -736,6 +737,9 @@ pub fn Server(comptime Handler: type) type {
         }
         if (@hasDecl(Handler, "onWsClose") and @typeInfo(@TypeOf(Handler.onWsClose)).@"fn".param_types.len != 4) {
             @compileError("onWsClose must have 4 params (self, ws: *WsConn, code: u16, reason)");
+        }
+        if (@hasDecl(Handler, "onPass") and @TypeOf(Handler.onPass) != fn (*Handler, i64) ?i64) {
+            @compileError("onPass must be fn (self: *Handler, now_ns: i64) ?i64");
         }
     }
 
@@ -779,6 +783,10 @@ pub fn Server(comptime Handler: type) type {
         /// Connections polled for events so far, one per connection per pass
         /// that looked. Writes alone add nothing; see `wantsPoll`.
         polls: u64 = 0,
+        /// What the handler's last `onPass` returned; see `runOnPass`.
+        pass_deadline: ?i64 = null,
+        /// The earliest `wakeAt` no pass has reached yet.
+        wake_at: ?i64 = null,
         /// A stopped server on a shared loop: every completion is cancelled or
         /// on its way off the loop, and nothing may re-arm.
         halted: bool,
@@ -1106,6 +1114,7 @@ pub fn Server(comptime Handler: type) type {
             defer self.endCallback();
             _ = self.recvAllPackets();
             self.processConnections();
+            self.runOnPass();
             self.tickAndSend();
             self.conn_mgr.freeDeadEntries();
         }
@@ -1139,6 +1148,20 @@ pub fn Server(comptime Handler: type) type {
             self.batch.flush();
             if (self.preferred) |*p| p.batch.flush();
             self.rescheduleTimer();
+        }
+
+        /// Have a pass, and so the handler's `onPass`, run by `deadline_ns`
+        /// (`sys.nanoTimestamp()`); one already past runs it within a
+        /// millisecond. For work whose deadline came up outside the server's
+        /// own callbacks, where no pass follows to ask `onPass` for it: a
+        /// WebSocket callback, or a completion of the caller's own on the
+        /// loop. Loop thread only.
+        pub fn wakeAt(self: *Self, deadline_ns: i64) void {
+            if (comptime !@hasDecl(Handler, "onPass")) @compileError("wakeAt needs the handler's onPass");
+            if (self.stopping) return;
+            if (self.wake_at == null or deadline_ns < self.wake_at.?) self.wake_at = deadline_ns;
+            // A callback's pass reschedules once it is over.
+            if (!self.in_callback) self.rescheduleTimer();
         }
 
         /// Turn `Config.require_retry` on or off, for an embedder with its own
@@ -1343,6 +1366,7 @@ pub fn Server(comptime Handler: type) type {
             self.in_callback = true;
             _ = self.recvAllPackets();
             self.processConnections();
+            self.runOnPass();
             self.tickAndSend();
             self.conn_mgr.freeDeadEntries();
             self.endCallback();
@@ -1377,6 +1401,7 @@ pub fn Server(comptime Handler: type) type {
             while (iterations < 4) : (iterations += 1) {
                 const received = self.recvAllPackets();
                 self.processConnections();
+                self.runOnPass();
                 self.tickAndSend();
                 // Free entries that were invalidated during tickAndSend.
                 // Deferred so that stale Session pointers from processConnections
@@ -1974,6 +1999,37 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
+        /// `pub fn onPass(self: *Handler, now_ns: i64) ?i64`, optional: the
+        /// handler's own timed work, such as a game's fixed-step ticks or a
+        /// publisher's frames. The loop calls it once per pass, after
+        /// dispatching what arrived and before sending, so what it writes
+        /// leaves in that pass's send batch rather than costing a pass of its
+        /// own. `now_ns` is `sys.nanoTimestamp()`.
+        ///
+        /// It returns when it next needs a pass, on that clock, or null for no
+        /// deadline. The loop wakes for it then, never earlier, even with
+        /// nothing else to do; packets and QUIC timers bring other passes, and
+        /// each calls it too. A server with nothing due sleeps. Not called
+        /// once `stop()` has begun. A deadline that comes up between passes,
+        /// outside the server's callbacks, goes to `wakeAt`.
+        fn runOnPass(self: *Self) void {
+            if (comptime !@hasDecl(Handler, "onPass")) return;
+            if (self.stopping) return;
+            const now: i64 = sys.nanoTimestamp();
+            if (self.wake_at) |t| {
+                if (t <= now) self.wake_at = null;
+            }
+            self.pass_deadline = self.handler.onPass(now);
+        }
+
+        /// The earliest pass the handler asked for, through `onPass` or `wakeAt`.
+        fn handlerDeadline(self: *const Self) ?i64 {
+            if (comptime !@hasDecl(Handler, "onPass")) return null;
+            if (self.stopping) return null;
+            const asked = self.pass_deadline orelse return self.wake_at;
+            return @min(asked, self.wake_at orelse asked);
+        }
+
         fn tickAndSend(self: *Self) void {
             // What was written before this point goes out below.
             self.written_in_pass = false;
@@ -2122,6 +2178,15 @@ pub fn Server(comptime Handler: type) type {
                 }
                 if (entry.drain_final_goaway_at) |deadline| {
                     if (earliest == null or deadline < earliest.?) earliest = deadline;
+                }
+            }
+            if (self.handlerDeadline()) |deadline| {
+                if (earliest == null or deadline <= earliest.?) {
+                    earliest = deadline;
+                    // Epoll's loop counts a timer from the time it read before
+                    // its last wait, so from a socket callback this one would
+                    // fire early. Read after `now`, it fires at the deadline.
+                    if (comptime xev.backend == .epoll) self.eventLoop().update_now();
                 }
             }
 
@@ -5344,6 +5409,172 @@ test "e2e: writes alone do not poll a WebTransport connection for events" {
     try runFor(&e2e.loop, 100); // and their ACKs land
     try testing.expect(client_handler.datagrams > 0);
     try testing.expectEqual(polls, e2e.server.polls);
+}
+
+/// Ticks every 10 ms from `onPass` once `due_ns` is set, writing a datagram
+/// to its one session each time, and keeps how late each tick ran.
+const WtPassTicker = struct {
+    pub const protocol: Protocol = .webtransport;
+    const period_ns = 10 * std.time.ns_per_ms;
+    session: ?Session = null,
+    session_id: u64 = 0,
+    due_ns: ?i64 = null,
+    late_ns: [32]i64 = undefined,
+    ticks: u32 = 0,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.session = session.*;
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onDatagram(_: *@This(), _: *Session, _: u64, _: []const u8) void {}
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.session = null;
+    }
+    pub fn onPass(self: *@This(), now_ns: i64) ?i64 {
+        const due = self.due_ns orelse return null;
+        if (now_ns < due or self.ticks == self.late_ns.len) return due;
+        self.late_ns[self.ticks] = now_ns - due;
+        self.ticks += 1;
+        self.due_ns = due + period_ns;
+        if (self.session) |*s| s.sendDatagram(self.session_id, "tick") catch {};
+        return self.due_ns;
+    }
+
+    fn ready(self: *@This()) bool {
+        return self.session != null;
+    }
+};
+
+test "e2e: onPass runs on its deadline, and what it writes leaves in that pass" {
+    var client_handler = WtTickClient{};
+    var server_handler = WtPassTicker{};
+    var e2e: E2e(WtPassTicker, WtTickClient) = undefined;
+    try e2e.init(29503, &server_handler, &client_handler);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &server_handler, WtPassTicker.ready, 10_000);
+    try runFor(&e2e.loop, 200);
+
+    // Started from outside any callback, so the loop learns of it by wakeAt.
+    const start = sys.nanoTimestamp() + WtPassTicker.period_ns;
+    server_handler.due_ns = start;
+    e2e.server.wakeAt(start);
+    const ticks = 20;
+    const entry = server_handler.session.?.entry;
+    while (server_handler.ticks < ticks) {
+        if (sys.nanoTimestamp() > start + 5 * std.time.ns_per_s) return error.Timeout;
+        const before = server_handler.ticks;
+        try e2e.loop.run(.no_wait);
+        // Sent by the tick's own pass, not left for a wake pass.
+        if (server_handler.ticks != before) try testing.expect(!entry.needs_visit);
+        sys.sleepNs(50 * std.time.ns_per_us);
+    }
+    // Only the deadline brings these passes: the client sends nothing but ACKs.
+    try testing.expect(sys.nanoTimestamp() - start < (ticks - 1) * WtPassTicker.period_ns + 100 * std.time.ns_per_ms);
+    const late = server_handler.late_ns[0..ticks];
+    std.mem.sort(i64, late, {}, std.sort.asc(i64));
+    try testing.expect(late[ticks / 2] < 3 * std.time.ns_per_ms);
+    try runUntilCount(&e2e.loop, &client_handler.datagrams, ticks, 5000);
+}
+
+/// Once `armed`, asks for a pass `delay_ns` after the first one that sees it,
+/// and counts the passes before that.
+const PassAfter = struct {
+    pub const protocol: Protocol = .h3;
+    const delay_ns = 5 * std.time.ns_per_ms;
+    armed: bool = false,
+    calls: u32 = 0,
+    target_ns: ?i64 = null,
+    early: u32 = 0,
+    reached_ns: ?i64 = null,
+
+    pub fn onPass(self: *@This(), now_ns: i64) ?i64 {
+        self.calls += 1;
+        if (!self.armed or self.reached_ns != null) return null;
+        const target = self.target_ns orelse blk: {
+            self.target_ns = now_ns + delay_ns;
+            break :blk self.target_ns.?;
+        };
+        if (now_ns >= target) {
+            self.reached_ns = now_ns;
+            return null;
+        }
+        self.early += 1;
+        return target;
+    }
+
+    fn called(self: *@This()) bool {
+        return self.calls > 0;
+    }
+    fn reached(self: *@This()) bool {
+        return self.reached_ns != null;
+    }
+};
+
+test "e2e: an onPass deadline set after a long wait is not woken for early" {
+    // Epoll's loop counted the timer from the time it read before waiting,
+    // so a deadline set in a socket callback after a 30 ms wait fired at once.
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var handler = PassAfter{};
+    var server = try Server(PassAfter).init(testing.allocator, &handler, .{
+        .port = 29504,
+        .tls_config = makeTestTlsConfig(),
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+    try runUntil(&loop, &handler, PassAfter.called, 5_000);
+
+    const Poke = struct {
+        fn run() void {
+            sys.sleepNs(30 * std.time.ns_per_ms);
+            const fd = sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
+            defer sys.close(fd);
+            const to = net.Address.parseIp4("127.0.0.1", 29504) catch unreachable;
+            _ = std.c.sendto(fd, "x", 1, 0, &to.any, to.getOsSockLen());
+        }
+    };
+    handler.armed = true;
+    const poker = try std.Thread.spawn(.{}, Poke.run, .{});
+    try loop.run(.once); // waits for the datagram; its pass sets the deadline
+    poker.join();
+    try testing.expect(handler.target_ns != null);
+    const early = handler.early; // the datagram's own pass
+    try runUntil(&loop, &handler, PassAfter.reached, 5_000);
+    try testing.expectEqual(early, handler.early);
+    try testing.expect(handler.reached_ns.? - handler.target_ns.? < 50 * std.time.ns_per_ms);
+
+    server.stop();
+    try runUntil(&loop, &server, Server(PassAfter).isStopped, 5_000);
+}
+
+test "e2e: wakeAt brings a pass, and a server with nothing due sleeps" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var handler = PassAfter{};
+    var server = try Server(PassAfter).init(testing.allocator, &handler, .{
+        .port = 29505,
+        .tls_config = makeTestTlsConfig(),
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+    try runUntil(&loop, &handler, PassAfter.called, 5_000);
+    // Nothing connected and nothing asked for.
+    try testing.expect(!server.timer_armed and !server.wake_armed);
+
+    server.wakeAt(sys.nanoTimestamp() + 2 * std.time.ns_per_ms);
+    try testing.expect(server.timer_armed);
+    try runUntilCount(&loop, &handler.calls, 2, 5_000);
+    // That pass reached it, so nothing is armed again.
+    try testing.expect(!server.timer_armed and !server.wake_armed);
+    try runFor(&loop, 20);
+    try testing.expectEqual(@as(u32, 2), handler.calls);
+
+    server.stop();
+    try runUntil(&loop, &server, Server(PassAfter).isStopped, 5_000);
 }
 
 /// Counts the events that reach it, and answers each datagram with one: what

@@ -168,6 +168,14 @@ before it gets any state. `max_handshakes_per_source` (a quarter of
 `max_handshakes`) bounds what one IPv4 address or IPv6 /64 holds even after
 it answers.
 
+Timed work, such as a game's fixed-step ticks, fits `onPass(self, now_ns) ?i64`
+better than a timer of your own. The loop calls it once per pass, after
+dispatching what arrived and before sending, so what it writes shares that
+pass's send batch. It returns the `sys.nanoTimestamp()` by which it next needs a
+pass, or null: the loop wakes for it then, never earlier, and sleeps while
+nothing is due. A deadline that comes up outside the server's callbacks, in a
+WebSocket callback say, goes to `server.wakeAt(ns)`.
+
 ### HTTP/1.1 listener: static files and WebSockets
 
 `Config.http1` adds a TCP listener to the server, on the same port as QUIC
