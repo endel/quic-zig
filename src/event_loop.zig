@@ -39,6 +39,7 @@ const wt_fc = @import("webtransport/flow_control.zig");
 const transport_params = @import("quic/transport_params.zig");
 const packet = @import("quic/packet.zig");
 const quic_lb = @import("quic/quic_lb.zig");
+const stateless_reset = @import("quic/stateless_reset.zig");
 const Certificate = std.crypto.Certificate;
 const ca_bundle = @import("quic/ca_bundle.zig");
 
@@ -150,6 +151,14 @@ pub const Config = struct {
     /// packets home. Servers sharing a key some other way must route by
     /// CID themselves.
     static_reset_key: ?[16]u8 = null,
+    /// With `static_reset_key` null, derive it from the TLS private key and
+    /// the bound UDP port (`stateless_reset.deriveKey`) instead of drawing
+    /// one. A server restarted on that port with that key then resets the
+    /// connections its last run left in a way their clients recognise, and
+    /// every server on the port derives the same key, as a shared one.
+    /// Two processes serving one port at once would reset each other's
+    /// connections.
+    derive_reset_key: bool = false,
 
     // Use IPv6 dual-stack socket (supports both IPv4 and IPv6)
     ipv6: bool = false,
@@ -236,8 +245,9 @@ pub const Config = struct {
     /// shared by all of them: with it, `Session.handOver` moves a connection
     /// to a sibling server and `adopt` takes one in. Requires
     /// `foreign_datagram`, which carries the moved connections' packets to
-    /// their new owner, and `static_reset_key`, which every server must
-    /// share for a connection's reset tokens to hold wherever it goes. The
+    /// their new owner, and `static_reset_key` or `derive_reset_key`: every
+    /// server must share the key for a connection's reset tokens to hold
+    /// wherever it goes. The
     /// servers must also share `tls_config`, whose material a connection
     /// keeps pointing into.
     moved_cids: ?*MovedCids = null,
@@ -990,8 +1000,7 @@ pub fn Server(comptime Handler: type) type {
             var retry_token_key: [16]u8 = if (config.retry_token_key) |k| k else undefined;
             if (config.retry_token_key == null) sys.randomBytes(&retry_token_key);
 
-            var static_reset_key: [16]u8 = if (config.static_reset_key) |k| k else undefined;
-            if (config.static_reset_key == null) sys.randomBytes(&static_reset_key);
+            const shared_reset_key = config.static_reset_key != null or config.derive_reset_key;
 
             // Connection config
             var conn_config: connection.ConnectionConfig = if (config.conn_config) |cc| cc else blk: {
@@ -1009,10 +1018,21 @@ pub fn Server(comptime Handler: type) type {
             if (config.quic_lb) |lb| conn_config.quic_lb = lb;
             if (conn_config.quic_lb) |*lb| try quic_lb.validate(lb);
             if (config.foreign_datagram != null and conn_config.quic_lb == null) return error.ForeignDatagramNeedsQuicLb;
-            if (config.moved_cids != null and (config.foreign_datagram == null or config.static_reset_key == null)) return error.MovedCidsNeedsSteering;
+            if (config.moved_cids != null and (config.foreign_datagram == null or !shared_reset_key)) return error.MovedCidsNeedsSteering;
 
             const sockfd, const local_addr = if (config.socket) |fd| .{ fd, try boundAddress(fd) } else try openUdpSocket(config, config.port);
             errdefer if (config.socket == null) sys.close(sockfd);
+
+            // After binding: a derived key takes the port the socket got.
+            const static_reset_key: [16]u8 = config.static_reset_key orelse if (config.derive_reset_key) blk: {
+                const pk = if (tls_config.certs.len > 0) tls_config.certs[0].cert.private_key_bytes else tls_config.private_key_bytes;
+                if (pk.len == 0) return error.ResetKeyNeedsPrivateKey;
+                break :blk stateless_reset.deriveKey(pk, local_addr.getPort());
+            } else blk: {
+                var k: [16]u8 = undefined;
+                sys.randomBytes(&k);
+                break :blk k;
+            };
 
             // A qlog run is a diagnostic run: stamp arrivals too, so the time a
             // datagram spent queued can be told apart from the time spent
@@ -1052,7 +1072,7 @@ pub fn Server(comptime Handler: type) type {
             conn_mgr.moved = config.moved_cids;
             conn_mgr.can_hand_over = config.moved_cids != null and @hasDecl(Handler, "onHandover");
             conn_mgr.next_entry_id = config.id_base + 1;
-            conn_mgr.reset_unknown = !(config.reuse_port and config.static_reset_key != null and config.foreign_datagram == null);
+            conn_mgr.reset_unknown = !(config.reuse_port and shared_reset_key and config.foreign_datagram == null);
 
             // Init libxev
             const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
@@ -6453,7 +6473,7 @@ test "e2e: a client and server that both offer QUIC v2 finish the handshake in i
     try testing.expectEqual(@as(u32, 0x6b3343cf), e2e.client.conn.version);
 }
 
-test "Server: workers sharing a reset key send no resets unless they steer" {
+test "Server: workers sharing a reset key, given or derived, send no resets unless they steer" {
     // A packet for one worker's connection can reach another, whose reset
     // handed the sender that connection's token (RFC 9000 §21.11).
     var handler = HelloServer{};
@@ -6470,11 +6490,22 @@ test "Server: workers sharing a reset key send no resets unless they steer" {
         .tls_config = makeTestTlsConfig(),
     });
     defer own.deinit();
+    var derived = try Server(HelloServer).init(testing.allocator, &handler, .{
+        .port = 29457,
+        .reuse_port = true,
+        .derive_reset_key = true,
+        .tls_config = makeTestTlsConfig(),
+    });
+    defer derived.deinit();
+    const pk = derived.conn_mgr.tls_config.private_key_bytes;
+    try testing.expectEqual(stateless_reset.deriveKey(pk, 29457), derived.conn_mgr.static_reset_key);
 
     const addr = std.mem.zeroes(posix.sockaddr.storage);
     var out: [1500]u8 = undefined;
     var pkt = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
     try testing.expect(shared.conn_mgr.recvDatagram(&pkt, addr, addr, 0, &out) == .dropped);
+    pkt = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
+    try testing.expect(derived.conn_mgr.recvDatagram(&pkt, addr, addr, 0, &out) == .dropped);
     pkt = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
     try testing.expect(own.conn_mgr.recvDatagram(&pkt, addr, addr, 0, &out) == .send_response);
 }

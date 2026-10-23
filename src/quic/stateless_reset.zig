@@ -2,6 +2,7 @@ const std = @import("std");
 const sys = @import("../sys.zig");
 const crypto = std.crypto;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
+const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 
 pub const TOKEN_LEN: usize = 16;
 pub const MIN_PACKET_LEN: usize = 21; // RFC 9000 §10.3: at least 1 byte header + 4 random + 16 token
@@ -12,6 +13,20 @@ pub fn computeToken(static_key: [16]u8, conn_id: []const u8) [TOKEN_LEN]u8 {
     var mac: [HmacSha256.mac_length]u8 = undefined;
     HmacSha256.create(&mac, conn_id, &static_key);
     return mac[0..TOKEN_LEN].*;
+}
+
+/// A static key from the server's TLS private key and its UDP port (HKDF,
+/// RFC 9000 10.3.2's suggestion): a server restarted with that key on that
+/// port derives it again, so the clients its last run left recognise its
+/// resets; another port's is unrelated. The label keeps it apart from any
+/// other secret drawn from the private key.
+pub fn deriveKey(private_key: []const u8, port: u16) [16]u8 {
+    const label = "quic-zig stateless reset key";
+    var info: [label.len + 2]u8 = (label ++ "\x00\x00").*;
+    std.mem.writeInt(u16, info[label.len..][0..2], port, .big);
+    var key: [16]u8 = undefined;
+    HkdfSha256.expand(&key, &info, HkdfSha256.extract("", private_key));
+    return key;
 }
 
 // Generate a stateless reset packet (RFC 9000 §10.3).
@@ -132,4 +147,13 @@ test "generatePacket too small" {
     // max_size < MIN_PACKET_LEN should return 0
     const size = generatePacket(&buf, 20, key, &cid);
     try std.testing.expect(size == 0);
+}
+
+test "deriveKey: the same for a private key and port, unrelated for another of either" {
+    const pk: [32]u8 = @splat(0x11);
+    const key = deriveKey(&pk, 4433);
+    try std.testing.expectEqual(key, deriveKey(&pk, 4433));
+    try std.testing.expect(!std.mem.eql(u8, &key, &deriveKey(&pk, 4434)));
+    const other: [32]u8 = @splat(0x12);
+    try std.testing.expect(!std.mem.eql(u8, &key, &deriveKey(&other, 4433)));
 }
