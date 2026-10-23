@@ -351,8 +351,10 @@ pub fn mapV4ToV6(storage: *posix.sockaddr.storage) void {
 pub const SendBatch = struct {
     const MAX_BATCH: usize = 64;
     /// GSO needs every segment but the last to be the same size, and the whole
-    /// thing to fit one datagram's length field.
-    const max_gso_bytes: usize = 65535;
+    /// thing to fit one IPv4 datagram: 65535 less the IP and UDP headers.
+    /// IPv6 takes 20 bytes more, but a dual-stack socket sends to v4-mapped
+    /// peers as IPv4, and the kernel refuses a larger send with EMSGSIZE.
+    const max_gso_bytes: usize = 65507;
     /// Room for one packet, and the size of a `reserve` slot.
     pub const max_packet: usize = 1500;
 
@@ -704,6 +706,12 @@ test "SendBatch.segmentEnd: equal packets and one shorter last" {
     // The datagram's 16-bit length caps it: 45 x 1436 fits, 46 does not.
     for (0..50) |i| b.lengths[i] = 1436;
     try std.testing.expectEqual(@as(usize, 45), b.segmentEnd(0, 50));
+    // Less IPv4's headers: 45 x 1452 leaves room for a 167-byte tail, not 168.
+    for (0..45) |i| b.lengths[i] = 1452;
+    for ([_]u32{ 167, 168 }, [_]usize{ 46, 45 }) |tail, want| {
+        b.lengths[45] = tail;
+        try std.testing.expectEqual(want, b.segmentEnd(0, 46));
+    }
     // Another address ends it.
     b.addr_lens[3] = 16;
     try std.testing.expectEqual(@as(usize, 3), b.segmentEnd(0, 50));
