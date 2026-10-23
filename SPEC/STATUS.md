@@ -251,7 +251,7 @@
 | 5 | Estimating the Round-Trip Time | | |
 | 5.1 | Generating RTT Samples | ✅ Done | Latest RTT from ACK, when the largest acknowledged is ack-eliciting |
 | 5.2 | Estimating min_rtt | ✅ Done | Lifetime minimum |
-| 5.3 | Estimating smoothed_rtt and rttvar | ✅ Done | EWMA + mean deviation |
+| 5.3 | Estimating smoothed_rtt and rttvar | ✅ Done | EWMA + mean deviation. The ACK delay comes off a sample that is at least min_rtt plus it, the boundary included |
 | 6 | Loss Detection | | |
 | 6.1 | Acknowledgment-Based Detection | ✅ Done | Packet + time thresholds. Packets not in flight get no record: nothing would ever release one |
 | 6.1.1 | Packet Threshold | ✅ Done | kPacketThreshold = 3 |

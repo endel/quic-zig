@@ -58,7 +58,8 @@ pub const RttStats = struct {
         var adjusted_rtt = send_delta;
         if (handshake_confirmed) {
             const effective_ack_delay = @min(ack_delay, self.max_ack_delay);
-            if (adjusted_rtt > self.min_rtt + effective_ack_delay) {
+            // >=: a delayed ACK on a path at its min_rtt is exactly that sum.
+            if (adjusted_rtt >= self.min_rtt + effective_ack_delay) {
                 adjusted_rtt -= effective_ack_delay;
             }
         }
@@ -156,6 +157,15 @@ test "RttStats: ack_delay adjustment" {
     // adjusted_rtt = 110ms, smoothed_rtt = 7/8*100 + 1/8*110 = 101.25ms
     try testing.expect(rtt.smoothed_rtt > 100_000_000);
     try testing.expect(rtt.smoothed_rtt < 105_000_000);
+}
+
+test "RttStats: a sample exactly min_rtt plus the ACK delay is the path's min_rtt" {
+    // RFC 9002 5.3. Left unadjusted, one delayed ACK on a 0.2 ms path took
+    // smoothed_rtt to 3.2 ms, and the pacer down with it.
+    var rtt = RttStats{};
+    rtt.updateRtt(200_000, 0, false);
+    rtt.updateRtt(24_200_000, 24_000_000, true);
+    try testing.expectEqual(@as(i64, 200_000), rtt.smoothed_rtt);
 }
 
 test "RttStats: loss delay" {
