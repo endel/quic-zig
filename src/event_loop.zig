@@ -781,7 +781,7 @@ pub fn Server(comptime Handler: type) type {
         sockfd: posix.socket_t,
         local_addr: posix.sockaddr.storage,
         batch: ecn_socket.SendBatch,
-        recv_buf: [MAX_RECV_DATAGRAM]u8,
+        recv_batch: ecn_socket.RecvBatch,
         out_buf: [1500]u8,
         /// How long datagrams waited in the kernel before the loop read them.
         /// Only filled when the socket was stamped (a qlog run); reported and
@@ -907,6 +907,8 @@ pub fn Server(comptime Handler: type) type {
                 };
             } else null;
             errdefer if (preferred) |p| sys.close(p.sockfd);
+            var recv_batch = try ecn_socket.RecvBatch.init(alloc, MAX_RECV_DATAGRAM);
+            errdefer recv_batch.deinit(alloc);
 
             var conn_mgr = connection_manager.ConnectionManager.init(
                 alloc,
@@ -973,7 +975,7 @@ pub fn Server(comptime Handler: type) type {
                 .sockfd = sockfd,
                 .local_addr = connection.sockaddrToStorage(&local_addr.any),
                 .batch = ecn_socket.SendBatch.init(sockfd),
-                .recv_buf = undefined,
+                .recv_batch = recv_batch,
                 .qpack_scratch = undefined,
                 .qpack_headers = undefined,
                 .out_buf = undefined,
@@ -1012,6 +1014,7 @@ pub fn Server(comptime Handler: type) type {
             if (self.preferred) |p| sys.close(p.sockfd);
             self.conn_mgr.deinit();
             self.quic_poll_ids.deinit(self.allocator);
+            self.recv_batch.deinit(self.allocator);
             // Last: live connections hold slices into this material.
             if (self.owned_tls) |*o| o.deinit(self.allocator);
         }
@@ -1417,54 +1420,57 @@ pub fn Server(comptime Handler: type) type {
             return received;
         }
 
-        fn drainSocket(self: *Self, sockfd: posix.socket_t, local_addr: posix.sockaddr.storage, recv_batch: *ecn_socket.SendBatch) bool {
-            var received = false;
+        /// `replies` takes the answers to datagrams that get one at once.
+        fn drainSocket(self: *Self, sockfd: posix.socket_t, local_addr: posix.sockaddr.storage, replies: *ecn_socket.SendBatch) bool {
             var n: usize = 0;
-            while (n < max_recv_per_pass) : (n += 1) {
-                const recv_result = ecn_socket.recvmsgEcn(sockfd, &self.recv_buf) catch |err| {
-                    if (err == error.WouldBlock) break;
-                    break;
-                };
-                received = true;
-                if (recv_result.kernel_ns != 0) {
-                    // SO_TIMESTAMPNS stamps the wall clock, so the comparison
-                    // has to be made on it rather than on the monotonic one.
-                    const now_ns: i64 = sys.realtimeNs();
-                    self.rx_wait.record(now_ns - recv_result.kernel_ns);
-                    self.rx_wait.maybeReport(now_ns);
+            while (n < max_recv_per_pass) {
+                const got = self.recv_batch.recv(sockfd, max_recv_per_pass - n) catch break;
+                for (self.recv_batch.results[0..got], 0..) |*recv_result, i| {
+                    self.dispatchDatagram(self.recv_batch.datagram(i), recv_result, local_addr, replies);
                 }
-                if (recv_result.truncated) {
-                    std.log.warn("datagram truncated at {d} bytes — raise MAX_RECV_DATAGRAM", .{recv_result.bytes_read});
-                }
-
-                switch (self.conn_mgr.recvDatagram(
-                    self.recv_buf[0..recv_result.bytes_read],
-                    recv_result.from_addr,
-                    local_addr,
-                    recv_result.ecn,
-                    &self.out_buf,
-                )) {
-                    .processed => {},
-                    .send_response => |data| {
-                        recv_batch.add(data, @ptrCast(&recv_result.from_addr), recv_result.addr_len, 0);
-                    },
-                    .dropped => {},
-                    .foreign => |server_id| if (self.foreign_hook) |hook| {
-                        const dg: ForeignDatagram = .{
-                            .bytes = self.recv_buf[0..recv_result.bytes_read],
-                            .peer = recv_result.from_addr,
-                            .local = local_addr,
-                            .ecn = recv_result.ecn,
-                            .server_id = server_id,
-                        };
-                        hook.func(hook.ctx, &dg);
-                    },
-                }
+                n += got;
             }
             // The rest on the next pass, without waiting for another edge.
             if (n == max_recv_per_pass) self.armWake();
 
-            return received;
+            return n > 0;
+        }
+
+        fn dispatchDatagram(self: *Self, bytes: []u8, recv_result: *const ecn_socket.RecvResult, local_addr: posix.sockaddr.storage, replies: *ecn_socket.SendBatch) void {
+            if (recv_result.kernel_ns != 0) {
+                // SO_TIMESTAMPNS stamps the wall clock, so the comparison
+                // has to be made on it rather than on the monotonic one.
+                const now_ns: i64 = sys.realtimeNs();
+                self.rx_wait.record(now_ns - recv_result.kernel_ns);
+                self.rx_wait.maybeReport(now_ns);
+            }
+            if (recv_result.truncated) {
+                std.log.warn("datagram truncated at {d} bytes — raise MAX_RECV_DATAGRAM", .{recv_result.bytes_read});
+            }
+
+            switch (self.conn_mgr.recvDatagram(
+                bytes,
+                recv_result.from_addr,
+                local_addr,
+                recv_result.ecn,
+                &self.out_buf,
+            )) {
+                .processed => {},
+                .send_response => |data| {
+                    replies.add(data, @ptrCast(&recv_result.from_addr), recv_result.addr_len, 0);
+                },
+                .dropped => {},
+                .foreign => |server_id| if (self.foreign_hook) |hook| {
+                    const dg: ForeignDatagram = .{
+                        .bytes = bytes,
+                        .peer = recv_result.from_addr,
+                        .local = local_addr,
+                        .ecn = recv_result.ecn,
+                        .server_id = server_id,
+                    };
+                    hook.func(hook.ctx, &dg);
+                },
+            }
         }
 
         /// Process a datagram another server received for one of our
