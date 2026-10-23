@@ -17,7 +17,6 @@ const TransportError = frame_mod.TransportError;
 const ack_handler = @import("ack_handler.zig");
 const congestion = @import("congestion.zig");
 const flow_control = @import("flow_control.zig");
-const rtt = @import("rtt.zig");
 const stream_mod = @import("stream.zig");
 const crypto_stream = @import("crypto_stream.zig");
 const transport_params = @import("transport_params.zig");
@@ -234,10 +233,14 @@ pub const LocalCidPool = struct {
     entries: [MAX_POOL_SIZE]LocalCidEntry = @splat(LocalCidEntry{}),
     next_seq_num: u64 = 1,
     retire_prior_to: u64 = 0,
+    /// Bumped whenever the set of entries changes, so the server's routing
+    /// map knows when to resync.
+    generation: u32 = 0,
 
     /// Register the initial SCID as sequence number 0.
     /// If static_key is provided, compute a deterministic reset token; otherwise random.
     pub fn registerInitialCid(self: *LocalCidPool, cid: []const u8, static_key: ?[16]u8) void {
+        self.generation +%= 1;
         self.entries[0] = LocalCidEntry{
             .occupied = true,
             .retired = false,
@@ -254,6 +257,7 @@ pub const LocalCidPool = struct {
 
     /// Register the preferred_address CID at sequence number 1 (RFC 9000 §5.1.1).
     pub fn registerPreferredCid(self: *LocalCidPool, cid: []const u8, reset_token: [16]u8) void {
+        self.generation +%= 1;
         // Find a free slot for seq 1
         for (&self.entries) |*entry| {
             if (!entry.occupied) {
@@ -273,6 +277,7 @@ pub const LocalCidPool = struct {
     /// Issue a new CID with the given length. Returns the entry or null if pool full.
     /// If static_key is provided, compute a deterministic reset token; otherwise random.
     pub fn issueNewCid(self: *LocalCidPool, cid_len: u8, static_key: ?[16]u8) ?*const LocalCidEntry {
+        self.generation +%= 1;
         // Find a free slot
         for (&self.entries) |*entry| {
             if (!entry.occupied) {
@@ -296,6 +301,7 @@ pub const LocalCidPool = struct {
     /// Issue a new CID using QUIC-LB encoding. Returns the entry or null if pool full.
     /// If static_key is provided, compute a deterministic reset token; otherwise random.
     pub fn issueNewCidLb(self: *LocalCidPool, lb_config: *const quic_lb.Config, static_key: ?[16]u8) ?*const LocalCidEntry {
+        self.generation +%= 1;
         for (&self.entries) |*entry| {
             if (!entry.occupied) {
                 entry.occupied = true;
@@ -318,6 +324,7 @@ pub const LocalCidPool = struct {
 
     /// Mark an entry as retired by sequence number.
     pub fn retireBySeq(self: *LocalCidPool, seq: u64) void {
+        self.generation +%= 1;
         for (&self.entries) |*entry| {
             if (entry.occupied and entry.seq_num == seq) {
                 entry.occupied = false;
@@ -337,22 +344,21 @@ pub const LocalCidPool = struct {
     }
 };
 
-/// Fixed-capacity queue for QUIC DATAGRAM frames (RFC 9221).
-/// Supports optional max-age expiry and configurable high water mark.
+/// Queue of QUIC DATAGRAM payloads (RFC 9221), at most `max_items` of them,
+/// with optional max-age expiry and a high water mark. Entries lie end to end
+/// in one buffer, allocated on first push and reset whenever the queue
+/// empties: an unused queue costs nothing, and one that drains every pass
+/// holds only what a pass queues.
 pub const DatagramQueue = struct {
-    pub const DEFAULT_MAX_ITEMS: usize = limits.datagram_static_items;
+    pub const DEFAULT_MAX_ITEMS: usize = limits.datagram_queue_items;
     pub const MAX_DATAGRAM_SIZE: usize = 1200;
+    /// Each entry: u16 length, i64 push time, then the payload.
+    const header_len = 10;
 
-    allocator: ?std.mem.Allocator = null,
-    bufs_static: [DEFAULT_MAX_ITEMS][MAX_DATAGRAM_SIZE]u8 = undefined,
-    lens_static: [DEFAULT_MAX_ITEMS]usize = @splat(0),
-    times_static: [DEFAULT_MAX_ITEMS]i64 = @splat(0),
-    bufs_dynamic: ?[][MAX_DATAGRAM_SIZE]u8 = null,
-    lens_dynamic: ?[]usize = null,
-    times_dynamic: ?[]i64 = null,
-    max_items: usize = DEFAULT_MAX_ITEMS,
+    bytes: std.ArrayList(u8) = .empty,
+    /// Where the oldest entry starts in `bytes`.
     head: usize = 0,
-    tail: usize = 0,
+    max_items: usize = DEFAULT_MAX_ITEMS,
     count: usize = 0,
 
     /// Max age in nanoseconds. Datagrams older than this are dropped on read.
@@ -362,79 +368,83 @@ pub const DatagramQueue = struct {
     /// High water mark (max queued items). null = use max_items (default).
     high_water_mark: ?usize = null,
 
-    /// Resize the queue to a custom capacity (must be called before use).
-    pub fn resize(self: *DatagramQueue, alloc: std.mem.Allocator, capacity: usize) !void {
-        if (capacity <= DEFAULT_MAX_ITEMS) return; // static buffer is enough
-        self.allocator = alloc;
-        self.bufs_dynamic = try alloc.alloc([MAX_DATAGRAM_SIZE]u8, capacity);
-        self.lens_dynamic = try alloc.alloc(usize, capacity);
-        self.times_dynamic = try alloc.alloc(i64, capacity);
-        @memset(self.lens_dynamic.?, 0);
-        @memset(self.times_dynamic.?, 0);
-        self.max_items = capacity;
-    }
-
-    pub fn deinitQueue(self: *DatagramQueue) void {
-        if (self.allocator) |alloc| {
-            if (self.bufs_dynamic) |b| alloc.free(b);
-            if (self.lens_dynamic) |l| alloc.free(l);
-            if (self.times_dynamic) |t| alloc.free(t);
-        }
-    }
-
-    fn getBuf(self: *DatagramQueue, idx: usize) *[MAX_DATAGRAM_SIZE]u8 {
-        if (self.bufs_dynamic) |b| return &b[idx];
-        return &self.bufs_static[idx];
-    }
-
-    fn getLen(self: *DatagramQueue, idx: usize) *usize {
-        if (self.lens_dynamic) |l| return &l[idx];
-        return &self.lens_static[idx];
-    }
-
-    fn getTime(self: *DatagramQueue, idx: usize) *i64 {
-        if (self.times_dynamic) |t| return &t[idx];
-        return &self.times_static[idx];
+    pub fn deinitQueue(self: *DatagramQueue, gpa: std.mem.Allocator) void {
+        self.bytes.deinit(gpa);
     }
 
     fn effectiveCapacity(self: *const DatagramQueue) usize {
         return self.high_water_mark orelse self.max_items;
     }
 
-    pub fn push(self: *DatagramQueue, data: []const u8) bool {
-        if (self.count >= self.effectiveCapacity() or data.len > MAX_DATAGRAM_SIZE) return false;
-        @memcpy(self.getBuf(self.tail)[0..data.len], data);
-        self.getLen(self.tail).* = data.len;
-        self.getTime(self.tail).* = @intCast(sys.nanoTimestamp());
-        self.tail = (self.tail + 1) % self.max_items;
+    fn headLen(self: *const DatagramQueue) usize {
+        return std.mem.readInt(u16, self.bytes.items[self.head..][0..2], .little);
+    }
+
+    fn headTime(self: *const DatagramQueue) i64 {
+        return std.mem.readInt(i64, self.bytes.items[self.head + 2 ..][0..8], .little);
+    }
+
+    /// False when full, too large, or out of memory.
+    pub fn push(self: *DatagramQueue, gpa: std.mem.Allocator, data: []const u8) bool {
+        return self.pushParts(gpa, &.{data});
+    }
+
+    /// `push` of the parts one after another, copied in once.
+    pub fn pushParts(self: *DatagramQueue, gpa: std.mem.Allocator, parts: []const []const u8) bool {
+        var len: usize = 0;
+        for (parts) |p| len += p.len;
+        if (self.count >= self.effectiveCapacity() or len > MAX_DATAGRAM_SIZE) return false;
+        const need = header_len + len;
+        // Reuse the room pops left at the front before growing.
+        if (self.head > 0 and self.bytes.items.len + need > self.bytes.capacity) {
+            const rest = self.bytes.items.len - self.head;
+            @memmove(self.bytes.items[0..rest], self.bytes.items[self.head..]);
+            self.bytes.items.len = rest;
+            self.head = 0;
+        }
+        const e = self.bytes.addManyAsSlice(gpa, need) catch return false;
+        std.mem.writeInt(u16, e[0..2], @intCast(len), .little);
+        // Only an age limit reads the stamp; the clock read showed up per datagram.
+        std.mem.writeInt(i64, e[2..10], if (self.max_age_ns != null) @intCast(sys.nanoTimestamp()) else 0, .little);
+        var at: usize = header_len;
+        for (parts) |p| {
+            @memcpy(e[at..][0..p.len], p);
+            at += p.len;
+        }
         self.count += 1;
         return true;
     }
 
+    /// Set the age limit; entries already queued count their age from `now`.
+    pub fn setMaxAge(self: *DatagramQueue, max_age_ns: ?i64, now: i64) void {
+        if (self.max_age_ns == null and max_age_ns != null) {
+            var at = self.head;
+            for (0..self.count) |_| {
+                std.mem.writeInt(i64, self.bytes.items[at + 2 ..][0..8], now, .little);
+                at += header_len + std.mem.readInt(u16, self.bytes.items[at..][0..2], .little);
+            }
+        }
+        self.max_age_ns = max_age_ns;
+    }
+
     pub fn pop(self: *DatagramQueue, out: []u8) ?usize {
-        if (self.count == 0) return null;
-        const len = self.getLen(self.head).*;
-        if (out.len < len) return null;
-        @memcpy(out[0..len], self.getBuf(self.head)[0..len]);
-        self.head = (self.head + 1) % self.max_items;
-        self.count -= 1;
-        return len;
+        const data = self.peekData() orelse return null;
+        if (out.len < data.len) return null;
+        @memcpy(out[0..data.len], data);
+        self.consume();
+        return data.len;
     }
 
     /// Pop the next non-expired datagram, dropping any expired entries.
     /// Returns null if queue is empty or all remaining entries are expired.
     pub fn popSkipExpired(self: *DatagramQueue, out: []u8, now: i64) ?usize {
-        const max_age = self.max_age_ns orelse return self.pop(out);
-        while (self.count > 0) {
-            const age = now - self.getTime(self.head).*;
-            if (age <= max_age) {
-                return self.pop(out);
-            }
-            // Expired — skip this entry
-            self.head = (self.head + 1) % self.max_items;
-            self.count -= 1;
-        }
-        return null;
+        self.dropExpired(now);
+        return self.pop(out);
+    }
+
+    fn dropExpired(self: *DatagramQueue, now: i64) void {
+        const max_age = self.max_age_ns orelse return;
+        while (self.count > 0 and now - self.headTime() > max_age) self.consume();
     }
 
     pub fn isEmpty(self: *const DatagramQueue) bool {
@@ -452,38 +462,32 @@ pub const DatagramQueue = struct {
     /// Peek at the length of the next datagram without removing it.
     pub fn peekLen(self: *DatagramQueue) ?usize {
         if (self.count == 0) return null;
-        return self.getLen(self.head).*;
+        return self.headLen();
     }
 
-    /// Return a slice into the ring buffer entry without copying.
-    /// The slice is valid until the next pop() or consume() call.
+    /// Return a slice into the queue's buffer without copying.
+    /// The slice is valid until the next push(), pop() or consume() call.
     pub fn peekData(self: *DatagramQueue) ?[]const u8 {
         if (self.count == 0) return null;
-        const len = self.getLen(self.head).*;
-        return self.getBuf(self.head)[0..len];
+        return self.bytes.items[self.head + header_len ..][0..self.headLen()];
     }
 
     /// Peek at next non-expired datagram, consuming any expired entries.
     /// Returns null if queue is empty or all remaining entries are expired.
     pub fn peekDataSkipExpired(self: *DatagramQueue, now: i64) ?[]const u8 {
-        const max_age = self.max_age_ns orelse return self.peekData();
-        while (self.count > 0) {
-            const age = now - self.getTime(self.head).*;
-            if (age <= max_age) {
-                return self.peekData();
-            }
-            // Expired — skip this entry
-            self.head = (self.head + 1) % self.max_items;
-            self.count -= 1;
-        }
-        return null;
+        self.dropExpired(now);
+        return self.peekData();
     }
 
     /// Advance past the head entry (after peekData was used).
     pub fn consume(self: *DatagramQueue) void {
         if (self.count == 0) return;
-        self.head = (self.head + 1) % self.max_items;
+        self.head += header_len + self.headLen();
         self.count -= 1;
+        if (self.count == 0) {
+            self.bytes.items.len = 0;
+            self.head = 0;
+        }
     }
 };
 
@@ -523,6 +527,11 @@ pub const RecvInfo = struct {
     // Size of the UDP datagram (for amplification limit accounting).
     // Set to the datagram size for the first packet; 0 for subsequent coalesced packets.
     datagram_size: u64 = 0,
+    /// When the datagram was read (`sys.nanoTimestamp()`), if the caller has
+    /// it: spares a clock read per packet. Null reads the clock. It must not
+    /// predate a wait the datagram wasn't queued through, or RTT samples and
+    /// ack delays are skewed by it.
+    now: ?i64 = null,
 };
 
 /// Configuration for a QUIC connection.
@@ -561,7 +570,48 @@ pub const ConnectionConfig = struct {
     // Key deriving our stateless reset tokens (server). Must be the key the
     // ConnectionManager signs its resets with, or they never match.
     static_reset_key: ?[16]u8 = null,
+    /// Milliseconds we may hold the ACK for a peer's 1-RTT packet while
+    /// waiting for data it can ride on, advertised as the max_ack_delay
+    /// transport parameter (RFC 9000 18.2); the delayed-ACK alarm keeps to
+    /// it. The peer adds it to its PTO (RFC 9002 6.2.1), so a longer delay
+    /// saves ACK-only packets but makes a peer whose last packet was lost
+    /// wait that much longer to resend it, and, without
+    /// `ack_bytes_threshold`, can stall a peer's upload that long while its
+    /// congestion window is small. An ACK_FREQUENCY frame from the peer
+    /// overrides it.
+    max_ack_delay: u14 = 25,
+    /// Payload bytes the ack-eliciting packets since our last ACK must add
+    /// up to, besides RFC 9000 13.2.2's two packets, before an ACK goes out
+    /// at once. Small packets then wait for data to ride on, or for
+    /// `max_ack_delay`, while full-size ones still draw an ACK every two, as
+    /// RFC 5681 counts full-sized segments: two 1200-byte datagrams carry
+    /// over 2300 bytes of payload, so 2000 keeps that. Once half of it is
+    /// owed, about a full packet, the ACK waits no longer than QUIC's
+    /// default 25 ms, so a bulk sender's odd packet out doesn't hold its
+    /// window for `max_ack_delay`. 0 counts packets alone. An ACK_FREQUENCY
+    /// frame from the peer replaces it with the peer's threshold.
+    ack_bytes_threshold: u32 = 0,
+    /// Servers only: ask a client that advertises min_ack_delay
+    /// (draft-ietf-quic-ack-frequency: quinn and quic-zig do, browsers
+    /// don't) to acknowledge every 11th ack-eliciting packet rather than
+    /// every 2nd. That spares the client's ACK-only packets and our reading
+    /// them. The client keeps the max_ack_delay it advertised, so our PTO
+    /// doesn't change. The packet that fills our congestion window, and
+    /// each PTO probe, carries IMMEDIATE_ACK, so a transfer waiting on the
+    /// window isn't held back. A client never asks: it would replace the
+    /// server's own ACK policy.
+    request_ack_frequency: bool = true,
 };
+
+/// The min_ack_delay we advertise (draft-ietf-quic-ack-frequency), in µs:
+/// 1 ms, but never above max_ack_delay, which the draft forbids.
+fn minAckDelayUs(max_ack_delay_ms: u14) u64 {
+    return @min(1000, @as(u64, max_ack_delay_ms) * 1000);
+}
+
+/// The Ack-Eliciting Threshold `request_ack_frequency` asks for: an ACK after
+/// more than this many ack-eliciting packets.
+const ACK_FREQUENCY_THRESHOLD: u64 = 10;
 
 /// An idle timeout in nanoseconds. The wire allows 2^62 ms, past what i64
 /// nanoseconds hold, and deadlines add it to the clock: capped at 2^32 ms
@@ -582,24 +632,28 @@ const UNDECRYPTABLE_MAX_PKTS = limits.undecryptable_max_pkts;
 const UNDECRYPTABLE_BUF_LEN = limits.undecryptable_buf_len;
 
 const UndecryptablePackets = struct {
-    buf: [UNDECRYPTABLE_BUF_LEN]u8 = undefined,
+    /// Allocated for the first packet held and freed once they are replayed:
+    /// most connections never hold one, and none past their handshake.
+    buf: ?*[UNDECRYPTABLE_BUF_LEN]u8 = null,
     off: [UNDECRYPTABLE_MAX_PKTS]u32 = undefined,
     plen: [UNDECRYPTABLE_MAX_PKTS]u16 = undefined,
     info: RecvInfo = undefined,
     used: u32 = 0,
     count: u8 = 0,
 
-    fn reset(self: *UndecryptablePackets) void {
-        self.used = 0;
-        self.count = 0;
+    fn reset(self: *UndecryptablePackets, gpa: std.mem.Allocator) void {
+        if (self.buf) |b| gpa.destroy(b);
+        self.* = .{};
     }
 
     /// Store a raw packet to replay later. Bounded; excess silently dropped
     /// (RFC 9001 §4.1.4 allows dropping when the buffer is full).
-    fn push(self: *UndecryptablePackets, bytes: []const u8, rinfo: RecvInfo) void {
+    fn push(self: *UndecryptablePackets, gpa: std.mem.Allocator, bytes: []const u8, rinfo: RecvInfo) void {
         if (self.count >= UNDECRYPTABLE_MAX_PKTS) return;
         if (self.used + bytes.len > UNDECRYPTABLE_BUF_LEN) return;
-        @memcpy(self.buf[self.used..][0..bytes.len], bytes);
+        const buf = self.buf orelse (gpa.create([UNDECRYPTABLE_BUF_LEN]u8) catch return);
+        self.buf = buf;
+        @memcpy(buf[self.used..][0..bytes.len], bytes);
         self.off[self.count] = self.used;
         self.plen[self.count] = @intCast(bytes.len);
         if (self.count == 0) self.info = rinfo;
@@ -625,10 +679,16 @@ pub const Connection = struct {
 
     // TLS 1.3 handshake (null if not configured with TlsConfig)
     /// Heap-allocated: the handshake state is ~52 KB, which by value made it
-    /// the single largest member of Connection. It cannot be released early —
-    /// advanceHandshake still reads it after handshake_confirmed to process
-    /// NewSessionTicket — so this buys size, not lifetime.
+    /// the single largest member of Connection. A client keeps it to read
+    /// NewSessionTicket after the handshake; a server, which has nothing left
+    /// to read, lets it go once the handshake completes (`releaseHandshake`).
     tls13_hs: ?*tls13.Tls13Handshake = null,
+    /// What a released handshake leaves for `negotiatedAlpn`, `peerCertificate`
+    /// and `clientAuth`.
+    alpn_buf: [32]u8 = undefined,
+    alpn_len: u8 = 0,
+    peer_cert: ?[]u8 = null,
+    client_auth: ?*const tls13.ClientAuth = null,
 
     // Network paths (active + candidate for migration)
     paths: [2]NetworkPath = .{ std.mem.zeroes(NetworkPath), std.mem.zeroes(NetworkPath) },
@@ -733,9 +793,16 @@ pub const Connection = struct {
     datagram_recv_callback: ?*const fn (data: []const u8, ctx: ?*anyopaque) void = null,
     datagram_recv_ctx: ?*anyopaque = null,
 
+    /// A frame arrived that the layers above may act on: anything but the
+    /// transport's own ACK, PADDING, PING, CID and path bookkeeping, or a
+    /// DATAGRAM already handed to `datagram_recv_callback`. The server loop
+    /// polls a connection's protocol layers only on this or the
+    /// application's say-so (`ConnEntry.needs_poll`), and clears it then.
+    app_frames: bool = false,
+
     // draft-ietf-quic-ack-frequency
-    peer_supports_ack_freq: bool = false,
-    ack_freq_send_seq: u64 = 0,
+    ack_freq_send_seq: u64 = 0, // > 0 once we asked: IMMEDIATE_ACK is then ours to send
+    ack_freq_wanted: bool = false, // ConnectionConfig.request_ack_frequency, on a server
 
     // 0-RTT (early data) keys
     early_data_open: ?quic_crypto.Open = null, // Server: decrypt 0-RTT packets
@@ -773,7 +840,8 @@ pub const Connection = struct {
     // Connection state
     got_peer_conn_id: bool = false,
     /// Sequence number of our CID the 1-RTT packet being processed came on,
-    /// which the peer may not retire in that packet (RFC 9000 §19.16).
+    /// which the peer may not retire in that packet (RFC 9000 §19.16). Looked
+    /// up only ahead of a RETIRE_CONNECTION_ID frame.
     current_dcid_seq: ?u64 = null,
     /// The SCID of the first long-header packet from the peer that
     /// decrypted: what initial_source_connection_id must name (RFC 9000 §7.3).
@@ -859,6 +927,7 @@ pub const Connection = struct {
 
         conn.* = Connection{
             .allocator = allocator,
+            .pending_frames = .{ .allocator = allocator },
             .version = header.version,
             .is_server = is_server,
             .paths = .{ initial_path, std.mem.zeroes(NetworkPath) },
@@ -929,7 +998,8 @@ pub const Connection = struct {
             .initial_max_streams_bidi = config.initial_max_streams_bidi,
             .initial_max_streams_uni = config.initial_max_streams_uni,
             .max_datagram_frame_size = config.max_datagram_frame_size,
-            .min_ack_delay = 1000, // 1ms minimum ACK delay (draft-ietf-quic-ack-frequency)
+            .max_ack_delay = config.max_ack_delay,
+            .min_ack_delay = minAckDelayUs(config.max_ack_delay),
             // Server's preferred address (RFC 9000 §9.6) — only for servers, must not coexist with disable_active_migration
             .preferred_address = if (is_server and config.preferred_address != null) config.preferred_address else null,
         };
@@ -942,6 +1012,7 @@ pub const Connection = struct {
         }
 
         conn.local_params = local_params;
+        conn.applyAckConfig(config);
         conn.enable_v2 = config.enable_v2;
         conn.disable_pmtud = config.disable_pmtud;
 
@@ -1027,10 +1098,8 @@ pub const Connection = struct {
         conn.handshake_timeout_ns = idleTimeoutNs(config.handshake_timeout);
 
         // Resize datagram queues if configured larger than default
-        if (config.datagram_queue_capacity > DatagramQueue.DEFAULT_MAX_ITEMS) {
-            try conn.datagram_recv_queue.resize(allocator, config.datagram_queue_capacity);
-            try conn.datagram_send_queue.resize(allocator, config.datagram_queue_capacity);
-        }
+        conn.datagram_recv_queue.max_items = config.datagram_queue_capacity;
+        conn.datagram_send_queue.max_items = config.datagram_queue_capacity;
     }
 
     /// Convenience wrapper for callers with stack to spare.
@@ -1050,12 +1119,39 @@ pub const Connection = struct {
         return conn;
     }
 
+    /// Holds 1-RTT ACKs to the max_ack_delay the transport parameters
+    /// advertise, with `config`'s byte threshold.
+    fn applyAckConfig(self: *Connection, config: ConnectionConfig) void {
+        const app = &self.pkt_handler.recv[@backingInt(ack_handler.EncLevel.application)];
+        app.max_ack_delay_ns = @as(i64, config.max_ack_delay) * std.time.ns_per_ms;
+        app.ack_bytes_threshold = config.ack_bytes_threshold;
+        self.ack_freq_wanted = self.is_server and config.request_ack_frequency;
+    }
+
+    /// Asks the peer to acknowledge less often (draft-ietf-quic-ack-frequency
+    /// 4). Its own max_ack_delay stays: a longer one would add to our PTO
+    /// (7), and with it to recovering a lost last packet.
+    fn requestAckFrequency(self: *Connection) void {
+        const peer = self.peer_params orelse return;
+        if (peer.min_ack_delay == null) return;
+        self.pushReliable(.{ .ack_frequency = .{
+            .sequence_number = self.ack_freq_send_seq,
+            .ack_eliciting_threshold = ACK_FREQUENCY_THRESHOLD,
+            // Never under its min_ack_delay, which may not exceed it.
+            .request_max_ack_delay = peer.max_ack_delay * std.time.us_per_ms,
+            .reordering_threshold = 1,
+        } });
+        self.ack_freq_send_seq += 1;
+    }
+
     pub fn deinit(self: *Connection) void {
         if (self.tls13_hs) |hs| {
             hs.deinit();
             self.allocator.destroy(hs);
             self.tls13_hs = null;
         }
+        if (self.peer_cert) |cert| self.allocator.free(cert);
+        self.peer_cert = null;
         if (self.qlog_writer) |*ql| {
             const now: i64 = @intCast(sys.nanoTimestamp());
             ql.connectionClosed(now, "application", 0);
@@ -1066,8 +1162,10 @@ pub const Connection = struct {
         self.pkt_handler.deinit();
         self.streams.deinit();
         self.crypto_streams.deinit();
-        self.datagram_recv_queue.deinitQueue();
-        self.datagram_send_queue.deinitQueue();
+        self.undecryptable.reset(self.allocator);
+        self.pending_frames.deinit();
+        self.datagram_recv_queue.deinitQueue(self.allocator);
+        self.datagram_send_queue.deinitQueue(self.allocator);
         self.control_retry.deinit(self.allocator);
         self.retiring_cids.deinit(self.allocator);
     }
@@ -1241,7 +1339,7 @@ pub const Connection = struct {
             try self.processFrame(&frame, .application, now);
             remaining = remaining[frame_len..];
         }
-        try self.pkt_handler.onPacketReceived(.application, header.packet_number, ack_eliciting, now, info.ecn);
+        try self.pkt_handler.onPacketReceived(.application, header.packet_number, ack_eliciting, now, info.ecn, payload.len);
         if (header.packet_number + 1 > self.pkt_num_spaces[2].next_packet_number) {
             self.pkt_num_spaces[2].next_packet_number = header.packet_number + 1;
         }
@@ -1263,8 +1361,8 @@ pub const Connection = struct {
     fn bufferUndecryptable(self: *Connection, header: *packet.Header, fbs: anytype, info: RecvInfo, what: []const u8) void {
         if (self.replaying_undecryptable) return;
         const bytes = currentPacketBytes(header, fbs) orelse return;
-        self.undecryptable.push(bytes, info);
-        std.log.info("recv: buffered undecryptable {s} packet ({d} bytes; {d} queued)", .{ what, bytes.len, self.undecryptable.count });
+        self.undecryptable.push(self.allocator, bytes, info);
+        std.log.debug("recv: buffered undecryptable {s} packet ({d} bytes; {d} queued)", .{ what, bytes.len, self.undecryptable.count });
     }
 
     /// Replay packets that were buffered because their keys weren't installed
@@ -1275,21 +1373,24 @@ pub const Connection = struct {
     fn replayUndecryptable(self: *Connection) void {
         const n = self.undecryptable.count;
         if (n == 0) return;
-        std.log.info("replaying {d} buffered undecryptable packet(s)", .{n});
+        std.log.debug("replaying {d} buffered undecryptable packet(s)", .{n});
         // Don't re-credit received bytes on replay (anti-amplification:
         // keeps the server conservative — RFC 9000 §8.1).
-        var rinfo = self.undecryptable.info;
+        // Taken out first: a replayed packet may finish the handshake, and
+        // that resets the queue under us.
+        var held = self.undecryptable;
+        self.undecryptable = .{};
+        defer held.reset(self.allocator);
+        var rinfo = held.info;
         rinfo.datagram_size = 0;
+        rinfo.now = null; // read long before
         self.replaying_undecryptable = true;
         defer self.replaying_undecryptable = false;
         for (0..n) |i| {
-            const off = self.undecryptable.off[i];
-            const len = self.undecryptable.plen[i];
-            var rfbs = io.fixedBufferStream(self.undecryptable.buf[off..][0..len]);
+            var rfbs = io.fixedBufferStream(held.buf.?[held.off[i]..][0..held.plen[i]]);
             var h = packet.Header.parse(&rfbs, self.scid_len) catch continue;
             self.recv(&h, &rfbs, rinfo) catch continue;
         }
-        self.undecryptable.reset();
     }
 
     /// Replay buffered packets if a read key was just installed. Safe to call
@@ -1346,14 +1447,16 @@ pub const Connection = struct {
         // Initial keys come from public inputs, so the header proves nothing:
         // a client moves only for an Initial that opens under the new
         // version's keys, and only once.
-        var prior: ?VersionState = null;
+        var prior: VersionState = undefined; // not an optional: null is 800 bytes zeroed per packet
+        var switched = false;
         var opened = false;
-        defer if (prior) |p| {
-            if (opened) self.version_negotiated = true else self.restoreVersion(p);
+        defer if (switched) {
+            if (opened) self.version_negotiated = true else self.restoreVersion(prior);
         };
         if (!self.is_server and self.enable_v2 and header.version != 0 and header.version != self.version) {
             if (header.packet_type != .initial or self.version_negotiated or !protocol.isSupportedVersion(header.version)) return;
             prior = self.versionState();
+            switched = true;
             try self.switchVersion(header.version);
         }
 
@@ -1425,7 +1528,7 @@ pub const Connection = struct {
             return error.ProtocolViolation;
         }
 
-        const now: i64 = @intCast(sys.nanoTimestamp());
+        const now: i64 = info.now orelse sys.nanoTimestamp();
 
         // RFC 9000 §8.1: Receipt of a Handshake packet from the client confirms
         // address ownership (client derived keys → it processed our Initial).
@@ -1506,11 +1609,6 @@ pub const Connection = struct {
         }
 
         self.current_dcid_seq = null;
-        if (header.packet_type == .one_rtt) {
-            for (&self.local_cid_pool.entries) |*e| {
-                if (e.occupied and std.mem.eql(u8, e.getCid(), header.dcid)) self.current_dcid_seq = e.seq_num;
-            }
-        }
 
         // Process all frames from the decrypted payload
         var ack_eliciting = false;
@@ -1556,11 +1654,17 @@ pub const Connection = struct {
             }
 
             // Track frames for QLOG
-            if (qlog_frame_count < qlog_frames.len) {
+            if (self.qlog_writer != null and qlog_frame_count < qlog_frames.len) {
                 qlog_frames[qlog_frame_count] = frame;
                 qlog_frame_count += 1;
             }
 
+            // Only this frame asks, so the scan isn't paid per packet.
+            if (frame == .retire_connection_id and header.packet_type == .one_rtt) {
+                for (&self.local_cid_pool.entries) |*e| {
+                    if (e.occupied and std.mem.eql(u8, e.getCid(), header.dcid)) self.current_dcid_seq = e.seq_num;
+                }
+            }
             try self.processFrame(&frame, epoch, now);
 
             remaining = remaining[frame_len..];
@@ -1574,7 +1678,7 @@ pub const Connection = struct {
         }
 
         // Record receipt for ACK generation
-        try self.pkt_handler.onPacketReceived(enc_level, header.packet_number, ack_eliciting, now, info.ecn);
+        try self.pkt_handler.onPacketReceived(enc_level, header.packet_number, ack_eliciting, now, info.ecn, payload.len);
 
         // Update expected packet number for correct decoding of subsequent packets
         // (critical for coalesced packets where multiple packets share a datagram)
@@ -1721,13 +1825,23 @@ pub const Connection = struct {
 
     /// Process a single frame.
     pub fn processFrame(self: *Connection, frame: *const Frame, epoch: packet.Epoch, now: i64) !void {
+        switch (frame.*) { // see app_frames
+            .padding, .ping, .ack, .ack_ecn, .new_connection_id, .retire_connection_id => {},
+            .path_challenge, .path_response, .ack_frequency, .immediate_ack => {},
+            .datagram, .datagram_with_length => if (self.datagram_recv_callback == null) {
+                self.app_frames = true; // queued for a poll to read
+            },
+            else => self.app_frames = true,
+        }
         switch (frame.*) {
             .padding => {},
             .ping => {},
 
             .ack => |ack| {
                 const enc_level = epochToEncLevel(epoch);
-                if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack.ack_ranges[0..ack.ack_range_count])) {
+                var ranges_buf: [frame_mod.MAX_ACK_RANGES]frame_mod.AckRange = undefined;
+                const ack_ranges = ack.ack_ranges.slice(&ranges_buf);
+                if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack_ranges)) {
                     self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.ack), "ACK for unsent packet");
                     return error.ProtocolViolation;
                 }
@@ -1745,7 +1859,7 @@ pub const Connection = struct {
                     ack.largest_ack,
                     ack.ack_delay,
                     @intCast(peer_tp.ack_delay_exponent),
-                    ack.ack_ranges[0..ack.ack_range_count],
+                    ack_ranges,
                     ack.first_ack_range,
                     now,
                     &self.ack_result,
@@ -1807,7 +1921,7 @@ pub const Connection = struct {
 
                     // Check if this is an MTU probe loss — don't trigger CC
                     if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {
-                        std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
+                        std.log.debug("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
                         has_non_probe_loss = true;
                         if (earliest_lost_sent_time == null or pkt.time_sent < earliest_lost_sent_time.?) {
@@ -1871,7 +1985,9 @@ pub const Connection = struct {
 
             .ack_ecn => |ack| {
                 const enc_level = epochToEncLevel(epoch);
-                if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack.ack_ranges[0..ack.ack_range_count])) {
+                var ranges_buf: [frame_mod.MAX_ACK_RANGES]frame_mod.AckRange = undefined;
+                const ack_ranges = ack.ack_ranges.slice(&ranges_buf);
+                if (self.pkt_handler.acksUnsentPacket(enc_level, ack.largest_ack, ack.first_ack_range, ack_ranges)) {
                     self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.ack_ecn), "ACK for unsent packet");
                     return error.ProtocolViolation;
                 }
@@ -1887,7 +2003,7 @@ pub const Connection = struct {
                     ack.largest_ack,
                     ack.ack_delay,
                     @intCast(peer_tp.ack_delay_exponent),
-                    ack.ack_ranges[0..ack.ack_range_count],
+                    ack_ranges,
                     ack.first_ack_range,
                     now,
                     &self.ack_result,
@@ -1950,7 +2066,7 @@ pub const Connection = struct {
                     if (pkt.has_datagram) self.datagrams_lost_outgoing += 1;
 
                     if (self.mtu_discoverer.onProbeLost(pkt.pn, now)) {
-                        std.log.info("PMTUD: probe lost pn={d}", .{pkt.pn});
+                        std.log.debug("PMTUD: probe lost pn={d}", .{pkt.pn});
                     } else {
                         has_non_probe_loss = true;
                         if (earliest_lost_sent_time_ecn == null or pkt.time_sent < earliest_lost_sent_time_ecn.?) {
@@ -2022,7 +2138,7 @@ pub const Connection = struct {
 
                 // If valid and CE count increased, treat as congestion event
                 if (ecn_valid and ack.ecn_ce > self.peer_ecn_ce[space_idx]) {
-                    std.log.info("ECN: CE count increased {d} -> {d}, congestion signal", .{ self.peer_ecn_ce[space_idx], ack.ecn_ce });
+                    std.log.debug("ECN: CE count increased {d} -> {d}, congestion signal", .{ self.peer_ecn_ce[space_idx], ack.ecn_ce });
                     self.cc.onCongestionEvent(now, now);
                 }
                 self.peer_ecn_ect0[space_idx] = ack.ecn_ect0;
@@ -2435,7 +2551,7 @@ pub const Connection = struct {
                     if (self.datagram_recv_callback) |cb| {
                         cb(d.data, self.datagram_recv_ctx);
                     } else {
-                        if (!self.datagram_recv_queue.push(d.data)) {
+                        if (!self.datagram_recv_queue.push(self.allocator, d.data)) {
                             self.datagrams_dropped_incoming += 1;
                         }
                     }
@@ -2448,7 +2564,7 @@ pub const Connection = struct {
                     if (self.datagram_recv_callback) |cb| {
                         cb(d.data, self.datagram_recv_ctx);
                     } else {
-                        if (!self.datagram_recv_queue.push(d.data)) {
+                        if (!self.datagram_recv_queue.push(self.allocator, d.data)) {
                             self.datagrams_dropped_incoming += 1;
                         }
                     }
@@ -2456,13 +2572,18 @@ pub const Connection = struct {
             },
 
             .ack_frequency => |af| {
-                // draft-ietf-quic-ack-frequency: update ACK generation parameters
-                if (!self.peer_supports_ack_freq) {
+                // draft-ietf-quic-ack-frequency 3: allowed by OUR min_ack_delay,
+                // whether or not the peer advertised its own.
+                if (self.local_params.min_ack_delay == null) {
                     self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY not negotiated");
                     return error.ProtocolViolation;
                 }
-                if (af.request_max_ack_delay < (self.local_params.min_ack_delay orelse 0)) {
-                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY delay under min_ack_delay");
+                // draft-ietf-quic-ack-frequency 4: under our min_ack_delay, or
+                // 2^14 ms or more (RFC 9000 18.2's limit), is invalid.
+                if (af.request_max_ack_delay < (self.local_params.min_ack_delay orelse 0) or
+                    af.request_max_ack_delay >= (1 << 14) * std.time.us_per_ms)
+                {
+                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY delay out of range");
                     return error.ProtocolViolation;
                 }
                 const applied = self.pkt_handler.recv[2].applyAckFrequency(
@@ -2549,7 +2670,7 @@ pub const Connection = struct {
             return;
         }
 
-        std.log.info("advanceHandshake: state={}, iterations starting", .{@backingInt(hs.state)});
+        std.log.debug("advanceHandshake: state={}, iterations starting", .{@backingInt(hs.state)});
 
         // RFC 9001 §4.1.3: TLS reads each level's CRYPTO data only while it
         // is at that level; the rest waits in its own stream.
@@ -2588,7 +2709,7 @@ pub const Connection = struct {
                 self.closeWithTransportError(TransportError.cryptoError(tls_alert), @backingInt(FrameType.crypto), "TLS handshake failure");
                 return;
             };
-            std.log.info("advanceHandshake: step {d} produced action={s}", .{ iterations, @tagName(action) });
+            std.log.debug("advanceHandshake: step {d} produced action={s}", .{ iterations, @tagName(action) });
 
             // Moving to a new level: nothing may be left of the old one.
             const next_level = hs.readLevel();
@@ -2609,7 +2730,7 @@ pub const Connection = struct {
                     // Log hash of data being written to crypto stream for corruption debugging
                     var data_hash: [32]u8 = undefined;
                     std.crypto.hash.sha2.Sha256.hash(sd.data, &data_hash, .{});
-                    std.log.info("advanceHandshake: writing {d} bytes to level {}, first4={x:0>2}{x:0>2}{x:0>2}{x:0>2}, sha256={x}", .{
+                    std.log.debug("advanceHandshake: writing {d} bytes to level {}, first4={x:0>2}{x:0>2}{x:0>2}{x:0>2}, sha256={x}", .{
                         sd.data.len,
                         cs_level,
                         sd.data[0],
@@ -2710,7 +2831,7 @@ pub const Connection = struct {
                     if (self.is_server) {
                         self.pending_replay_undecryptable = true;
                     } else {
-                        self.undecryptable.reset();
+                        self.undecryptable.reset(self.allocator);
                         self.pending_replay_undecryptable = false;
                     }
 
@@ -2738,13 +2859,6 @@ pub const Connection = struct {
                         // Server must send HANDSHAKE_DONE to the client (RFC 9001 Section 4.1.2)
                         self.packer.send_handshake_done = true;
                         self.handshake_done_pending = true;
-
-                        // draft-ietf-quic-ack-frequency: disabled for now.
-                        // Sending ACK_FREQUENCY changes the browser's ACK behavior,
-                        // which can negatively impact datagram latency in ping-pong patterns.
-                        // The RFC 9000 default (ACK every 2 ack-eliciting packets) works well
-                        // for interactive workloads. Re-enable for bulk transfer scenarios.
-                        // if (self.peer_supports_ack_freq) { ... }
                     }
                     // Client: Keep Handshake keys until HANDSHAKE_DONE received (RFC 9001 §4.9.2)
                     // This allows the client to ACK server's Handshake retransmissions under loss
@@ -2837,10 +2951,8 @@ pub const Connection = struct {
                             peer_tp.initial_max_data,
                         });
 
-                        // draft-ietf-quic-ack-frequency: detect peer support
-                        if (peer_tp.min_ack_delay != null) {
-                            self.peer_supports_ack_freq = true;
-                        }
+                        // draft-ietf-quic-ack-frequency, if the peer supports it
+                        if (self.ack_freq_wanted) self.requestAckFrequency();
 
                         // Client: migrate to server's preferred address (RFC 9000 §9.6)
                         if (!self.is_server) {
@@ -2878,13 +2990,7 @@ pub const Connection = struct {
                                     const challenge = self.paths[candidate_idx].validator.startChallenge();
                                     self.pending_frames.push(.{ .path_challenge = challenge });
 
-                                    // Reset CC/RTT/MTU/ECN for new IP
-                                    self.cc = congestion.Cubic.init();
-                                    self.pacer = congestion.Pacer.init();
-                                    self.pkt_handler.rtt_stats = rtt.RttStats{};
-                                    self.mtu_discoverer.reset();
-                                    self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
-                                    self.ecn_validator.reset();
+                                    self.resetPathEstimates();
 
                                     const migrating_to_v4 = !current_is_v4 and pref.hasIpv4();
                                     std.log.info("preferred_address: migrating from {s} to {s} port {d}", .{
@@ -2923,6 +3029,7 @@ pub const Connection = struct {
                     // Start PMTUD now that the handshake is complete
                     if (!self.disable_pmtud) self.mtu_discoverer.start();
 
+                    if (self.is_server) self.releaseHandshake();
                     break;
                 },
                 ._continue => continue,
@@ -3058,6 +3165,7 @@ pub const Connection = struct {
                 .error_code = ss.reset_err.?,
                 .final_size = ss.send_offset,
             } });
+            if (!ss.reset_stream_sent) self.framesStillDue();
         }
     }
 
@@ -3075,10 +3183,10 @@ pub const Connection = struct {
     }
 
     /// Packets sent from here to `endBurst` share one flow-control scan,
-    /// the first `send`'s. The scan walks every stream; between the sends of
-    /// a burst nothing it reads changes but through the packer, and what
-    /// the packer changes (a stream finishing, a limit reached) can wait
-    /// for the next burst.
+    /// the first `send`'s. The scan can walk every stream; between the
+    /// sends of a burst nothing it reads changes but through the packer,
+    /// and what the packer changes (a stream finishing, a limit reached)
+    /// can wait for the next burst.
     pub fn beginBurst(self: *Connection) void {
         self.burst = .fresh;
     }
@@ -3110,11 +3218,21 @@ pub const Connection = struct {
         // and MAX_STREAMS updates can fire.
         self.streams.collectClosedStreams();
 
+        // What streams raised since the last scan. Without a ledger no stream
+        // has been made through the map to raise anything, so look anyway.
+        const ledger = self.streams.send_ledger;
+        const credit_due = if (ledger) |l| l.credit_due else true;
+        const frames_due = if (ledger) |l| l.frames_due else true;
+        if (ledger) |l| {
+            l.credit_due = false;
+            l.frames_due = false;
+        }
+
         // MAX_DATA grows only with what the consumer took or a reset abandoned.
         // With every byte charged already credited, no stream has any to give.
         const conn_fc = &self.conn_flow_ctrl.base;
         var credit: u64 = 0;
-        if (conn_fc.bytes_read != conn_fc.highest_received) {
+        if (credit_due and conn_fc.bytes_read != conn_fc.highest_received) {
             credit = self.streams.takeConnCredit();
             self.conn_flow_ctrl.addBytesRead(credit);
         }
@@ -3169,6 +3287,10 @@ pub const Connection = struct {
             self.pending_frames.push(.{ .data_blocked = limit });
         }
 
+        // RESET_STREAM, STOP_SENDING and STREAM_DATA_BLOCKED come due only
+        // where a stream raises `frames_due`; one the queue turns away
+        // raises it again.
+        if (!frames_due) return;
         {
             // One walk of the bidi streams for both directions' frames.
             var stream_it = self.streams.streams.valueIterator();
@@ -3210,6 +3332,12 @@ pub const Connection = struct {
             .stream_id = rs.stream_id,
             .error_code = rs.stop_sending_err.?,
         } });
+        if (!rs.stop_sending_sent) self.framesStillDue();
+    }
+
+    /// Bring the next scan back for a frame the queue had no room for.
+    fn framesStillDue(self: *Connection) void {
+        if (self.streams.send_ledger) |l| l.frames_due = true;
     }
 
     /// RFC 9000 4.1: the connection window bounds the sum over streams of each
@@ -3304,6 +3432,11 @@ pub const Connection = struct {
                 else
                     continue,
                 .new_token => self.newTokenFrame() orelse continue,
+                // draft-ietf-quic-ack-frequency 4: another, with the next sequence number.
+                .ack_frequency => {
+                    self.requestAckFrequency();
+                    continue;
+                },
             };
             self.pushReliable(frame);
         }
@@ -3366,6 +3499,7 @@ pub const Connection = struct {
             }
 
             // First time: build close packet at best available encryption level
+            self.packer.window_left = null;
             const app_seal: ?*const quic_crypto.Seal = if (self.key_update) |*ku|
                 &ku.current_seal
             else
@@ -3494,6 +3628,14 @@ pub const Connection = struct {
 
         self.packer.conn_flow_ctrl = &self.conn_flow_ctrl;
         self.packer.ecn_mark = self.ecn_validator.shouldMark();
+        // Once the peer was asked for fewer ACKs, the packet that fills the
+        // window, or a probe, asks for one at once.
+        self.packer.window_left = if (self.ack_freq_send_seq == 0)
+            null
+        else if (self.pto_probe_pending > 0)
+            0
+        else
+            self.cc.sendWindow() -| self.pkt_handler.bytes_in_flight;
 
         const bytes_written = try self.packer.packCoalesced(
             send_buf,
@@ -3668,12 +3810,7 @@ pub const Connection = struct {
         const old_path = &self.paths[1 - candidate_idx];
         const same_ip = sockaddrSameIp(&new_peer_addr, &old_path.peer_addr);
         if (!same_ip) {
-            self.cc = congestion.Cubic.init();
-            self.pacer = congestion.Pacer.init();
-            self.pkt_handler.rtt_stats = rtt.RttStats{};
-            self.mtu_discoverer.reset();
-            self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
-            self.ecn_validator.reset();
+            self.resetPathEstimates();
             std.log.info("migration: IP changed, reset CC, RTT, MTU and ECN", .{});
         } else {
             // NAT rebinding (port-only change): keep CC and MTU, but the new
@@ -3687,7 +3824,34 @@ pub const Connection = struct {
         }
     }
 
+    /// A new peer IP: congestion control, RTT, MTU and ECN start over (RFC
+    /// 9000 9.4). max_ack_delay stays: it is the peer's transport parameter,
+    /// or what we asked it for, not an estimate of the path.
+    fn resetPathEstimates(self: *Connection) void {
+        self.cc = congestion.Cubic.init();
+        self.pacer = congestion.Pacer.init();
+        self.pkt_handler.rtt_stats = .{ .max_ack_delay = self.pkt_handler.rtt_stats.max_ack_delay };
+        self.mtu_discoverer.reset();
+        self.packer.max_packet_size = mtu_mod.BASE_PLPMTU;
+        self.ecn_validator.reset();
+    }
+
     /// Check for timeouts and maintenance tasks.
+    /// The idle timeout in force: at least 3x the base PTO, so that probes get
+    /// a chance to be answered (RFC 9000 10.1), and while a packet is in
+    /// flight long enough to cover the PTO backoff, up to 5 doublings. Past
+    /// that it would keep a dead peer's connection for minutes.
+    fn effectiveIdleNs(self: *const Connection) i64 {
+        const base_pto = self.pkt_handler.rtt_stats.pto();
+        var effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
+        const app_idx = @backingInt(ack_handler.EncLevel.application);
+        if (self.handshake_confirmed and self.pkt_handler.sent[app_idx].ack_eliciting_in_flight > 0) {
+            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 5));
+            effective_idle = @max(effective_idle, 3 * (base_pto << shift));
+        }
+        return effective_idle;
+    }
+
     pub fn onTimeout(self: *Connection) !void {
         if (self.state == .terminated) return;
 
@@ -3717,26 +3881,9 @@ pub const Connection = struct {
         if (self.key_update) |*ku| ku.maybeDropPrevKeys(now);
 
         // Check idle timeout (RFC 9000 §10.1, §10.1.2)
-        // The effective idle timeout MUST be at least 3× the *base* PTO (without backoff)
-        // to avoid terminating the connection before probes have a chance to be answered.
-        //
-        // When data is in flight, extend idle to cover the current PTO backoff schedule,
-        // but cap at 5 retries to prevent indefinite extension (e.g. server broadcasting
-        // to a dead peer would otherwise grow effective_idle to 180s+).
-        {
-            const base_pto = self.pkt_handler.rtt_stats.pto();
-            var effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
-            const app_idx = @backingInt(ack_handler.EncLevel.application);
-            if (self.handshake_confirmed and self.pkt_handler.sent[app_idx].ack_eliciting_in_flight > 0) {
-                const capped_pto_count = @min(self.pkt_handler.pto_count, 5);
-                const shift: u6 = @intCast(capped_pto_count);
-                const backed_off_pto = base_pto << shift;
-                effective_idle = @max(effective_idle, 3 * backed_off_pto);
-            }
-            if (now - self.idleTimerStart() > effective_idle) {
-                self.state = .terminated;
-                return;
-            }
+        if (now - self.idleTimerStart() > self.effectiveIdleNs()) {
+            self.state = .terminated;
+            return;
         }
         // Auto-close: when close_when_idle is set and all stream data has been
         // sent (FIN queued, no pending retransmissions), close the connection.
@@ -3810,12 +3957,14 @@ pub const Connection = struct {
 
         // Check PTO — fire when any space has an expired deadline.
         // Loss detection and PTO can both fire in the same onTimeout() call.
-        if (self.pkt_handler.getPtoTimeout()) |pto_time| {
+        if (self.pkt_handler.getPtoTimeout(self.handshake_confirmed)) |pto_time| {
             if (now >= pto_time) {
                 self.pkt_handler.pto_count += 1;
                 // Increment per-space PTO count for the space that triggered
-                if (self.pkt_handler.getPtoSpace()) |pto_space| {
-                    self.pkt_handler.sent[@backingInt(pto_space)].pto_count += 1;
+                if (self.pkt_handler.getPtoSpace(self.handshake_confirmed)) |pto_space| {
+                    const tracker = &self.pkt_handler.sent[@backingInt(pto_space)];
+                    tracker.pto_count += 1;
+                    tracker.pto_fired_at = now;
                 }
 
                 // Force-arm ACKs so probes include acknowledgements.
@@ -3845,8 +3994,11 @@ pub const Connection = struct {
                 // without, the probe is a PING — the client's anti-deadlock
                 // probe (RFC 9002 §6.2.2.1).
                 {
+                    // A client with Handshake keys has had its ClientHello
+                    // answered; a server has them as soon as it sends its
+                    // ServerHello, which the client may never have seen.
                     const has_hs_keys = self.pkt_num_spaces[1].crypto_seal != null;
-                    if (!has_hs_keys and self.pkt_num_spaces[0].crypto_seal != null and self.pkt_handler.cryptoInFlight(.initial)) {
+                    if ((self.is_server or !has_hs_keys) and self.pkt_num_spaces[0].crypto_seal != null and self.pkt_handler.cryptoInFlight(.initial)) {
                         self.queueCryptoRetransmission(.initial);
                     }
                     if (self.pkt_num_spaces[1].crypto_seal != null and self.pkt_handler.cryptoInFlight(.handshake)) {
@@ -3923,7 +4075,7 @@ pub const Connection = struct {
                     // without ever probing: 22365 fires in 10 s of
                     // handshakecorruption. Letting the app space stay quiet is
                     // deliberate, so that a delivered connection can idle out.
-                    const in_handshake_space = if (self.pkt_handler.getPtoSpace()) |sp|
+                    const in_handshake_space = if (self.pkt_handler.getPtoSpace(self.handshake_confirmed)) |sp|
                         sp != .application
                     else
                         false;
@@ -3937,8 +4089,8 @@ pub const Connection = struct {
                 // PTO fire for burst loss resilience. With burst_to_client=3, a single
                 // probe can be wiped; 2 probes double the chance of getting through.
                 self.pto_probe_pending = 2;
-                if (self.pkt_handler.getPtoSpace()) |space| {
-                    std.log.info("PTO fired: count={d}, space={s}, has_data={}", .{ self.pkt_handler.pto_count, @tagName(space), has_data });
+                if (self.pkt_handler.getPtoSpace(self.handshake_confirmed)) |space| {
+                    std.log.debug("PTO fired: count={d}, space={s}, has_data={}", .{ self.pkt_handler.pto_count, @tagName(space), has_data });
                 }
             }
         }
@@ -4005,6 +4157,11 @@ pub const Connection = struct {
         }
         if (peer_tp.max_ack_delay >= 16384) {
             self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "max_ack_delay exceeds 2^14");
+            return error.TransportParameterError;
+        }
+        // draft-ietf-quic-ack-frequency 3 (µs against ms).
+        if ((peer_tp.min_ack_delay orelse 0) > peer_tp.max_ack_delay * std.time.us_per_ms) {
+            self.closeWithTransportError(@backingInt(TransportError.transport_parameter_error), @backingInt(FrameType.crypto), "min_ack_delay above max_ack_delay");
             return error.TransportParameterError;
         }
 
@@ -4121,10 +4278,18 @@ pub const Connection = struct {
     /// Returns error.DatagramsNotEnabled, error.DatagramTooLarge (permanent — reduce payload),
     /// or error.DatagramQueueFull (transient — retry after sending).
     pub fn sendDatagram(self: *Connection, data: []const u8) !void {
+        return self.sendDatagramParts(&.{data});
+    }
+
+    /// `sendDatagram` of the parts one after another, as one datagram: a
+    /// header goes in front without first copying the payload behind it.
+    pub fn sendDatagramParts(self: *Connection, parts: []const []const u8) !void {
         if (!self.datagrams_enabled) return error.DatagramsNotEnabled;
-        if (data.len > DatagramQueue.MAX_DATAGRAM_SIZE) return error.DatagramTooLarge;
+        var len: usize = 0;
+        for (parts) |p| len += p.len;
+        if (len > DatagramQueue.MAX_DATAGRAM_SIZE) return error.DatagramTooLarge;
         if (self.datagram_send_queue.isFull()) return error.DatagramQueueFull;
-        _ = self.datagram_send_queue.push(data);
+        if (!self.datagram_send_queue.pushParts(self.allocator, parts)) return error.OutOfMemory;
     }
 
     /// Returns true if the datagram send queue is full.
@@ -4204,34 +4369,54 @@ pub const Connection = struct {
     /// has got that far. A server that advertises several — two MoQ drafts,
     /// say — needs this to know which one it is speaking.
     pub fn negotiatedAlpn(self: *const Connection) []const u8 {
-        const hs = self.tls13_hs orelse return "";
+        const hs = self.tls13_hs orelse return self.alpn_buf[0..self.alpn_len];
         return hs.negotiatedAlpn();
     }
 
     /// Server: the client's verified certificate (DER leaf); see
     /// `Tls13Handshake.peerCertificate`.
     pub fn peerCertificate(self: *const Connection) ?[]const u8 {
-        const hs = self.tls13_hs orelse return null;
+        const hs = self.tls13_hs orelse return self.peer_cert;
         return hs.peerCertificate();
     }
 
     /// Server: the client-auth policy the handshake ran under, from the
     /// certificate entry SNI selected; null when none asked for a certificate.
     pub fn clientAuth(self: *const Connection) ?*const tls13.ClientAuth {
-        const hs = self.tls13_hs orelse return null;
+        const hs = self.tls13_hs orelse return self.client_auth;
         return hs.client_auth;
     }
 
+    /// Free a finished server handshake, keeping what the accessors above
+    /// still answer: 52 KB a connection otherwise held for its lifetime.
+    fn releaseHandshake(self: *Connection) void {
+        const hs = self.tls13_hs orelse return;
+        const alpn = hs.negotiatedAlpn();
+        if (alpn.len > self.alpn_buf.len) return;
+        @memcpy(self.alpn_buf[0..alpn.len], alpn);
+        self.alpn_len = @intCast(alpn.len);
+        self.client_auth = hs.client_auth;
+        // Its allocator is ours (acceptInto), so the certificate can move.
+        self.peer_cert = hs.peer_cert;
+        hs.peer_cert = null;
+        hs.deinit();
+        self.allocator.destroy(hs);
+        self.tls13_hs = null;
+    }
+
     pub fn recvDatagram(self: *Connection, buf: []u8) ?usize {
-        const now: i64 = @intCast(sys.nanoTimestamp());
-        return self.datagram_recv_queue.popSkipExpired(buf, now);
+        const q = &self.datagram_recv_queue;
+        // Polled per connection per pass, mostly empty: no clock without an age limit.
+        if (q.max_age_ns == null) return q.pop(buf);
+        return q.popSkipExpired(buf, @intCast(sys.nanoTimestamp()));
     }
 
     /// Zero-copy datagram receive: returns a slice into the internal ring buffer.
     /// Caller MUST call consumeDatagram() after processing the data.
     pub fn peekDatagram(self: *Connection) ?[]const u8 {
-        const now: i64 = @intCast(sys.nanoTimestamp());
-        return self.datagram_recv_queue.peekDataSkipExpired(now);
+        const q = &self.datagram_recv_queue;
+        if (q.max_age_ns == null) return q.peekData();
+        return q.peekDataSkipExpired(@intCast(sys.nanoTimestamp()));
     }
 
     /// Advance past the datagram returned by peekDatagram().
@@ -4241,12 +4426,12 @@ pub const Connection = struct {
 
     /// Set max age for incoming datagrams (milliseconds). null = no limit.
     pub fn setIncomingDatagramMaxAge(self: *Connection, max_age_ms: ?u64) void {
-        self.datagram_recv_queue.max_age_ns = if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null;
+        self.datagram_recv_queue.setMaxAge(if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null, @intCast(sys.nanoTimestamp()));
     }
 
     /// Set max age for outgoing datagrams (milliseconds). null = no limit.
     pub fn setOutgoingDatagramMaxAge(self: *Connection, max_age_ms: ?u64) void {
-        self.datagram_send_queue.max_age_ns = if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null;
+        self.datagram_send_queue.setMaxAge(if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null, @intCast(sys.nanoTimestamp()));
     }
 
     /// Set high water mark for incoming datagram queue (count).
@@ -4286,9 +4471,6 @@ pub const Connection = struct {
         return false;
     }
 
-    /// Compute the next timeout deadline (nanosecond timestamp) without side effects.
-    /// Returns null if the connection is terminated and needs no timer.
-    /// Used by event loop to schedule the global timer.
     /// When a connection still in its handshake gives up on it; null once
     /// the handshake is done or the limit is off.
     fn handshakeDeadline(self: *const Connection) ?i64 {
@@ -4296,7 +4478,47 @@ pub const Connection = struct {
         return self.creation_time +| self.handshake_timeout_ns;
     }
 
+    /// Compute the next timeout deadline (nanosecond timestamp) without side effects.
+    /// Returns null if the connection is terminated and needs no timer.
+    /// Used by event loop to schedule the global timer.
     pub fn nextTimeoutNs(self: *const Connection) ?i64 {
+        return self.nextTimeoutNsAt(@intCast(sys.nanoTimestamp()));
+    }
+
+    /// `nextTimeoutNs` at `now`, a `sys.nanoTimestamp()` the caller read: an
+    /// event loop asks every connection each pass, and one read serves them all.
+    pub fn nextTimeoutNsAt(self: *const Connection, now: i64) ?i64 {
+        var earliest = self.nextOnTimeoutNs();
+        if (self.state == .terminated or self.state == .closing or self.state == .draining) return earliest;
+
+        // ACK alarm: if we have pending ACKs to send (delayed ACK timer),
+        // include the alarm deadline so the event loop wakes up in time (RFC 9000 §13.2.1).
+        for (self.pkt_handler.recv) |tracker| {
+            if (tracker.ack_alarm) |alarm| {
+                if (earliest == null or alarm < earliest.?) {
+                    earliest = alarm;
+                }
+            }
+        }
+
+        // Pacer: if the pacer has bandwidth set (active transfer), include its
+        // next-send time so the event loop wakes up promptly to send more data.
+        if (self.pacer.bandwidth_shifted > 0 and self.state == .connected) {
+            const delay = self.pacer.delayAt(now);
+            if (delay > 0) {
+                const pacer_deadline = now + delay;
+                if (earliest == null or pacer_deadline < earliest.?) {
+                    earliest = pacer_deadline;
+                }
+            }
+        }
+
+        return earliest;
+    }
+
+    /// When `onTimeout` next has something to do: `nextTimeoutNsAt` but for
+    /// the ACK alarm and the pacer, which a send answers.
+    pub inline fn nextOnTimeoutNs(self: *const Connection) ?i64 {
         if (self.state == .terminated) return null;
 
         var earliest: ?i64 = null;
@@ -4313,11 +4535,10 @@ pub const Connection = struct {
 
         earliest = self.handshakeDeadline();
 
-        // Idle timeout — use base PTO (no backoff), matching quic-go/quiche
+        // Idle timeout: the one onTimeout() acts on, or the loop wakes before it
+        // to find nothing to do, every pass, until it comes.
         {
-            const base_pto = self.pkt_handler.rtt_stats.pto();
-            const effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
-            const idle_deadline = self.idleTimerStart() + effective_idle;
+            const idle_deadline = self.idleTimerStart() + self.effectiveIdleNs();
             if (earliest == null or idle_deadline < earliest.?) {
                 earliest = idle_deadline;
             }
@@ -4350,7 +4571,7 @@ pub const Connection = struct {
             var pto_earliest: ?i64 = null;
             for (self.pkt_handler.sent, 0..) |tracker, idx| {
                 if (tracker.loss_time != null) continue; // handled above
-                const deadline = self.pkt_handler.spacePtoDeadline(tracker, idx) orelse continue;
+                const deadline = self.pkt_handler.spacePtoDeadline(tracker, idx, self.handshake_confirmed) orelse continue;
                 if (pto_earliest == null or deadline < pto_earliest.?) {
                     pto_earliest = deadline;
                 }
@@ -4366,30 +4587,24 @@ pub const Connection = struct {
         // last_ack_eliciting_sent_time for handshake spaces. For application space,
         // the loss detection timer + send loop handles retransmissions.
 
-        // ACK alarm: if we have pending ACKs to send (delayed ACK timer),
-        // include the alarm deadline so the event loop wakes up in time (RFC 9000 §13.2.1).
-        for (self.pkt_handler.recv) |tracker| {
-            if (tracker.ack_alarm) |alarm| {
-                if (earliest == null or alarm < earliest.?) {
-                    earliest = alarm;
-                }
-            }
-        }
-
-        // Pacer: if the pacer has bandwidth set (active transfer), include its
-        // next-send time so the event loop wakes up promptly to send more data.
-        if (self.pacer.bandwidth_shifted > 0 and self.state == .connected) {
-            const now: i64 = @intCast(sys.nanoTimestamp());
-            const delay = self.pacer.delayAt(now);
-            if (delay > 0) {
-                const pacer_deadline = now + delay;
-                if (earliest == null or pacer_deadline < earliest.?) {
-                    earliest = pacer_deadline;
-                }
-            }
-        }
-
         return earliest;
+    }
+
+    /// `onTimeout` until none of its deadlines has passed, so the PTOs of
+    /// several spaces that expired together all fire; at most 8 calls.
+    /// Returns how many it took. An ACK alarm that has passed stays due
+    /// until a send carries the ACK, so it is not one of the deadlines
+    /// checked here: it would take all 8 calls, each doing nothing.
+    pub fn fireTimers(self: *Connection) !usize {
+        var calls: usize = 0;
+        while (calls < 8) {
+            calls += 1;
+            try self.onTimeout();
+            if (self.isClosed()) break;
+            const next = self.nextOnTimeoutNs() orelse break;
+            if (next > sys.nanoTimestamp()) break;
+        }
+        return calls;
     }
 
     /// Drop Initial and Handshake encryption keys (RFC 9001 §4.9).
@@ -4751,7 +4966,8 @@ pub fn connectInto(
         .initial_max_streams_bidi = config.initial_max_streams_bidi,
         .initial_max_streams_uni = config.initial_max_streams_uni,
         .max_datagram_frame_size = config.max_datagram_frame_size,
-        .min_ack_delay = 1000, // 1ms minimum ACK delay (draft-ietf-quic-ack-frequency)
+        .max_ack_delay = config.max_ack_delay,
+        .min_ack_delay = minAckDelayUs(config.max_ack_delay),
         .initial_source_connection_id = .init(&scid),
     };
 
@@ -4764,6 +4980,7 @@ pub fn connectInto(
 
     conn.* = Connection{
         .allocator = allocator,
+        .pending_frames = .{ .allocator = allocator },
         .version = protocol.SUPPORTED_VERSIONS[0],
         .is_server = false,
         .state = .first_flight,
@@ -4780,6 +4997,8 @@ pub fn connectInto(
 
         .local_params = local_params,
     };
+    conn.pkt_handler.is_client = true;
+    conn.applyAckConfig(config);
 
     // Set connection IDs
     conn.scid_len = 8;
@@ -4887,10 +5106,8 @@ pub fn connectInto(
     }
 
     // Resize datagram queues if configured larger than default
-    if (config.datagram_queue_capacity > DatagramQueue.DEFAULT_MAX_ITEMS) {
-        try conn.datagram_recv_queue.resize(allocator, config.datagram_queue_capacity);
-        try conn.datagram_send_queue.resize(allocator, config.datagram_queue_capacity);
-    }
+    conn.datagram_recv_queue.max_items = config.datagram_queue_capacity;
+    conn.datagram_send_queue.max_items = config.datagram_queue_capacity;
 
     return;
 }
@@ -4934,6 +5151,7 @@ test "Connection: init and basic state" {
 
     var conn = Connection{
         .allocator = std.testing.allocator,
+        .pending_frames = .{ .allocator = std.testing.allocator },
         .is_server = true,
         .dcid = dcid_val.*,
         .dcid_len = 8,
@@ -5108,15 +5326,16 @@ test "LocalCidPool: pool full" {
 // --- DatagramQueue tests ---
 
 test "DatagramQueue: push and pop" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     try std.testing.expect(q.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), q.queueLen());
     try std.testing.expect(!q.isFull());
 
     const data1 = "hello";
     const data2 = "world!";
-    try std.testing.expect(q.push(data1));
-    try std.testing.expect(q.push(data2));
+    try std.testing.expect(q.push(std.testing.allocator, data1));
+    try std.testing.expect(q.push(std.testing.allocator, data2));
     try std.testing.expect(!q.isEmpty());
     try std.testing.expectEqual(@as(usize, 2), q.queueLen());
 
@@ -5136,58 +5355,63 @@ test "DatagramQueue: push and pop" {
 }
 
 test "DatagramQueue: full queue" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     // Fill the queue (MAX_ITEMS = 32)
     var i: usize = 0;
     while (i < DatagramQueue.DEFAULT_MAX_ITEMS) : (i += 1) {
         try std.testing.expect(!q.isFull());
-        try std.testing.expect(q.push("data"));
+        try std.testing.expect(q.push(std.testing.allocator, "data"));
     }
     // Queue full — push should fail
     try std.testing.expect(q.isFull());
     try std.testing.expectEqual(@as(usize, DatagramQueue.DEFAULT_MAX_ITEMS), q.queueLen());
-    try std.testing.expect(!q.push("overflow"));
+    try std.testing.expect(!q.push(std.testing.allocator, "overflow"));
 }
 
 test "DatagramQueue: oversized datagram rejected" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     const big: [(DatagramQueue.MAX_DATAGRAM_SIZE + 1)]u8 = @splat(0xAA);
-    try std.testing.expect(!q.push(&big));
+    try std.testing.expect(!q.push(std.testing.allocator, &big));
     try std.testing.expect(q.isEmpty());
 }
 
 test "DatagramQueue: pop with small buffer" {
-    var q = DatagramQueue{};
-    try std.testing.expect(q.push("hello"));
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
+    try std.testing.expect(q.push(std.testing.allocator, "hello"));
     var small_buf: [2]u8 = undefined;
     // Buffer too small — should return null
     try std.testing.expect(q.pop(&small_buf) == null);
 }
 
 test "DatagramQueue: high water mark limits push" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     q.high_water_mark = 3;
 
-    try std.testing.expect(q.push("one"));
-    try std.testing.expect(q.push("two"));
-    try std.testing.expect(q.push("three"));
+    try std.testing.expect(q.push(std.testing.allocator, "one"));
+    try std.testing.expect(q.push(std.testing.allocator, "two"));
+    try std.testing.expect(q.push(std.testing.allocator, "three"));
     // At high water mark — push should fail
-    try std.testing.expect(!q.push("four"));
+    try std.testing.expect(!q.push(std.testing.allocator, "four"));
     try std.testing.expect(q.isFull());
     try std.testing.expectEqual(@as(usize, 3), q.queueLen());
 
     // Pop one, then push succeeds again
     var buf: [1200]u8 = undefined;
     _ = q.pop(&buf);
-    try std.testing.expect(q.push("four"));
+    try std.testing.expect(q.push(std.testing.allocator, "four"));
 }
 
 test "DatagramQueue: max age expiry on pop" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     q.max_age_ns = 10_000_000; // 10ms
 
-    try std.testing.expect(q.push("old"));
-    try std.testing.expect(q.push("new"));
+    try std.testing.expect(q.push(std.testing.allocator, "old"));
+    try std.testing.expect(q.push(std.testing.allocator, "new"));
 
     // Both datagrams are fresh — popSkipExpired should return first
     const now: i64 = @intCast(sys.nanoTimestamp());
@@ -5198,13 +5422,57 @@ test "DatagramQueue: max age expiry on pop" {
 }
 
 test "DatagramQueue: peekDataSkipExpired with no max age" {
-    var q = DatagramQueue{};
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     // No max_age set — behaves like peekData
-    try std.testing.expect(q.push("data"));
+    try std.testing.expect(q.push(std.testing.allocator, "data"));
     const now: i64 = @intCast(sys.nanoTimestamp());
     const peeked = q.peekDataSkipExpired(now);
     try std.testing.expect(peeked != null);
     try std.testing.expectEqualSlices(u8, "data", peeked.?);
+}
+
+test "DatagramQueue: keeps order across sizes as pops free the front" {
+    var q: DatagramQueue = .{ .max_items = 8 };
+    defer q.deinitQueue(std.testing.allocator);
+    var payload: [DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+    var buf: [DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
+    var pushed: usize = 0;
+    var popped: usize = 0;
+    // Sizes cycle 1..1200; three in, two out, until 500 have gone through.
+    while (popped < 500) {
+        for (0..3) |_| {
+            const n = 1 + (pushed * 37) % DatagramQueue.MAX_DATAGRAM_SIZE;
+            if (q.push(std.testing.allocator, payload[0..n])) pushed += 1;
+        }
+        for (0..2) |_| {
+            const len = q.pop(&buf) orelse break;
+            try std.testing.expectEqual(1 + (popped * 37) % DatagramQueue.MAX_DATAGRAM_SIZE, len);
+            try std.testing.expectEqualSlices(u8, payload[0..len], buf[0..len]);
+            popped += 1;
+        }
+    }
+}
+
+test "DatagramQueue: a queue drained each pass stays the size of one pass" {
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
+    var buf: [64]u8 = undefined;
+    for (0..1000) |_| {
+        for (0..4) |_| try std.testing.expect(q.push(std.testing.allocator, &buf));
+        while (q.pop(&buf)) |_| {}
+    }
+    try std.testing.expect(q.bytes.capacity < 4 * (DatagramQueue.header_len + buf.len) * 2);
+}
+
+test "DatagramQueue: an age limit set late counts from when it was set" {
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
+    try std.testing.expect(q.push(std.testing.allocator, "early"));
+    q.setMaxAge(10_000_000, 1_000_000_000);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, 5), q.popSkipExpired(&buf, 1_005_000_000));
 }
 
 // --- Address utility function tests ---
@@ -5323,6 +5591,7 @@ fn testConnection(allocator: std.mem.Allocator) Connection {
     const scid_val = "src12345" ++ @as([12]u8, @splat(0));
     return Connection{
         .allocator = allocator,
+        .pending_frames = .{ .allocator = allocator },
         .is_server = true,
         .dcid = dcid_val.*,
         .dcid_len = 8,
@@ -5471,7 +5740,7 @@ test "Connection: datagram receive" {
     try std.testing.expect(conn.recvDatagram(&buf) == null);
 
     // Simulate receiving a datagram (push to recv queue)
-    try std.testing.expect(conn.datagram_recv_queue.push("incoming data"));
+    try std.testing.expect(conn.datagram_recv_queue.push(std.testing.allocator, "incoming data"));
 
     const len = conn.recvDatagram(&buf).?;
     try std.testing.expectEqualSlices(u8, "incoming data", buf[0..len]);
@@ -6235,17 +6504,83 @@ test "an ACK Delay no clock could produce is clamped, not overflowed" {
     try std.testing.expect(conn.pkt_handler.rtt_stats.has_measurement);
 }
 
-test "ACK_FREQUENCY: a huge max ack delay is capped, one under our min_ack_delay refused" {
+test "ACK_FREQUENCY: a delay of 2^14 ms or more, or under our min_ack_delay, is PROTOCOL_VIOLATION" {
+    // draft-ietf-quic-ack-frequency 4. The largest was capped instead.
+    const limit: u64 = (1 << 14) * 1000;
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
-    conn.peer_supports_ack_freq = true;
     conn.local_params.min_ack_delay = 1000;
+    try conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = limit - 1, .reordering_threshold = 1 } }, .application, 0);
+    try std.testing.expectEqual(@as(i64, limit - 1) * 1000, conn.pkt_handler.recv[2].max_ack_delay_ns);
 
-    try conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = 1 << 60, .reordering_threshold = 1 } }, .application, 0);
-    conn.pkt_handler.recv[2].ack_alarm = null;
-    try conn.pkt_handler.recv[2].onPacketReceived(0, true, std.math.maxInt(i64) / 2, 0);
+    for ([_]u64{ limit, 1 << 60, 999 }) |delay| {
+        var refused = testConnection(std.testing.allocator);
+        defer refused.deinit();
+        refused.local_params.min_ack_delay = 1000;
+        try std.testing.expectError(error.ProtocolViolation, refused.processFrame(&.{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = delay, .reordering_threshold = 1 } }, .application, 0));
+    }
+}
 
-    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 1, .ack_eliciting_threshold = 2, .request_max_ack_delay = 999, .reordering_threshold = 1 } }, .application, 0));
+test "ACK_FREQUENCY: ours to accept once we advertise min_ack_delay, whatever the peer advertised" {
+    // draft-ietf-quic-ack-frequency 3: the parameter says what its sender
+    // accepts. A peer without one of its own was refused.
+    const af: Frame = .{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 9, .request_max_ack_delay = 30_000, .reordering_threshold = 1 } };
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.local_params.min_ack_delay = 1000;
+    try conn.processFrame(&af, .application, 0);
+    try std.testing.expectEqual(@as(u32, 10), conn.pkt_handler.recv[2].ack_eliciting_threshold);
+    try std.testing.expectEqual(30 * std.time.ns_per_ms, conn.pkt_handler.recv[2].max_ack_delay_ns);
+
+    var unadvertised = testConnection(std.testing.allocator);
+    defer unadvertised.deinit();
+    unadvertised.peer_params = .{ .min_ack_delay = 1000 };
+    try std.testing.expectError(error.ProtocolViolation, unadvertised.processFrame(&af, .application, 0));
+}
+
+test "ACK_FREQUENCY: a peer with a min_ack_delay is asked for fewer ACKs, keeping its max_ack_delay" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.requestAckFrequency();
+    conn.peer_params = .{ .max_ack_delay = 40 };
+    conn.requestAckFrequency();
+    try std.testing.expectEqual(@as(?frame_mod.PendingControlFrame, null), conn.pending_frames.pop());
+    try std.testing.expectEqual(@as(u64, 0), conn.ack_freq_send_seq);
+
+    conn.peer_params.?.min_ack_delay = 1000;
+    const pto = conn.pkt_handler.rtt_stats.max_ack_delay;
+    conn.requestAckFrequency();
+    const af = conn.pending_frames.pop().?.ack_frequency;
+    try std.testing.expectEqual(@as(u64, 0), af.sequence_number);
+    try std.testing.expectEqual(ACK_FREQUENCY_THRESHOLD, af.ack_eliciting_threshold);
+    try std.testing.expectEqual(@as(u64, 40_000), af.request_max_ack_delay);
+    try std.testing.expectEqual(@as(u64, 1), af.reordering_threshold);
+    try std.testing.expectEqual(pto, conn.pkt_handler.rtt_stats.max_ack_delay);
+}
+
+test "ACK_FREQUENCY: a lost one is asked again, with the next sequence number" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.peer_params = .{ .max_ack_delay = 25, .min_ack_delay = 1000 };
+    conn.requestAckFrequency();
+    const sent = conn.pending_frames.pop().?;
+    try loseControlFrames(&conn, &.{sent});
+    var again: ?frame_mod.PendingControlFrame = null;
+    while (conn.pending_frames.pop()) |f| {
+        if (f == .ack_frequency) again = f;
+    }
+    try std.testing.expectEqual(@as(u64, 1), again.?.ack_frequency.sequence_number);
+    try std.testing.expectEqual(sent.ack_frequency.request_max_ack_delay, again.?.ack_frequency.request_max_ack_delay);
+}
+
+test "transport parameters: a min_ack_delay above the max_ack_delay is TRANSPORT_PARAMETER_ERROR" {
+    // draft-ietf-quic-ack-frequency 3; one is in µs, the other in ms.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    var tp: transport_params.TransportParams = .{ .initial_source_connection_id = .init(conn.peer_initial_scid[0..conn.peer_initial_scid_len]), .max_ack_delay = 25, .min_ack_delay = 25_000 };
+    try conn.validatePeerTransportParams(&tp);
+    tp.min_ack_delay = 25_001;
+    try std.testing.expectError(error.TransportParameterError, conn.validatePeerTransportParams(&tp));
 }
 
 test "0-RTT: a replayed packet is processed once" {
@@ -6268,7 +6603,8 @@ test "0-RTT: a replayed packet is processed once" {
     defer streams.deinit();
     var pending: frame_mod.PendingFrameQueue = .{};
     var dq: DatagramQueue = .{};
-    try std.testing.expect(dq.push("once"));
+    defer dq.deinitQueue(std.testing.allocator);
+    try std.testing.expect(dq.push(std.testing.allocator, "once"));
     var buf: [1500]u8 = undefined;
     const n = try packer.packCoalesced(&buf, &handler, &crypto_mgr, &streams, &pending, null, &client_keys[1], null, null, 0, &dq, false);
     try std.testing.expect(n > 0);
@@ -6975,10 +7311,10 @@ test "an ACK for a packet number never sent is a PROTOCOL_VIOLATION" {
     // Two packets sent: 0 and 1. Acking 1 is fine, acking 2 is not.
     _ = conn.pkt_handler.nextPacketNumber(.application);
     _ = conn.pkt_handler.nextPacketNumber(.application);
-    try conn.processFrame(&.{ .ack = .{ .largest_ack = 1, .ack_delay = 0, .first_ack_range = 1, .ack_range_count = 0 } }, .application, 0);
+    try conn.processFrame(&.{ .ack = .{ .largest_ack = 1, .ack_delay = 0, .first_ack_range = 1 } }, .application, 0);
     try std.testing.expect(conn.local_err == null);
 
-    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack = .{ .largest_ack = 2, .ack_delay = 0, .first_ack_range = 0, .ack_range_count = 0 } }, .application, 0));
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack = .{ .largest_ack = 2, .ack_delay = 0, .first_ack_range = 0 } }, .application, 0));
     try std.testing.expectEqual(@as(u64, @backingInt(TransportError.protocol_violation)), conn.local_err.?.code);
 }
 
@@ -6990,7 +7326,6 @@ test "an ACK_ECN for a packet number never sent is a PROTOCOL_VIOLATION" {
         .largest_ack = 0,
         .ack_delay = 0,
         .first_ack_range = 0,
-        .ack_range_count = 0,
         .ecn_ect0 = 0,
         .ecn_ect1 = 0,
         .ecn_ce = 0,
@@ -7154,7 +7489,7 @@ fn loseControlFrames(conn: *Connection, frames: []const frame_mod.PendingControl
         });
     }
     const largest = conn.pkt_handler.next_pn[@backingInt(ack_handler.EncLevel.application)] - 1;
-    try conn.processFrame(&.{ .ack = .{ .largest_ack = largest, .ack_delay = 0, .first_ack_range = 2, .ack_range_count = 0 } }, .application, now + 1_000_000);
+    try conn.processFrame(&.{ .ack = .{ .largest_ack = largest, .ack_delay = 0, .first_ack_range = 2 } }, .application, now + 1_000_000);
 }
 
 test "a lost RESET_STREAM is rebuilt from its record after the uni stream is freed" {
@@ -7415,6 +7750,149 @@ test "connection flow control: a repeated RESET_STREAM counts its final size onc
 
     try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.highest_received);
     try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.bytes_read);
+}
+
+/// The control frames queued, by kind. Drains the queue.
+const Queued = struct { reset_stream: u8 = 0, stop_sending: u8 = 0, stream_data_blocked: u8 = 0, max_stream_data: u8 = 0 };
+
+fn drainQueued(conn: *Connection) Queued {
+    var q: Queued = .{};
+    while (conn.pending_frames.pop()) |f| switch (f) {
+        .reset_stream => q.reset_stream += 1,
+        .stop_sending => q.stop_sending += 1,
+        .stream_data_blocked => q.stream_data_blocked += 1,
+        .max_stream_data => q.max_stream_data += 1,
+        else => {},
+    };
+    return q;
+}
+
+test "flow control scan: streams are walked only once one raises a flag" {
+    // State set behind the stream methods' backs is not looked for.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    const s = try conn.streams.openBidiStream();
+    conn.queueFlowControlUpdates();
+    s.send.reset_err = 5;
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u8, 0), drainQueued(&conn).reset_stream);
+
+    (try conn.streams.openBidiStream()).recv.stopSending(7);
+    conn.queueFlowControlUpdates();
+    const q = drainQueued(&conn);
+    try std.testing.expectEqual(@as(u8, 1), q.stop_sending);
+    try std.testing.expectEqual(@as(u8, 1), q.reset_stream);
+    try std.testing.expect(!conn.streams.send_ledger.?.frames_due);
+}
+
+test "flow control scan: each send-side frame coming due brings the next scan" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    // Our bidi streams get 4 bytes of window, our uni ones none.
+    conn.streams.setPeerInitialMaxStreamData(1000, 4, 0);
+    const bidi = try conn.streams.openBidiStream();
+    const uni = try conn.streams.openUniStream();
+    conn.queueFlowControlUpdates();
+
+    // A write with the window already reached.
+    try uni.writeData("x");
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).stream_data_blocked);
+
+    // A send reaching the window with bytes left.
+    try bidi.send.writeData("0123456789");
+    _ = bidi.send.popStreamFrame(100).?;
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).stream_data_blocked);
+
+    // Our reset, and the one a peer's STOP_SENDING makes.
+    bidi.send.reset(1);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).reset_stream);
+    try conn.processFrame(&.{ .stop_sending = .{ .stream_id = uni.stream_id, .error_code = 2 } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).reset_stream);
+}
+
+test "flow control scan: each receive-side credit brings the next scan" {
+    const alloc = std.testing.allocator;
+    var conn = testConnection(alloc);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    conn.streams.local_max_stream_data_bidi_remote = 100;
+    const fc = &conn.conn_flow_ctrl.base;
+    var data: [100]u8 = @splat('d');
+
+    // A read past a quarter of the window.
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 0, .length = 80, .data = data[0..80], .fin = false } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 0), fc.bytes_read);
+    const rs = &conn.streams.getStream(0).?.recv;
+    while (rs.read()) |d| alloc.free(d);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 80), fc.bytes_read);
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).max_stream_data);
+
+    // The same on a stream we opened.
+    conn.streams.setMaxStreams(10, 10);
+    conn.streams.local_max_stream_data_bidi_local = 100;
+    const ours = try conn.streams.openBidiStream();
+    try conn.processFrame(&.{ .stream = .{ .stream_id = ours.stream_id, .offset = 0, .length = 80, .data = data[0..80], .fin = false } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    while (ours.recv.read()) |d| alloc.free(d);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 160), fc.bytes_read);
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).max_stream_data);
+
+    // Bytes read and kept, as HTTP/3 keeps a frame, then let go of.
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = 80, .length = 100, .data = &data, .fin = false } }, .application, 0);
+    const kept = rs.read().?;
+    defer alloc.free(kept);
+    rs.retained += kept.len;
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 160), fc.bytes_read);
+    rs.release(kept.len);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 260), fc.bytes_read);
+    try std.testing.expectEqual(@as(u8, 1), drainQueued(&conn).max_stream_data);
+
+    // A peer's reset hands back its final size.
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 4, .offset = 0, .length = 10, .data = data[0..10], .fin = false } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    try conn.processFrame(&.{ .reset_stream = .{ .stream_id = 4, .error_code = 1, .final_size = 30 } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 290), fc.bytes_read);
+
+    // A stream reclaimed with bytes never read hands those back.
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 8, .offset = 0, .length = 20, .data = data[0..20], .fin = true } }, .application, 0);
+    conn.queueFlowControlUpdates();
+    const done = conn.streams.getStream(8).?;
+    done.send.close();
+    _ = done.send.popStreamFrame(100).?;
+    try done.send.onAck(0, 0, true);
+    conn.streams.closeIfDone(done);
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(conn.streams.getStream(8) == null);
+    conn.queueFlowControlUpdates();
+    try std.testing.expectEqual(@as(u64, 310), fc.bytes_read);
+}
+
+test "a STOP_SENDING that finds the queue full is queued on a later pass" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+
+    while (conn.pending_frames.hasRoomFor(1)) conn.pending_frames.push(.{ .path_challenge = @splat(0) });
+    const s = try conn.streams.openBidiStream();
+    s.recv.stopSending(4);
+    conn.queueFlowControlUpdates();
+    try std.testing.expect(!s.recv.stop_sending_sent);
+
+    _ = conn.pending_frames.pop();
+    conn.queueFlowControlUpdates();
+    try std.testing.expect(s.recv.stop_sending_sent);
 }
 
 /// A server Initial carrying a PING to `conn`'s client, labelled `version` and

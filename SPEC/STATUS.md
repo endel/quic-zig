@@ -61,7 +61,7 @@
 | 9.3.1 | Peer Address Spoofing | ✅ Done | Path validation + amplification limits prevent spoofed address attacks |
 | 9.3.2 | On-Path Address Spoofing | ✅ Done | Path validation detects on-path spoofing per spec |
 | 9.3.3 | Off-Path Packet Forwarding | ✅ Done | Path validation + non-probing frame detection |
-| 9.4 | Loss Detection and Congestion Control | ✅ Done | CC/RTT reset on IP change |
+| 9.4 | Loss Detection and Congestion Control | ✅ Done | CC/RTT reset on IP change, the preferred address's included; the peer's max_ack_delay is kept |
 | 9.5 | Privacy Implications of Connection Migration | ✅ Done | Fresh CID consumed on migration |
 | 9.6 | Server's Preferred Address | ✅ Done | PreferredAddress struct, encode/decode, client migration |
 | 9.6.1 | Communicating a Preferred Address | ✅ Done | Server sends via transport params (ConnectionConfig.preferred_address) |
@@ -91,15 +91,15 @@
 | 12.5 | Frames and Number Spaces | ✅ Done | Frame-in-wrong-space enforcement |
 | **13** | **Packetization and Reliability** | | |
 | 13.1 | Packet Processing | ✅ Done | Decrypt→parse→process pipeline |
-| 13.2 | Generating Acknowledgments | ✅ Done | ACK generation with delay |
-| 13.2.1 | Sending ACK Frames | ✅ Done | max_ack_delay honored |
-| 13.2.2 | Acknowledgment Frequency | ✅ Done | Ack-elicit threshold = 2 |
+| 13.2 | Generating Acknowledgments | ✅ Done | ACK generation with delay. A 1-RTT ACK not yet due rides behind other frames and never goes alone; Initial and Handshake packets are acknowledged at once |
+| 13.2.1 | Sending ACK Frames | ✅ Done | max_ack_delay honored: the alarm is set 1 ms short of it, so a timer firing late still lands within what we advertise (§18.2). 25 ms unless `ConnectionConfig.max_ack_delay` says otherwise. A packet out of order or past a gap is acknowledged at once |
+| 13.2.2 | Acknowledgment Frequency | ✅ Done | Ack-elicit threshold = 2. `ConnectionConfig.ack_bytes_threshold` (off by default) also requires that many ack-eliciting payload bytes: small packets wait for data to ride on or for the alarm, full-size ones are still acknowledged every two, as the RFC 5681 rule this SHOULD cites counts full-sized segments. Once half of it is owed, about a full packet, the alarm uses 25 ms rather than a longer max_ack_delay, so a bulk sender's window isn't held. An ACK_FREQUENCY frame replaces it |
 | 13.2.3 | Managing ACK Ranges | ✅ Done | RangeSet with descending order, capped at 64 ranges per space (oldest dropped; their gaps then read as duplicates) |
 | 13.2.4 | Limiting Ranges by Tracking ACK Frames | ✅ Done | ACK-of-ACK pruning via largest_acked in ack-eliciting SentPackets. ACK-only packets aren't recorded, so pruning waits for the peer to acknowledge an ack-eliciting one; received ranges are capped at 64 |
 | 13.2.5 | Measuring and Reporting Host Delay | ✅ Done | ACK delay field |
 | 13.2.6 | ACK Frames and Packet Protection | ✅ Done | ACKs at correct encryption level |
 | 13.2.7 | PADDING Frames Consume Congestion Window | ✅ Done | Counted as in-flight bytes |
-| 13.3 | Retransmission of Information | ✅ Done | STREAM, CRYPTO and HANDSHAKE_DONE are resent from the lost packet's record, and so are control frames: credit (MAX_*) at its current value, BLOCKED only while still blocked, RESET_STREAM rebuilt from the record, STOP_SENDING until the stream's final size is known, NEW_CONNECTION_ID while the CID is live, a fresh NEW_TOKEN. PING, PATH_* and ACK_FREQUENCY are not resent — see [RFC9000_3.md](RFC9000_3.md) |
+| 13.3 | Retransmission of Information | ✅ Done | STREAM, CRYPTO and HANDSHAKE_DONE are resent from the lost packet's record, and so are control frames: credit (MAX_*) at its current value, BLOCKED only while still blocked, RESET_STREAM rebuilt from the record, STOP_SENDING until the stream's final size is known, NEW_CONNECTION_ID while the CID is live, a fresh NEW_TOKEN, ACK_FREQUENCY again with the next sequence number. PING and PATH_* are not resent — see [RFC9000_3.md](RFC9000_3.md) |
 | 13.4 | Explicit Congestion Notification | ✅ Done | IP-level ECT(0) marking + reading via recvmsg |
 | 13.4.1 | Reporting ECN Counts | ✅ Done | ACK_ECN frames with counters |
 | 13.4.2 | ECN Validation | ✅ Done | Full validation state machine (ecn.zig) |
@@ -251,7 +251,7 @@
 | 5 | Estimating the Round-Trip Time | | |
 | 5.1 | Generating RTT Samples | ✅ Done | Latest RTT from ACK, when the largest acknowledged is ack-eliciting |
 | 5.2 | Estimating min_rtt | ✅ Done | Lifetime minimum |
-| 5.3 | Estimating smoothed_rtt and rttvar | ✅ Done | EWMA + mean deviation |
+| 5.3 | Estimating smoothed_rtt and rttvar | ✅ Done | EWMA + mean deviation. The ACK delay comes off a sample that is at least min_rtt plus it, the boundary included |
 | 6 | Loss Detection | | |
 | 6.1 | Acknowledgment-Based Detection | ✅ Done | Packet + time thresholds. Packets not in flight get no record: nothing would ever release one |
 | 6.1.1 | Packet Threshold | ✅ Done | kPacketThreshold = 3 |
@@ -546,13 +546,13 @@ https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/
 
 | § | Section | Status | Notes |
 |---|---------|--------|-------|
-| — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize, send after handshake; frames packed after it in a packet are read too (picoquic puts HANDSHAKE_DONE there) |
-| — | IMMEDIATE_ACK frame (0x1f) | ✅ Done | Parse, serialize, triggers immediate ACK |
-| — | min_ack_delay transport parameter (0xff04de1b) | ✅ Done | Advertised by both client and server |
-| — | Dynamic ACK thresholds | ✅ Done | ack_eliciting_threshold, max_ack_delay, reordering_threshold |
+| — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize; frames packed after it in a packet are read too (picoquic puts HANDSHAKE_DONE there). A requested delay under our min_ack_delay, or of 2^14 ms or more, is PROTOCOL_VIOLATION (§4) |
+| — | IMMEDIATE_ACK frame (0x1f) | ✅ Done | Parse, serialize, triggers immediate ACK. Once we sent ACK_FREQUENCY, the packet that fills the congestion window (§8.1.1) and each PTO probe (§7) carry one |
+| — | min_ack_delay transport parameter (0xff04de1b) | ✅ Done | Advertised by both client and server: 1 ms, or max_ack_delay if that is lower. A peer's above its max_ack_delay is TRANSPORT_PARAMETER_ERROR |
+| — | Dynamic ACK thresholds | ✅ Done | ack_eliciting_threshold (an ACK after more than it: 1 is every second packet), max_ack_delay, reordering_threshold |
 | — | Sequence number tracking | ✅ Done | Obsolete ACK_FREQUENCY frames ignored |
-| — | Negotiation via min_ack_delay | ✅ Done | Only send ACK_FREQUENCY if peer advertises support |
-| — | Server sends ACK_FREQUENCY | ✅ Done | threshold=10, max_delay=25ms, reorder=1 after handshake |
+| — | Negotiation via min_ack_delay | ✅ Done | ACK_FREQUENCY goes only to a peer that advertised it, and is accepted whenever we advertised ours, whatever the peer did (§3) |
+| — | Server sends ACK_FREQUENCY | ✅ Done | With HANDSHAKE_DONE, to a client that advertises min_ack_delay (quinn and quic-zig do, no browser does): threshold 10, the client's own max_ack_delay, so our PTO is unchanged, reorder 1. Sent again if lost. `ConnectionConfig.request_ack_frequency` turns it off. A client never asks |
 
 ### Summary — ACK Frequency: ✅ Complete (7/7)
 

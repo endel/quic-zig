@@ -490,6 +490,9 @@ pub const ReceiveStream = struct {
     conn_counted: u64 = 0,
     conn_credited: u64 = 0,
 
+    /// The connection's; null for a stream built outside a StreamsMap.
+    ledger: ?*SendLedger = null,
+
     pub fn init(allocator: Allocator, stream_id: u64) ReceiveStream {
         return .{
             .stream_id = stream_id,
@@ -533,6 +536,7 @@ pub const ReceiveStream = struct {
         self.sorter.fin_offset = final_size;
         // Never read now, and its connection credit is handed back at once.
         self.sorter.discard();
+        self.creditDue();
     }
 
     /// The next contiguous bytes, up to `out.len`, left unread.
@@ -549,6 +553,7 @@ pub const ReceiveStream = struct {
         const data = self.sorter.pop();
         if (data) |d| {
             self.bytes_read += d.len;
+            self.creditDue();
         } else if (self.sorter.isComplete()) {
             self.finished = true;
         }
@@ -565,6 +570,16 @@ pub const ReceiveStream = struct {
     /// Bytes the consumer has read and let go of.
     pub fn consumed(self: *const ReceiveStream) u64 {
         return self.bytes_read -| self.retained;
+    }
+
+    /// Let go of `n` bytes the consumer read and kept (`retained`).
+    pub fn release(self: *ReceiveStream, n: usize) void {
+        self.retained -|= n;
+        self.creditDue();
+    }
+
+    fn creditDue(self: *ReceiveStream) void {
+        if (self.ledger) |l| l.credit_due = true;
     }
 
     /// Connection credit newly earned since the last call: what the consumer
@@ -604,6 +619,7 @@ pub const ReceiveStream = struct {
     /// Request that the peer stop sending on this stream (sends STOP_SENDING).
     pub fn stopSending(self: *ReceiveStream, error_code: u64) void {
         self.stop_sending_err = error_code;
+        if (self.ledger) |l| l.frames_due = true;
     }
 
     /// Nothing more will ever be delivered from this stream: the FIN has been
@@ -636,6 +652,16 @@ const RetransmitRange = struct {
 /// heap-allocated so the pointer survives a move of the owning connection.
 pub const SendLedger = struct {
     committed: u64 = 0,
+    /// Raised by streams, which are reached without the map, for the
+    /// connection's next send: a RESET_STREAM, STOP_SENDING or
+    /// STREAM_DATA_BLOCKED may be due (`frames_due`), or receive window was
+    /// freed for MAX_DATA and MAX_STREAM_DATA (`credit_due`). While a flag is
+    /// down, that send doesn't walk every stream looking for it.
+    frames_due: bool = false,
+    credit_due: bool = false,
+    /// A stream may have bytes or a FIN to pack: raised on a write, a close
+    /// or a loss, lowered by a packer walk that finds nothing to send.
+    send_due: bool = false,
     /// Send buffers that streams drained or finished with, for the next one
     /// to grow past `SPARE_MIN`. Most allocators hand out a buffer that size
     /// straight from the kernel (std's smp_allocator maps anything of 64 KiB
@@ -818,7 +844,12 @@ pub const SendStream = struct {
         }
         try self.write_buffer.appendSlice(self.allocator, data);
         self.write_offset += data.len;
-        if (self.ledger) |l| l.committed += data.len;
+        if (self.ledger) |l| {
+            l.committed += data.len;
+            l.send_due = true;
+        }
+        // Written past the window: STREAM_DATA_BLOCKED.
+        if (self.send_offset >= self.send_window) self.framesDue();
     }
 
     /// Drop the acknowledged prefix once it is worth the memmove. Without this
@@ -908,6 +939,7 @@ pub const SendStream = struct {
     /// Close the stream (queue FIN).
     pub fn close(self: *SendStream) void {
         self.fin_queued = true;
+        if (self.ledger) |l| l.send_due = true;
     }
 
     /// Update the acknowledged offset when a packet carrying stream frames is
@@ -950,6 +982,11 @@ pub const SendStream = struct {
             if (self.ledger) |l| l.committed -= self.write_offset - self.send_offset;
         }
         self.reset_err = error_code;
+        self.framesDue();
+    }
+
+    fn framesDue(self: *SendStream) void {
+        if (self.ledger) |l| l.frames_due = true;
     }
 
     /// Update the send window from a MAX_STREAM_DATA frame.
@@ -981,6 +1018,7 @@ pub const SendStream = struct {
     /// Queue a range of stream data for retransmission (called when a packet is declared lost).
     pub fn queueRetransmit(self: *SendStream, offset_in: u64, length_in: u64, fin: bool) void {
         if (self.reset_err != null) return;
+        if (self.ledger) |l| l.send_due = true;
 
         // If FIN was in the lost packet, mark it for retransmission
         if (fin) {
@@ -1203,6 +1241,8 @@ pub const SendStream = struct {
 
         self.send_offset += data_len;
         if (fin) self.fin_sent = true;
+        // Bytes left past the window: STREAM_DATA_BLOCKED.
+        if (self.send_offset >= self.send_window and self.send_offset < self.write_offset) self.framesDue();
 
         return Frame{
             .stream = .{
@@ -1499,6 +1539,7 @@ pub const StreamsMap = struct {
         const s = try self.allocator.create(Stream);
         s.* = Stream.init(self.allocator, id);
         s.send.ledger = ledger;
+        s.recv.ledger = ledger;
         // We initiated this stream → peer's "bidi_remote" limit applies to our sends
         s.send.send_window = self.peer_initial_max_stream_data_bidi_remote;
         // Our local receive window for streams we initiated
@@ -1565,6 +1606,7 @@ pub const StreamsMap = struct {
         const s = try self.allocator.create(Stream);
         s.* = Stream.init(self.allocator, stream_id);
         s.send.ledger = ledger;
+        s.recv.ledger = ledger;
         // Peer initiated this stream → peer's "bidi_local" limit applies to our sends
         s.send.send_window = self.peer_initial_max_stream_data_bidi_local;
         // Our local receive window for peer-initiated streams
@@ -1605,8 +1647,10 @@ pub const StreamsMap = struct {
 
     /// Build one peer-initiated receive stream and add it to the map.
     fn openPeerUniStream(self: *StreamsMap, stream_id: u64) !*ReceiveStream {
+        const ledger = try self.sendLedger();
         const s = try self.allocator.create(ReceiveStream);
         s.* = ReceiveStream.initWithWindow(self.allocator, stream_id, self.local_max_stream_data_uni);
+        s.ledger = ledger;
         errdefer {
             s.deinit();
             self.allocator.destroy(s);
@@ -1932,6 +1976,9 @@ pub const StreamsMap = struct {
                 self.closeStream(id);
             }
         }
+        if (self.freed_conn_credit > 0) if (self.send_ledger) |l| {
+            l.credit_due = true;
+        };
         self.removed_since_rehash += self.disposal_count;
         if (self.removed_since_rehash > self.streams.unmanaged.capacity() / 4) {
             self.removed_since_rehash = 0;

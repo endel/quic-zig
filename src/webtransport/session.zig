@@ -15,6 +15,8 @@ const WT_BIDI_STREAM_TYPE: u64 = 0x41;
 
 /// Maximum number of concurrent WebTransport sessions.
 pub const MAX_SESSIONS: usize = 4;
+/// Longest close reason a CLOSE_WEBTRANSPORT_SESSION capsule may carry.
+const max_close_reason = 1024;
 
 /// WebTransport error codes (draft-ietf-webtrans-http3).
 pub const WEBTRANSPORT_SESSION_GONE: u64 = 0x170d7b68;
@@ -77,8 +79,10 @@ pub const Session = struct {
     state: SessionState = .closed,
     occupied: bool = false,
     close_error_code: u32 = 0,
-    close_reason_buf: [1024]u8 = undefined,
-    close_reason_len: u16 = 0,
+    /// Our close's reason or the peer's, at most `max_close_reason` bytes.
+    /// Kept until the slot is next taken: the session_closed event that
+    /// reports it points here.
+    close_reason: []u8 = &.{},
     /// Bytes still to discard from an over-long capsule; see MAX_CAPSULE_PAYLOAD.
     capsule_skip: u64 = 0,
     /// draft-13 §5.3-§5.6 session flow control, sized by `allocateSession`
@@ -172,10 +176,6 @@ pub const WebTransportConnection = struct {
     // per new stream — same pattern as quic-go's nextStreamToAccept.
     next_peer_bidi_to_examine: u64 = 0,
 
-    // Persistent buffer for datagram polling — avoids heap allocation per datagram.
-    // Valid until the next pollDatagrams() call.
-    dgram_poll_buf: [quic_connection.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined,
-
     // Buffered data for WT streams (data after type prefix, or data read before poll)
     stream_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
 
@@ -221,6 +221,7 @@ pub const WebTransportConnection = struct {
     }
 
     pub fn deinit(self: *WebTransportConnection) void {
+        for (&self.sessions) |*s| self.allocator.free(s.close_reason);
         // Free all buffered stream data
         var buf_it = self.stream_bufs.iterator();
         while (buf_it.next()) |entry| {
@@ -255,6 +256,7 @@ pub const WebTransportConnection = struct {
     fn allocateSession(self: *WebTransportConnection, session_id: u64, state: SessionState) ?*Session {
         for (&self.sessions) |*s| {
             if (!s.occupied) {
+                self.allocator.free(s.close_reason);
                 s.* = .{
                     .session_id = session_id,
                     .state = state,
@@ -516,13 +518,10 @@ pub const WebTransportConnection = struct {
     /// Send a QUIC DATAGRAM carrying WT session data.
     /// Format: quarter_stream_id (varint) + payload.
     pub fn sendDatagram(self: *WebTransportConnection, session_id: u64, data: []const u8) !void {
-        const quarter_id = session_id / 4;
-        var dgram_buf: [quic_connection.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = undefined;
-        var fbs = io.fixedBufferStream(&dgram_buf);
-        const w = &fbs;
-        try packet.writeVarInt(w, quarter_id);
-        try w.writeAll(data);
-        try self.quic.sendDatagram(fbs.buffered());
+        var quarter_id: [8]u8 = undefined;
+        var fbs = io.fixedBufferStream(&quarter_id);
+        try packet.writeVarInt(&fbs, session_id / 4);
+        try self.quic.sendDatagramParts(&.{ fbs.buffered(), data });
     }
 
     /// Returns connection-level statistics (matches browser WebTransport.getStats()).
@@ -631,7 +630,7 @@ pub const WebTransportConnection = struct {
         if (session.state == .draining or session.state == .closed) return;
 
         // Truncate reason to spec limit (1024 bytes)
-        const truncated_reason = if (reason.len > 1024) reason[0..1024] else reason;
+        const truncated_reason = reason[0..@min(reason.len, max_close_reason)];
 
         // Send CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
         var frame_buf: [1100]u8 = undefined;
@@ -646,9 +645,7 @@ pub const WebTransportConnection = struct {
         // Store our close code/reason so pollSessionStreams reports it correctly
         // when the draining state is finalized
         session.close_error_code = error_code;
-        const reason_copy_len: u16 = @intCast(@min(truncated_reason.len, session.close_reason_buf.len));
-        @memcpy(session.close_reason_buf[0..reason_copy_len], truncated_reason[0..reason_copy_len]);
-        session.close_reason_len = reason_copy_len;
+        self.setCloseReason(session, truncated_reason);
 
         session.state = .draining;
 
@@ -702,6 +699,11 @@ pub const WebTransportConnection = struct {
         if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
             recv_stream.stopSending(h3_code);
         }
+    }
+
+    fn setCloseReason(self: *WebTransportConnection, session: *Session, reason: []const u8) void {
+        self.allocator.free(session.close_reason);
+        session.close_reason = self.allocator.dupe(u8, reason[0..@min(reason.len, max_close_reason)]) catch &.{};
     }
 
     /// Mark a session as fully closed and release its slot.
@@ -852,6 +854,9 @@ pub const WebTransportConnection = struct {
         // 8. Poll H3 for events (settings, connect requests, responses)
         if (try self.pollH3Events()) |event| return event;
 
+        // Credit the steps above earned the peer (a WT_*_BLOCKED answered,
+        // a stream opened) goes now: null tells a server nothing is pending.
+        self.flushFlowControl();
         return null;
     }
 
@@ -878,12 +883,11 @@ pub const WebTransportConnection = struct {
             if (stream.recv.finished and session.state == .draining) {
                 const sid = session.session_id;
                 const code = session.close_error_code;
-                const reason_len = session.close_reason_len;
                 self.finalizeSession(session);
                 return .{ .session_closed = .{
                     .session_id = sid,
                     .error_code = code,
-                    .reason = session.close_reason_buf[0..reason_len],
+                    .reason = session.close_reason,
                 } };
             }
             // In the active state a FIN on the CONNECT stream recv side is
@@ -903,7 +907,7 @@ pub const WebTransportConnection = struct {
         if (kv.value.items.len == 0) return;
         // HTTP/3 held these back from flow control until consumed; we read
         // capsules as they come, so they are credited now.
-        if (self.quic.streams.getStream(stream_id)) |s| s.recv.retained -|= kv.value.items.len;
+        if (self.quic.streams.getStream(stream_id)) |s| s.recv.release(kv.value.items.len);
         const buf = try self.streamBuf(stream_id);
         try buf.insertSlice(self.allocator, 0, kv.value.items);
     }
@@ -990,9 +994,7 @@ pub const WebTransportConnection = struct {
             .close_webtransport_session => |cls| {
                 const sid = session.session_id;
                 session.close_error_code = cls.error_code;
-                const copy_len: u16 = @intCast(@min(cls.reason.len, session.close_reason_buf.len));
-                @memcpy(session.close_reason_buf[0..copy_len], cls.reason[0..copy_len]);
-                session.close_reason_len = copy_len;
+                self.setCloseReason(session, cls.reason);
 
                 // Send our own FIN (echo close) if we haven't already
                 if (session.state == .active) {
@@ -1006,7 +1008,7 @@ pub const WebTransportConnection = struct {
                 return .{ .session_closed = .{
                     .session_id = sid,
                     .error_code = cls.error_code,
-                    .reason = session.close_reason_buf[0..copy_len],
+                    .reason = session.close_reason,
                 } };
             },
             .drain_webtransport_session => {
@@ -1054,13 +1056,14 @@ pub const WebTransportConnection = struct {
 
     /// Check for incoming QUIC DATAGRAM frames and demux by quarter_stream_id.
     pub fn pollDatagrams(self: *WebTransportConnection) ?WtEvent {
-        // Pop datagram into persistent member buffer — one copy, no heap allocation.
-        // The slice is valid until the next pollDatagrams() call.
-        const dgram_len = self.quic.recvDatagram(&self.dgram_poll_buf) orelse return null;
-        if (dgram_len == 0) return null;
+        // Read in place: the bytes stay put until the next datagram arrives,
+        // which is after the caller is done with this one.
+        const dgram = self.quic.peekDatagram() orelse return null;
+        self.quic.consumeDatagram();
+        if (dgram.len == 0) return null;
 
         // Parse quarter_stream_id
-        var fbs = io.fixedBufferStream(self.dgram_poll_buf[0..dgram_len]);
+        var fbs = io.fixedBufferStream(dgram);
         const reader = &fbs;
         const quarter_id = packet.readVarInt(reader) catch return null;
         const session_id = quarter_id * 4;
@@ -1068,7 +1071,7 @@ pub const WebTransportConnection = struct {
         if (self.sessionActive(session_id)) {
             return .{ .datagram = .{
                 .session_id = session_id,
-                .data = self.dgram_poll_buf[fbs.seek..dgram_len],
+                .data = dgram[fbs.seek..],
             } };
         }
 
@@ -1540,12 +1543,11 @@ pub const WebTransportConnection = struct {
         return std.mem.eql(u8, token, "webtransport") or std.mem.eql(u8, token, "webtransport-h3");
     }
 
-    /// Poll H3 events and translate to WT events.
+    /// Poll H3 events and translate to WT events. One with no WebTransport
+    /// meaning is taken and the next looked at: null has to mean H3 holds
+    /// nothing more, as a server polls again only when something new arrives.
     fn pollH3Events(self: *WebTransportConnection) !?WtEvent {
-        const event = try self.h3.poll();
-        if (event == null) return null;
-
-        switch (event.?) {
+        while (try self.h3.poll()) |event| switch (event) {
             .connect_request => |req| {
                 if (isWebTransportProtocol(req.protocol)) {
                     // Register as a connecting session; past our slots the
@@ -1556,7 +1558,7 @@ pub const WebTransportConnection = struct {
                             st.recv.stopSending(@backingInt(h3_conn.H3Error.request_rejected));
                         }
                         try self.h3.excluded_streams.put(req.stream_id, {});
-                        return null;
+                        continue;
                     }
                     self.active_session_count += 1;
                     // Exclude this stream from H3 bidi processing
@@ -1626,12 +1628,11 @@ pub const WebTransportConnection = struct {
                     if (session.state == .draining) {
                         const sid = session.session_id;
                         const code = session.close_error_code;
-                        const reason_len = session.close_reason_len;
                         self.finalizeSession(session);
                         return .{ .session_closed = .{
                             .session_id = sid,
                             .error_code = code,
-                            .reason = session.close_reason_buf[0..reason_len],
+                            .reason = session.close_reason,
                         } };
                     }
                 } else if (self.is_server) {
@@ -1657,8 +1658,7 @@ pub const WebTransportConnection = struct {
                 }
             },
             .writable => |sid| return .{ .writable = .{ .session_id = sid, .stream_id = sid } },
-        }
-
+        };
         return null;
     }
 };
@@ -1672,9 +1672,10 @@ test "Session: basic init" {
 }
 
 test "DatagramQueue used by WT" {
-    var q = quic_connection.DatagramQueue{};
+    var q: quic_connection.DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
     const data = "hello";
-    try std.testing.expect(q.push(data));
+    try std.testing.expect(q.push(std.testing.allocator, data));
     var buf: [1200]u8 = undefined;
     const len = q.pop(&buf).?;
     try std.testing.expectEqual(@as(usize, 5), len);
@@ -2266,7 +2267,7 @@ test "WT integration: poll receives datagram demuxed by session" {
     var fbs = io.fixedBufferStream(&dgram_buf);
     packet.writeVarInt(&fbs, quarter_id) catch unreachable;
     fbs.writeAll("hello dgram") catch unreachable;
-    try testing.expect(setup.quic_conn.datagram_recv_queue.push(dgram_buf[0..fbs.seek]));
+    try testing.expect(setup.quic_conn.datagram_recv_queue.push(testing.allocator, dgram_buf[0..fbs.seek]));
 
     const ev = try setup.wt.poll();
     try testing.expect(ev != null);
@@ -2309,6 +2310,30 @@ test "WT integration: server receives connect_request from H3" {
         },
         else => return error.UnexpectedEvent,
     }
+}
+
+test "WT: a CONNECT behind the peer's SETTINGS comes out of the same poll" {
+    // A poll that took SETTINGS and returned null left the CONNECT for the
+    // next packet, which a server that polls only on news may never get.
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, true);
+    defer wt.deinit();
+
+    var ctrl: [128]u8 = undefined;
+    const ctrl_len = buildWtControlPayload(&ctrl);
+    try (try quic_conn.streams.getOrCreateRecvStream(2)).handleStreamFrame(0, ctrl[0..ctrl_len], false);
+    var req: [512]u8 = undefined;
+    const req_len = buildConnectRequest(&req, "/wt");
+    try (try quic_conn.streams.getOrCreateStream(0)).recv.handleStreamFrame(0, req[0..req_len], false);
+
+    const ev = (try wt.poll()) orelse return error.ExpectedConnectRequest;
+    try testing.expect(ev == .connect_request);
+    try testing.expect(h3.peer_settings_received);
 }
 
 test "WT integration: webtransport-h3 opens a session too" {

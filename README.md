@@ -168,6 +168,14 @@ before it gets any state. `max_handshakes_per_source` (a quarter of
 `max_handshakes`) bounds what one IPv4 address or IPv6 /64 holds even after
 it answers.
 
+Timed work, such as a game's fixed-step ticks, fits `onPass(self, now_ns) ?i64`
+better than a timer of your own. The loop calls it once per pass, after
+dispatching what arrived and before sending, so what it writes shares that
+pass's send batch. It returns the `sys.nanoTimestamp()` by which it next needs a
+pass, or null: the loop wakes for it then, never earlier, and sleeps while
+nothing is due. A deadline that comes up outside the server's callbacks, in a
+WebSocket callback say, goes to `server.wakeAt(ns)`.
+
 ### HTTP/1.1 listener: static files and WebSockets
 
 `Config.http1` adds a TCP listener to the server, on the same port as QUIC
@@ -432,6 +440,12 @@ Produces binaries in `zig-out/bin/`:
 | `interop-server` | QUIC Interop Runner server endpoint |
 | `interop-client` | QUIC Interop Runner client endpoint |
 | `interop-wt-server` | QUIC Interop Runner WebTransport server |
+
+Hardware AES is chosen when the binary is built, not when it runs. A build
+for another machine (`-Dtarget=x86_64-linux-gnu`) targets a baseline CPU
+without AES instructions, so TLS falls back to ChaCha20 in software; the
+server warns about it at startup. Name the deployment CPU, e.g.
+`-Dcpu=x86_64_v3+aes+pclmul` or `-Dcpu=neoverse_n1`.
 
 ## Running Tests
 

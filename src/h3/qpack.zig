@@ -585,119 +585,7 @@ pub const QpackDecoder = struct {
         scratch: []u8,
         stream_id: u64,
     ) !usize {
-        if (data.len < 2) return error.BufferTooShort;
-
-        var pos: usize = 0;
-        var scratch_pos: usize = 0;
-
-        // Decode Required Insert Count
-        const encoded_ric = try decodeInteger(data, &pos, 8);
-
-        // Decode Delta Base; a multi-byte RIC can use up the whole block.
-        if (pos >= data.len) return error.BufferTooShort;
-        const sign_bit = (data[pos] & 0x80) != 0;
-        const delta_base = try decodeInteger(data, &pos, 7);
-
-        // Compute RIC and Base
-        var ric: u64 = 0;
-        var base: u64 = 0;
-        if (encoded_ric > 0) {
-            // RFC 9204 4.5.1.1: from the capacity we advertised, not the
-            // encoder's current one.
-            const max_entries = self.max_capacity / ENTRY_OVERHEAD;
-            ric = try decodeRequiredInsertCount(encoded_ric, max_entries, self.dynamic.insert_count);
-            if (sign_bit) {
-                // RFC 9204 4.5.1.2: Base = RIC - DeltaBase - 1 must not go negative.
-                if (delta_base >= ric) return error.InvalidBase;
-                base = ric - delta_base - 1;
-            } else {
-                base = std.math.add(u64, ric, delta_base) catch return error.InvalidBase;
-            }
-        }
-
-        var count: usize = 0;
-
-        while (pos < data.len) {
-            if (count >= headers_buf.len) return error.TooManyHeaders;
-
-            const first = data[pos];
-
-            if (first & 0xc0 == 0xc0) {
-                // Indexed static: 11NNNNNN
-                const index = try decodeInteger(data, &pos, 6);
-                if (index >= static_table.len) return error.InvalidIndex;
-                headers_buf[count] = .{
-                    .name = static_table[index].name,
-                    .value = static_table[index].value,
-                };
-                count += 1;
-            } else if (first & 0xc0 == 0x80) {
-                // Indexed dynamic: 10NNNNNN (T=0, relative index from base)
-                const rel_idx = try decodeInteger(data, &pos, 6);
-                const entry = try self.fieldRef(ric, relativeToAbsolute(base, rel_idx));
-                // Copy name/value from dynamic entry into scratch
-                const name = try stashString(entry.name, false, scratch, &scratch_pos);
-                const value = try stashString(entry.value, false, scratch, &scratch_pos);
-                headers_buf[count] = .{ .name = name, .value = value };
-                count += 1;
-            } else if (first & 0xc0 == 0x40) {
-                // Literal Field Line with Name Reference: 01NTNNNN (RFC 9204 §4.5.4)
-                // N = never-indexed (bit 5), T = table type (bit 4): 1=static, 0=dynamic
-                const is_static = (first & 0x10) != 0;
-                if (is_static) {
-                    const index = try decodeInteger(data, &pos, 4);
-                    if (index >= static_table.len) return error.InvalidIndex;
-                    const value = try decodeString(data, &pos, scratch, &scratch_pos);
-                    headers_buf[count] = .{
-                        .name = static_table[index].name,
-                        .value = value,
-                    };
-                    count += 1;
-                } else {
-                    const rel_idx = try decodeInteger(data, &pos, 4);
-                    const entry = try self.fieldRef(ric, relativeToAbsolute(base, rel_idx));
-                    const name = try stashString(entry.name, false, scratch, &scratch_pos);
-                    const value = try decodeString(data, &pos, scratch, &scratch_pos);
-                    headers_buf[count] = .{ .name = name, .value = value };
-                    count += 1;
-                }
-            } else if (first & 0xe0 == 0x20) {
-                // Literal with literal name: 001NHNNN
-                const is_name_huffman = (first & 0x08) != 0;
-                const name_len = try decodeInteger(data, &pos, 3);
-                if (name_len > data.len - pos) return error.BufferTooShort;
-                const name = try stashString(data[pos..][0..name_len], is_name_huffman, scratch, &scratch_pos);
-                pos += name_len;
-                const value = try decodeString(data, &pos, scratch, &scratch_pos);
-                headers_buf[count] = .{ .name = name, .value = value };
-                count += 1;
-            } else if (first & 0xf0 == 0x10) {
-                // Post-base indexed: 0001NNNN
-                const post_idx = try decodeInteger(data, &pos, 4);
-                const entry = try self.fieldRef(ric, std.math.add(u64, base, post_idx) catch null);
-                const name = try stashString(entry.name, false, scratch, &scratch_pos);
-                const value = try stashString(entry.value, false, scratch, &scratch_pos);
-                headers_buf[count] = .{ .name = name, .value = value };
-                count += 1;
-            } else if (first & 0xf0 == 0x00) {
-                // Literal with post-base name ref: 0000NNNN
-                const post_idx = try decodeInteger(data, &pos, 3);
-                const entry = try self.fieldRef(ric, std.math.add(u64, base, post_idx) catch null);
-                const name = try stashString(entry.name, false, scratch, &scratch_pos);
-                const value = try decodeString(data, &pos, scratch, &scratch_pos);
-                headers_buf[count] = .{ .name = name, .value = value };
-                count += 1;
-            } else {
-                pos += 1;
-            }
-        }
-
-        // Emit Header Acknowledgment if we used dynamic refs
-        if (ric > 0) {
-            self.emitHeaderAck(stream_id);
-        }
-
-        return count;
+        return decodeBlock(self, data, headers_buf, scratch, stream_id);
     }
 
     /// Resolve a field line's dynamic reference. RFC 9204 4.5.1: an entry at
@@ -810,6 +698,133 @@ pub const QpackDecoder = struct {
         return result;
     }
 };
+
+/// `QpackDecoder.decode`, for a connection that may have no decoder yet: one
+/// is made only when the peer's encoder stream first sends something, and
+/// until then a block can only use the static table and literals.
+pub fn decodeBlock(
+    dec: ?*QpackDecoder,
+    data: []const u8,
+    headers_buf: []Header,
+    scratch: []u8,
+    stream_id: u64,
+) !usize {
+    if (data.len < 2) return error.BufferTooShort;
+
+    var pos: usize = 0;
+    var scratch_pos: usize = 0;
+
+    // Decode Required Insert Count
+    const encoded_ric = try decodeInteger(data, &pos, 8);
+
+    // Decode Delta Base; a multi-byte RIC can use up the whole block.
+    if (pos >= data.len) return error.BufferTooShort;
+    const sign_bit = (data[pos] & 0x80) != 0;
+    const delta_base = try decodeInteger(data, &pos, 7);
+
+    // Compute RIC and Base
+    var ric: u64 = 0;
+    var base: u64 = 0;
+    if (encoded_ric > 0) {
+        // No decoder means nothing was ever inserted: no block may need one.
+        const d = dec orelse return error.InvalidIndex;
+        // RFC 9204 4.5.1.1: from the capacity we advertised, not the
+        // encoder's current one.
+        const max_entries = d.max_capacity / ENTRY_OVERHEAD;
+        ric = try decodeRequiredInsertCount(encoded_ric, max_entries, d.dynamic.insert_count);
+        if (sign_bit) {
+            // RFC 9204 4.5.1.2: Base = RIC - DeltaBase - 1 must not go negative.
+            if (delta_base >= ric) return error.InvalidBase;
+            base = ric - delta_base - 1;
+        } else {
+            base = std.math.add(u64, ric, delta_base) catch return error.InvalidBase;
+        }
+    }
+
+    var count: usize = 0;
+
+    while (pos < data.len) {
+        if (count >= headers_buf.len) return error.TooManyHeaders;
+
+        const first = data[pos];
+
+        if (first & 0xc0 == 0xc0) {
+            // Indexed static: 11NNNNNN
+            const index = try decodeInteger(data, &pos, 6);
+            if (index >= static_table.len) return error.InvalidIndex;
+            headers_buf[count] = .{
+                .name = static_table[index].name,
+                .value = static_table[index].value,
+            };
+            count += 1;
+        } else if (first & 0xc0 == 0x80) {
+            // Indexed dynamic: 10NNNNNN (T=0, relative index from base)
+            const rel_idx = try decodeInteger(data, &pos, 6);
+            const entry = try (dec orelse return error.InvalidIndex).fieldRef(ric, relativeToAbsolute(base, rel_idx));
+            // Copy name/value from dynamic entry into scratch
+            const name = try stashString(entry.name, false, scratch, &scratch_pos);
+            const value = try stashString(entry.value, false, scratch, &scratch_pos);
+            headers_buf[count] = .{ .name = name, .value = value };
+            count += 1;
+        } else if (first & 0xc0 == 0x40) {
+            // Literal Field Line with Name Reference: 01NTNNNN (RFC 9204 §4.5.4)
+            // N = never-indexed (bit 5), T = table type (bit 4): 1=static, 0=dynamic
+            const is_static = (first & 0x10) != 0;
+            if (is_static) {
+                const index = try decodeInteger(data, &pos, 4);
+                if (index >= static_table.len) return error.InvalidIndex;
+                const value = try decodeString(data, &pos, scratch, &scratch_pos);
+                headers_buf[count] = .{
+                    .name = static_table[index].name,
+                    .value = value,
+                };
+                count += 1;
+            } else {
+                const rel_idx = try decodeInteger(data, &pos, 4);
+                const entry = try (dec orelse return error.InvalidIndex).fieldRef(ric, relativeToAbsolute(base, rel_idx));
+                const name = try stashString(entry.name, false, scratch, &scratch_pos);
+                const value = try decodeString(data, &pos, scratch, &scratch_pos);
+                headers_buf[count] = .{ .name = name, .value = value };
+                count += 1;
+            }
+        } else if (first & 0xe0 == 0x20) {
+            // Literal with literal name: 001NHNNN
+            const is_name_huffman = (first & 0x08) != 0;
+            const name_len = try decodeInteger(data, &pos, 3);
+            if (name_len > data.len - pos) return error.BufferTooShort;
+            const name = try stashString(data[pos..][0..name_len], is_name_huffman, scratch, &scratch_pos);
+            pos += name_len;
+            const value = try decodeString(data, &pos, scratch, &scratch_pos);
+            headers_buf[count] = .{ .name = name, .value = value };
+            count += 1;
+        } else if (first & 0xf0 == 0x10) {
+            // Post-base indexed: 0001NNNN
+            const post_idx = try decodeInteger(data, &pos, 4);
+            const entry = try (dec orelse return error.InvalidIndex).fieldRef(ric, std.math.add(u64, base, post_idx) catch null);
+            const name = try stashString(entry.name, false, scratch, &scratch_pos);
+            const value = try stashString(entry.value, false, scratch, &scratch_pos);
+            headers_buf[count] = .{ .name = name, .value = value };
+            count += 1;
+        } else if (first & 0xf0 == 0x00) {
+            // Literal with post-base name ref: 0000NNNN
+            const post_idx = try decodeInteger(data, &pos, 3);
+            const entry = try (dec orelse return error.InvalidIndex).fieldRef(ric, std.math.add(u64, base, post_idx) catch null);
+            const name = try stashString(entry.name, false, scratch, &scratch_pos);
+            const value = try decodeString(data, &pos, scratch, &scratch_pos);
+            headers_buf[count] = .{ .name = name, .value = value };
+            count += 1;
+        } else {
+            pos += 1;
+        }
+    }
+
+    // Emit Header Acknowledgment if we used dynamic refs
+    if (ric > 0) {
+        dec.?.emitHeaderAck(stream_id);
+    }
+
+    return count;
+}
 
 /// Encode HTTP headers into a QPACK header block (static-only, no Huffman).
 /// Returns the number of bytes written.

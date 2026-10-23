@@ -6,9 +6,9 @@
 //! whatever constructs one, and `ConnEntry` embeds an `H3Connection`, so the
 //! QPACK numbers multiply by the connection count.
 
-/// Datagrams each direction can queue without allocating.
-/// `DatagramQueue.resize` allocates beyond this when an app asks for more.
-pub const datagram_static_items: usize = 32;
+/// Datagrams each direction queues by default; `datagram_queue_capacity`
+/// in `ConnectionConfig` sets it per connection.
+pub const datagram_queue_items: usize = 32;
 
 /// Packets buffered while their keys are missing (RFC 9001 4.1.4 permits
 /// dropping when full).

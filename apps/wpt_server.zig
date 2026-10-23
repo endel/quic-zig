@@ -816,6 +816,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         } else |_| {}
     }
 
+    // MAX_ACK_DELAY=<ms> advertises that max_ack_delay, as netcode does: past
+    // QUIC's 25 ms, with the byte threshold that goes with it.
+    const max_ack_delay: u14 = if (sys.getenv("MAX_ACK_DELAY")) |raw| std.fmt.parseInt(u14, raw, 10) catch 25 else 25;
+
     var server = try event_loop.Server(WptHandler).init(alloc, &handler, .{
         .address = "0.0.0.0",
         .port = port,
@@ -824,6 +828,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .wt_legacy_settings = legacy,
         .wt_credits = credits,
         .wt_advertise_credits = advertise,
+        .max_ack_delay = max_ack_delay,
+        .ack_bytes_threshold = if (max_ack_delay > 25) 2000 else 0,
     });
     defer server.deinit();
 

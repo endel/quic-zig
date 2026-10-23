@@ -1,6 +1,7 @@
 const std = @import("std");
 const sys = @import("../sys.zig");
 const net = @import("../sockaddr.zig");
+const BASE_PLPMTU = @import("mtu.zig").BASE_PLPMTU;
 const posix = std.posix;
 const builtin = @import("builtin");
 
@@ -102,6 +103,31 @@ pub fn enableRxTimestamps(sockfd: posix.socket_t) void {
     if (rc != 0) std.debug.print("rx timestamps: setsockopt failed rc={d}\n", .{rc});
 }
 
+/// Have what the socket sends go with the don't-fragment bit, for IPv4 and
+/// IPv6 alike (RFC 9000 §14): a datagram too large for the path is then lost
+/// rather than fragmented, which is what path MTU discovery has to see. One
+/// larger than the interface's MTU fails to send, with EMSGSIZE.
+///
+/// Linux gets IP_PMTUDISC_PROBE: it ignores the path MTU the kernel learns
+/// from ICMP, which is the connection's PMTUD to find, and spares the kernel
+/// picking an IP ID for every packet. macOS refuses IP_DONTFRAG on a
+/// dual-stack socket, so there IPv4 peers go without. Windows: no-op.
+pub fn setDontFragment(sockfd: posix.socket_t) void {
+    const opts: [2]struct { level: i32, name: u32, value: c_int } = switch (builtin.target.os.tag) {
+        .linux => .{
+            .{ .level = IPPROTO_IP, .name = linux.IP.MTU_DISCOVER, .value = linux.IP.PMTUDISC_PROBE },
+            .{ .level = posix.IPPROTO.IPV6, .name = linux.IPV6.MTU_DISCOVER, .value = linux.IPV6.PMTUDISC_PROBE },
+        },
+        .macos => .{
+            .{ .level = IPPROTO_IP, .name = posix.IP.DONTFRAG, .value = 1 },
+            .{ .level = posix.IPPROTO.IPV6, .name = posix.IPV6.DONTFRAG, .value = 1 },
+        },
+        else => return,
+    };
+    // One the socket's family lacks fails, and may.
+    for (opts) |o| rawSetsockopt(sockfd, o.level, o.name, std.mem.asBytes(&o.value));
+}
+
 /// Set the ECN codepoint for outgoing packets (low 2 bits of IP TOS).
 /// No-op on Windows.
 pub fn setEcnMark(sockfd: posix.socket_t, ecn_mark: u2) !void {
@@ -152,7 +178,7 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
 
     var cmsg_buf: [CMSG_BUF_SIZE]u8 align(@alignOf(CmsgHdr)) = @splat(0);
     var from_addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    const addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
 
     var msg = std.c.msghdr{
         .name = @ptrCast(&from_addr),
@@ -175,15 +201,26 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
         };
     }
 
-    const bytes_read: usize = @intCast(rc);
-    addr_len = msg.namelen;
+    const control = parseControl(cmsg_buf[0..msg.controllen]);
+    return .{
+        .bytes_read = @intCast(rc),
+        .from_addr = from_addr,
+        .addr_len = msg.namelen,
+        .ecn = control.ecn,
+        .truncated = msg.flags & @as(i32, @intCast(posix.MSG.TRUNC)) != 0,
+        .kernel_ns = control.kernel_ns,
+    };
+}
 
-    // Parse cmsg for IP_TOS, and for the arrival stamp when it was asked for.
-    var ecn: u2 = 0;
-    var kernel_ns: i64 = 0;
+const Control = struct { ecn: u2 = 0, kernel_ns: i64 = 0 };
+
+/// A received datagram's ECN codepoint, and its arrival stamp when one was
+/// asked for, from its control messages.
+fn parseControl(control: []align(@alignOf(CmsgHdr)) const u8) Control {
+    var out: Control = .{};
     var offset: usize = 0;
-    while (offset + CMSG_HDR_SIZE <= msg.controllen) {
-        const hdr: *const CmsgHdr = @ptrCast(@alignCast(&cmsg_buf[offset]));
+    while (offset + CMSG_HDR_SIZE <= control.len) {
+        const hdr: *const CmsgHdr = @ptrCast(@alignCast(&control[offset]));
         const data_offset = offset + CMSG_HDR_SIZE;
         const data_len = @as(usize, hdr.cmsg_len) -| CMSG_HDR_SIZE;
         const is_ipv4_tos = hdr.cmsg_level == @as(i32, @intCast(IPPROTO_IP)) and
@@ -191,33 +228,99 @@ pub fn recvmsgEcn(sockfd: posix.socket_t, buf: []u8) !RecvResult {
         const is_ipv6_tclass = hdr.cmsg_level == @as(i32, @intCast(posix.IPPROTO.IPV6)) and
             hdr.cmsg_type == @as(i32, @intCast(IPV6_TCLASS));
         if ((is_ipv4_tos or is_ipv6_tclass) and
-            data_len >= 1 and data_offset < CMSG_BUF_SIZE)
+            data_len >= 1 and data_offset < control.len)
         {
-            ecn = @truncate(cmsg_buf[data_offset] & 0x03);
+            out.ecn = @truncate(control[data_offset] & 0x03);
         } else if (builtin.target.os.tag == .linux and
             hdr.cmsg_level == SOL_SOCKET_LEVEL and
             hdr.cmsg_type == @as(i32, @intCast(SO_TIMESTAMPNS)) and
-            data_len >= 16 and data_offset + 16 <= CMSG_BUF_SIZE)
+            data_len >= 16 and data_offset + 16 <= control.len)
         {
             const ts: *align(1) const extern struct { sec: i64, nsec: i64 } =
-                @ptrCast(&cmsg_buf[data_offset]);
-            kernel_ns = ts.sec * std.time.ns_per_s + ts.nsec;
+                @ptrCast(&control[data_offset]);
+            out.kernel_ns = ts.sec * std.time.ns_per_s + ts.nsec;
         }
         // Advance to next cmsg (aligned)
         const total = (CMSG_HDR_SIZE + data_len + @alignOf(CmsgHdr) - 1) & ~@as(usize, @alignOf(CmsgHdr) - 1);
         if (total == 0) break;
         offset += total;
     }
-
-    return .{
-        .bytes_read = bytes_read,
-        .from_addr = from_addr,
-        .addr_len = addr_len,
-        .ecn = ecn,
-        .truncated = msg.flags & @as(i32, @intCast(posix.MSG.TRUNC)) != 0,
-        .kernel_ns = kernel_ns,
-    };
+    return out;
 }
+
+/// Datagrams taken off a socket together: up to `capacity` per `recvmmsg` on
+/// Linux, one `recvmsg` elsewhere. A slot holds the largest datagram a peer
+/// may send, so the slots are allocated.
+pub const RecvBatch = struct {
+    pub const capacity: usize = if (is_linux) 32 else 1;
+
+    slots: []u8,
+    slot_len: usize,
+    /// What the last `recv` read, one per datagram.
+    results: [capacity]RecvResult = undefined,
+    addrs: [capacity]posix.sockaddr.storage = undefined,
+    controls: [capacity][CMSG_BUF_SIZE]u8 align(@alignOf(CmsgHdr)) = undefined,
+
+    pub fn init(gpa: std.mem.Allocator, slot_len: usize) !RecvBatch {
+        return .{ .slots = try gpa.alloc(u8, capacity * slot_len), .slot_len = slot_len };
+    }
+
+    pub fn deinit(self: *RecvBatch, gpa: std.mem.Allocator) void {
+        gpa.free(self.slots);
+    }
+
+    /// The `i`th datagram the last `recv` read, to be decrypted in place.
+    pub fn datagram(self: *RecvBatch, i: usize) []u8 {
+        return self.slots[i * self.slot_len ..][0..self.results[i].bytes_read];
+    }
+
+    /// Reads at least one datagram and at most `max`: error.WouldBlock when
+    /// none is queued.
+    pub fn recv(self: *RecvBatch, sockfd: posix.socket_t, max: usize) !usize {
+        if (comptime !is_linux) {
+            self.results[0] = try recvmsgEcn(sockfd, self.slots[0..self.slot_len]);
+            return 1;
+        }
+        // Rebuilt each call: the batch may have moved since the last.
+        const n = @min(max, capacity);
+        var iovs: [capacity]posix.iovec = undefined;
+        var msgs: [capacity]linux.mmsghdr = undefined;
+        for (0..n) |i| {
+            iovs[i] = .{ .base = self.slots[i * self.slot_len ..].ptr, .len = self.slot_len };
+            msgs[i] = .{
+                .hdr = .{
+                    .name = @ptrCast(&self.addrs[i]),
+                    .namelen = @sizeOf(posix.sockaddr.storage),
+                    .iov = @ptrCast(&iovs[i]),
+                    .iovlen = 1,
+                    .control = &self.controls[i],
+                    .controllen = CMSG_BUF_SIZE,
+                    .flags = 0,
+                },
+                .len = 0,
+            };
+        }
+        const rc = linux.recvmmsg(sockfd, &msgs, @intCast(n), 0, null);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .AGAIN => return error.WouldBlock,
+            .CONNREFUSED => return error.ConnectionRefused,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+        for (msgs[0..rc], 0..) |*m, i| {
+            const control = parseControl(self.controls[i][0..m.hdr.controllen]);
+            self.results[i] = .{
+                .bytes_read = m.len,
+                .from_addr = self.addrs[i],
+                .addr_len = m.hdr.namelen,
+                .ecn = control.ecn,
+                .truncated = m.hdr.flags & linux.MSG.TRUNC != 0,
+                .kernel_ns = control.kernel_ns,
+            };
+        }
+        return rc;
+    }
+};
 
 /// Convert an AF_INET sockaddr to IPv4-mapped AF_INET6 (::ffff:a.b.c.d) in-place.
 /// No-op if already AF_INET6. Useful for dual-stack IPv6 sockets that need to sendto IPv4 addresses.
@@ -238,17 +341,20 @@ pub fn mapV4ToV6(storage: *posix.sockaddr.storage) void {
 
 /// Batch sender that collects outgoing packets and flushes them together.
 ///
-/// On Linux a run of packets to one address leaves in one `sendmmsg`, and each
-/// stretch of it GSO can take (same-sized packets, then at most one shorter) is
-/// a single message carrying `UDP_SEGMENT`, so the kernel does the splitting:
-/// one skb for the stretch, which is what nginx's `quic_gso` buys. Where
-/// UDP_SEGMENT is unavailable every packet is its own message. Other platforms
-/// send one `sendmsg` per packet.
+/// On Linux the batch leaves in one `sendmmsg` per ECN mark, each message to
+/// its own address, and each stretch to one address that GSO can take
+/// (same-sized packets, then at most one shorter) is a single message carrying
+/// `UDP_SEGMENT`, so the kernel does the splitting: one skb for the stretch,
+/// which is what nginx's `quic_gso` buys. Where UDP_SEGMENT is unavailable
+/// every packet is its own message. Other platforms send one `sendmsg` per
+/// packet.
 pub const SendBatch = struct {
     const MAX_BATCH: usize = 64;
     /// GSO needs every segment but the last to be the same size, and the whole
-    /// thing to fit one datagram's length field.
-    const max_gso_bytes: usize = 65535;
+    /// thing to fit one IPv4 datagram: 65535 less the IP and UDP headers.
+    /// IPv6 takes 20 bytes more, but a dual-stack socket sends to v4-mapped
+    /// peers as IPv4, and the kernel refuses a larger send with EMSGSIZE.
+    const max_gso_bytes: usize = 65507;
     /// Room for one packet, and the size of a `reserve` slot.
     pub const max_packet: usize = 1500;
 
@@ -314,16 +420,13 @@ pub const SendBatch = struct {
             self.count = 0;
             self.data_len = 0;
         }
-        // Packets that share a destination and an ECN mark go out together:
-        // changing the mark is a setsockopt, and a segmented send carries one
-        // address. A connection's burst is one run, which is the case that pays.
+        // Packets that share an ECN mark go out together: changing the mark is
+        // a setsockopt. A server sends one packet to each of many peers a pass,
+        // and those runs of one cost a syscall apiece when split by address.
         var start: usize = 0;
         while (start < self.count) {
             var end = start + 1;
-            while (end < self.count and
-                self.ecn_marks[end] == self.ecn_marks[start] and
-                self.sameAddr(start, end)) : (end += 1)
-            {}
+            while (end < self.count and self.ecn_marks[end] == self.ecn_marks[start]) : (end += 1) {}
             if (self.ecn_marks[start] != self.current_ecn) {
                 self.current_ecn = self.ecn_marks[start];
                 setEcnMark(self.sockfd, self.current_ecn) catch {};
@@ -420,22 +523,29 @@ pub const SendBatch = struct {
             // A kernel or socket without UDP_SEGMENT will keep saying so, so
             // stop asking. Either way, what is left goes out a packet at a time.
             switch (posix.errno(rc)) {
-                .INVAL, .NOPROTOOPT, .OPNOTSUPP => self.gso = false,
+                .NOPROTOOPT, .OPNOTSUPP => self.gso = false,
+                // Kernels without 6.14's fix also say EINVAL for a segment
+                // over the interface MTU, as a PMTU probe leading a stretch
+                // is: only a refused segment every path carries rules GSO out.
+                .INVAL => if (self.lengths[starts[sent]] <= BASE_PLPMTU) {
+                    self.gso = false;
+                },
                 else => {},
             }
             return self.sendMany(starts[sent], to);
         }
     }
 
-    /// Where a GSO send starting at `from` has to stop: packets the size of
-    /// the first, then at most one shorter, within the length limit.
+    /// Where a GSO send starting at `from` has to stop: packets to its address
+    /// the size of the first, then at most one shorter, within the length
+    /// limit.
     fn segmentEnd(self: *const SendBatch, from: usize, to: usize) usize {
         const seg = self.lengths[from];
         var total: usize = seg;
         var i = from + 1;
         while (i < to) : (i += 1) {
             const len = self.lengths[i];
-            if (len > seg or total + len > max_gso_bytes) break;
+            if (len > seg or total + len > max_gso_bytes or !self.sameAddr(from, i)) break;
             total += len;
             if (len < seg) return i + 1;
         }
@@ -522,8 +632,64 @@ test "recvmsgEcn returns WouldBlock on empty socket" {
     try std.testing.expectError(error.WouldBlock, result);
 }
 
+test "RecvBatch: datagrams from two senders arrive whole, in order, with their sources" {
+    if (comptime is_windows) return error.SkipZigTest;
+    const loopback = try net.Address.parseIp4("127.0.0.1", 0);
+    const rx = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(rx);
+    try sys.bind(rx, &loopback.any, loopback.getOsSockLen());
+    try enableEcnRecv(rx);
+    var to: net.Address = undefined;
+    var to_len: posix.socklen_t = @sizeOf(net.Address);
+    try sys.getsockname(rx, &to.any, &to_len);
+
+    var senders: [2]posix.socket_t = undefined;
+    var ports: [2]u16 = undefined;
+    for (&senders, &ports, 0..) |*fd, *port, k| {
+        fd.* = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+        try sys.bind(fd.*, &loopback.any, loopback.getOsSockLen());
+        var a: net.Address = undefined;
+        var len: posix.socklen_t = @sizeOf(net.Address);
+        try sys.getsockname(fd.*, &a.any, &len);
+        port.* = a.getPort();
+        if (k == 1) try setEcnMark(fd.*, 0b10);
+    }
+    defer for (senders) |fd| sys.close(fd);
+
+    // Past one batch, sizes up to a slot's, alternating senders.
+    const total = 2 * RecvBatch.capacity + 5;
+    var out: [3000]u8 = undefined;
+    for (0..total) |i| {
+        const len = 1 + i * 97 % out.len;
+        @memset(out[0..len], @truncate(i));
+        _ = std.c.sendto(senders[i % 2], &out, len, 0, &to.any, to.getOsSockLen());
+    }
+
+    var batch = try RecvBatch.init(std.testing.allocator, out.len);
+    defer batch.deinit(std.testing.allocator);
+    var seen: usize = 0;
+    while (seen < total) {
+        // macOS loopback delivers after sendto returns, not before.
+        var pfd = [_]std.c.pollfd{.{ .fd = rx, .events = posix.POLL.IN, .revents = 0 }};
+        try std.testing.expectEqual(@as(c_int, 1), std.c.poll(&pfd, 1, 5_000));
+        const got = try batch.recv(rx, RecvBatch.capacity);
+        for (batch.results[0..got], 0..) |r, k| {
+            const i = seen + k;
+            const d = batch.datagram(k);
+            try std.testing.expectEqual(1 + i * 97 % out.len, d.len);
+            for (d) |b| try std.testing.expectEqual(@as(u8, @truncate(i)), b);
+            const from: *const posix.sockaddr.in = @ptrCast(@alignCast(&r.from_addr));
+            try std.testing.expectEqual(ports[i % 2], std.mem.bigToNative(u16, from.port));
+            if (is_linux) try std.testing.expectEqual(@as(u2, if (i % 2 == 1) 0b10 else 0), r.ecn);
+        }
+        seen += got;
+    }
+    try std.testing.expectError(error.WouldBlock, batch.recv(rx, RecvBatch.capacity));
+}
+
 test "SendBatch.segmentEnd: equal packets and one shorter last" {
     var b = SendBatch.init(0);
+    @memset(&b.addr_lens, 0); // one address for all
     const cases = [_]struct { lens: []const u32, from: usize, want: usize }{
         // All the same size: the whole run.
         .{ .lens = &.{ 1436, 1436, 1436 }, .from = 0, .want = 3 },
@@ -540,6 +706,15 @@ test "SendBatch.segmentEnd: equal packets and one shorter last" {
     // The datagram's 16-bit length caps it: 45 x 1436 fits, 46 does not.
     for (0..50) |i| b.lengths[i] = 1436;
     try std.testing.expectEqual(@as(usize, 45), b.segmentEnd(0, 50));
+    // Less IPv4's headers: 45 x 1452 leaves room for a 167-byte tail, not 168.
+    for (0..45) |i| b.lengths[i] = 1452;
+    for ([_]u32{ 167, 168 }, [_]usize{ 46, 45 }) |tail, want| {
+        b.lengths[45] = tail;
+        try std.testing.expectEqual(want, b.segmentEnd(0, 46));
+    }
+    // Another address ends it.
+    b.addr_lens[3] = 16;
+    try std.testing.expectEqual(@as(usize, 3), b.segmentEnd(0, 50));
 }
 
 test "SendBatch: a run with odd packets in it arrives whole and in order" {
@@ -581,4 +756,101 @@ test "SendBatch: a run with odd packets in it arrives whole and in order" {
         got += 1;
     }
     try std.testing.expectEqual(sizes.len, got);
+}
+
+test "SendBatch: packets for two peers, interleaved, each arrive whole and in order" {
+    if (comptime !is_linux) return error.SkipZigTest;
+    var rx: [2]posix.socket_t = undefined;
+    var to: [2]posix.sockaddr.storage = undefined;
+    var to_len: [2]posix.socklen_t = @splat(@sizeOf(posix.sockaddr.storage));
+    for (&rx, &to, &to_len) |*fd, *addr, *len| {
+        fd.* = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+        const any = try net.Address.parseIp4("127.0.0.1", 0);
+        try sys.bind(fd.*, &any.any, any.getOsSockLen());
+        try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(fd.*, @ptrCast(addr), len));
+    }
+    defer for (rx) |fd| sys.close(fd);
+
+    const tx = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(tx);
+    var batch = SendBatch.init(tx);
+    // Peer 0 gets a segmentable pair; the rest alternate one packet each.
+    const peers = [_]usize{ 0, 0, 1, 0, 1, 1, 0 };
+    for (peers, 0..) |p, i| {
+        const slot = batch.reserve();
+        @memset(slot[0..300], @intCast(i));
+        batch.commit(300, @ptrCast(&to[p]), to_len[p], 0);
+    }
+    batch.flush();
+
+    var buf: [1500]u8 = undefined;
+    for (rx, 0..) |fd, p| {
+        var tries: usize = 0;
+        for (peers, 0..) |want_peer, i| {
+            if (want_peer != p) continue;
+            const r = while (tries < 1000) : (tries += 1) {
+                break recvmsgEcn(fd, &buf) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        sys.sleepNs(std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return err,
+                };
+            } else return error.Timeout;
+            try std.testing.expectEqual(@as(usize, 300), r.bytes_read);
+            try std.testing.expectEqual(@as(u8, @intCast(i)), buf[0]);
+        }
+    }
+}
+
+test "SendBatch: a refused segment larger than every path carries leaves GSO on" {
+    if (comptime !is_linux) return error.SkipZigTest;
+    const rx = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(rx);
+    const any = try net.Address.parseIp4("127.0.0.1", 0);
+    try sys.bind(rx, &any.any, any.getOsSockLen());
+    var to: posix.sockaddr.storage = undefined;
+    var to_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(rx, @ptrCast(&to), &to_len));
+
+    const tx = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer sys.close(tx);
+    // Every segmented send now fails with EINVAL, which is also what kernels
+    // before 6.14 say to a segment larger than the interface MTU.
+    const on: c_int = 1;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.setsockopt(tx, posix.SOL.SOCKET, linux.SO.NO_CHECK, std.mem.asBytes(&on), @sizeOf(c_int)));
+    var batch = SendBatch.init(tx);
+
+    const phases = [_]struct { sizes: []const usize, gso: bool }{
+        // A PMTU probe leading a stretch.
+        .{ .sizes = &.{ 1400, 1000 }, .gso = true },
+        .{ .sizes = &.{ 1200, 1200, 60 }, .gso = false },
+    };
+    var buf: [1500]u8 = undefined;
+    var tag: u8 = 0;
+    for (phases) |phase| {
+        for (phase.sizes, 0..) |len, i| {
+            const slot = batch.reserve();
+            @memset(slot[0..len], tag + @as(u8, @intCast(i)));
+            batch.commit(len, @ptrCast(&to), to_len, 0);
+        }
+        batch.flush();
+        try std.testing.expectEqual(phase.gso, batch.gso);
+        // Either way the packets go out, one per message.
+        var tries: usize = 0;
+        for (phase.sizes) |len| {
+            const r = while (tries < 1000) : (tries += 1) {
+                break recvmsgEcn(rx, &buf) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        sys.sleepNs(std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return err,
+                };
+            } else return error.Timeout;
+            try std.testing.expectEqual(len, r.bytes_read);
+            try std.testing.expectEqual(tag, buf[0]);
+            tag += 1;
+        }
+    }
 }

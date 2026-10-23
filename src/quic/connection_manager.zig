@@ -135,6 +135,8 @@ pub const ConnEntry = struct {
     /// one per LocalCidPool slot.
     registered_cids: [connection.LocalCidPool.MAX_POOL_SIZE]CidKey = @splat(.{}),
     registered_cid_count: u8 = 0,
+    /// The pool's `generation` when `syncCids` last routed all of it.
+    cid_pool_gen: ?u32 = null,
     /// The DCID the client chose for its first Initial, which it keeps using
     /// until it learns ours. Not in LocalCidPool.
     initial_dcid: CidKey = .{},
@@ -144,14 +146,49 @@ pub const ConnEntry = struct {
     reset_key_count: u8 = 0,
     reset_pool_gen: ?u32 = null,
 
-    /// Tell the owner there is data to send; see `wake_fn`.
+    /// Something for the owner's next pass to look at: a packet arrived, or
+    /// the application queued, read or resumed data. A pass may skip an
+    /// entry without it whose `deadline` has not come. Set through `mark`.
+    needs_visit: bool = true,
+    /// The next visit must also poll the protocol layers for events: the
+    /// application did something that can surface one with nothing new on
+    /// the wire. Frames say so through `Connection.app_frames` instead. Kept
+    /// until a poll, so it outlasts a pass that had already gone by.
+    needs_poll: bool = true,
+    /// `conn.nextTimeoutNsAt` as of the owner's last visit, and this entry's
+    /// key in `ConnectionManager.timers`: set through `setDeadline`. Between
+    /// visits only a packet or a close can move a timer, and either brings a
+    /// visit, which sets it again.
+    deadline: ?i64 = null,
+
+    /// The manager whose `to_visit` `mark` adds this entry to. Null once
+    /// removed, so a stale Session's write can't queue it again, and for an
+    /// entry built by hand. The manager must not move while it has entries.
+    mgr: ?*ConnectionManager = null,
+    /// In `mgr.to_visit`.
+    queued: bool = false,
+    /// Where it sits in `mgr.timers`, while it has a `deadline` there.
+    timer_slot: u32 = no_slot,
+
+    /// Tell the owner there is data to send; see `wake_fn`. A write raises
+    /// no event, so this asks for a send, not a poll.
     pub fn wake(self: *ConnEntry) void {
+        self.mark(false);
         if (self.wake_fn) |f| f(self.wake_ctx orelse return);
     }
 
     /// Ask the owner for another poll pass; see `repoll_fn`.
     pub fn repoll(self: *ConnEntry) void {
+        self.mark(true);
         if (self.repoll_fn) |f| f(self.wake_ctx orelse return);
+    }
+
+    /// Have the owner's next pass visit this entry, and with `poll` poll its
+    /// protocol layers too. Arms nothing: `wake` and `repoll` do that.
+    pub fn mark(self: *ConnEntry, poll: bool) void {
+        self.needs_visit = true;
+        if (poll) self.needs_poll = true;
+        if (self.mgr) |m| m.enqueue(self);
     }
 
     fn addRegisteredCid(self: *ConnEntry, key: CidKey) void {
@@ -184,6 +221,10 @@ pub const ConnEntry = struct {
         }
     }
 };
+
+const no_slot = std.math.maxInt(u32);
+
+const Timer = struct { at: i64, entry: *ConnEntry };
 
 /// An entry taken out of service, plus the protocol layers detached from it.
 /// The layers are unhooked from the entry immediately so stale `Session`
@@ -282,6 +323,14 @@ pub const ConnectionManager = struct {
     next_entry_id: u64 = 1,
     cid_map: std.HashMap(CidKey, *ConnEntry, CidKeyContext, 80),
     entries: std.ArrayList(*ConnEntry),
+    /// The entries `ConnEntry.mark` asked a pass to look at, each once, so a
+    /// pass costs what is active rather than everything connected. The pass
+    /// keeps the ones still marked when it is done; see `settleVisits`.
+    to_visit: std.ArrayList(*ConnEntry) = .empty,
+    /// Entries with a `deadline`, as a binary min-heap on it: when the next
+    /// timer is due, and which, without asking every connection. The key is
+    /// kept inline, so ordering it reads no entry.
+    timers: std.ArrayList(Timer) = .empty,
 
     /// Peer-issued stateless reset tokens, so a reset from a client that
     /// lost state finds its connection even though its DCID is random.
@@ -327,6 +376,9 @@ pub const ConnectionManager = struct {
     /// When true, every new connection is answered with CONNECTION_REFUSED,
     /// as it is at `max_connections`. Set while a server drains.
     refuse_new: bool = false,
+    /// Connections refused at `max_connections` since the last warning.
+    refused_full: u64 = 0,
+    refused_full_warned_at: ?i64 = null,
 
     /// Budgets for stateless replies; see `ReplyLimits`.
     reply_limits: ReplyLimits = .{},
@@ -344,6 +396,11 @@ pub const ConnectionManager = struct {
     /// — typically another worker thread on the same port.
     steer_foreign: bool = false,
     foreign_id: [15]u8 = undefined,
+
+    /// `RecvInfo.now` for the datagrams being routed: when they were read,
+    /// if their reader knows. A server's loop sets it for each batch it
+    /// reads and clears it after; null has each packet read the clock.
+    recv_time: ?i64 = null,
 
     // Deferred free queue: entries invalidated by removeConnection are held
     // here until freeDeadEntries() is called after all event processing.
@@ -395,6 +452,8 @@ pub const ConnectionManager = struct {
         }
         self.entries.deinit(self.allocator);
         self.dead_entries.deinit(self.allocator);
+        self.to_visit.deinit(self.allocator);
+        self.timers.deinit(self.allocator);
         self.cid_map.deinit();
         self.reset_token_map.deinit(self.allocator);
         self.source_handshakes.deinit();
@@ -487,6 +546,9 @@ pub const ConnectionManager = struct {
             self.allocator,
             self.entries.items.len + self.dead_entries.items.len + 1,
         );
+        // Each holds a live entry at most once, so neither has to grow later.
+        try self.to_visit.ensureTotalCapacity(self.allocator, self.entries.items.len + 1);
+        try self.timers.ensureTotalCapacity(self.allocator, self.entries.items.len + 1);
 
         // Heap-allocate Connection, then build it in place: the by-value
         // accept() would stage all ~185 KB on the stack first.
@@ -524,6 +586,8 @@ pub const ConnectionManager = struct {
         entry.initial_dcid = client_dcid_key;
 
         self.entries.appendAssumeCapacity(entry);
+        entry.mgr = self;
+        entry.mark(true);
         entry.handshaking = true;
         self.handshakes += 1;
         if (source) |s| {
@@ -540,8 +604,13 @@ pub const ConnectionManager = struct {
     /// The pool can hand a retired CID's slot to its replacement before this
     /// runs, so what the entry registered is checked against the pool's active
     /// CIDs rather than read off the pool's retired flags.
+    ///
+    /// Runs for every packet, so it does nothing until the pool's generation
+    /// moves, or while a CID it could not route last time is still waiting.
     pub fn syncCids(self: *ConnectionManager, entry: *ConnEntry) void {
+        defer self.syncResetTokens(entry);
         const pool = &entry.conn.local_cid_pool;
+        if (entry.cid_pool_gen == pool.generation) return;
 
         var removed: usize = 0;
         var i: usize = 0;
@@ -556,19 +625,23 @@ pub const ConnectionManager = struct {
             removed += 1;
         }
 
+        var unrouted: usize = 0;
         for (&pool.entries) |*cid_entry| {
             if (!cid_entry.occupied or cid_entry.retired or cid_entry.cid_len == 0) continue;
             const key = CidKey.fromSlice(cid_entry.getCid());
             if (entry.hasRegisteredCid(key)) continue;
+            unrouted += 1;
             // Untracked, a map entry would outlive the connection.
             if (entry.registered_cid_count == entry.registered_cids.len) break;
             const slot = self.cid_map.getOrPut(key) catch continue;
             if (slot.found_existing and slot.value_ptr.* != entry) continue; // another connection's
             slot.value_ptr.* = entry;
             entry.addRegisteredCid(key);
+            unrouted -= 1;
         }
         self.noteRemovals(removed);
-        self.syncResetTokens(entry);
+        // One left out is tried again with the next packet.
+        entry.cid_pool_gen = if (unrouted == 0) pool.generation else null;
     }
 
     fn poolHasActive(pool: *const connection.LocalCidPool, key: CidKey) bool {
@@ -612,6 +685,16 @@ pub const ConnectionManager = struct {
 
         self.endHandshake(entry);
 
+        // Out of both pass structures. A pass removes the entry it is
+        // visiting and carries on at the same slot: `to_visit` shifts the
+        // rest down, keeping their order, and `entries` below swaps its last in.
+        if (entry.queued) {
+            if (std.mem.indexOfScalar(*ConnEntry, self.to_visit.items, entry)) |i| _ = self.to_visit.orderedRemove(i);
+            entry.queued = false;
+        }
+        self.setDeadline(entry, null);
+        entry.mgr = null;
+
         // Swap-remove from entries list
         var idx: usize = 0;
         while (idx < self.entries.items.len) : (idx += 1) {
@@ -641,6 +724,105 @@ pub const ConnectionManager = struct {
         entry.conn.deinit();
         self.allocator.destroy(entry.conn);
         self.allocator.destroy(entry);
+    }
+
+    fn enqueue(self: *ConnectionManager, e: *ConnEntry) void {
+        if (e.queued) return;
+        e.queued = true;
+        self.to_visit.appendAssumeCapacity(e);
+    }
+
+    /// Put `to_visit` in connection order, by `ConnEntry.id`. A pass then
+    /// sends to each peer at the same point in its batches as the last pass
+    /// did, rather than wherever this pass's traffic happened to mark it,
+    /// which at 2048 clients added 0.3 ms to the median tick's jitter.
+    pub fn orderVisits(self: *ConnectionManager) void {
+        std.sort.pdq(*ConnEntry, self.to_visit.items, {}, struct {
+            fn lt(_: void, a: *ConnEntry, b: *ConnEntry) bool {
+                return a.id < b.id;
+            }
+        }.lt);
+    }
+
+    /// Ends a pass over `to_visit`: what the pass finished with leaves it,
+    /// and what was marked again, or still wants a visit, stays for the next.
+    pub fn settleVisits(self: *ConnectionManager) void {
+        var kept: usize = 0;
+        for (self.to_visit.items) |e| {
+            if (e.needs_visit or e.needs_poll) {
+                self.to_visit.items[kept] = e;
+                kept += 1;
+            } else e.queued = false;
+        }
+        self.to_visit.shrinkRetainingCapacity(kept);
+    }
+
+    /// Set `entry.deadline`, keeping `timers` ordered on it. A removed or
+    /// hand-built entry has no place there and gets only the field.
+    pub fn setDeadline(self: *ConnectionManager, entry: *ConnEntry, deadline: ?i64) void {
+        entry.deadline = deadline;
+        const at = deadline orelse return self.dropTimer(entry);
+        if (entry.mgr == null) return self.dropTimer(entry);
+        if (entry.timer_slot == no_slot) {
+            entry.timer_slot = @intCast(self.timers.items.len);
+            self.timers.appendAssumeCapacity(.{ .at = at, .entry = entry });
+        } else {
+            const t = &self.timers.items[entry.timer_slot];
+            if (t.at == at) return;
+            t.at = at;
+        }
+        self.siftTimer(entry.timer_slot);
+    }
+
+    /// The earliest `deadline` among the entries.
+    pub fn nextDeadline(self: *const ConnectionManager) ?i64 {
+        return if (self.timers.items.len > 0) self.timers.items[0].at else null;
+    }
+
+    /// Queue every entry due by `now` for the pass, out of `timers` until
+    /// its visit sets the next deadline.
+    pub fn queueDue(self: *ConnectionManager, now: i64) void {
+        while (self.timers.items.len > 0 and self.timers.items[0].at <= now) {
+            const e = self.timers.items[0].entry;
+            self.dropTimer(e);
+            self.enqueue(e);
+        }
+    }
+
+    fn dropTimer(self: *ConnectionManager, entry: *ConnEntry) void {
+        const slot = entry.timer_slot;
+        if (slot == no_slot) return;
+        entry.timer_slot = no_slot;
+        const last = self.timers.pop().?;
+        if (last.entry == entry) return;
+        self.timers.items[slot] = last;
+        last.entry.timer_slot = slot;
+        self.siftTimer(slot);
+    }
+
+    /// Move the timer at `slot` up or down to where its deadline belongs.
+    fn siftTimer(self: *ConnectionManager, slot: u32) void {
+        const items = self.timers.items;
+        const t = items[slot];
+        var i: usize = slot;
+        while (i > 0) {
+            const parent = (i - 1) / 2;
+            if (items[parent].at <= t.at) break;
+            items[i] = items[parent];
+            items[i].entry.timer_slot = @intCast(i);
+            i = parent;
+        }
+        while (true) {
+            var child = 2 * i + 1;
+            if (child >= items.len) break;
+            if (child + 1 < items.len and items[child + 1].at < items[child].at) child += 1;
+            if (items[child].at >= t.at) break;
+            items[i] = items[child];
+            items[i].entry.timer_slot = @intCast(i);
+            i = child;
+        }
+        items[i] = t;
+        t.entry.timer_slot = @intCast(i);
     }
 
     /// Result of processing a received UDP datagram.
@@ -727,7 +909,8 @@ pub const ConnectionManager = struct {
 
             if (entry == null and current_entry == null and header.packet_type == .one_rtt) {
                 if (self.findByResetToken(bytes)) |e| {
-                    _ = e.conn.handleStatelessReset(bytes);
+                    // Now draining: a visit sets the deadline that ends it.
+                    if (e.conn.handleStatelessReset(bytes)) e.mark(false);
                     return .{ .processed = e };
                 }
             }
@@ -768,6 +951,7 @@ pub const ConnectionManager = struct {
                 }
 
                 if (self.refuse_new or self.entries.items.len >= self.max_connections) {
+                    if (!self.refuse_new) self.noteFull();
                     return self.refuse(header, out_buf);
                 }
 
@@ -822,7 +1006,8 @@ pub const ConnectionManager = struct {
             // to avoid double-counting in amplification limit calculations.
             const dg_size: u64 = if (current_entry == null) bytes.len else 0;
             current_entry = e;
-            const recv_info: connection.RecvInfo = .{ .to = local, .from = from, .ecn = ecn_val, .datagram_size = dg_size };
+            const recv_info: connection.RecvInfo = .{ .to = local, .from = from, .ecn = ecn_val, .datagram_size = dg_size, .now = self.recv_time };
+            e.mark(false);
             e.conn.recv(&header, &fbs, recv_info) catch |err| {
                 if (err == error.UndecryptablePacket and pkt_start == 0) _ = e.conn.handleStatelessReset(bytes);
                 break;
@@ -850,6 +1035,17 @@ pub const ConnectionManager = struct {
         if (!quic_lb.extractServerId(lb, dcid, &self.foreign_id)) return null;
         if (std.mem.eql(u8, self.foreign_id[0..n], lb.server_id[0..n])) return null;
         return self.foreign_id[0..n];
+    }
+
+    /// A full server turns clients away without them knowing why, so say
+    /// so, at most every 10 s.
+    fn noteFull(self: *ConnectionManager) void {
+        self.refused_full += 1;
+        const now = sys.nanoTimestamp();
+        if (self.refused_full_warned_at) |at| if (now - at < 10 * std.time.ns_per_s) return;
+        std.log.warn("max_connections ({d}) reached: refused {d} new connection(s)", .{ self.max_connections, self.refused_full });
+        self.refused_full = 0;
+        self.refused_full_warned_at = now;
     }
 
     /// Answer an Initial we will not serve with CONNECTION_REFUSED (RFC 9000
@@ -1147,6 +1343,196 @@ test "a CID the peer retires stops routing, and none outlive the connection" {
     mgr.removeConnection(e);
     mgr.freeDeadEntries();
     try std.testing.expectEqual(@as(usize, 0), mgr.cid_map.count());
+}
+
+test "every change to a CID pool reaches routing, and a CID another connection holds is retried" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    const a = try acceptTest(&mgr, 1);
+    const b = try acceptTest(&mgr, 2);
+    mgr.syncCids(b);
+
+    // Each CID the pool has held routes to `a` exactly while it is active.
+    const pool = &a.conn.local_cid_pool;
+    const preferred: [8]u8 = @splat(0x5a);
+    const initial: [8]u8 = @splat(0x6b);
+    var held: [16]CidKey = undefined;
+    var n_held: usize = 0;
+    for (0..6) |step| {
+        switch (step) {
+            0 => {},
+            1 => pool.registerPreferredCid(&preferred, @splat(0)),
+            2 => _ = pool.issueNewCid(8, null),
+            3 => _ = pool.issueNewCidLb(&lbConfig(1), null),
+            4 => pool.retireBySeq(0),
+            5 => pool.registerInitialCid(&initial, null),
+            else => unreachable,
+        }
+        for (&pool.entries) |*c| {
+            if (!c.occupied) continue;
+            const key = CidKey.fromSlice(c.getCid());
+            for (held[0..n_held]) |k| {
+                if (CidKeyContext.eql(.{}, k, key)) break;
+            } else {
+                held[n_held] = key;
+                n_held += 1;
+            }
+        }
+        mgr.syncCids(a);
+        for (held[0..n_held]) |key| {
+            try std.testing.expectEqual(ConnectionManager.poolHasActive(pool, key), mgr.findByDcid(key.getSlice()) == a);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), n_held);
+
+    // Handed one of `a`'s CIDs, `b` leaves it to `a`, and takes it with its
+    // next packet once `a` is gone, though its own pool hasn't changed since.
+    b.conn.local_cid_pool.registerPreferredCid(&preferred, @splat(0));
+    mgr.syncCids(b);
+    try std.testing.expect(mgr.findByDcid(&preferred) == a);
+    mgr.removeConnection(a);
+    mgr.syncCids(b);
+    try std.testing.expect(mgr.findByDcid(&preferred) == b);
+}
+
+fn acceptTest(mgr: *ConnectionManager, n: u64) !*ConnEntry {
+    var dcid: [8]u8 = undefined;
+    std.mem.writeInt(u64, &dcid, n, .big);
+    const scid: [8]u8 = @splat(0xaa);
+    const local = std.mem.zeroes(posix.sockaddr.storage);
+    return mgr.acceptConnection(.{
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .packet_type = .initial,
+        .dcid = &dcid,
+        .scid = &scid,
+    }, local, local, null, null);
+}
+
+/// `timers` is a heap on `deadline` whose slots name their own places, and
+/// a live entry with a deadline is in it or else queued for the visit that
+/// sets the next.
+fn expectTimersSound(mgr: *const ConnectionManager) !void {
+    const items = mgr.timers.items;
+    for (items, 0..) |t, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)), t.entry.timer_slot);
+        try std.testing.expectEqual(t.entry.deadline, t.at);
+        if (i > 0) try std.testing.expect(items[(i - 1) / 2].at <= t.at);
+    }
+    var timed: usize = 0;
+    for (mgr.entries.items) |e| {
+        if (e.timer_slot != no_slot) {
+            timed += 1;
+        } else if (e.deadline != null) try std.testing.expect(e.queued);
+    }
+    try std.testing.expectEqual(timed, items.len);
+}
+
+test "a removed entry leaves the pass structures, and a stale write can't put it back" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    const a = try acceptTest(&mgr, 1);
+    const b = try acceptTest(&mgr, 2);
+    const c = try acceptTest(&mgr, 3);
+
+    // New entries wait for their first visit, each once however often marked.
+    a.mark(false);
+    a.repoll();
+    try std.testing.expectEqualSlices(*ConnEntry, &.{ a, b, c }, mgr.to_visit.items);
+    // A pass done with one drops it; one marked again stays.
+    for ([_]*ConnEntry{ a, b, c }) |e| {
+        e.needs_visit = false;
+        e.needs_poll = false;
+    }
+    c.mark(false);
+    mgr.settleVisits();
+    try std.testing.expectEqualSlices(*ConnEntry, &.{c}, mgr.to_visit.items);
+    try std.testing.expect(!a.queued and !b.queued and c.queued);
+
+    mgr.setDeadline(a, 300);
+    mgr.setDeadline(b, 100);
+    mgr.setDeadline(c, 200);
+    try std.testing.expectEqual(@as(?i64, 100), mgr.nextDeadline());
+    try expectTimersSound(&mgr);
+
+    // Due by 150: b joins the pass, out of the heap until its visit sets one.
+    mgr.queueDue(150);
+    try std.testing.expectEqualSlices(*ConnEntry, &.{ c, b }, mgr.to_visit.items);
+    try std.testing.expectEqual(@as(?i64, 200), mgr.nextDeadline());
+    mgr.setDeadline(b, 400);
+
+    // Removed while queued and timed: out of both at once.
+    mgr.removeConnection(c);
+    try std.testing.expectEqualSlices(*ConnEntry, &.{b}, mgr.to_visit.items);
+    try std.testing.expect(!c.queued and c.timer_slot == no_slot);
+    try std.testing.expectEqual(@as(?i64, 300), mgr.nextDeadline());
+    try expectTimersSound(&mgr);
+    // A Session kept past onConnectionClosed writes to it: flags only.
+    c.wake();
+    mgr.setDeadline(c, 50);
+    try std.testing.expectEqualSlices(*ConnEntry, &.{b}, mgr.to_visit.items);
+    try std.testing.expectEqual(@as(?i64, 300), mgr.nextDeadline());
+
+    mgr.removeConnection(a);
+    mgr.removeConnection(b);
+    try std.testing.expectEqual(@as(usize, 0), mgr.to_visit.items.len);
+    try std.testing.expectEqual(@as(usize, 0), mgr.timers.items.len);
+    mgr.freeDeadEntries();
+}
+
+test "a pass visits what is queued in the order it connected, and a removal keeps that" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    var e: [4]*ConnEntry = undefined;
+    for (&e, 0..) |*x, i| {
+        x.* = try acceptTest(&mgr, i + 1);
+        x.*.needs_visit = false;
+        x.*.needs_poll = false;
+    }
+    mgr.settleVisits();
+
+    for ([_]usize{ 3, 1, 0, 2 }) |i| e[i].mark(false);
+    mgr.orderVisits();
+    try std.testing.expectEqualSlices(*ConnEntry, &e, mgr.to_visit.items);
+    mgr.removeConnection(e[0]);
+    try std.testing.expectEqualSlices(*ConnEntry, e[1..], mgr.to_visit.items);
+    for (e[1..]) |x| mgr.removeConnection(x);
+    mgr.freeDeadEntries();
+}
+
+test "timers stay a heap through deadlines set, moved, cleared and removed" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.max_connections = 64;
+    for (0..64) |i| _ = try acceptTest(&mgr, i + 1);
+
+    var prng: std.Random.DefaultPrng = .init(0x7123);
+    const rand = prng.random();
+    var next_id: u64 = 65;
+    for (0..4000) |_| {
+        const e = mgr.entries.items[rand.uintLessThan(usize, mgr.entries.items.len)];
+        switch (rand.uintLessThan(u8, 10)) {
+            0 => mgr.setDeadline(e, null),
+            1 => {
+                mgr.removeConnection(e);
+                mgr.freeDeadEntries();
+                _ = try acceptTest(&mgr, next_id);
+                next_id += 1;
+            },
+            2 => mgr.queueDue(rand.intRangeAtMost(i64, 0, 1000)),
+            else => mgr.setDeadline(e, rand.intRangeAtMost(i64, 0, 1000)),
+        }
+        try expectTimersSound(&mgr);
+        var min: ?i64 = null;
+        for (mgr.entries.items) |x| {
+            if (x.timer_slot == no_slot) continue;
+            if (min == null or x.deadline.? < min.?) min = x.deadline;
+        }
+        try std.testing.expectEqual(min, mgr.nextDeadline());
+    }
 }
 
 fn testManager(alloc: Allocator) ConnectionManager {

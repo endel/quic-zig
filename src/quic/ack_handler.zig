@@ -33,6 +33,11 @@ const ACK_ELICITING_THRESHOLD: u32 = 2;
 /// Default max ACK delay (25ms in nanoseconds).
 const DEFAULT_MAX_ACK_DELAY: i64 = 25_000_000;
 
+/// How much sooner than max_ack_delay the delayed-ACK alarm is set. The
+/// value we advertise has to cover the timer firing late (RFC 9000 18.2),
+/// and ours fire a fraction of a millisecond past their deadline.
+const ACK_ALARM_LEAD: i64 = 1_000_000;
+
 /// Maximum PTO (60 seconds in nanoseconds).
 const MAX_PTO: i64 = 60_000_000_000;
 
@@ -70,9 +75,10 @@ pub const SentControlFrame = union(enum) {
     new_connection_id: u64,
     retire_connection_id: u64,
     new_token: void,
+    ack_frequency: void,
 
     /// The record for a queued frame, or null for one that is never repeated
-    /// (PING, PATH_*, CONNECTION_CLOSE, ACK_FREQUENCY, IMMEDIATE_ACK).
+    /// (PING, PATH_*, CONNECTION_CLOSE, IMMEDIATE_ACK).
     pub fn from(pcf: frame_mod.PendingControlFrame) ?SentControlFrame {
         return switch (pcf) {
             .max_data => .max_data,
@@ -88,7 +94,8 @@ pub const SentControlFrame = union(enum) {
             .new_connection_id => |n| .{ .new_connection_id = n.seq_num },
             .retire_connection_id => |seq| .{ .retire_connection_id = seq },
             .new_token => .new_token,
-            .ping, .path_challenge, .path_response, .connection_close, .ack_frequency, .immediate_ack => null,
+            .ack_frequency => .ack_frequency,
+            .ping, .path_challenge, .path_response, .connection_close, .immediate_ack => null,
         };
     }
 };
@@ -344,6 +351,9 @@ pub const SentPacketTracker = struct {
     /// Per-space PTO count (exponential backoff). Reset when ACK is received
     /// for this space. Separate from other spaces to allow independent backoff.
     pto_count: u32 = 0,
+    /// When this space's PTO last fired. Its deadline counts from here too
+    /// until a probe goes out: at the backoff cap a fire no longer moves it.
+    pto_fired_at: ?i64 = null,
 
     pub fn init(allocator: Allocator) SentPacketTracker {
         return .{ .allocator = allocator };
@@ -522,6 +532,10 @@ pub const ReceivedPacketTracker = struct {
 
     // draft-ietf-quic-ack-frequency: configurable ACK generation parameters
     ack_eliciting_threshold: u32 = ACK_ELICITING_THRESHOLD,
+    /// Payload bytes the packets counted by `ack_eliciting_threshold` must
+    /// also add up to; see `ConnectionConfig.ack_bytes_threshold`.
+    ack_bytes_threshold: u32 = 0,
+    ack_eliciting_bytes: u64 = 0, // payload of the ack-eliciting packets since the last ACK
     max_ack_delay_ns: i64 = DEFAULT_MAX_ACK_DELAY,
     reordering_threshold: u64 = 1, // 0 = no reorder-triggered ACKs
     ack_frequency_seq: u64 = 0, // highest received ACK_FREQUENCY sequence number
@@ -537,7 +551,8 @@ pub const ReceivedPacketTracker = struct {
         self.received.deinit();
     }
 
-    pub fn onPacketReceived(self: *ReceivedPacketTracker, pn: u64, ack_eliciting: bool, now: i64, ecn: u2) !void {
+    /// `payload_len` is the packet's decrypted payload, for `ack_bytes_threshold`.
+    pub fn onPacketReceived(self: *ReceivedPacketTracker, pn: u64, ack_eliciting: bool, now: i64, ecn: u2, payload_len: usize) !void {
         if (self.received.contains(pn)) return;
         try self.received.add(pn);
         // A peer skipping every other PN would otherwise grow this without
@@ -547,6 +562,7 @@ pub const ReceivedPacketTracker = struct {
             self.pruneAckedRanges(tracked[MAX_RECEIVED_RANGES - 1].start);
         }
 
+        const prev_largest = self.largest_received;
         if (self.largest_received == null or pn > self.largest_received.?) {
             self.largest_received = pn;
             self.largest_received_time = now;
@@ -562,6 +578,7 @@ pub const ReceivedPacketTracker = struct {
 
         if (ack_eliciting) {
             self.ack_eliciting_since_last_ack += 1;
+            self.ack_eliciting_bytes += payload_len;
 
             // Reordering-based immediate ACK (draft-ietf-quic-ack-frequency)
             if (self.largest_received != null and pn < self.largest_received.?) {
@@ -573,15 +590,35 @@ pub const ReceivedPacketTracker = struct {
                     }
                 }
                 // If reordering_threshold == 0, don't trigger immediate ACK on reorder
-            } else if (self.ack_eliciting_since_last_ack >= self.ack_eliciting_threshold) {
+            } else if ((self.ack_eliciting_since_last_ack >= self.ack_eliciting_threshold and
+                self.ack_eliciting_bytes >= self.ack_bytes_threshold) or
+                self.pastGap(pn, prev_largest))
+            {
                 self.ack_queued = true;
                 self.ack_alarm = null;
             } else {
-                if (self.ack_alarm == null) {
-                    self.ack_alarm = now + self.max_ack_delay_ns;
-                }
+                const at = now + @max(self.alarmDelay() - ACK_ALARM_LEAD, 0);
+                if (self.ack_alarm == null or at < self.ack_alarm.?) self.ack_alarm = at;
             }
         }
+    }
+
+    /// How long the ACK owed may wait. Under the byte threshold, once about
+    /// a full packet is owed, no longer than QUIC's default: a bulk sender
+    /// whose window is still small waits on it, while the small packets the
+    /// longer delay is for never add up to that much.
+    fn alarmDelay(self: *const ReceivedPacketTracker) i64 {
+        if (self.ack_bytes_threshold > 0 and self.ack_eliciting_bytes >= self.ack_bytes_threshold / 2)
+            return @min(self.max_ack_delay_ns, DEFAULT_MAX_ACK_DELAY);
+        return self.max_ack_delay_ns;
+    }
+
+    /// Whether `pn`, the new largest, leaves packets missing below it: the
+    /// sender then hears at once, to detect the loss (RFC 9000 13.2.1).
+    /// Held to the reordering threshold, as a packet arriving late is.
+    fn pastGap(self: *const ReceivedPacketTracker, pn: u64, prev_largest: ?u64) bool {
+        const prev = prev_largest orelse return false;
+        return self.reordering_threshold > 0 and pn -| prev -| 1 >= self.reordering_threshold;
     }
 
     /// Apply ACK_FREQUENCY frame parameters (draft-ietf-quic-ack-frequency).
@@ -589,7 +626,9 @@ pub const ReceivedPacketTracker = struct {
     pub fn applyAckFrequency(self: *ReceivedPacketTracker, seq: u64, threshold: u64, max_delay_us: u64, reorder_threshold: u64) bool {
         if (self.ack_frequency_seq > 0 and seq < self.ack_frequency_seq) return false;
         self.ack_frequency_seq = seq + 1; // store next expected (> current)
-        self.ack_eliciting_threshold = @intCast(@max(1, @min(threshold, 256)));
+        // An ACK after MORE than `threshold` packets: 1 is RFC 9000's every second.
+        self.ack_eliciting_threshold = @as(u32, @min(threshold, 255)) + 1;
+        self.ack_bytes_threshold = 0; // the peer's threshold stands alone
         // Capped where the max_ack_delay transport parameter's range ends (2^14 ms).
         self.max_ack_delay_ns = @as(i64, @min(max_delay_us, (1 << 14) * 1000)) * 1000;
         self.reordering_threshold = reorder_threshold;
@@ -635,8 +674,8 @@ pub const ReceivedPacketTracker = struct {
         return self.getAckFrameImpl(now, ack_delay_exponent, false);
     }
 
-    /// Generate an ACK frame regardless of threshold/alarm timers.
-    /// Used to piggyback ACKs on outgoing data packets (RFC 9000 §13.2.1).
+    /// Generate an ACK frame regardless of threshold/alarm timers: Initial
+    /// and Handshake packets are acknowledged at once (RFC 9000 §13.2.1).
     pub fn getAckFrameForced(self: *ReceivedPacketTracker, now: i64, ack_delay_exponent: u64) ?Frame {
         return self.getAckFrameImpl(now, ack_delay_exponent, true);
     }
@@ -649,7 +688,15 @@ pub const ReceivedPacketTracker = struct {
                 return null;
             }
         }
+        const frame = self.peekAckFrame(now, ack_delay_exponent) orelse return null;
+        self.onAckSent();
+        return frame;
+    }
 
+    /// The ACK frame for what has been received, leaving the ACK state
+    /// untouched until `onAckSent`. Valid until the next packet is received,
+    /// so write the frame first.
+    pub fn peekAckFrame(self: *const ReceivedPacketTracker, now: i64, ack_delay_exponent: u64) ?Frame {
         const largest = self.largest_received orelse return null;
         const recv_ranges = self.received.getRanges();
         if (recv_ranges.len == 0) return null;
@@ -661,20 +708,7 @@ pub const ReceivedPacketTracker = struct {
         const ack_delay_us: u64 = @intCast(@max(0, @divTrunc(ack_delay_ns, 1000)));
         const ack_delay_encoded = ack_delay_us >> @intCast(ack_delay_exponent);
 
-        self.ack_queued = false;
-        self.ack_alarm = null;
-        self.ack_eliciting_since_last_ack = 0;
-
-        // Populate additional ACK ranges from received range set
-        var ack_ranges: [MAX_ACK_RANGES]AckRange = undefined;
-        var ack_range_count: u8 = 0;
-        if (recv_ranges.len > 1) {
-            for (recv_ranges[1..]) |r| {
-                if (ack_range_count >= MAX_ACK_RANGES) break;
-                ack_ranges[ack_range_count] = .{ .start = r.start, .end = r.end };
-                ack_range_count += 1;
-            }
-        }
+        const ack_ranges: frame_mod.AckRanges = .{ .list = recv_ranges[1..@min(recv_ranges.len, MAX_ACK_RANGES + 1)] };
 
         // Use ACK_ECN when any ECN counter is non-zero (RFC 9000 §13.4.2)
         if (self.ecn_ect0 > 0 or self.ecn_ect1 > 0 or self.ecn_ce > 0) {
@@ -683,7 +717,6 @@ pub const ReceivedPacketTracker = struct {
                     .largest_ack = largest,
                     .ack_delay = ack_delay_encoded,
                     .first_ack_range = first_ack_range,
-                    .ack_range_count = ack_range_count,
                     .ack_ranges = ack_ranges,
                     .ecn_ect0 = self.ecn_ect0,
                     .ecn_ect1 = self.ecn_ect1,
@@ -697,10 +730,17 @@ pub const ReceivedPacketTracker = struct {
                 .largest_ack = largest,
                 .ack_delay = ack_delay_encoded,
                 .first_ack_range = first_ack_range,
-                .ack_range_count = ack_range_count,
                 .ack_ranges = ack_ranges,
             },
         };
+    }
+
+    /// An ACK covering everything received has gone out.
+    pub fn onAckSent(self: *ReceivedPacketTracker) void {
+        self.ack_queued = false;
+        self.ack_alarm = null;
+        self.ack_eliciting_since_last_ack = 0;
+        self.ack_eliciting_bytes = 0;
     }
 };
 
@@ -713,6 +753,10 @@ pub const PacketHandler = struct {
     bytes_in_flight: u64 = 0,
     pto_count: u32 = 0,
     next_pn: [3]u64 = .{ 0, 0, 0 },
+    /// A client keeps its PTO backoff through Initial ACKs: the server may not
+    /// have validated its address yet, and probing it as fast as at first
+    /// only adds to what it can't answer (RFC 9002 6.2.1).
+    is_client: bool = false,
 
     /// RFC 9000 21.4: the application space leaves the odd packet number
     /// unsent, so a peer acking what it never received (to inflate our
@@ -800,9 +844,9 @@ pub const PacketHandler = struct {
         }
     }
 
-    pub fn onPacketReceived(self: *PacketHandler, level: EncLevel, pn: u64, ack_eliciting: bool, now: i64, ecn: u2) !void {
+    pub fn onPacketReceived(self: *PacketHandler, level: EncLevel, pn: u64, ack_eliciting: bool, now: i64, ecn: u2, payload_len: usize) !void {
         const idx = @backingInt(level);
-        try self.recv[idx].onPacketReceived(pn, ack_eliciting, now, ecn);
+        try self.recv[idx].onPacketReceived(pn, ack_eliciting, now, ecn, payload_len);
     }
 
     pub fn onAckReceived(
@@ -854,6 +898,7 @@ pub const PacketHandler = struct {
             }
         }
 
+        if (self.is_client and level == .initial) return;
         self.pto_count = 0;
         self.sent[idx].pto_count = 0;
     }
@@ -863,11 +908,19 @@ pub const PacketHandler = struct {
         return self.recv[idx].getAckFrame(now, ack_delay_exponent);
     }
 
-    /// Generate an ACK frame regardless of threshold/alarm timers.
-    /// Used to piggyback ACKs when the packet already carries data.
+    /// See `ReceivedPacketTracker.getAckFrameForced`.
     pub fn getAckFrameForced(self: *PacketHandler, level: EncLevel, now: i64, ack_delay_exponent: u64) ?Frame {
         const idx = @backingInt(level);
         return self.recv[idx].getAckFrameForced(now, ack_delay_exponent);
+    }
+
+    /// See `ReceivedPacketTracker.peekAckFrame`.
+    pub fn peekAckFrame(self: *const PacketHandler, level: EncLevel, now: i64, ack_delay_exponent: u64) ?Frame {
+        return self.recv[@backingInt(level)].peekAckFrame(now, ack_delay_exponent);
+    }
+
+    pub fn onAckSent(self: *PacketHandler, level: EncLevel) void {
+        self.recv[@backingInt(level)].onAckSent();
     }
 
     /// Check if there are unacked ack-eliciting packets at the given level.
@@ -887,10 +940,14 @@ pub const PacketHandler = struct {
     }
 
     /// Compute PTO deadline for a single packet number space.
-    /// Returns null if the space should not arm PTO (no data, application space idle).
+    /// Returns null if the space should not arm PTO (no data, application space
+    /// idle or its handshake not `confirmed`).
     /// RFC 9002 §6.2.2.1: handshake spaces arm PTO even with no packets in flight.
-    pub fn spacePtoDeadline(self: *const PacketHandler, tracker: SentPacketTracker, idx: usize) ?i64 {
+    pub fn spacePtoDeadline(self: *const PacketHandler, tracker: SentPacketTracker, idx: usize, confirmed: bool) ?i64 {
         const is_handshake_space = (idx != @backingInt(EncLevel.application));
+        // RFC 9002 6.2.1: until then the peer may lack the keys to read a
+        // probe, or we the keys to read its ACK.
+        if (!is_handshake_space and !confirmed) return null;
         if (tracker.ack_eliciting_in_flight == 0) {
             if (!(is_handshake_space and tracker.last_ack_eliciting_sent_time != null)) {
                 return null;
@@ -898,7 +955,8 @@ pub const PacketHandler = struct {
         }
 
         // RFC 9002 6.2.1: from the last ack-eliciting packet, not the last sent.
-        const base_time = tracker.last_ack_eliciting_sent_time orelse return null;
+        const sent_at = tracker.last_ack_eliciting_sent_time orelse return null;
+        const base_time = @max(sent_at, tracker.pto_fired_at orelse sent_at);
 
         var pto_duration = if (idx == @backingInt(EncLevel.application))
             self.rtt_stats.pto()
@@ -914,7 +972,7 @@ pub const PacketHandler = struct {
         return base_time + pto_duration;
     }
 
-    pub fn getPtoTimeout(self: *const PacketHandler) ?i64 {
+    pub fn getPtoTimeout(self: *const PacketHandler, confirmed: bool) ?i64 {
         var earliest: ?i64 = null;
 
         for (self.sent, 0..) |tracker, idx| {
@@ -925,7 +983,7 @@ pub const PacketHandler = struct {
                 continue;
             }
 
-            const timeout = self.spacePtoDeadline(tracker, idx) orelse continue;
+            const timeout = self.spacePtoDeadline(tracker, idx, confirmed) orelse continue;
             if (earliest == null or timeout < earliest.?) {
                 earliest = timeout;
             }
@@ -965,13 +1023,13 @@ pub const PacketHandler = struct {
     }
 
     /// Get the encryption level where PTO should fire (the one with earliest timeout).
-    pub fn getPtoSpace(self: *PacketHandler) ?EncLevel {
+    pub fn getPtoSpace(self: *PacketHandler, confirmed: bool) ?EncLevel {
         var earliest: ?i64 = null;
         var result: ?EncLevel = null;
 
         for (self.sent, 0..) |tracker, idx| {
             if (tracker.loss_time != null) continue;
-            const timeout = self.spacePtoDeadline(tracker, idx) orelse continue;
+            const timeout = self.spacePtoDeadline(tracker, idx, confirmed) orelse continue;
             if (earliest == null or timeout < earliest.?) {
                 earliest = timeout;
                 result = @fromBackingInt(@intCast(idx));
@@ -1028,14 +1086,120 @@ test "SentPacketTracker: basic send and ack" {
     try testing.expect(rtt_stats.has_measurement);
 }
 
+test "ReceivedPacketTracker: a packet past a gap is acknowledged at once" {
+    var tracker = ReceivedPacketTracker.init(testing.allocator);
+    defer tracker.deinit();
+    try tracker.onPacketReceived(0, true, 1000, 0, 0);
+    try testing.expect(!tracker.ack_queued);
+    tracker.onAckSent();
+    try tracker.onPacketReceived(2, true, 2000, 0, 0);
+    try testing.expect(tracker.ack_queued);
+
+    // In order again, it waits.
+    tracker.onAckSent();
+    try tracker.onPacketReceived(3, true, 3000, 0, 0);
+    try testing.expect(!tracker.ack_queued);
+
+    // ACK_FREQUENCY's threshold of 0 waits past a gap too.
+    tracker.onAckSent();
+    tracker.reordering_threshold = 0;
+    try tracker.onPacketReceived(5, true, 4000, 0, 0);
+    try testing.expect(!tracker.ack_queued);
+}
+
+test "ReceivedPacketTracker: with a byte threshold, two small packets wait for the alarm, two full-size ones don't" {
+    var tracker = ReceivedPacketTracker.init(testing.allocator);
+    defer tracker.deinit();
+    tracker.ack_bytes_threshold = 2000;
+    tracker.max_ack_delay_ns = 60 * std.time.ns_per_ms;
+    const now: i64 = 1_000_000_000;
+
+    try tracker.onPacketReceived(0, true, now, 0, 40);
+    try tracker.onPacketReceived(1, true, now + 1, 0, 40);
+    try testing.expect(!tracker.ack_queued);
+    try testing.expectEqual(@as(?i64, now + 60 * std.time.ns_per_ms - ACK_ALARM_LEAD), tracker.ack_alarm);
+
+    // What went before that ACK doesn't count toward the next.
+    tracker.onAckSent();
+    try tracker.onPacketReceived(2, true, now + 2, 0, 1160);
+    try tracker.onPacketReceived(3, true, now + 3, 0, 800);
+    try testing.expect(!tracker.ack_queued);
+
+    tracker.onAckSent();
+    try tracker.onPacketReceived(4, true, now + 4, 0, 1160);
+    try testing.expect(!tracker.ack_queued);
+    try tracker.onPacketReceived(5, true, now + 5, 0, 1160);
+    try testing.expect(tracker.ack_queued);
+}
+
+test "ReceivedPacketTracker: with a byte threshold, a full packet owed waits no longer than QUIC's default delay" {
+    var tracker = ReceivedPacketTracker.init(testing.allocator);
+    defer tracker.deinit();
+    tracker.ack_bytes_threshold = 2000;
+    tracker.max_ack_delay_ns = 60 * std.time.ns_per_ms;
+    const ms = std.time.ns_per_ms;
+    const now: i64 = 1_000_000_000;
+    const short = DEFAULT_MAX_ACK_DELAY - ACK_ALARM_LEAD;
+    const long = 60 * ms - ACK_ALARM_LEAD;
+
+    try tracker.onPacketReceived(0, true, now, 0, 40);
+    try testing.expectEqual(@as(?i64, now + long), tracker.ack_alarm);
+    // A full-size one after it pulls the alarm in.
+    try tracker.onPacketReceived(1, true, now + 10 * ms, 0, 1160);
+    try testing.expect(!tracker.ack_queued);
+    try testing.expectEqual(@as(?i64, now + 10 * ms + short), tracker.ack_alarm);
+
+    tracker.onAckSent();
+    try tracker.onPacketReceived(2, true, now + 20 * ms, 0, 1160);
+    try testing.expectEqual(@as(?i64, now + 20 * ms + short), tracker.ack_alarm);
+
+    // Never past what we advertise.
+    tracker.onAckSent();
+    tracker.max_ack_delay_ns = 10 * ms;
+    try tracker.onPacketReceived(3, true, now + 30 * ms, 0, 1160);
+    try testing.expectEqual(@as(?i64, now + 30 * ms + 10 * ms - ACK_ALARM_LEAD), tracker.ack_alarm);
+
+    // Without the byte threshold, size doesn't matter.
+    tracker.onAckSent();
+    tracker.max_ack_delay_ns = 60 * ms;
+    tracker.ack_bytes_threshold = 0;
+    try tracker.onPacketReceived(4, true, now + 40 * ms, 0, 1160);
+    try testing.expectEqual(@as(?i64, now + 40 * ms + long), tracker.ack_alarm);
+}
+
+test "ReceivedPacketTracker: an ACK_FREQUENCY threshold replaces the byte threshold" {
+    var tracker = ReceivedPacketTracker.init(testing.allocator);
+    defer tracker.deinit();
+    tracker.ack_bytes_threshold = 2000;
+    try testing.expect(tracker.applyAckFrequency(0, 1, 25_000, 1));
+    try tracker.onPacketReceived(0, true, 1000, 0, 40);
+    try tracker.onPacketReceived(1, true, 2000, 0, 40);
+    try testing.expect(tracker.ack_queued);
+}
+
+test "ReceivedPacketTracker: an ACK_FREQUENCY threshold of N acknowledges after N + 1 packets" {
+    // draft-ietf-quic-ack-frequency 4: 1 is RFC 9000's every second packet.
+    for ([_]u64{ 0, 1, 10 }) |threshold| {
+        var tracker = ReceivedPacketTracker.init(testing.allocator);
+        defer tracker.deinit();
+        try testing.expect(tracker.applyAckFrequency(0, threshold, 25_000, 1));
+        for (0..threshold) |pn| {
+            try tracker.onPacketReceived(pn, true, 1000, 0, 40);
+            try testing.expect(!tracker.ack_queued);
+        }
+        try tracker.onPacketReceived(threshold, true, 1000, 0, 40);
+        try testing.expect(tracker.ack_queued);
+    }
+}
+
 test "ReceivedPacketTracker: immediate ACK on reorder" {
     var tracker = ReceivedPacketTracker.init(testing.allocator);
     defer tracker.deinit();
 
     const now: i64 = 1_000_000_000;
 
-    try tracker.onPacketReceived(0, true, now, 0);
-    try tracker.onPacketReceived(1, true, now + 1_000_000, 0);
+    try tracker.onPacketReceived(0, true, now, 0, 0);
+    try tracker.onPacketReceived(1, true, now + 1_000_000, 0, 0);
 
     try testing.expect(tracker.ack_queued);
 }
@@ -1091,7 +1255,7 @@ test "PacketHandler: integration" {
 
     try testing.expectEqual(@as(u64, 1200), handler.bytes_in_flight);
 
-    try handler.onPacketReceived(.initial, 0, true, now, 0);
+    try handler.onPacketReceived(.initial, 0, true, now, 0, 0);
 
     const ack_time = now + 50_000_000;
     var result: AckResult = .{};
@@ -1101,6 +1265,29 @@ test "PacketHandler: integration" {
     try testing.expectEqual(@as(u64, 0), handler.bytes_in_flight);
 }
 
+test "PacketHandler: a client keeps its PTO backoff through Initial ACKs" {
+    // RFC 9002 6.2.1: only a Handshake ACK tells a client the server has
+    // validated its address. A server resets on any ACK.
+    for ([_]bool{ true, false }) |is_client| {
+        var handler = PacketHandler.init(testing.allocator);
+        defer handler.deinit();
+        handler.is_client = is_client;
+        const now: i64 = 1_000_000_000;
+        var result: AckResult = .{};
+        defer result.deinit(testing.allocator);
+        for ([_]EncLevel{ .initial, .handshake }) |level| {
+            const pn = handler.nextPacketNumber(level);
+            try handler.onPacketSent(.{ .pn = pn, .time_sent = now, .size = 1200, .ack_eliciting = true, .in_flight = true, .enc_level = level });
+            handler.pto_count = 3;
+            handler.sent[@backingInt(level)].pto_count = 3;
+            try handler.onAckReceived(level, pn, 0, 3, &.{}, 0, now + 50_000_000, &result);
+            const kept = is_client and level == .initial;
+            try testing.expectEqual(@as(u32, if (kept) 3 else 0), handler.pto_count);
+            try testing.expectEqual(@as(u32, if (kept) 3 else 0), handler.sent[@backingInt(level)].pto_count);
+        }
+    }
+}
+
 test "ReceivedPacketTracker: ECN counters and ACK_ECN generation" {
     var tracker = ReceivedPacketTracker.init(testing.allocator);
     defer tracker.deinit();
@@ -1108,9 +1295,9 @@ test "ReceivedPacketTracker: ECN counters and ACK_ECN generation" {
     const now: i64 = 1_000_000_000;
 
     // Receive packets with ECN marks
-    try tracker.onPacketReceived(0, true, now, 0b10); // ECT(0)
-    try tracker.onPacketReceived(1, true, now + 1_000_000, 0b10); // ECT(0)
-    try tracker.onPacketReceived(2, true, now + 2_000_000, 0b11); // CE
+    try tracker.onPacketReceived(0, true, now, 0b10, 0); // ECT(0)
+    try tracker.onPacketReceived(1, true, now + 1_000_000, 0b10, 0); // ECT(0)
+    try tracker.onPacketReceived(2, true, now + 2_000_000, 0b11, 0); // CE
 
     try testing.expectEqual(@as(u64, 2), tracker.ecn_ect0);
     try testing.expectEqual(@as(u64, 0), tracker.ecn_ect1);
@@ -1137,8 +1324,8 @@ test "ReceivedPacketTracker: no ECN returns plain ACK" {
     const now: i64 = 1_000_000_000;
 
     // Receive packets without ECN marks
-    try tracker.onPacketReceived(0, true, now, 0); // Not-ECT
-    try tracker.onPacketReceived(1, true, now + 1_000_000, 0); // Not-ECT
+    try tracker.onPacketReceived(0, true, now, 0, 0); // Not-ECT
+    try tracker.onPacketReceived(1, true, now + 1_000_000, 0, 0); // Not-ECT
 
     // getAckFrame should return plain ACK
     const frame = tracker.getAckFrame(now + 2_000_000, 3);
@@ -1229,7 +1416,7 @@ test "ReceivedPacketTracker: range count is capped, oldest dropped" {
     // Every other PN: one range per packet.
     var pn: u64 = 0;
     while (pn < 4 * MAX_RECEIVED_RANGES) : (pn += 2) {
-        try tracker.onPacketReceived(pn, true, 0, 0);
+        try tracker.onPacketReceived(pn, true, 0, 0, 0);
     }
     try testing.expectEqual(MAX_RECEIVED_RANGES, tracker.received.len());
     // The newest survive; a forgotten gap now reads as a duplicate.
@@ -1245,7 +1432,7 @@ test "ReceivedPacketTracker: pruneAckedRanges removes old ranges" {
     // Receive packets 0..9
     var i: u64 = 0;
     while (i < 10) : (i += 1) {
-        try tracker.onPacketReceived(i, true, 1000 + @as(i64, @intCast(i)), 0);
+        try tracker.onPacketReceived(i, true, 1000 + @as(i64, @intCast(i)), 0, 0);
     }
 
     // Ranges should cover 0..9

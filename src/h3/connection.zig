@@ -141,8 +141,10 @@ pub const H3Connection = struct {
     // Initialization state
     initialized: bool = false,
 
-    // Decoded headers buffer (reused across calls)
-    headers_buf: [MAX_HEADERS]qpack.Header = undefined,
+    /// Decoded headers, pointing into `qpack_scratch`: shared, left empty or
+    /// owned the same way, and good for as long.
+    headers_buf: []qpack.Header = &.{},
+    headers_buf_owned: bool = false,
 
     // Per-stream partial frame buffer for streams that haven't delivered a complete frame yet
     // Key: stream_id, Value: accumulated bytes
@@ -175,7 +177,11 @@ pub const H3Connection = struct {
 
     // Static-only encoder; the decoder accepts a dynamic table.
     qpack_encoder: qpack.QpackEncoder = .{},
-    qpack_decoder: qpack.QpackDecoder = .{},
+    /// Made when the peer's encoder stream first sends something: 13 KB of
+    /// table and instruction buffers that a peer keeping to the static table
+    /// never needs. `qpack_capacity` is what our SETTINGS offered it.
+    qpack_decoder: ?*qpack.QpackDecoder = null,
+    qpack_capacity: usize = 0,
 
     /// Scratch the decoder copies header names/values into; `headers_buf`
     /// slices point in here and survive only until the next decode into it.
@@ -236,6 +242,8 @@ pub const H3Connection = struct {
 
     pub fn deinit(self: *H3Connection) void {
         if (self.qpack_scratch_owned) self.allocator.free(self.qpack_scratch);
+        if (self.headers_buf_owned) self.allocator.free(self.headers_buf);
+        if (self.qpack_decoder) |d| self.allocator.destroy(d);
         var it = self.stream_bufs.valueIterator();
         while (it.next()) |buf| {
             buf.deinit(self.allocator);
@@ -252,10 +260,28 @@ pub const H3Connection = struct {
         self.body_owed.deinit(self.allocator);
     }
 
+    fn encoderInstructions(self: *H3Connection, data: []const u8) !void {
+        // Chrome opens its encoder stream with Set Dynamic Table Capacity 0
+        // and goes no further: an empty table needs no decoder for that.
+        if (self.qpack_decoder == null and std.mem.allEqual(u8, data, 0x20)) return;
+        const d = self.qpack_decoder orelse blk: {
+            const d = try self.allocator.create(qpack.QpackDecoder);
+            d.* = .{};
+            d.setCapacity(self.qpack_capacity);
+            self.qpack_decoder = d;
+            break :blk d;
+        };
+        try d.processEncoderInstruction(data);
+    }
+
     fn qpackScratch(self: *H3Connection) ![]u8 {
         if (self.qpack_scratch.len == 0) {
             self.qpack_scratch = try self.allocator.alloc(u8, qpack.SCRATCH_SIZE);
             self.qpack_scratch_owned = true;
+        }
+        if (self.headers_buf.len == 0) {
+            self.headers_buf = try self.allocator.alloc(qpack.Header, MAX_HEADERS);
+            self.headers_buf_owned = true;
         }
         return self.qpack_scratch;
     }
@@ -281,7 +307,8 @@ pub const H3Connection = struct {
         // and SETTINGS can't promise more table than there is.
         const cap = &self.local_settings.qpack_max_table_capacity;
         cap.* = @min(cap.*, qpack.DynamicTable.MAX_CAPACITY);
-        self.qpack_decoder.setCapacity(@intCast(cap.*));
+        self.qpack_capacity = @intCast(cap.*);
+        if (self.qpack_decoder) |d| d.setCapacity(self.qpack_capacity);
 
         // Send SETTINGS frame on control stream
         var settings_buf: [128]u8 = undefined;
@@ -918,7 +945,7 @@ pub const H3Connection = struct {
                 self.peer_qpack_enc_stream_id = stream_id;
                 // Buffer remaining data (encoder instructions after type byte)
                 if (remaining.len > 0) {
-                    self.qpack_decoder.processEncoderInstruction(remaining) catch {
+                    self.encoderInstructions(remaining) catch {
                         self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
                         return error.H3GeneralProtocolError;
                     };
@@ -1424,7 +1451,7 @@ pub const H3Connection = struct {
         const scratch = try self.qpackScratch();
         // RFC 9204 §2.2.3: a block that does not decode fails the connection;
         // decoding around its dynamic references would drop fields.
-        const hdr_count = self.qpack_decoder.decode(qpack_data, &self.headers_buf, scratch, stream_id) catch {
+        const hdr_count = qpack.decodeBlock(self.qpack_decoder, qpack_data, self.headers_buf, scratch, stream_id) catch {
             self.consumeRequestBytes(rs, buf, frame_len);
             self.closeWithError(.qpack_decompression_failed, "QPACK decode failure");
             return error.H3FrameError;
@@ -1531,7 +1558,7 @@ pub const H3Connection = struct {
     /// flow control credit them.
     fn consumeRequestBytes(_: *H3Connection, rs: ?*stream_mod.ReceiveStream, buf: *std.ArrayList(u8), n: usize) void {
         h3_frame.consumeFromBuf(buf, n);
-        if (rs) |r| r.retained -|= n;
+        if (rs) |r| r.release(n);
     }
 
     /// Discard what is buffered of a skipped frame. True once it is gone.
@@ -1561,7 +1588,7 @@ pub const H3Connection = struct {
                 if (recv_stream.read()) |data| {
                     defer self.allocator.free(data);
                     if (data.len > 0) {
-                        self.qpack_decoder.processEncoderInstruction(data) catch |err| {
+                        self.encoderInstructions(data) catch |err| {
                             if (err == error.CapacityExceeded) {
                                 self.closeWithError(.qpack_encoder_stream_error, "QPACK encoder stream error");
                             } else if (err == error.ExcessiveLoad) {
@@ -1599,7 +1626,8 @@ pub const H3Connection = struct {
     /// Send pending decoder instructions on the QPACK decoder stream.
     fn flushDecoderInstructions(self: *H3Connection) !void {
         const dec_stream = self.local_qpack_dec_stream orelse return;
-        const instructions = self.qpack_decoder.getInstructions();
+        const decoder = self.qpack_decoder orelse return;
+        const instructions = decoder.getInstructions();
         if (instructions.len > 0) {
             try dec_stream.writeData(instructions);
         }
@@ -1622,6 +1650,8 @@ test "H3Connection: init and deinit" {
     conn.frame_progress = .empty;
     conn.body_owed = .empty;
     conn.qpack_scratch_owned = false;
+    conn.headers_buf_owned = false;
+    conn.qpack_decoder = null;
     conn.deinit();
 }
 
@@ -2255,6 +2285,22 @@ test "H3 integration: poll identifies QPACK encoder + decoder streams" {
     try testing.expectEqual(@as(u64, 6), h3.peer_qpack_enc_stream_id.?);
     try testing.expect(h3.peer_qpack_dec_stream_id != null);
     try testing.expectEqual(@as(u64, 10), h3.peer_qpack_dec_stream_id.?);
+}
+
+test "H3 integration: Set Dynamic Table Capacity 0 alone makes no decoder" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    // What Chrome sends on its encoder stream, and all it sends.
+    try injectUniStreamData(&quic_conn, 6, &.{ 0x02, 0x20 }, false);
+    _ = try h3.poll();
+    try testing.expect(h3.qpack_decoder == null);
+
+    // A table worth keeping does make one.
+    h3.qpack_capacity = 4096;
+    try h3.encoderInstructions(&.{ 0x3f, 0xe1, 0x1f });
+    try testing.expectEqual(@as(usize, 4096), h3.qpack_decoder.?.dynamic.capacity);
 }
 
 test "H3 integration: a second control or QPACK stream is H3_STREAM_CREATION_ERROR" {
