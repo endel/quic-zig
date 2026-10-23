@@ -107,7 +107,7 @@ is rejected even if it would decode to fit.
 | Instruction | Pattern | Implementation |
 |-------------|---------|----------------|
 | Header Acknowledgment | `1xxxxxxx` | Emitted by `emitHeaderAck(stream_id)` after a decode with dynamic refs; received, it is `QPACK_DECODER_STREAM_ERROR` (§4.4.1 — we never send a block that needs one) |
-| Stream Cancellation | `01xxxxxx` | Parsed; no per-stream state to reclaim |
+| Stream Cancellation | `01xxxxxx` | Emitted by `cancelStream(stream_id)` when H3 refuses an oversized section after the peer has inserted; received, parsed with no per-stream state to reclaim |
 | Insert Count Increment | `00xxxxxx` | Received, any value is `QPACK_DECODER_STREAM_ERROR` (§4.4.3 — we never insert) |
 
 ### §4.3 Encoder Stream — ✅ Done
@@ -147,9 +147,10 @@ return `error.InvalidRIC`.
 ### §4.5.5 Decompression Failure — ✅ Done
 
 Any error from `QpackDecoder.decode()` (bad index, truncated string,
-corrupt Huffman, buffer too small, too many headers, …) yields
-`H3_QPACK_DECOMPRESSION_FAILED` via `closeWithError()` in the H3 bidi
-poll loop (connection.zig:976).
+corrupt Huffman, …) yields `H3_QPACK_DECOMPRESSION_FAILED` via
+`closeWithError()` in `handleHeadersFrame`. The exceptions are
+`FieldSectionTooLarge` and `TooManyHeaders`: the section decodes fine but
+is larger than we take, which RFC 9114 §4.2.2 makes a stream error (431).
 
 ## §5 Configuration — ✅ Done
 
@@ -202,6 +203,13 @@ poll loop (connection.zig:976).
   read, plus one table. A one-byte Duplicate or name reference can copy a
   whole entry, so past the budget the connection closes with
   `H3_EXCESSIVE_LOAD` rather than spend a table's worth of copying per byte.
+- **A field section may not outgrow its scratch.** `decode()` counts the
+  section down from `scratch.len` by RFC 9114 §4.2.2's measure (name +
+  value + 32 per field) as it goes, and stops with `FieldSectionTooLarge`
+  at the field that crosses it — before copying a dynamic entry or
+  expanding a Huffman string past it. Static and dynamic references cost
+  one byte on the wire, so without the overhead and the static strings in
+  the count, a peer could make a 1-byte field line cost far more.
 - **Decoded slices point into the caller's scratch** (`SCRATCH_SIZE`,
   16 KiB), valid until the next decode into it. The event loop shares one
   per loop across its connections, so headers are valid only during the
