@@ -102,6 +102,31 @@ pub fn enableRxTimestamps(sockfd: posix.socket_t) void {
     if (rc != 0) std.debug.print("rx timestamps: setsockopt failed rc={d}\n", .{rc});
 }
 
+/// Have what the socket sends go with the don't-fragment bit, for IPv4 and
+/// IPv6 alike (RFC 9000 §14): a datagram too large for the path is then lost
+/// rather than fragmented, which is what path MTU discovery has to see. One
+/// larger than the interface's MTU fails to send, with EMSGSIZE.
+///
+/// Linux gets IP_PMTUDISC_PROBE: it ignores the path MTU the kernel learns
+/// from ICMP, which is the connection's PMTUD to find, and spares the kernel
+/// picking an IP ID for every packet. macOS refuses IP_DONTFRAG on a
+/// dual-stack socket, so there IPv4 peers go without. Windows: no-op.
+pub fn setDontFragment(sockfd: posix.socket_t) void {
+    const opts: [2]struct { level: i32, name: u32, value: c_int } = switch (builtin.target.os.tag) {
+        .linux => .{
+            .{ .level = IPPROTO_IP, .name = linux.IP.MTU_DISCOVER, .value = linux.IP.PMTUDISC_PROBE },
+            .{ .level = posix.IPPROTO.IPV6, .name = linux.IPV6.MTU_DISCOVER, .value = linux.IPV6.PMTUDISC_PROBE },
+        },
+        .macos => .{
+            .{ .level = IPPROTO_IP, .name = posix.IP.DONTFRAG, .value = 1 },
+            .{ .level = posix.IPPROTO.IPV6, .name = posix.IPV6.DONTFRAG, .value = 1 },
+        },
+        else => return,
+    };
+    // One the socket's family lacks fails, and may.
+    for (opts) |o| rawSetsockopt(sockfd, o.level, o.name, std.mem.asBytes(&o.value));
+}
+
 /// Set the ECN codepoint for outgoing packets (low 2 bits of IP TOS).
 /// No-op on Windows.
 pub fn setEcnMark(sockfd: posix.socket_t, ecn_mark: u2) !void {

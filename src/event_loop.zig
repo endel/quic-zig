@@ -2268,6 +2268,7 @@ fn openUdpSocket(config: Config, port: u16) !struct { posix.socket_t, net.Addres
 
     try sys.bind(fd, &addr.any, addr.getOsSockLen());
     ecn_socket.enableEcnRecv(fd) catch {};
+    ecn_socket.setDontFragment(fd);
     return .{ fd, addr };
 }
 
@@ -2920,6 +2921,7 @@ pub fn Client(comptime Handler: type) type {
             };
             errdefer sys.close(sockfd);
             ecn_socket.enableEcnRecv(sockfd) catch {};
+            ecn_socket.setDontFragment(sockfd);
 
             // Init libxev
             const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
@@ -4607,6 +4609,40 @@ test "Server: serves on a socket it is given" {
     try testing.expectEqual(fd, b.sockfd);
     const local: *const posix.sockaddr.in = @ptrCast(@alignCast(&b.local_addr));
     try testing.expectEqual(@as(u16, 29416), std.mem.bigToNative(u16, local.port));
+}
+
+test "Server and Client sockets send with DF set, IPv4 and dual-stack" {
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    var handler = TestH3Handler{};
+    const S = Server(TestH3Handler);
+    var v4 = try S.init(testing.allocator, &handler, .{ .port = 29417 });
+    defer v4.deinit();
+    var dual = try S.init(testing.allocator, &handler, .{ .port = 29418, .ipv6 = true });
+    defer dual.deinit();
+    var client_handler = CheckingClient{};
+    var client = try Client(CheckingClient).init(testing.allocator, &client_handler, .{ .port = 29417, .skip_cert_verify = true });
+    defer client.deinit();
+
+    try testing.expectEqual(df_on, try dfOption(v4.sockfd, .ip));
+    try testing.expectEqual(df_on, try dfOption(client.sockfd, .ip));
+    try testing.expectEqual(df_on, try dfOption(dual.sockfd, .ipv6));
+    // A dual-stack socket's IPv4 peers take the IPv4 option, where it can be set.
+    if (builtin.target.os.tag == .linux) try testing.expectEqual(df_on, try dfOption(dual.sockfd, .ip));
+}
+
+const df_on: c_int = if (builtin.target.os.tag == .linux) std.os.linux.IP.PMTUDISC_PROBE else 1;
+
+/// The option `ecn_socket.setDontFragment` sets for `family`, as `fd` has it.
+fn dfOption(fd: posix.socket_t, family: enum { ip, ipv6 }) !c_int {
+    const linux = std.os.linux;
+    const level: i32, const name: u32 = switch (builtin.target.os.tag) {
+        .linux => if (family == .ip) .{ posix.IPPROTO.IP, linux.IP.MTU_DISCOVER } else .{ posix.IPPROTO.IPV6, linux.IPV6.MTU_DISCOVER },
+        else => if (family == .ip) .{ posix.IPPROTO.IP, posix.IP.DONTFRAG } else .{ posix.IPPROTO.IPV6, posix.IPV6.DONTFRAG },
+    };
+    var v: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    try testing.expectEqual(@as(c_int, 0), std.c.getsockopt(fd, level, name, @ptrCast(&v), &len));
+    return v;
 }
 
 fn getRcvBuf(fd: posix.socket_t) !c_int {
