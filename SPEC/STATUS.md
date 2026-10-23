@@ -546,7 +546,7 @@ https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/
 
 | § | Section | Status | Notes |
 |---|---------|--------|-------|
-| — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize; frames packed after it in a packet are read too (picoquic puts HANDSHAKE_DONE there) |
+| — | ACK_FREQUENCY frame (0xaf) | ✅ Done | Parse, serialize; frames packed after it in a packet are read too (picoquic puts HANDSHAKE_DONE there). A requested delay under our min_ack_delay, or of 2^14 ms or more, is PROTOCOL_VIOLATION (§4) |
 | — | IMMEDIATE_ACK frame (0x1f) | ✅ Done | Parse, serialize, triggers immediate ACK. Once we sent ACK_FREQUENCY, the packet that fills the congestion window (§8.1.1) and each PTO probe (§7) carry one |
 | — | min_ack_delay transport parameter (0xff04de1b) | ✅ Done | Advertised by both client and server: 1 ms, or max_ack_delay if that is lower. A peer's above its max_ack_delay is TRANSPORT_PARAMETER_ERROR |
 | — | Dynamic ACK thresholds | ✅ Done | ack_eliciting_threshold (an ACK after more than it: 1 is every second packet), max_ack_delay, reordering_threshold |

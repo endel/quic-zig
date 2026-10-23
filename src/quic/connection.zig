@@ -2578,8 +2578,12 @@ pub const Connection = struct {
                     self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY not negotiated");
                     return error.ProtocolViolation;
                 }
-                if (af.request_max_ack_delay < (self.local_params.min_ack_delay orelse 0)) {
-                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY delay under min_ack_delay");
+                // draft-ietf-quic-ack-frequency 4: under our min_ack_delay, or
+                // 2^14 ms or more (RFC 9000 18.2's limit), is invalid.
+                if (af.request_max_ack_delay < (self.local_params.min_ack_delay orelse 0) or
+                    af.request_max_ack_delay >= (1 << 14) * std.time.us_per_ms)
+                {
+                    self.closeWithTransportError(@backingInt(TransportError.protocol_violation), 0xaf, "ACK_FREQUENCY delay out of range");
                     return error.ProtocolViolation;
                 }
                 const applied = self.pkt_handler.recv[2].applyAckFrequency(
@@ -6500,16 +6504,21 @@ test "an ACK Delay no clock could produce is clamped, not overflowed" {
     try std.testing.expect(conn.pkt_handler.rtt_stats.has_measurement);
 }
 
-test "ACK_FREQUENCY: a huge max ack delay is capped, one under our min_ack_delay refused" {
+test "ACK_FREQUENCY: a delay of 2^14 ms or more, or under our min_ack_delay, is PROTOCOL_VIOLATION" {
+    // draft-ietf-quic-ack-frequency 4. The largest was capped instead.
+    const limit: u64 = (1 << 14) * 1000;
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     conn.local_params.min_ack_delay = 1000;
+    try conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = limit - 1, .reordering_threshold = 1 } }, .application, 0);
+    try std.testing.expectEqual(@as(i64, limit - 1) * 1000, conn.pkt_handler.recv[2].max_ack_delay_ns);
 
-    try conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = 1 << 60, .reordering_threshold = 1 } }, .application, 0);
-    conn.pkt_handler.recv[2].ack_alarm = null;
-    try conn.pkt_handler.recv[2].onPacketReceived(0, true, std.math.maxInt(i64) / 2, 0, 0);
-
-    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .ack_frequency = .{ .sequence_number = 1, .ack_eliciting_threshold = 2, .request_max_ack_delay = 999, .reordering_threshold = 1 } }, .application, 0));
+    for ([_]u64{ limit, 1 << 60, 999 }) |delay| {
+        var refused = testConnection(std.testing.allocator);
+        defer refused.deinit();
+        refused.local_params.min_ack_delay = 1000;
+        try std.testing.expectError(error.ProtocolViolation, refused.processFrame(&.{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = delay, .reordering_threshold = 1 } }, .application, 0));
+    }
 }
 
 test "ACK_FREQUENCY: ours to accept once we advertise min_ack_delay, whatever the peer advertised" {
