@@ -123,8 +123,31 @@ spreads new connections across workers, and QUIC-LB CIDs steer the rest.
   has the same address.
 
 Initials are never steered: whichever worker receives one accepts the
-connection. A datagram handed over is never handed on again, so a CID nobody
-owns gets a stateless reset from the worker it was steered to.
+connection. A datagram handed over is never handed on again by its id, so a
+CID nobody owns gets a stateless reset from the worker it was steered to.
+
+### Handing a connection to another worker
+
+A worker can give a live connection away, streams, datagrams and
+WebTransport sessions as they stand: a game server moves a client to the
+worker that runs its room. Every worker shares one `Config.moved_cids` (and
+`static_reset_key`, `tls_config` and the QUIC-LB config but its id), and the
+handler declares `onHandover`.
+
+1. `session.handOver(to)` on the old worker. At the end of the pass, after its
+   sends, the server detaches the connection, records its CIDs in `MovedCids`
+   as `to`'s, and calls `onHandover(handover)`.
+2. The handler queues the `Handover` for the new worker's thread — in the same
+   ordered queue as the datagrams `foreign_datagram` steers there, so the
+   connection always arrives before its packets.
+3. The new worker calls `adopt(handover)`. It gives the peer CIDs carrying its
+   own id with Retire Prior To past the old ones (RFC 9000 §5.1.2); the peer
+   switches to them within a round trip.
+
+Meanwhile a packet still on an old CID lands on a worker that does not know
+it, finds it in `MovedCids`, and is steered to the new owner; one that
+reaches the new owner before the connection does is dropped, not reset. The
+old CIDs leave `MovedCids` when the peer retires them or the connection closes.
 
 ## Limitations
 

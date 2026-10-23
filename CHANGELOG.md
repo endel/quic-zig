@@ -7,6 +7,10 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Added
 
+- A server can hand a live connection, streams and WebTransport sessions
+  included, to a sibling server on another thread sharing its port
+  (`Session.handOver`, `Server.adopt`, a shared `Config.moved_cids`); the
+  client is moved onto CIDs naming the new server. See QUIC-LB.md.
 - Client certificates (mutual TLS) for QUIC servers and `tls_server`: give a
   certificate entry a `ClientAuth` (CA bundle, `.required` or `.optional`)
   and clients reaching it by SNI are asked for a certificate, verified

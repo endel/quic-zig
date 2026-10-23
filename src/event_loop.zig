@@ -20,6 +20,7 @@ pub const Xev = xev;
 const connection = @import("quic/connection.zig");
 const connection_manager = @import("quic/connection_manager.zig");
 pub const ConnEntry = connection_manager.ConnEntry;
+pub const MovedCids = connection_manager.MovedCids;
 const stream_mod = @import("quic/stream.zig");
 const tls13 = @import("quic/tls13.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
@@ -227,6 +228,22 @@ pub const Config = struct {
     /// server receives one accepts the connection.
     foreign_datagram: ?ForeignDatagramHook = null,
 
+    /// The CIDs of connections handed between the servers on this port,
+    /// shared by all of them: with it, `Session.handOver` moves a connection
+    /// to a sibling server and `adopt` takes one in. Requires
+    /// `foreign_datagram`, which carries the moved connections' packets to
+    /// their new owner, and `static_reset_key`, which every server must
+    /// share for a connection's reset tokens to hold wherever it goes. The
+    /// servers must also share `tls_config`, whose material a connection
+    /// keeps pointing into.
+    moved_cids: ?*MovedCids = null,
+
+    /// Connection ids this server hands out are `id_base` + 1, + 2, …:
+    /// servers that hand connections to each other give each a range of its
+    /// own, so an id stays unique wherever its connection goes. WebSocket
+    /// ids are drawn from the same counter.
+    id_base: u64 = 0,
+
     /// SO_RCVBUF / SO_SNDBUF for the UDP socket(s). Null keeps the OS default,
     /// which is small for a busy server (~200 KB on Linux); several MB avoids
     /// drops under bursts. The kernel may clamp it (`net.core.rmem_max`).
@@ -263,6 +280,31 @@ pub const ForeignDatagram = struct {
 pub const ForeignDatagramHook = struct {
     ctx: ?*anyopaque = null,
     func: *const fn (ctx: ?*anyopaque, datagram: *const ForeignDatagram) void,
+};
+
+/// A connection on its way from one server to another: from the old one's
+/// `onHandover` to the new one's `adopt`, on the new one's thread. See
+/// `Session.handOver`. It must reach exactly one `adopt`, or `discard`.
+pub const Handover = struct {
+    entry: *ConnEntry,
+
+    /// The connection's id, which it keeps on the new server.
+    pub fn id(self: Handover) u64 {
+        return self.entry.id;
+    }
+
+    /// Free a connection no server will adopt — one still queued when the
+    /// server it was going to stops — without a word to the peer. Its CIDs
+    /// stay in `MovedCids` until that goes too.
+    pub fn discard(self: Handover) void {
+        const entry = self.entry;
+        const alloc = entry.conn.allocator;
+        connection_manager.destroyProtocols(alloc, entry.wt_conn, entry.h3_conn, entry.h0_conn);
+        entry.finished_streams.deinit(alloc);
+        entry.conn.deinit();
+        alloc.destroy(entry.conn);
+        alloc.destroy(entry);
+    }
 };
 
 /// Session wraps a ConnEntry and provides convenience methods for sending data.
@@ -677,6 +719,28 @@ pub const Session = struct {
         defer self.entry.wake();
         self.entry.conn.sendKeepAlive();
     }
+
+    /// Move this connection, with its streams, datagrams and WebTransport
+    /// sessions as they stand, to the sibling server whose QUIC-LB id is
+    /// `to`: one on another thread, on the same port (`Config.moved_cids`).
+    ///
+    /// At the end of the current pass, once its sends are out, this server
+    /// lets go of the connection and hands it to the handler's
+    /// `onHandover(handover: Handover)`, on this thread. That passes it to
+    /// the new server's thread, where `adopt` takes it in. From this call on
+    /// the connection's events are no longer polled here, so what has not
+    /// been delivered yet is delivered by the new server; datagrams arriving
+    /// meanwhile are dropped. Don't use this Session, or a copy, again.
+    ///
+    /// A connection that starts closing before the pass ends stays here and
+    /// closes as usual, with no `onHandover`. Errors when this server has no
+    /// `moved_cids` or no `onHandover`, or `to` is not a sibling's id.
+    pub fn handOver(self: *Session, to: []const u8) !void {
+        const mgr = self.entry.mgr orelse return error.NotConnected;
+        if (!mgr.can_hand_over) return error.HandoverNotConfigured;
+        try mgr.requestHandover(self.entry, to);
+        self.entry.wake(); // the pass that lets go, if no callback's is under way
+    }
 };
 
 pub fn Server(comptime Handler: type) type {
@@ -698,7 +762,7 @@ pub fn Server(comptime Handler: type) type {
             "onH0Finished",       "onWritable",         "onRequestEnd",
             "onRequestCancelled", "onConnectionClosed", "onQuicConnected",
             "onWsUpgrade",        "onWsMessage",        "onWsClose",
-            "onPass",
+            "onPass",             "onHandover",
         };
 
         for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
@@ -718,7 +782,7 @@ pub fn Server(comptime Handler: type) type {
                         "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
                         "onStopSending, onWritable, onPollComplete, onConnectionClosed, " ++
                         "onQuicConnected, onH0Request, onH0Data, onH0Finished, " ++
-                        "onWsUpgrade, onWsMessage, onWsClose, onPass");
+                        "onWsUpgrade, onWsMessage, onWsClose, onPass, onHandover");
                 }
             }
         }
@@ -753,6 +817,9 @@ pub fn Server(comptime Handler: type) type {
         }
         if (@hasDecl(Handler, "onPass") and @TypeOf(Handler.onPass) != fn (*Handler, i64) ?i64) {
             @compileError("onPass must be fn (self: *Handler, now_ns: i64) ?i64");
+        }
+        if (@hasDecl(Handler, "onHandover") and @TypeOf(Handler.onHandover) != fn (*Handler, Handover) void) {
+            @compileError("onHandover must be fn (self: *Handler, handover: Handover) void");
         }
     }
 
@@ -921,6 +988,7 @@ pub fn Server(comptime Handler: type) type {
             if (config.quic_lb) |lb| conn_config.quic_lb = lb;
             if (conn_config.quic_lb) |*lb| try quic_lb.validate(lb);
             if (config.foreign_datagram != null and conn_config.quic_lb == null) return error.ForeignDatagramNeedsQuicLb;
+            if (config.moved_cids != null and (config.foreign_datagram == null or config.static_reset_key == null)) return error.MovedCidsNeedsSteering;
 
             const sockfd, const local_addr = if (config.socket) |fd| .{ fd, try boundAddress(fd) } else try openUdpSocket(config, config.port);
             errdefer if (config.socket == null) sys.close(sockfd);
@@ -960,6 +1028,9 @@ pub fn Server(comptime Handler: type) type {
             conn_mgr.max_handshakes_per_source = config.max_handshakes_per_source orelse @max(conn_mgr.max_handshakes / 4, 1);
             conn_mgr.reply_limits = .init(config.stateless_reply_rate);
             conn_mgr.steer_foreign = config.foreign_datagram != null;
+            conn_mgr.moved = config.moved_cids;
+            conn_mgr.can_hand_over = config.moved_cids != null and @hasDecl(Handler, "onHandover");
+            conn_mgr.next_entry_id = config.id_base + 1;
             conn_mgr.reset_unknown = !(config.reuse_port and config.static_reset_key != null and config.foreign_datagram == null);
 
             // Init libxev
@@ -1137,7 +1208,7 @@ pub fn Server(comptime Handler: type) type {
             self.processConnections();
             self.runOnPass();
             self.tickAndSend();
-            self.conn_mgr.freeDeadEntries();
+            self.endPass();
         }
 
         /// Build and send whatever is queued, now. Writes made through a
@@ -1381,6 +1452,81 @@ pub fn Server(comptime Handler: type) type {
             return .disarm;
         }
 
+        /// After a pass's sends: let go of the connections handed over, and
+        /// free the ones that closed. Freed only now so that stale Session
+        /// pointers from processConnections, which may still be on the stack,
+        /// safely see wt_conn == null instead of freed memory.
+        fn endPass(self: *Self) void {
+            if (self.conn_mgr.handovers.items.len > 0) self.detachHandovers();
+            self.conn_mgr.freeDeadEntries();
+        }
+
+        fn detachHandovers(self: *Self) void {
+            const mgr = &self.conn_mgr;
+            while (mgr.handovers.pop()) |h| {
+                const entry = h.entry;
+                entry.handing_over = false;
+                const conn = entry.conn;
+                // Closing, or we are: it ends here, with the rest.
+                if (self.stopping or self.draining or conn.isClosed() or
+                    conn.state == .closing or conn.state == .draining) continue;
+                mgr.detach(entry, h.to);
+                if (comptime @hasDecl(Handler, "onHandover")) self.handler.onHandover(.{ .entry = entry });
+            }
+        }
+
+        /// Take in a connection a sibling server let go of (`Session.handOver`),
+        /// and serve it from here on: its handler is ours, and its next
+        /// events, the rest of what it had received included, come to ours.
+        /// The peer is given CIDs carrying our QUIC-LB id and told to retire
+        /// the old server's, which route here until it does (RFC 9000
+        /// §5.1.2); a peer that never switches is still steered here.
+        ///
+        /// The connection is ours either way: on error it is closed without
+        /// a word, and its next packet draws a stateless reset. Errors when
+        /// this server has no `moved_cids`, or does not share the old one's
+        /// `static_reset_key` or CID length. `max_connections` does not
+        /// apply: the connection was admitted where it began.
+        ///
+        /// Loop thread only, outside the server's callbacks. Writes made
+        /// through the Session it returns go out on the next pass.
+        pub fn adopt(self: *Self, h: Handover) !Session {
+            const entry = h.entry;
+            const conn = entry.conn;
+            errdefer {
+                self.conn_mgr.abandon(entry);
+                h.discard();
+            }
+            if (self.conn_mgr.moved == null) return error.HandoverNotConfigured;
+            if (!std.mem.eql(u8, &conn.static_reset_key, &self.conn_mgr.static_reset_key)) return error.ResetKeyMismatch;
+            try self.conn_mgr.adopt(entry);
+            errdefer unreachable; // adopted: nothing below fails
+            _ = conn.rotateLocalCids(self.conn_mgr.conn_config.quic_lb);
+            self.conn_mgr.syncCids(entry);
+
+            if (entry.h3_initialized) {
+                entry.wake_fn = wakeFromEntry;
+                entry.repoll_fn = repollFromEntry;
+                entry.wake_ctx = self;
+            }
+            // Shared per loop, so the old server's would be read on two threads.
+            if (entry.h3_conn) |h3c| if (!h3c.qpack_scratch_owned) {
+                h3c.qpack_scratch = &self.qpack_scratch;
+                h3c.headers_buf = &self.qpack_headers;
+            };
+            if (entry.wt_conn != null and @hasDecl(Handler, "onDatagram")) {
+                conn.datagram_recv_callback = datagramRecvCallback;
+                conn.datagram_recv_ctx = @ptrCast(entry);
+                entry.datagram_handler_ctx = @ptrCast(self.handler);
+            } else {
+                conn.datagram_recv_callback = null;
+                entry.datagram_handler_ctx = null;
+            }
+            if (self.stopping) conn.close(0, "server shutdown");
+            self.armWake();
+            return .{ .entry = entry };
+        }
+
         /// One pass over everything: read, dispatch, send, reap. Shared by
         /// the timer and wakeup callbacks.
         fn service(self: *Self) void {
@@ -1389,7 +1535,7 @@ pub fn Server(comptime Handler: type) type {
             self.processConnections();
             self.runOnPass();
             self.tickAndSend();
-            self.conn_mgr.freeDeadEntries();
+            self.endPass();
             self.endCallback();
 
             if (self.stopping and self.allConnectionsClosed()) {
@@ -1424,11 +1570,7 @@ pub fn Server(comptime Handler: type) type {
                 self.processConnections();
                 self.runOnPass();
                 self.tickAndSend();
-                // Free entries that were invalidated during tickAndSend.
-                // Deferred so that stale Session pointers from processConnections
-                // (which may still be on the stack) safely see wt_conn == null
-                // instead of accessing freed memory.
-                self.conn_mgr.freeDeadEntries();
+                self.endPass();
 
                 // If no new packets arrived during this cycle, we're done.
                 // On the first iteration we always process (triggered by poll event).
@@ -1559,7 +1701,12 @@ pub fn Server(comptime Handler: type) type {
             self.in_callback = true;
             switch (self.conn_mgr.recvHandedOver(bytes, peer, on, ecn, &self.out_buf)) {
                 .send_response => |data| batch.add(data, @ptrCast(&peer), connection.sockaddrLen(&peer), 0),
-                .processed, .dropped, .foreign => {},
+                .processed, .dropped => {},
+                // Its connection moved on from here.
+                .foreign => |server_id| if (self.foreign_hook) |hook| {
+                    const dg: ForeignDatagram = .{ .bytes = bytes, .peer = peer, .local = local, .ecn = ecn, .server_id = server_id };
+                    hook.func(hook.ctx, &dg);
+                },
             }
             self.in_callback = false;
             // One pass covers every datagram handed over this loop tick.
@@ -1663,6 +1810,7 @@ pub fn Server(comptime Handler: type) type {
         /// the decrypted packet and is only valid for the duration of this call.
         fn datagramRecvCallback(data: []const u8, ctx: ?*anyopaque) void {
             const entry: *ConnEntry = @ptrCast(@alignCast(ctx orelse return));
+            if (entry.handing_over) return;
             const wtc = entry.wt_conn orelse return;
 
             // Parse WT quarter_stream_id prefix inline
@@ -1782,7 +1930,8 @@ pub fn Server(comptime Handler: type) type {
             // full wt.poll() chain. This avoids O(event_types) overhead per
             // datagram by calling pollDatagrams() directly.
             if (@hasDecl(Handler, "onDatagram")) {
-                while (wtc.pollDatagrams()) |dg_event| {
+                while (!entry.handing_over) {
+                    const dg_event = wtc.pollDatagrams() orelse break;
                     switch (dg_event) {
                         .datagram => |dg| self.handler.onDatagram(&session, dg.session_id, dg.data),
                         else => unreachable,
@@ -1790,7 +1939,8 @@ pub fn Server(comptime Handler: type) type {
                 }
             }
 
-            while (true) {
+            // A handover leaves the rest for the new server to deliver.
+            while (!entry.handing_over) {
                 const event = wtc.poll() catch break;
                 if (event == null) break;
 
@@ -1921,7 +2071,7 @@ pub fn Server(comptime Handler: type) type {
             const h3c = entry.h3_conn.?;
             var session = Session{ .entry = entry };
 
-            while (true) {
+            while (!entry.handing_over) {
                 const event = h3c.poll() catch break;
                 if (event == null) break;
 
@@ -1957,7 +2107,7 @@ pub fn Server(comptime Handler: type) type {
             const h0c = entry.h0_conn orelse return;
             var session = Session{ .entry = entry };
 
-            while (true) {
+            while (!entry.handing_over) {
                 const event = h0c.poll() catch break;
                 if (event == null) break;
 
@@ -1993,7 +2143,8 @@ pub fn Server(comptime Handler: type) type {
             // WebTransport installs a zero-copy callback instead and does
             // not reach here.
             if (@hasDecl(Handler, "onDatagram")) {
-                while (conn.peekDatagram()) |dg| {
+                while (!entry.handing_over) {
+                    const dg = conn.peekDatagram() orelse break;
                     self.handler.onDatagram(&session, 0, dg);
                     conn.consumeDatagram();
                 }
@@ -2012,6 +2163,7 @@ pub fn Server(comptime Handler: type) type {
 
             // Looked up again each time: the handler may have closed it.
             for (ids.items) |stream_id| {
+                if (entry.handing_over) break;
                 while (conn.streams.getRecvStream(stream_id)) |rs| {
                     const data = rs.read() orelse break;
                     const fin = rs.finished;
