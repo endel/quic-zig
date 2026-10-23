@@ -397,6 +397,17 @@ pub const MovedCids = struct {
         return self.map.getContext(key, self.ctx);
     }
 
+    /// Drop the CIDs a detached `entry` took along, once no server will
+    /// adopt it, so their packets draw stateless resets.
+    pub fn abandon(self: *MovedCids, entry: *ConnEntry) void {
+        std.debug.assert(entry.mgr == null);
+        if (!entry.cids_moved) return;
+        entry.cids_moved = false;
+        for (&entry.conn.local_cid_pool.entries) |*c| {
+            if (c.occupied) self.remove(CidKey.fromSlice(c.getCid()));
+        }
+    }
+
     fn remove(self: *MovedCids, key: CidKey) void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -921,18 +932,6 @@ pub const ConnectionManager = struct {
         entry.deadline = null;
         self.syncCids(entry);
         entry.mark(true);
-    }
-
-    /// Forget the CIDs of a detached entry no manager will adopt, so their
-    /// packets draw stateless resets.
-    pub fn abandon(self: *ConnectionManager, entry: *ConnEntry) void {
-        std.debug.assert(entry.mgr == null);
-        if (!entry.cids_moved) return;
-        entry.cids_moved = false;
-        const m = self.moved orelse return;
-        for (&entry.conn.local_cid_pool.entries) |*c| {
-            if (c.occupied) m.remove(CidKey.fromSlice(c.getCid()));
-        }
     }
 
     /// Drop `entry`'s CIDs from `moved`, once it closes.

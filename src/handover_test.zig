@@ -716,3 +716,35 @@ test "handover: a packet the old server gets back while its connection is on the
     try testing.expect(f.group.workers[1].injected.load(.monotonic) > 0);
     try testing.expectEqual(@as(usize, 1), f.group.connections(2));
 }
+
+test "handover: one discarded on the way takes its CIDs out of MovedCids, so the client is reset" {
+    var f: Fixture = undefined;
+    try f.init(29670, 0);
+    defer f.deinit();
+
+    f.group.workers[1].held.store(true, .release);
+    try f.move("move");
+    try f.runUntil(handedByOne, &f, 5_000);
+    try testing.expect(f.group.moved.count() > 0);
+    // As a server that stops with it still queued.
+    const w = f.group.workers[1];
+    w.lock.lock();
+    var items = w.queue;
+    w.queue = .empty;
+    w.lock.unlock();
+    defer items.deinit(gpa);
+    for (items.items) |item| switch (item) {
+        .datagram => |d| gpa.free(d.bytes),
+        .handover => |h| h.discard(),
+        .call => {},
+    };
+    try testing.expectEqual(@as(usize, 0), f.group.moved.count());
+    w.held.store(false, .release);
+
+    // Its CIDs name the first server, which no longer knows them.
+    var cs = f.session();
+    try cs.sendDatagram(f.handler.session_id.?, "anyone there? anyone there? anyone there? anyone there?");
+    const t0 = sys.nanoTimestamp();
+    try f.runUntil(resetReceived, &f, 5_000);
+    try testing.expect(sys.nanoTimestamp() - t0 < 2 * std.time.ns_per_s);
+}

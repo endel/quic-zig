@@ -287,6 +287,7 @@ pub const ForeignDatagramHook = struct {
 /// `Session.handOver`. It must reach exactly one `adopt`, or `discard`.
 pub const Handover = struct {
     entry: *ConnEntry,
+    moved: *MovedCids,
 
     /// The connection's id, which it keeps on the new server.
     pub fn id(self: Handover) u64 {
@@ -295,9 +296,10 @@ pub const Handover = struct {
 
     /// Free a connection no server will adopt — one still queued when the
     /// server it was going to stops — without a word to the peer. Its CIDs
-    /// stay in `MovedCids` until that goes too.
+    /// leave `MovedCids`, so its next packet draws a stateless reset.
     pub fn discard(self: Handover) void {
         const entry = self.entry;
+        self.moved.abandon(entry);
         const alloc = entry.conn.allocator;
         connection_manager.destroyProtocols(alloc, entry.wt_conn, entry.h3_conn, entry.h0_conn);
         entry.finished_streams.deinit(alloc);
@@ -1471,7 +1473,7 @@ pub fn Server(comptime Handler: type) type {
                 if (self.stopping or self.draining or conn.isClosed() or
                     conn.state == .closing or conn.state == .draining) continue;
                 mgr.detach(entry, h.to);
-                if (comptime @hasDecl(Handler, "onHandover")) self.handler.onHandover(.{ .entry = entry });
+                if (comptime @hasDecl(Handler, "onHandover")) self.handler.onHandover(.{ .entry = entry, .moved = mgr.moved.? });
             }
         }
 
@@ -1493,10 +1495,7 @@ pub fn Server(comptime Handler: type) type {
         pub fn adopt(self: *Self, h: Handover) !Session {
             const entry = h.entry;
             const conn = entry.conn;
-            errdefer {
-                self.conn_mgr.abandon(entry);
-                h.discard();
-            }
+            errdefer h.discard();
             if (self.conn_mgr.moved == null) return error.HandoverNotConfigured;
             if (!std.mem.eql(u8, &conn.static_reset_key, &self.conn_mgr.static_reset_key)) return error.ResetKeyMismatch;
             try self.conn_mgr.adopt(entry);
