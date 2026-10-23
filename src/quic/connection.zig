@@ -3690,6 +3690,21 @@ pub const Connection = struct {
     }
 
     /// Check for timeouts and maintenance tasks.
+    /// The idle timeout in force: at least 3x the base PTO, so that probes get
+    /// a chance to be answered (RFC 9000 10.1), and while a packet is in
+    /// flight long enough to cover the PTO backoff, up to 5 doublings. Past
+    /// that it would keep a dead peer's connection for minutes.
+    fn effectiveIdleNs(self: *const Connection) i64 {
+        const base_pto = self.pkt_handler.rtt_stats.pto();
+        var effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
+        const app_idx = @backingInt(ack_handler.EncLevel.application);
+        if (self.handshake_confirmed and self.pkt_handler.sent[app_idx].ack_eliciting_in_flight > 0) {
+            const shift: u6 = @intCast(@min(self.pkt_handler.pto_count, 5));
+            effective_idle = @max(effective_idle, 3 * (base_pto << shift));
+        }
+        return effective_idle;
+    }
+
     pub fn onTimeout(self: *Connection) !void {
         if (self.state == .terminated) return;
 
@@ -3719,26 +3734,9 @@ pub const Connection = struct {
         if (self.key_update) |*ku| ku.maybeDropPrevKeys(now);
 
         // Check idle timeout (RFC 9000 §10.1, §10.1.2)
-        // The effective idle timeout MUST be at least 3× the *base* PTO (without backoff)
-        // to avoid terminating the connection before probes have a chance to be answered.
-        //
-        // When data is in flight, extend idle to cover the current PTO backoff schedule,
-        // but cap at 5 retries to prevent indefinite extension (e.g. server broadcasting
-        // to a dead peer would otherwise grow effective_idle to 180s+).
-        {
-            const base_pto = self.pkt_handler.rtt_stats.pto();
-            var effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
-            const app_idx = @backingInt(ack_handler.EncLevel.application);
-            if (self.handshake_confirmed and self.pkt_handler.sent[app_idx].ack_eliciting_in_flight > 0) {
-                const capped_pto_count = @min(self.pkt_handler.pto_count, 5);
-                const shift: u6 = @intCast(capped_pto_count);
-                const backed_off_pto = base_pto << shift;
-                effective_idle = @max(effective_idle, 3 * backed_off_pto);
-            }
-            if (now - self.idleTimerStart() > effective_idle) {
-                self.state = .terminated;
-                return;
-            }
+        if (now - self.idleTimerStart() > self.effectiveIdleNs()) {
+            self.state = .terminated;
+            return;
         }
         // Auto-close: when close_when_idle is set and all stream data has been
         // sent (FIN queued, no pending retransmissions), close the connection.
@@ -4346,11 +4344,10 @@ pub const Connection = struct {
 
         earliest = self.handshakeDeadline();
 
-        // Idle timeout — use base PTO (no backoff), matching quic-go/quiche
+        // Idle timeout: the one onTimeout() acts on, or the loop wakes before it
+        // to find nothing to do, every pass, until it comes.
         {
-            const base_pto = self.pkt_handler.rtt_stats.pto();
-            const effective_idle = @max(self.idle_timeout_ns, 3 * base_pto);
-            const idle_deadline = self.idleTimerStart() + effective_idle;
+            const idle_deadline = self.idleTimerStart() + self.effectiveIdleNs();
             if (earliest == null or idle_deadline < earliest.?) {
                 earliest = idle_deadline;
             }

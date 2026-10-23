@@ -4225,12 +4225,14 @@ test "e2e: a connection that falls silent times out though no pass is asked to l
             return items.len == 1 and items[0].conn.isEstablished();
         }
     }.f, 5000);
-    // Nothing is sent after the handshake: only the cached deadline brings it up.
+    // Nothing is sent after the handshake: only the cached deadline brings it
+    // up. A client that idles out before acknowledging the server's last
+    // packet leaves it waiting out its probes' backoff too, 3 x PTO x 32.
     try runUntil(&e2e.loop, &server_handler, struct {
         fn f(h: *IdleServer) bool {
             return h.closed == 1;
         }
-    }.f, 3000);
+    }.f, 8000);
     try testing.expectEqual(@as(usize, 0), e2e.server.conn_mgr.connectionCount());
 }
 

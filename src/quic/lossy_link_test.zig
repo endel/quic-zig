@@ -628,6 +628,29 @@ test "PTO: a client sends no Application Data probe before the handshake is conf
     try testing.expect(client.pkt_handler.sent[@backingInt(ack_handler.EncLevel.handshake)].pto_count > 0);
 }
 
+test "idle timeout: a peer gone with a packet in flight is waited out, not spun on" {
+    // While a packet is unacknowledged, onTimeout() stretches the idle timeout
+    // to cover the probes' backoff. The deadline handed to the loop didn't, so
+    // from the plain timeout on every pass was due and did nothing.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    var p: Pair = undefined;
+    try p.initWith(.{ .max_idle_timeout = 200 }, .{ .max_idle_timeout = 200 });
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    sconn.pending_frames.push(.ping);
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var passes: usize = 0;
+    while (!sconn.isClosed()) : (passes += 1) {
+        try testing.expect(passes < 100);
+        while (try sconn.send(&buf) > 0) {} // the peer is gone
+        const now = @max(sconn.nextTimeoutNs() orelse break, sys.test_clock.? + std.time.ns_per_us);
+        sys.test_clock = now;
+        try timeoutPass(sconn, now);
+    }
+    try testing.expect(sconn.isClosed());
+}
+
 test "PTO: a server's probes carry its ServerHello" {
     // Both probes of a PTO resend the server's in-flight CRYPTO. The first
     // left the ServerHello out, as a client with Handshake keys may; a server
