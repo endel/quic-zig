@@ -6123,7 +6123,7 @@ fn nothingInFlight(c: *connection.Connection) bool {
     return c.pkt_handler.sent[2].ack_eliciting_in_flight == 0;
 }
 
-test "e2e: a lone packet with nothing to answer is acknowledged on its receiver's timer, within max_ack_delay" {
+test "e2e: a lone packet with nothing to answer is acknowledged on its receiver's timer" {
     var h = EchoOnAsk{};
     var client_handler = QuicIdleClient{};
     var e2e: E2e(EchoOnAsk, QuicIdleClient) = undefined;
@@ -6142,6 +6142,9 @@ test "e2e: a lone packet with nothing to answer is acknowledged on its receiver'
     const sconn = e2e.server.conn_mgr.entries.items[0].conn;
     const cconn = e2e.client.conn;
     const max_ack_delay: i64 = @intCast(sconn.local_params.max_ack_delay * std.time.ns_per_ms);
+    // The alarm's own timing is pinned on lossy_link_test's virtual clock.
+    // Here a loaded machine may run the timer late.
+    const late = 10 * max_ack_delay;
     // A skipped packet number leaves a gap, which is acknowledged at once.
     sconn.pkt_handler.skip_pn = std.math.maxInt(u64);
     cconn.pkt_handler.skip_pn = std.math.maxInt(u64);
@@ -6151,15 +6154,18 @@ test "e2e: a lone packet with nothing to answer is acknowledged on its receiver'
     var cs = e2e.client.clientSession();
 
     // Server side: the visit that reads it has nothing to send, so only the
-    // deadline it leaves in the heap brings the ACK.
+    // deadline it leaves in the heap brings the ACK, alone.
     const received = sconn.total_packets_received;
+    const server_sent = sconn.total_packets_sent;
     try cs.sendDatagram(0, "quiet");
     try runUntilCount(&e2e.loop, &h.datagrams, 1, 3_000);
-    try testing.expect(sconn.pkt_handler.recv[2].hasUnackedAckEliciting());
+    const server_alarm = sconn.pkt_handler.recv[2].ack_alarm orelse return error.NoAckAlarm;
     var server_ack = AckWatch{ .conn = sconn };
     try runUntil(&e2e.loop, &server_ack, AckWatch.sent, 1_000);
     try testing.expectEqual(received + 1, sconn.total_packets_received);
-    try testing.expect(server_ack.delay() <= max_ack_delay);
+    try testing.expectEqual(server_sent + 1, sconn.total_packets_sent);
+    try testing.expect(server_ack.at >= server_alarm);
+    try testing.expect(server_ack.delay() <= late);
 
     // Client side: the echo carries the server's ACK, and the client owes
     // one for the echo that only its own timer sends.
@@ -6172,15 +6178,20 @@ test "e2e: a lone packet with nothing to answer is acknowledged on its receiver'
         }
     };
     try runUntil(&e2e.loop, cconn, Echoed.f, 3_000);
+    const client_sent = cconn.total_packets_sent;
+    const client_alarm = cconn.pkt_handler.recv[2].ack_alarm orelse return error.NoAckAlarm;
     var client_ack = AckWatch{ .conn = cconn };
     try runUntil(&e2e.loop, &client_ack, AckWatch.sent, 1_000);
     try testing.expectEqual(client_received + 1, cconn.total_packets_received);
-    try testing.expect(client_ack.delay() <= max_ack_delay);
+    try testing.expectEqual(client_sent + 1, cconn.total_packets_sent);
+    try testing.expect(client_ack.at >= client_alarm);
+    try testing.expect(client_ack.delay() <= late);
 
-    // Neither side waited long enough on an ACK to probe for it.
+    // An ACK on time leaves its peer nothing to probe for. A loaded machine
+    // can run the timer past the peer's PTO, so only those are checked.
     try runUntil(&e2e.loop, sconn, nothingInFlight, 1_000);
-    try testing.expectEqual(server_pto, sconn.pkt_handler.sent[2].pto_fired_at);
-    try testing.expectEqual(client_pto, cconn.pkt_handler.sent[2].pto_fired_at);
+    if (server_ack.delay() <= max_ack_delay) try testing.expectEqual(client_pto, cconn.pkt_handler.sent[2].pto_fired_at);
+    if (client_ack.delay() <= max_ack_delay) try testing.expectEqual(server_pto, sconn.pkt_handler.sent[2].pto_fired_at);
 }
 
 test "e2e: a server's longer max_ack_delay reaches its client, and small packets wait for it" {
