@@ -1200,10 +1200,14 @@ pub const ConnectionManager = struct {
                         // Valid NEW_TOKEN — the address is proven already
                         entry = self.acceptConnection(header, local, from, header.dcid, null) catch
                             return .{ .dropped = {} };
-                    } else if (need_retry) {
+                    } else if (need_retry and !packet.isNewTokenSized(token)) {
+                        // An invalid Retry token: its client takes no second Retry.
                         return .{ .dropped = {} };
                     }
-                } else if (need_retry) {
+                }
+                // No token, or a NEW_TOKEN one that no longer holds, which
+                // counts as none (RFC 9000 8.1.3).
+                if (entry == null and need_retry) {
                     var retry_scid: [8]u8 = undefined;
                     sys.randomBytes(&retry_scid);
 
@@ -2294,6 +2298,37 @@ test "a Retry token admits only the connection its Retry was for" {
     defer replay.deinit();
     const n = try replay.send(&buf);
     try std.testing.expect(mgr.recvDatagram(buf[0..n], addr, addr, 0, &out) == .dropped);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+}
+
+test "a NEW_TOKEN token that no longer holds counts as none: a Retry when one is demanded, else served unproven" {
+    // RFC 9000 8.1.3. Dropping it left a client back after a restart, which
+    // drew a new key, to wait out its handshake whenever load asked for Retry.
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    const from = testIn4(.{ 198, 51, 100, 7 }, 1000);
+    var stale: [packet.TOKEN_MAX_LEN]u8 = undefined;
+    const stale_len = try packet.generateNewToken(&stale, from, @splat(9)); // another run's key
+    var buf: [1500]u8 = undefined;
+    var out: [1500]u8 = undefined;
+
+    for ([_]bool{ true, false }) |demanded| {
+        mgr.require_retry = demanded;
+        const client = try alloc.create(connection.Connection);
+        defer destroyClient(alloc, client);
+        try connection.connectInto(client, alloc, "example.com", .{}, null, stale[0..stale_len]);
+        const n = try client.send(&buf);
+        switch (mgr.recvDatagram(buf[0..n], from, from, 0, &out)) {
+            .send_response => |retry| {
+                try std.testing.expect(demanded);
+                client.handleDatagram(@constCast(retry), .{ .to = from, .from = from, .datagram_size = retry.len });
+                try std.testing.expect(client.retry_received);
+            },
+            .processed => try std.testing.expect(!demanded),
+            else => return error.TestUnexpectedResult,
+        }
+    }
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
 }
 

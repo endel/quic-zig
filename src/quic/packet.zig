@@ -939,6 +939,12 @@ pub fn generateNewToken(
     return NEW_TOKEN_MAX_LEN;
 }
 
+/// A NEW_TOKEN token's size, which no Retry token of ours has (those carry
+/// a DCID of at least 8 bytes): an invalid one is told apart by it.
+pub fn isNewTokenSized(token: []const u8) bool {
+    return token.len == NEW_TOKEN_MAX_LEN;
+}
+
 pub fn validateNewToken(
     token_data: []const u8,
     client_addr: posix.sockaddr.storage,
