@@ -564,14 +564,61 @@ const HalfOpen = struct {
     }
 };
 
-/// What tickAndSend does with a due connection: onTimeout() again while a
-/// deadline has passed, to fire every space that expired.
-fn timeoutPass(conn: *connection.Connection, now: i64) !void {
-    for (0..8) |_| {
-        try conn.onTimeout();
-        const next = conn.nextTimeoutNsAt(now) orelse return;
-        if (next > now) return;
+test "timers: an ACK alarm due alone takes one onTimeout call" {
+    // The alarm stays due until a send carries the ACK: firing timers until
+    // no deadline at all has passed would run onTimeout 8 times for it.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    const config: connection.ConnectionConfig = .{ .max_datagram_frame_size = 1200, .disable_pmtud = true };
+    var p: Pair = undefined;
+    try p.initWith(config, config);
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    // Everything from the handshake acknowledged, so no PTO is armed.
+    for (0..3) |_| {
+        sys.test_clock.? += 30 * std.time.ns_per_ms;
+        while (p.exchange()) {}
     }
+    // A gap would be acknowledged at once, with no alarm.
+    p.client.pkt_handler.skip_pn = std.math.maxInt(u64);
+
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var resp: [MAX_DGRAM]u8 = undefined;
+    try p.client.sendDatagram("input");
+    const n = try p.client.send(&buf);
+    _ = p.mgr.recvDatagram(buf[0..n], p.c_addr, p.s_addr, 0, &resp);
+    try testing.expectEqual(@as(usize, 0), try sconn.send(&buf));
+    const alarm = sconn.pkt_handler.recv[2].ack_alarm.?;
+    try testing.expectEqual(alarm, sconn.nextTimeoutNsAt(sys.test_clock.?).?);
+    try testing.expect(sconn.nextOnTimeoutNs().? > alarm);
+
+    sys.test_clock = alarm;
+    try testing.expectEqual(@as(usize, 1), try sconn.fireTimers());
+    try testing.expect(try sconn.send(&buf) > 0);
+    try testing.expectEqual(@as(?i64, null), sconn.pkt_handler.recv[2].ack_alarm);
+}
+
+test "timers: a closing connection waits for its drain, not for an ACK it owes" {
+    // Nothing sends that ACK while closing, so the alarm would stay due.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    const config: connection.ConnectionConfig = .{ .max_datagram_frame_size = 1200, .disable_pmtud = true };
+    var p: Pair = undefined;
+    try p.initWith(config, config);
+    defer p.deinit();
+    const sconn = p.mgr.entries.items[0].conn;
+    p.client.pkt_handler.skip_pn = std.math.maxInt(u64);
+
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var resp: [MAX_DGRAM]u8 = undefined;
+    try p.client.sendDatagram("input");
+    const n = try p.client.send(&buf);
+    _ = p.mgr.recvDatagram(buf[0..n], p.c_addr, p.s_addr, 0, &resp);
+    const alarm = sconn.pkt_handler.recv[2].ack_alarm.?;
+    sconn.close(0, "");
+    const drained = sconn.closing_start_time + 3 * sconn.pkt_handler.rtt_stats.pto();
+    try testing.expect(drained > alarm);
+    try testing.expectEqual(drained, sconn.nextTimeoutNsAt(sys.test_clock.?).?);
 }
 
 test "PTO: an expiry at the backoff cap fires each handshake space once" {
@@ -587,16 +634,20 @@ test "PTO: an expiry at the backoff cap fires each handshake space once" {
     var buf: [MAX_DGRAM]u8 = undefined;
     // The server's replies are all lost; past 6 s its probes are at the cap.
     var fires: usize = 0;
+    var most: usize = 0;
     while (sys.test_clock.? - start < 9 * std.time.ns_per_s) {
         while (try sconn.send(&buf) > 0) {}
         const now = sconn.nextTimeoutNs() orelse break;
         sys.test_clock = now;
         const before = sconn.pkt_handler.pto_count;
-        try timeoutPass(sconn, now);
+        _ = try sconn.fireTimers();
         try testing.expect(sconn.pkt_handler.pto_count - before <= 2);
         fires += sconn.pkt_handler.pto_count - before;
+        most = @max(most, sconn.pkt_handler.pto_count - before);
     }
     try testing.expect(fires >= 10);
+    // Both spaces expiring together fire in one pass.
+    try testing.expectEqual(@as(usize, 2), most);
 }
 
 test "PTO: a server out of amplification budget waits instead of spinning" {
@@ -631,7 +682,7 @@ test "PTO: a server out of amplification budget waits instead of spinning" {
         while (try sconn.send(&buf) > 0) {}
         const now = @max(sconn.nextTimeoutNs() orelse break, sys.test_clock.? + std.time.ns_per_us);
         sys.test_clock = now;
-        try timeoutPass(sconn, now);
+        _ = try sconn.fireTimers();
     }
     try testing.expect(sconn.paths[0].bytes_sent > budget - 100 and sconn.paths[0].bytes_sent <= budget);
     try testing.expect(sys.test_clock.? - start >= 10 * std.time.ns_per_s);
@@ -696,7 +747,7 @@ test "idle timeout: a peer gone with a packet in flight is waited out, not spun 
         while (try sconn.send(&buf) > 0) {} // the peer is gone
         const now = @max(sconn.nextTimeoutNs() orelse break, sys.test_clock.? + std.time.ns_per_us);
         sys.test_clock = now;
-        try timeoutPass(sconn, now);
+        _ = try sconn.fireTimers();
     }
     try testing.expect(sconn.isClosed());
 }

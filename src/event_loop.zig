@@ -2078,7 +2078,8 @@ pub fn Server(comptime Handler: type) type {
                     continue;
                 }
 
-                // Call onTimeout() in a loop to fire ALL expired PTO deadlines.
+                // fireTimers calls onTimeout() again while one of its deadlines
+                // has passed, to fire ALL expired PTO deadlines.
                 // quic-go fires PTO for each space independently; without this loop,
                 // we only fire the earliest space per tick, requiring separate timer
                 // events for each space. Under burst loss, coalescing all PTO fires
@@ -2089,15 +2090,8 @@ pub fn Server(comptime Handler: type) type {
                 // Otherwise onTimeout does nothing, and reaching it costs a call
                 // and a clock read for every connection on every pass.
                 if (due or entry.conn.close_when_idle) {
-                    var timeout_iter: usize = 0;
-                    while (timeout_iter < 8) : (timeout_iter += 1) {
-                        entry.conn.onTimeout() catch {};
-                        if (entry.conn.isClosed()) break;
-                        // Check if there are more expired timeouts
-                        now_ns = sys.nanoTimestamp();
-                        const next = entry.conn.nextTimeoutNsAt(now_ns) orelse break;
-                        if (next > now_ns) break;
-                    }
+                    _ = entry.conn.fireTimers() catch 0;
+                    now_ns = sys.nanoTimestamp();
                 }
                 if (entry.conn.isClosed()) {
                     // Fire onSessionClosed BEFORE removeConnection invalidates
@@ -3524,20 +3518,10 @@ pub fn Client(comptime Handler: type) type {
 
         fn tickAndSend(self: *Self) void {
             const conn = self.conn;
-            // Loop to fire ALL expired PTO deadlines in one tick
-            {
-                var timeout_iter: usize = 0;
-                while (timeout_iter < 8) : (timeout_iter += 1) {
-                    conn.onTimeout() catch |err| {
-                        std.log.warn("client onTimeout error: {}", .{err});
-                        break;
-                    };
-                    if (conn.isClosed()) break;
-                    const now_ns: i64 = sys.nanoTimestamp();
-                    const next = conn.nextTimeoutNsAt(now_ns) orelse break;
-                    if (next > now_ns) break;
-                }
-            }
+            _ = conn.fireTimers() catch |err| blk: {
+                std.log.warn("client onTimeout error: {}", .{err});
+                break :blk 0;
+            };
 
             if (conn.isClosed()) {
                 // A shared loop is left to our callers' finishStop.

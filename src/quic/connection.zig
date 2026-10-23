@@ -4405,6 +4405,37 @@ pub const Connection = struct {
     /// `nextTimeoutNs` at `now`, a `sys.nanoTimestamp()` the caller read: an
     /// event loop asks every connection each pass, and one read serves them all.
     pub fn nextTimeoutNsAt(self: *const Connection, now: i64) ?i64 {
+        var earliest = self.nextOnTimeoutNs();
+        if (self.state == .terminated or self.state == .closing or self.state == .draining) return earliest;
+
+        // ACK alarm: if we have pending ACKs to send (delayed ACK timer),
+        // include the alarm deadline so the event loop wakes up in time (RFC 9000 §13.2.1).
+        for (self.pkt_handler.recv) |tracker| {
+            if (tracker.ack_alarm) |alarm| {
+                if (earliest == null or alarm < earliest.?) {
+                    earliest = alarm;
+                }
+            }
+        }
+
+        // Pacer: if the pacer has bandwidth set (active transfer), include its
+        // next-send time so the event loop wakes up promptly to send more data.
+        if (self.pacer.bandwidth_shifted > 0 and self.state == .connected) {
+            const delay = self.pacer.delayAt(now);
+            if (delay > 0) {
+                const pacer_deadline = now + delay;
+                if (earliest == null or pacer_deadline < earliest.?) {
+                    earliest = pacer_deadline;
+                }
+            }
+        }
+
+        return earliest;
+    }
+
+    /// When `onTimeout` next has something to do: `nextTimeoutNsAt` but for
+    /// the ACK alarm and the pacer, which a send answers.
+    pub inline fn nextOnTimeoutNs(self: *const Connection) ?i64 {
         if (self.state == .terminated) return null;
 
         var earliest: ?i64 = null;
@@ -4473,29 +4504,24 @@ pub const Connection = struct {
         // last_ack_eliciting_sent_time for handshake spaces. For application space,
         // the loss detection timer + send loop handles retransmissions.
 
-        // ACK alarm: if we have pending ACKs to send (delayed ACK timer),
-        // include the alarm deadline so the event loop wakes up in time (RFC 9000 §13.2.1).
-        for (self.pkt_handler.recv) |tracker| {
-            if (tracker.ack_alarm) |alarm| {
-                if (earliest == null or alarm < earliest.?) {
-                    earliest = alarm;
-                }
-            }
-        }
-
-        // Pacer: if the pacer has bandwidth set (active transfer), include its
-        // next-send time so the event loop wakes up promptly to send more data.
-        if (self.pacer.bandwidth_shifted > 0 and self.state == .connected) {
-            const delay = self.pacer.delayAt(now);
-            if (delay > 0) {
-                const pacer_deadline = now + delay;
-                if (earliest == null or pacer_deadline < earliest.?) {
-                    earliest = pacer_deadline;
-                }
-            }
-        }
-
         return earliest;
+    }
+
+    /// `onTimeout` until none of its deadlines has passed, so the PTOs of
+    /// several spaces that expired together all fire; at most 8 calls.
+    /// Returns how many it took. An ACK alarm that has passed stays due
+    /// until a send carries the ACK, so it is not one of the deadlines
+    /// checked here: it would take all 8 calls, each doing nothing.
+    pub fn fireTimers(self: *Connection) !usize {
+        var calls: usize = 0;
+        while (calls < 8) {
+            calls += 1;
+            try self.onTimeout();
+            if (self.isClosed()) break;
+            const next = self.nextOnTimeoutNs() orelse break;
+            if (next > sys.nanoTimestamp()) break;
+        }
+        return calls;
     }
 
     /// Drop Initial and Handshake encryption keys (RFC 9001 §4.9).
