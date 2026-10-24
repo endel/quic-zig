@@ -131,6 +131,15 @@ pub const WsConn = struct {
     pub fn peerAddress(self: *const WsConn) *const posix.sockaddr.storage {
         return &self.constConn().peer;
     }
+
+    /// The kernel's smoothed round trip for this connection's TCP socket,
+    /// in nanoseconds, the unit of `Session.getStats().smoothed_rtt_ns`.
+    /// Microsecond resolution on Linux (`TCP_INFO`), millisecond on macOS
+    /// (`TCP_CONNECTION_INFO`). 0 until the kernel has a sample; null on
+    /// other platforms or when the query fails. A syscall each call.
+    pub fn rtt(self: *const WsConn) ?u64 {
+        return socket.tcpRtt(self.constConn().sock.fd());
+    }
 };
 
 pub const HandoverError = error{

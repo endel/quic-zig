@@ -88,10 +88,9 @@ const EchoHandler = struct {
         return self.findRacer(session, session_id) != null;
     }
 
-    fn reject(session: *event_loop.Session, session_id: u64, status: []const u8) void {
-        std.log.info("WT session {d} rejected: {s}", .{ session_id, status });
-        const headers = [_]qpack.Header{.{ .name = ":status", .value = status }};
-        session.sendResponse(session_id, &headers, "") catch {};
+    fn reject(session: *event_loop.Session, session_id: u64, status: u16) void {
+        std.log.info("WT session {d} rejected: {d}", .{ session_id, status });
+        session.rejectSession(session_id, status) catch {};
     }
 
     pub fn onConnectRequest(
@@ -104,10 +103,10 @@ const EchoHandler = struct {
         std.log.info("WT session request (id={d}, path={s})", .{ session_id, path });
 
         if (race.isPath(path)) {
-            if (!race.originAllowed(wt_protocol.findHeader(headers, "origin"))) return reject(session, session_id, "403");
+            if (!race.originAllowed(wt_protocol.findHeader(headers, "origin"))) return reject(session, session_id, 403);
             const slot = for (&self.racers) |*s| {
                 if (s.* == null) break s;
-            } else return reject(session, session_id, "503");
+            } else return reject(session, session_id, 503);
             slot.* = .{ .session = session.*, .session_id = session_id };
         }
 

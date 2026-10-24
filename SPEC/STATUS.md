@@ -420,7 +420,7 @@ cross-impl byte-exact UTF-8 header check.
 |---|---------|--------|-------|
 | 3 | Transport Parameter | ✅ Done | max_datagram_frame_size |
 | 4 | Datagram Frame Types | ✅ Done | 0x30 (no length) + 0x31 (with length) |
-| 5 | Behavior and Usage | ✅ Done | DatagramQueue, 16 entries, 1200 byte max |
+| 5 | Behavior and Usage | ✅ Done | DatagramQueue, 32 entries, 1200 byte max. `sendDatagram` refuses what no packet of the path holds (`maxDatagramPayloadSize`); queued ones expire after max(1.25 × min RTT, 20 ms) unless the application sets an age. Packed after STREAM frames, or before them with `datagrams_before_streams` |
 
 ### Summary — RFC 9221: ✅ Complete
 

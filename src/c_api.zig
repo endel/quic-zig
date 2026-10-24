@@ -510,6 +510,18 @@ export fn qz_session_accept(handle: ?*anyopaque, client_id: u64, session_id: u64
     return ERR_OK;
 }
 
+/// Refuse a session not yet accepted with an HTTP status (300–599).
+export fn qz_session_reject(handle: ?*anyopaque, client_id: u64, session_id: u64, status: u16) i32 {
+    const ws = getWtServer(handle) orelse return ERR_INVALID_ARG;
+    const entry = getEntry(ws, client_id) orelse return ERR_INVALID_CLIENT;
+    var session = event_loop.Session{ .entry = entry };
+    session.rejectSession(session_id, status) catch |err| return switch (err) {
+        error.InvalidStatus => ERR_INVALID_ARG,
+        else => ERR_INVALID_SESSION,
+    };
+    return ERR_OK;
+}
+
 export fn qz_session_close(handle: ?*anyopaque, client_id: u64, session_id: u64) void {
     const ws = getWtServer(handle) orelse return;
     const entry = getEntry(ws, client_id) orelse return;
@@ -732,6 +744,7 @@ test "c_api: NULL from C is refused, not dereferenced" {
     try testing.expectEqual(@as(u32, 0), qz_server_connection_count(null));
     try testing.expectEqual(@as(i32, 0), qz_is_client_connected(null, 1));
     try testing.expectEqual(ERR_INVALID_ARG, qz_session_accept(null, 1, 0));
+    try testing.expectEqual(ERR_INVALID_ARG, qz_session_reject(null, 1, 0, 409));
     qz_session_close(null, 1, 0);
     try testing.expectEqual(STREAM_ERROR, qz_stream_open_bidi(null, 1, 0));
     try testing.expectEqual(STREAM_ERROR, qz_stream_open_uni(null, 1, 0));

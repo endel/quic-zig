@@ -369,6 +369,37 @@ pub const WebTransportConnection = struct {
         s.state = .active;
     }
 
+    /// Server: refuse a session the peer asked for, one not yet accepted,
+    /// by answering its CONNECT with `status` — any final status outside
+    /// 2xx, from 300 to 599 — and ending the stream. The peer sees the
+    /// session rejected (a browser's `ready` rejects); every other session
+    /// on the connection carries on. Streams the peer opened for it are
+    /// refused with WEBTRANSPORT_SESSION_GONE on the next poll.
+    ///
+    /// This is how a server says no. A session never accepted has no
+    /// response for a close capsule to follow, and a capsule before the
+    /// response HEADERS is H3_FRAME_UNEXPECTED, which ends the whole
+    /// connection (RFC 9114 §4.1). `closeSession` on such a session
+    /// refuses it with 403.
+    ///
+    /// Fails with `error.InvalidStatus` for a status outside 300–599 and
+    /// `error.SessionNotPending` for a session already accepted, closed or
+    /// unknown, or on a client.
+    pub fn rejectSession(self: *WebTransportConnection, session_id: u64, status: u16) !void {
+        if (status < 300 or status > 599) return error.InvalidStatus;
+        const s = self.getSession(session_id) orelse return error.SessionNotPending;
+        if (!self.is_server or s.state != .connecting) return error.SessionNotPending;
+        // The slot goes either way: a CONNECT we could not answer is no session.
+        defer self.finalizeSession(s);
+        var digits: [3]u8 = undefined;
+        _ = std.fmt.bufPrint(&digits, "{d}", .{status}) catch unreachable;
+        try self.h3.sendConnectResponse(session_id, &digits);
+        const stream = self.quic.streams.getStream(session_id) orelse return;
+        stream.send.close();
+        // RFC 9114 §4.1: the rest of the request is not wanted.
+        stream.recv.stopSending(@backingInt(h3_conn.H3Error.no_error));
+    }
+
     /// Open a WT bidirectional stream: write type prefix 0x41 + session_id varint.
     /// Fails with `error.WtStreamLimitReached` when the session's §5.6.2 credit
     /// is spent; a WT_STREAMS_BLOCKED then asks the peer for more.
@@ -570,7 +601,8 @@ pub const WebTransportConnection = struct {
         self.quic.setIncomingDatagramMaxAge(max_age_ms);
     }
 
-    /// Set max age for outgoing datagrams (milliseconds). null = no limit.
+    /// Set max age for outgoing datagrams (milliseconds). null = the default,
+    /// max(1.25 × min RTT, 20 ms); see `Connection.setOutgoingDatagramMaxAge`.
     pub fn setOutgoingDatagramMaxAge(self: *WebTransportConnection, max_age_ms: ?u64) void {
         self.quic.setOutgoingDatagramMaxAge(max_age_ms);
     }
@@ -625,9 +657,14 @@ pub const WebTransportConnection = struct {
     /// Close a WebTransport session with an application error code and reason.
     /// Sends CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
     /// Reason is truncated to 1024 bytes per spec.
+    ///
+    /// A server's session not yet accepted is refused instead, as
+    /// `rejectSession(session_id, 403)` would: the code and reason have no
+    /// way to reach the peer.
     pub fn closeSessionWithError(self: *WebTransportConnection, session_id: u64, error_code: u32, reason: []const u8) !void {
         const session = self.getSession(session_id) orelse return;
         if (session.state == .draining or session.state == .closed) return;
+        if (self.is_server and session.state == .connecting) return self.rejectSession(session_id, 403);
 
         // Truncate reason to spec limit (1024 bytes)
         const truncated_reason = reason[0..@min(reason.len, max_close_reason)];
@@ -3064,6 +3101,88 @@ test "WT: a CONNECT past the session slots is rejected, never answered 200" {
 
     try testing.expectError(error.TooManySessions, setup.wt.acceptSession(4 * MAX_SESSIONS));
     try testing.expectEqual(@as(u64, 0), extra.send.write_offset);
+}
+
+/// Surface a CONNECT on client bidi stream `sid` to the server's `wt`.
+fn injectConnect(setup: *WtTestSetup, sid: u64) !void {
+    var buf: [512]u8 = undefined;
+    const len = buildConnectRequest(&buf, "/wt");
+    try (try setup.quic_conn.streams.getOrCreateStream(sid)).recv.handleStreamFrame(0, buf[0..len], false);
+    const ev = try pollFor(&setup.wt, .connect_request);
+    try testing.expectEqual(sid, ev.connect_request.session_id);
+}
+
+/// What a refused CONNECT stream carries: one HEADERS frame and its FIN,
+/// never a capsule. Returns the :status.
+fn expectRefusal(stream: *stream_mod.Stream, status_buf: []u8) ![]const u8 {
+    const written = stream.send.write_buffer.items;
+    const parsed = try h3_frame.parse(written);
+    try testing.expectEqual(written.len, parsed.consumed);
+    const block = switch (parsed.frame) {
+        .headers => |b| b,
+        else => return error.UnexpectedFrame,
+    };
+    var headers: [8]qpack.Header = undefined;
+    var scratch: [512]u8 = undefined;
+    const n = try qpack.decodeHeaders(block, &headers, &scratch);
+    try testing.expect(stream.send.fin_queued);
+    try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.no_error)), stream.recv.stop_sending_err);
+    for (headers[0..n]) |h| if (std.mem.eql(u8, h.name, ":status")) {
+        @memcpy(status_buf[0..h.value.len], h.value);
+        return status_buf[0..h.value.len];
+    };
+    return error.NoStatus;
+}
+
+test "WT: rejectSession answers a second CONNECT with its status and leaves the first session open" {
+    var setup: WtTestSetup = undefined;
+    const first = try setup.initServer();
+    defer setup.deinit();
+
+    try injectConnect(&setup, 4);
+    // A stream the peer opened for the pending session: held until it settles.
+    var prefix: [16]u8 = undefined;
+    const prefix_len = buildWtBidiPrefix(&prefix, 4);
+    try (try setup.quic_conn.streams.getOrCreateStream(8)).recv.handleStreamFrame(0, prefix[0..prefix_len], false);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+
+    try testing.expectError(error.InvalidStatus, setup.wt.rejectSession(4, 200));
+    try testing.expectError(error.InvalidStatus, setup.wt.rejectSession(4, 103));
+    try setup.wt.rejectSession(4, 409);
+
+    var status: [3]u8 = undefined;
+    try testing.expectEqualStrings("409", try expectRefusal(setup.quic_conn.streams.getStream(4).?, &status));
+    try testing.expect(setup.wt.getSession(4) == null);
+    try testing.expectEqual(@as(u32, 1), setup.wt.active_session_count);
+    try testing.expectError(error.SessionNotPending, setup.wt.rejectSession(4, 409));
+    try testing.expectError(error.SessionNotPending, setup.wt.rejectSession(first, 409));
+
+    // The held stream goes with its session; the first one is untouched.
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+    const held = setup.quic_conn.streams.getStream(8).?;
+    try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), held.send.reset_err);
+    try testing.expectEqual(SessionState.active, setup.wt.getSession(first).?.state);
+    const connect = setup.quic_conn.streams.getStream(first).?;
+    try testing.expect(!connect.send.fin_queued);
+    try testing.expectEqual(@as(?u64, null), connect.recv.stop_sending_err);
+    try setup.wt.sendDatagram(first, "still here");
+}
+
+test "WT: closeSession on a session never accepted refuses it rather than writing a capsule" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    try injectConnect(&setup, 4);
+    setup.wt.closeSession(4);
+    var status: [3]u8 = undefined;
+    try testing.expectEqualStrings("403", try expectRefusal(setup.quic_conn.streams.getStream(4).?, &status));
+    try testing.expect(setup.wt.getSession(4) == null);
+
+    try injectConnect(&setup, 8);
+    try setup.wt.closeSessionWithError(8, 7, "unused");
+    try testing.expectEqualStrings("403", try expectRefusal(setup.quic_conn.streams.getStream(8).?, &status));
+    try testing.expectEqual(@as(u32, 1), setup.wt.active_session_count);
 }
 
 test "WT: invalid session ID triggers H3_ID_ERROR on uni stream" {
