@@ -111,6 +111,15 @@ At most 16 wait at once; past that a stream is reset with
 stream that never was one, is reset with `WT_SESSION_GONE`. Datagrams for a
 session not yet active are dropped rather than buffered.
 
+**A server refuses a session with a status, never a capsule (§3.3).**
+`rejectSession(id, status)` answers the CONNECT with a 3xx–5xx and its FIN;
+the connection's other sessions are untouched. A close capsule there would
+come before any response HEADERS, which RFC 9114 §4.1 makes
+H3_FRAME_UNEXPECTED: the peer would close the whole connection. So
+`closeSession` on a session not yet accepted refuses it with 403. A CONNECT
+past the session slots is reset with H3_REQUEST_REJECTED before the
+application sees it.
+
 **A capsule may not straddle a DATA frame.** RFC 9297 §3.2 puts the capsule
 stream in the HTTP message content, so in HTTP/3 capsules travel inside DATA
 frames; we unwrap a DATA frame by dropping its header and reading the capsules

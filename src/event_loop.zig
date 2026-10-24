@@ -476,6 +476,15 @@ pub const Session = struct {
         }
     }
 
+    /// Refuse a session `onConnectRequest` offered with an HTTP status from
+    /// 300 to 599, leaving the connection and its other sessions as they
+    /// are; see `WebTransportConnection.rejectSession`.
+    pub fn rejectSession(self: *Session, session_id: u64, status: u16) !void {
+        defer self.entry.repoll(); // streams held for it are refused on a poll
+        const wtc = self.entry.wt_conn orelse return error.NoWtConnection;
+        try wtc.rejectSession(session_id, status);
+    }
+
     pub fn closeStream(self: *Session, stream_id: u64) void {
         defer self.entry.wake();
         if (self.entry.wt_conn) |wtc| {
@@ -4722,6 +4731,81 @@ test "e2e: a WebTransport listener serves a plain GET" {
     try testing.expectEqual(@as(u32, 0), server_handler.connects);
     try testing.expectEqualStrings("200", &client_handler.status);
     try testing.expectEqualStrings("hello world", client_handler.body[0..client_handler.received]);
+}
+
+/// One session per connection, as netcode keeps it: any later CONNECT is
+/// refused, by `rejectSession` or by `closeSession` before it was accepted.
+const OneSessionServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    refuse_with_close: bool = false,
+    first: ?u64 = null,
+    datagrams: u32 = 0,
+    closed: u32 = 0,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        if (self.first != null) {
+            if (self.refuse_with_close) return session.closeSession(session_id);
+            return session.rejectSession(session_id, 409) catch unreachable;
+        }
+        self.first = session_id;
+        session.acceptSession(session_id) catch unreachable;
+    }
+    pub fn onDatagram(self: *@This(), _: *Session, session_id: u64, _: []const u8) void {
+        if (session_id == self.first) self.datagrams += 1;
+    }
+    pub fn onSessionClosed(self: *@This(), _: *Session, _: u64, _: u32, _: []const u8) void {
+        self.closed += 1;
+    }
+};
+
+/// Asks for a second session as soon as the first is ready.
+const SecondSessionClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    first: ?u64 = null,
+    second: ?u64 = null,
+    rejected: ?u64 = null,
+    status: [3]u8 = undefined,
+
+    pub fn onSessionReady(self: *@This(), session: *ClientSession, session_id: u64) void {
+        if (self.first != null) return;
+        self.first = session_id;
+        self.second = session.wt_conn.?.connect("localhost", "/second") catch unreachable;
+    }
+    pub fn onSessionRejected(self: *@This(), _: *ClientSession, session_id: u64, status: []const u8) void {
+        self.rejected = session_id;
+        @memcpy(&self.status, status[0..3]);
+    }
+    fn settled(self: *const @This()) bool {
+        return self.rejected != null;
+    }
+};
+
+fn expectSecondSessionRefused(port: u16, refuse_with_close: bool, status: []const u8) !void {
+    var client_handler = SecondSessionClient{};
+    var server_handler = OneSessionServer{ .refuse_with_close = refuse_with_close };
+    var e2e: E2e(OneSessionServer, SecondSessionClient) = undefined;
+    try e2e.init(port, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, SecondSessionClient.settled, 10_000);
+    try testing.expectEqual(client_handler.second, client_handler.rejected);
+    try testing.expectEqualStrings(status, &client_handler.status);
+
+    // The first session carries on over the same connection.
+    var cs = e2e.client.clientSession();
+    try cs.sendDatagram(client_handler.first.?, "still here");
+    try runUntilCount(&e2e.loop, &server_handler.datagrams, 1, 3000);
+    try runFor(&e2e.loop, 50);
+    try testing.expect(!e2e.client.conn.isClosed());
+    try testing.expectEqual(@as(u32, 0), server_handler.closed);
+}
+
+test "e2e: a second CONNECT refused with rejectSession leaves the first session open" {
+    try expectSecondSessionRefused(29680, false, "409");
+}
+
+test "e2e: closeSession on a CONNECT never accepted refuses it, and the first session stays" {
+    try expectSecondSessionRefused(29681, true, "403");
 }
 
 test "e2e: an RSA certificate, picked by SNI next to an EC one" {
