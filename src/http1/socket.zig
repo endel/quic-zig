@@ -399,6 +399,23 @@ pub fn setNoDelay(fd: std.posix.socket_t) void {
     _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
 }
 
+/// The kernel's smoothed round trip for a TCP socket, in nanoseconds, at the
+/// kernel's resolution: microseconds on Linux (`TCP_INFO`, `tcpi_rtt`),
+/// milliseconds on macOS (`TCP_CONNECTION_INFO`, `tcpi_srtt`). 0 until the
+/// kernel has a sample; null on other platforms or when the query fails.
+pub fn tcpRtt(fd: std.posix.socket_t) ?u64 {
+    // std declares neither struct: read the one field at its offset.
+    const opt: u32, const at: usize, const unit_ns: u64 = switch (builtin.target.os.tag) {
+        .linux => .{ std.posix.TCP.INFO, 68, std.time.ns_per_us },
+        .macos => .{ std.posix.TCP.CONNECTION_INFO, 44, std.time.ns_per_ms },
+        else => return null,
+    };
+    var info: [128]u8 align(4) = undefined;
+    var len: std.posix.socklen_t = info.len;
+    if (std.c.getsockopt(fd, std.posix.IPPROTO.TCP, opt, &info, &len) != 0 or len < at + 4) return null;
+    return @as(u64, std.mem.readInt(u32, info[at..][0..4], builtin.cpu.arch.endian())) * unit_ns;
+}
+
 fn setNoSigpipe(fd: std.posix.socket_t) void {
     if (comptime builtin.target.os.tag.isDarwin()) {
         const one: c_int = 1;

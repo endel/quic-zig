@@ -47,8 +47,8 @@ pub fn onWsClose(self: *H, ws: *event_loop.WsConn, code: u16, reason: []const u8
   `*WsConn`. `req.reject(status)` answers with an HTTP error. A request the
   handler leaves undecided gets 403.
 - `WsConn` has `id()`, `send`, `sendText`, `close(code, reason)`,
-  `bufferedAmount()` and `peerAddress()`. `id()` comes from the counter
-  behind `Session.id()`.
+  `bufferedAmount()`, `peerAddress()` and `rtt()` (the kernel's TCP
+  estimate, in ns). `id()` comes from the counter behind `Session.id()`.
 - `onWsClose` fires exactly once for every accepted WebSocket:
   - with the peer's code, or 1005 when its Close carried none;
   - with 1006 when there was no Close frame at all (a TCP reset, a TLS

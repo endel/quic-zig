@@ -4,6 +4,7 @@
 //! the test, between non-blocking runs of the loop.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const testing = std.testing;
 const sys = @import("../sys.zig");
@@ -546,6 +547,24 @@ test "ws: upgrade, echo, a fragmented message with a ping inside, and the client
     try testing.expectEqual(@as(u16, 1000), h.handler.close_code);
     try testing.expectEqualStrings("bye", h.handler.closeReason());
     try testing.expectEqual(@as(u32, 1), h.handler.closes);
+}
+
+test "ws: rtt() reads the kernel's round trip for the TCP connection" {
+    var h: Harness = undefined;
+    try h.init(29454, .{ .tls = false });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try h.upgrade(&c, "/", false);
+    try c.sendFrame(.binary, true, "x");
+    _ = try h.frame(&c);
+
+    const rtt = h.handler.ws.?.rtt();
+    switch (builtin.target.os.tag) {
+        // Loopback: a sample under a second, possibly 0 at macOS's ms resolution.
+        .linux, .macos => try testing.expect(rtt.? < std.time.ns_per_s),
+        else => try testing.expectEqual(@as(?u64, null), rtt),
+    }
 }
 
 test "ws: a frame split across reads, then two frames in one read" {

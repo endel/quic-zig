@@ -99,6 +99,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - `ConnectionConfig.datagrams_before_streams` (or `Config.datagrams_before_streams`
   on a server) packs datagrams ahead of stream data, so a backlogged stream no
   longer holds them back. Off by default.
+- `WsConn.rtt()`: the kernel's smoothed round trip for a WebSocket's TCP
+  connection, in nanoseconds (Linux and macOS).
 
 ### Changed
 
