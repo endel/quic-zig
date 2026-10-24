@@ -93,6 +93,12 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   defaults to a quarter of `max_connections`.
 - `ConnectionConfig.handshake_timeout` (default 10 s): a handshake not done in
   that time closes the connection, client or server.
+- `Session.rejectSession(id, status)` (C: `qz_session_reject`) refuses a
+  WebTransport session with an HTTP status and leaves the connection's other
+  sessions open.
+- `ConnectionConfig.datagrams_before_streams` (or `Config.datagrams_before_streams`
+  on a server) packs datagrams ahead of stream data, so a backlogged stream no
+  longer holds them back. Off by default.
 
 ### Changed
 
@@ -141,6 +147,12 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   in and unmaps a buffer for each burst: routez serves 1 MB HTTP/3 responses
   26% faster, with 17% less CPU each. The buffers go when the connection has
   no bidirectional streams left.
+- Outgoing datagrams now expire after max(1.25 × min RTT, 20 ms) unless
+  `setOutgoingDatagramMaxAge` sets an age; `null` restores that default rather
+  than meaning no limit. Expired ones count in `Stats.datagrams_expired_outgoing`.
+- `sendDatagram` fails with `error.DatagramTooLarge` for anything over
+  `maxDatagramPayloadSize()`, which now also respects the peer's
+  `max_datagram_frame_size`.
 - `tls_server` and `tls_client` key AES-128-GCM once per connection instead
   of once per record: a 16 KB record seals in 2.8 µs, where std's AES-GCM
   took 4.5 µs (8.7 µs under Zig 0.17), and routez serves 10 KB files over
@@ -148,6 +160,11 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A WebTransport server's `closeSession` on a session it hadn't accepted made
+  the client close the whole connection, ending its other sessions too. It now
+  refuses the session with 403.
+- A queued datagram too large for any packet (about 1168–1199 bytes) blocked
+  every datagram behind it for good.
 - qlog traces now have a `packet_sent` event for every packet, under its own
   type; coalesced packets and those sent while congestion-limited or closing
   were missing.
