@@ -615,6 +615,13 @@ pub const ConnectionConfig = struct {
     // Datagram queue capacity (per direction). Default 32. Increase for apps
     // that send/receive large bursts of datagrams (e.g. WebTransport datagram tests).
     datagram_queue_capacity: usize = DatagramQueue.DEFAULT_MAX_ITEMS,
+    /// Pack queued datagrams into each packet before STREAM frames. Off,
+    /// streams fill a packet first and datagrams take the room left, so a
+    /// backlogged stream — a joiner's full game state, say — holds back
+    /// the datagrams behind it, the latest state among them, until it
+    /// drains or they expire. On, the datagrams go first, and the stream
+    /// gets what they leave.
+    datagrams_before_streams: bool = false,
     // Auto-close connection when all data is sent and acknowledged.
     close_when_idle: bool = false,
     // Key deriving our stateless reset tokens (server). Must be the key the
@@ -1158,6 +1165,7 @@ pub const Connection = struct {
         // Resize datagram queues if configured larger than default
         conn.datagram_recv_queue.max_items = config.datagram_queue_capacity;
         conn.datagram_send_queue.max_items = config.datagram_queue_capacity;
+        conn.packer.datagrams_first = config.datagrams_before_streams;
     }
 
     /// Convenience wrapper for callers with stack to spare.
@@ -5216,6 +5224,7 @@ pub fn connectInto(
     // Resize datagram queues if configured larger than default
     conn.datagram_recv_queue.max_items = config.datagram_queue_capacity;
     conn.datagram_send_queue.max_items = config.datagram_queue_capacity;
+    conn.packer.datagrams_first = config.datagrams_before_streams;
 
     return;
 }
@@ -6193,6 +6202,32 @@ test "acceptInto keeps its own copy of the ODCID and retry SCID" {
     @memset(&retry_scid, 0);
     try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0x0a)), conn.local_params.original_destination_connection_id.?.slice());
     try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0x0b)), conn.local_params.retry_source_connection_id.?.slice());
+}
+
+test "datagrams_before_streams reaches the packer of either end" {
+    var plain = try connect(std.testing.allocator, "example.com", .{}, null, null);
+    defer plain.deinit();
+    try std.testing.expect(!plain.packer.datagrams_first);
+    var client = try connect(std.testing.allocator, "example.com", .{ .datagrams_before_streams = true }, null, null);
+    defer client.deinit();
+    try std.testing.expect(client.packer.datagrams_first);
+
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const header = packet.Header{
+        .packet_type = .initial,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .dcid = &dcid,
+        .scid = &dcid,
+        .token = &.{},
+        .packet_number = 0,
+        .packet_number_len = 1,
+        .remainder_len = 0,
+    };
+    const local = makeIpv4Addr(0, 0, 0, 0, 443);
+    const remote = makeIpv4Addr(192, 168, 1, 100, 12345);
+    var server = try Connection.accept(std.testing.allocator, header, local, remote, true, .{ .datagrams_before_streams = true }, null, null, null);
+    defer server.deinit();
+    try std.testing.expect(server.packer.datagrams_first);
 }
 
 test "accept: a client may choose a zero-length SCID" {

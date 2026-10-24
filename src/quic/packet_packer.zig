@@ -88,6 +88,10 @@ pub const PacketPacker = struct {
     /// Spin bit for passive RTT measurement (RFC 9000 §17.4).
     spin_bit: bool = false,
 
+    /// Pack queued datagrams ahead of STREAM frames; see
+    /// `ConnectionConfig.datagrams_before_streams`.
+    datagrams_first: bool = false,
+
     /// Maximum packet size for regular (non-probe) packets.
     max_packet_size: usize = DEFAULT_MAX_PACKET_SIZE,
 
@@ -150,6 +154,39 @@ pub const PacketPacker = struct {
     pub fn maxDatagramPayload(self: *const PacketPacker) usize {
         const short_header = 1 + @as(usize, self.dcid_len) + MAX_PN_LEN;
         return self.max_packet_size -| (short_header + AEAD_TAG_LEN + DATAGRAM_FRAME_OVERHEAD);
+    }
+
+    /// Write queued datagrams into the packet while they fit. Whether any went in.
+    fn packDatagrams(
+        self: *PacketPacker,
+        dq: *conn_mod.DatagramQueue,
+        fbs: *io.FixedBufferStream([]u8),
+        payload_start: usize,
+        effective_max: usize,
+        zero_rtt: bool,
+        now: i64,
+    ) !bool {
+        var any = false;
+        // Zero-copy peek: read directly from the queue's buffer.
+        while (dq.peekDataSkipExpired(now)) |dgram_data| {
+            // DATAGRAM_WITH_LENGTH frame: type(1) + varint(len) + payload
+            const varint_overhead: usize = if (dgram_data.len <= 63) 1 else 2;
+            const frame_size = 1 + varint_overhead + dgram_data.len;
+            if (fbs.seek + frame_size + AEAD_TAG_LEN > effective_max) {
+                // No packet of this path holds it, as a smaller MTU or a longer
+                // CID can leave one queued: held, it blocks all behind it.
+                if (!zero_rtt and payload_start + frame_size + AEAD_TAG_LEN > self.max_packet_size) {
+                    dq.drop();
+                    continue;
+                }
+                break;
+            }
+            const dgram_frame = Frame{ .datagram_with_length = .{ .data = dgram_data } };
+            try dgram_frame.write(fbs);
+            dq.consume();
+            any = true;
+        }
+        return any;
     }
 
     /// Pack a coalesced packet (Initial + 0-RTT + Handshake + 1-RTT).
@@ -512,6 +549,14 @@ pub const PacketPacker = struct {
             }
         }
 
+        // 5a. DATAGRAM frames ahead of streams, when asked: a backlogged
+        // stream would otherwise fill every packet before them.
+        const dgram_queue: ?*conn_mod.DatagramQueue = if (level == .application and !ack_only) datagram_queue else null;
+        var has_datagram = false;
+        if (dgram_queue) |dq| {
+            if (self.datagrams_first) has_datagram = try self.packDatagrams(dq, &fbs, payload_start, effective_max, zero_rtt, now);
+        }
+
         // 5. Stream frames (only in 1-RTT or 0-RTT, skip when ack_only)
         // Track stream frames for retransmission on loss
         var stream_frame_infos: [ack_handler.MAX_STREAM_FRAMES_PER_PACKET]ack_handler.StreamFrameInfo = undefined;
@@ -607,35 +652,10 @@ pub const PacketPacker = struct {
 
         // 6. DATAGRAM frames (RFC 9221) — subject to congestion control (RFC 9221 §5)
         // Only pack datagrams when CC allows (i.e. not in ack_only mode).
-        var has_datagram = false;
-        if (level == .application and !ack_only) {
-            if (datagram_queue) |dq| {
-                while (true) {
-                    // Zero-copy peek: read directly from ring buffer without
-                    // copying to an intermediate stack buffer.
-                    const dgram_data = dq.peekDataSkipExpired(now) orelse break;
-                    // DATAGRAM_WITH_LENGTH frame: type(1) + varint(len) + payload
-                    const varint_overhead: usize = if (dgram_data.len <= 63) 1 else 2;
-                    const frame_size = 1 + varint_overhead + dgram_data.len;
-                    if (fbs.seek + frame_size + AEAD_TAG_LEN > effective_max) {
-                        // No packet of this path holds it, as a smaller MTU or a longer
-                        // CID can leave one queued: held, it blocks all behind it.
-                        if (!zero_rtt and payload_start + frame_size + AEAD_TAG_LEN > self.max_packet_size) {
-                            dq.drop();
-                            continue;
-                        }
-                        break;
-                    }
-                    const dgram_frame = Frame{ .datagram_with_length = .{
-                        .data = dgram_data,
-                    } };
-                    try dgram_frame.write(writer);
-                    dq.consume();
-                    ack_eliciting = true;
-                    has_datagram = true;
-                }
-            }
+        if (dgram_queue) |dq| {
+            if (!self.datagrams_first and try self.packDatagrams(dq, &fbs, payload_start, effective_max, zero_rtt, now)) has_datagram = true;
         }
+        if (has_datagram) ack_eliciting = true;
 
         // 7. The ACK held in step 1, if anything else went in. Without the
         // room, the threshold or the alarm sends it later.
@@ -1710,32 +1730,31 @@ fn openRigPacket(pkt: []u8, pn: u64) ![]u8 {
     return keys.open.decryptPayload(pn, pkt[0..header_len], pkt[header_len..]);
 }
 
-/// The payloads of the DATAGRAM frames in `frames`, and where the first
-/// STREAM frame sat among the frames, if there was one.
-fn datagramsIn(frames: []u8, out: [][]const u8) !struct { n: usize, stream_at: ?usize } {
+/// The payloads of the DATAGRAM frames in `frames`, and where among the
+/// frames the first DATAGRAM and the first STREAM sat.
+fn datagramsIn(frames: []u8, out: [][]const u8) !struct { n: usize, datagram_at: ?usize, stream_at: ?usize } {
     var n: usize = 0;
+    var datagram_at: ?usize = null;
     var stream_at: ?usize = null;
     var at: usize = 0;
     var i: usize = 0;
     while (at < frames.len) : (i += 1) {
         var size: usize = undefined;
-        switch (try Frame.parseSized(frames[at..], &size)) {
-            .datagram => |d| {
-                out[n] = d.data;
-                n += 1;
+        const data = switch (try Frame.parseSized(frames[at..], &size)) {
+            .datagram => |d| d.data,
+            .datagram_with_length => |d| d.data,
+            .stream => blk: {
+                if (stream_at == null) stream_at = i;
+                break :blk null;
             },
-            .datagram_with_length => |d| {
-                out[n] = d.data;
-                n += 1;
-            },
-            .stream => if (stream_at == null) {
-                stream_at = i;
-            },
-            else => {},
-        }
+            else => null,
+        };
         at += size;
+        out[n] = data orelse continue;
+        if (datagram_at == null) datagram_at = i;
+        n += 1;
     }
-    return .{ .n = n, .stream_at = stream_at };
+    return .{ .n = n, .datagram_at = datagram_at, .stream_at = stream_at };
 }
 
 test "PacketPacker: a datagram no packet of the path holds is dropped, not left to block the rest" {
@@ -1777,6 +1796,36 @@ test "PacketPacker: a datagram that fits only a packet of its own waits for one"
     const found = try datagramsIn(try openRigPacket(out[0..written], 1), &got);
     try testing.expectEqual(@as(usize, big.len), got[0].len);
     try testing.expectEqual(@as(usize, 1), found.n);
+}
+
+test "PacketPacker: datagrams_first packs a datagram ahead of a backlogged stream" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const s = try rig.streams.getOrCreateStream(0);
+    try s.send.writeData(&(@as([8000]u8, @splat('x'))));
+    // About a game's hot update: more than the room streams leave for an ACK.
+    const update: [200]u8 = @splat('u');
+    try testing.expect(rig.dq.push(testing.allocator, &update));
+    var out: [1500]u8 = undefined;
+    var got: [4][]const u8 = undefined;
+
+    // By default the stream fills the packet and the datagram waits behind it.
+    var written = try rig.pack(&out, 1000);
+    var found = try datagramsIn(try openRigPacket(out[0..written], 0), &got);
+    try testing.expectEqual(@as(usize, 0), found.n);
+    try testing.expect(found.stream_at != null);
+    try testing.expectEqual(@as(usize, 1), rig.dq.queueLen());
+
+    rig.packer.datagrams_first = true;
+    written = try rig.pack(&out, 1000);
+    found = try datagramsIn(try openRigPacket(out[0..written], 1), &got);
+    try testing.expectEqual(@as(usize, 1), found.n);
+    try testing.expectEqualSlices(u8, &update, got[0]);
+    try testing.expect(found.datagram_at.? < found.stream_at.?);
+    try testing.expect(rig.dq.isEmpty());
+    // The stream still fills what the datagram left.
+    try testing.expect(written + 32 >= rig.packer.max_packet_size);
 }
 
 test "PacketPacker: streams are walked only while one may have something to send" {

@@ -137,6 +137,10 @@ pub const Config = struct {
     /// clients that support it for fewer ACKs. Ignored when `conn_config`
     /// is set.
     request_ack_frequency: bool = true,
+    /// `ConnectionConfig.datagrams_before_streams` for every connection:
+    /// datagrams are not held behind a backlogged stream. Ignored when
+    /// `conn_config` is set.
+    datagrams_before_streams: bool = false,
 
     // Advanced: provide pre-built TLS and connection configs directly.
     // When tls_config is set, cert_path/key_path are ignored.
@@ -1018,6 +1022,7 @@ pub fn Server(comptime Handler: type) type {
                     .max_ack_delay = config.max_ack_delay,
                     .ack_bytes_threshold = config.ack_bytes_threshold,
                     .request_ack_frequency = config.request_ack_frequency,
+                    .datagrams_before_streams = config.datagrams_before_streams,
                 };
                 if (Handler.protocol == .webtransport or Handler.protocol == .quic) {
                     cc.max_datagram_frame_size = config.max_datagram_frame_size;
