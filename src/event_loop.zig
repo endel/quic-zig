@@ -4808,6 +4808,36 @@ test "e2e: closeSession on a CONNECT never accepted refuses it, and the first se
     try expectSecondSessionRefused(29681, true, "403");
 }
 
+const ReadyClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    session_id: ?u64 = null,
+
+    pub fn onSessionReady(self: *@This(), _: *ClientSession, session_id: u64) void {
+        self.session_id = session_id;
+    }
+    fn ready(self: *const @This()) bool {
+        return self.session_id != null;
+    }
+};
+
+test "e2e: a datagram of maxDatagramPayloadSize arrives, and one byte more is refused at the send" {
+    var client_handler = ReadyClient{};
+    var server_handler = OneSessionServer{};
+    var e2e: E2e(OneSessionServer, ReadyClient) = undefined;
+    try e2e.init(29682, &server_handler, &client_handler);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &client_handler, ReadyClient.ready, 10_000);
+
+    var cs = e2e.client.clientSession();
+    const sid = client_handler.session_id.?;
+    const max = cs.maxDatagramPayloadSize(sid).?;
+    var buf: [connection.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = @splat('d');
+    try testing.expectError(error.DatagramTooLarge, cs.sendDatagram(sid, buf[0 .. max + 1]));
+    try cs.sendDatagram(sid, buf[0..max]);
+    try cs.sendDatagram(sid, "and one behind it");
+    try runUntilCount(&e2e.loop, &server_handler.datagrams, 2, 3000);
+}
+
 test "e2e: an RSA certificate, picked by SNI next to an EC one" {
     const test_certs = @import("tls/test_certs.zig");
     var ec_certs: test_certs.TestCerts = undefined;

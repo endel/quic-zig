@@ -375,9 +375,19 @@ pub const DatagramQueue = struct {
     max_items: usize = DEFAULT_MAX_ITEMS,
     count: usize = 0,
 
-    /// Max age in nanoseconds. Datagrams older than this are dropped on read.
-    /// null = no age limit (default).
+    /// Max age in nanoseconds, counted from the push. Datagrams older than
+    /// this are dropped on read. null = `default_max_age_ns`.
     max_age_ns: ?i64 = null,
+
+    /// The age limit while `max_age_ns` is null, counted from the first
+    /// `stamp` an entry sees rather than from its push. null = none.
+    default_max_age_ns: ?i64 = null,
+
+    /// Where in `bytes` the entries `stamp` has yet to see begin.
+    unstamped: usize = 0,
+
+    /// Datagrams dropped unsent: past their age, or too large for the path.
+    expired: u64 = 0,
 
     /// High water mark (max queued items). null = use max_items (default).
     high_water_mark: ?usize = null,
@@ -414,6 +424,7 @@ pub const DatagramQueue = struct {
             const rest = self.bytes.items.len - self.head;
             @memmove(self.bytes.items[0..rest], self.bytes.items[self.head..]);
             self.bytes.items.len = rest;
+            self.unstamped -|= self.head;
             self.head = 0;
         }
         const e = self.bytes.addManyAsSlice(gpa, need) catch return false;
@@ -431,14 +442,29 @@ pub const DatagramQueue = struct {
 
     /// Set the age limit; entries already queued count their age from `now`.
     pub fn setMaxAge(self: *DatagramQueue, max_age_ns: ?i64, now: i64) void {
-        if (self.max_age_ns == null and max_age_ns != null) {
-            var at = self.head;
-            for (0..self.count) |_| {
-                std.mem.writeInt(i64, self.bytes.items[at + 2 ..][0..8], now, .little);
-                at += header_len + std.mem.readInt(u16, self.bytes.items[at..][0..2], .little);
-            }
-        }
+        if (self.max_age_ns == null and max_age_ns != null) self.stampFrom(self.head, now);
+        // Under a limit of its own, every entry carries its time.
+        if (self.max_age_ns != null or max_age_ns != null) self.unstamped = self.bytes.items.len;
         self.max_age_ns = max_age_ns;
+    }
+
+    /// Start the default age of the entries pushed since the last call, at
+    /// `now`, and make `default_max_age_ns` the limit. Called on each chance
+    /// to send them: the age is then the time the transport held them, not
+    /// the loop's own delay before it flushed, and a push reads no clock.
+    pub fn stamp(self: *DatagramQueue, now: i64, default_max_age_ns: i64) void {
+        self.default_max_age_ns = default_max_age_ns;
+        // Pushed under `max_age_ns`, entries carry their push time already.
+        if (self.max_age_ns == null) self.stampFrom(@max(self.unstamped, self.head), now);
+        self.unstamped = self.bytes.items.len;
+    }
+
+    fn stampFrom(self: *DatagramQueue, start: usize, now: i64) void {
+        var at = start;
+        while (at < self.bytes.items.len) {
+            std.mem.writeInt(i64, self.bytes.items[at + 2 ..][0..8], now, .little);
+            at += header_len + std.mem.readInt(u16, self.bytes.items[at..][0..2], .little);
+        }
     }
 
     pub fn pop(self: *DatagramQueue, out: []u8) ?usize {
@@ -457,8 +483,17 @@ pub const DatagramQueue = struct {
     }
 
     fn dropExpired(self: *DatagramQueue, now: i64) void {
-        const max_age = self.max_age_ns orelse return;
-        while (self.count > 0 and now - self.headTime() > max_age) self.consume();
+        const max_age = self.max_age_ns orelse self.default_max_age_ns orelse return;
+        // Under the default, an entry `stamp` has not seen has no age yet.
+        while (self.count > 0 and (self.max_age_ns != null or self.head < self.unstamped) and
+            now - self.headTime() > max_age) self.drop();
+    }
+
+    /// Drop the head entry unsent, counting it in `expired`.
+    pub fn drop(self: *DatagramQueue) void {
+        if (self.count == 0) return;
+        self.consume();
+        self.expired += 1;
     }
 
     pub fn isEmpty(self: *const DatagramQueue) bool {
@@ -501,6 +536,7 @@ pub const DatagramQueue = struct {
         if (self.count == 0) {
             self.bytes.items.len = 0;
             self.head = 0;
+            self.unstamped = 0;
         }
     }
 };
@@ -633,6 +669,14 @@ const ACK_FREQUENCY_THRESHOLD: u64 = 10;
 fn idleTimeoutNs(ms: u64) i64 {
     return @as(i64, @min(ms, 1 << 32)) * std.time.ns_per_ms;
 }
+
+/// Milliseconds as nanoseconds, saturating at what an i64 holds.
+fn msToNs(ms: u64) i64 {
+    return std.math.mul(i64, std.math.cast(i64, ms) orelse std.math.maxInt(i64), std.time.ns_per_ms) catch std.math.maxInt(i64);
+}
+
+/// See `Connection.defaultDatagramMaxAge`.
+const DATAGRAM_MAX_AGE_FLOOR_NS: i64 = 20 * std.time.ns_per_ms;
 
 /// A QUIC connection.
 ///
@@ -3580,6 +3624,9 @@ pub const Connection = struct {
             return 0;
         }
 
+        // Before the window can hold them back: that wait is what the age counts.
+        if (self.datagram_send_queue.count > 0) self.datagram_send_queue.stamp(now, self.defaultDatagramMaxAge());
+
         // Check congestion window — only send ACKs + control frames when congestion-limited
         // Exception: PTO probes MUST bypass congestion control (RFC 9002 §6.2.4);
         // past the record limit they go out as bare PINGs.
@@ -4315,8 +4362,9 @@ pub const Connection = struct {
     }
 
     /// Send a QUIC DATAGRAM frame (RFC 9221).
-    /// Returns error.DatagramsNotEnabled, error.DatagramTooLarge (permanent — reduce payload),
-    /// or error.DatagramQueueFull (transient — retry after sending).
+    /// Returns error.DatagramsNotEnabled, error.DatagramTooLarge (larger than
+    /// `maxDatagramPayloadSize`: no packet on this path could carry it), or
+    /// error.DatagramQueueFull (transient — retry after sending).
     pub fn sendDatagram(self: *Connection, data: []const u8) !void {
         return self.sendDatagramParts(&.{data});
     }
@@ -4327,7 +4375,7 @@ pub const Connection = struct {
         if (!self.datagrams_enabled) return error.DatagramsNotEnabled;
         var len: usize = 0;
         for (parts) |p| len += p.len;
-        if (len > DatagramQueue.MAX_DATAGRAM_SIZE) return error.DatagramTooLarge;
+        if (len > self.datagramLimit()) return error.DatagramTooLarge;
         if (self.datagram_send_queue.isFull()) return error.DatagramQueueFull;
         if (!self.datagram_send_queue.pushParts(self.allocator, parts)) return error.OutOfMemory;
     }
@@ -4381,26 +4429,37 @@ pub const Connection = struct {
         return self.datagram_send_queue.queueLen();
     }
 
-    /// Returns the maximum payload size for a DATAGRAM frame, accounting for
-    /// short header overhead, AEAD tag, and frame encoding. Returns null if
-    /// datagrams are not enabled.
+    /// The largest datagram `sendDatagram` takes now: what an otherwise empty
+    /// 1-RTT packet holds at the current packet size and DCID, within the
+    /// peer's max_datagram_frame_size and `DatagramQueue.MAX_DATAGRAM_SIZE`.
+    /// Null if datagrams are not enabled. It can shrink, with the path MTU
+    /// or a longer CID: a datagram queued before then and too large after
+    /// is dropped unsent.
     pub fn maxDatagramPayloadSize(self: *const Connection) ?usize {
         if (!self.datagrams_enabled) return null;
-        const peer_max = if (self.peer_params) |pp| pp.max_datagram_frame_size orelse return null else return null;
-        // Short header: 1 (flags) + dcid_len + 4 (max pkt num) + 16 (AEAD tag)
-        const header_overhead = 1 + @as(usize, self.dcid_len) + 4 + 16;
-        const max_pkt = self.packer.max_packet_size;
-        if (header_overhead >= max_pkt) return null;
-        const payload_budget = max_pkt - header_overhead;
-        // DATAGRAM_WITH_LENGTH frame: 1 (type) + varint(len) + payload
-        // Use 2-byte varint for length (covers up to 16383)
-        const frame_overhead: usize = 1 + 2;
-        if (frame_overhead >= payload_budget) return null;
-        const from_pkt = payload_budget - frame_overhead;
-        // Peer's max_datagram_frame_size includes type + length + payload
-        const from_peer = if (peer_max > frame_overhead) peer_max - frame_overhead else return null;
-        const max_payload = @min(from_pkt, from_peer);
-        return @min(max_payload, DatagramQueue.MAX_DATAGRAM_SIZE);
+        const pp = self.peer_params orelse return null;
+        if (pp.max_datagram_frame_size == null) return null;
+        const max = self.datagramLimit();
+        return if (max == 0) null else max;
+    }
+
+    fn datagramLimit(self: *const Connection) usize {
+        const room = @min(self.packer.maxDatagramPayload(), DatagramQueue.MAX_DATAGRAM_SIZE);
+        const pp = self.peer_params orelse return room;
+        // RFC 9221 §3: the peer's limit counts the frame's type and length too.
+        const peer_max = pp.max_datagram_frame_size orelse return 0;
+        return @min(room, peer_max -| packet_packer.DATAGRAM_FRAME_OVERHEAD);
+    }
+
+    /// The outgoing datagram age limit while the application sets none:
+    /// max(1.25 × min RTT, 20 ms), from the first chance to send. 1.25 is
+    /// Chrome's multiple (quiche's QuicDatagramQueue); the floor is
+    /// Firefox's (neqo), one frame at 60 fps, so a loopback or LAN path does
+    /// not shed datagrams faster than a game or a page uses them.
+    fn defaultDatagramMaxAge(self: *const Connection) i64 {
+        const rtt = &self.pkt_handler.rtt_stats;
+        const min_rtt = if (rtt.has_measurement) rtt.min_rtt else rtt.smoothedRttOrDefault();
+        return @max(@divTrunc(min_rtt * 5, 4), DATAGRAM_MAX_AGE_FLOOR_NS);
     }
 
     /// Receive a QUIC DATAGRAM frame (RFC 9221).
@@ -4466,12 +4525,17 @@ pub const Connection = struct {
 
     /// Set max age for incoming datagrams (milliseconds). null = no limit.
     pub fn setIncomingDatagramMaxAge(self: *Connection, max_age_ms: ?u64) void {
-        self.datagram_recv_queue.setMaxAge(if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null, @intCast(sys.nanoTimestamp()));
+        self.datagram_recv_queue.setMaxAge(if (max_age_ms) |ms| msToNs(ms) else null, @intCast(sys.nanoTimestamp()));
     }
 
-    /// Set max age for outgoing datagrams (milliseconds). null = no limit.
+    /// Set max age for outgoing datagrams (milliseconds), counted from the
+    /// send: an older one is dropped unsent, and counts in the stats'
+    /// `datagrams_expired_outgoing`. null restores the default, max(1.25 ×
+    /// min RTT, 20 ms) from the first chance to send it: without an age, a
+    /// datagram held back by congestion control or a backlogged stream
+    /// delays every one behind it. `std.math.maxInt(u64)` keeps them all.
     pub fn setOutgoingDatagramMaxAge(self: *Connection, max_age_ms: ?u64) void {
-        self.datagram_send_queue.setMaxAge(if (max_age_ms) |ms| @as(i64, @intCast(ms)) * 1_000_000 else null, @intCast(sys.nanoTimestamp()));
+        self.datagram_send_queue.setMaxAge(if (max_age_ms) |ms| msToNs(ms) else null, @intCast(sys.nanoTimestamp()));
     }
 
     /// Set high water mark for incoming datagram queue (count).
@@ -4719,6 +4783,9 @@ pub const Connection = struct {
         min_rtt_ns: i64,
         datagrams_dropped_incoming: u64,
         datagrams_lost_outgoing: u64,
+        /// Dropped from the send queue unsent: past their max age, or too
+        /// large for the path once it shrank. W3C `expiredOutgoing`.
+        datagrams_expired_outgoing: u64,
     };
 
     pub fn getStats(self: *const Connection) Stats {
@@ -4753,6 +4820,7 @@ pub const Connection = struct {
             .min_rtt_ns = self.pkt_handler.rtt_stats.min_rtt,
             .datagrams_dropped_incoming = self.datagrams_dropped_incoming,
             .datagrams_lost_outgoing = self.datagrams_lost_outgoing,
+            .datagrams_expired_outgoing = self.datagram_send_queue.expired,
         };
     }
 
@@ -5515,6 +5583,56 @@ test "DatagramQueue: an age limit set late counts from when it was set" {
     try std.testing.expectEqual(@as(?usize, 5), q.popSkipExpired(&buf, 1_005_000_000));
 }
 
+test "DatagramQueue: the default age counts from the first stamp an entry sees" {
+    var q: DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
+    const age: i64 = 20_000_000;
+    try std.testing.expect(q.push(std.testing.allocator, "a"));
+    q.stamp(1_000_000_000, age);
+    try std.testing.expect(q.push(std.testing.allocator, "b"));
+
+    // "b" has no age until a stamp sees it, however late the clock.
+    try std.testing.expectEqualStrings("b", q.peekDataSkipExpired(1_000_000_000 + age + 1).?);
+    try std.testing.expectEqual(@as(u64, 1), q.expired);
+
+    q.stamp(5_000_000_000, age);
+    q.stamp(5_010_000_000, age); // seen already: its age keeps running
+    try std.testing.expectEqualStrings("b", q.peekDataSkipExpired(5_000_000_000 + age).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), q.peekDataSkipExpired(5_000_000_000 + age + 1));
+    try std.testing.expectEqual(@as(u64, 2), q.expired);
+
+    // An age of the application's own counts from the push, as before.
+    q.setMaxAge(10_000_000, 6_000_000_000);
+    sys.test_clock = 7_000_000_000;
+    defer sys.test_clock = null;
+    try std.testing.expect(q.push(std.testing.allocator, "c"));
+    q.stamp(7_050_000_000, age);
+    try std.testing.expectEqual(@as(?[]const u8, null), q.peekDataSkipExpired(7_010_000_001));
+}
+
+test "DatagramQueue: the stamped boundary survives compaction" {
+    var q: DatagramQueue = .{ .max_items = 64 };
+    defer q.deinitQueue(std.testing.allocator);
+    var payload: [300]u8 = @splat('p');
+    var buf: [300]u8 = undefined;
+    // Pops free the front, and a later push moves what is left down to it.
+    for (0..3) |_| try std.testing.expect(q.push(std.testing.allocator, &payload));
+    q.stamp(1_000, 20);
+    for (0..2) |_| _ = q.pop(&buf).?;
+    while (q.bytes.items.len + DatagramQueue.header_len + payload.len <= q.bytes.capacity) {
+        try std.testing.expect(q.push(std.testing.allocator, &payload));
+    }
+    try std.testing.expect(q.push(std.testing.allocator, &payload));
+    try std.testing.expectEqual(@as(usize, 0), q.head);
+    // Only the entry stamped before the move is old.
+    _ = q.peekDataSkipExpired(1_000_000);
+    try std.testing.expectEqual(@as(u64, 1), q.expired);
+    try std.testing.expect(q.count > 0);
+    q.stamp(2_000_000, 20);
+    _ = q.peekDataSkipExpired(3_000_000);
+    try std.testing.expect(q.isEmpty());
+}
+
 // --- Address utility function tests ---
 
 fn makeIpv4Addr(a: u8, b: u8, c: u8, d: u8, port: u16) posix.sockaddr.storage {
@@ -5769,6 +5887,63 @@ test "Connection: maxDatagramPayloadSize" {
     // Disabled peer param → null
     conn.peer_params.?.max_datagram_frame_size = null;
     try std.testing.expect(conn.maxDatagramPayloadSize() == null);
+}
+
+test "Connection: sendDatagram refuses a datagram no packet of the path holds" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.datagrams_enabled = true;
+    conn.peer_params = transport_params.TransportParams{};
+    conn.peer_params.?.max_datagram_frame_size = 65536;
+    var big: [DatagramQueue.MAX_DATAGRAM_SIZE + 1]u8 = @splat('d');
+
+    // 1200 - (1 + 8-byte DCID + 4-byte PN) - 16 (tag) - 3 (frame header)
+    try std.testing.expectEqual(@as(?usize, 1168), conn.maxDatagramPayloadSize());
+    try conn.sendDatagram(big[0..1168]);
+    try std.testing.expectError(error.DatagramTooLarge, conn.sendDatagram(big[0..1169]));
+
+    // A 20-byte CID takes 12 more bytes of every packet.
+    conn.packer.updateDcid(&(@as([20]u8, @splat(7))));
+    try std.testing.expectEqual(@as(?usize, 1156), conn.maxDatagramPayloadSize());
+    try std.testing.expectError(error.DatagramTooLarge, conn.sendDatagram(big[0..1157]));
+
+    // A path PMTUD raised is still held to the queue's own cap.
+    conn.packer.max_packet_size = 1452;
+    try std.testing.expectEqual(@as(?usize, DatagramQueue.MAX_DATAGRAM_SIZE), conn.maxDatagramPayloadSize());
+    try std.testing.expectError(error.DatagramTooLarge, conn.sendDatagram(&big));
+
+    // RFC 9221 §3: the peer's limit counts the frame's type and length.
+    conn.peer_params.?.max_datagram_frame_size = 100;
+    try std.testing.expectEqual(@as(?usize, 97), conn.maxDatagramPayloadSize());
+    try conn.sendDatagram(big[0..97]);
+    try std.testing.expectError(error.DatagramTooLarge, conn.sendDatagram(big[0..98]));
+}
+
+test "Connection: an outgoing datagram expires by default, from the first chance to send it" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.datagrams_enabled = true;
+
+    // No RTT yet: 1.25 × the initial 100 ms. Then the 20 ms floor, then RTT.
+    try std.testing.expectEqual(@as(i64, 125_000_000), conn.defaultDatagramMaxAge());
+    conn.pkt_handler.rtt_stats.updateRtt(1_000_000, 0, false);
+    try std.testing.expectEqual(DATAGRAM_MAX_AGE_FLOOR_NS, conn.defaultDatagramMaxAge());
+    conn.pkt_handler.rtt_stats.min_rtt = 80_000_000;
+    try std.testing.expectEqual(@as(i64, 100_000_000), conn.defaultDatagramMaxAge());
+
+    try conn.sendDatagram("held back");
+    const t0: i64 = 1_000_000_000;
+    var out: [1500]u8 = undefined;
+    _ = try conn.sendAt(&out, t0); // no keys: a chance to send that sends nothing
+    try std.testing.expectEqualStrings("held back", conn.datagram_send_queue.peekDataSkipExpired(t0 + 100_000_000).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), conn.datagram_send_queue.peekDataSkipExpired(t0 + 100_000_001));
+    try std.testing.expectEqual(@as(u64, 1), conn.getStats().datagrams_expired_outgoing);
+
+    // One of the application's own replaces the default.
+    conn.setOutgoingDatagramMaxAge(std.math.maxInt(u64));
+    try conn.sendDatagram("kept");
+    _ = try conn.sendAt(&out, t0);
+    try std.testing.expect(conn.datagram_send_queue.peekDataSkipExpired(std.math.maxInt(i64)) != null);
 }
 
 test "Connection: datagram receive" {

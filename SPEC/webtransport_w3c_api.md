@@ -27,7 +27,7 @@ wants parity needs them.
 | `incomingUnidirectionalStreams` | `onUniStream` |
 | `datagrams.readable` | `onDatagram` |
 | `datagrams.maxDatagramSize` | `maxDatagramPayloadSize(session_id)` |
-| `datagrams.incomingMaxAge` / `outgoingMaxAge` | `setIncomingDatagramMaxAge` / `setOutgoingDatagramMaxAge` |
+| `datagrams.incomingMaxAge` / `outgoingMaxAge` | `setIncomingDatagramMaxAge` / `setOutgoingDatagramMaxAge`; outgoing defaults to max(1.25 × min RTT, 20 ms), Chrome's multiple and Firefox's floor |
 | `WebTransportSendStream.abort(code)` → RESET_STREAM | `resetStream(stream_id, code)` |
 | `readable.cancel()` → STOP_SENDING | `stopSending(stream_id, code)` |
 | `ReadableStream` backpressure (not reading) | `pauseStream(stream_id)` / `resumeStream(stream_id)` |

@@ -601,7 +601,8 @@ pub const WebTransportConnection = struct {
         self.quic.setIncomingDatagramMaxAge(max_age_ms);
     }
 
-    /// Set max age for outgoing datagrams (milliseconds). null = no limit.
+    /// Set max age for outgoing datagrams (milliseconds). null = the default,
+    /// max(1.25 × min RTT, 20 ms); see `Connection.setOutgoingDatagramMaxAge`.
     pub fn setOutgoingDatagramMaxAge(self: *WebTransportConnection, max_age_ms: ?u64) void {
         self.quic.setOutgoingDatagramMaxAge(max_age_ms);
     }
