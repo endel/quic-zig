@@ -103,17 +103,19 @@ lost or crossed in flight.
 
 ## Session termination (§6)
 
-Followed as draft-16 §6 words it, which adds the optional STOP_SENDING to
-draft-13's text. Any end of the CONNECT stream ends the session: the
-application gets one `session_closed`, and the session's streams are reset and
-stopped with `WT_SESSION_GONE`.
+Followed as draft-16 §6 words it, which adds the UTF-8 rules and the optional
+STOP_SENDING to draft-13's text. Any end of the CONNECT stream ends the
+session: the application gets one `session_closed`, and the session's streams
+are reset and stopped with `WT_SESSION_GONE`.
 
 | Peer sends on the CONNECT stream | `session_closed` | We answer with |
 | --- | --- | --- |
 | `WT_CLOSE_SESSION` (then FIN) | its code and reason | FIN |
 | FIN alone | code 0, reason `""` | FIN |
 | RESET_STREAM or STOP_SENDING | `abrupt`, code 0 | RESET_STREAM and, while it may still send, STOP_SENDING, both `H3_REQUEST_CANCELLED` |
-| a FIN cutting a capsule short | `abrupt`, code 0 | both, `H3_MESSAGE_ERROR` (RFC 9297 §3.3, RFC 9114 §4.1.2) |
+| a FIN cutting a capsule short; a close whose reason is past 1024 bytes or not UTF-8; a known capsule that does not parse | `abrupt`, code 0 | both, `H3_MESSAGE_ERROR` (RFC 9297 §3.3, RFC 9114 §4.1.2) |
+| bytes after a `WT_CLOSE_SESSION` | the close's code | both, `H3_MESSAGE_ERROR` |
+| a capsule type we do not know | nothing: dropped (RFC 9297 §3.2) | — |
 
 Capsules are acted on before the stream's end, so a close that shares a packet
 with the FIN or with a STOP_SENDING (webtransport-go sends all three) keeps its
@@ -121,20 +123,25 @@ code. A STOP_SENDING that overtakes the capsule in an earlier packet does not:
 the session is gone by the time the code arrives, as in Chrome and Firefox.
 
 Once we have sent our own close, the session waits for the peer to end its
-side, however it does, and then reports our code. A client whose CONNECT the
-server finishes or resets without a 200 gets `session_rejected` with an empty
-status; our own server does that to a CONNECT past its session slots.
+side, however it does, and then reports our code. Nothing malformed from the
+peer is answered with a reset in that state: the reset could overtake our
+capsule. A client whose CONNECT the server finishes or resets without a 200
+gets `session_rejected` with an empty status; our own server does that to a
+CONNECT past its session slots.
 
 **What we send.** A close is the capsule and a FIN, nothing more: no
 STOP_SENDING before the peer's FIN, which Chrome and Firefox turn into an
 abrupt close that loses the code (Chrome counts a close clean only once both
 FINs have crossed). The library never follows a close with CONNECTION_CLOSE; an
 application that wants the connection gone too should wait for
-`session_closed`, which arrives with the peer's FIN.
+`session_closed`, which arrives with the peer's FIN. A reason longer than 1024
+bytes is cut at a UTF-8 character boundary.
 
 **Not enforced.** §6 also forbids new streams and datagrams on a terminated
 session. `openBidiStream`, `openUniStream` and `sendDatagram` do not check;
 the peer refuses them, and the application has had its `session_closed`.
+Bytes the peer sends after its close in a *later* packet go unread rather
+than answered with H3_MESSAGE_ERROR: the session slot is released by then.
 
 ## Caveats worth knowing
 
@@ -164,7 +171,8 @@ frames would mis-parse.
 
 **A capsule longer than 4 KB is skipped, not buffered.** The peer chooses
 Length, and buffering whatever it names would let it name 2^62. The largest
-capsule we parse is `WT_CLOSE_SESSION`, whose reason §6 caps at 1024 bytes.
+capsule we parse is `WT_CLOSE_SESSION`, whose reason §6 caps at 1024 bytes; one
+announcing more is malformed and ends the session before any of it is read.
 
 **Session flow control is invisible on a Chrome connection.** Nothing in this
 family is emitted or enforced unless the peer speaks draft-13, so the Chrome and

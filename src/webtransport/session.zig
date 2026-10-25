@@ -18,6 +18,16 @@ pub const MAX_SESSIONS: usize = 4;
 /// Longest close reason a CLOSE_WEBTRANSPORT_SESSION capsule may carry.
 const max_close_reason = 1024;
 
+/// The longest prefix of `reason` that fits a close capsule. §6 has a sender
+/// that truncates cut at a UTF-8 character boundary: Firefox fails a session
+/// whose reason is not valid UTF-8 rather than report it.
+fn truncateReason(reason: []const u8) []const u8 {
+    if (reason.len <= max_close_reason) return reason;
+    var n: usize = max_close_reason;
+    while (n > 0 and reason[n] & 0xC0 == 0x80) n -= 1; // back off continuation bytes
+    return reason[0..n];
+}
+
 /// WebTransport error codes (draft-ietf-webtrans-http3).
 pub const WEBTRANSPORT_SESSION_GONE: u64 = 0x170d7b68;
 pub const WEBTRANSPORT_BUFFERED_STREAM_REJECTED: u64 = 0x3994bd84;
@@ -669,7 +679,7 @@ pub const WebTransportConnection = struct {
 
     /// Close a WebTransport session with an application error code and reason.
     /// Sends CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
-    /// Reason is truncated to 1024 bytes per spec.
+    /// `reason` is UTF-8, cut to 1024 bytes at a character boundary per spec.
     ///
     /// Nothing else follows on the CONNECT stream: no STOP_SENDING until the
     /// peer's FIN, which Chrome and Firefox both turn into an abrupt close
@@ -685,8 +695,7 @@ pub const WebTransportConnection = struct {
         if (session.state == .draining or session.state == .closed) return;
         if (self.is_server and session.state == .connecting) return self.rejectSession(session_id, 403);
 
-        // Truncate reason to spec limit (1024 bytes)
-        const truncated_reason = reason[0..@min(reason.len, max_close_reason)];
+        const truncated_reason = truncateReason(reason);
 
         // Send CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
         var frame_buf: [1100]u8 = undefined;
@@ -759,7 +768,7 @@ pub const WebTransportConnection = struct {
 
     fn setCloseReason(self: *WebTransportConnection, session: *Session, reason: []const u8) void {
         self.allocator.free(session.close_reason);
-        session.close_reason = self.allocator.dupe(u8, reason[0..@min(reason.len, max_close_reason)]) catch &.{};
+        session.close_reason = self.allocator.dupe(u8, truncateReason(reason)) catch &.{};
     }
 
     /// Release a session and report it closed with the code and reason it
@@ -1064,38 +1073,71 @@ pub const WebTransportConnection = struct {
                 continue;
             }
 
-            if (header.length > MAX_CAPSULE_PAYLOAD) {
+            const kind = h3_frame.H3FrameType.fromInt(header.frame_type);
+            // §6: a reason past 1024 bytes is a malformed close, not a long one.
+            if (kind == .close_webtransport_session and header.length > 4 + max_close_reason) {
+                return self.malformedCapsule(session);
+            }
+            // RFC 9297 §3.2: a capsule type we do not know is dropped.
+            if (kind == null or !isSessionCapsule(kind.?) or header.length > MAX_CAPSULE_PAYLOAD) {
                 h3_frame.consumeFromBuf(buf, header.header_len);
                 session.capsule_skip = header.length;
                 continue;
             }
             if (buf.items.len < header.header_len + header.length) return null; // more to come
 
-            const result = h3_frame.parse(buf.items) catch {
-                buf.clearRetainingCapacity();
-                self.rejectCapsuleStream(session);
-                return null;
-            };
+            const result = h3_frame.parse(buf.items) catch return self.malformedCapsule(session);
+            const sid = session.session_id;
+            const trailing = buf.items.len > result.consumed;
 
             // Act before consuming: a capsule's payload points into the buffer.
             // A close releases the session and its buffer with it, so the
             // pointer is re-read rather than reused.
-            const event = self.handleCapsule(session, result.frame);
-            if (self.stream_bufs.getPtr(session.session_id)) |live| {
-                h3_frame.consumeFromBuf(live, result.consumed);
+            const event = self.handleCapsule(session, result.frame) orelse {
+                if (self.stream_bufs.getPtr(sid)) |live| {
+                    h3_frame.consumeFromBuf(live, @min(result.consumed, live.items.len));
+                }
+                continue;
+            };
+            // §6: stream data after a received WT_CLOSE_SESSION MUST reset the
+            // stream with H3_MESSAGE_ERROR. The close itself stands.
+            if (event == .session_closed and !event.session_closed.abrupt and trailing) {
+                self.abortConnectStream(sid, @backingInt(h3_conn.H3Error.message_error));
             }
-            if (event) |e| return e;
+            if (self.stream_bufs.getPtr(sid)) |live| h3_frame.consumeFromBuf(live, result.consumed);
+            return event;
         }
     }
 
-    /// §6: stream data after a WT_CLOSE_SESSION is a MUST-reset with
-    /// H3_MESSAGE_ERROR. Only meaningful while draining — before that, an
-    /// unexpected capsule is one we simply do not know.
-    fn rejectCapsuleStream(self: *WebTransportConnection, session: *Session) void {
-        if (session.state != .draining) return;
-        if (self.quic.streams.getStream(session.session_id)) |s| {
-            s.send.reset(@backingInt(h3_conn.H3Error.message_error));
+    /// The capsules a session's CONNECT stream carries that we act on; any
+    /// other type, H3 frame types included, is an unknown capsule.
+    fn isSessionCapsule(kind: h3_frame.H3FrameType) bool {
+        return switch (kind) {
+            .close_webtransport_session,
+            .drain_webtransport_session,
+            .wt_max_data,
+            .wt_max_streams_bidi,
+            .wt_max_streams_uni,
+            .wt_data_blocked,
+            .wt_streams_blocked_bidi,
+            .wt_streams_blocked_uni,
+            => true,
+            else => false,
+        };
+    }
+
+    /// RFC 9297 §3.3 makes a malformed capsule a malformed message, which
+    /// RFC 9114 §4.1.2 answers with H3_MESSAGE_ERROR: a live session ends
+    /// abruptly. One we are closing ignores the rest of the stream and keeps
+    /// waiting for the peer's FIN: a reset now could overtake our own close.
+    fn malformedCapsule(self: *WebTransportConnection, session: *Session) ?WtEvent {
+        if (self.stream_bufs.getPtr(session.session_id)) |buf| buf.clearRetainingCapacity();
+        if (session.state != .active) {
+            session.capsule_skip = std.math.maxInt(u64);
+            return null;
         }
+        session.capsule_skip = 0;
+        return self.abortSession(session, @backingInt(h3_conn.H3Error.message_error));
     }
 
     /// Abort whatever of a CONNECT stream is still open, both ways.
@@ -1112,6 +1154,7 @@ pub const WebTransportConnection = struct {
         const fc_live = self.flowControlEnabled();
         switch (frame) {
             .close_webtransport_session => |cls| {
+                if (!std.unicode.utf8ValidateSlice(cls.reason)) return self.malformedCapsule(session);
                 const sid = session.session_id;
                 session.close_error_code = cls.error_code;
                 self.setCloseReason(session, cls.reason);
@@ -1138,7 +1181,7 @@ pub const WebTransportConnection = struct {
             .wt_streams_blocked_bidi => |n| if (fc_live) session.fc.bidi.peerBlockedAt(n),
             .wt_streams_blocked_uni => |n| if (fc_live) session.fc.uni.peerBlockedAt(n),
             .wt_data_blocked => |n| if (fc_live) session.fc.peerDataBlockedAt(n),
-            else => self.rejectCapsuleStream(session),
+            else => {}, // consumeCapsules drops these unparsed
         }
         return null;
     }
@@ -2731,6 +2774,77 @@ test "WT: a FIN that cuts a capsule short ends the session with H3_MESSAGE_ERROR
     try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.send.reset_err);
 }
 
+test "WT: a close reason that is not UTF-8 or longer than 1024 bytes is H3_MESSAGE_ERROR" {
+    // 0xff is never UTF-8; the long one is past the 4 KB we would buffer.
+    const bad = [_]u8{ 'a', 0xff };
+    const long: [5000]u8 = @splat('x');
+    for ([_][]const u8{ &bad, long[0..1025], &long }) |reason| {
+        var setup: WtTestSetup = undefined;
+        const session_id = try setup.initServer();
+        defer setup.deinit();
+
+        var payload: [4 + long.len]u8 = undefined;
+        std.mem.writeInt(u32, payload[0..4], 9, .big);
+        @memcpy(payload[4..][0..reason.len], reason);
+        var hdr: [16]u8 = undefined;
+        var fbs = io.fixedBufferStream(&hdr);
+        try packet.writeVarInt(&fbs, @backingInt(h3_frame.H3FrameType.close_webtransport_session));
+        try packet.writeVarInt(&fbs, 4 + reason.len);
+        _ = try peerSends(&setup, session_id, fbs.buffered(), false);
+        const stream = try peerSends(&setup, session_id, payload[0 .. 4 + reason.len], false);
+
+        const ev = (try setup.wt.poll()).?;
+        try testing.expect(ev.session_closed.abrupt);
+        try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.send.reset_err);
+    }
+}
+
+test "WT: data after a received close resets the CONNECT stream, and the close stands" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var buf: [64]u8 = undefined;
+    const close = wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 5, .reason = "bye" } });
+    _ = try peerSends(&setup, session_id, close, false);
+    var more: [64]u8 = undefined;
+    const stream = try peerSends(&setup, session_id, wrapCapsule(&more, .{ .wt_max_data = 7 }), false);
+
+    const ev = (try setup.wt.poll()).?;
+    try testing.expect(!ev.session_closed.abrupt);
+    try testing.expectEqual(@as(u32, 5), ev.session_closed.error_code);
+    try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.send.reset_err);
+}
+
+test "WT: unknown and malformed capsules reset nothing while our close waits for the peer's FIN" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    try setup.wt.closeSessionWithError(session_id, 3, "ours");
+    // A reserved capsule type and an HTTP/2 frame type, as capsules, then a
+    // close too short for its code, and bytes that would parse as another.
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    for ([_]u64{ 0x1f * 3 + 0x21, 0x02, @backingInt(h3_frame.H3FrameType.close_webtransport_session) }) |t| {
+        try packet.writeVarInt(&fbs, t);
+        try packet.writeVarInt(&fbs, 2);
+        try fbs.writeAll("zz");
+    }
+    var later: [64]u8 = undefined;
+    const close = wrapCapsule(&later, .{ .close_webtransport_session = .{ .error_code = 9, .reason = "theirs" } });
+    _ = try peerSends(&setup, session_id, fbs.buffered(), false);
+    const stream = try peerSends(&setup, session_id, close, false);
+    try testing.expect(try setup.wt.poll() == null);
+    try testing.expectEqual(@as(?u64, null), stream.send.reset_err);
+    try testing.expectEqual(@as(?u64, null), stream.recv.stop_sending_err);
+
+    _ = try peerSends(&setup, session_id, "", true);
+    const ev = (try setup.wt.poll()).?;
+    try testing.expectEqual(@as(u32, 3), ev.session_closed.error_code);
+    try testing.expectEqualStrings("ours", ev.session_closed.reason);
+}
+
 test "WT: our close answered by a reset ends the session with our code" {
     var setup: WtTestSetup = undefined;
     const session_id = try setup.initServer();
@@ -2744,6 +2858,23 @@ test "WT: our close answered by a reset ends the session with our code" {
     try testing.expect(!ev.session_closed.abrupt);
     try testing.expectEqual(@as(u32, 4), ev.session_closed.error_code);
     try testing.expectEqualStrings("ours", ev.session_closed.reason);
+}
+
+test "WT: a long close reason is cut at a UTF-8 boundary" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // 1023 ASCII bytes, then a 2-byte character straddling the limit.
+    var reason: [1025]u8 = @splat('x');
+    reason[1023] = 0xc3;
+    reason[1024] = 0xa9;
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+    try setup.wt.closeSessionWithError(session_id, 1, &reason);
+
+    const cls = (try h3_frame.parse(try expectCapsulePayload(stream.send.write_buffer.items[pre_len..]))).frame.close_webtransport_session;
+    try testing.expectEqual(@as(usize, 1023), cls.reason.len);
 }
 
 test "WT integration: a CONNECT the server resets unanswered is rejected" {

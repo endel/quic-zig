@@ -443,8 +443,8 @@ cross-impl byte-exact UTF-8 header check.
 | — | WEBTRANSPORT_BUFFERED_STREAM_REJECTED (0x3994bd84) | ❌ Missing | Constant declared, never sent. A stream naming an unknown session is registered and surfaced instead — see the test at `src/webtransport/session.zig` |
 | — | Stream error code remapping | ✅ Done | appErrorCodeToH3() maps 32-bit codes to H3 range, resetStream() API |
 | — | H3_ID_ERROR validation | ✅ Done | Invalid session IDs (not client-initiated bidi) close connection |
-| — | H3_MESSAGE_ERROR post-close | ✅ Done | Data on CONNECT stream after CLOSE triggers reset |
-| — | Session termination by the CONNECT stream (§6) | ✅ Done | A bare FIN is a close with code 0 and is answered with a FIN; a RESET_STREAM or STOP_SENDING ends the session as `abrupt`. Nothing but the capsule and FIN follows our close. `SPEC/DRAFT_IETF_WEBTRANS_HTTP3_13.md` |
+| — | H3_MESSAGE_ERROR post-close | ✅ Done | Bytes after a received WT_CLOSE_SESSION, a truncated or malformed capsule, or a close reason past 1024 bytes or not UTF-8, reset the CONNECT stream. Unknown capsule types are dropped |
+| — | Session termination by the CONNECT stream (§6) | ✅ Done | A bare FIN is a close with code 0 and is answered with a FIN; a RESET_STREAM or STOP_SENDING ends the session as `abrupt`. Reasons sent are cut at a UTF-8 boundary; nothing but the capsule and FIN follows our close. `SPEC/DRAFT_IETF_WEBTRANS_HTTP3_13.md` |
 | — | Application-protocol negotiation | ✅ Done | draft-13 §3.3 `WT-Available-Protocols` / `WT-Protocol`, RFC 8941 structured fields (`src/webtransport/protocol.zig`). The older `sec-webtransport-protocol` spelling survives only in the interop apps |
 | — | Session prioritization | ✅ Done | Priority header on CONNECT parsed by H3 layer, PRIORITY_UPDATE frames supported |
 | — | GOAWAY → session interaction | ✅ Done | H3 GOAWAY triggers session_draining events for active WT sessions |
