@@ -799,31 +799,82 @@ pub const Session = struct {
     }
 };
 
+/// What `Server.drain` tells the peers.
+pub const DrainOptions = struct {
+    /// A GOAWAY on each HTTP/3 connection and a WT_DRAIN_SESSION on each
+    /// WebTransport session; see `Session.drainConnection`. Browsers resolve
+    /// `WebTransport.draining` on one or the other.
+    ///
+    /// Off for an application that tells its clients in band before it
+    /// closes their sessions, since a GOAWAY costs browsers more than it
+    /// says to them (measured headless, October 2026): Firefox 158 then
+    /// drops a page's own session close, sending CONNECTION_CLOSE without its
+    /// WT_CLOSE_SESSION, and can crash outright when the GOAWAY lands as a
+    /// session is being accepted; Chrome 155-158 lose a session whose page
+    /// opens a stream after one. New connections are refused either way. A
+    /// connection whose WebTransport sessions are over still closes, as
+    /// `Config.wt_close_after_sessions` says; a plain HTTP/3 one waits for its
+    /// idle timeout or `stop()`.
+    signal_peers: bool = true,
+};
+
 /// Begin one connection's HTTP/3 shutdown; see `Session.drainConnection`.
+/// Its sessions get WT_DRAIN_SESSION now and the connection its GOAWAY once
+/// the peer has acked what its CONNECT streams carry, or 3 PTO on: Firefox
+/// 158 crashes when a GOAWAY comes with the 200 that accepts a session.
 fn beginDrain(entry: *ConnEntry, now: i64) void {
     const conn = entry.conn;
     if (conn.state == .closing or conn.state == .draining or conn.isClosed()) return;
     // Still handshaking, it gets GOAWAY(0) once it can; raw QUIC has none.
     const h3c = entry.h3_conn orelse return;
-    if (h3c.shutdown_state != .active) return;
+    if (h3c.shutdown_state != .active or entry.drain_goaway_due != null) return;
+    drainSessions(entry);
+    entry.drain_goaway_due = now + 3 * conn.pkt_handler.rtt_stats.pto();
+    sendDrainGoaway(entry, now);
+}
+
+fn drainSessions(entry: *ConnEntry) void {
+    const wtc = entry.wt_conn orelse return;
+    for (&wtc.sessions) |*sess| {
+        if (sess.occupied and sess.state == .active) wtc.drainSession(sess.session_id) catch {};
+    }
+}
+
+/// The held GOAWAY of a drain, once its time has come.
+fn sendDrainGoaway(entry: *ConnEntry, now: i64) void {
+    const due = entry.drain_goaway_due orelse return;
+    const conn = entry.conn;
+    if (now < due and connectStreamsUnacked(entry)) return;
+    entry.drain_goaway_due = null;
+    if (conn.state != .connected) return;
+    const h3c = entry.h3_conn orelse return;
+    drainSessions(entry); // one accepted meanwhile
     h3c.initiateShutdown() catch {
         conn.close(@backingInt(h3.H3Error.no_error), "server shutdown");
         return;
     };
     entry.drain_final_goaway_at = now + conn.pkt_handler.rtt_stats.pto();
-    if (entry.wt_conn) |wtc| {
-        for (&wtc.sessions) |*sess| {
-            if (sess.occupied and sess.state == .active) wtc.drainSession(sess.session_id) catch {};
-        }
-    }
 }
 
-/// When an entry next needs a pass: its connection's timers, and the final
-/// GOAWAY of a drain.
+fn connectStreamsUnacked(entry: *ConnEntry) bool {
+    const wtc = entry.wt_conn orelse return false;
+    for (wtc.sessions) |sess| {
+        if (!sess.occupied or sess.state != .active) continue;
+        const st = entry.conn.streams.getStream(sess.session_id) orelse continue;
+        if (st.send.ack_offset < st.send.write_offset) return true;
+    }
+    return false;
+}
+
+/// When an entry next needs a pass: its connection's timers, and those of
+/// a drain's GOAWAYs.
 fn entryDeadline(entry: *const ConnEntry, now: i64) ?i64 {
-    const quic_at = entry.conn.nextTimeoutNsAt(now);
-    const goaway_at = entry.drain_final_goaway_at orelse return quic_at;
-    return if (quic_at) |q| @min(q, goaway_at) else goaway_at;
+    var at = entry.conn.nextTimeoutNsAt(now);
+    for ([_]?i64{ entry.drain_goaway_due, entry.drain_final_goaway_at }) |d| {
+        const t = d orelse continue;
+        at = if (at) |a| @min(a, t) else t;
+    }
+    return at;
 }
 
 pub fn Server(comptime Handler: type) type {
@@ -944,6 +995,8 @@ pub fn Server(comptime Handler: type) type {
         stopping: bool,
         /// `drain()` was called; see there.
         draining: bool,
+        /// ... with `DrainOptions.signal_peers`.
+        drain_signals: bool = true,
 
         /// Zero-delay timer that services connections written to from outside
         /// our callbacks; see `ConnEntry.wake`.
@@ -1397,7 +1450,9 @@ pub fn Server(comptime Handler: type) type {
         /// - Every HTTP/3 connection gets a GOAWAY (RFC 9114 §5.2) and every
         ///   WebTransport session a WT_DRAIN_SESSION; see `Session.drainConnection`.
         ///   Both, because a browser's `WebTransport.draining` follows one or
-        ///   the other: Firefox's only GOAWAY, Safari's only the capsule.
+        ///   the other: Firefox's only GOAWAY, Safari's only the capsule. Not
+        ///   with `options.signal_peers` off, for an application that tells its
+        ///   clients itself: see `DrainOptions` for what a GOAWAY costs them.
         ///
         /// Requests in flight carry on: the first GOAWAY names no limit, and a
         /// PTO later a second one names the last request served, after which
@@ -1425,13 +1480,16 @@ pub fn Server(comptime Handler: type) type {
         /// included, as from outside them, on the server's own loop or a
         /// shared one: checking `isDrained()` and the deadline in `onPass`
         /// and calling `stop()` there is the intended shape.
-        pub fn drain(self: *Self) void {
+        pub fn drain(self: *Self, options: DrainOptions) void {
             if (self.draining or self.stopping) return;
             self.draining = true;
+            self.drain_signals = options.signal_peers;
             self.conn_mgr.refuse_new = true;
             if (self.http1_server) |*h1| h1.drain();
-            const now: i64 = sys.nanoTimestamp();
-            for (self.conn_mgr.entries.items) |entry| beginDrain(entry, now);
+            if (options.signal_peers) {
+                const now: i64 = sys.nanoTimestamp();
+                for (self.conn_mgr.entries.items) |entry| beginDrain(entry, now);
+            }
             self.flush();
         }
 
@@ -1986,7 +2044,7 @@ pub fn Server(comptime Handler: type) type {
             }
 
             // Finished its handshake after drain() began: it may send nothing.
-            if (self.draining) if (entry.h3_conn) |h3c| {
+            if (self.draining and self.drain_signals) if (entry.h3_conn) |h3c| {
                 h3c.sendGoaway(0) catch entry.conn.close(@backingInt(h3.H3Error.no_error), "server shutdown");
             };
         }
@@ -2423,6 +2481,7 @@ pub fn Server(comptime Handler: type) type {
                 }
 
                 const conn = entry.conn;
+                if (entry.drain_goaway_due != null) sendDrainGoaway(entry, pass_now_ns);
                 if (entry.h3_conn) |h| if (h.shutdown_state != .active) advanceDrain(entry, pass_now_ns);
                 if (self.wt_settings.close_after_sessions) if (entry.wt_conn) |wtc| wtc.closeIfUnused();
                 const batch = self.batchForConn(conn);
@@ -2511,7 +2570,8 @@ pub fn Server(comptime Handler: type) type {
                             earliest = deadline;
                         }
                     }
-                    if (entry.drain_final_goaway_at) |deadline| {
+                    for ([_]?i64{ entry.drain_goaway_due, entry.drain_final_goaway_at }) |d| {
+                        const deadline = d orelse continue;
                         if (earliest == null or deadline < earliest.?) earliest = deadline;
                     }
                 }
@@ -5331,7 +5391,7 @@ test "e2e: drain() lets an in-flight response finish and turns new requests away
     defer e2e.deinit();
 
     try runUntil(&e2e.loop, &server_handler, DrippingServer.inFlight, 10_000);
-    e2e.server.drain();
+    e2e.server.drain(.{});
     try testing.expect(!e2e.server.isDrained());
 
     try runUntil(&e2e.loop, &e2e, drainSettled, 10_000);
@@ -6548,12 +6608,17 @@ test "e2e: drain() refuses newcomers, sends GOAWAY and WT_DRAIN_SESSION, and clo
     try runUntil(&e2e.loop, &ch, WtDrainClient.ready, 10_000);
     const sid = ch.session_id.?;
 
-    e2e.server.drain();
+    e2e.server.drain(.{});
     try runUntilCount(&e2e.loop, &ch.drainings, 1, 3000);
-    try runFor(&e2e.loop, 100);
-    // Both signals reached the client, which reports the drain once.
+    // Both signals reach the client, which reports the drain once. The
+    // GOAWAY waits for the capsule's ack.
     const wsess = e2e.client.wt_conn.?.getSession(sid).?;
-    try testing.expect(wsess.drain_by_goaway and wsess.drain_by_capsule);
+    try runUntil(&e2e.loop, wsess, struct {
+        fn f(w: *const wt.Session) bool {
+            return w.drain_by_goaway;
+        }
+    }.f, 3000);
+    try testing.expect(wsess.drain_by_capsule);
     try testing.expectEqual(@as(u32, 1), ch.drainings);
 
     // RFC 9000 §5.2.2: a newcomer's Initial is answered with CONNECTION_REFUSED.
@@ -6586,6 +6651,49 @@ test "e2e: drain() refuses newcomers, sends GOAWAY and WT_DRAIN_SESSION, and clo
     try testing.expectEqual(@as(u32, 1), ch.closed);
 }
 
+test "e2e: drain() that signals no peer still refuses newcomers, and is drained once the sessions are over" {
+    var ch = WtDrainClient{};
+    var sh = WtShutdownServer{};
+    var e2e: E2e(WtShutdownServer, WtDrainClient) = undefined;
+    try e2e.init(29541, &sh, &ch);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &ch, WtDrainClient.ready, 10_000);
+    const sid = ch.session_id.?;
+
+    e2e.server.drain(.{ .signal_peers = false });
+    try runFor(&e2e.loop, 200);
+    try testing.expectEqual(@as(u32, 0), ch.drainings);
+    try testing.expectEqual(@as(?u64, null), e2e.client.h3_conn.?.peer_goaway_id);
+    const wsess = e2e.client.wt_conn.?.getSession(sid).?;
+    try testing.expect(!wsess.drain_by_capsule and !wsess.drain_by_goaway);
+
+    var lh = WtDrainClient{};
+    var late = try Client(WtDrainClient).init(testing.allocator, &lh, .{ .port = 29541, .skip_cert_verify = true, .loop = &e2e.loop });
+    late.start();
+    try runUntil(&e2e.loop, &late, refusedOrUp, 5000);
+    try testing.expectEqual(@as(u64, @backingInt(@import("quic/frame.zig").TransportError.connection_refused)), late.conn.local_err.?.code);
+    late.stop();
+    try runUntil(&e2e.loop, &late, struct {
+        fn f(c: *Client(WtDrainClient)) bool {
+            return c.isStopped();
+        }
+    }.f, 5000);
+    late.deinit();
+
+    // The application tells its client itself, then ends the session; the
+    // connection goes with it, by wt_close_after_sessions.
+    var cs = e2e.client.clientSession();
+    try cs.sendDatagram(sid, "ping");
+    try runUntilCount(&e2e.loop, &ch.echoes, 1, 3000);
+    try testing.expect(!e2e.server.isDrained());
+    var ss = sh.session.?;
+    try ss.closeSessionWithError(sh.session_id, 4002, "server shutdown");
+    const began = sys.nanoTimestamp();
+    try runUntil(&e2e.loop, &e2e.server, serverDrained, 3000);
+    try testing.expect(sys.nanoTimestamp() - began < std.time.ns_per_s);
+    try testing.expectEqual(@as(u32, 1), ch.closed);
+}
+
 test "e2e: drainConnection drains one connection, and the server still takes new ones" {
     var ch = WtDrainClient{};
     var sh = WtShutdownServer{};
@@ -6596,8 +6704,15 @@ test "e2e: drainConnection drains one connection, and the server still takes new
     var ss = sh.session.?;
     ss.drainConnection();
     try runUntilCount(&e2e.loop, &ch.drainings, 1, 3000);
+    // The GOAWAY waits for the capsule's ack: one drain report for both.
     const wsess = e2e.client.wt_conn.?.getSession(ch.session_id.?).?;
-    try testing.expect(wsess.drain_by_goaway and wsess.drain_by_capsule);
+    try runUntil(&e2e.loop, wsess, struct {
+        fn f(w: *const wt.Session) bool {
+            return w.drain_by_goaway;
+        }
+    }.f, 3000);
+    try testing.expect(wsess.drain_by_capsule);
+    try testing.expectEqual(@as(u32, 1), ch.drainings);
 
     var lh = WtDrainClient{};
     var late = try Client(WtDrainClient).init(testing.allocator, &lh, .{ .port = 29534, .skip_cert_verify = true, .loop = &e2e.loop });
@@ -6643,7 +6758,7 @@ const ShutdownOnPass = struct {
                 self.stopped_in_pass = true;
             },
             .drain_then_stop => if (!self.drained) {
-                server.drain();
+                server.drain(.{});
                 self.drained = true;
             } else if (server.isDrained()) {
                 self.plan = .none;

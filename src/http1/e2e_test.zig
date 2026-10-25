@@ -711,7 +711,7 @@ test "ws: drain() refuses new connections and leaves an open WebSocket working u
     defer c.deinit();
     try h.upgrade(&c, "/", false);
 
-    h.server.drain();
+    h.server.drain(.{});
     try h.spinUntil(&h, listenerClosed);
     // Refused by the kernel, rather than accepted only to be closed.
     var late: TestClient = .{};

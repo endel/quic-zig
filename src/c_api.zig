@@ -467,7 +467,7 @@ export fn qz_server_flush(handle: ?*anyopaque) void {
 /// `qz_server_stop`. See `Server.drain`.
 export fn qz_server_drain(handle: ?*anyopaque) void {
     const ws = getWtServer(handle) orelse return;
-    ws.server.drain();
+    ws.server.drain(.{});
 }
 
 /// 1 once `qz_server_drain` has left nothing in flight, else 0.

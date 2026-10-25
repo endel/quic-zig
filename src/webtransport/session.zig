@@ -107,6 +107,8 @@ pub const Session = struct {
     drain_by_capsule: bool = false,
     drain_by_goaway: bool = false,
     drain_reported: bool = false,
+    /// We sent WT_DRAIN_SESSION: once is all §4.7 asks.
+    drain_sent: bool = false,
     /// draft-13 §5.3-§5.6 session flow control, sized by `allocateSession`
     /// from the connection's grant. An unallocated slot grants nothing.
     fc: fc_mod.SessionFlowControl = fc_mod.SessionFlowControl.init(.{}),
@@ -784,7 +786,8 @@ pub const WebTransportConnection = struct {
     /// but should begin winding down.
     pub fn drainSession(self: *WebTransportConnection, session_id: u64) !void {
         const session = self.getSession(session_id) orelse return;
-        if (session.state != .active) return;
+        if (session.state != .active or session.drain_sent) return;
+        session.drain_sent = true;
 
         var frame_buf: [16]u8 = undefined;
         var fbs = io.fixedBufferStream(&frame_buf);
