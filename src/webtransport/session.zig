@@ -102,6 +102,11 @@ pub const Session = struct {
     close_reason: []u8 = &.{},
     /// Bytes still to discard from an over-long capsule; see MAX_CAPSULE_PAYLOAD.
     capsule_skip: u64 = 0,
+    /// The peer asked for a drain (§4.7): by WT_DRAIN_SESSION, by GOAWAY,
+    /// and whether `session_draining` has said so, once whichever came.
+    drain_by_capsule: bool = false,
+    drain_by_goaway: bool = false,
+    drain_reported: bool = false,
     /// draft-13 §5.3-§5.6 session flow control, sized by `allocateSession`
     /// from the connection's grant. An unallocated slot grants nothing.
     fc: fc_mod.SessionFlowControl = fc_mod.SessionFlowControl.init(.{}),
@@ -423,6 +428,8 @@ pub const WebTransportConnection = struct {
         if (!self.is_server or s.state != .connecting) return error.SessionNotPending;
         try self.h3.sendConnectResponseWithHeaders(session_id, "200", extra_headers);
         s.state = .active;
+        // Accepted after our GOAWAY: it drains like the rest.
+        if (self.h3.shutdown_state != .active) self.drainSession(session_id) catch {};
     }
 
     /// Server: refuse a session the peer asked for, one not yet accepted,
@@ -1100,6 +1107,7 @@ pub const WebTransportConnection = struct {
 
         // 1. Check CONNECT streams for capsules
         if (self.pollSessionStreams()) |event| return event;
+        if (self.pendingDrain()) |event| return event;
 
         // 2. Check for incoming WT datagrams
         if (self.pollDatagrams()) |event| return event;
@@ -1348,6 +1356,22 @@ pub const WebTransportConnection = struct {
         if (s.recv.reset_err == null and !s.recv.allReceived()) s.recv.stopSending(h3_code);
     }
 
+    fn drainEvent(_: *WebTransportConnection, session: *Session) ?WtEvent {
+        if (!(session.drain_by_capsule or session.drain_by_goaway)) return null;
+        if (session.drain_reported or session.state != .active) return null;
+        session.drain_reported = true;
+        return .{ .session_draining = .{ .session_id = session.session_id } };
+    }
+
+    /// The next session a GOAWAY drained that has not heard so yet.
+    fn pendingDrain(self: *WebTransportConnection) ?WtEvent {
+        for (&self.sessions) |*session| {
+            if (!session.occupied) continue;
+            if (self.drainEvent(session)) |ev| return ev;
+        }
+        return null;
+    }
+
     /// Act on one capsule from a session's CONNECT stream.
     fn handleCapsule(self: *WebTransportConnection, session: *Session, frame: h3_frame.H3Frame) ?WtEvent {
         // §5.1: capsules that arrive while flow control is not in force MUST be
@@ -1376,10 +1400,8 @@ pub const WebTransportConnection = struct {
                 return closedEvent(session, false);
             },
             .drain_webtransport_session => {
-                // Graceful shutdown signal from peer
-                if (session.state == .active) {
-                    return .{ .session_draining = .{ .session_id = session.session_id } };
-                }
+                session.drain_by_capsule = true;
+                return self.drainEvent(session);
             },
             .wt_max_streams_bidi => |n| if (fc_live) session.fc.bidi.raiseSendLimit(n),
             .wt_max_streams_uni => |n| if (fc_live) session.fc.uni.raiseSendLimit(n),
@@ -1994,16 +2016,12 @@ pub const WebTransportConnection = struct {
                 }
             },
             .goaway => {
-                // H3 GOAWAY signals shutdown — drain all active WT sessions.
-                // New session creation will be blocked by H3 layer (GOAWAY stream ID).
-                // Signal draining on the first active session found.
+                // §4.7: GOAWAY drains every session on the connection; H3
+                // keeps new CONNECTs from going out past it.
                 for (&self.sessions) |*session| {
-                    if (session.occupied and session.state == .active) {
-                        return .{ .session_draining = .{
-                            .session_id = session.session_id,
-                        } };
-                    }
+                    if (session.occupied) session.drain_by_goaway = true;
                 }
+                if (self.pendingDrain()) |ev| return ev;
             },
             .shutdown_complete => {},
             .request_cancelled => |rc| {
@@ -3251,6 +3269,46 @@ test "WT: an open request or another session keeps the connection" {
     try ackEverything(&setup.quic_conn);
     setup.wt.closeIfUnused();
     try testing.expect(setup.quic_conn.isEstablished());
+}
+
+test "WT: a session accepted after our GOAWAY is drained at once" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+    try injectConnect(&setup, 4);
+    try setup.h3.initiateShutdown();
+
+    try setup.wt.acceptSession(4);
+    const written = setup.quic_conn.streams.getStream(4).?.send.write_buffer.items;
+    const response = try h3_frame.parse(written);
+    const capsule = try h3_frame.parse(try expectCapsulePayload(written[response.consumed..]));
+    try testing.expect(capsule.frame == .drain_webtransport_session);
+}
+
+test "WT: a drain asked by GOAWAY and by capsule is reported once per session" {
+    var setup: WtTestSetup = undefined;
+    const first = try setup.initClient();
+    defer setup.deinit();
+    const second = try setup.wt.connect("example.com", "/wt");
+    var resp: [64]u8 = undefined;
+    _ = try peerSends(&setup, second, resp[0..buildConnectResponse(&resp)], false);
+    _ = try pollFor(&setup.wt, .session_ready);
+
+    var buf: [64]u8 = undefined;
+    _ = try peerSends(&setup, first, wrapCapsule(&buf, .{ .drain_webtransport_session = {} }), false);
+    var goaway: [16]u8 = undefined;
+    var fbs = io.fixedBufferStream(&goaway);
+    try h3_frame.write(.{ .goaway = 8 }, &fbs);
+    const ctrl = setup.quic_conn.streams.recv_streams.get(3).?;
+    try ctrl.handleStreamFrame(ctrl.sorter.highestReceived(), fbs.buffered(), false);
+
+    var events: [8]WtEvent = undefined;
+    const got = try drainEvents(&setup.wt, &events);
+    var seen = [_]u32{ 0, 0 };
+    for (got) |ev| if (ev == .session_draining) {
+        seen[if (ev.session_draining.session_id == first) 0 else 1] += 1;
+    };
+    try testing.expectEqual([_]u32{ 1, 1 }, seen);
 }
 
 test "WT: unknown and malformed capsules reset nothing while our close waits for the peer's FIN" {
