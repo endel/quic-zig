@@ -202,26 +202,38 @@ Two-phase GOAWAY per the spec:
   `request_cancelled` event even when no response byte arrived; the
   client event loop hands it to an optional `onRequestCancelled`.
 
-### Server-wide drain (`event_loop.Server.drain()`)
+### Server-wide drain (`event_loop.Server.drain(options)`)
 
-What a server does on SIGTERM. `drain()`:
+What a server does on SIGTERM, the first of two steps, closing nothing in use.
+`drain()`:
 
 1. Sets `ConnectionManager.refuse_new`, so every new connection is answered
-   with CONNECTION_REFUSED in an Initial.
-2. Sends phase-1 GOAWAY on every H3 connection and DRAIN_WEBTRANSPORT_SESSION
-   on every active WebTransport session. Raw-QUIC and HTTP/0.9 connections,
-   which have no graceful signal, are closed at once. A connection still
-   handshaking gets GOAWAY(0) as soon as H3 is set up.
-3. One PTO later per connection (`ConnEntry.drain_final_goaway_at`, on the
-   server's timer), sends phase 2: `completeShutdown()`.
+   with CONNECTION_REFUSED in an Initial (RFC 9000 §5.2.2), and closes the
+   HTTP/1.1 listener's socket, so new TCP connections are refused by the
+   kernel or go to a `reuse_port` sibling.
+2. Sends DRAIN_WEBTRANSPORT_SESSION on every active WebTransport session at
+   once, and phase-1 GOAWAY on every H3 connection once the peer has acked
+   what its CONNECT streams carry, or 3 PTO on
+   (`ConnEntry.drain_goaway_due`): a GOAWAY right behind the 200 that accepts
+   a session crashed Firefox 158 in 5 runs of 6. A connection still
+   handshaking gets GOAWAY(0) as soon as H3 is set up. Raw-QUIC and HTTP/0.9
+   connections have no graceful signal and are left to the handler.
+   `DrainOptions.signal_peers = false` skips this step; see
+   [DRAFT_IETF_WEBTRANS_HTTP3_13.md](DRAFT_IETF_WEBTRANS_HTTP3_13.md#graceful-shutdown)
+   for what each signal costs which browser.
+3. One PTO later per connection (`ConnEntry.drain_final_goaway_at`, in the
+   entry's deadline), sends phase 2: `completeShutdown()`.
 4. Closes each connection with H3_NO_ERROR once `isDrainComplete()` holds,
    no request stream has unacked data, and every rejection's RESET_STREAM
    has been queued — closing sooner would drop the tail of a response.
 
-`isDrained()` is true once every connection is closing or closed; the caller
-waits on it against its own deadline and then calls `stop()`, which is also
-the fallback when the deadline passes first. WebTransport sessions keep their
-connection open until the handler or the peer closes them.
+`isDrained()` is true once every connection is closing or closed and no
+HTTP/1.1 request or WebSocket is open; the caller waits on it against its own
+deadline, from `onPass` if it likes, and then calls `stop()`, which is also the
+fallback when the deadline passes first. WebTransport sessions keep their
+connection open until the handler or the peer closes them, and the connection
+then closes as `Config.wt_close_after_sessions` says. `Session.drainConnection`
+runs steps 2-4 for one connection.
 
 ## Request-body backpressure
 
