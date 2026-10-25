@@ -9,8 +9,10 @@
     "handlers in web-platform-tests/wpt/webtransport/handlers.",
     "",
     "runners lists who can run it: a browser is left out when the API the",
-    "scenario needs does not exist there. expect_fail records a known failure",
-    "with its reason, so a red cell is a tracked cell rather than a surprise."
+    "scenario needs does not exist there. Where only some versions have it, the",
+    "body reports n/a on the others instead of passing on nothing.",
+    "expect_fail records a known failure with its reason, so a red cell is a",
+    "tracked cell rather than a surprise."
   ],
   "scenarios": [
     {
@@ -32,11 +34,12 @@
     },
     {
       "id": "client-close-code",
-      "handler": "echo.py",
+      "handler": "client-close.py",
       "title": "client close carries code and reason to the server",
       "exercises": [
         "close(WebTransportCloseInfo)",
-        "closed"
+        "closed",
+        "the server's record of the close, read back through query.py"
       ],
       "runners": [
         "zig",
@@ -191,7 +194,7 @@
         "safari"
       ],
       "expect_fail": {
-        "firefox": "Firefox 148 surfaces only 2 of the 5; Chrome and the Zig client receive all five from the same server, and the peer granted max_uni=100, so this is not stream credit."
+        "firefox": "Firefox 148-152 surface only 2 of the 5 (bug 2046262: the incoming-streams ReadableStream stops pulling while one is queued), fixed in 153. Kept for the harness's pinned Firefox 148; 158 passes."
       }
     },
     {
@@ -294,10 +297,12 @@
       ],
       "runners": [
         "zig",
+        "chrome",
         "firefox",
         "safari"
       ],
       "expect_fail": {
+        "firefox": "Firefox 155+ has `draining`, but neqo knows no WT_DRAIN_SESSION and drops it as an unknown capsule: it resolves only on GOAWAY, and 158.0.1 times out here. 148-154 have no attribute and report n/a.",
         "safari-preview": "Safari Technology Preview 27.0 never resolves `WebTransport.draining` on a WT_DRAIN_SESSION capsule: the scenario times out in both clean runs of three, where release 26.4 passes it in all three against the same server. Preview's own regression, alongside the server-connection-close one."
       }
     },
@@ -316,7 +321,7 @@
         "safari"
       ],
       "expect_fail": {
-        "firefox": "WebTransport.protocol lands in Firefox 155; 148 leaves it undefined."
+        "firefox": "WebTransport.protocol lands in Firefox 155; 148 leaves it undefined. Kept for the harness's pinned Firefox 148; 158 passes."
       }
     }
   ]

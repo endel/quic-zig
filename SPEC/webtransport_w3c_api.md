@@ -8,7 +8,9 @@ same Zig server — which is what `SPEC/webtransport_conformance.md` does.
 This document is the gap analysis: what browsers actually expose, what our
 client has, and which of the differences are worth closing.
 
-Browser support is from [MDN's compat data][bcd], checked September 2026.
+Browser support is from [MDN's compat data][bcd], checked September 2026, and
+corrected in October 2026 against the browsers' source where BCD lags (it still
+lists Firefox's `getStats` as throwing and Chrome without `draining`).
 
 [bcd]: https://github.com/mdn/browser-compat-data/blob/main/api/WebTransport.json
 
@@ -43,8 +45,13 @@ Three of those were missing and are now implemented.
 A browser's `writer.write()` never refuses: it queues, `desiredSize` goes
 negative, and `ready` stays pending until there is room. `sendStreamData`
 queued the same way but offered neither of the other two, so a Zig server
-writing to a peer that stopped granting MAX_DATA grew its send buffers without
-limit. Safari is that peer (WebKit bug 319818).
+writing to a peer that stopped granting credit grew its send buffers without
+limit. Safari is that peer: [WebKit bug 319818][wk319818] covers both QUIC
+credits, MAX_STREAMS (uni, which stops after about 98 server-opened streams)
+and MAX_DATA (never raised past the initial 16 MiB), and shows only when the
+server opens many streams. One long-lived stream is not affected.
+
+[wk319818]: https://bugs.webkit.org/show_bug.cgi?id=319818
 
 `streamSendCapacity(stream_id)` is `desiredSize`, measured against the peer's
 credit rather than a local high-water mark. `notifyWritable(session_id,
@@ -88,7 +95,7 @@ Firefox and Safari have these; Chrome does not.
 
 | W3C member | quic-zig | verdict |
 |---|---|---|
-| `draining` | `onSessionDraining`; server-side `Session.drainSession` **added** | done |
+| `draining` | `onSessionDraining`; server-side `Session.drainSession` **added** | done. Chrome has it from 158. Firefox resolves it only on GOAWAY, not on `WT_DRAIN_SESSION` (conformance `server-drain`) |
 | `sendOrder` | `openBidiStream(…, send_order)`, `setSendOrder` | already had it |
 | `createSendGroup()` / `sendGroup` | — | **skip**: grouping is a local scheduling hint with no wire form, and nothing downstream of us asks for one |
 | `congestionControl` | — | **skip**: a hint, and we already choose our own controller |
@@ -104,11 +111,19 @@ fixed, and the `server-drain` scenario now covers it.
 
 | W3C member | engine | quic-zig | verdict |
 |---|---|---|---|
-| `getStats()` | Safari only (Firefox throws) | `getStats`, `getSendStreamStats`, `getRecvStreamStats` | we are ahead |
+| `getStats()` | Firefox 158+ with real values; Safari 26.4–27.0 resolves all zeros; Chrome behind a flag (target 159). Firefox 157 and older throw | `getStats`, `getSendStreamStats`, `getRecvStreamStats` | we are ahead |
 | `responseHeaders` | Safari preview | the 4-arity `onSessionReady` receives them | we are ahead |
 | `exportKeyingMaterial()` | Firefox only | — | **skip** until a second engine wants it |
-| `anticipatedConcurrentIncoming*` | Safari only | — | **skip**: a pre-allocation hint |
+| `anticipatedConcurrentIncoming*` | Safari 26.4+ (no floor of 100); Chrome 158, which can only raise the limit above 100. Not in Firefox | — | **skip**: a pre-allocation hint |
 | `supportsReliableOnly` | Safari only | — | not applicable to a native client |
+
+Sources for the October corrections, read from each engine's code:
+`getStats` is real in Firefox 158 (bug 2007202), a `// FIXME: Implement`
+returning zeros in WebKit's `NetworkTransportSessionCocoa.mm` up to 27.0, and
+behind the experimental `WebTransportStats` flag in Chrome.
+`anticipatedConcurrentIncoming*` is a stable flag on Chromium trunk (158),
+which sets the initial MAX_STREAMS to max(100, value); WebKit passes it
+straight to Network.framework; Firefox's WebIDL has no such option.
 
 ## The protocol-level gap: draft-13 §5, since closed
 

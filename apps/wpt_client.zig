@@ -112,6 +112,9 @@ const Runner = struct {
     expected_datagram_len: usize = 0,
     /// client-abort-stream resets once, after the header lands.
     reset_sent: bool = false,
+    /// client-close-code's second connection, to query.py: what the server
+    /// recorded of the close the first one sent.
+    readback: bool = false,
 
     fn init(alloc: std.mem.Allocator, scenario: Scenario) Runner {
         return .{
@@ -186,6 +189,7 @@ const Runner = struct {
     ) void {
         self.session_id = session_id;
         self.ready = true;
+        if (self.readback) return; // the server writes first
 
         if (wt_protocol.findHeader(headers, wt_protocol.HEADER_SELECTED)) |raw| {
             var scratch: [64]u8 = undefined;
@@ -371,6 +375,7 @@ const Runner = struct {
         self.closed_code = error_code;
         self.closed_reason.clearRetainingCapacity();
         self.closed_reason.appendSlice(self.alloc, reason) catch {};
+        if (self.readback) return self.fail("query session closed (code={d})", .{error_code});
 
         switch (self.scenario) {
             .connect_echo => self.pass("ok", .{}),
@@ -384,6 +389,20 @@ const Runner = struct {
 
     pub fn onSessionRejected(self: *Runner, _: *event_loop.ClientSession, _: u64, status: []const u8) void {
         self.fail("CONNECT rejected with status {s}", .{status});
+    }
+
+    /// What client-close.py stashed of our close, as query.py hands it back.
+    fn expectStash(self: *Runner, json: []const u8, want_code: u32, want_reason: []const u8) void {
+        const Stash = struct { close_code: u32, close_reason: []const u8, abruptly: bool };
+        const parsed = std.json.parseFromSlice(Stash, self.alloc, json, .{ .ignore_unknown_fields = true }) catch
+            return self.fail("server recorded no close: {s}", .{json});
+        defer parsed.deinit();
+        const got = parsed.value;
+        if (got.abruptly) return self.fail("server saw an abrupt close", .{});
+        if (got.close_code != want_code or !std.mem.eql(u8, got.close_reason, want_reason)) {
+            return self.fail("server saw code={d} reason=\"{s}\"", .{ got.close_code, got.close_reason });
+        }
+        self.pass("ok (server saw {d} \"{s}\")", .{ got.close_code, got.close_reason });
     }
 
     fn expectCloseInfo(self: *Runner, want_code: u32, want_reason: []const u8) void {
@@ -428,6 +447,10 @@ const Runner = struct {
     fn evaluate(self: *Runner) void {
         if (self.outcome != null) return;
         switch (self.scenario) {
+            .client_close_code => if (self.readback) {
+                if (self.uni_done.items.len == 0) return;
+                self.expectStash(self.uni_done.items[0], 7, "done");
+            },
             .bidi_echo_small => {
                 const id = self.firstOpened() orelse return;
                 if (!self.finished.contains(id)) return;
@@ -595,8 +618,15 @@ fn runScenario(
     var id_buf: [64]u8 = undefined;
     const id = scenario.idOf(&id_buf);
 
+    // The server keeps what it stashes for as long as it runs: a fresh token
+    // keeps an earlier run's close from answering for this one.
+    var token_buf: [32]u8 = undefined;
+    const token = try std.fmt.bufPrint(&token_buf, "zig-{d}", .{sys.nanoTimestamp()});
     var path_buf: [160]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/webtransport/handlers/{s}", .{handlerFor(scenario)});
+    const path = if (scenario == .client_close_code)
+        try std.fmt.bufPrint(&path_buf, "/webtransport/handlers/{s}?token={s}", .{ handlerFor(scenario), token })
+    else
+        try std.fmt.bufPrint(&path_buf, "/webtransport/handlers/{s}", .{handlerFor(scenario)});
 
     var offer_buf: [128]u8 = undefined;
     const offered = [_][]const u8{ "nonesuch", "echo" };
@@ -607,12 +637,48 @@ fn runScenario(
 
     var runner = Runner.init(alloc, scenario);
     defer runner.deinit();
+    try drive(alloc, &runner, port, path, pins, if (scenario == .wt_protocol_negotiation) &connect_headers else &.{}, timeout_ms);
 
-    var client = try event_loop.Client(Runner).init(alloc, &runner, .{
+    // Our own close resolving says nothing of whether the capsule reached the
+    // server (Safari's does not); ask the server what it recorded.
+    var readback = Runner.init(alloc, scenario);
+    defer readback.deinit();
+    readback.readback = true;
+    const passed = if (runner.outcome) |o| o == .pass else false;
+    const last = if (scenario == .client_close_code and passed) blk: {
+        var query_buf: [160]u8 = undefined;
+        const query = try std.fmt.bufPrint(&query_buf, "/webtransport/handlers/query.py?token={s}", .{token});
+        try drive(alloc, &readback, port, query, pins, &.{}, timeout_ms);
+        break :blk &readback;
+    } else &runner;
+
+    const detail = if (last.outcome == null)
+        try alloc.print("timeout ({d}ms)", .{timeout_ms})
+    else
+        try alloc.dupe(u8, last.detail.items);
+
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .passed = if (last.outcome) |o| o == .pass else false,
+        .detail = detail,
+    };
+}
+
+/// Run one connection to `path` until `runner` has an outcome or time is up.
+fn drive(
+    alloc: std.mem.Allocator,
+    runner: *Runner,
+    port: u16,
+    path: []const u8,
+    pins: []const [32]u8,
+    connect_headers: []const qpack.Header,
+    timeout_ms: i64,
+) !void {
+    var client = try event_loop.Client(Runner).init(alloc, runner, .{
         .port = port,
         .path = path,
         .ca = .{ .pinned_hashes = pins },
-        .connect_headers = if (scenario == .wt_protocol_negotiation) &connect_headers else &.{},
+        .connect_headers = connect_headers,
     });
     defer client.deinit();
 
@@ -623,7 +689,7 @@ fn runScenario(
         if (client.conn.isClosed()) {
             // An abrupt QUIC close is the whole point of one scenario and a
             // failure everywhere else.
-            if (scenario == .server_connection_close) {
+            if (runner.scenario == .server_connection_close) {
                 runner.pass("ok: connection closed", .{});
             } else {
                 runner.fail("connection closed before the scenario finished", .{});
@@ -631,23 +697,12 @@ fn runScenario(
             break;
         }
     }
-
-    const detail = if (runner.outcome == null)
-        try alloc.print("timeout ({d}ms)", .{timeout_ms})
-    else
-        try alloc.dupe(u8, runner.detail.items);
-
-    return .{
-        .id = try alloc.dupe(u8, id),
-        .passed = runner.outcome != null and runner.outcome.? == .pass,
-        .detail = detail,
-    };
 }
 
 fn handlerFor(scenario: Scenario) []const u8 {
     return switch (scenario) {
+        .client_close_code => "client-close.py",
         .connect_echo,
-        .client_close_code,
         .bidi_echo_small,
         .bidi_echo_3_streams,
         .bidi_echo_64kb,

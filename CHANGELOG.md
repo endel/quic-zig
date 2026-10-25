@@ -101,6 +101,10 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   longer holds them back. Off by default.
 - `WsConn.rtt()`: the kernel's smoothed round trip for a WebSocket's TCP
   connection, in nanoseconds (Linux and macOS).
+- `onSessionClosed` may take a sixth parameter, `abrupt` (and
+  `WtEvent.session_closed` has the field): true when the peer reset or stopped
+  the session's CONNECT stream, or sent it a malformed capsule, instead of
+  closing it. That is when a browser rejects `closed` rather than resolving it.
 
 ### Changed
 
@@ -162,6 +166,19 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A WebTransport session whose peer finished, reset or stopped the CONNECT
+  stream without a close capsule stayed open until the connection ended. A
+  bare FIN now closes it with code 0, answered with our own FIN, and a reset
+  or STOP_SENDING closes it as `abrupt`.
+- A client whose CONNECT the server reset without answering, as a quic-zig
+  server does past its session slots, now gets `onSessionRejected` with an
+  empty status instead of waiting out its idle timeout.
+- Close reasons over 1024 bytes are now cut at a UTF-8 character boundary;
+  cut mid-character, Firefox failed the session rather than report its code.
+- Unknown capsule types on a CONNECT stream are ignored, as RFC 9297 asks;
+  after our own close they reset the stream, which could cost the peer our
+  close code. A malformed capsule, or a peer's close reason over 1024 bytes or
+  not UTF-8, now ends the session with H3_MESSAGE_ERROR.
 - A WebTransport server's `closeSession` on a session it hadn't accepted made
   the client close the whole connection, ending its other sessions too. It now
   refuses the session with 403.

@@ -151,7 +151,9 @@ Server lifecycle callbacks, all optional: `onRequest`, `onData`,
 `onRequestCancelled(session, stream_id, error_code)` (peer RESET_STREAM or
 STOP_SENDING), and `onConnectionClosed(session)` — called once per connection,
 after which its `Session`/`ConnEntry` must not be used. `session.id()` is a
-stable per-connection key.
+stable per-connection key. Just before it, `onSessionClosed(session, 0, 0, "")`
+fires too (`abrupt` true in the 6-parameter form), whatever the connection's
+sessions did.
 
 Request headers, and a CONNECT's path, are valid only during their callback:
 every connection on a loop decodes into one buffer, so copy what you keep.
@@ -378,7 +380,7 @@ Handler callbacks (all optional):
 |---|---|
 | `onConnected(session)` | QUIC handshake complete |
 | `onSessionReady(session, session_id)` | WebTransport session established |
-| `onSessionRejected(session, session_id, status)` | Server rejected CONNECT |
+| `onSessionRejected(session, session_id, status)` | Server rejected CONNECT. `status` is empty when it reset the CONNECT stream instead of answering |
 | `onStreamData(session, stream_id, data[, fin])` | Data received on a stream |
 | `onDatagram(session, session_id, data)` | Datagram received |
 | `onBidiStream(session, session_id, stream_id)` | Incoming bidi stream opened |
@@ -386,7 +388,7 @@ Handler callbacks (all optional):
 | `onStreamReset(session, session_id, stream_id, error_code)` | Peer reset a stream — the `WebTransportError.streamErrorCode` equivalent |
 | `onStopSending(session, session_id, stream_id, error_code)` | Peer asked us to stop sending on a stream |
 | `onWritable(session, session_id, stream_id)` | The peer's credit now fits what `notifyWritable` asked for — the `writer.ready` equivalent. `stream_id` is null for a session-wide wait |
-| `onSessionClosed(session, session_id, error_code, reason)` | Session closed |
+| `onSessionClosed(session, session_id, error_code, reason[, abrupt])` | Session closed: the code and reason of a close capsule (ours or the peer's), or 0 and `""` for a bare FIN on the CONNECT stream. `abrupt` is true when the peer reset or stopped that stream instead, or sent a malformed capsule — what makes a browser reject `closed` |
 | `onSessionDraining(session, session_id)` | Session draining |
 | `onPollComplete(session)` | Called each poll cycle |
 

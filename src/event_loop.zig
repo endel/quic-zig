@@ -831,6 +831,13 @@ pub fn Server(comptime Handler: type) type {
                     "or 5 params (self, session, stream_id, data, fin)");
             }
         }
+        if (@hasDecl(Handler, "onSessionClosed")) {
+            const n = @typeInfo(@TypeOf(Handler.onSessionClosed)).@"fn".param_types.len;
+            if (n != 5 and n != 6) {
+                @compileError("onSessionClosed must have 5 params (self, session, session_id, error_code, reason) " ++
+                    "or 6 params (self, session, session_id, error_code, reason, abrupt)");
+            }
+        }
 
         if ((@hasDecl(Handler, "onWsMessage") or @hasDecl(Handler, "onWsClose") or @hasDecl(Handler, "onWsHandover")) and !@hasDecl(Handler, "onWsUpgrade")) {
             @compileError("onWsMessage, onWsClose and onWsHandover need onWsUpgrade, which accepts the WebSockets they serve");
@@ -2026,9 +2033,7 @@ pub fn Server(comptime Handler: type) type {
                         }
                     },
                     .session_closed => |cls| {
-                        if (@hasDecl(Handler, "onSessionClosed")) {
-                            self.handler.onSessionClosed(&session, cls.session_id, cls.error_code, cls.reason);
-                        }
+                        self.dispatchSessionClosed(&session, cls.session_id, cls.error_code, cls.reason, cls.abrupt);
                     },
                     .session_draining => |sd| {
                         if (@hasDecl(Handler, "onSessionDraining")) {
@@ -2128,6 +2133,17 @@ pub fn Server(comptime Handler: type) type {
                 self.handler.onSessionReady(session, session_id, headers);
             } else {
                 self.handler.onSessionReady(session, session_id);
+            }
+        }
+
+        // The 6-arity form also learns whether the session ended abruptly.
+        fn dispatchSessionClosed(self: *Self, session: *Session, session_id: u64, code: u32, reason: []const u8, abrupt: bool) void {
+            if (!@hasDecl(Handler, "onSessionClosed")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionClosed)).@"fn".param_types.len == 6) {
+                self.handler.onSessionClosed(session, session_id, code, reason, abrupt);
+            } else {
+                self.handler.onSessionClosed(session, session_id, code, reason);
             }
         }
 
@@ -2334,9 +2350,7 @@ pub fn Server(comptime Handler: type) type {
                     // event because the entry is removed from the list before the
                     // WT layer can generate one.
                     var session = Session{ .entry = entry };
-                    if (@hasDecl(Handler, "onSessionClosed")) {
-                        self.handler.onSessionClosed(&session, 0, 0, "");
-                    }
+                    self.dispatchSessionClosed(&session, 0, 0, "", true);
                     if (@hasDecl(Handler, "onConnectionClosed")) {
                         self.handler.onConnectionClosed(&session);
                     }
@@ -2967,6 +2981,13 @@ pub fn Client(comptime Handler: type) type {
                     "or 5 params (self, session, stream_id, data, fin)");
             }
         }
+        if (@hasDecl(Handler, "onSessionClosed")) {
+            const n = @typeInfo(@TypeOf(Handler.onSessionClosed)).@"fn".param_types.len;
+            if (n != 5 and n != 6) {
+                @compileError("onSessionClosed must have 5 params (self, session, session_id, error_code, reason) " ++
+                    "or 6 params (self, session, session_id, error_code, reason, abrupt)");
+            }
+        }
     }
 
     return struct {
@@ -3582,9 +3603,7 @@ pub fn Client(comptime Handler: type) type {
                         }
                     },
                     .session_closed => |cls| {
-                        if (@hasDecl(Handler, "onSessionClosed")) {
-                            self.handler.onSessionClosed(&session, cls.session_id, cls.error_code, cls.reason);
-                        }
+                        self.dispatchSessionClosed(&session, cls.session_id, cls.error_code, cls.reason, cls.abrupt);
                     },
                     .session_draining => |drain| {
                         if (@hasDecl(Handler, "onSessionDraining")) {
@@ -3631,6 +3650,17 @@ pub fn Client(comptime Handler: type) type {
                 self.handler.onSessionReady(session, session_id, headers);
             } else {
                 self.handler.onSessionReady(session, session_id);
+            }
+        }
+
+        // The 6-arity form also learns whether the session ended abruptly.
+        fn dispatchSessionClosed(self: *Self, session: *ClientSession, session_id: u64, code: u32, reason: []const u8, abrupt: bool) void {
+            if (!@hasDecl(Handler, "onSessionClosed")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionClosed)).@"fn".param_types.len == 6) {
+                self.handler.onSessionClosed(session, session_id, code, reason, abrupt);
+            } else {
+                self.handler.onSessionClosed(session, session_id, code, reason);
             }
         }
 
@@ -6086,6 +6116,140 @@ test "e2e: WebTransport events arrive alone or on a pass that also wrote to the 
         try testing.expectEqual(@as(u32, 42), h.close_code);
 
         try testing.expectEqual(@as(u32, if (with_write) 5 else 0), h.datagrams);
+    }
+}
+
+/// How a session's close reached one side, through the 6-arity callback.
+const CloseSeen = struct {
+    count: u32 = 0,
+    code: u32 = 0,
+    reason_buf: [32]u8 = undefined,
+    reason_len: usize = 0,
+    abrupt: bool = false,
+
+    fn record(self: *CloseSeen, code: u32, why: []const u8, abrupt: bool) void {
+        self.count += 1;
+        self.code = code;
+        self.reason_len = @min(why.len, self.reason_buf.len);
+        @memcpy(self.reason_buf[0..self.reason_len], why[0..self.reason_len]);
+        self.abrupt = abrupt;
+    }
+
+    fn reason(self: *const CloseSeen) []const u8 {
+        return self.reason_buf[0..self.reason_len];
+    }
+};
+
+/// Keeps its one session, for a test to end it from outside a callback.
+const WtCloseServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    session: ?Session = null,
+    session_id: u64 = 0,
+    seen: CloseSeen = .{},
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.session = session.*;
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onSessionClosed(self: *@This(), _: *Session, session_id: u64, code: u32, reason: []const u8, abrupt: bool) void {
+        // The connection's own end reports session 0 as well; only the
+        // session's counts here.
+        if (session_id == self.session_id and self.seen.count == 0) self.seen.record(code, reason, abrupt);
+    }
+};
+
+const WtCloseClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    session_id: ?u64 = null,
+    seen: CloseSeen = .{},
+
+    pub fn onSessionReady(self: *@This(), _: *ClientSession, session_id: u64) void {
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    pub fn onSessionClosed(self: *@This(), _: *ClientSession, _: u64, code: u32, reason: []const u8, abrupt: bool) void {
+        self.seen.record(code, reason, abrupt);
+    }
+
+    fn ready(self: *@This()) bool {
+        return self.session_id != null;
+    }
+};
+
+/// How a test ends the session: from which side, and with what.
+const SessionEnd = enum { fin, reset, capsule };
+
+/// Ends an established session the way `how` says, from the client or the
+/// server, and runs until both sides have heard. Each side's view is returned.
+fn endSessionE2e(port: u16, from_client: bool, how: SessionEnd) !struct { server: CloseSeen, client: CloseSeen } {
+    var ch = WtCloseClient{};
+    var sh = WtCloseServer{};
+    var e2e: E2e(WtCloseServer, WtCloseClient) = undefined;
+    try e2e.init(port, &sh, &ch);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &ch, WtCloseClient.ready, 10_000);
+    try runFor(&e2e.loop, 50);
+    const sid = ch.session_id.?;
+    var cs = e2e.client.clientSession();
+    var ss = sh.session.?;
+    const cancelled = @backingInt(H3Error.request_cancelled);
+    switch (how) {
+        .fin => if (from_client) cs.closeQuicStream(sid) else ss.closeQuicStream(sid),
+        .reset => if (from_client) {
+            cs.conn.streams.getStream(sid).?.send.reset(cancelled);
+            cs.sendKeepAlive();
+        } else {
+            ss.entry.conn.streams.getStream(sid).?.send.reset(cancelled);
+            ss.sendKeepAlive();
+        },
+        .capsule => if (from_client)
+            try cs.closeSessionWithError(sid, 42, "bye")
+        else
+            try ss.closeSessionWithError(sid, 3999, "later"),
+    }
+    try runUntilCount(&e2e.loop, &sh.seen.count, 1, 3000);
+    try runUntilCount(&e2e.loop, &ch.seen.count, 1, 3000);
+    // The connection outlives the session: only it was closed.
+    try testing.expect(!e2e.client.conn.isClosed());
+    return .{ .server = sh.seen, .client = ch.seen };
+}
+
+test "e2e: a bare FIN on the CONNECT stream closes the session as code 0, from either side" {
+    for ([_]bool{ true, false }, [_]u16{ 29520, 29521 }) |from_client, port| {
+        const seen = try endSessionE2e(port, from_client, .fin);
+        // The other side answers with its own FIN, so both see a clean close.
+        for ([_]CloseSeen{ seen.server, seen.client }) |side| {
+            try testing.expectEqual(@as(u32, 0), side.code);
+            try testing.expectEqualStrings("", side.reason());
+            try testing.expect(!side.abrupt);
+        }
+    }
+}
+
+test "e2e: a RESET_STREAM of the CONNECT stream ends the session abruptly, from either side" {
+    for ([_]bool{ true, false }, [_]u16{ 29522, 29523 }) |from_client, port| {
+        const seen = try endSessionE2e(port, from_client, .reset);
+        for ([_]CloseSeen{ seen.server, seen.client }) |side| {
+            try testing.expectEqual(@as(u32, 0), side.code);
+            try testing.expect(side.abrupt);
+        }
+    }
+}
+
+test "e2e: a close capsule still carries its code and reason, from either side" {
+    for ([_]bool{ true, false }, [_]u16{ 29524, 29525 }) |from_client, port| {
+        const seen = try endSessionE2e(port, from_client, .capsule);
+        const want_code: u32 = if (from_client) 42 else 3999;
+        const want_reason = if (from_client) "bye" else "later";
+        // The closer's own view, once the peer's FIN is in, is its own close.
+        for ([_]CloseSeen{ seen.server, seen.client }) |side| {
+            try testing.expectEqual(want_code, side.code);
+            try testing.expectEqualStrings(want_reason, side.reason());
+            try testing.expect(!side.abrupt);
+        }
     }
 }
 
