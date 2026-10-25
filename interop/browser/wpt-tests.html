@@ -65,6 +65,7 @@
 
 <script type="module">
 import { BODIES } from '../conformance/bodies.mjs';
+import { expectFailFor } from '../conformance/expect.mjs';
 
 const TIMEOUT = 10000;
 let SCENARIOS = [];
@@ -85,6 +86,9 @@ function engine() {
   return 'chrome';
 }
 const ENGINE = engine();
+// The version its notes are keyed by, out of the same user agent.
+const VERSION = (navigator.userAgent.match(ENGINE === 'firefox' ? /Firefox\/([\d.]+)/ :
+  ENGINE === 'safari' ? /Version\/([\d.]+)/ : /Chrome\/([\d.]+)/) || [])[1] || null;
 
 async function loadScenarios() {
   const res = await fetch('../conformance/scenarios.json');
@@ -96,7 +100,7 @@ async function loadScenarios() {
     throw new Error('bodies.mjs has no implementation for: ' + missing.join(', '));
   }
   render();
-  log(`${SCENARIOS.length} scenarios for ${ENGINE}`);
+  log(`${SCENARIOS.length} scenarios for ${ENGINE} ${VERSION ?? '(version unknown)'}`);
 }
 
 function render() {
@@ -220,7 +224,7 @@ window.runAll = async function runAll() {
   document.getElementById('summary').style.display = 'block';
 
   for (const s of SCENARIOS) {
-    const expected = s.expect_fail?.[ENGINE] ?? null;
+    const expected = expectFailFor(s, ENGINE, VERSION);
     try {
       const detail = await runOne(s);
       if (expected) {

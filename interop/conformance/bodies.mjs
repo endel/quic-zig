@@ -322,6 +322,32 @@ export const BODIES = {
     return 'ok';
   `,
 
+  'server-goaway': `
+    // The server begins the graceful shutdown of this connection alone,
+    // GOAWAY and WT_DRAIN_SESSION both, as each browser heeds only one; a
+    // datagram asks for it once the session is up.
+    const wt = createWT(HANDLER);
+    await wt.ready;
+    if (!('draining' in wt)) {
+      wt.close();
+      throw notApplicable('no WebTransport.draining');
+    }
+    const s = await wt.createBidirectionalStream();
+    const dw = datagramWriter(wt);
+    await dw.write(new TextEncoder().encode('drain'));
+    dw.releaseLock();
+    await wt.draining;
+    // GOAWAY stops new sessions, not this one: a stream opened before it
+    // still carries both ways.
+    const w = s.writable.getWriter();
+    await w.write(new TextEncoder().encode('still here'));
+    await w.close();
+    const text = await readStreamText(s.readable);
+    if (text !== 'still here') throw new Error('got "' + text + '"');
+    wt.close();
+    return 'ok';
+  `,
+
   'wt-protocol-negotiation': `
     const wt = createWT(HANDLER, { protocols: ['nonesuch', 'echo'] });
     await wt.ready;

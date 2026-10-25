@@ -11,8 +11,11 @@
     "runners lists who can run it: a browser is left out when the API the",
     "scenario needs does not exist there. Where only some versions have it, the",
     "body reports n/a on the others instead of passing on nothing.",
-    "expect_fail records a known failure with its reason, so a red cell is a",
-    "tracked cell rather than a surprise."
+    "expect_fail records a known failure with its reason, per engine and per",
+    "version range, so a red cell is a tracked cell rather than a surprise, on",
+    "whichever version runs. `versions` is '*', 'N', '<N', '<=N', '>N', '>=N' or",
+    "'N-M' (inclusive), compared part by part: '26.4' and '27' both work.",
+    "Engines: chrome, firefox, safari, safari-preview, webkit (Playwright's)."
   ],
   "scenarios": [
     {
@@ -194,7 +197,12 @@
         "safari"
       ],
       "expect_fail": {
-        "firefox": "Firefox 148-152 surface only 2 of the 5 (bug 2046262: the incoming-streams ReadableStream stops pulling while one is queued), fixed in 153. Kept for the harness's pinned Firefox 148; 158 passes."
+        "firefox": [
+          {
+            "versions": "148-152",
+            "why": "Bug 2046262: the incoming-streams ReadableStream stops pulling while a stream is already queued, so only 2 of the 5 surface. Fixed in 153."
+          }
+        ]
       }
     },
     {
@@ -241,7 +249,12 @@
         "safari"
       ],
       "expect_fail": {
-        "safari": "Safari 26.4 reports maxDatagramSize as the QUIC max_datagram_frame_size (65535) rather than a path-MTU-derived size, so a datagram of that size is refused by its own stack. Chrome reports 1024 and the Zig client 1199."
+        "safari": [
+          {
+            "versions": "26.4",
+            "why": "Safari 26.4 reports maxDatagramSize as the QUIC max_datagram_frame_size (65535) rather than a path-MTU-derived size, so a datagram of that size is refused by its own stack. Chrome reports 1024 and the Zig client 1199. Technology Preview 27.0 reports 1024; later releases are not measured."
+          }
+        ]
       }
     },
     {
@@ -302,9 +315,40 @@
         "safari"
       ],
       "expect_fail": {
-        "firefox": "Firefox 155+ has `draining`, but neqo knows no WT_DRAIN_SESSION and drops it as an unknown capsule: it resolves only on GOAWAY, and 158.0.1 times out here. 148-154 have no attribute and report n/a.",
-        "safari-preview": "Safari Technology Preview 27.0 never resolves `WebTransport.draining` on a WT_DRAIN_SESSION capsule: the scenario times out in both clean runs of three, where release 26.4 passes it in all three against the same server. Preview's own regression, alongside the server-connection-close one."
+        "firefox": [
+          {
+            "versions": ">=155",
+            "why": "Firefox 155+ has `draining`, but neqo knows no WT_DRAIN_SESSION and drops it as an unknown capsule: it resolves only on GOAWAY (see server-goaway). 148-154 have no attribute and report n/a."
+          }
+        ],
+        "safari-preview": [
+          {
+            "versions": "27.0",
+            "why": "Safari Technology Preview 27.0 never resolves `WebTransport.draining` on a WT_DRAIN_SESSION capsule: the scenario timed out in both clean runs of three, where release 26.4 passed it in all three against the same server."
+          }
+        ],
+        "webkit": [
+          {
+            "versions": "27.2",
+            "why": "Playwright's WebKit build 2370 (27.2's engine, on macOS 26.6.2's Network.framework) never resolves `draining` on a WT_DRAIN_SESSION that arrives in the 200's flight; the same capsule once the session is up resolves it (server-goaway). Not on GOAWAY alone."
+          }
+        ]
       }
+    },
+    {
+      "id": "server-goaway",
+      "handler": "server-drain.py?goaway=1",
+      "title": "GOAWAY with WT_DRAIN_SESSION resolves draining without closing",
+      "exercises": [
+        "draining",
+        "HTTP/3 GOAWAY"
+      ],
+      "runners": [
+        "zig",
+        "chrome",
+        "firefox",
+        "safari"
+      ]
     },
     {
       "id": "wt-protocol-negotiation",
@@ -321,7 +365,12 @@
         "safari"
       ],
       "expect_fail": {
-        "firefox": "WebTransport.protocol lands in Firefox 155; 148 leaves it undefined. Kept for the harness's pinned Firefox 148; 158 passes."
+        "firefox": [
+          {
+            "versions": "<155",
+            "why": "WebTransport.protocol lands in Firefox 155; earlier versions leave it undefined."
+          }
+        ]
       }
     }
   ]
