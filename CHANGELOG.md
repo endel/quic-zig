@@ -105,10 +105,45 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   `WtEvent.session_closed` has the field): true when the peer reset or stopped
   the session's CONNECT stream, or sent it a malformed capsule, instead of
   closing it. That is when a browser rejects `closed` rather than resolving it.
+- A connection closes once the WebTransport sessions it carried are over and
+  no HTTP/3 request is open: GOAWAY, then CONNECTION_CLOSE with H3_NO_ERROR
+  when the peer has the end of its sessions, or after 3 PTO. Chrome leaves
+  such a connection without a word, so the server used to hold it for the
+  idle timeout. `wt_close_after_sessions` (on, server and client) turns it off
+  for a client that pools sessions with plain requests.
+- `Session.drainConnection()` drains one connection as `Server.drain()`
+  drains them all, and `drain()` takes `DrainOptions`: `.signal_peers = false`
+  refuses newcomers without the GOAWAY and WT_DRAIN_SESSION, for an
+  application that tells its clients itself. C: `qz_server_drain`,
+  `qz_server_is_drained`, `qz_session_drain`, `qz_client_drain`.
+- The conformance suite runs Playwright's WebKit headless (`--webkit`), keys
+  its expected failures by browser version, and has a `server-goaway`
+  scenario.
 
 ### Changed
 
 - **Breaking:** quic-zig now needs Zig 0.17.0; 0.16 no longer builds it.
+- **Breaking:** when a connection ends, `onSessionClosed` reports each
+  WebTransport session it still held, once, by its own id: our close with its
+  code, any other as `abrupt`. It used to fire once with session 0, a real id,
+  for every connection, sessions or not. A handler that freed per-connection
+  state there should do it in `onConnectionClosed`. Clients now report it too,
+  and a CONNECT still waiting on its answer as `onSessionRejected`.
+- **Breaking:** a closed WebTransport session takes no new stream or datagram
+  and its streams take no writes: `error.SessionGone`. Its streams are reset
+  even after their FIN, so a last message can't ride out on a close: FIN it,
+  and let the side that read it end the session. `sendStreamData` writes only
+  WebTransport streams, and `acceptSession` only a session not yet answered.
+- **Breaking:** `Server.drain()` takes `DrainOptions` (`drain(.{})` as before),
+  closes no connection in use, raw QUIC and HTTP/0.9 included, and closes the
+  HTTP/1.1 listener's socket instead of accepting connections to close them.
+  `isDrained()` also waits for WebSockets. Its GOAWAY waits for the peer to ack
+  each session's 200 and drain capsule: one right behind the 200 can crash
+  Firefox 158. `stop()` closes HTTP/3 connections with H3_NO_ERROR, and both
+  may be called from the handler's callbacks, `onPass` included.
+- C API: SESSION_CLOSED carries `abrupt` in flags bit 0, every client gets
+  CLIENT_DISCONNECTED after its sessions' SESSION_CLOSED, and a send on a
+  closed session returns `ERR_SESSION_GONE`.
 - **Breaking:** the event-loop `Client` now verifies servers against the
   platform's trust store by default (`ClientConfig.ca = .system`, loaded once
   per process), and a server whose chain ends at no trusted anchor is refused.
@@ -166,6 +201,15 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- Bytes after a peer's WT_CLOSE_SESSION now reset the CONNECT stream with
+  H3_MESSAGE_ERROR whichever packet brings them; only the capsule's own read
+  was checked.
+- When both sides close a session at once, each reports its own close, as a
+  browser does; the peer's capsule could overwrite ours.
+- A client hears a drain once per session whether GOAWAY or WT_DRAIN_SESSION
+  brought it; GOAWAY reached only the first session.
+- A server's CONNECT that the peer resets before it is answered is reported
+  closed; its slot used to stay taken, and a later accept answered it 200.
 - A WebTransport session whose peer finished, reset or stopped the CONNECT
   stream without a close capsule stayed open until the connection ended. A
   bare FIN now closes it with code 0, answered with our own FIN, and a reset
