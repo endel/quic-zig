@@ -1170,11 +1170,9 @@ pub fn Server(comptime Handler: type) type {
             // Whatever is still live goes now; the handler hears about each
             // one first, as it would had the connection closed on its own.
             self.halted = true;
-            if (@hasDecl(Handler, "onConnectionClosed")) {
-                for (self.conn_mgr.entries.items) |entry| {
-                    var session = Session{ .entry = entry };
-                    self.handler.onConnectionClosed(&session);
-                }
+            for (self.conn_mgr.entries.items) |entry| {
+                var session = Session{ .entry = entry };
+                self.endConnection(&session);
             }
 
             self.timer.deinit();
@@ -2147,6 +2145,18 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
+        /// The handler's last word on a connection before its entry goes:
+        /// each WebTransport session it still holds ends, then the connection.
+        fn endConnection(self: *Self, session: *Session) void {
+            if (session.entry.wt_conn) |wtc| {
+                while (wtc.nextLostSession()) |ev| switch (ev) {
+                    .session_closed => |c| self.dispatchSessionClosed(session, c.session_id, c.error_code, c.reason, c.abrupt),
+                    else => {},
+                };
+            }
+            if (@hasDecl(Handler, "onConnectionClosed")) self.handler.onConnectionClosed(session);
+        }
+
         fn pollH3Events(self: *Self, entry: *ConnEntry) void {
             if (entry.h3_conn == null) return;
             const h3c = entry.h3_conn.?;
@@ -2344,16 +2354,8 @@ pub fn Server(comptime Handler: type) type {
                     now_ns = sys.nanoTimestamp();
                 }
                 if (entry.conn.isClosed()) {
-                    // Fire onSessionClosed BEFORE removeConnection invalidates
-                    // the entry, so the handler can mark clients as disconnected.
-                    // Without this, PTO-killed connections never get a session_closed
-                    // event because the entry is removed from the list before the
-                    // WT layer can generate one.
                     var session = Session{ .entry = entry };
-                    self.dispatchSessionClosed(&session, 0, 0, "", true);
-                    if (@hasDecl(Handler, "onConnectionClosed")) {
-                        self.handler.onConnectionClosed(&session);
-                    }
+                    self.endConnection(&session);
                     self.conn_mgr.removeConnection(entry);
                     continue;
                 }
@@ -3664,6 +3666,20 @@ pub fn Client(comptime Handler: type) type {
             }
         }
 
+        /// The connection is over: each session not yet reported ends with
+        /// it, for one that closed with no poll in between (an idle timeout).
+        fn reportLostSessions(self: *Self) void {
+            const wtc = self.wt_conn orelse return;
+            var session = self.makeSession();
+            while (wtc.nextLostSession()) |ev| switch (ev) {
+                .session_closed => |c| self.dispatchSessionClosed(&session, c.session_id, c.error_code, c.reason, c.abrupt),
+                .session_rejected => |r| if (@hasDecl(Handler, "onSessionRejected")) {
+                    self.handler.onSessionRejected(&session, r.session_id, r.status);
+                },
+                else => {},
+            };
+        }
+
         fn dispatchStreamData(self: *Self, session: *ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
             if (!@hasDecl(Handler, "onStreamData")) return;
 
@@ -3782,6 +3798,7 @@ pub fn Client(comptime Handler: type) type {
             };
 
             if (conn.isClosed()) {
+                self.reportLostSessions();
                 // A shared loop is left to our callers' finishStop.
                 if (self.stopping and self.shared_loop == null) self.own_loop.stop();
                 return;
@@ -6146,6 +6163,9 @@ const WtCloseServer = struct {
     session: ?Session = null,
     session_id: u64 = 0,
     seen: CloseSeen = .{},
+    conns_closed: u32 = 0,
+    /// Sessions reported when their connection's own end came.
+    seen_at_conn_close: u32 = 0,
 
     pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
         session.acceptSession(session_id) catch unreachable;
@@ -6154,9 +6174,12 @@ const WtCloseServer = struct {
     }
     pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
     pub fn onSessionClosed(self: *@This(), _: *Session, session_id: u64, code: u32, reason: []const u8, abrupt: bool) void {
-        // The connection's own end reports session 0 as well; only the
-        // session's counts here.
-        if (session_id == self.session_id and self.seen.count == 0) self.seen.record(code, reason, abrupt);
+        std.debug.assert(session_id == self.session_id);
+        self.seen.record(code, reason, abrupt);
+    }
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.conns_closed += 1;
+        self.seen_at_conn_close = self.seen.count;
     }
 };
 
@@ -6251,6 +6274,58 @@ test "e2e: a close capsule still carries its code and reason, from either side" 
             try testing.expect(!side.abrupt);
         }
     }
+}
+
+fn clientConnClosed(c: *Client(WtCloseClient)) bool {
+    return c.conn.isClosed();
+}
+
+test "e2e: a connection's end reports its session once, by its id, on both sides" {
+    // Under a live session, and after one already closed.
+    for ([_]bool{ false, true }, [_]u16{ 29526, 29527 }) |closed_first, port| {
+        var ch = WtCloseClient{};
+        var sh = WtCloseServer{};
+        var e2e: E2e(WtCloseServer, WtCloseClient) = undefined;
+        try e2e.init(port, &sh, &ch);
+        defer e2e.deinit();
+        try runUntil(&e2e.loop, &ch, WtCloseClient.ready, 10_000);
+        try runFor(&e2e.loop, 50);
+        var ss = sh.session.?;
+        if (closed_first) {
+            try ss.closeSessionWithError(sh.session_id, 7, "bye");
+            try runUntilCount(&e2e.loop, &sh.seen.count, 1, 3000);
+            try runUntilCount(&e2e.loop, &ch.seen.count, 1, 3000);
+        }
+        ss.closeConnection();
+        try runUntilCount(&e2e.loop, &sh.conns_closed, 1, 3000);
+        try runUntil(&e2e.loop, &e2e.client, clientConnClosed, 3000);
+        for ([_]CloseSeen{ sh.seen, ch.seen }) |side| {
+            try testing.expectEqual(@as(u32, 1), side.count);
+            try testing.expectEqual(!closed_first, side.abrupt);
+        }
+        // Before the connection's own callback, never after it.
+        try testing.expectEqual(@as(u32, 1), sh.seen_at_conn_close);
+    }
+}
+
+test "e2e: a connection that times out reports its session, and one with none reports nothing" {
+    var idle = QuicIdleClient{}; // no session at all
+    var sh = WtCloseServer{};
+    var e2e: E2e(WtCloseServer, QuicIdleClient) = undefined;
+    try e2e.initWith(29528, &sh, &idle, .{ .max_idle_timeout = 300 }, null);
+    defer e2e.deinit();
+    // A session's client on a loop of its own, so it can fall silent.
+    var ch = WtCloseClient{};
+    var c = try Client(WtCloseClient).init(testing.allocator, &ch, .{ .port = 29528, .skip_cert_verify = true });
+    defer c.deinit();
+    c.start();
+    try runUntil2(&e2e.loop, c.eventLoop(), &ch, WtCloseClient.ready, 10_000);
+
+    // An idle timeout ends it inside the pass's timers, with no poll after.
+    try runUntilCount(&e2e.loop, &sh.conns_closed, 2, 8000);
+    try testing.expectEqual(@as(u32, 1), sh.seen.count);
+    try testing.expect(sh.seen.abrupt);
+    try testing.expectEqual(@as(u32, 0), sh.seen.code);
 }
 
 test "e2e: a WT_STREAMS_BLOCKED is answered with nothing more from the peer" {

@@ -380,12 +380,21 @@ const RelayHandler = struct {
     ns_subs: [MAX_NAMESPACE_SUBS]NamespaceSub = @splat(.{}),
     ns_seq: u64 = 0,
 
-    /// The loop frees the connection right after this fires, so the entry
-    /// pointer stops being a valid key the moment we return. Without it a
-    /// relay simply runs out of client slots.
+    /// A WebTransport client is its one session.
     pub fn onSessionClosed(self: *RelayHandler, session: *event_loop.Session, _: u64, _: u32, _: []const u8) void {
+        self.dropClient(session.entry);
+    }
+
+    /// The loop frees the entry right after this, so it stops being a valid
+    /// key the moment we return: a native-QUIC client, which has no session
+    /// to report, goes here. Without it a relay runs out of client slots.
+    pub fn onConnectionClosed(self: *RelayHandler, session: *event_loop.Session) void {
+        self.dropClient(session.entry);
+    }
+
+    fn dropClient(self: *RelayHandler, entry: *cm.ConnEntry) void {
         const ci = blk: {
-            for (&self.clients, 0..) |*c, i| if (c.active and c.entry == session.entry) break :blk i;
+            for (&self.clients, 0..) |*c, i| if (c.active and c.entry == entry) break :blk i;
             return;
         };
         std.debug.print("[relay] client {d} gone\n", .{ci});

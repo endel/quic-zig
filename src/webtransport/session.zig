@@ -110,7 +110,8 @@ pub const Session = struct {
 pub const WtEvent = union(enum) {
     session_ready: struct { session_id: u64, headers: []const qpack.Header = &.{} },
     /// Client: the server refused the session. `status` is its final status,
-    /// or empty when it reset the CONNECT stream, or ended it, unanswered.
+    /// or empty when it reset the CONNECT stream, or ended it, unanswered,
+    /// or the connection ended first.
     session_rejected: struct { session_id: u64, status: []const u8 },
     connect_request: struct { session_id: u64, protocol: []const u8, authority: []const u8, path: []const u8, headers: []const qpack.Header = &.{} },
     bidi_stream: struct { session_id: u64, stream_id: u64 },
@@ -125,9 +126,14 @@ pub const WtEvent = union(enum) {
     /// for a bare FIN on the CONNECT stream, which §6 makes the same thing.
     ///
     /// `abrupt` is set when the peer reset or stopped the CONNECT stream, or
-    /// sent a malformed capsule, instead of closing it: code and reason are
+    /// sent a malformed capsule, instead of closing it, or the connection
+    /// ended under a session neither side had closed: code and reason are
     /// then 0 and empty. A browser tells the two apart the same way, resolving
-    /// `closed` on a clean close and rejecting it on an abrupt one.
+    /// `closed` on a clean close and rejecting it on an abrupt one. A session
+    /// we had closed reports our close however its end comes.
+    ///
+    /// Each session is reported once, by its own id. On a server that is one
+    /// it offered as `connect_request`, accepted or not yet answered.
     session_closed: struct { session_id: u64, error_code: u32, reason: []const u8, abrupt: bool = false },
     session_draining: struct { session_id: u64 },
     /// The peer reset its send side: no more data is coming on this stream.
@@ -404,13 +410,12 @@ pub const WebTransportConnection = struct {
     }
 
     /// Server: accept a WebTransport session with extra response headers (e.g., sub-protocol).
-    /// The slot is claimed first: a 200 promises a session we can hold.
+    /// Fails with `error.SessionNotPending` for a session that is not waiting
+    /// on an answer: already accepted, refused, withdrawn by the peer, or
+    /// never offered (a CONNECT past the session slots never is).
     pub fn acceptSessionWithHeaders(self: *WebTransportConnection, session_id: u64, extra_headers: []const qpack.Header) !void {
-        const s = self.getSession(session_id) orelse blk: {
-            const new = self.allocateSession(session_id, .connecting) orelse return error.TooManySessions;
-            self.active_session_count += 1;
-            break :blk new;
-        };
+        const s = self.getSession(session_id) orelse return error.SessionNotPending;
+        if (!self.is_server or s.state != .connecting) return error.SessionNotPending;
         try self.h3.sendConnectResponseWithHeaders(session_id, "200", extra_headers);
         s.state = .active;
     }
@@ -863,6 +868,51 @@ pub const WebTransportConnection = struct {
         }
     }
 
+    /// The connection has ended or is ending: report the next session the
+    /// application still holds, once, with its own id, and release it. Null
+    /// once none is left. A session we were closing reports our close; one
+    /// the connection took down is `abrupt`, code 0; a client's that was
+    /// still waiting on its response is `session_rejected` with no status.
+    /// A session already reported (the peer's close, awaiting its FIN) is
+    /// released without a word.
+    ///
+    /// `poll` calls this once the QUIC connection is closing; an event loop
+    /// calls it again before it lets the connection go, for one that ended
+    /// without a poll in between (an idle timeout).
+    pub fn nextLostSession(self: *WebTransportConnection) ?WtEvent {
+        for (&self.sessions) |*session| {
+            if (!session.occupied) continue;
+            self.cleanupSessionStreams(session.session_id);
+            switch (session.state) {
+                .draining => return self.sessionClosed(session, false),
+                .active => return self.lostSession(session),
+                .connecting => {
+                    if (self.is_server) return self.lostSession(session);
+                    const sid = session.session_id;
+                    self.finalizeSession(session);
+                    return .{ .session_rejected = .{ .session_id = sid, .status = "" } };
+                },
+                .awaiting_fin, .closed => self.finalizeSession(session),
+            }
+        }
+        return null;
+    }
+
+    fn lostSession(self: *WebTransportConnection, session: *Session) WtEvent {
+        session.close_error_code = 0;
+        self.setCloseReason(session, "");
+        return self.sessionClosed(session, true);
+    }
+
+    /// Server: a CONNECT not answered yet that the peer reset or stopped is
+    /// withdrawn. Its bytes stay unread meanwhile: capsules sent ahead of
+    /// the 200 are only acted on once it is given (draft-16 §3.2).
+    fn connectWithdrawn(self: *WebTransportConnection, session: *Session) ?WtEvent {
+        const stream = self.quic.streams.getStream(session.session_id) orelse return self.lostSession(session);
+        if (stream.recv.reset_err == null and stream.send.peer_stop_sending == null) return null;
+        return self.abortSession(session, @backingInt(h3_conn.H3Error.request_cancelled));
+    }
+
     /// Mark a session as fully closed and release its slot.
     fn finalizeSession(self: *WebTransportConnection, session: *Session) void {
         if (self.stream_bufs.fetchRemove(session.session_id)) |kv| {
@@ -1034,7 +1084,12 @@ pub const WebTransportConnection = struct {
         // Credit the steps above earned the peer (a WT_*_BLOCKED answered,
         // a stream opened) goes now: null tells a server nothing is pending.
         self.flushFlowControl();
-        return null;
+
+        // Last, so what arrived ahead of a CONNECTION_CLOSE is delivered first.
+        switch (self.quic.state) {
+            .closing, .draining, .terminated => return self.nextLostSession(),
+            .first_flight, .handshake, .connected => return null,
+        }
     }
 
     /// Poll established sessions' CONNECT streams: their capsules, then
@@ -1044,7 +1099,11 @@ pub const WebTransportConnection = struct {
             if (!session.occupied) continue;
             switch (session.state) {
                 .active, .draining, .awaiting_fin => {},
-                .connecting, .closed => continue,
+                .connecting => {
+                    if (self.is_server) if (self.connectWithdrawn(session)) |ev| return ev;
+                    continue;
+                },
+                .closed => continue,
             }
 
             const stream = self.quic.streams.getStream(session.session_id) orelse {
@@ -2972,6 +3031,80 @@ test "WT: closes that cross report our own, once the peer's FIN is in" {
     try testing.expectEqual(@as(?u64, null), stream.send.reset_err);
 }
 
+/// Every event `poll` has left, up to a bound.
+fn drainEvents(wt: *WebTransportConnection, out: []WtEvent) ![]WtEvent {
+    var n: usize = 0;
+    while (try wt.poll()) |ev| {
+        if (n == out.len) return error.TooManyEvents;
+        out[n] = ev;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "WT: a connection that ends reports each session once, by its own id" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer(); // session 0, active
+    defer setup.deinit();
+    try injectConnect(&setup, 4);
+    try setup.wt.acceptSession(4);
+    try setup.wt.closeSessionWithError(4, 44, "ours"); // draining
+    try injectConnect(&setup, 8);
+    try setup.wt.acceptSession(8);
+    var buf: [64]u8 = undefined;
+    _ = try peerSends(&setup, 8, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 8, .reason = "theirs" } }), false);
+    _ = try pollFor(&setup.wt, .session_closed); // 8, reported; its FIN still due
+    try injectConnect(&setup, 12); // offered, not answered
+
+    setup.quic_conn.state = .draining;
+    var events: [8]WtEvent = undefined;
+    const got = try drainEvents(&setup.wt, &events);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqual(@as(u64, 0), got[0].session_closed.session_id);
+    try testing.expect(got[0].session_closed.abrupt);
+    try testing.expectEqual(@as(u64, 4), got[1].session_closed.session_id);
+    try testing.expectEqual(@as(u32, 44), got[1].session_closed.error_code);
+    try testing.expectEqualStrings("ours", got[1].session_closed.reason);
+    try testing.expect(!got[1].session_closed.abrupt);
+    try testing.expectEqual(@as(u64, 12), got[2].session_closed.session_id);
+    try testing.expect(got[2].session_closed.abrupt);
+    // Nothing is left to report, however often it is asked.
+    try testing.expectEqual(@as(?WtEvent, null), setup.wt.nextLostSession());
+    try testing.expectEqual(@as(u32, 0), setup.wt.active_session_count);
+}
+
+test "WT: a client's session still waiting on its response is rejected when the connection ends" {
+    var setup: WtTestSetup = undefined;
+    const first = try setup.initClient();
+    defer setup.deinit();
+    const second = try setup.wt.connect("example.com", "/wt");
+
+    setup.quic_conn.state = .terminated;
+    var events: [8]WtEvent = undefined;
+    const got = try drainEvents(&setup.wt, &events);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(first, got[0].session_closed.session_id);
+    try testing.expect(got[0].session_closed.abrupt);
+    try testing.expectEqual(second, got[1].session_rejected.session_id);
+    try testing.expectEqualStrings("", got[1].session_rejected.status);
+}
+
+test "WT: a CONNECT the peer resets before it is answered ends abruptly, and can't be accepted" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+    try injectConnect(&setup, 4);
+
+    const stream = setup.quic_conn.streams.getStream(4).?;
+    try stream.recv.handleResetStream(@backingInt(h3_conn.H3Error.request_cancelled), stream.recv.sorter.highestReceived());
+    const ev = try pollFor(&setup.wt, .session_closed);
+    try testing.expectEqual(@as(u64, 4), ev.session_closed.session_id);
+    try testing.expect(ev.session_closed.abrupt);
+    try testing.expectError(error.SessionNotPending, setup.wt.acceptSession(4));
+    try testing.expectEqual(@as(u64, 0), stream.send.write_offset);
+    try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.request_cancelled)), stream.send.reset_err);
+}
+
 test "WT: unknown and malformed capsules reset nothing while our close waits for the peer's FIN" {
     var setup: WtTestSetup = undefined;
     const session_id = try setup.initServer();
@@ -3544,10 +3677,12 @@ test "WT: invalid session ID triggers H3_ID_ERROR on bidi stream" {
     const stream = try setup.quic_conn.streams.getOrCreateStream(4);
     try stream.recv.handleStreamFrame(0, fbs.buffered(), false);
 
-    const ev = try setup.wt.poll();
-    // Should return null (connection closed with H3_ID_ERROR)
-    try testing.expect(ev == null);
-    // Connection should be closing with H3_ID_ERROR (RFC 9114 §8.1)
+    // The connection closes with H3_ID_ERROR (RFC 9114 §8.1), and the
+    // session goes with it, once.
+    const ev = (try setup.wt.poll()).?;
+    try testing.expectEqual(@as(u64, 0), ev.session_closed.session_id);
+    try testing.expect(ev.session_closed.abrupt);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
     try testing.expect(setup.quic_conn.local_err != null);
     try testing.expect(setup.quic_conn.local_err.?.is_app);
     try testing.expectEqual(@backingInt(h3_conn.H3Error.id_error), setup.quic_conn.local_err.?.code);
@@ -3682,7 +3817,7 @@ test "WT: a CONNECT past the session slots is rejected, never answered 200" {
     try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.request_rejected)), extra.send.reset_err);
     try testing.expectEqual(@as(u32, MAX_SESSIONS), setup.wt.active_session_count);
 
-    try testing.expectError(error.TooManySessions, setup.wt.acceptSession(4 * MAX_SESSIONS));
+    try testing.expectError(error.SessionNotPending, setup.wt.acceptSession(4 * MAX_SESSIONS));
     try testing.expectEqual(@as(u64, 0), extra.send.write_offset);
 }
 
@@ -3782,10 +3917,12 @@ test "WT: invalid session ID triggers H3_ID_ERROR on uni stream" {
     const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
     try rs.handleStreamFrame(0, fbs.buffered(), false);
 
-    const ev = try setup.wt.poll();
-    // Should return null (connection closed with H3_ID_ERROR)
-    try testing.expect(ev == null);
-    // Connection should be closing with H3_ID_ERROR (RFC 9114 §8.1)
+    // The connection closes with H3_ID_ERROR (RFC 9114 §8.1), and the
+    // session goes with it, once.
+    const ev = (try setup.wt.poll()).?;
+    try testing.expectEqual(@as(u64, 0), ev.session_closed.session_id);
+    try testing.expect(ev.session_closed.abrupt);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
     try testing.expect(setup.quic_conn.local_err != null);
     try testing.expect(setup.quic_conn.local_err.?.is_app);
     try testing.expectEqual(@backingInt(h3_conn.H3Error.id_error), setup.quic_conn.local_err.?.code);

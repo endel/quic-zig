@@ -699,6 +699,20 @@ const WptHandler = struct {
         _ = self.session_state.remove(keyFor(session, session_id));
     }
 
+    /// Its entry is freed after this, and the next connection may get the
+    /// same address: nothing keyed by it may outlive it.
+    pub fn onConnectionClosed(self: *WptHandler, session: *event_loop.Session) void {
+        const conn = @intFromPtr(session.entry);
+        inline for (.{ &self.session_state, &self.uni_echo_streams }) |map| {
+            var it = map.keyIterator();
+            while (it.next()) |k| {
+                if (k.conn != conn) continue;
+                _ = map.remove(k.*);
+                it = map.keyIterator(); // removal invalidates the iterator
+            }
+        }
+    }
+
     pub fn onSessionDraining(self: *WptHandler, _: *event_loop.Session, session_id: u64) void {
         _ = self;
         std.log.info("[wpt] session {d} draining", .{session_id});

@@ -179,13 +179,9 @@ pub const CApiHandler = struct {
 
     /// Forgets a client's backlog. Events still queued for it are delivered
     /// uncounted.
-    fn dropBacklog(self: *CApiHandler, client_id: u64, entry: ?*ConnEntry) void {
+    fn dropBacklog(self: *CApiHandler, client_id: u64) void {
         var kv = self.backlogs.fetchRemove(client_id) orelse return;
-        defer kv.value.paused.deinit(self.allocator);
-        // Its other sessions go on under a new client id.
-        const e = entry orelse return;
-        var session: event_loop.Session = .{ .entry = e };
-        for (kv.value.paused.items) |id| session.resumeStream(id);
+        kv.value.paused.deinit(self.allocator);
     }
 
     /// Writes the next event into `buf`. Returns its size, or 0 when there
@@ -236,33 +232,6 @@ pub const CApiHandler = struct {
         var ev = self.event_queue.popFront().?;
         defer ev.deinit(self.allocator);
         self.release(ev.client_id, ev.payload().len);
-    }
-
-    /// Scan for closed connections and emit CLIENT_DISCONNECTED events.
-    pub fn checkDisconnected(self: *CApiHandler) void {
-        var to_remove_buf: [256]u64 = undefined;
-        var to_remove_count: usize = 0;
-
-        var it = self.client_to_entry.iterator();
-        while (it.next()) |kv| {
-            if (kv.value_ptr.*.conn.isClosed()) {
-                self.push(.{
-                    .event_type = .client_disconnected,
-                    .client_id = kv.key_ptr.*,
-                });
-                if (to_remove_count < to_remove_buf.len) {
-                    to_remove_buf[to_remove_count] = kv.key_ptr.*;
-                    to_remove_count += 1;
-                }
-            }
-        }
-
-        for (to_remove_buf[0..to_remove_count]) |id| {
-            if (self.client_to_entry.fetchRemove(id)) |kv| {
-                _ = self.entry_to_client.remove(kv.value);
-            }
-            self.dropBacklog(id, null);
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -338,12 +307,15 @@ pub const CApiHandler = struct {
             .error_code = error_code,
             .data = reason_copy,
         });
+    }
 
-        // Remove from lookup maps BEFORE the event loop frees the entry.
-        // Without this, checkDisconnected() dereferences freed memory.
-        _ = self.entry_to_client.remove(session.entry);
-        _ = self.client_to_entry.remove(client_id);
-        self.dropBacklog(client_id, session.entry);
+    /// The connection is gone, every session on it reported first: the
+    /// client's last event. Its entry is freed once this returns.
+    pub fn onConnectionClosed(self: *CApiHandler, session: *event_loop.Session) void {
+        const kv = self.entry_to_client.fetchRemove(session.entry) orelse return;
+        _ = self.client_to_entry.remove(kv.value);
+        self.push(.{ .event_type = .client_disconnected, .client_id = kv.value });
+        self.dropBacklog(kv.value);
     }
 
     pub fn onSessionDraining(self: *CApiHandler, session: *event_loop.Session, session_id: u64) void {
@@ -461,7 +433,6 @@ export fn qz_server_tick(handle: ?*anyopaque) i32 {
     // In no_wait mode, kqueue/epoll edge-triggered events can be missed
     // between ticks, so we must poll directly to ensure packets are read.
     ws.server.pollDirect();
-    ws.handler.checkDisconnected();
     return 0;
 }
 
