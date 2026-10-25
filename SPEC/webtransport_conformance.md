@@ -129,9 +129,10 @@ Two scenarios changed so they cannot pass on nothing:
   resolves with the page's own closeInfo whatever reaches the wire. It now
   connects to `client-close.py?token=…`, where the server stashes the close it
   received, and reads that back through `query.py` (both sides, Zig and
-  browser). This matters for Safari: wpt.fyi shows Safari 26.5–27.0 never
-  delivering a page's close to the server at all (it passes in STP 255), so
-  the Safari and Preview ✓ above are unproven and marked ?.
+  browser), as WPT's own `close.https.any.js` does. This matters for Safari:
+  wpt.fyi shows Safari 26.5–27.0 failing those WPT close tests, the server
+  recording no close at all (STP 255 passes them), so the Safari and Preview ✓
+  above are unproven and marked ?.
 - **`server-drain`** reports n/a when `draining` is absent, and is now run
   under Chrome too.
 
@@ -152,8 +153,9 @@ Safari was not run.
   attribute; canary has it and resolves it on the `WT_DRAIN_SESSION` capsule
   alone. Chrome 158 ships 2026-11-17.
 - **Firefox 155+ never resolves `draining` on the capsule.** neqo knows only
-  `WT_CLOSE_SESSION` and drops `WT_DRAIN_SESSION` as an unknown capsule; it
-  resolves `draining` on GOAWAY only. A server that wants Firefox to see a
+  `WT_CLOSE_SESSION` (`neqo-http3/src/frames/wtframe.rs`) and drops
+  `WT_DRAIN_SESSION` as an unknown capsule; it resolves `draining` on GOAWAY
+  only. A server that wants Firefox to see a
   drain has to send GOAWAY, which drains every session on the connection.
   Recorded as `expect_fail` for Firefox; 148 reports n/a.
 - **The two Firefox XPASSes are expected.** The notes are kept for the
