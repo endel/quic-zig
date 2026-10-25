@@ -101,6 +101,41 @@ lost or crossed in flight.
 | Flow control across an intermediary (§5.6.1) | We are not an intermediary. |
 | 0-RTT limit retention (§3.2) | No 0-RTT on the WebTransport path. |
 
+## Session termination (§6)
+
+Followed as draft-16 §6 words it, which adds the optional STOP_SENDING to
+draft-13's text. Any end of the CONNECT stream ends the session: the
+application gets one `session_closed`, and the session's streams are reset and
+stopped with `WT_SESSION_GONE`.
+
+| Peer sends on the CONNECT stream | `session_closed` | We answer with |
+| --- | --- | --- |
+| `WT_CLOSE_SESSION` (then FIN) | its code and reason | FIN |
+| FIN alone | code 0, reason `""` | FIN |
+| RESET_STREAM or STOP_SENDING | `abrupt`, code 0 | RESET_STREAM and, while it may still send, STOP_SENDING, both `H3_REQUEST_CANCELLED` |
+| a FIN cutting a capsule short | `abrupt`, code 0 | both, `H3_MESSAGE_ERROR` (RFC 9297 §3.3, RFC 9114 §4.1.2) |
+
+Capsules are acted on before the stream's end, so a close that shares a packet
+with the FIN or with a STOP_SENDING (webtransport-go sends all three) keeps its
+code. A STOP_SENDING that overtakes the capsule in an earlier packet does not:
+the session is gone by the time the code arrives, as in Chrome and Firefox.
+
+Once we have sent our own close, the session waits for the peer to end its
+side, however it does, and then reports our code. A client whose CONNECT the
+server finishes or resets without a 200 gets `session_rejected` with an empty
+status; our own server does that to a CONNECT past its session slots.
+
+**What we send.** A close is the capsule and a FIN, nothing more: no
+STOP_SENDING before the peer's FIN, which Chrome and Firefox turn into an
+abrupt close that loses the code (Chrome counts a close clean only once both
+FINs have crossed). The library never follows a close with CONNECTION_CLOSE; an
+application that wants the connection gone too should wait for
+`session_closed`, which arrives with the peer's FIN.
+
+**Not enforced.** §6 also forbids new streams and datagrams on a terminated
+session. `openBidiStream`, `openUniStream` and `sendDatagram` do not check;
+the peer refuses them, and the application has had its `session_closed`.
+
 ## Caveats worth knowing
 
 **Streams wait for their session (§4.5).** A stream naming a session that is
