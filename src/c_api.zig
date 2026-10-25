@@ -8,6 +8,13 @@ const ConnEntry = quic.connection_manager.ConnEntry;
 // Event types — matches the binary protocol consumed by JS
 // ---------------------------------------------------------------------------
 
+/// Each event is a 24-byte header — type, flags, reserved u16, payload length
+/// u32, client id u64, id u64, little-endian — then the type's extended
+/// fields, then the payload. Flags bit 0 is the FIN on STREAM_DATA, and on
+/// SESSION_CLOSED says the session ended abruptly: the peer reset its CONNECT
+/// stream, or the connection ended under it, so the code is 0. Every session
+/// a client had gets one SESSION_CLOSED, by its own id, before the client's
+/// CLIENT_DISCONNECTED, which is its last event.
 const EventType = enum(u8) {
     none = 0,
     connect_request = 1,
@@ -297,11 +304,12 @@ pub const CApiHandler = struct {
         });
     }
 
-    pub fn onSessionClosed(self: *CApiHandler, session: *event_loop.Session, session_id: u64, error_code: u32, reason: []const u8) void {
+    pub fn onSessionClosed(self: *CApiHandler, session: *event_loop.Session, session_id: u64, error_code: u32, reason: []const u8, abrupt: bool) void {
         const client_id = self.getOrAssignClientId(session.entry);
         const reason_copy: ?[]u8 = if (reason.len > 0) (self.allocator.dupe(u8, reason) catch null) else null;
         self.push(.{
             .event_type = .session_closed,
+            .flags = if (abrupt) 1 else 0,
             .client_id = client_id,
             .id1 = session_id,
             .error_code = error_code,
@@ -371,6 +379,13 @@ const ERR_QUEUE_FULL: i32 = -4;
 const ERR_TOO_LARGE: i32 = -5;
 /// A NULL handle, or NULL where a non-zero length says bytes are.
 const ERR_INVALID_ARG: i32 = -6;
+/// The session is closed, by either side, or never was: draft-16 §6 allows no
+/// new stream or datagram on it, and its streams take no more writes.
+const ERR_SESSION_GONE: i32 = -7;
+
+fn sendError(err: anyerror) i32 {
+    return if (err == error.SessionGone) ERR_SESSION_GONE else ERR_STREAM;
+}
 const STREAM_ERROR: u64 = std.math.maxInt(u64);
 
 // ---------------------------------------------------------------------------
@@ -446,6 +461,22 @@ export fn qz_server_flush(handle: ?*anyopaque) void {
     ws.server.flush();
 }
 
+/// The first step of a graceful shutdown: new connections refused, a GOAWAY
+/// to every client and a WT_DRAIN_SESSION to every session, nothing closed.
+/// End the sessions, wait for `qz_server_is_drained` or a deadline, then
+/// `qz_server_stop`. See `Server.drain`.
+export fn qz_server_drain(handle: ?*anyopaque) void {
+    const ws = getWtServer(handle) orelse return;
+    ws.server.drain();
+}
+
+/// 1 once `qz_server_drain` has left nothing in flight, else 0.
+export fn qz_server_is_drained(handle: ?*anyopaque) i32 {
+    const ws = getWtServer(handle) orelse return 0;
+    return if (ws.server.isDrained()) 1 else 0;
+}
+
+/// Close everything now: every connection gets CONNECTION_CLOSE at once.
 export fn qz_server_stop(handle: ?*anyopaque) void {
     const ws = getWtServer(handle) orelse return;
     ws.server.stop();
@@ -500,6 +531,26 @@ export fn qz_session_close(handle: ?*anyopaque, client_id: u64, session_id: u64)
     session.closeSession(session_id);
 }
 
+/// Ask the client to wind one session down (WT_DRAIN_SESSION), closing
+/// nothing.
+export fn qz_session_drain(handle: ?*anyopaque, client_id: u64, session_id: u64) i32 {
+    const ws = getWtServer(handle) orelse return ERR_INVALID_ARG;
+    const entry = getEntry(ws, client_id) orelse return ERR_INVALID_CLIENT;
+    var session = event_loop.Session{ .entry = entry };
+    session.drainSession(session_id) catch return ERR_INVALID_SESSION;
+    return ERR_OK;
+}
+
+/// `qz_server_drain` for one client's connection: a GOAWAY, and a
+/// WT_DRAIN_SESSION on each of its sessions.
+export fn qz_client_drain(handle: ?*anyopaque, client_id: u64) i32 {
+    const ws = getWtServer(handle) orelse return ERR_INVALID_ARG;
+    const entry = getEntry(ws, client_id) orelse return ERR_INVALID_CLIENT;
+    var session = event_loop.Session{ .entry = entry };
+    session.drainConnection();
+    return ERR_OK;
+}
+
 export fn qz_session_close_error(
     handle: ?*anyopaque,
     client_id: u64,
@@ -545,7 +596,7 @@ export fn qz_stream_send(
     const bytes = cBytes(data, len) orelse return ERR_INVALID_ARG;
     const entry = getEntry(ws, client_id) orelse return ERR_INVALID_CLIENT;
     var session = event_loop.Session{ .entry = entry };
-    session.sendStreamData(stream_id, bytes) catch return ERR_STREAM;
+    session.sendStreamData(stream_id, bytes) catch |err| return sendError(err);
     return ERR_OK;
 }
 
@@ -582,7 +633,7 @@ export fn qz_datagram_send(
     if (session.maxDatagramPayloadSize(session_id)) |max| {
         if (len > max) return ERR_TOO_LARGE;
     }
-    session.sendDatagram(session_id, bytes) catch return ERR_STREAM;
+    session.sendDatagram(session_id, bytes) catch |err| return sendError(err);
     return ERR_OK;
 }
 
@@ -679,7 +730,7 @@ test "c_api: an event too big for the host's buffer doesn't stall the queue" {
     h.onConnectRequest(&s, 0, &big);
     h.onDatagram(&s, 0, &big);
     h.onStreamData(&s, 4, &big, true);
-    h.onSessionClosed(&s, 0, 7, big[0..1024]);
+    h.onSessionClosed(&s, 0, 7, big[0..1024], false);
 
     var buf: [4096]u8 = undefined;
     var got: usize = 0;
@@ -705,11 +756,52 @@ test "c_api: an event too big for the host's buffer doesn't stall the queue" {
     try testing.expectEqual(@as(usize, 0), h.event_queue.len);
 }
 
+test "c_api: an abrupt end is flagged, and a client's sessions all close before it disconnects" {
+    var ws: WtServer = undefined;
+    testServer(&ws);
+    const h = &ws.handler;
+    defer h.deinit();
+    var p: TestPeer = .{};
+    p.init();
+    defer p.deinit();
+    var s = p.session();
+
+    h.onSessionClosed(&s, 0, 9, "bye", false);
+    h.onSessionClosed(&s, 4, 0, "", true);
+    try testing.expectEqual(@as(u32, 1), qz_server_connection_count(&ws)); // the connection lives on
+    h.onConnectionClosed(&s);
+    try testing.expectEqual(@as(u32, 0), qz_server_connection_count(&ws));
+
+    var buf: [256]u8 = undefined;
+    const want = [_]struct { t: EventType, flags: u8, id: u64 }{
+        .{ .t = .session_closed, .flags = 0, .id = 0 },
+        .{ .t = .session_closed, .flags = 1, .id = 4 },
+        .{ .t = .client_disconnected, .flags = 0, .id = 0 },
+    };
+    for (want) |w| {
+        try testing.expect(qz_server_poll(&ws, &buf, buf.len) > 0);
+        try testing.expectEqual(w.t, @as(EventType, @fromBackingInt(buf[0])));
+        try testing.expectEqual(w.flags, buf[1]);
+        try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, buf[8..16], .little));
+        try testing.expectEqual(w.id, std.mem.readInt(u64, buf[16..24], .little));
+    }
+    try testing.expectEqual(@as(u32, 0), qz_server_poll(&ws, &buf, buf.len));
+}
+
+test "c_api: a send on a closed session says so" {
+    try testing.expectEqual(ERR_SESSION_GONE, sendError(error.SessionGone));
+    try testing.expectEqual(ERR_STREAM, sendError(error.StreamNotFound));
+}
+
 test "c_api: NULL from C is refused, not dereferenced" {
     try testing.expectEqual(@as(?*anyopaque, null), qz_server_create(null, 4433, null, null));
     try testing.expectEqual(@as(i32, -1), qz_server_tick(null));
     try testing.expectEqual(@as(u32, 0), qz_server_poll(null, null, 64));
     qz_server_flush(null);
+    qz_server_drain(null);
+    try testing.expectEqual(@as(i32, 0), qz_server_is_drained(null));
+    try testing.expectEqual(ERR_INVALID_ARG, qz_session_drain(null, 1, 0));
+    try testing.expectEqual(ERR_INVALID_ARG, qz_client_drain(null, 1));
     qz_server_stop(null);
     qz_server_destroy(null);
     try testing.expectEqual(@as(u32, 0), qz_server_connection_count(null));
