@@ -653,7 +653,7 @@ const WptHandler = struct {
         session.closeStream(out);
     }
 
-    pub fn onSessionClosed(self: *WptHandler, session: *event_loop.Session, session_id: u64, error_code: u32, reason: []const u8) void {
+    pub fn onSessionClosed(self: *WptHandler, session: *event_loop.Session, session_id: u64, error_code: u32, reason: []const u8, abrupt: bool) void {
         const info = self.session_state.get(keyFor(session, session_id)) orelse return;
         // Log CONNECT stream state for debugging
         var recv_finished: bool = false;
@@ -664,17 +664,18 @@ const WptHandler = struct {
                 send_fin_sent = stream.send.fin_sent;
             }
         }
-        std.log.info("[wpt] session {d} closed (handler={s}, code={d}, reason={s}, recv_fin={}, send_fin={})", .{
-            session_id, @tagName(info.handler), error_code, reason, recv_finished, send_fin_sent,
+        std.log.info("[wpt] session {d} closed (handler={s}, code={d}, reason={s}, abrupt={}, recv_fin={}, send_fin={})", .{
+            session_id, @tagName(info.handler), error_code, reason, abrupt, recv_finished, send_fin_sent,
         });
 
-        // For client-close handler: stash the close info
+        // client-close: stash what arrived for query.py to hand back, as
+        // WPT's handler does, so a client can prove its close reached us.
         if (info.handler == .client_close) {
             const token = info.getToken();
             if (token.len > 0) {
                 var buf: [512]u8 = undefined;
-                const json = std.fmt.bufPrint(&buf, "{{\"close_code\":{d},\"close_reason\":\"{s}\"}}", .{
-                    error_code, reason,
+                const json = std.fmt.bufPrint(&buf, "{{\"close_code\":{d},\"close_reason\":\"{s}\",\"abruptly\":{}}}", .{
+                    error_code, reason, abrupt,
                 }) catch return;
 
                 const key = self.allocator.dupe(u8, token) catch return;

@@ -157,6 +157,13 @@ function webTransportError(code) {
   }
 }
 
+// What a body throws when this browser lacks what it tests: shown as n/a.
+function notApplicable(why) {
+  const e = new Error(why);
+  e.notApplicable = true;
+  return e;
+}
+
 // Safari 26.4 dropped the datagrams.writable attribute for createWritable();
 // Chrome and Firefox still only have writable. Neither is safe to assume.
 function datagramWriter(wt) {
@@ -190,7 +197,7 @@ function compile(body) {
   // they become a function closed over the preamble above.
   return new Function(
     'wtUrl', 'createWT', 'webTransportError', 'datagramWriter',
-    'readStream', 'readStreamText', 'HANDLER',
+    'readStream', 'readStreamText', 'notApplicable', 'HANDLER',
     '"use strict"; return (async () => {' + body + '})();',
   );
 }
@@ -199,7 +206,7 @@ async function runOne(s) {
   HANDLER = s.handler;
   const fn = compile(BODIES[s.id]);
   return Promise.race([
-    fn(wtUrl, createWT, webTransportError, datagramWriter, readStream, readStreamText, HANDLER),
+    fn(wtUrl, createWT, webTransportError, datagramWriter, readStream, readStreamText, notApplicable, HANDLER),
     new Promise((_, rej) => setTimeout(() => rej(new Error('timeout (' + TIMEOUT + 'ms)')), TIMEOUT)),
   ]);
 }
@@ -226,6 +233,11 @@ window.runAll = async function runAll() {
       }
     } catch (e) {
       const msg = e.message || String(e);
+      if (e && e.notApplicable) {
+        mark(s.id, 'pending', 'n/a', msg);
+        log(`N/A ${s.id} ${msg}`);
+        continue;
+      }
       if (expected) {
         xfailed++;
         mark(s.id, 'xfail', '~', msg + '  —  known: ' + expected);

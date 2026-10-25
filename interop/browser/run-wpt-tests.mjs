@@ -97,6 +97,14 @@ function webTransportError(code) {
   }
 }
 
+// What a body throws when this browser lacks what it tests: reported as n/a,
+// so a missing API reads as missing rather than as a pass.
+function notApplicable(why) {
+  const e = new Error(why);
+  e.notApplicable = true;
+  return e;
+}
+
 // Safari 26.4 dropped the datagrams.writable attribute for createWritable();
 // Chrome and Firefox still only have writable. Neither is safe to assume.
 function datagramWriter(wt) {
@@ -137,7 +145,7 @@ async function main() {
     ]);
     document.title = 'PASS:' + (result || 'ok');
   } catch (e) {
-    document.title = 'FAIL:' + (e.message || e);
+    document.title = (e && e.notApplicable ? 'SKIP:' : 'FAIL:') + (e.message || e);
   }
 }
 main();
@@ -146,9 +154,17 @@ main();
 
 // Test definitions come from the shared manifest; this runner only decides
 // which of them this browser is expected to be able to run.
-let passed = 0, failed = 0, xfailed = 0;
+let passed = 0, failed = 0, xfailed = 0, skipped = 0;
 const failures = [];
 const results = [];
+
+// Not run for want of the API: neither a pass nor a failure, whatever the
+// manifest expects.
+function recordSkip(test, detail) {
+  skipped++;
+  console.log(`\x1b[90mN/A\x1b[0m ${detail}`);
+  results.push({ id: test.name, ok: null, not_applicable: true, expected_fail: test.expectFail ?? null, detail });
+}
 
 // A scenario the manifest already marks as failing here is reported but not
 // counted against the run; one that starts passing IS counted, so a stale note
@@ -317,11 +333,13 @@ async function main() {
           if (titleRes === null) throw new Error('safaridriver stopped responding');
           const title = titleRes?.value || '';
           if (title.startsWith('PASS:')) { result = title.slice(5); break; }
+          if (title.startsWith('SKIP:')) { result = { skip: title.slice(5) }; break; }
           if (title.startsWith('FAIL:')) { throw new Error(title.slice(5)); }
         }
         if (result === null) throw new Error('runner timeout');
 
-        record(test, true, result);
+        if (result.skip !== undefined) recordSkip(test, result.skip);
+        else record(test, true, result);
       } catch (err) {
         record(test, false, err.message || String(err));
       }
@@ -355,6 +373,7 @@ async function main() {
             try {
               const title = await page.title();
               if (title.startsWith('PASS:')) return resolve(title.slice(5));
+              if (title.startsWith('SKIP:')) return resolve({ skip: title.slice(5) });
               if (title.startsWith('FAIL:')) return reject(new Error(title.slice(5)));
             } catch (e) { /* page might be navigating */ }
             setTimeout(check, 100);
@@ -362,7 +381,8 @@ async function main() {
           check();
         });
 
-        record(test, true, result);
+        if (result.skip !== undefined) recordSkip(test, result.skip);
+        else record(test, true, result);
       } catch (err) {
         record(test, false, err.message || String(err));
         if (consoleLogs.length) {
@@ -381,7 +401,8 @@ async function main() {
 
   console.log(`\n${'─'.repeat(50)}`);
   const xf = xfailed ? `  \x1b[33m${xfailed} expected-fail\x1b[0m` : '';
-  console.log(`  \x1b[32m${passed} passed\x1b[0m  \x1b[31m${failed} failed\x1b[0m${xf}`);
+  const na = skipped ? `  \x1b[90m${skipped} n/a\x1b[0m` : '';
+  console.log(`  \x1b[32m${passed} passed\x1b[0m  \x1b[31m${failed} failed\x1b[0m${xf}${na}`);
   if (process.env.RESULTS_JSON) {
     fs.writeFileSync(process.env.RESULTS_JSON, JSON.stringify({ runner: browserType, results }, null, 2));
   }

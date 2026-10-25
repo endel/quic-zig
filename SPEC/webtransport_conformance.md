@@ -68,6 +68,11 @@ scenario reports `XFAIL` and does not fail the run; one that *starts passing*
 reports `XPASS` and **does** fail it, so a stale note gets noticed instead of
 outliving the bug it describes.
 
+A body that finds the browser lacks what it tests throws `notApplicable(why)`
+and reports `N/A`, which is neither a pass nor a failure. Without that,
+`server-drain` passed on a Firefox with no `draining` at all: `await undefined`
+resolves at once.
+
 The handler paths mirror the Python handlers in
 [web-platform-tests/wpt/webtransport/handlers][wpt], so the lineage stays
 legible; `apps/wpt_server.zig` implements them in Zig.
@@ -78,13 +83,16 @@ legible; `apps/wpt_server.zig` implements them in Zig.
 
 September 2026. Chrome 146, Firefox 148, Safari 26.4, Safari Technology
 Preview 27.0. Four Safari runs and three Preview runs, because a single Safari
-run is weak evidence either way — see *Flakiness*.
-✓ pass · ✗ fail · ~ expected failure (reason recorded in the manifest).
+run is weak evidence either way — see *Flakiness*. Two rows were corrected in
+October, after their bodies were found to pass on nothing; see
+*October 2026 re-run* below.
+✓ pass · ✗ fail · ~ expected failure (reason recorded in the manifest) ·
+n/a the browser lacks the API · ? needs a re-run since the body changed.
 
 | Scenario | Zig | Chrome | Firefox | Safari&nbsp;26.4 | STP&nbsp;27.0 |
 |---|:--:|:--:|:--:|:--:|:--:|
 | connect-echo | ✓ | ✓ | ✓ | ✓ | ✓ |
-| client-close-code | ✓ | ✓ | ✓ | ✓ | ✓ |
+| client-close-code | ✓ | ✓ | ✓ | ? | ? |
 | server-close-code0 | ✓ | ✓ | ✓ | ✓ | ✓ |
 | server-close-code42 | ✓ | ✓ | ✓ | ✓ | ✓ |
 | server-close-code3999 | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -101,16 +109,60 @@ run is weak evidence either way — see *Flakiness*.
 | server-abort-stream | ✓ | ✓ | ✓ | ✓ | ✓ |
 | client-abort-stream | ✓ | ✓ | ✓ | ✓ | ✓ |
 | server-stop-sending | ✓ | ✓ | ✓ | ✓* | ✓* |
-| server-drain | ✓ | n/a | ✓ | ✓ | ~ |
+| server-drain | ✓ | n/a | n/a | ✓ | ~ |
 | wt-protocol-negotiation | ✓ | ✓ | ~ | ✓ | ✓ |
-| **Total** | **20/20** | **19/19** | **18/18 + 2~** | **18-19/19 + 1~** | **17-19/19 + 1~** |
+| **Total** | **20/20** | **19/19** | **17/17 + 2~** | **17-18/18 + 1~ + 1?** | **16-18/18 + 1~ + 1?** |
 
 \* Passed in some runs and failed in others against an unchanged server — see
 *Flakiness* below. `server-stop-sending` is a coin flip under both Safari
 builds; the others moved once each.
 
-`server-drain` is not run under Chrome: `WebTransport.draining` lands in Firefox
-155 and Safari 26.4 and does not exist in Chrome at all.
+`WebTransport.draining` exists in Safari 26.4, Firefox 155 and Chrome 158; the
+September columns predate all but Safari's, so those cells are n/a. The Firefox
+cell used to read ✓, but that pass was vacuous: Firefox 148 has no attribute.
+
+### October 2026 re-run
+
+Two scenarios changed so they cannot pass on nothing:
+
+- **`client-close-code`** used to check only the page's own `closed`, which
+  resolves with the page's own closeInfo whatever reaches the wire. It now
+  connects to `client-close.py?token=…`, where the server stashes the close it
+  received, and reads that back through `query.py` (both sides, Zig and
+  browser). This matters for Safari: wpt.fyi shows Safari 26.5–27.0 never
+  delivering a page's close to the server at all (it passes in STP 255), so
+  the Safari and Preview ✓ above are unproven and marked ?.
+- **`server-drain`** reports n/a when `draining` is absent, and is now run
+  under Chrome too.
+
+Re-run headless (Chrome `--headless=new` or chrome-headless-shell, Firefox
+`-headless`), the whole suite, against a server with the CONNECT-stream
+changes in [DRAFT_IETF_WEBTRANS_HTTP3_13.md](DRAFT_IETF_WEBTRANS_HTTP3_13.md#session-termination-6).
+Safari was not run.
+
+| Scenario | Zig | Chrome 155 | Chrome 158.0.8117.2 (dev) | Chrome 158.0.8123.0 (canary) | Firefox 148.0.2 | Firefox 158.0.1 |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|
+| client-close-code | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| server-drain | ✓ | n/a | n/a | ✓ | n/a | ~ (times out) |
+| uni-multiple-streams | ✓ | ✓ | ✓ | ✓ | ~ (2 of 5) | XPASS |
+| wt-protocol-negotiation | ✓ | ✓ | ✓ | ✓ | ~ | XPASS |
+| the other 16 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+- **Chrome's `draining` arrives between 158 builds.** The dev build has no
+  attribute; canary has it and resolves it on the `WT_DRAIN_SESSION` capsule
+  alone. Chrome 158 ships 2026-11-17.
+- **Firefox 155+ never resolves `draining` on the capsule.** neqo knows only
+  `WT_CLOSE_SESSION` and drops `WT_DRAIN_SESSION` as an unknown capsule; it
+  resolves `draining` on GOAWAY only. A server that wants Firefox to see a
+  drain has to send GOAWAY, which drains every session on the connection.
+  Recorded as `expect_fail` for Firefox; 148 reports n/a.
+- **The two Firefox XPASSes are expected.** The notes are kept for the
+  harness's pinned Firefox 148 (Puppeteer 24.39.1); run with a newer one and
+  they fail the run until the pin moves past 155.
+- **Firefox reports `streamErrorCode` as `undefined`** in `server-abort-stream`
+  and `server-stop-sending`, 148 and 158 alike. The bodies accept that because
+  Safari does the same, so those two cells say a reset arrived, not that its
+  code survived.
 
 ### What changed for Safari
 
@@ -166,12 +218,16 @@ the Zig client 1199. Preview has fixed it.
 **Preview, `server-drain`.** Described above; the one stable Preview gap.
 
 **Firefox, `uni-multiple-streams`.** Firefox 148 surfaces only 2 of the 5 server
-uni streams. Chrome and the Zig client receive all five from the same server,
-and Firefox granted `max_uni=100`, so this is not stream credit. Firefox 155 may
-fix it; re-run when it is the installed version.
+uni streams. This is [bug 2046262](https://bugzilla.mozilla.org/show_bug.cgi?id=2046262):
+the incoming-streams `ReadableStream` stopped pulling whenever a stream was
+already queued, so a backlog of uni or bidi streams stalled at two. Fixed in
+153; 158.0.1 receives all five.
 
 **Firefox, `wt-protocol-negotiation`.** `WebTransport.protocol` lands in Firefox
-155; 148 leaves it `undefined`.
+155; 148 leaves it `undefined`. 158.0.1 passes.
+
+**Firefox, `server-drain`.** See the October re-run: 155+ has `draining` but
+resolves it only on GOAWAY.
 
 ### Flakiness worth knowing about
 

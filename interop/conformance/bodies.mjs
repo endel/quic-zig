@@ -6,7 +6,10 @@
 //
 // A body is source text, not a function: the automated runner injects it into a
 // page it generates. The preamble there defines wtUrl, createWT, readStream,
-// readStreamText, datagramWriter, webTransportError and HANDLER.
+// readStreamText, datagramWriter, webTransportError, notApplicable and HANDLER.
+//
+// A body that finds the browser lacks what it tests throws notApplicable(why)
+// rather than passing on nothing; runners count that as neither pass nor fail.
 
 export const BODIES = {
   'connect-echo': `
@@ -18,13 +21,35 @@ export const BODIES = {
   `,
 
   'client-close-code': `
-    const wt = createWT(HANDLER);
+    // 'closed' resolves with the page's own closeInfo whatever reaches the
+    // wire, so the server's record is the evidence: client-close.py stashes
+    // the close it saw under this token, and query.py hands it back.
+    const token = 'cc-' + Math.random().toString(36).slice(2);
+    const wt = createWT(HANDLER + '?token=' + token);
     await wt.ready;
     wt.close({ closeCode: 7, reason: 'done' });
     const info = await wt.closed;
     if (info.closeCode !== 7) throw new Error('code=' + info.closeCode);
     if (info.reason !== 'done') throw new Error('reason=' + info.reason);
-    return 'ok';
+    // 'closed' can resolve before the capsule lands: ask until it has.
+    let seen = {};
+    for (let i = 0; i < 20 && seen.close_code === undefined; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 100));
+      const q = createWT('query.py?token=' + token);
+      q.closed.catch(() => {});
+      await q.ready;
+      const reader = q.incomingUnidirectionalStreams.getReader();
+      const { value } = await reader.read();
+      reader.releaseLock();
+      seen = JSON.parse(await readStreamText(value));
+      q.close();
+    }
+    if (seen.close_code === undefined) throw new Error('server recorded no close');
+    if (seen.abruptly) throw new Error('server saw an abrupt close');
+    if (seen.close_code !== 7 || seen.close_reason !== 'done') {
+      throw new Error('server saw ' + JSON.stringify(seen));
+    }
+    return 'ok (server saw ' + seen.close_code + ' "' + seen.close_reason + '")';
   `,
 
   'server-close-code0': `
@@ -282,6 +307,11 @@ export const BODIES = {
   'server-drain': `
     const wt = createWT(HANDLER);
     await wt.ready;
+    // Without the attribute, 'await wt.draining' resolves at once on undefined.
+    if (!('draining' in wt)) {
+      wt.close();
+      throw notApplicable('no WebTransport.draining');
+    }
     await wt.draining;
     // Draining is a warning, not a close: the session must still work.
     const s = await wt.createBidirectionalStream();
