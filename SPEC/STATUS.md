@@ -444,10 +444,11 @@ cross-impl byte-exact UTF-8 header check.
 | — | Stream error code remapping | ✅ Done | appErrorCodeToH3() maps 32-bit codes to H3 range, resetStream() API |
 | — | H3_ID_ERROR validation | ✅ Done | Invalid session IDs (not client-initiated bidi) close connection |
 | — | H3_MESSAGE_ERROR post-close | ✅ Done | Bytes after a received WT_CLOSE_SESSION, a truncated or malformed capsule, or a close reason past 1024 bytes or not UTF-8, reset the CONNECT stream. Unknown capsule types are dropped |
-| — | Session termination by the CONNECT stream (§6) | ✅ Done | A bare FIN is a close with code 0 and is answered with a FIN; a RESET_STREAM or STOP_SENDING ends the session as `abrupt`. Reasons sent are cut at a UTF-8 boundary; nothing but the capsule and FIN follows our close. `SPEC/DRAFT_IETF_WEBTRANS_HTTP3_13.md` |
+| — | Session termination by the CONNECT stream (§6) | ✅ Done | A bare FIN is a close with code 0 and is answered with a FIN; a RESET_STREAM or STOP_SENDING ends the session as `abrupt`. Reasons sent are cut at a UTF-8 boundary; nothing but the capsule and FIN follows our close. A terminated session takes no new stream or datagram (`error.SessionGone`), and all its streams are reset, a FIN already sent included. A connection's end reports each session once, by its id. `SPEC/DRAFT_IETF_WEBTRANS_HTTP3_13.md` |
+| — | Connection close after the last session | ✅ Done | GOAWAY, then CONNECTION_CLOSE(H3_NO_ERROR) once the peer has ended its CONNECT streams and acked ours, or 3 PTO; `wt_close_after_sessions`. Chrome leaves such a connection silently |
 | — | Application-protocol negotiation | ✅ Done | draft-13 §3.3 `WT-Available-Protocols` / `WT-Protocol`, RFC 8941 structured fields (`src/webtransport/protocol.zig`). The older `sec-webtransport-protocol` spelling survives only in the interop apps |
 | — | Session prioritization | ✅ Done | Priority header on CONNECT parsed by H3 layer, PRIORITY_UPDATE frames supported |
-| — | GOAWAY → session interaction | ✅ Done | H3 GOAWAY triggers session_draining events for active WT sessions |
+| — | GOAWAY → session interaction | ✅ Done | A GOAWAY or a WT_DRAIN_SESSION drains a session, reported once per session whichever came. `Server.drain` / `Session.drainConnection` send both, the GOAWAY once each session's 200 is acked |
 | — | Capsules ride in H3 DATA frames | ✅ Done | RFC 9297 §3.2. Sent bare until Sep 2026, which cost every browser the close code |
 | — | Peer RESET_STREAM / STOP_SENDING reported | ✅ Done | `stream_reset` / `stream_stop_sending` events, `onStreamReset` / `onStopSending` callbacks; codes mapped back with `h3ToAppErrorCode` |
 | — | Send backpressure | ✅ Done | `sendCapacity` / `streamSendCapacity` report the peer's remaining credit — QUIC MAX_DATA and MAX_STREAM_DATA, narrowed by WT_MAX_DATA where it binds. `notifyWritable` asks for one `writable` event (`onWritable`) when it rises. Advisory, like a browser `WritableStream`: a write past it is buffered |
@@ -455,11 +456,11 @@ cross-impl byte-exact UTF-8 header check.
 | — | draft-13 §5.5 initial credits in SETTINGS | ⚠️ Partial | `WT_INITIAL_MAX_DATA` / `_STREAMS_BIDI` / `_STREAMS_UNI` serialize and are configurable, but are **not advertised by default**: Safari 26.4 refuses the session outright when it sees them. The same credit reaches every peer as a capsule instead — `SPEC/DRAFT_IETF_WEBTRANS_HTTP3_13.md` |
 | — | RESET_STREAM_AT reliable reset | ❌ Missing | Needed by draft-13; `TODO.md` I5 |
 
-### Summary — WebTransport: 21 done, 1 partial, 2 missing
+### Summary — WebTransport: 22 done, 1 partial, 2 missing
 
 | Status | Count |
 |--------|-------|
-| ✅ Done | 21 |
+| ✅ Done | 22 |
 | ⚠️ Partial | 1 |
 | ❌ Missing | 2 |
 
@@ -583,7 +584,7 @@ Track at: https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
 | RFC 9221 (QUIC DG) | 3 | 0 | 0 | 100% |
 | RFC 9368 (Version Neg) | 3 | 0 | 0 | 100% |
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
-| WebTransport | 21 | 1 | 2 | 88% |
+| WebTransport | 22 | 1 | 2 | 88% |
 | RFC 6455 (WebSocket, server) | 6 | 0 | 2 | 75% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
 | MoQ Transport (draft-17, -18) | 15 | 1 | 0 | see below |

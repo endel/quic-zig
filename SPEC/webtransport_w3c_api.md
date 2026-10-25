@@ -95,7 +95,7 @@ Firefox and Safari have these; Chrome does not.
 
 | W3C member | quic-zig | verdict |
 |---|---|---|
-| `draining` | `onSessionDraining`; server-side `Session.drainSession` **added** | done. Chrome has it from 158. Firefox resolves it only on GOAWAY, not on `WT_DRAIN_SESSION` (conformance `server-drain`) |
+| `draining` | `onSessionDraining`, once per session whichever signal; server-side `Session.drainSession`, `Session.drainConnection` and `Server.drain` | done. Chrome has it from 158, on either signal. Firefox resolves it only on GOAWAY (conformance `server-drain`, `server-goaway`); Playwright's WebKit 2370 only on `WT_DRAIN_SESSION`, and not on one in the 200's flight |
 | `sendOrder` | `openBidiStream(…, send_order)`, `setSendOrder` | already had it |
 | `createSendGroup()` / `sendGroup` | — | **skip**: grouping is a local scheduling hint with no wire form, and nothing downstream of us asks for one |
 | `congestionControl` | — | **skip**: a hint, and we already choose our own controller |

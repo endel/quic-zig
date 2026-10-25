@@ -5,6 +5,7 @@
 #   ./tools/wt_conformance.sh --firefox       # ... and Firefox
 #   ./tools/wt_conformance.sh --safari        # ... and Safari
 #   ./tools/wt_conformance.sh --safari-preview # ... and Safari Technology Preview
+#   ./tools/wt_conformance.sh --webkit        # ... and Playwright's WebKit, headless
 #   ./tools/wt_conformance.sh --zig-only      # no browser needed (this is CI's leg)
 #
 # Scenarios live in interop/conformance/scenarios.json. Both runners refuse to
@@ -23,6 +24,7 @@ for arg in "$@"; do
     --firefox) BROWSERS+=(firefox) ;;
     --safari)  BROWSERS+=(safari) ;;
     --safari-preview) BROWSERS+=(safari-preview) ;;
+    --webkit)  BROWSERS+=(webkit) ;;
     --zig-only) ZIG_ONLY=1 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
@@ -58,6 +60,7 @@ if [ "$ZIG_ONLY" = 0 ]; then
     [ "$b" = firefox ] && flag=--firefox
     [ "$b" = safari ] && flag=--safari
     [ "$b" = safari-preview ] && flag=--safari-preview
+    [ "$b" = webkit ] && flag=--webkit
     RESULTS_JSON="$OUT/$b.json" WT_SERVER="127.0.0.1:$PORT" \
       node interop/browser/run-wpt-tests.mjs $flag | tee "$OUT/$b.txt" || status=1
   done

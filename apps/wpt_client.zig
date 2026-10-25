@@ -48,6 +48,7 @@ const Scenario = enum {
     client_abort_stream,
     server_stop_sending,
     server_drain,
+    server_goaway,
     wt_protocol_negotiation,
 
     fn idOf(self: Scenario, buf: []u8) []const u8 {
@@ -102,6 +103,9 @@ const Runner = struct {
     reset_code: ?u32 = null,
     stop_code: ?u32 = null,
     draining: bool = false,
+    /// Which drain signals came: server-goaway wants both.
+    drain_by_goaway: bool = false,
+    drain_by_capsule: bool = false,
     negotiated: std.ArrayList(u8),
     closed_code: ?u32 = null,
     closed_reason: std.ArrayList(u8),
@@ -248,6 +252,11 @@ const Runner = struct {
             // cannot carry a reset code back.
             .client_abort_stream => self.openAndSend(session, "x"),
 
+            // The server drains the connection when asked, once the session is up.
+            .server_goaway => session.sendDatagram(session_id, "drain") catch |e| {
+                self.fail("sendDatagram failed: {any}", .{e});
+            },
+
             .wt_protocol_negotiation => {
                 if (self.negotiated.items.len == 0) {
                     self.fail("server named no protocol", .{});
@@ -358,11 +367,23 @@ const Runner = struct {
 
     pub fn onSessionDraining(self: *Runner, session: *event_loop.ClientSession, _: u64) void {
         self.draining = true;
-        if (self.scenario == .server_drain) {
-            // Draining is a warning, not a close: the session must still work.
-            self.openAndSend(session, "still here");
-            if (self.outcome == null) self.pass("ok", .{});
+        switch (self.scenario) {
+            .server_drain => {
+                // Draining is a warning, not a close: the session must still work.
+                self.openAndSend(session, "still here");
+                if (self.outcome == null) self.pass("ok", .{});
+            },
+            .server_goaway => self.openAndSend(session, "still here"),
+            else => {},
         }
+        self.noteDrainSignals(session);
+    }
+
+    fn noteDrainSignals(self: *Runner, session: *event_loop.ClientSession) void {
+        const wtc = session.wt_conn orelse return;
+        const s = wtc.getSession(self.session_id) orelse return;
+        self.drain_by_goaway = s.drain_by_goaway;
+        self.drain_by_capsule = s.drain_by_capsule;
     }
 
     pub fn onSessionClosed(
@@ -371,12 +392,18 @@ const Runner = struct {
         _: u64,
         error_code: u32,
         reason: []const u8,
+        abrupt: bool,
     ) void {
         self.closed_code = error_code;
         self.closed_reason.clearRetainingCapacity();
         self.closed_reason.appendSlice(self.alloc, reason) catch {};
         if (self.readback) return self.fail("query session closed (code={d})", .{error_code});
 
+        // A browser rejects `closed` on an abrupt end and resolves it otherwise.
+        if (self.scenario == .server_connection_close) {
+            return if (abrupt) self.pass("ok: ended abruptly", .{}) else self.fail("closed cleanly instead of abruptly", .{});
+        }
+        if (abrupt) return self.fail("session ended abruptly", .{});
         switch (self.scenario) {
             .connect_echo => self.pass("ok", .{}),
             .client_close_code => self.expectCloseInfo(7, "done"),
@@ -416,6 +443,7 @@ const Runner = struct {
 
     pub fn onPollComplete(self: *Runner, session: *event_loop.ClientSession) void {
         if (self.outcome != null or !self.ready) return;
+        if (self.draining) self.noteDrainSignals(session);
 
         // Reset only once the peer has acknowledged the stream header,
         // otherwise RESET_STREAM lets it discard a stream it never surfaced.
@@ -455,6 +483,11 @@ const Runner = struct {
                 const id = self.firstOpened() orelse return;
                 if (!self.finished.contains(id)) return;
                 self.expectEql(self.bytesOf(id), "hello");
+            },
+            .server_goaway => {
+                const id = self.firstOpened() orelse return;
+                if (!self.finished.contains(id) or !self.drain_by_goaway or !self.drain_by_capsule) return;
+                self.expectEql(self.bytesOf(id), "still here");
             },
             .bidi_echo_3_streams => {
                 if (self.opened.items.len < 3) return;
@@ -722,6 +755,7 @@ fn handlerFor(scenario: Scenario) []const u8 {
         .client_abort_stream => "abort-echo.py",
         .server_stop_sending => "stop-sending.py?code=19",
         .server_drain => "server-drain.py",
+        .server_goaway => "server-drain.py?goaway=1",
     };
 }
 

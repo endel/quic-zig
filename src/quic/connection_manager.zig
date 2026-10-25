@@ -127,6 +127,9 @@ pub const ConnEntry = struct {
     /// promises nothing, so it goes out at once; this one names the last
     /// request served and waits a PTO for requests already in flight.
     drain_final_goaway_at: ?i64 = null,
+    /// While a drain holds its first GOAWAY back until the peer has acked
+    /// what its CONNECT streams carry: when it goes regardless.
+    drain_goaway_due: ?i64 = null,
 
     // For raw QUIC protocol: track streams whose fin has been delivered to handler
     finished_streams: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,

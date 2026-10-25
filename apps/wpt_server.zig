@@ -76,6 +76,11 @@ const WptHandler = struct {
         /// `?code=` from the path, for handlers that act on stream events
         /// rather than on a deferred tick.
         arg_code: u32 = 0,
+        /// server-drain `?goaway=1`: drain the whole connection, GOAWAY and
+        /// all, once the page's first datagram asks, rather than send the
+        /// session's capsule alone at once. A GOAWAY close behind the 200 is
+        /// a case of its own: it can crash Firefox 158 (see `beginDrain`).
+        drain_goaway: bool = false,
         /// server-create-multiple-streams: how many uni streams are still owed
         /// and which index comes next. A peer's initial MAX_STREAMS credit can
         /// be as low as a handful — Firefox 148 grants five, three of which the
@@ -312,6 +317,7 @@ const WptHandler = struct {
         if (getQueryParam(path, "code")) |code| {
             info.arg_code = std.fmt.parseInt(u32, code, 10) catch 0;
         }
+        info.drain_goaway = std.mem.eql(u8, getQueryParam(path, "goaway") orelse "0", "1");
 
         // Extract token if present
         if (getQueryParam(path, "token")) |token| {
@@ -368,11 +374,11 @@ const WptHandler = struct {
                 // Trigger a QUIC keepalive to ensure processConnections runs again soon
                 session.sendKeepAlive();
             },
-            .server_connection_close, .server_drain => {
-                if (self.session_state.getPtr(keyFor(session, session_id))) |si| {
+            .server_connection_close, .server_drain => if (self.session_state.getPtr(keyFor(session, session_id))) |si| {
+                if (!si.drain_goaway) {
                     si.deferred_ticks = 1;
+                    session.sendKeepAlive();
                 }
-                session.sendKeepAlive();
             },
             .server_create_multiple_streams => {
                 const count_str = getQueryParam(path, "count") orelse "5";
@@ -565,7 +571,8 @@ const WptHandler = struct {
         });
 
         switch (info.handler) {
-            .echo, .echo_raw => {
+            // A drained session still carries streams; the scenarios prove it.
+            .echo, .echo_raw, .server_drain => {
                 if (isUniStream(stream_id)) {
                     // Unidirectional: echo on a single outgoing uni stream per incoming stream.
                     const out_id: ?u64 = self.uni_echo_streams.get(keyFor(session, stream_id)) orelse blk: {
@@ -628,6 +635,7 @@ const WptHandler = struct {
                 // Echo datagram back as-is
                 session.sendDatagram(session_id, data) catch {};
             },
+            .server_drain => if (info.drain_goaway) session.drainConnection(),
             .echo_datagram_length => {
                 // Reply with the length we saw, which catches truncation that
                 // an identical echo would hide.
@@ -697,6 +705,21 @@ const WptHandler = struct {
         }
 
         _ = self.session_state.remove(keyFor(session, session_id));
+    }
+
+    /// Its entry is freed after this, and the next connection may get the
+    /// same address: nothing keyed by it may outlive it.
+    pub fn onConnectionClosed(self: *WptHandler, session: *event_loop.Session) void {
+        std.log.info("[wpt] connection {d} closed", .{session.id()});
+        const conn = @intFromPtr(session.entry);
+        inline for (.{ &self.session_state, &self.uni_echo_streams }) |map| {
+            var it = map.keyIterator();
+            while (it.next()) |k| {
+                if (k.conn != conn) continue;
+                _ = map.remove(k.*);
+                it = map.keyIterator(); // removal invalidates the iterator
+            }
+        }
     }
 
     pub fn onSessionDraining(self: *WptHandler, _: *event_loop.Session, session_id: u64) void {
@@ -788,7 +811,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("  /webtransport/handlers/abort-stream-from-server.py?code=N\n", .{});
     std.debug.print("  /webtransport/handlers/server-connection-close.py\n", .{});
     std.debug.print("  /webtransport/handlers/server-read-then-close.py\n", .{});
-    std.debug.print("  /webtransport/handlers/server-drain.py\n", .{});
+    std.debug.print("  /webtransport/handlers/server-drain.py[?goaway=1]\n", .{});
     std.debug.print("  /webtransport/handlers/stop-sending.py?code=N\n", .{});
     std.debug.print("  /webtransport/handlers/abort-echo.py\n", .{});
     std.debug.print("  /webtransport/handlers/echo-datagram-length.py\n", .{});

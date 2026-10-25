@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 /**
  * Automated WPT WebTransport test runner.
- * Launches Chrome via Puppeteer, serves a test page, collects results.
+ * Launches a browser, serves a test page, collects results: Chrome or Firefox
+ * through Puppeteer, headless; Safari or Technology Preview through
+ * safaridriver; WebKit through Playwright, headless.
  *
  * Usage:
  *   # Start server first:  ./zig-out/bin/wpt-server
- *   node interop/browser/run-wpt-tests.mjs [--filter <pattern>]
+ *   node interop/browser/run-wpt-tests.mjs [--firefox|--safari|--safari-preview|--webkit] [--filter <pattern>]
+ *
+ * PUPPETEER_EXECUTABLE_PATH picks the Chrome or Firefox build. The browser's
+ * version decides which expect_fail notes apply.
  */
 import puppeteer from 'puppeteer';
 import { execSync } from 'child_process';
@@ -15,7 +20,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
-import { MANIFEST, BODIES, assertComplete, scenariosFor } from '../conformance/scenarios.mjs';
+import { MANIFEST, BODIES, assertComplete, scenariosFor, expectFailFor } from '../conformance/scenarios.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_URL = process.env.WT_SERVER || '127.0.0.1:4433';
@@ -32,6 +37,7 @@ for (let i = 0; i < args.length; i++) {
   if (args[i] === '--firefox') browserType = 'firefox';
   if (args[i] === '--safari') browserType = 'safari';
   if (args[i] === '--safari-preview') browserType = 'safari-preview';
+  if (args[i] === '--webkit') browserType = 'webkit';
 }
 
 // An expired cert fails every test identically, which reads as a protocol
@@ -192,9 +198,19 @@ const TESTS = scenariosFor(browserType).map((s) => ({
   name: s.id,
   handler: s.handler,
   title: s.title,
-  expectFail: s.expect_fail?.[browserType] ?? null,
+  scenario: s,
+  expectFail: null, // set once the browser's version is known
   code: BODIES[s.id],
 }));
+
+/// The browser's dotted version, out of whatever its driver reports:
+/// "HeadlessChrome/158.0.8123.0", "firefox/148.0.2", "27.2".
+let browserVersion = null;
+function setVersion(reported) {
+  browserVersion = String(reported ?? '').match(/\d+(\.\d+)*/)?.[0] ?? null;
+  console.log(`Version:   ${browserVersion ?? 'unknown'} (${reported ?? 'not reported'})`);
+  for (const t of TESTS) t.expectFail = expectFailFor(t.scenario, browserType, browserVersion);
+}
 
 async function main() {
   // Start a simple HTTP server to serve test pages
@@ -220,6 +236,11 @@ async function main() {
   let browser;
   if (safari) {
     // nothing to launch
+  } else if (browserType === 'webkit') {
+    // Playwright's WebKit build, on the OS's Network.framework as Safari is.
+    // Headless: each page is a borderless window parked off every display.
+    const { webkit } = await import('playwright-core');
+    browser = await webkit.launch({ headless: true });
   } else if (browserType === 'firefox') {
     // Firefox needs the CA cert imported into a profile.
     // Create a temp profile, import cert, then launch.
@@ -261,6 +282,8 @@ async function main() {
       ],
     });
   }
+
+  if (browser) setVersion(await browser.version());
 
   const testsToRun = filterArg
     ? TESTS.filter(t => t.name.includes(filterArg))
@@ -311,6 +334,7 @@ async function main() {
         capabilities: { alwaysMatch: { browserName: preview ? 'Safari Technology Preview' : 'safari' } },
       });
       const sid = sessRes?.value?.sessionId;
+      if (sid && browserVersion === null) setVersion(sessRes.value.capabilities?.browserVersion);
       if (!sid) {
         // safaridriver's own message is the useful one — it names the setting
         // that is off, and Technology Preview has its own copy of it.
@@ -353,7 +377,8 @@ async function main() {
 
     driverProc.kill();
   } else {
-    // Chrome/Firefox: use Puppeteer
+    // Chrome/Firefox through Puppeteer, WebKit through Playwright: the page
+    // calls used here are the same in both.
     for (const test of testsToRun) {
       process.stdout.write(`  ${test.name} ... `);
       const page = await browser.newPage();
@@ -404,7 +429,7 @@ async function main() {
   const na = skipped ? `  \x1b[90m${skipped} n/a\x1b[0m` : '';
   console.log(`  \x1b[32m${passed} passed\x1b[0m  \x1b[31m${failed} failed\x1b[0m${xf}${na}`);
   if (process.env.RESULTS_JSON) {
-    fs.writeFileSync(process.env.RESULTS_JSON, JSON.stringify({ runner: browserType, results }, null, 2));
+    fs.writeFileSync(process.env.RESULTS_JSON, JSON.stringify({ runner: browserType, version: browserVersion, results }, null, 2));
   }
   if (failures.length) {
     console.log('\n  Failures:');

@@ -197,6 +197,8 @@ pub const Server = struct {
     started: bool = false,
     draining: bool = false,
     stopping: bool = false,
+    /// `listen_fd` is open and watched; `drain` closes it.
+    listening: bool = true,
 
     /// Opens and binds the listening socket; nothing runs until `start`.
     pub fn init(alloc: std.mem.Allocator, config: Config, opts: ListenOptions) !Server {
@@ -240,13 +242,17 @@ pub const Server = struct {
         self.started = true;
     }
 
-    /// Stop taking new work: requests in flight finish and their connections
-    /// close, idle keep-alive connections close now, new connections are
-    /// closed on accept. WebSockets stay open until the handler or the peer
-    /// closes them, as WebTransport sessions do under drain.
+    /// Stop taking new work, closing nothing in use. The listening socket
+    /// closes, so new connections are refused by the kernel, or under
+    /// `reuse_port` go to another listener on the port, rather than being
+    /// accepted only to be closed. Requests in flight finish, answered with
+    /// `Connection: close`; idle keep-alive connections close now, as
+    /// RFC 9112 §9.6 lets a server; WebSockets stay open until the handler or
+    /// the peer closes them, as WebTransport sessions do under drain.
     pub fn drain(self: *Server) void {
         if (self.draining or self.stopping) return;
         self.draining = true;
+        self.closeListener();
         var it = self.conns;
         while (it) |c| {
             it = c.next;
@@ -254,14 +260,42 @@ pub const Server = struct {
         }
     }
 
-    /// True once no HTTP request is in flight.
+    /// True once no HTTP request is in flight and no WebSocket is open.
     pub fn isDrained(self: *const Server) bool {
         var it = self.conns;
         while (it) |c| : (it = c.next) {
-            if (!c.isIdle()) return false;
+            if (!c.isIdle() or c.phase == .ws_open or c.phase == .ws_closing) return false;
         }
         return true;
     }
+
+    /// Take the listening socket's watch off the loop, and close the socket
+    /// once it is off: epoll would find it gone otherwise.
+    fn closeListener(self: *Server) void {
+        if (!self.listening) return;
+        self.listening = false;
+        if (!self.started or self.poll_c.state() == .dead) return self.closeListenFd();
+        self.poll_cancel_c = .{
+            .op = .{ .cancel = .{ .c = &self.poll_c } },
+            .userdata = self,
+            .callback = onListenerCancelled,
+        };
+        self.loop.add(&self.poll_cancel_c);
+    }
+
+    fn onListenerCancelled(ud: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, _: xev.Result) xev.CallbackAction {
+        const self: *Server = @ptrCast(@alignCast(ud.?));
+        self.closeListenFd();
+        return .disarm;
+    }
+
+    fn closeListenFd(self: *Server) void {
+        if (self.listen_fd == closed_fd) return;
+        sys.close(self.listen_fd);
+        self.listen_fd = closed_fd;
+    }
+
+    const closed_fd: posix.socket_t = -1;
 
     /// Stop accepting and end every connection: each open WebSocket gets a
     /// Close with 1001 (sent if the socket takes it at once) and
@@ -271,7 +305,8 @@ pub const Server = struct {
         if (self.stopping) return;
         self.stopping = true;
         if (!self.started) return;
-        xev_backend.cancelCompletion(self.loop, &self.poll_c, &self.poll_cancel_c);
+        // After a drain, its own cancel took the watch.
+        if (self.listening) xev_backend.cancelCompletion(self.loop, &self.poll_c, &self.poll_cancel_c);
         var it = self.conns;
         while (it) |c| {
             it = c.next;
@@ -301,7 +336,7 @@ pub const Server = struct {
             }
             self.timers.deinit();
         }
-        sys.close(self.listen_fd);
+        self.closeListenFd();
     }
 
     /// Take in a WebSocket another server let go of (`WsConn.handOver`) and
@@ -324,6 +359,7 @@ pub const Server = struct {
 
     /// The TCP port the listener is bound to.
     pub fn port(self: *const Server) u16 {
+        if (self.listen_fd == closed_fd) return 0;
         var addr: net.Address = undefined;
         var len: posix.socklen_t = @sizeOf(net.Address);
         if (std.c.getsockname(self.listen_fd, &addr.any, &len) != 0) return 0;
@@ -362,9 +398,11 @@ pub const Server = struct {
 
     fn onListenReadable(ud: ?*Server, _: *xev.Loop, c: *xev.Completion, _: xev.File, r: xev.PollError!xev.PollEvent) xev.CallbackAction {
         xev_backend.forgetPollResult(c);
-        _ = r catch return .rearm;
         const self = ud orelse return .disarm;
-        if (self.stopping) return xev_backend.halted_poll_action;
+        // Before the result: kqueue hands a cancelled watch its error, and
+        // rearming it would put the listener back.
+        if (self.stopping or !self.listening) return xev_backend.halted_poll_action;
+        _ = r catch return .rearm;
         // Several per wakeup, capped so a storm can't starve the loop.
         var n: usize = 0;
         while (n < 64) : (n += 1) {

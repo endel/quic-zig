@@ -14,6 +14,7 @@ implements, see [webtransport_w3c_api.md](webtransport_w3c_api.md).
 ./tools/wt_conformance.sh --firefox        # ... and Firefox
 ./tools/wt_conformance.sh --safari         # ... and Safari
 ./tools/wt_conformance.sh --safari-preview # ... and Safari Technology Preview
+./tools/wt_conformance.sh --webkit         # ... and Playwright's WebKit
 ./tools/wt_conformance.sh --zig-only       # no browser; this is what CI runs
 ```
 
@@ -24,7 +25,16 @@ builds, starts one `wpt-server`, and runs each client against it. Set
 Prerequisites: Node 18+ with `npm install` done. Firefox needs
 `npx puppeteer browsers install firefox` and `brew install nss` (for
 `certutil`). Safari needs *Allow Remote Automation* in Safari → Settings →
-Developer.
+Developer. `PUPPETEER_EXECUTABLE_PATH` picks the Chrome or Firefox build to
+run; the runner prints the version it found and applies the notes for it.
+
+Chrome runs with `--headless=new` (or as chrome-headless-shell), Firefox with
+`-headless`, WebKit with Playwright's `headless: true`. `--webkit` drives
+Playwright's own WebKit build through `playwright-core`, pinned to exactly
+1.64.1 (build 2370, 27.2's engine), which uses the OS's Network.framework for
+WebTransport as Safari does: its cells are WebKit's on that macOS, not
+Safari's. Headless, each page is a borderless window parked off every display,
+with no Dock icon or focus.
 
 Safari Technology Preview is worth running whenever a Safari gap is in
 question: it is the same engine some versions ahead, so a gap it has closed is
@@ -63,10 +73,14 @@ forgetting the other is then a startup error rather than a quietly smaller
 suite — which is exactly how the two previous copies of the browser list drifted
 apart.
 
-`expect_fail` records a known failure against a runner, with the reason. Such a
-scenario reports `XFAIL` and does not fail the run; one that *starts passing*
-reports `XPASS` and **does** fail it, so a stale note gets noticed instead of
-outliving the bug it describes.
+`expect_fail` records a known failure against an engine and a version range,
+with the reason: `{"firefox": [{"versions": "148-152", "why": "…"}]}`, where
+`versions` is `*`, `N`, `<N`, `<=N`, `>N`, `>=N` or `N-M` and compares dotted
+versions part by part (`26.4`, `158`). The runner reads the browser's version
+off its driver, so a run on any version gets the notes for it. Such a scenario
+reports `XFAIL` and does not fail the run; one that *starts passing* reports
+`XPASS` and **does** fail it, so a stale note gets noticed instead of outliving
+the bug it describes.
 
 A body that finds the browser lacks what it tests throws `notApplicable(why)`
 and reports `N/A`, which is neither a pass nor a failure. Without that,
@@ -120,6 +134,53 @@ builds; the others moved once each.
 `WebTransport.draining` exists in Safari 26.4, Firefox 155 and Chrome 158; the
 September columns predate all but Safari's, so those cells are n/a. The Firefox
 cell used to read ✓, but that pass was vacuous: Firefox 148 has no attribute.
+
+### October 2026, session lifecycle
+
+Re-run headless after the session-lifecycle work in
+[DRAFT_IETF_WEBTRANS_HTTP3_13.md](DRAFT_IETF_WEBTRANS_HTTP3_13.md#session-termination-6):
+a closed session refuses new streams and resets every stream of its own, a
+connection closes once its sessions are over, and `drain()`'s GOAWAY waits for
+each session's 200 to be acked. One scenario was added, `server-goaway`, which
+drains the whole connection (GOAWAY and `WT_DRAIN_SESSION`) once the page's
+first datagram asks. macOS 26.6.2; Safari and Technology Preview were not run.
+
+| Scenario | Zig | Chrome 155.0.8059.40 | Chrome 158.0.8123.0 (CfT canary) | Headless shell 150.0.7871.24 | Firefox 148.0.2 | Firefox 158.0.1 | WebKit (Playwright 2370, macOS 26.6.2) |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
+| connect-echo | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| client-close-code | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| server-close-code0 / 42 / 3999 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| server-connection-close | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| bidi-echo-small / 3-streams / 64kb | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| uni-echo / uni-echo-64kb | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| uni-multiple-streams | ✓ | ✓ | ✓ | ✓ | ~ (2 of 5) | ✓ | ✓ |
+| datagram-echo / maxsize / length-echo | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (1024) |
+| server-abort-stream / client-abort-stream | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| server-stop-sending | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (`undefined` code) |
+| server-drain | ✓ | n/a | ✓ | n/a | n/a | ~ | ~ |
+| server-goaway | ✓ | n/a | ✓ | n/a | n/a | ✓ | ✓ |
+| wt-protocol-negotiation | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | ✓ |
+| **Total** | **21/21** | **19/19 + 2 n/a** | **21/21** | **19/19 + 2 n/a** | **17/17 + 2~ + 2 n/a** | **20/20 + 1~** | **20/20 + 1~** |
+
+- **`server-goaway` passes in Firefox 158**, where `server-drain` cannot:
+  Firefox resolves `draining` on GOAWAY only.
+- **WebKit build 2370 heeds the capsule, not GOAWAY, and not a capsule in the
+  200's flight.** `server-drain` sends `WT_DRAIN_SESSION` right after accepting,
+  and WebKit never resolves `draining` on it; `server-goaway` sends it once the
+  session is up, and it does. A GOAWAY alone resolves nothing. It also delivers
+  the page's own close code (`client-close-code`), which Safari 26.5–27.0
+  did not.
+- **What GOAWAY costs browsers**, found while building `server-goaway` and
+  probed separately: Chrome 155 and 158 lose a session whose page opens a
+  stream after a GOAWAY; Firefox 158 sends a page's later `close()` as a bare
+  CONNECTION_CLOSE, without its `WT_CLOSE_SESSION`; and a GOAWAY right behind
+  the 200 that accepts a session crashes Firefox 158 outright. The table and
+  what `drain()` does about it are in
+  [DRAFT_IETF_WEBTRANS_HTTP3_13.md](DRAFT_IETF_WEBTRANS_HTTP3_13.md#graceful-shutdown);
+  the scenario asks for its drain after the 200 for that reason.
+- **The Zig `server-connection-close` cell now reads the session's end, not the
+  connection's.** A connection's end reports each session as `abrupt`, so the
+  Zig runner passes on that, as a browser's `closed` rejects.
 
 ### October 2026 re-run
 
@@ -229,7 +290,11 @@ already queued, so a backlog of uni or bidi streams stalled at two. Fixed in
 155; 148 leaves it `undefined`. 158.0.1 passes.
 
 **Firefox, `server-drain`.** See the October re-run: 155+ has `draining` but
-resolves it only on GOAWAY.
+resolves it only on GOAWAY, which `server-goaway` sends.
+
+**WebKit, `server-drain`.** Build 2370 never resolves `draining` on a
+`WT_DRAIN_SESSION` that arrives with the 200; one sent once the session is up
+resolves it.
 
 ### Flakiness worth knowing about
 
@@ -272,7 +337,10 @@ runner says so and stops.
 3. Add an enum member and a case to `apps/wpt_client.zig` (`Scenario`,
    `handlerFor`, `onSessionReady`, and `evaluate` if the verdict depends on what
    arrives).
-4. If it needs new server behaviour, extend `apps/wpt_server.zig`: the `Handler`
+4. A known failure goes in `expect_fail` under its engine, with the versions
+   it was seen on: an open-ended range (`>=155`) only when the cause is known
+   to persist.
+5. If it needs new server behaviour, extend `apps/wpt_server.zig`: the `Handler`
    enum, `parseHandler`, and the startup routing table.
 
 Skipping step 2 or 3 makes that runner refuse to start, which is the point.

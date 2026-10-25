@@ -699,6 +699,37 @@ test "ws: stop() sends 1001 and reports it once" {
     try testing.expectEqual(@as(u16, 1001), h.handler.close_code);
 }
 
+fn listenerClosed(h: *Harness) bool {
+    return h.server.http1_server.?.port() == 0;
+}
+
+test "ws: drain() refuses new connections and leaves an open WebSocket working until stop()" {
+    var h: Harness = undefined;
+    try h.init(29483, .{ .tls = false });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try h.upgrade(&c, "/", false);
+
+    h.server.drain(.{});
+    try h.spinUntil(&h, listenerClosed);
+    // Refused by the kernel, rather than accepted only to be closed.
+    var late: TestClient = .{};
+    defer late.deinit();
+    try testing.expectError(error.ConnectionRefused, late.connect(h.port, false));
+    try testing.expect(!h.server.isDrained()); // the WebSocket is open
+
+    try c.sendFrame(.binary, true, "still here");
+    const echo = try h.frame(&c);
+    try testing.expectEqualStrings("still here", echo.payload);
+    try testing.expectEqual(@as(u32, 0), h.handler.closes);
+
+    h.server.stop();
+    try testing.expectEqual(@as(?u16, 1001), (try h.frame(&c)).closeCode());
+    try h.eof(&c);
+    try testing.expectEqual(@as(u16, 1001), h.handler.close_code);
+}
+
 test "ws: an idle peer gets a ping, and is dropped when it stays silent" {
     var h: Harness = undefined;
     try h.init(29445, .{ .tls = false, .websocket = .{ .ping_interval_ms = 200 } });

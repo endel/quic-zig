@@ -940,6 +940,8 @@ pub const Connection = struct {
 
     // Connection close state (RFC 9000 Section 10)
     closing_start_time: i64 = 0,
+    /// A close `closeBy` scheduled, made when `at` comes unless one came first.
+    close_deadline: ?struct { at: i64, code: u64 } = null,
     close_pkt_buf: [1500]u8 = undefined,
     close_pkt_len: u16 = 0,
     needs_close_retransmit: bool = false,
@@ -2582,6 +2584,7 @@ pub const Connection = struct {
             },
 
             .application_close => |ac| {
+                std.log.info("peer APPLICATION_CLOSE: error_code=0x{x}, reason_len={d}", .{ ac.error_code, ac.reason.len });
                 self.state = .draining;
                 self.closing_start_time = now;
                 self.local_err = .init(true, ac.error_code, ac.reason);
@@ -3975,6 +3978,11 @@ pub const Connection = struct {
 
         if (self.key_update) |*ku| ku.maybeDropPrevKeys(now);
 
+        if (self.close_deadline) |d| if (now >= d.at) {
+            self.close(d.code, "");
+            return;
+        };
+
         // Check idle timeout (RFC 9000 §10.1, §10.1.2)
         if (now - self.idleTimerStart() > self.effectiveIdleNs()) {
             self.state = .terminated;
@@ -4213,6 +4221,30 @@ pub const Connection = struct {
                 path.validator.checkTimeout(now, pto_ns);
             }
         }
+    }
+
+    /// `close(error_code, "")` once `deadline_ns` (`sys.nanoTimestamp()`)
+    /// comes, unless the connection closes before; null cancels it. For a
+    /// close that waits on the peer, bounded: the caller closes as soon as
+    /// what it waits for is in, and this when it is not.
+    pub fn closeBy(self: *Connection, deadline_ns: ?i64, error_code: u64) void {
+        self.close_deadline = if (deadline_ns) |at| .{ .at = at, .code = error_code } else null;
+    }
+
+    /// Nothing we sent on a stream is still in flight: every byte and FIN
+    /// acked, every RESET_STREAM queued. What a close would otherwise throw
+    /// away, as RFC 9000 §10.2 stops retransmission.
+    pub fn sendsSettled(self: *Connection) bool {
+        var it = self.streams.streams.valueIterator();
+        while (it.next()) |s| if (!sendSettled(&s.*.send)) return false;
+        var uit = self.streams.send_streams.valueIterator();
+        while (uit.next()) |ss| if (!sendSettled(ss.*)) return false;
+        return true;
+    }
+
+    fn sendSettled(ss: *const stream_mod.SendStream) bool {
+        if (ss.reset_err != null) return ss.reset_stream_sent;
+        return !ss.hasUnackedData();
     }
 
     /// Close the connection gracefully with an application error.
@@ -4646,6 +4678,9 @@ pub const Connection = struct {
         }
 
         earliest = self.handshakeDeadline();
+        if (self.close_deadline) |d| {
+            if (earliest == null or d.at < earliest.?) earliest = d.at;
+        }
 
         // Idle timeout: the one onTimeout() acts on, or the loop wakes before it
         // to find nothing to do, every pass, until it comes.

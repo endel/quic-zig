@@ -34,13 +34,15 @@ export function assertComplete() {
   }
 }
 
-/// Technology Preview is the same engine as Safari, so it runs the same
-/// scenarios — but it gets its own `expect_fail` key (looked up by the runner),
-/// deliberately empty, so a gap the preview has closed shows up as XPASS
-/// instead of being masked by the release browser's notes.
-const ENGINE_BASE = { 'safari-preview': 'safari' };
+/// Technology Preview and Playwright's WebKit are Safari's engine, so they run
+/// the same scenarios — but each gets its own `expect_fail` key, so a gap one
+/// of them has closed shows up as XPASS instead of being masked by the
+/// release browser's notes.
+const ENGINE_BASE = { 'safari-preview': 'safari', webkit: 'safari' };
 
 export function scenariosFor(runner) {
   const base = ENGINE_BASE[runner] ?? runner;
   return MANIFEST.filter((s) => s.runners.includes(base));
 }
+
+export { versionInRange, expectFailFor } from './expect.mjs';

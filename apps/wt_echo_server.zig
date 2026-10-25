@@ -188,12 +188,9 @@ const EchoHandler = struct {
 
     pub fn onSessionClosed(self: *EchoHandler, session: *event_loop.Session, session_id: u64, error_code: u32, reason: []const u8) void {
         std.log.info("WT session {d} closed (code={d}, reason={s})", .{ session_id, error_code, reason });
-        // A dead connection reports only session 0, and its entry is freed
-        // right after, so every racer on it goes now.
-        const dead = session.entry.conn.isClosed();
         for (&self.racers) |*slot| {
             const r = if (slot.*) |*r| r else continue;
-            if (r.session.entry == session.entry and (dead or r.session_id == session_id)) slot.* = null;
+            if (r.session.entry == session.entry and r.session_id == session_id) slot.* = null;
         }
     }
 
