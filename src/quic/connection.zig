@@ -2584,6 +2584,7 @@ pub const Connection = struct {
             },
 
             .application_close => |ac| {
+                std.log.info("peer APPLICATION_CLOSE: error_code=0x{x}, reason_len={d}", .{ ac.error_code, ac.reason.len });
                 self.state = .draining;
                 self.closing_start_time = now;
                 self.local_err = .init(true, ac.error_code, ac.reason);
