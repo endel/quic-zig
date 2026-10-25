@@ -664,6 +664,7 @@ test "a subscriber that can't keep up loses the group, not the relay's memory" {
         r.clients[i].sess = Relay.Sess.init(&r.clients[i].ref);
     }
     const out = try conn.openUniStream();
+    try wtc.wt_uni_streams.put(out.stream_id, 0); // as openUniStream registers it
     r.flows[0] = .{ .active = true, .in_ci = 0, .in_stream = 2, .out_ci = 1, .out_stream = out.stream_id };
 
     // Nothing is ever sent in a test, so every byte stays queued.

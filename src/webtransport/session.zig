@@ -208,6 +208,10 @@ pub const WebTransportConnection = struct {
     // Streams that have already reported a peer RESET_STREAM / STOP_SENDING.
     reset_delivered: std.AutoHashMap(u64, ResetDelivery),
 
+    /// Streams of ended sessions that QUIC still holds, so a write to one
+    /// says why it fails. Dropped as QUIC reclaims them.
+    gone_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
     /// Streams the application paused; see `pauseStream`.
     paused_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
@@ -257,6 +261,7 @@ pub const WebTransportConnection = struct {
         self.writable_waits.deinit(self.allocator);
         self.request_body.deinit(self.allocator);
         self.paused_streams.deinit(self.allocator);
+        self.gone_streams.deinit(self.allocator);
         self.wt_bidi_streams.deinit();
         self.wt_uni_streams.deinit();
     }
@@ -273,6 +278,18 @@ pub const WebTransportConnection = struct {
     pub fn sessionActive(self: *WebTransportConnection, session_id: u64) bool {
         const s = self.getSession(session_id) orelse return false;
         return s.state == .active;
+    }
+
+    /// The session `session_id` names while it may still carry new streams
+    /// and datagrams: from its CONNECT, which draft-16 §4 lets both sides use
+    /// before the 200, until it is terminated. §6 forbids both after a close
+    /// sent or received, or once the CONNECT stream has ended.
+    fn liveSession(self: *WebTransportConnection, session_id: u64) error{SessionGone}!*Session {
+        const s = self.getSession(session_id) orelse return error.SessionGone;
+        return switch (s.state) {
+            .connecting, .active => s,
+            .draining, .closed => error.SessionGone,
+        };
     }
 
     /// Allocate a session slot.
@@ -424,10 +441,13 @@ pub const WebTransportConnection = struct {
     }
 
     /// Open a WT bidirectional stream: write type prefix 0x41 + session_id varint.
-    /// Fails with `error.WtStreamLimitReached` when the session's §5.6.2 credit
-    /// is spent; a WT_STREAMS_BLOCKED then asks the peer for more.
+    /// Fails with `error.SessionGone` once the session is closed, by either
+    /// side, or when there is no such session; with `error.WtStreamLimitReached`
+    /// when its §5.6.2 credit is spent, and a WT_STREAMS_BLOCKED then asks the
+    /// peer for more.
     pub fn openBidiStream(self: *WebTransportConnection, session_id: u64, send_order: ?i64) !u64 {
-        const session = self.limitedSession(session_id);
+        const live = try self.liveSession(session_id);
+        const session = if (self.flowControlEnabled()) live else null;
         if (session) |sess| try spendStreamCredit(&sess.fc.bidi);
         const stream = try self.quic.openStream();
         const stream_id = stream.stream_id;
@@ -452,10 +472,10 @@ pub const WebTransportConnection = struct {
     }
 
     /// Open a WT unidirectional stream: write type prefix 0x54 + session_id varint.
-    /// Fails with `error.WtStreamLimitReached` when the session's §5.6.2 credit
-    /// is spent; a WT_STREAMS_BLOCKED then asks the peer for more.
+    /// Fails as `openBidiStream` does.
     pub fn openUniStream(self: *WebTransportConnection, session_id: u64, send_order: ?i64) !u64 {
-        const session = self.limitedSession(session_id);
+        const live = try self.liveSession(session_id);
+        const session = if (self.flowControlEnabled()) live else null;
         if (session) |sess| try spendStreamCredit(&sess.fc.uni);
         const send_stream = try self.quic.openUniStream();
         const stream_id = send_stream.stream_id;
@@ -489,9 +509,15 @@ pub const WebTransportConnection = struct {
     }
 
     /// Send data on a WT stream.
-    /// Fails with `error.WtDataLimitReached` when the write would exceed the
-    /// session's §5.6.4 credit; a WT_DATA_BLOCKED then asks the peer for more.
+    /// Fails with `error.SessionGone` once the stream's session has ended,
+    /// which reset the stream (§6), and `error.StreamNotFound` for any other
+    /// stream that is not a WebTransport stream we send on; with
+    /// `error.WtDataLimitReached` when the write would exceed the session's
+    /// §5.6.4 credit, and a WT_DATA_BLOCKED then asks the peer for more.
     pub fn sendStreamData(self: *WebTransportConnection, stream_id: u64, data: []const u8) !void {
+        if (!self.wt_bidi_streams.contains(stream_id) and !self.wt_uni_streams.contains(stream_id)) {
+            return if (self.gone_streams.contains(stream_id)) error.SessionGone else error.StreamNotFound;
+        }
         const session = self.limitedSessionForStream(stream_id);
         if (session) |sess| {
             if (!sess.fc.canSend(data.len)) {
@@ -512,8 +538,10 @@ pub const WebTransportConnection = struct {
         if (session) |sess| sess.fc.recordSent(data.len);
     }
 
-    /// Close a WT stream with FIN.
+    /// Close a WT stream with FIN. A stream of an ended session is left as
+    /// §6 left it.
     pub fn closeStream(self: *WebTransportConnection, stream_id: u64) void {
+        if (self.gone_streams.contains(stream_id)) return;
         if (self.quic.streams.getStream(stream_id)) |stream| {
             stream.send.close();
             return;
@@ -570,8 +598,10 @@ pub const WebTransportConnection = struct {
     }
 
     /// Send a QUIC DATAGRAM carrying WT session data.
-    /// Format: quarter_stream_id (varint) + payload.
+    /// Format: quarter_stream_id (varint) + payload. Fails with
+    /// `error.SessionGone` as `openBidiStream` does.
     pub fn sendDatagram(self: *WebTransportConnection, session_id: u64, data: []const u8) !void {
+        _ = try self.liveSession(session_id);
         var quarter_id: [8]u8 = undefined;
         var fbs = io.fixedBufferStream(&quarter_id);
         try packet.writeVarInt(&fbs, session_id / 4);
@@ -734,6 +764,7 @@ pub const WebTransportConnection = struct {
     /// Reset a WT stream with an application error code.
     /// The error code is mapped to the WEBTRANSPORT_APPLICATION_ERROR range.
     pub fn resetStream(self: *WebTransportConnection, stream_id: u64, error_code: u32) void {
+        if (self.gone_streams.contains(stream_id)) return; // already reset with WT_SESSION_GONE
         const h3_code = appErrorCodeToH3(error_code);
         if (self.quic.streams.getStream(stream_id)) |stream| {
             if (!stream.send.fin_sent) {
@@ -756,6 +787,7 @@ pub const WebTransportConnection = struct {
     /// Equivalent to browser's ReadableStream.cancel().
     /// Unlike resetStream(), this does NOT reset the send side.
     pub fn stopSending(self: *WebTransportConnection, stream_id: u64, error_code: u32) void {
+        if (self.gone_streams.contains(stream_id)) return;
         const h3_code = appErrorCodeToH3(error_code);
         if (self.quic.streams.getStream(stream_id)) |stream| {
             stream.recv.stopSending(h3_code);
@@ -848,6 +880,7 @@ pub const WebTransportConnection = struct {
                 if (self.quic.streams.getStream(sid)) |st| {
                     if (!st.send.fin_sent) st.send.reset(WEBTRANSPORT_SESSION_GONE);
                     st.recv.stopSending(WEBTRANSPORT_SESSION_GONE);
+                    self.gone_streams.put(self.allocator, sid, {}) catch {};
                 }
                 self.dropStreamState(sid);
             }
@@ -868,6 +901,7 @@ pub const WebTransportConnection = struct {
                 _ = self.wt_uni_streams.remove(sid);
                 if (self.quic.streams.send_streams.get(sid)) |send_stream| {
                     if (!send_stream.fin_sent) send_stream.reset(WEBTRANSPORT_SESSION_GONE);
+                    self.gone_streams.put(self.allocator, sid, {}) catch {};
                 }
                 if (self.quic.streams.recv_streams.get(sid)) |recv_stream| {
                     recv_stream.stopSending(WEBTRANSPORT_SESSION_GONE);
@@ -898,6 +932,7 @@ pub const WebTransportConnection = struct {
             _ = self.reset_delivered.remove(id);
             _ = self.paused_streams.remove(id);
             _ = self.held_streams.remove(id);
+            _ = self.gone_streams.remove(id);
             if (self.stream_bufs.fetchRemove(id)) |kv| {
                 var buf = kv.value;
                 buf.deinit(self.allocator);
@@ -2875,6 +2910,58 @@ test "WT: a long close reason is cut at a UTF-8 boundary" {
 
     const cls = (try h3_frame.parse(try expectCapsulePayload(stream.send.write_buffer.items[pre_len..]))).frame.close_webtransport_session;
     try testing.expectEqual(@as(usize, 1023), cls.reason.len);
+}
+
+/// How a test ends a session: our close, the peer's capsule, or its bare FIN.
+const Termination = enum { ours, peer_capsule, peer_fin };
+
+fn terminate(setup: *WtTestSetup, session_id: u64, how: Termination) !void {
+    var buf: [64]u8 = undefined;
+    switch (how) {
+        .ours => try setup.wt.closeSessionWithError(session_id, 1, "ours"),
+        .peer_capsule => _ = try peerSends(setup, session_id, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 2, .reason = "theirs" } }), true),
+        .peer_fin => _ = try peerSends(setup, session_id, "", true),
+    }
+    if (how != .ours) _ = try pollFor(&setup.wt, .session_closed);
+}
+
+test "WT: a terminated session takes no new streams or datagrams, and its streams no writes" {
+    for ([_]bool{ true, false }) |server| {
+        for ([_]Termination{ .ours, .peer_capsule, .peer_fin }) |how| {
+            var setup: WtTestSetup = undefined;
+            const session_id = if (server) try setup.initServer() else try setup.initClient();
+            defer setup.deinit();
+            const bidi = try setup.wt.openBidiStream(session_id, null);
+            const uni = try setup.wt.openUniStream(session_id, null);
+            try setup.wt.sendDatagram(session_id, "before");
+
+            try terminate(&setup, session_id, how);
+            try testing.expectError(error.SessionGone, setup.wt.openBidiStream(session_id, null));
+            try testing.expectError(error.SessionGone, setup.wt.openUniStream(session_id, null));
+            try testing.expectError(error.SessionGone, setup.wt.sendDatagram(session_id, "after"));
+            try testing.expectError(error.SessionGone, setup.wt.sendStreamData(bidi, "after"));
+            try testing.expectError(error.SessionGone, setup.wt.sendStreamData(uni, "after"));
+            // Our own calls on them change nothing the reset set.
+            setup.wt.resetStream(bidi, 7);
+            setup.wt.closeStream(uni);
+            try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), setup.quic_conn.streams.getStream(bidi).?.send.reset_err);
+            try testing.expect(!setup.quic_conn.streams.send_streams.get(uni).?.fin_queued);
+        }
+    }
+}
+
+test "WT: streams and datagrams wait for no 200, and need a session that exists" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    // §4: a server may use a session from its CONNECT on.
+    try injectConnect(&setup, 4);
+    _ = try setup.wt.openUniStream(4, null);
+    try setup.wt.sendDatagram(4, "early");
+    try testing.expectError(error.SessionGone, setup.wt.openBidiStream(8, null));
+    try testing.expectError(error.SessionGone, setup.wt.sendDatagram(8, "nobody"));
+    try testing.expectError(error.StreamNotFound, setup.wt.sendStreamData(3, "control"));
 }
 
 test "WT integration: a CONNECT the server resets unanswered is rejected" {
