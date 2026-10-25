@@ -215,7 +215,7 @@ What a server does on SIGTERM, the first of two steps, closing nothing in use.
    once, and phase-1 GOAWAY on every H3 connection once the peer has acked
    what its CONNECT streams carry, or 3 PTO on
    (`ConnEntry.drain_goaway_due`): a GOAWAY right behind the 200 that accepts
-   a session crashed Firefox 158 in 5 runs of 6. A connection still
+   a session crashed Firefox 158 in 5 runs of 6 (155–158; fixed in 159). A connection still
    handshaking gets GOAWAY(0) as soon as H3 is set up. Raw-QUIC and HTTP/0.9
    connections have no graceful signal and are left to the handler.
    `DrainOptions.signal_peers = false` skips this step; see

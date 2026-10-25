@@ -809,19 +809,19 @@ pub const DrainOptions = struct {
     /// closes their sessions, since a GOAWAY costs browsers more than it
     /// says to them (measured headless, October 2026): Firefox 158 then
     /// drops a page's own session close, sending CONNECTION_CLOSE without its
-    /// WT_CLOSE_SESSION, and can crash outright when the GOAWAY lands as a
-    /// session is being accepted; Chrome 155-158 lose a session whose page
-    /// opens a stream after one. New connections are refused either way. A
-    /// connection whose WebTransport sessions are over still closes, as
-    /// `Config.wt_close_after_sessions` says; a plain HTTP/3 one waits for its
-    /// idle timeout or `stop()`.
+    /// WT_CLOSE_SESSION, and Firefox 155-158 can crash outright when the
+    /// GOAWAY lands as a session is being accepted (fixed in 159); Chrome
+    /// 155-158 lose a session whose page opens a stream after one. New
+    /// connections are refused either way. A connection whose WebTransport
+    /// sessions are over still closes, as `Config.wt_close_after_sessions`
+    /// says; a plain HTTP/3 one waits for its idle timeout or `stop()`.
     signal_peers: bool = true,
 };
 
 /// Begin one connection's HTTP/3 shutdown; see `Session.drainConnection`.
 /// Its sessions get WT_DRAIN_SESSION now and the connection its GOAWAY once
 /// the peer has acked what its CONNECT streams carry, or 3 PTO on: Firefox
-/// 158 crashes when a GOAWAY comes with the 200 that accepts a session.
+/// 155-158 crash when a GOAWAY comes with the 200 that accepts a session.
 fn beginDrain(entry: *ConnEntry, now: i64) void {
     const conn = entry.conn;
     if (conn.state == .closing or conn.state == .draining or conn.isClosed()) return;

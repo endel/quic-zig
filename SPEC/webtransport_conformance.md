@@ -174,7 +174,7 @@ first datagram asks. macOS 26.6.2; Safari and Technology Preview were not run.
   probed separately: Chrome 155 and 158 lose a session whose page opens a
   stream after a GOAWAY; Firefox 158 sends a page's later `close()` as a bare
   CONNECTION_CLOSE, without its `WT_CLOSE_SESSION`; and a GOAWAY right behind
-  the 200 that accepts a session crashes Firefox 158 outright. The table and
+  the 200 that accepts a session crashes Firefox 155–158 outright (fixed in 159). The table and
   what `drain()` does about it are in
   [DRAFT_IETF_WEBTRANS_HTTP3_13.md](DRAFT_IETF_WEBTRANS_HTTP3_13.md#graceful-shutdown);
   the scenario asks for its drain after the 200 for that reason.

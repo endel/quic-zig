@@ -199,7 +199,7 @@ against `wpt-server` on macOS 26.6.2:
 | --- | :--: | :--: | --- |
 | Chrome 158.0.8123.0 | ✓ | ✓ | a page that opens a stream loses the session ("Connection lost", the connection dropped silently); streams opened before, datagrams and the page's close still work |
 | Chrome 155.0.8059.40, headless shell 150 | no attribute | — | the same loss on a new stream (155) |
-| Firefox 158.0.1 | ✗ (dropped as an unknown capsule) | ✓ | the page's `close()` goes out as CONNECTION_CLOSE with no `WT_CLOSE_SESSION`, so its code never arrives; a GOAWAY close behind the 200 that accepts a session crashes the browser |
+| Firefox 158.0.1 | ✗ (dropped as an unknown capsule) | ✓ | the page's `close()` goes out as CONNECTION_CLOSE with no `WT_CLOSE_SESSION`, so its code never arrives; a GOAWAY close behind the 200 that accepts a session crashes the browser (155–158, fixed in 159) |
 | Firefox 148.0.2 | no attribute | — | the session carries on |
 | WebKit (Playwright 2370) | ✓ once the session is up; ✗ in the 200's flight | ✗ | the page's close arrives with its code |
 
@@ -211,8 +211,16 @@ sees an abrupt end (netcode's runs through a relay dropping 20% each way: 2 of
 Hence two choices. The GOAWAY waits until the peer has acked what its CONNECT
 streams carry (the 200 and the drain capsule), or 3 PTO: sent at once it
 crashed Firefox 158 in 5 runs of 6, held it did in 1 of 5, and 200 ms after the
-session in none of 5. The crash is Firefox's to fix; holding the GOAWAY only
-makes it rarer.
+session in none of 5. The crash is Firefox's: until the session's ready callback
+has run on the main thread and retargeted it, `WebTransportSessionProxy::OnDraining`
+hands the event to the main thread, where `PWebTransportParent::SendDraining`
+trips IPC's `MOZ_RELEASE_ASSERT` (not on worker thread!). quic-go and aioquic
+reproduce it as quic-zig does: a GOAWAY 0–2 ms behind the 200 crashed 158.0.1
+in 5–6 runs of 6 from each, 10 ms in 2 of 6, 50 ms in none. The code shipped
+with `draining` in 155. 159 forwards such a stale event to the socket thread
+(Bug 2059961), and 159.0b5 survived all 30 runs of the same tests; 160 also
+holds it until the session is ready (Bug 2007160, commit 65b088648201). Holding
+the GOAWAY only makes it rarer on 155–158.
 And `DrainOptions.signal_peers` off sends neither signal, for an application
 that tells its clients in band before it closes their sessions; new connections
 are refused either way, and a WebTransport connection still closes once its
