@@ -711,6 +711,11 @@ pub const WebTransportConnection = struct {
     /// Sends CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
     /// `reason` is UTF-8, cut to 1024 bytes at a character boundary per spec.
     ///
+    /// The session's streams are reset (§6), a FIN already sent included, and
+    /// the peer stops reading its own copies when the close reaches it, so a
+    /// last message cannot ride out on a close. Write it and FIN its stream,
+    /// and let the side that has read it end the session.
+    ///
     /// Nothing else follows on the CONNECT stream: no STOP_SENDING until the
     /// peer's FIN, which Chrome and Firefox both turn into an abrupt close
     /// that loses the code. For the same reason, an application closing the
@@ -856,11 +861,13 @@ pub const WebTransportConnection = struct {
         self.active_session_count -|= 1;
     }
 
-    /// Reset all streams belonging to a session and free their buffers.
-    /// Uses WEBTRANSPORT_SESSION_GONE error code per draft-ietf-webtrans-http3.
-    /// Reset a closed session's streams. They stay in `h3.excluded_streams`
-    /// until QUIC reclaims them: whatever the peer still sends on them is
-    /// neither a request nor a stream type for H3.
+    /// §6: a terminated session's streams are reset and stopped with
+    /// WEBTRANSPORT_SESSION_GONE, those whose FIN is already out included —
+    /// the peer aborts reading them as it learns of the close, so bytes it
+    /// has not acked are lost either way. Only a side with nothing left to
+    /// abort is left alone. The streams stay in `h3.excluded_streams` until
+    /// QUIC reclaims them: whatever the peer still sends on them is neither a
+    /// request nor a stream type for H3.
     fn cleanupSessionStreams(self: *WebTransportConnection, session_id: u64) void {
         // Removed in batches: the maps cannot change while iterated.
         while (true) {
@@ -878,8 +885,8 @@ pub const WebTransportConnection = struct {
             for (batch[0..n]) |sid| {
                 _ = self.wt_bidi_streams.remove(sid);
                 if (self.quic.streams.getStream(sid)) |st| {
-                    if (!st.send.fin_sent) st.send.reset(WEBTRANSPORT_SESSION_GONE);
-                    st.recv.stopSending(WEBTRANSPORT_SESSION_GONE);
+                    abortSend(&st.send);
+                    abortRecv(&st.recv);
                     self.gone_streams.put(self.allocator, sid, {}) catch {};
                 }
                 self.dropStreamState(sid);
@@ -900,16 +907,31 @@ pub const WebTransportConnection = struct {
             for (batch[0..n]) |sid| {
                 _ = self.wt_uni_streams.remove(sid);
                 if (self.quic.streams.send_streams.get(sid)) |send_stream| {
-                    if (!send_stream.fin_sent) send_stream.reset(WEBTRANSPORT_SESSION_GONE);
+                    abortSend(send_stream);
                     self.gone_streams.put(self.allocator, sid, {}) catch {};
                 }
                 if (self.quic.streams.recv_streams.get(sid)) |recv_stream| {
-                    recv_stream.stopSending(WEBTRANSPORT_SESSION_GONE);
+                    abortRecv(recv_stream);
                     self.quic.streams.releaseRecvStream(sid);
                 }
                 self.dropStreamState(sid);
             }
         }
+    }
+
+    /// RESET_STREAM, unless the peer has acked every byte and the FIN
+    /// (RFC 9000 §3.1 "Data Recvd"), when there is nothing left to abandon.
+    fn abortSend(ss: *stream_mod.SendStream) void {
+        if (ss.reset_err != null) return;
+        if (ss.fin_acked and !ss.hasUnackedData()) return;
+        ss.reset(WEBTRANSPORT_SESSION_GONE);
+    }
+
+    /// STOP_SENDING, unless the peer has nothing more to send: it reset the
+    /// stream or every byte has arrived. What arrived is dropped unread.
+    fn abortRecv(rs: *stream_mod.ReceiveStream) void {
+        if (rs.reset_err != null or rs.stop_sending_err != null or rs.allReceived()) return;
+        rs.stopSending(WEBTRANSPORT_SESSION_GONE);
     }
 
     fn dropStreamState(self: *WebTransportConnection, sid: u64) void {
@@ -2947,6 +2969,38 @@ test "WT: a terminated session takes no new streams or datagrams, and its stream
             try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), setup.quic_conn.streams.getStream(bidi).?.send.reset_err);
             try testing.expect(!setup.quic_conn.streams.send_streams.get(uni).?.fin_queued);
         }
+    }
+}
+
+test "WT: a session's end resets a stream whose FIN is out but unacked, not one acked whole" {
+    for ([_]Termination{ .ours, .peer_capsule, .peer_fin }) |how| {
+        var setup: WtTestSetup = undefined;
+        const session_id = try setup.initServer();
+        defer setup.deinit();
+
+        // A last message and its FIN on each; both sent, one of them acked.
+        const ids = [_]u64{ try setup.wt.openUniStream(session_id, null), try setup.wt.openUniStream(session_id, null) };
+        for (ids, 0..) |id, i| {
+            try setup.wt.sendStreamData(id, "last words");
+            setup.wt.closeStream(id);
+            const ss = setup.quic_conn.streams.send_streams.get(id).?;
+            const f = ss.popStreamFrame(1000).?.stream;
+            try testing.expect(f.fin and ss.fin_sent);
+            if (i == 1) try ss.onAck(f.offset, f.length, f.fin);
+        }
+        // A bidi stream whose peer has sent everything, FIN included.
+        const bidi = try setup.wt.openBidiStream(session_id, null);
+        const bs = setup.quic_conn.streams.getStream(bidi).?;
+        try bs.recv.handleStreamFrame(0, "done", true);
+
+        try terminate(&setup, session_id, how);
+        // §6: the peer stops reading at the close, so "last words" may never
+        // be read; resetting says so instead of leaving it to retransmit.
+        try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), setup.quic_conn.streams.send_streams.get(ids[0]).?.reset_err);
+        try testing.expectEqual(@as(?u64, null), setup.quic_conn.streams.send_streams.get(ids[1]).?.reset_err);
+        // Nothing left for the peer to send: no STOP_SENDING, only our reset.
+        try testing.expectEqual(@as(?u64, null), bs.recv.stop_sending_err);
+        try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), bs.send.reset_err);
     }
 }
 
