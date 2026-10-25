@@ -680,6 +680,23 @@ pub const H3Connection = struct {
         return true;
     }
 
+    /// A request stream, ours or the peer's, still has something to carry:
+    /// any bidi stream the WebTransport layer has not taken, until both its
+    /// halves are done or abandoned. Includes a peer stream not yet read far
+    /// enough to say what it is.
+    pub fn hasOpenRequests(self: *H3Connection) bool {
+        var it = self.quic_conn.streams.streams.iterator();
+        while (it.next()) |entry| {
+            if (self.excluded_streams.contains(entry.key_ptr.*)) continue;
+            const s = entry.value_ptr.*;
+            if (s.closed_for_gc) continue;
+            const recv_done = s.recv.reset_err != null or s.recv.allReceived() or s.recv.stop_sending_err != null;
+            const send_done = s.send.fin_queued or s.send.reset_err != null;
+            if (!recv_done or !send_done) return true;
+        }
+        return false;
+    }
+
     /// Cancel a request (RFC 9114 §4.1.1).
     /// Sends RESET_STREAM + STOP_SENDING with the given H3 error code.
     pub fn cancelRequest(self: *H3Connection, stream_id: u64, error_code: u64) void {

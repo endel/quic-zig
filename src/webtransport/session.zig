@@ -1,5 +1,6 @@
 const std = @import("std");
 const io = @import("../io_compat.zig");
+const sys = @import("../sys.zig");
 
 const quic_connection = @import("../quic/connection.zig");
 const stream_mod = @import("../quic/stream.zig");
@@ -196,6 +197,9 @@ pub const WebTransportConnection = struct {
     is_server: bool,
     sessions: [MAX_SESSIONS]Session = @splat(Session{}),
     active_session_count: u32 = 0,
+    /// A session was asked for on this connection, accepted or not: see
+    /// `closeIfUnused`.
+    carried_session: bool = false,
     /// Streams registered for a session not yet established: kept from the
     /// application, their data left unread, until it is (draft-13 §4.5).
     held_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -308,6 +312,7 @@ pub const WebTransportConnection = struct {
     fn allocateSession(self: *WebTransportConnection, session_id: u64, state: SessionState) ?*Session {
         for (&self.sessions) |*s| {
             if (!s.occupied) {
+                self.carried_session = true;
                 self.allocator.free(s.close_reason);
                 s.* = .{
                     .session_id = session_id,
@@ -911,6 +916,47 @@ pub const WebTransportConnection = struct {
         const stream = self.quic.streams.getStream(session.session_id) orelse return self.lostSession(session);
         if (stream.recv.reset_err == null and stream.send.peer_stop_sending == null) return null;
         return self.abortSession(session, @backingInt(h3_conn.H3Error.request_cancelled));
+    }
+
+    /// Close a connection whose WebTransport is over: it carried a session,
+    /// every one has been terminated, and no HTTP/3 request is open. Call it
+    /// on each pass; `Config.wt_close_after_sessions` is the event loops'.
+    ///
+    /// Nothing in draft-16 ends such a connection, and a browser gives each
+    /// session one of its own: Chrome lets it go without a CONNECTION_CLOSE
+    /// once its FIN is acked, which leaves the server holding it until the
+    /// idle timeout. A server first sends GOAWAY naming the next request it
+    /// has not seen (RFC 9114 §5.2), so a client that pools knows what to
+    /// retry elsewhere. CONNECTION_CLOSE, H3_NO_ERROR, then waits for what
+    /// it would discard (§6's SHOULD): the peer's end of every CONNECT
+    /// stream, and the ack of our own capsules, FINs and that GOAWAY. That
+    /// wait is bounded at 3 PTO, as RFC 9000 §10.2 bounds a closing period:
+    /// a peer that left silently answers nothing.
+    pub fn closeIfUnused(self: *WebTransportConnection) void {
+        const quic = self.quic;
+        if (!quic.isEstablished()) return;
+        if (!self.carried_session or self.liveSessions() or self.h3.hasOpenRequests()) {
+            quic.closeBy(null, 0); // a request came in meanwhile
+            return;
+        }
+        const no_error = @backingInt(h3_conn.H3Error.no_error);
+        if (quic.close_deadline == null) {
+            if (self.is_server and self.h3.local_goaway_id == null) {
+                const next = if (quic.streams.highest_peer_bidi_stream_id) |id| id + 4 else 0;
+                self.h3.sendGoaway(next) catch {};
+            }
+            quic.closeBy(sys.nanoTimestamp() + 3 * quic.pkt_handler.rtt_stats.pto(), no_error);
+        }
+        for (self.sessions) |s| if (s.occupied) return; // a CONNECT stream the peer hasn't ended
+        if (quic.sendsSettled()) quic.close(no_error, "");
+    }
+
+    /// A session still connecting or established.
+    fn liveSessions(self: *const WebTransportConnection) bool {
+        for (self.sessions) |s| {
+            if (s.occupied and (s.state == .connecting or s.state == .active)) return true;
+        }
+        return false;
     }
 
     /// Mark a session as fully closed and release its slot.
@@ -3103,6 +3149,108 @@ test "WT: a CONNECT the peer resets before it is answered ends abruptly, and can
     try testing.expectError(error.SessionNotPending, setup.wt.acceptSession(4));
     try testing.expectEqual(@as(u64, 0), stream.send.write_offset);
     try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.request_cancelled)), stream.send.reset_err);
+}
+
+/// What the peer's ACKs would do: every byte and FIN we have queued counts
+/// as sent and acknowledged.
+fn ackEverything(conn: *quic_connection.Connection) !void {
+    var it = conn.streams.streams.valueIterator();
+    while (it.next()) |st| try ackSends(&st.*.send);
+    var uit = conn.streams.send_streams.valueIterator();
+    while (uit.next()) |ss| try ackSends(ss.*);
+}
+
+fn ackSends(ss: *stream_mod.SendStream) !void {
+    while (ss.popStreamFrame(1 << 20)) |f| try ss.onAck(f.stream.offset, f.stream.length, f.stream.fin);
+    if (ss.reset_err != null) ss.reset_stream_sent = true;
+}
+
+const h3_no_error = @backingInt(h3_conn.H3Error.no_error);
+
+test "WT: a connection whose last session is over closes once the peer has the end of it" {
+    for ([_]bool{ true, false }) |server| {
+        for ([_]Termination{ .ours, .peer_capsule, .peer_fin }) |how| {
+            var setup: WtTestSetup = undefined;
+            const session_id = if (server) try setup.initServer() else try setup.initClient();
+            defer setup.deinit();
+            setup.quic_conn.state = .connected;
+
+            setup.wt.closeIfUnused();
+            try testing.expect(setup.quic_conn.close_deadline == null); // a live session
+
+            try terminate(&setup, session_id, how);
+            if (how == .ours) {
+                // Not before the peer ends its side of the CONNECT stream.
+                setup.wt.closeIfUnused();
+                try testing.expect(setup.quic_conn.isEstablished());
+                _ = try peerSends(&setup, session_id, "", true);
+                _ = try pollFor(&setup.wt, .session_closed);
+            } else if (how == .peer_capsule) {
+                _ = try setup.wt.poll(); // its FIN came with the capsule
+            }
+            setup.wt.closeIfUnused();
+            // A server says first what it will not take (RFC 9114 §5.2).
+            try testing.expectEqual(if (server) @as(?u64, 4) else null, setup.h3.local_goaway_id);
+            try testing.expect(setup.quic_conn.close_deadline != null);
+            // Not before our capsule, FIN and GOAWAY are acked.
+            try testing.expect(setup.quic_conn.isEstablished());
+            try ackEverything(&setup.quic_conn);
+            setup.wt.closeIfUnused();
+            try testing.expectEqual(quic_connection.State.closing, setup.quic_conn.state);
+            try testing.expectEqual(@as(u64, h3_no_error), setup.quic_conn.local_err.?.code);
+        }
+    }
+}
+
+test "WT: a peer that never acks the end is closed on 3 PTO" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    setup.quic_conn.state = .connected;
+    setup.quic_conn.last_packet_received_time = sys.nanoTimestamp(); // the idle timeout 30 s off
+    try terminate(&setup, session_id, .peer_fin);
+    setup.wt.closeIfUnused();
+    const due = setup.quic_conn.close_deadline.?.at;
+    try testing.expect(due <= sys.nanoTimestamp() + 3 * setup.quic_conn.pkt_handler.rtt_stats.pto());
+    try testing.expectEqual(due, setup.quic_conn.nextOnTimeoutNs().?);
+
+    setup.quic_conn.close_deadline.?.at = sys.nanoTimestamp() - 1;
+    try setup.quic_conn.onTimeout();
+    try testing.expectEqual(quic_connection.State.closing, setup.quic_conn.state);
+    try testing.expectEqual(@as(u64, h3_no_error), setup.quic_conn.local_err.?.code);
+}
+
+test "WT: an open request or another session keeps the connection" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    setup.quic_conn.state = .connected;
+    try injectConnect(&setup, 4);
+    try setup.wt.acceptSession(4);
+    try terminate(&setup, session_id, .peer_fin);
+    setup.wt.closeIfUnused();
+    try testing.expect(setup.quic_conn.close_deadline == null);
+
+    // A plain request on the connection, its response not yet sent.
+    try terminate(&setup, 4, .peer_fin);
+    const req = try setup.quic_conn.streams.getOrCreateStream(8);
+    var buf: [512]u8 = undefined;
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qbuf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try h3_frame.write(.{ .headers = qbuf[0..try qpack.encodeHeaders(&headers, &qbuf)] }, &fbs);
+    try req.recv.handleStreamFrame(0, fbs.buffered(), true);
+    _ = try pollFor(&setup.wt, .request);
+    setup.wt.closeIfUnused();
+    try testing.expect(setup.quic_conn.close_deadline == null);
+    try ackEverything(&setup.quic_conn);
+    setup.wt.closeIfUnused();
+    try testing.expect(setup.quic_conn.isEstablished());
 }
 
 test "WT: unknown and malformed capsules reset nothing while our close waits for the peer's FIN" {

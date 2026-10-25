@@ -111,6 +111,20 @@ pub const Config = struct {
     /// which are always sent.
     wt_legacy_settings: bool = true,
 
+    /// Close a connection once the WebTransport sessions it carried are all
+    /// over and no HTTP/3 request is open: GOAWAY, then CONNECTION_CLOSE with
+    /// H3_NO_ERROR when the peer has ended its CONNECT streams and acked our
+    /// last capsules, or 3 PTO on; see `WebTransportConnection.closeIfUnused`.
+    ///
+    /// On, because browsers never reuse such a connection: each WebTransport
+    /// object gets one of its own, and Chrome leaves without a
+    /// CONNECTION_CLOSE, so every session would otherwise hold its connection
+    /// (and a `max_connections` place) for the idle timeout. Off suits a
+    /// client known to pool sessions and plain requests on one connection;
+    /// it then idles out instead. Either way a client sending a request just
+    /// as it closes learns from the GOAWAY that it was not processed.
+    wt_close_after_sessions: bool = true,
+
     /// Answer every new client with Retry (RFC 9000 8.1.2): it must echo
     /// the token from its own address before the server keeps any state.
     /// Costs every client a round trip; see `retry_threshold`.
@@ -958,12 +972,14 @@ pub fn Server(comptime Handler: type) type {
 
         foreign_hook: ?ForeignDatagramHook,
 
-        /// WebTransport SETTINGS advertised to every peer, from Config.
+        /// WebTransport SETTINGS advertised to every peer, and what is done
+        /// with a connection its sessions are over with, from Config.
         wt_settings: struct {
             max_sessions: u64,
             legacy: bool,
             advertise_credits: bool,
             credits: wt_fc.Credits,
+            close_after_sessions: bool,
         },
 
         const PreferredSocket = struct {
@@ -1157,6 +1173,7 @@ pub fn Server(comptime Handler: type) type {
                     .legacy = config.wt_legacy_settings,
                     .advertise_credits = config.wt_advertise_credits,
                     .credits = config.wt_credits,
+                    .close_after_sessions = config.wt_close_after_sessions,
                 },
             };
         }
@@ -2361,6 +2378,7 @@ pub fn Server(comptime Handler: type) type {
                 }
 
                 const conn = entry.conn;
+                if (self.wt_settings.close_after_sessions) if (entry.wt_conn) |wtc| wtc.closeIfUnused();
                 const batch = self.batchForConn(conn);
                 const max_burst_packets = 1000;
                 var send_count: usize = 0;
@@ -2626,6 +2644,9 @@ pub const ClientConfig = struct {
     /// fields.
     wt_credits: wt_fc.Credits = wt_fc.Credits.default,
     wt_advertise_credits: bool = false,
+    /// Close the connection once its session is over, as Firefox does; see
+    /// the identically named `Config` field. `run()` returns then.
+    wt_close_after_sessions: bool = true,
 
     // Advanced overrides
     tls_config: ?tls13.TlsConfig = null,
@@ -3062,6 +3083,7 @@ pub fn Client(comptime Handler: type) type {
         /// draft-13 §5.6 session windows, mirrored from ClientConfig.
         wt_credits: wt_fc.Credits,
         wt_advertise_credits: bool,
+        wt_close_after_sessions: bool,
 
         /// The default ALPN list, when we built it rather than the caller.
         owned_alpn: ?[][]const u8,
@@ -3209,6 +3231,7 @@ pub fn Client(comptime Handler: type) type {
                 .connect_headers = config.connect_headers,
                 .wt_credits = config.wt_credits,
                 .wt_advertise_credits = config.wt_advertise_credits,
+                .wt_close_after_sessions = config.wt_close_after_sessions,
                 .owned_alpn = owned_alpn,
                 .owned_ca = owned_ca,
             };
@@ -3803,6 +3826,8 @@ pub fn Client(comptime Handler: type) type {
                 if (self.stopping and self.shared_loop == null) self.own_loop.stop();
                 return;
             }
+
+            if (self.wt_close_after_sessions) if (self.wt_conn) |wtc| wtc.closeIfUnused();
 
             // Use remote_addr for pre-handshake, peer address after connection established
             const send_addr: *const posix.sockaddr.storage = if (conn.isEstablished())
@@ -6166,6 +6191,9 @@ const WtCloseServer = struct {
     conns_closed: u32 = 0,
     /// Sessions reported when their connection's own end came.
     seen_at_conn_close: u32 = 0,
+    /// How that connection ended: its CONNECTION_CLOSE code, either way.
+    conn_close_code: ?u64 = null,
+    goaway_sent: bool = false,
 
     pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
         session.acceptSession(session_id) catch unreachable;
@@ -6177,9 +6205,11 @@ const WtCloseServer = struct {
         std.debug.assert(session_id == self.session_id);
         self.seen.record(code, reason, abrupt);
     }
-    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+    pub fn onConnectionClosed(self: *@This(), session: *Session) void {
         self.conns_closed += 1;
         self.seen_at_conn_close = self.seen.count;
+        if (session.entry.conn.local_err) |e| self.conn_close_code = e.code;
+        if (session.entry.h3_conn) |h| self.goaway_sent = h.local_goaway_id != null;
     }
 };
 
@@ -6235,8 +6265,6 @@ fn endSessionE2e(port: u16, from_client: bool, how: SessionEnd) !struct { server
     }
     try runUntilCount(&e2e.loop, &sh.seen.count, 1, 3000);
     try runUntilCount(&e2e.loop, &ch.seen.count, 1, 3000);
-    // The connection outlives the session: only it was closed.
-    try testing.expect(!e2e.client.conn.isClosed());
     return .{ .server = sh.seen, .client = ch.seen };
 }
 
@@ -6326,6 +6354,84 @@ test "e2e: a connection that times out reports its session, and one with none re
     try testing.expectEqual(@as(u32, 1), sh.seen.count);
     try testing.expect(sh.seen.abrupt);
     try testing.expectEqual(@as(u32, 0), sh.seen.code);
+}
+
+const h3_no_error: u64 = @backingInt(H3Error.no_error);
+
+test "e2e: once its only session is over, a connection closes with H3_NO_ERROR, from either side" {
+    for ([_]bool{ true, false }, [_]u16{ 29529, 29530 }) |from_client, port| {
+        var ch = WtCloseClient{};
+        var sh = WtCloseServer{};
+        var e2e: E2e(WtCloseServer, WtCloseClient) = undefined;
+        try e2e.init(port, &sh, &ch);
+        defer e2e.deinit();
+        try runUntil(&e2e.loop, &ch, WtCloseClient.ready, 10_000);
+        var cs = e2e.client.clientSession();
+        var ss = sh.session.?;
+        if (from_client) try cs.closeSessionWithError(sh.session_id, 42, "bye") else try ss.closeSessionWithError(sh.session_id, 3999, "later");
+
+        try runUntilCount(&e2e.loop, &sh.conns_closed, 1, 3000);
+        try runUntil(&e2e.loop, &e2e.client, clientConnClosed, 3000);
+        // The session's own report came first, with the code it was given.
+        try testing.expectEqual(@as(u32, 1), sh.seen_at_conn_close);
+        try testing.expect(!sh.seen.abrupt and !ch.seen.abrupt);
+        try testing.expectEqual(h3_no_error, sh.conn_close_code.?);
+        try testing.expectEqual(h3_no_error, e2e.client.conn.local_err.?.code);
+    }
+}
+
+/// Leaves when its session is over, without a CONNECTION_CLOSE, as Chrome does.
+fn silentlyGone(port: u16, sh: *WtCloseServer, loop: *xev.Loop) !void {
+    var ch = WtCloseClient{};
+    var c = try Client(WtCloseClient).init(testing.allocator, &ch, .{
+        .port = port,
+        .skip_cert_verify = true,
+        .wt_close_after_sessions = false,
+    });
+    defer c.deinit();
+    c.start();
+    try runUntil2(loop, c.eventLoop(), &ch, WtCloseClient.ready, 10_000);
+    var cs = c.clientSession();
+    try cs.closeSessionWithError(ch.session_id.?, 7, "bye");
+    // Both sides have heard it, so our FIN reached the client; its loop then stops.
+    const Heard = struct {
+        s: *WtCloseServer,
+        c: *WtCloseClient,
+        fn done(self: *const @This()) bool {
+            return self.s.seen.count == 1 and self.c.seen.count == 1;
+        }
+    };
+    try runUntil2(loop, c.eventLoop(), &Heard{ .s = sh, .c = &ch }, Heard.done, 3000);
+}
+
+test "e2e: a peer that leaves silently once its session is over is closed in a few PTO, not on its idle timeout" {
+    var idle = QuicIdleClient{};
+    var sh = WtCloseServer{};
+    var e2e: E2e(WtCloseServer, QuicIdleClient) = undefined;
+    try e2e.init(29531, &sh, &idle);
+    defer e2e.deinit();
+    try silentlyGone(29531, &sh, &e2e.loop);
+
+    // The idle timeout is 30 s; waiting out the ack of our FIN and GOAWAY
+    // is bounded by 3 PTO, and the closing period by 3 more.
+    const began = sys.nanoTimestamp();
+    try runUntilCount(&e2e.loop, &sh.conns_closed, 1, 5000);
+    try testing.expect(sys.nanoTimestamp() - began < 3 * std.time.ns_per_s);
+    try testing.expect(sh.goaway_sent);
+    try testing.expectEqual(h3_no_error, sh.conn_close_code.?);
+    try testing.expectEqual(@as(usize, 1), e2e.server.conn_mgr.connectionCount()); // the idle client's
+}
+
+test "e2e: with wt_close_after_sessions off, a connection outlives its session" {
+    var idle = QuicIdleClient{};
+    var sh = WtCloseServer{};
+    var e2e: E2e(WtCloseServer, QuicIdleClient) = undefined;
+    try e2e.initServer(29532, &sh, &idle, .{ .wt_close_after_sessions = false }, null);
+    defer e2e.deinit();
+    try silentlyGone(29532, &sh, &e2e.loop);
+    try runFor(&e2e.loop, 1000);
+    try testing.expectEqual(@as(u32, 0), sh.conns_closed);
+    try testing.expectEqual(@as(usize, 2), e2e.server.conn_mgr.connectionCount());
 }
 
 test "e2e: a WT_STREAMS_BLOCKED is answered with nothing more from the peer" {

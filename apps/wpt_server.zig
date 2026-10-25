@@ -702,6 +702,7 @@ const WptHandler = struct {
     /// Its entry is freed after this, and the next connection may get the
     /// same address: nothing keyed by it may outlive it.
     pub fn onConnectionClosed(self: *WptHandler, session: *event_loop.Session) void {
+        std.log.info("[wpt] connection {d} closed", .{session.id()});
         const conn = @intFromPtr(session.entry);
         inline for (.{ &self.session_state, &self.uni_echo_streams }) |map| {
             var it = map.keyIterator();
