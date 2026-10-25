@@ -79,7 +79,13 @@ fn peekCapsuleHeader(data: []const u8) ?struct { frame_type: u64, length: u64, h
 pub const SessionState = enum {
     connecting,
     active,
-    draining, // CLOSE_WEBTRANSPORT_SESSION sent or received, awaiting FIN
+    /// We closed it: our WT_CLOSE_SESSION and FIN are out. It is reported
+    /// once the peer ends its side of the CONNECT stream.
+    draining,
+    /// The peer closed it with WT_CLOSE_SESSION, and it has been reported.
+    /// The CONNECT stream is still read up to the peer's FIN, so bytes after
+    /// the capsule can be refused with H3_MESSAGE_ERROR (§6).
+    awaiting_fin,
     closed,
 };
 
@@ -288,7 +294,7 @@ pub const WebTransportConnection = struct {
         const s = self.getSession(session_id) orelse return error.SessionGone;
         return switch (s.state) {
             .connecting, .active => s,
-            .draining, .closed => error.SessionGone,
+            .draining, .awaiting_fin, .closed => error.SessionGone,
         };
     }
 
@@ -727,8 +733,11 @@ pub const WebTransportConnection = struct {
     /// way to reach the peer.
     pub fn closeSessionWithError(self: *WebTransportConnection, session_id: u64, error_code: u32, reason: []const u8) !void {
         const session = self.getSession(session_id) orelse return;
-        if (session.state == .draining or session.state == .closed) return;
-        if (self.is_server and session.state == .connecting) return self.rejectSession(session_id, 403);
+        switch (session.state) {
+            .draining, .awaiting_fin, .closed => return,
+            .connecting => if (self.is_server) return self.rejectSession(session_id, 403),
+            .active => {},
+        }
 
         const truncated_reason = truncateReason(reason);
 
@@ -811,10 +820,14 @@ pub const WebTransportConnection = struct {
     /// Release a session and report it closed with the code and reason it
     /// holds. The reason stays in the slot, which outlives the poll.
     fn sessionClosed(self: *WebTransportConnection, session: *Session, abrupt: bool) WtEvent {
-        const sid = session.session_id;
+        const event = closedEvent(session, abrupt);
         self.finalizeSession(session);
+        return event;
+    }
+
+    fn closedEvent(session: *const Session, abrupt: bool) WtEvent {
         return .{ .session_closed = .{
-            .session_id = sid,
+            .session_id = session.session_id,
             .error_code = session.close_error_code,
             .reason = session.close_reason,
             .abrupt = abrupt,
@@ -846,7 +859,7 @@ pub const WebTransportConnection = struct {
                 return .{ .session_rejected = .{ .session_id = sid, .status = "" } };
             },
             .draining => return self.sessionClosed(session, false),
-            .active, .closed => return null,
+            .active, .awaiting_fin, .closed => return null,
         }
     }
 
@@ -1029,9 +1042,16 @@ pub const WebTransportConnection = struct {
     fn pollSessionStreams(self: *WebTransportConnection) ?WtEvent {
         for (&self.sessions) |*session| {
             if (!session.occupied) continue;
-            if (session.state != .active and session.state != .draining) continue;
+            switch (session.state) {
+                .active, .draining, .awaiting_fin => {},
+                .connecting, .closed => continue,
+            }
 
-            const stream = self.quic.streams.getStream(session.session_id) orelse continue;
+            const stream = self.quic.streams.getStream(session.session_id) orelse {
+                // Reclaimed: both sides are over.
+                if (session.state == .awaiting_fin) self.finalizeSession(session);
+                continue;
+            };
 
             // Buffer all that arrived: one read can carry several capsules, or
             // half of one, and `finished` flips only on the read after the
@@ -1042,6 +1062,10 @@ pub const WebTransportConnection = struct {
                 buf.appendSlice(self.allocator, data) catch {};
             }
 
+            if (session.state == .awaiting_fin) {
+                self.awaitPeerFin(session, stream);
+                continue;
+            }
             if (self.consumeCapsules(session)) |event| return event;
             if (self.connectStreamEnd(session, stream)) |event| return event;
         }
@@ -1075,6 +1099,22 @@ pub const WebTransportConnection = struct {
         session.close_error_code = 0;
         self.setCloseReason(session, "");
         return self.sessionClosed(session, false);
+    }
+
+    /// A session the peer closed, already reported: its slot goes once the
+    /// CONNECT stream ends, or once it carries a byte past the capsule, which
+    /// §6 answers with H3_MESSAGE_ERROR.
+    fn awaitPeerFin(self: *WebTransportConnection, session: *Session, stream: *stream_mod.Stream) void {
+        const left = if (self.stream_bufs.getPtr(session.session_id)) |b| b.items.len else 0;
+        if (left > 0) return self.refuseAfterClose(session);
+        if (stream.recv.finished or stream.recv.reset_err != null or stream.send.peer_stop_sending != null) {
+            self.finalizeSession(session);
+        }
+    }
+
+    fn refuseAfterClose(self: *WebTransportConnection, session: *Session) void {
+        self.abortConnectStream(session.session_id, @backingInt(h3_conn.H3Error.message_error));
+        self.finalizeSession(session);
     }
 
     /// Take over what HTTP/3 read past the CONNECT's HEADERS: capsules that
@@ -1145,24 +1185,23 @@ pub const WebTransportConnection = struct {
 
             const result = h3_frame.parse(buf.items) catch return self.malformedCapsule(session);
             const sid = session.session_id;
-            const trailing = buf.items.len > result.consumed;
 
             // Act before consuming: a capsule's payload points into the buffer.
-            // A close releases the session and its buffer with it, so the
-            // pointer is re-read rather than reused.
-            const event = self.handleCapsule(session, result.frame) orelse {
-                if (self.stream_bufs.getPtr(sid)) |live| {
-                    h3_frame.consumeFromBuf(live, @min(result.consumed, live.items.len));
-                }
-                continue;
-            };
-            // §6: stream data after a received WT_CLOSE_SESSION MUST reset the
-            // stream with H3_MESSAGE_ERROR. The close itself stands.
-            if (event == .session_closed and !event.session_closed.abrupt and trailing) {
-                self.abortConnectStream(sid, @backingInt(h3_conn.H3Error.message_error));
+            // An abrupt close releases the session and its buffer with it, so
+            // the pointer is re-read rather than reused.
+            const event = self.handleCapsule(session, result.frame);
+            if (self.stream_bufs.getPtr(sid)) |live| {
+                h3_frame.consumeFromBuf(live, @min(result.consumed, live.items.len));
             }
-            if (self.stream_bufs.getPtr(sid)) |live| h3_frame.consumeFromBuf(live, result.consumed);
-            return event;
+            const ev = event orelse continue;
+            // §6: stream data after a received WT_CLOSE_SESSION MUST reset the
+            // stream with H3_MESSAGE_ERROR, whichever read it comes in. The
+            // close itself stands.
+            if (session.occupied and session.state == .awaiting_fin) {
+                const left = if (self.stream_bufs.getPtr(sid)) |b| b.items.len else 0;
+                if (left > 0) self.refuseAfterClose(session);
+            }
+            return ev;
         }
     }
 
@@ -1212,19 +1251,24 @@ pub const WebTransportConnection = struct {
         switch (frame) {
             .close_webtransport_session => |cls| {
                 if (!std.unicode.utf8ValidateSlice(cls.reason)) return self.malformedCapsule(session);
+                // Closes that crossed: ours stands, as a browser's does for
+                // its page, and the peer's FIN is still what ends it.
+                if (session.state == .draining) {
+                    session.capsule_skip = std.math.maxInt(u64);
+                    return null;
+                }
                 const sid = session.session_id;
                 session.close_error_code = cls.error_code;
                 self.setCloseReason(session, cls.reason);
 
                 // §6: answered with our FIN. No STOP_SENDING: browsers count a
                 // close as clean only once both FINs have crossed.
-                if (session.state == .active) {
-                    if (self.quic.streams.getStream(sid)) |s| {
-                        if (s.send.reset_err == null) s.send.close();
-                    }
-                    self.cleanupSessionStreams(sid);
+                if (self.quic.streams.getStream(sid)) |s| {
+                    if (s.send.reset_err == null) s.send.close();
                 }
-                return self.sessionClosed(session, false);
+                self.cleanupSessionStreams(sid);
+                session.state = .awaiting_fin;
+                return closedEvent(session, false);
             },
             .drain_webtransport_session => {
                 // Graceful shutdown signal from peer
@@ -1441,7 +1485,7 @@ pub const WebTransportConnection = struct {
         if (self.getSession(session_id)) |s| return switch (s.state) {
             .active => .active,
             .connecting => .pending,
-            .draining, .closed => .gone,
+            .draining, .awaiting_fin, .closed => .gone,
         };
         // A client's sessions are its own CONNECTs: no session, none coming.
         if (!self.is_server) return .gone;
@@ -1744,7 +1788,7 @@ pub const WebTransportConnection = struct {
     /// What a wait is measured against, or null once it can never be met.
     fn waitCapacity(self: *WebTransportConnection, w: WritableWait) ?u64 {
         const sess = self.getSession(w.session_id) orelse return null;
-        if (sess.state == .draining or sess.state == .closed) return null;
+        if (sess.state != .active and sess.state != .connecting) return null;
         const stream_id = w.stream_id orelse return self.sendCapacity(w.session_id);
         const ss = self.quic.streams.getSendStream(stream_id) orelse return null;
         if (ss.reset_err != null or ss.fin_queued) return null;
@@ -2871,6 +2915,61 @@ test "WT: data after a received close resets the CONNECT stream, and the close s
     try testing.expect(!ev.session_closed.abrupt);
     try testing.expectEqual(@as(u32, 5), ev.session_closed.error_code);
     try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.send.reset_err);
+}
+
+test "WT: bytes after the peer's close in a later read reset the CONNECT stream" {
+    for ([_]bool{ true, false }) |server| {
+        var setup: WtTestSetup = undefined;
+        const session_id = if (server) try setup.initServer() else try setup.initClient();
+        defer setup.deinit();
+
+        var buf: [64]u8 = undefined;
+        const stream = try peerSends(&setup, session_id, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 5, .reason = "bye" } }), false);
+        const ev = try pollFor(&setup.wt, .session_closed);
+        try testing.expectEqual(@as(u32, 5), ev.session_closed.error_code);
+        try testing.expect(stream.send.fin_queued);
+        try testing.expectEqual(@as(?u64, null), stream.send.reset_err);
+
+        // The CONNECT stream is still read: what follows is a §6 violation.
+        _ = try peerSends(&setup, session_id, "x", false);
+        try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+        try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.send.reset_err);
+        try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.recv.stop_sending_err);
+        try testing.expect(setup.wt.getSession(session_id) == null);
+    }
+}
+
+test "WT: the peer's FIN after its close ends the wait for it, with nothing more reported" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var buf: [64]u8 = undefined;
+    const stream = try peerSends(&setup, session_id, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 5, .reason = "bye" } }), false);
+    _ = try pollFor(&setup.wt, .session_closed);
+    try testing.expectEqual(SessionState.awaiting_fin, setup.wt.getSession(session_id).?.state);
+
+    _ = try peerSends(&setup, session_id, "", true);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+    try testing.expect(setup.wt.getSession(session_id) == null);
+    try testing.expectEqual(@as(?u64, null), stream.send.reset_err);
+    try testing.expectEqual(@as(u32, 0), setup.wt.active_session_count);
+}
+
+test "WT: closes that cross report our own, once the peer's FIN is in" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initClient();
+    defer setup.deinit();
+
+    try setup.wt.closeSessionWithError(session_id, 3, "ours");
+    var buf: [64]u8 = undefined;
+    const stream = try peerSends(&setup, session_id, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 9, .reason = "theirs" } }), false);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+    _ = try peerSends(&setup, session_id, "", true);
+    const ev = try pollFor(&setup.wt, .session_closed);
+    try testing.expectEqual(@as(u32, 3), ev.session_closed.error_code);
+    try testing.expectEqualStrings("ours", ev.session_closed.reason);
+    try testing.expectEqual(@as(?u64, null), stream.send.reset_err);
 }
 
 test "WT: unknown and malformed capsules reset nothing while our close waits for the peer's FIN" {
