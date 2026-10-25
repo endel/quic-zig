@@ -1326,12 +1326,13 @@ pub fn Server(comptime Handler: type) type {
         /// non-blocking event loop polls (edge-triggered race in kqueue/epoll).
         pub fn pollDirect(self: *Self) void {
             self.in_callback = true;
-            defer self.endCallback();
             _ = self.recvAllPackets();
             self.processConnections();
             self.runOnPass();
             self.tickAndSend();
             self.endPass();
+            self.endCallback();
+            if (self.stopping and self.allConnectionsClosed()) self.finishStop(null);
         }
 
         /// Build and send whatever is queued, now. Writes made through a
@@ -1419,6 +1420,11 @@ pub fn Server(comptime Handler: type) type {
         ///    resets every stream of its session. The same for WebSockets.
         /// 3. Run the loop until `isDrained()`, or a deadline passes.
         /// 4. `stop()`, which closes whatever is left.
+        ///
+        /// Both may be called from the handler's own callbacks, `onPass`
+        /// included, as from outside them, on the server's own loop or a
+        /// shared one: checking `isDrained()` and the deadline in `onPass`
+        /// and calling `stop()` there is the intended shape.
         pub fn drain(self: *Self) void {
             if (self.draining or self.stopping) return;
             self.draining = true;
@@ -1482,8 +1488,10 @@ pub fn Server(comptime Handler: type) type {
         /// a Close with 1001 (going away), sent if its socket takes it at
         /// once, and the handler `onWsClose(1001)`; other TCP connections are
         /// dropped. The CONNECTION_CLOSEs are flushed before this returns.
-        /// Then the loop exits, or on a shared loop the server takes itself
-        /// off it: keep running it until `isStopped()`.
+        /// Once the connections' closing periods are over, the loop exits,
+        /// or on a shared loop the server takes itself off it: keep running
+        /// it until `isStopped()`. Callable from a handler callback, `onPass`
+        /// included: the pass it is called in finishes first.
         pub fn stop(self: *Self) void {
             self.stopping = true;
             if (self.http1_server) |*h1| h1.stop();
@@ -1500,7 +1508,9 @@ pub fn Server(comptime Handler: type) type {
             // when it exits instead — the peer then holds the connection
             // until its idle timeout rather than learning we are gone.
             self.flush();
-            if (self.started and self.allConnectionsClosed()) self.finishStop(null);
+            // In a callback, the pass's own end finishes it: a watch can't
+            // be cancelled from inside its callback.
+            if (self.started and !self.in_callback and self.allConnectionsClosed()) self.finishStop(null);
         }
 
         /// The last step of `stop()`, once every connection has closed. Our
@@ -6601,6 +6611,156 @@ test "e2e: drainConnection drains one connection, and the server still takes new
         }
     }.f, 5000);
     late.deinit();
+}
+
+/// Runs the graceful shutdown from its own `onPass`, as netcode does: drain,
+/// then stop once drained or at once, whichever the test asks for.
+const ShutdownOnPass = struct {
+    pub const protocol: Protocol = .webtransport;
+    /// The `Server(ShutdownOnPass)`: its type can't be named in a field here.
+    server: ?*anyopaque = null,
+    plan: enum { none, stop, drain_then_stop } = .none,
+    drained: bool = false,
+    stopped_in_pass: bool = false,
+    /// Off, it asks for no passes of its own: only a packet brings one.
+    ticking: bool = true,
+    session: ?Session = null,
+    session_id: u64 = 0,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.session = session.*;
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onPass(self: *@This(), now_ns: i64) ?i64 {
+        const server: *Server(ShutdownOnPass) = @ptrCast(@alignCast(self.server orelse return null));
+        switch (self.plan) {
+            .none => {},
+            .stop => {
+                self.plan = .none;
+                server.stop();
+                self.stopped_in_pass = true;
+            },
+            .drain_then_stop => if (!self.drained) {
+                server.drain();
+                self.drained = true;
+            } else if (server.isDrained()) {
+                self.plan = .none;
+                server.stop();
+                self.stopped_in_pass = true;
+            },
+        }
+        return if (self.ticking) now_ns + 5 * std.time.ns_per_ms else null; // a game's tick
+    }
+};
+
+fn shutdownServerStopped(s: *Server(ShutdownOnPass)) bool {
+    return s.isStopped();
+}
+
+test "e2e: stop() from onPass takes a server off a shared loop, with a connection open or none" {
+    for ([_]bool{ false, true }, [_]u16{ 29535, 29536 }) |with_conn, port| {
+        var sh = ShutdownOnPass{};
+        var ch = WtDrainClient{};
+        var e2e: E2e(ShutdownOnPass, WtDrainClient) = undefined;
+        try e2e.init(port, &sh, &ch);
+        defer e2e.deinit();
+        sh.server = &e2e.server;
+        if (with_conn) {
+            try runUntil(&e2e.loop, &ch, WtDrainClient.ready, 10_000);
+        } else {
+            e2e.client.stop(); // nothing connected when the server stops
+            try runUntil(&e2e.loop, &e2e.client, struct {
+                fn f(c: *Client(WtDrainClient)) bool {
+                    return c.isStopped();
+                }
+            }.f, 5000);
+            try runUntil(&e2e.loop, &e2e.server, struct {
+                fn f(s: *Server(ShutdownOnPass)) bool {
+                    return s.conn_mgr.connectionCount() == 0;
+                }
+            }.f, 5000);
+        }
+        sh.plan = .stop;
+        try runUntil(&e2e.loop, &e2e.server, shutdownServerStopped, 5000);
+        try testing.expect(sh.stopped_in_pass);
+        try testing.expect(!e2e.loop.stopped());
+        if (with_conn) try testing.expect(e2e.client.conn.state != .connected);
+    }
+}
+
+test "e2e: stop() from an onPass a datagram brought takes the server off a shared loop" {
+    // The pass runs inside the socket watch's own callback, which a cancel
+    // can't take off the loop: on epoll, cancelling it there panicked.
+    var sh = ShutdownOnPass{ .ticking = false };
+    var idle = QuicIdleClient{};
+    var e2e: E2e(ShutdownOnPass, QuicIdleClient) = undefined;
+    try e2e.init(29540, &sh, &idle);
+    defer e2e.deinit();
+    sh.server = &e2e.server;
+    e2e.client.stop();
+    try runUntil(&e2e.loop, &e2e.client, struct {
+        fn f(c: *Client(QuicIdleClient)) bool {
+            return c.isStopped();
+        }
+    }.f, 5000);
+    try runFor(&e2e.loop, 50);
+
+    sh.plan = .stop;
+    const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(fd);
+    const to = try net.Address.parseIp4("127.0.0.1", 29540);
+    _ = std.c.sendto(fd, "x", 1, 0, &to.any, to.getOsSockLen());
+    try runUntil(&e2e.loop, &e2e.server, shutdownServerStopped, 5000);
+    try testing.expect(sh.stopped_in_pass);
+}
+
+test "e2e: stop() from onPass exits a server's own loop, with a connection open or none" {
+    for ([_]bool{ false, true }, [_]u16{ 29537, 29538 }) |with_conn, port| {
+        var sh = ShutdownOnPass{};
+        var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = port, .tls_config = makeTestTlsConfig() });
+        defer server.deinit();
+        sh.server = &server;
+        server.start();
+        var ch = WtDrainClient{};
+        var client = try Client(WtDrainClient).init(testing.allocator, &ch, .{ .port = port, .skip_cert_verify = true });
+        defer client.deinit();
+        if (with_conn) {
+            client.start();
+            try runUntil2(server.eventLoop(), client.eventLoop(), &ch, WtDrainClient.ready, 10_000);
+        }
+        sh.plan = .stop;
+        const deadline = sys.nanoTimestamp() + 5 * std.time.ns_per_s;
+        while (!server.eventLoop().stopped()) {
+            if (sys.nanoTimestamp() > deadline) return error.Timeout;
+            try server.tick();
+            if (with_conn) try client.tick();
+            sys.sleepNs(50 * std.time.ns_per_us);
+        }
+        try testing.expect(sh.stopped_in_pass);
+        try testing.expectEqual(@as(usize, 0), server.conn_mgr.connectionCount());
+    }
+}
+
+test "e2e: drain() then stop() from onPass, once the client has ended its session" {
+    var sh = ShutdownOnPass{};
+    var ch = WtDrainClient{};
+    var e2e: E2e(ShutdownOnPass, WtDrainClient) = undefined;
+    try e2e.init(29539, &sh, &ch);
+    defer e2e.deinit();
+    sh.server = &e2e.server;
+    try runUntil(&e2e.loop, &ch, WtDrainClient.ready, 10_000);
+
+    sh.plan = .drain_then_stop;
+    try runUntilCount(&e2e.loop, &ch.drainings, 1, 3000);
+    try runFor(&e2e.loop, 50);
+    try testing.expect(!sh.stopped_in_pass); // a live session holds it
+    var cs = e2e.client.clientSession();
+    try cs.closeSessionWithError(ch.session_id.?, 0, "leaving");
+    try runUntil(&e2e.loop, &e2e.server, shutdownServerStopped, 5000);
+    try testing.expect(sh.stopped_in_pass);
+    try testing.expectEqual(@as(u32, 1), ch.closed);
 }
 
 test "e2e: a WT_STREAMS_BLOCKED is answered with nothing more from the peer" {
