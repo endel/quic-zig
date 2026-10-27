@@ -56,6 +56,13 @@ fn sourceKey(addr: *const posix.sockaddr.storage) SourceKey {
     return key;
 }
 
+/// Asked whether a datagram's source may open a connection; see
+/// `ConnectionManager.source_filter`.
+pub const SourceFilter = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, peer: *const posix.sockaddr.storage) bool,
+};
+
 pub const SourceKeyContext = struct {
     seed: u64 = 0,
 
@@ -484,6 +491,11 @@ pub const ConnectionManager = struct {
     /// Handshakes per source counted under `max_handshakes_per_source`.
     /// Seeded like `cid_map`: IPv6 sources choose their keys too.
     source_handshakes: std.HashMap(SourceKey, u32, SourceKeyContext, 80),
+
+    /// Consulted for an Initial that would open a connection, before Retry
+    /// or any decryption: false drops it without a reply. For an embedder's
+    /// own denylist; datagrams of existing connections never reach it.
+    source_filter: ?SourceFilter = null,
 
     /// When true, every new connection is answered with CONNECTION_REFUSED,
     /// as it is at `max_connections`. Set while a server drains.
@@ -1178,6 +1190,7 @@ pub const ConnectionManager = struct {
                 if (bytes.len < MIN_INITIAL_DATAGRAM or header.dcid.len < MIN_INITIAL_DCID_LEN) {
                     return .{ .dropped = {} };
                 }
+                if (self.source_filter) |f| if (!f.func(f.ctx, &from)) return .{ .dropped = {} };
                 if (!self.initialOpens(header, bytes[pkt_start..][0..full_size], fbs.seek - pkt_start)) {
                     return .{ .dropped = {} };
                 }
@@ -1992,6 +2005,35 @@ test "refuse_new turns away new connections while existing ones keep routing" {
     }
     var out: [1500]u8 = undefined;
     try std.testing.expect(mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out) == .send_response);
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+}
+
+test "source_filter drops a refused source's Initial before Retry, and lets others in" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    // Retry is the cheapest reply there is; a refused source doesn't get even that.
+    mgr.require_retry = true;
+    const Deny = struct {
+        var asked: u32 = 0;
+        fn admit(ctx: ?*anyopaque, peer: *const posix.sockaddr.storage) bool {
+            asked += 1;
+            const banned: *const posix.sockaddr.storage = @ptrCast(@alignCast(ctx.?));
+            return !std.mem.eql(u8, &packet.mappedIp(peer), &packet.mappedIp(banned));
+        }
+    };
+    var banned = testIn4(.{ 198, 51, 100, 7 }, 1000);
+    mgr.source_filter = .{ .ctx = &banned, .func = Deny.admit };
+
+    var buf: [1500]u8 = undefined;
+    const client = try clientInitial(alloc, &buf);
+    defer destroyClient(alloc, client.conn);
+    var out: [1500]u8 = undefined;
+    const local = testIn4(.{ 192, 0, 2, 1 }, 443);
+    // Another port of the same address is the same source.
+    try std.testing.expect(mgr.recvDatagram(buf[0..client.len], testIn4(.{ 198, 51, 100, 7 }, 2000), local, 0, &out) == .dropped);
+    try std.testing.expect(mgr.recvDatagram(buf[0..client.len], testIn4(.{ 203, 0, 113, 9 }, 1000), local, 0, &out) == .send_response);
+    try std.testing.expectEqual(@as(u32, 2), Deny.asked);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
 }
 

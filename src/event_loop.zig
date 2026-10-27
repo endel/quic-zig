@@ -21,6 +21,7 @@ const connection = @import("quic/connection.zig");
 const connection_manager = @import("quic/connection_manager.zig");
 pub const ConnEntry = connection_manager.ConnEntry;
 pub const MovedCids = connection_manager.MovedCids;
+pub const SourceFilter = connection_manager.SourceFilter;
 const stream_mod = @import("quic/stream.zig");
 const tls13 = @import("quic/tls13.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
@@ -224,6 +225,11 @@ pub const Config = struct {
     /// new Initials are dropped until one of its handshakes ends. Null is a
     /// quarter of `max_handshakes`.
     max_handshakes_per_source: ?usize = null,
+
+    /// Asked for each Initial that would open a connection, before Retry or
+    /// any decryption: false drops it without a reply. For a denylist of
+    /// the embedder's own; established connections are not affected.
+    source_filter: ?SourceFilter = null,
 
     /// Server-wide cap, per second, on each kind of reply sent without
     /// connection state: Version Negotiation, stateless reset and
@@ -1197,6 +1203,7 @@ pub fn Server(comptime Handler: type) type {
             conn_mgr.max_connections = config.max_connections;
             conn_mgr.max_handshakes = config.max_handshakes orelse @max(config.max_connections / 4, 1);
             conn_mgr.max_handshakes_per_source = config.max_handshakes_per_source orelse @max(conn_mgr.max_handshakes / 4, 1);
+            conn_mgr.source_filter = config.source_filter;
             conn_mgr.reply_limits = .init(config.stateless_reply_rate);
             conn_mgr.steer_foreign = config.foreign_datagram != null;
             conn_mgr.moved = config.moved_cids;

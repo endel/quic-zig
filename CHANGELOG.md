@@ -7,6 +7,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Added
 
+- `Config.source_filter`: a server asks it before an Initial opens a
+  connection, and drops the datagram without a reply when it says no, so a
+  denylist costs a banned client neither a Retry nor a handshake.
 - A server can hand a live connection, streams and WebTransport sessions
   included, to a sibling server on another thread sharing its port
   (`Session.handOver`, `Server.adopt`, a shared `Config.moved_cids`); the
