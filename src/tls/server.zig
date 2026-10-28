@@ -615,10 +615,7 @@ pub const Conn = struct {
     fn onClientHello(self: *Conn, msg: []const u8) Error!void {
         const retry = self.state == .wait_client_hello_retry;
         // The second, after a HelloRetryRequest, is the one we asked for.
-        if (!retry) if (self.config.fingerprint_filter) |f| {
-            self.fp = ja4.compute(msg[4..], .tcp);
-            if (self.fp) |*fp| if (!f.func(f.ctx, fp)) return error.HandshakeFailure;
-        };
+        if (!retry) if (self.config.fingerprint_filter) |f| if (!f.admits(msg[4..], .tcp, &self.fp)) return error.HandshakeFailure;
         const ch = try ClientHello.parse(msg[4..]);
         const config = self.config;
 

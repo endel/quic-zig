@@ -2197,10 +2197,7 @@ pub const Tls13Handshake = struct {
         const body = msg[4..];
         if (body.len < 2 + 32 + 1) return error.DecodeError;
         // The second, after a HelloRetryRequest, is the one we asked for.
-        if (!self.hrr_seen) if (self.config.fingerprint_filter) |f| {
-            self.fp = ja4.compute(body, .quic);
-            if (self.fp) |*fp| if (!f.func(f.ctx, fp)) return error.HandshakeFailure;
-        };
+        if (!self.hrr_seen) if (self.config.fingerprint_filter) |f| if (!f.admits(body, .quic, &self.fp)) return error.HandshakeFailure;
 
         var pos: usize = 0;
         pos += 2; // legacy_version

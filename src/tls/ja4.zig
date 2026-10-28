@@ -61,6 +61,21 @@ pub const Ja4 = struct {
 pub const Filter = struct {
     ctx: ?*anyopaque = null,
     func: *const fn (ctx: ?*anyopaque, fp: *const Ja4) bool,
+
+    /// Fingerprint a ClientHello's `body` into `out` and ask; one that
+    /// doesn't parse has none, and is left to the handshake to refuse.
+    pub fn admits(f: Filter, body: []const u8, transport: Transport, out: *?Ja4) bool {
+        out.* = compute(body, transport);
+        const fp = &(out.* orelse return true);
+        return f.func(f.ctx, fp);
+    }
+};
+
+/// The version codes of the `a` part, by the protocol version they stand
+/// for; anything else is `00`.
+pub const versions = [_]struct { u16, *const [2]u8 }{
+    .{ 0x0304, "13" }, .{ 0x0303, "12" }, .{ 0x0302, "11" }, .{ 0x0301, "10" },
+    .{ 0x0300, "s3" }, .{ 0x0002, "s2" },
 };
 
 /// The fingerprint of a ClientHello's `body` (the message after its 4-byte
@@ -189,15 +204,8 @@ fn hashList(h: *Sha256, items: []const u16) void {
 }
 
 fn versionText(v: u16) [2]u8 {
-    return switch (v) {
-        0x0304 => "13".*,
-        0x0303 => "12".*,
-        0x0302 => "11".*,
-        0x0301 => "10".*,
-        0x0300 => "s3".*,
-        0x0002 => "s2".*,
-        else => "00".*,
-    };
+    for (versions) |known| if (known[0] == v) return known[1].*;
+    return "00".*;
 }
 
 fn twoDigits(n: usize) [2]u8 {
@@ -243,7 +251,7 @@ test "the README's example: t13d1516h2_8daaf6152771_e5627efa2ab1" {
     // Its lists, shuffled and with GREASE added: neither may change a thing.
     const ciphers = [_]u16{ 0x1a1a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035 };
     const sig_algs = [_]u8{ 0, 16, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01 };
-    const versions = [_]u8{ 6, 0x7a, 0x7a, 0x03, 0x04, 0x03, 0x03 };
+    const supported_versions = [_]u8{ 6, 0x7a, 0x7a, 0x03, 0x04, 0x03, 0x03 };
     const alpn = [_]u8{ 0, 12, 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
     var buf: [512]u8 = undefined;
     const body = testHello(&buf, &ciphers, &.{
@@ -253,7 +261,7 @@ test "the README's example: t13d1516h2_8daaf6152771_e5627efa2ab1" {
         .{ 0x0023, "" },                     .{ 0x0010, &alpn },
         .{ 0x0005, "\x01\x00\x00\x00\x00" }, .{ 0x000d, &sig_algs },
         .{ 0x0012, "" },                     .{ 0x0033, "\x00\x00" },
-        .{ 0x002d, "\x01\x01" },             .{ 0x002b, &versions },
+        .{ 0x002d, "\x01\x01" },             .{ 0x002b, &supported_versions },
         .{ 0x001b, "\x02\x00\x02" },         .{ 0x4469, "" },
         .{ 0x0015, "\x00" },
     });
