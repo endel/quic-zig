@@ -31,6 +31,7 @@ const std = @import("std");
 const sys = @import("../sys.zig");
 const tls13 = @import("../quic/tls13.zig");
 const common = @import("common.zig");
+const ja4 = @import("ja4.zig");
 
 const crypto = std.crypto;
 const tls = crypto.tls;
@@ -107,6 +108,10 @@ pub const Config = struct {
     /// How long a ticket stays valid, in seconds. RFC 8446 caps it at 7 days,
     /// and a longer value is clamped to that.
     ticket_lifetime_s: u32 = 24 * 3600,
+    /// Asked with the JA4 fingerprint of each connection's first
+    /// ClientHello, before any key exchange: false fails the handshake with
+    /// `handshake_failure`. When set, `fingerprint()` keeps it.
+    fingerprint_filter: ?ja4.Filter = null,
 };
 
 pub const Error = error{
@@ -177,6 +182,8 @@ pub const Conn = struct {
     client_auth: ?*const tls13.ClientAuth = null,
     /// The client's verified leaf certificate (DER), owned.
     peer_cert: ?[]u8 = null,
+    /// With `Config.fingerprint_filter`, once the ClientHello is in.
+    fp: ?ja4.Ja4 = null,
 
     bufs: ?*Buffers = null,
     in_len: usize = 0,
@@ -347,6 +354,12 @@ pub const Conn = struct {
     /// names which policy vouched for `peerCertificate()`.
     pub fn clientAuth(self: *const Conn) ?*const tls13.ClientAuth {
         return self.client_auth;
+    }
+
+    /// The JA4 fingerprint of the client's first ClientHello, when
+    /// `Config.fingerprint_filter` is set and the ClientHello parsed.
+    pub fn fingerprint(self: *const Conn) ?ja4.Ja4 {
+        return self.fp;
     }
 
     /// The negotiated key exchange group, once the ServerHello is out.
@@ -601,6 +614,8 @@ pub const Conn = struct {
 
     fn onClientHello(self: *Conn, msg: []const u8) Error!void {
         const retry = self.state == .wait_client_hello_retry;
+        // The second, after a HelloRetryRequest, is the one we asked for.
+        if (!retry) if (self.config.fingerprint_filter) |f| if (!f.admits(msg[4..], .tcp, &self.fp)) return error.HandshakeFailure;
         const ch = try ClientHello.parse(msg[4..]);
         const config = self.config;
 
@@ -2298,6 +2313,49 @@ test "a TLS 1.2-only client gets protocol_version" {
     defer client.deinit();
     try testing.expectError(error.ProtocolVersion, client.handshake(&conn));
     try expectAlert(&conn, .protocol_version);
+}
+
+test "fingerprint_filter sees the first ClientHello's JA4, and can refuse it" {
+    var certs: TestCerts = undefined;
+    try certs.load();
+    const Deny = struct {
+        var seen: ?ja4.Ja4 = null;
+        var calls: u32 = 0;
+        var refuse = false;
+        fn admit(_: ?*anyopaque, fp: *const ja4.Ja4) bool {
+            seen = fp.*;
+            calls += 1;
+            return !refuse;
+        }
+    };
+    const config: Config = .{ .certs = &certs.entries, .fingerprint_filter = .{ .func = Deny.admit } };
+    {
+        var conn = Conn.init(testing.allocator, &config);
+        defer conn.deinit();
+        // A HelloRetryRequest brings a second ClientHello; only the first is asked about.
+        var client: MiniClient = .{ .gpa = testing.allocator, .shares = &.{0x0018}, .groups = &.{ 0x0018, @backingInt(Group.x25519) } };
+        defer client.deinit();
+        try client.handshake(&conn);
+        try testing.expect(client.got_hrr and conn.handshakeComplete());
+        try testing.expectEqual(@as(u32, 1), Deny.calls);
+        try testing.expectEqual(Deny.seen.?, conn.fingerprint().?);
+        try testing.expectEqual(@as(u8, 't'), conn.fingerprint().?.a[0]);
+    }
+    Deny.refuse = true;
+    var conn = Conn.init(testing.allocator, &config);
+    defer conn.deinit();
+    var client: MiniClient = .{ .gpa = testing.allocator };
+    defer client.deinit();
+    try testing.expectError(error.HandshakeFailure, client.handshake(&conn));
+    try expectAlert(&conn, .handshake_failure);
+    // Without a filter, no fingerprint is taken.
+    const plain: Config = .{ .certs = &certs.entries };
+    var other = Conn.init(testing.allocator, &plain);
+    defer other.deinit();
+    var c2: MiniClient = .{ .gpa = testing.allocator };
+    defer c2.deinit();
+    try c2.handshake(&other);
+    try testing.expect(other.fingerprint() == null);
 }
 
 test "mutated ClientHellos never crash the server" {

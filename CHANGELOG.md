@@ -7,6 +7,11 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Added
 
+- JA4 client fingerprints. Set `fingerprint_filter` in `tls_server.Config`
+  or a QUIC server's `TlsConfig`, and each connection's first ClientHello
+  is fingerprinted and offered to it before any key exchange; false fails
+  the handshake. `fingerprint()` on the connection or `Session` returns it,
+  and `quic.ja4.compute` takes one from any ClientHello.
 - `Config.source_filter`: a server asks it before an Initial opens a
   connection, and drops the datagram without a reply when it says no, so a
   denylist costs a banned client neither a Retry nor a handshake.

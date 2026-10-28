@@ -13,6 +13,7 @@ const quic_crypto = @import("crypto.zig");
 const protocol = @import("protocol.zig");
 const transport_params = @import("transport_params.zig");
 const limits = @import("limits.zig");
+const ja4 = @import("../tls/ja4.zig");
 pub const rsa = @import("rsa.zig");
 
 const Certificate = std.crypto.Certificate;
@@ -1138,6 +1139,10 @@ pub const TlsConfig = struct {
     /// Empty leaves the choice to the server, at the cost of a round trip.
     key_share_groups: []const tls.NamedGroup = &.{ .x25519, .secp256r1 },
     quic_version: u32 = protocol.QUIC_V1, // QUIC version (affects HKDF labels)
+    /// Server only: asked with the JA4 fingerprint of each connection's
+    /// first ClientHello, before any key exchange; false fails the
+    /// handshake. When set, `Connection.fingerprint()` keeps it.
+    fingerprint_filter: ?ja4.Filter = null,
 };
 
 // ─── SSLKEYLOGFILE support (NSS Key Log format) ─────────────────────
@@ -1331,6 +1336,8 @@ pub const Tls13Handshake = struct {
     /// Holds `peer_cert`; the connection sets it. Without it a client-auth
     /// handshake fails with internal_error.
     allocator: ?std.mem.Allocator = null,
+    /// Server: with `config.fingerprint_filter`, once the ClientHello is in.
+    fp: ?ja4.Ja4 = null,
 
     /// Server: the ClientHello carried the early_data extension. RFC 8446
     /// 4.2.10 only lets EncryptedExtensions answer an extension the client
@@ -1405,6 +1412,7 @@ pub const Tls13Handshake = struct {
         self.client_auth = null;
         self.peer_cert = null;
         self.allocator = null;
+        self.fp = null;
         self.early_data_offered = false;
         self.selected_alpn_len = 0;
         self.zero_rtt_accepted = false;
@@ -1482,6 +1490,7 @@ pub const Tls13Handshake = struct {
         self.client_auth = null;
         self.peer_cert = null;
         self.allocator = null;
+        self.fp = null;
         self.early_data_offered = false;
         self.selected_alpn_len = 0;
         self.zero_rtt_accepted = false;
@@ -2187,6 +2196,8 @@ pub const Tls13Handshake = struct {
 
         const body = msg[4..];
         if (body.len < 2 + 32 + 1) return error.DecodeError;
+        // The second, after a HelloRetryRequest, is the one we asked for.
+        if (!self.hrr_seen) if (self.config.fingerprint_filter) |f| if (!f.admits(body, .quic, &self.fp)) return error.HandshakeFailure;
 
         var pos: usize = 0;
         pos += 2; // legacy_version
@@ -5606,6 +5617,50 @@ test "client: a HelloRetryRequest it cannot act on is refused" {
     _ = try other.step();
     other.provideData(for_p384);
     try std.testing.expectError(error.IllegalParameter, other.step());
+}
+
+test "server: fingerprint_filter sees the first ClientHello's JA4, and can refuse it" {
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    const Deny = struct {
+        var calls: u32 = 0;
+        var refuse = false;
+        fn admit(_: ?*anyopaque, fp: *const ja4.Ja4) bool {
+            calls += 1;
+            return !refuse and fp.a[0] == 'q';
+        }
+    };
+    const ec = certs.entries[0].cert;
+    const config: TlsConfig = .{
+        .cert_chain_der = ec.cert_chain_der,
+        .private_key_bytes = ec.private_key_bytes,
+        .private_key_algorithm = ec.private_key_algorithm,
+        .alpn = &[_][]const u8{"h3"},
+        .fingerprint_filter = .{ .func = Deny.admit },
+    };
+    // No share at first: a HelloRetryRequest, and a second ClientHello
+    // the filter isn't asked about.
+    var none = test_client_config;
+    none.key_share_groups = &.{};
+    var buf: [2048]u8 = undefined;
+    var server = Tls13Handshake.initServer(config, .{ .initial_max_data = 1 << 20 });
+    server.provideData(try testClientHello(&buf, none));
+    while (true) if (try server.step() == .send_data) break;
+    try std.testing.expect(server.hrr_seen);
+    const first = server.fp.?;
+    try std.testing.expectEqualStrings("q13d", first.a[0..4]);
+    var x25519_only = test_client_config;
+    x25519_only.key_share_groups = &.{.x25519};
+    var buf2: [2048]u8 = undefined;
+    server.provideData(try testClientHello(&buf2, x25519_only));
+    while (true) if (try server.step() == .send_data) break;
+    try std.testing.expectEqual(@as(u32, 1), Deny.calls);
+    try std.testing.expectEqual(first, server.fp.?);
+
+    Deny.refuse = true;
+    var refused = Tls13Handshake.initServer(config, .{ .initial_max_data = 1 << 20 });
+    refused.provideData(try testClientHello(&buf, test_client_config));
+    try std.testing.expectError(error.HandshakeFailure, refused.step());
 }
 
 test "server: a second ClientHello without the share it asked for is refused" {
