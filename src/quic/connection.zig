@@ -10,6 +10,7 @@ const tls = std.crypto.tls;
 const protocol = @import("protocol.zig");
 const packet = @import("packet.zig");
 const tls13 = @import("tls13.zig");
+const ja4 = @import("../tls/ja4.zig");
 const frame_mod = @import("frame.zig");
 const Frame = frame_mod.Frame;
 const FrameType = frame_mod.FrameType;
@@ -754,6 +755,7 @@ pub const Connection = struct {
     alpn_len: u8 = 0,
     peer_cert: ?[]u8 = null,
     client_auth: ?*const tls13.ClientAuth = null,
+    fp: ?ja4.Ja4 = null,
 
     // Network paths (active + candidate for migration)
     paths: [2]NetworkPath = .{ std.mem.zeroes(NetworkPath), std.mem.zeroes(NetworkPath) },
@@ -4526,6 +4528,13 @@ pub const Connection = struct {
         return hs.client_auth;
     }
 
+    /// Server: the JA4 fingerprint of the client's first ClientHello, when
+    /// `TlsConfig.fingerprint_filter` is set and the ClientHello parsed.
+    pub fn fingerprint(self: *const Connection) ?ja4.Ja4 {
+        const hs = self.tls13_hs orelse return self.fp;
+        return hs.fp;
+    }
+
     /// Free a finished server handshake, keeping what the accessors above
     /// still answer: 52 KB a connection otherwise held for its lifetime.
     fn releaseHandshake(self: *Connection) void {
@@ -4535,6 +4544,7 @@ pub const Connection = struct {
         @memcpy(self.alpn_buf[0..alpn.len], alpn);
         self.alpn_len = @intCast(alpn.len);
         self.client_auth = hs.client_auth;
+        self.fp = hs.fp;
         // Its allocator is ours (acceptInto), so the certificate can move.
         self.peer_cert = hs.peer_cert;
         hs.peer_cert = null;

@@ -24,6 +24,7 @@ pub const MovedCids = connection_manager.MovedCids;
 pub const SourceFilter = connection_manager.SourceFilter;
 const stream_mod = @import("quic/stream.zig");
 const tls13 = @import("quic/tls13.zig");
+const ja4 = @import("tls/ja4.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
 
@@ -375,6 +376,12 @@ pub const Session = struct {
     /// The client-auth policy this connection's handshake ran under.
     pub fn clientAuth(self: *const Session) ?*const tls13.ClientAuth {
         return self.entry.conn.clientAuth();
+    }
+
+    /// The JA4 fingerprint of the client's ClientHello, when
+    /// `TlsConfig.fingerprint_filter` is set.
+    pub fn fingerprint(self: *const Session) ?ja4.Ja4 {
+        return self.entry.conn.fingerprint();
     }
 
     // --- H3 methods (also for ordinary requests on a WebTransport server) ---
