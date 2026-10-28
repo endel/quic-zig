@@ -110,6 +110,7 @@ const EchoHandler = struct {
 
     pub fn onHttpRequest(_: *EchoHandler, req: *event_loop.HttpRequest, target: []const u8) void {
         if (std.mem.eql(u8, target, "/hello")) req.respond(200, "text/plain", "hi there");
+        if (std.mem.eql(u8, target, "/cors")) req.respondWith(200, "application/json", "Access-Control-Allow-Origin: *\r\n", "[]");
     }
 
     pub fn onConnectRequest(self: *EchoHandler, session: *event_loop.Session, session_id: u64, _: []const u8) void {
@@ -1108,4 +1109,10 @@ test "http1: onHttpRequest answers what it takes; the rest goes to the static fi
     try testing.expect(std.mem.indexOf(u8, try h.head(&c), "Content-Length: 8\r\n") != null);
     try c.send("GET /missing.txt HTTP/1.1\r\nHost: a\r\n\r\n");
     try testing.expect(std.mem.startsWith(u8, try h.head(&c), "HTTP/1.1 404 "));
+
+    // respondWith adds its own header lines.
+    try c.send("GET /cors HTTP/1.1\r\nHost: a\r\n\r\n");
+    const cors = try h.head(&c);
+    try testing.expect(std.mem.indexOf(u8, cors, "Content-Type: application/json\r\nContent-Length: 2\r\nAccess-Control-Allow-Origin: *\r\n") != null);
+    try testing.expectEqualStrings("[]", try h.bytes(&c, 2));
 }

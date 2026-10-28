@@ -268,14 +268,20 @@ pub const HttpRequest = struct {
 
     /// Answers with `body` (left out for HEAD), all of it queued now.
     pub fn respond(self: *HttpRequest, status: u16, content_type: []const u8, body: []const u8) void {
+        self.respondWith(status, content_type, "", body);
+    }
+
+    /// `respond`, with `headers` too: whole header lines, each ending in
+    /// `\r\n` (`"Access-Control-Allow-Origin: *\r\n"`, say).
+    pub fn respondWith(self: *HttpRequest, status: u16, content_type: []const u8, headers: []const u8, body: []const u8) void {
         if (self.answered) return;
         self.answered = true;
         const c = self.conn;
         var buf: [1024]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         const head = blk: {
-            w.print("HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n", .{
-                status, parser.reason(status), content_type, body.len,
+            w.print("HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n{s}", .{
+                status, parser.reason(status), content_type, body.len, headers,
             }) catch break :blk null;
             c.writeCommonHeaders(&w, !c.keep_alive) catch break :blk null;
             w.writeAll("\r\n") catch break :blk null;
