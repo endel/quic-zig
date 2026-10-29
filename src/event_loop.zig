@@ -1227,7 +1227,7 @@ pub fn Server(comptime Handler: type) type {
                 try http1.Server.init(alloc, h1cfg, .{
                     .address = config.address,
                     .ipv6 = config.ipv6,
-                    .quic_port = config.port,
+                    .quic_port = local_addr.getPort(), // the kernel's pick for port 0
                     .reuse_port = config.reuse_port,
                     .certs = .{
                         .entries = tls_config.certs,
@@ -5140,6 +5140,18 @@ test "Server: port 0 takes one the kernel picks, which port() names for siblings
     var b = try S.init(testing.allocator, &handler, .{ .port = a.port(), .reuse_port = true });
     defer b.deinit();
     try testing.expectEqual(a.port(), b.port());
+}
+
+test "Server: port 0 puts the HTTP/1.1 listener and Alt-Svc on the port UDP got" {
+    var handler = TestH3Handler{};
+    const S = Server(TestH3Handler);
+    var s = try S.init(testing.allocator, &handler, .{ .port = 0, .http1 = .{ .tls = false } });
+    defer s.deinit();
+    const h1 = &s.http1_server.?;
+    try testing.expectEqual(s.port(), h1.port());
+    var buf: [32]u8 = undefined;
+    const want = try std.fmt.bufPrint(&buf, "h3=\":{d}\"", .{s.port()});
+    try testing.expect(std.mem.startsWith(u8, h1.altSvc().?, want));
 }
 
 test "Server and Client sockets send with DF set, IPv4 and dual-stack" {
