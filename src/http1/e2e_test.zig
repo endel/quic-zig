@@ -131,145 +131,151 @@ const EchoHandler = struct {
     }
 };
 
+const Harness = HarnessFor(EchoHandler);
+
 /// A server on a loop the test owns, with real certificates so TLS over
 /// TCP works as well as QUIC.
-const Harness = struct {
-    loop: xev.Loop,
-    certs: test_certs.TestCerts,
-    handler: EchoHandler,
-    server: event_loop.Server(EchoHandler),
-    port: u16,
+fn HarnessFor(comptime H: type) type {
+    return struct {
+        const Self = @This();
 
-    /// In place: the server keeps pointers into `self` once started.
-    fn init(self: *Harness, port: u16, h1: event_loop.Http1Config) !void {
-        self.port = port;
-        self.handler = .{};
-        try self.certs.load();
-        self.loop = try xev.Loop.init(.{});
-        errdefer self.loop.deinit();
-        self.server = try event_loop.Server(EchoHandler).init(testing.allocator, &self.handler, .{
-            .port = port,
-            .tls_config = .{
-                .cert_chain_der = &.{},
-                .private_key_bytes = &.{},
-                .certs = self.certs.entries[0..1],
-                .alpn = &.{"h3"},
-            },
-            .loop = &self.loop,
-            .http1 = h1,
-        });
-        self.server.start();
-    }
+        loop: xev.Loop,
+        certs: test_certs.TestCerts,
+        handler: H,
+        server: event_loop.Server(H),
+        port: u16,
 
-    fn deinit(self: *Harness) void {
-        self.server.stop();
-        self.spinUntil(self, stopped) catch @panic("server did not stop");
-        self.server.deinit();
-        self.loop.deinit();
-    }
-
-    fn stopped(self: *Harness) bool {
-        return self.server.isStopped();
-    }
-
-    fn step(self: *Harness) !void {
-        try self.loop.run(.no_wait);
-        sys.sleepNs(50 * std.time.ns_per_us);
-    }
-
-    fn spinUntil(self: *Harness, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool) !void {
-        const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
-        while (!done(ctx)) {
-            if (sys.nanoTimestamp() > deadline) return error.Timeout;
-            try self.step();
+        /// In place: the server keeps pointers into `self` once started.
+        fn init(self: *Self, port: u16, h1: event_loop.Http1Config) !void {
+            self.port = port;
+            self.handler = .{};
+            try self.certs.load();
+            self.loop = try xev.Loop.init(.{});
+            errdefer self.loop.deinit();
+            self.server = try event_loop.Server(H).init(testing.allocator, &self.handler, .{
+                .port = port,
+                .tls_config = .{
+                    .cert_chain_der = &.{},
+                    .private_key_bytes = &.{},
+                    .certs = self.certs.entries[0..1],
+                    .alpn = &.{"h3"},
+                },
+                .loop = &self.loop,
+                .http1 = h1,
+            });
+            self.server.start();
         }
-    }
 
-    /// The next response head from `c`.
-    fn head(self: *Harness, c: *TestClient) ![]const u8 {
-        const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
-        while (true) {
-            c.poll();
-            if (c.takeHead()) |h| return h;
-            if (c.eof) return error.EndOfStream;
-            if (sys.nanoTimestamp() > deadline) return error.Timeout;
-            try self.step();
+        fn deinit(self: *Self) void {
+            self.server.stop();
+            self.spinUntil(self, stopped) catch @panic("server did not stop");
+            self.server.deinit();
+            self.loop.deinit();
         }
-    }
 
-    /// The next `n` bytes from `c`.
-    fn bytes(self: *Harness, c: *TestClient, n: usize) ![]const u8 {
-        const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
-        while (true) {
-            c.poll();
-            if (c.in.items.len - c.pos >= n) {
-                defer c.pos += n;
-                return c.in.items[c.pos..][0..n];
+        fn stopped(self: *Self) bool {
+            return self.server.isStopped();
+        }
+
+        fn step(self: *Self) !void {
+            try self.loop.run(.no_wait);
+            sys.sleepNs(50 * std.time.ns_per_us);
+        }
+
+        fn spinUntil(self: *Self, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool) !void {
+            const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
+            while (!done(ctx)) {
+                if (sys.nanoTimestamp() > deadline) return error.Timeout;
+                try self.step();
             }
-            if (c.eof) return error.EndOfStream;
-            if (sys.nanoTimestamp() > deadline) return error.Timeout;
-            try self.step();
         }
-    }
 
-    /// The next frame the server sent `c`.
-    fn frame(self: *Harness, c: *TestClient) !ServerFrame {
-        const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
-        while (true) {
-            c.poll();
-            if (try c.takeFrame()) |f| return f;
-            if (c.eof) return error.EndOfStream;
-            if (sys.nanoTimestamp() > deadline) return error.Timeout;
-            try self.step();
-        }
-    }
-
-    /// Waits for the server to close `c`'s connection.
-    fn eof(self: *Harness, c: *TestClient) !void {
-        const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
-        while (!c.eof) {
-            c.poll();
-            if (sys.nanoTimestamp() > deadline) return error.Timeout;
-            try self.step();
-        }
-    }
-
-    fn handlerCloses(self: *Harness, n: u32) !void {
-        const W = struct {
-            h: *Harness,
-            n: u32,
-            fn done(w: *const @This()) bool {
-                return w.h.handler.closes >= w.n;
+        /// The next response head from `c`.
+        fn head(self: *Self, c: *TestClient) ![]const u8 {
+            const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
+            while (true) {
+                c.poll();
+                if (c.takeHead()) |h| return h;
+                if (c.eof) return error.EndOfStream;
+                if (sys.nanoTimestamp() > deadline) return error.Timeout;
+                try self.step();
             }
-        };
-        try self.spinUntil(&W{ .h = self, .n = n }, W.done);
-    }
-
-    /// Connects, upgrades, and checks the 101 and the greeting.
-    fn upgrade(self: *Harness, c: *TestClient, path: []const u8, use_tls: bool) !void {
-        try c.connect(self.port, use_tls);
-        if (use_tls) try self.handshake(c);
-        try c.sendRequest(path, "13", "echo");
-        const h = try self.head(c);
-        try testing.expect(std.mem.startsWith(u8, h, "HTTP/1.1 101 Switching Protocols\r\n"));
-        try testing.expect(std.mem.indexOf(u8, h, "Sec-WebSocket-Accept: " ++ sample_accept ++ "\r\n") != null);
-        try testing.expect(std.mem.indexOf(u8, h, "Sec-WebSocket-Protocol: echo\r\n") != null);
-        try testing.expect(std.mem.indexOf(u8, h, "X-Test: 1\r\n") != null);
-        const hello = try self.frame(c);
-        try testing.expectEqual(websocket.Opcode.binary, hello.opcode);
-        try testing.expectEqualStrings("hello", hello.payload);
-    }
-
-    fn handshake(self: *Harness, c: *TestClient) !void {
-        const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
-        while (!c.tls.?.handshakeComplete()) {
-            c.poll();
-            if (c.eof) return error.EndOfStream;
-            if (sys.nanoTimestamp() > deadline) return error.Timeout;
-            try self.step();
         }
-    }
-};
+
+        /// The next `n` bytes from `c`.
+        fn bytes(self: *Self, c: *TestClient, n: usize) ![]const u8 {
+            const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
+            while (true) {
+                c.poll();
+                if (c.in.items.len - c.pos >= n) {
+                    defer c.pos += n;
+                    return c.in.items[c.pos..][0..n];
+                }
+                if (c.eof) return error.EndOfStream;
+                if (sys.nanoTimestamp() > deadline) return error.Timeout;
+                try self.step();
+            }
+        }
+
+        /// The next frame the server sent `c`.
+        fn frame(self: *Self, c: *TestClient) !ServerFrame {
+            const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
+            while (true) {
+                c.poll();
+                if (try c.takeFrame()) |f| return f;
+                if (c.eof) return error.EndOfStream;
+                if (sys.nanoTimestamp() > deadline) return error.Timeout;
+                try self.step();
+            }
+        }
+
+        /// Waits for the server to close `c`'s connection.
+        fn eof(self: *Self, c: *TestClient) !void {
+            const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
+            while (!c.eof) {
+                c.poll();
+                if (sys.nanoTimestamp() > deadline) return error.Timeout;
+                try self.step();
+            }
+        }
+
+        fn handlerCloses(self: *Self, n: u32) !void {
+            const W = struct {
+                h: *Self,
+                n: u32,
+                fn done(w: *const @This()) bool {
+                    return w.h.handler.closes >= w.n;
+                }
+            };
+            try self.spinUntil(&W{ .h = self, .n = n }, W.done);
+        }
+
+        /// Connects, upgrades, and checks the 101 and the greeting.
+        fn upgrade(self: *Self, c: *TestClient, path: []const u8, use_tls: bool) !void {
+            try c.connect(self.port, use_tls);
+            if (use_tls) try self.handshake(c);
+            try c.sendRequest(path, "13", "echo");
+            const h = try self.head(c);
+            try testing.expect(std.mem.startsWith(u8, h, "HTTP/1.1 101 Switching Protocols\r\n"));
+            try testing.expect(std.mem.indexOf(u8, h, "Sec-WebSocket-Accept: " ++ sample_accept ++ "\r\n") != null);
+            try testing.expect(std.mem.indexOf(u8, h, "Sec-WebSocket-Protocol: echo\r\n") != null);
+            try testing.expect(std.mem.indexOf(u8, h, "X-Test: 1\r\n") != null);
+            const hello = try self.frame(c);
+            try testing.expectEqual(websocket.Opcode.binary, hello.opcode);
+            try testing.expectEqualStrings("hello", hello.payload);
+        }
+
+        fn handshake(self: *Self, c: *TestClient) !void {
+            const deadline = sys.nanoTimestamp() + 10 * std.time.ns_per_s;
+            while (!c.tls.?.handshakeComplete()) {
+                c.poll();
+                if (c.eof) return error.EndOfStream;
+                if (sys.nanoTimestamp() > deadline) return error.Timeout;
+                try self.step();
+            }
+        }
+    };
+}
 
 /// Two servers, each on a loop of its own as two workers' would be: a
 /// WebSocket the first lets go of is adopted by the second at once.
@@ -365,6 +371,15 @@ const TestClient = struct {
         self.in.deinit(testing.allocator);
         if (self.fd >= 0) sys.close(self.fd);
         self.fd = -1;
+    }
+
+    /// Sends nothing more, reading on: a FIN, or over TLS a close_notify.
+    fn halfClose(self: *TestClient) void {
+        if (self.tls) |*t| {
+            t.close();
+            return self.flushTls();
+        }
+        _ = std.c.shutdown(self.fd, posix.SHUT.WR);
     }
 
     /// Drops the connection with no Close frame.
@@ -1115,4 +1130,269 @@ test "http1: onHttpRequest answers what it takes; the rest goes to the static fi
     const cors = try h.head(&c);
     try testing.expect(std.mem.indexOf(u8, cors, "Content-Type: application/json\r\nContent-Length: 2\r\nAccess-Control-Allow-Origin: *\r\n") != null);
     try testing.expectEqualStrings("[]", try h.bytes(&c, 2));
+}
+
+// ─── Raw connections ─────────────────────────────────────────────────
+
+/// Serves what the server doesn't answer itself: echoes it, and records
+/// what it saw. "close" asks for a goodbye and a close; "big" for writes
+/// until they queue past high water.
+const RawHandler = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+
+    raw: ?*event_loop.RawConn = null,
+    opens: u32 = 0,
+    closes: u32 = 0,
+    drains: u32 = 0,
+    ends: u32 = 0,
+    /// Close on the peer's end, as Node's http.Server does by default; off,
+    /// the connection stays open for a reply to a half-closed peer.
+    close_on_end: bool = true,
+    /// Bytes the "big" writes made, `bufferedAmount` after them, and at `onRawDrain`.
+    big_written: usize = 0,
+    queued_after_big: usize = 0,
+    queued_at_drain: usize = 0,
+    pause_on_open: bool = false,
+    received: std.ArrayList(u8) = .empty,
+
+    pub fn onWsUpgrade(_: *RawHandler, req: *WsRequest, _: []const u8) void {
+        _ = req.accept(.{}) catch {};
+    }
+
+    pub fn onHttpRequest(_: *RawHandler, req: *event_loop.HttpRequest, target: []const u8) void {
+        if (std.mem.eql(u8, target, "/hello")) req.respond(200, "text/plain", "hi");
+    }
+
+    pub fn onRawOpen(self: *RawHandler, raw: *event_loop.RawConn) void {
+        self.opens += 1;
+        self.raw = raw;
+        if (self.pause_on_open) raw.pauseReading();
+    }
+
+    pub fn onRawData(self: *RawHandler, raw: *event_loop.RawConn, data: []const u8) void {
+        self.received.appendSlice(testing.allocator, data) catch unreachable;
+        if (std.mem.endsWith(u8, data, "close")) {
+            raw.write("bye") catch unreachable;
+            return raw.close();
+        }
+        if (std.mem.endsWith(u8, data, "big")) {
+            // Until something queues: the kernel's buffers take the first
+            // megabytes on loopback, however many that is.
+            const chunk: [64 * 1024]u8 = @splat('b');
+            while (raw.bufferedAmount() <= socket.high_water and self.big_written < 64 << 20) {
+                raw.write(&chunk) catch unreachable;
+                self.big_written += chunk.len;
+            }
+            self.queued_after_big = raw.bufferedAmount();
+            return;
+        }
+        raw.write(data) catch unreachable;
+    }
+
+    pub fn onRawClose(self: *RawHandler, raw: *event_loop.RawConn) void {
+        self.closes += 1;
+        if (self.raw == raw) self.raw = null;
+    }
+
+    pub fn onRawEnd(self: *RawHandler, raw: *event_loop.RawConn) void {
+        self.ends += 1;
+        if (self.close_on_end) raw.close();
+    }
+
+    pub fn onRawDrain(self: *RawHandler, raw: *event_loop.RawConn) void {
+        self.drains += 1;
+        self.queued_at_drain = raw.bufferedAmount();
+    }
+};
+
+const RawHarness = HarnessFor(RawHandler);
+
+fn rawOpened(h: *RawHarness) bool {
+    return h.handler.opens > 0;
+}
+
+test "http1: what the handler doesn't answer reaches onRawOpen as bytes, request line first, with its connection" {
+    var h: RawHarness = undefined;
+    try h.init(29484, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.received.deinit(testing.allocator);
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+
+    // onHttpRequest still answers first, and the connection stays the server's.
+    try c.send("GET /hello HTTP/1.1\r\nHost: a\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, try h.head(&c), "HTTP/1.1 200 OK\r\n"));
+    try testing.expectEqualStrings("hi", try h.bytes(&c, 2));
+    try testing.expectEqual(@as(u32, 0), h.handler.opens);
+
+    // A method and a body the server can't serve itself.
+    const post = "POST /matchmake/joinOrCreate/room HTTP/1.1\r\nHost: a\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
+    try c.send(post);
+    try testing.expectEqualStrings(post, try h.bytes(&c, post.len));
+    try testing.expectEqual(@as(u32, 1), h.handler.opens);
+
+    // From here on everything is the handler's, even what the server would answer.
+    const get = "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n";
+    try c.send(get);
+    try testing.expectEqualStrings(get, try h.bytes(&c, get.len));
+    try testing.expectEqualStrings(post ++ get, h.handler.received.items);
+    try testing.expectEqual(@as(u32, 1), h.handler.opens);
+
+    // An upgrade on another connection is still a WebSocket.
+    var ws: TestClient = .{};
+    defer ws.deinit();
+    try ws.connect(h.port, false);
+    try ws.sendRequest("/", "13", null);
+    try testing.expect(std.mem.startsWith(u8, try h.head(&ws), "HTTP/1.1 101 Switching Protocols\r\n"));
+    try testing.expectEqual(@as(u32, 1), h.handler.opens);
+}
+
+test "http1: a raw connection's close sends what was queued first; a peer's end reports it too" {
+    var h: RawHarness = undefined;
+    try h.init(29485, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.received.deinit(testing.allocator);
+
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+    try c.send("DELETE /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nclose");
+    try testing.expectEqualStrings("bye", try h.bytes(&c, 3));
+    try h.eof(&c);
+    try h.handlerCloses(1);
+
+    var d: TestClient = .{};
+    defer d.deinit();
+    try d.connect(h.port, false);
+    try d.send("PUT /y HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi");
+    try h.spinUntil(&h, rawOpened);
+    d.abort();
+    try h.handlerCloses(2);
+    try testing.expect(h.handler.raw == null);
+    try testing.expectEqual(@as(u32, 1), h.handler.ends);
+}
+
+test "http1: pauseReading holds input back until resumeReading" {
+    var h: RawHarness = undefined;
+    try h.init(29486, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.received.deinit(testing.allocator);
+    h.handler.pause_on_open = true;
+
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+    const req = "POST /up HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\n\r\nbody";
+    try c.send(req);
+    try h.spinUntil(&h, rawOpened);
+    for (0..50) |_| try h.step();
+    try testing.expectEqual(@as(usize, 0), h.handler.received.items.len);
+
+    h.handler.raw.?.resumeReading();
+    try testing.expectEqualStrings(req, try h.bytes(&c, req.len));
+    try testing.expectEqualStrings(req, h.handler.received.items);
+}
+
+test "http1: a raw write that queues owes onRawDrain, paid once the peer reads it down" {
+    var h: RawHarness = undefined;
+    try h.init(29487, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.received.deinit(testing.allocator);
+
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+    try c.send("POST /dl HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nbig");
+    try h.spinUntil(&h, rawOpened);
+    try testing.expect(h.handler.queued_after_big > socket.high_water);
+    try testing.expect(h.handler.raw.?.owesDrain());
+
+    _ = try h.bytes(&c, h.handler.big_written);
+    const W = struct {
+        fn done(hh: *RawHarness) bool {
+            return hh.handler.drains > 0;
+        }
+    };
+    try h.spinUntil(&h, W.done);
+    for (0..20) |_| try h.step();
+    try testing.expectEqual(@as(u32, 1), h.handler.drains);
+    try testing.expect(h.handler.queued_at_drain < socket.low_water);
+    try testing.expect(!h.handler.raw.?.owesDrain());
+}
+
+test "http1: raw connections over TLS hold drain() open and end at stop()" {
+    var h: RawHarness = undefined;
+    try h.init(29488, .{});
+    defer h.deinit();
+    defer h.handler.received.deinit(testing.allocator);
+
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, true);
+    try h.handshake(&c);
+    const req = "PATCH /tls HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc";
+    try c.send(req);
+    try testing.expectEqualStrings(req, try h.bytes(&c, req.len));
+
+    h.server.drain(.{});
+    for (0..20) |_| try h.step();
+    try testing.expect(!h.server.isDrained());
+    try testing.expectEqual(@as(u32, 0), h.handler.closes);
+
+    h.server.stop();
+    try h.eof(&c);
+    try h.handlerCloses(1);
+}
+
+fn replyAfterHalfClose(port: u16, h1: event_loop.Http1Config, use_tls: bool) !void {
+    var h: RawHarness = undefined;
+    try h.init(port, h1);
+    defer h.deinit();
+    defer h.handler.received.deinit(testing.allocator);
+    h.handler.close_on_end = false;
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, use_tls);
+    if (use_tls) try h.handshake(&c);
+
+    const req = "POST /half HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi";
+    try c.send(req);
+    try testing.expectEqualStrings(req, try h.bytes(&c, req.len));
+    c.halfClose();
+    for (0..30) |_| try h.step();
+    try testing.expectEqual(@as(u32, 0), h.handler.closes);
+    try testing.expectEqual(@as(u32, 1), h.handler.ends);
+
+    h.handler.raw.?.write("late reply") catch unreachable;
+    h.handler.raw.?.close();
+    try testing.expectEqualStrings("late reply", try h.bytes(&c, 10));
+    try h.eof(&c);
+    try h.handlerCloses(1);
+}
+
+test "http1: a raw connection's peer may half-close and still get the handler's reply" {
+    try replyAfterHalfClose(29489, .{ .tls = false }, false);
+    try replyAfterHalfClose(29490, .{}, true);
+}
+
+test "http1: a raw connection's abort drops what was queued, and onRawClose follows" {
+    var h: RawHarness = undefined;
+    try h.init(29492, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.received.deinit(testing.allocator);
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+
+    try c.send("POST /dl HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nbig");
+    try h.spinUntil(&h, rawOpened);
+    try testing.expect(h.handler.queued_after_big > socket.high_water);
+
+    h.handler.raw.?.abort();
+    try testing.expectEqual(@as(u32, 0), h.handler.closes); // never from inside the call
+    try h.eof(&c);
+    // What was queued never left; only what the kernel already had arrived.
+    try testing.expect(c.in.items.len + h.handler.queued_after_big <= h.handler.big_written);
+    try h.handlerCloses(1);
 }

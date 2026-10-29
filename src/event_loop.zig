@@ -63,6 +63,9 @@ pub const WsSendError = http1.WsSendError;
 pub const WsHandover = http1.WsHandover;
 /// A plain GET or HEAD on the HTTP/1.1 listener, for `onHttpRequest`.
 pub const HttpRequest = http1.HttpRequest;
+/// An HTTP/1.1 connection the handler serves itself, for `onRawOpen`.
+pub const RawConn = http1.RawConn;
+pub const RawError = http1.RawError;
 pub const WsMessageKind = http1.WsMessageKind;
 pub const WsCloseCode = http1.WsCloseCode;
 
@@ -200,7 +203,9 @@ pub const Config = struct {
     /// default (TCP and UDP are separate namespaces) and the same loop:
     /// the handler's `onHttpRequest` and static files from `static_dir`,
     /// WebSockets through its `onWsUpgrade` / `onWsMessage` / `onWsClose`,
-    /// TLS with the QUIC certificates, and Alt-Svc advertising HTTP/3.
+    /// connections it serves itself through `onRawOpen` / `onRawData` /
+    /// `onRawClose`, TLS with the QUIC certificates, and Alt-Svc
+    /// advertising HTTP/3.
     /// Required when the handler declares `onWsUpgrade`.
     http1: ?Http1Config = null,
 
@@ -912,7 +917,8 @@ pub fn Server(comptime Handler: type) type {
             "onRequestCancelled", "onConnectionClosed", "onQuicConnected",
             "onWsUpgrade",        "onWsMessage",        "onWsClose",
             "onPass",             "onHandover",         "onWsHandover",
-            "onHttpRequest",
+            "onHttpRequest",      "onRawOpen",          "onRawData",
+            "onRawClose",         "onRawDrain",         "onRawEnd",
         };
 
         for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
@@ -933,7 +939,7 @@ pub fn Server(comptime Handler: type) type {
                         "onStopSending, onWritable, onPollComplete, onConnectionClosed, " ++
                         "onQuicConnected, onH0Request, onH0Data, onH0Finished, " ++
                         "onWsUpgrade, onWsMessage, onWsClose, onPass, onHandover, onWsHandover, " ++
-                        "onHttpRequest");
+                        "onHttpRequest, onRawOpen, onRawData, onRawClose, onRawDrain, onRawEnd");
                 }
             }
         }
@@ -984,6 +990,27 @@ pub fn Server(comptime Handler: type) type {
         }
         if (@hasDecl(Handler, "onHttpRequest") and @TypeOf(Handler.onHttpRequest) != fn (*Handler, *HttpRequest, []const u8) void) {
             @compileError("onHttpRequest must be fn (self: *Handler, req: *HttpRequest, target: []const u8) void");
+        }
+        const raw_any = @hasDecl(Handler, "onRawOpen") or @hasDecl(Handler, "onRawData") or
+            @hasDecl(Handler, "onRawClose") or @hasDecl(Handler, "onRawDrain") or @hasDecl(Handler, "onRawEnd");
+        const raw_all = @hasDecl(Handler, "onRawOpen") and @hasDecl(Handler, "onRawData") and @hasDecl(Handler, "onRawClose");
+        if (raw_any and !raw_all) {
+            @compileError("a handler that serves raw connections needs all of onRawOpen, onRawData and onRawClose");
+        }
+        if (@hasDecl(Handler, "onRawOpen") and @TypeOf(Handler.onRawOpen) != fn (*Handler, *RawConn) void) {
+            @compileError("onRawOpen must be fn (self: *Handler, raw: *RawConn) void");
+        }
+        if (@hasDecl(Handler, "onRawData") and @TypeOf(Handler.onRawData) != fn (*Handler, *RawConn, []const u8) void) {
+            @compileError("onRawData must be fn (self: *Handler, raw: *RawConn, data: []const u8) void");
+        }
+        if (@hasDecl(Handler, "onRawClose") and @TypeOf(Handler.onRawClose) != fn (*Handler, *RawConn) void) {
+            @compileError("onRawClose must be fn (self: *Handler, raw: *RawConn) void");
+        }
+        if (@hasDecl(Handler, "onRawDrain") and @TypeOf(Handler.onRawDrain) != fn (*Handler, *RawConn) void) {
+            @compileError("onRawDrain must be fn (self: *Handler, raw: *RawConn) void");
+        }
+        if (@hasDecl(Handler, "onRawEnd") and @TypeOf(Handler.onRawEnd) != fn (*Handler, *RawConn) void) {
+            @compileError("onRawEnd must be fn (self: *Handler, raw: *RawConn) void");
         }
     }
 

@@ -489,6 +489,9 @@ against the W3C spec: `SPEC/webtransport_w3c_api.md`.
 Autobahn fuzzingclient, `ws://` and `wss://`, macOS and Linux: 298 OK, 3
 INFORMATIONAL, 0 NON-STRICT, 0 FAILED of 301 cases (`tools/autobahn.sh`, run
 in CI). Details, API and caveats: [RFC6455_WEBSOCKET.md](RFC6455_WEBSOCKET.md).
+Requests the listener doesn't answer itself can go to the handler as raw
+connections (`onRawOpen`), for a host with an HTTP/1.1 implementation of its
+own.
 
 ---
 

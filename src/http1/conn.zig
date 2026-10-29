@@ -1,5 +1,6 @@
 //! One TCP connection on the HTTP/1.1 listener: TLS (or plain text),
-//! request heads, static files, and the WebSocket it may upgrade to.
+//! request heads, static files, and the WebSocket it may upgrade to, or
+//! the bytes the handler serves itself (`RawConn`).
 //!
 //! Everything runs on the listener's loop thread. A connection is freed only
 //! from its socket's deferred close, so a handler callback may do anything —
@@ -45,6 +46,8 @@ const Phase = enum {
     ws_open,
     /// Our Close is out; waiting for the peer's.
     ws_closing,
+    /// The handler's, as bytes: see `RawConn`.
+    raw,
     /// Flushing, lingering or aborting; nothing more is read or written.
     closing,
     /// A WebSocket handed over (`WsConn.handOver`), waiting for its socket
@@ -255,7 +258,8 @@ pub const WsRequest = struct {
 };
 
 /// A GET or HEAD request that isn't an upgrade, valid only during the
-/// handler's `onHttpRequest`. Unanswered, it goes to the static files.
+/// handler's `onHttpRequest`. Unanswered, it goes to the handler's
+/// `onRawOpen` when it has one, and to the static files otherwise.
 pub const HttpRequest = struct {
     conn: *Conn,
     head: *const parser.RequestHead,
@@ -293,6 +297,106 @@ pub const HttpRequest = struct {
     }
 };
 
+pub const RawError = error{
+    /// The connection is closing or gone.
+    Closed,
+};
+
+/// A connection the handler serves itself, as bytes: a request the server
+/// doesn't answer, from its request line on, and everything after it on
+/// the connection, through TLS when the listener has it. For a host with
+/// an HTTP/1.1 implementation of its own. Valid from `onRawOpen` until
+/// `onRawClose` returns; use it only on the loop's thread.
+pub const RawConn = struct {
+    raw_id: u64 = 0,
+    /// The handler has heard `onRawClose`, or was never given this handle.
+    notified: bool = true,
+    /// By `pauseReading`, apart from the output backpressure every phase has.
+    paused: bool = false,
+    /// A write left `socket.low_water` or more queued: `onRawDrain` is owed.
+    full: bool = false,
+    /// The peer sent its last byte, and the handler has heard.
+    ended: bool = false,
+
+    fn conn(self: *RawConn) *Conn {
+        return @alignCast(@fieldParentPtr("raw", self));
+    }
+
+    fn constConn(self: *const RawConn) *const Conn {
+        return @alignCast(@fieldParentPtr("raw", self));
+    }
+
+    /// From the counter `WsConn.id` draws from.
+    pub fn id(self: *const RawConn) u64 {
+        return self.raw_id;
+    }
+
+    /// Queues all of `data`, refusing none. Once a write leaves
+    /// `socket.low_water` or more queued, `onRawDrain` follows when it falls
+    /// below again: a producer past its own mark waits for that.
+    pub fn write(self: *RawConn, data: []const u8) RawError!void {
+        const c = self.conn();
+        if (self.notified or c.phase != .raw or !c.sock.isOpen()) return error.Closed;
+        c.output(data);
+        // A failed write aborts; `onRawClose` follows from the deferred close.
+        if (!c.sock.isOpen()) return error.Closed;
+        if (c.sock.buffered() >= socket.low_water) self.full = true;
+    }
+
+    /// Sends what is queued, then ends the connection. `onRawClose`
+    /// follows once the socket is closed; never from inside this call.
+    pub fn close(self: *RawConn) void {
+        const c = self.conn();
+        if (self.notified or c.phase != .raw) return;
+        c.enterClosing(.graceful);
+    }
+
+    /// Ends the connection now, dropping what is queued: a host's
+    /// `destroy()`. After `close()` it does nothing, so a close's output
+    /// still goes out. `onRawClose` follows, never from inside this call.
+    pub fn abort(self: *RawConn) void {
+        const c = self.conn();
+        if (self.notified or c.phase != .raw) return;
+        c.enterClosing(.abort);
+    }
+
+    /// No more `onRawData` until `resumeReading`; the peer stalls once the
+    /// kernel's buffers fill.
+    pub fn pauseReading(self: *RawConn) void {
+        if (self.paused) return;
+        self.paused = true;
+        self.conn().sock.pauseRead();
+    }
+
+    /// Input already buffered arrives from a deferred callback, never from
+    /// inside this call.
+    pub fn resumeReading(self: *RawConn) void {
+        if (!self.paused) return;
+        self.paused = false;
+        const c = self.conn();
+        // Output over high water: onSocketWritable resumes once it drains.
+        if (c.phase != .raw or c.sock.buffered() > socket.high_water) return;
+        c.sock.read_paused = false;
+        c.server.timers.defer_(&c.resume_cb);
+    }
+
+    /// Bytes queued for the socket and not yet taken by the kernel,
+    /// counting TLS framing.
+    pub fn bufferedAmount(self: *const RawConn) usize {
+        return self.constConn().sock.buffered();
+    }
+
+    /// Whether an `onRawDrain` is on its way: a write left low water or
+    /// more queued, and the output hasn't fallen below it since.
+    pub fn owesDrain(self: *const RawConn) bool {
+        return self.full;
+    }
+
+    pub fn peerAddress(self: *const RawConn) *const posix.sockaddr.storage {
+        return &self.constConn().peer;
+    }
+};
+
 pub const Conn = struct {
     server: *Server,
     sock: socket.Socket(Conn),
@@ -322,6 +426,7 @@ pub const Conn = struct {
     file_remaining: u64 = 0,
 
     ws: WsConn = .{},
+    raw: RawConn = .{},
 
     // The server's list.
     prev: ?*Conn = null,
@@ -417,6 +522,7 @@ pub const Conn = struct {
             .head => self.enterClosing(.graceful),
             // A WebSocket that ends without a Close frame is abnormal (1006).
             .static_body, .ws_open, .ws_closing => self.finish(websocket.CloseCode.abnormal, .abort),
+            .raw => self.rawEnd(),
             // A failed write: the new server reads the end.
             .moving => {},
         }
@@ -430,6 +536,17 @@ pub const Conn = struct {
             // that hands the WebSocket over finds no read armed.
             .head, .ws_open, .ws_closing => {
                 if (!self.sock.read_paused) return;
+                self.sock.read_paused = false;
+                if (self.unreadLen() > 0) self.process();
+                self.sock.startReading();
+            },
+            .raw => {
+                if (self.raw.full) {
+                    self.raw.full = false;
+                    const h = self.server.handlers;
+                    if (h.raw.?.drain) |drain| drain(h.ctx, &self.raw);
+                }
+                if (self.phase != .raw or !self.sock.read_paused or self.raw.paused) return;
                 self.sock.read_paused = false;
                 if (self.unreadLen() > 0) self.process();
                 self.sock.startReading();
@@ -472,6 +589,8 @@ pub const Conn = struct {
             .ws_closing => self.finish(websocket.CloseCode.abnormal, .abort),
             // Cleared by handOver.
             .moving => {},
+            // Never set: the handler keeps its own time.
+            .raw => {},
             // Handshake, idle keep-alive, a stalled response, or linger.
             .head, .static_body, .closing => self.finish(websocket.CloseCode.abnormal, .abort),
         }
@@ -528,6 +647,11 @@ pub const Conn = struct {
     }
 
     fn notifyClose(self: *Conn, code: u16, reason: []const u8) void {
+        if (!self.raw.notified) {
+            self.raw.notified = true;
+            const h = self.server.handlers;
+            return h.raw.?.close(h.ctx, &self.raw);
+        }
         if (self.ws.notified) return;
         self.ws.notified = true;
         self.server.ws_count -= 1;
@@ -565,6 +689,7 @@ pub const Conn = struct {
             const used = switch (self.phase) {
                 .head => self.processHead(buf[pos..]),
                 .ws_open, .ws_closing => self.processFrame(buf[pos..]),
+                .raw => self.processRaw(buf[pos..]),
                 .static_body, .closing, .moving => null,
             } orelse break;
             pos += used;
@@ -613,22 +738,56 @@ pub const Conn = struct {
         self.http10 = head.version == .http10;
         self.head_only = std.mem.eql(u8, head.method, "HEAD");
 
-        if (websocket.isUpgrade(head) and self.server.handlers.upgrade != null) {
+        const h = self.server.handlers;
+        if (websocket.isUpgrade(head) and h.upgrade != null) {
             self.handleUpgrade(head);
-        } else if (!std.mem.eql(u8, head.method, "GET") and !self.head_only) {
+            return parsed.len;
+        }
+        const is_get = std.mem.eql(u8, head.method, "GET") or self.head_only;
+        if (is_get and !head.hasBody()) if (h.request) |onRequest| {
+            var req: HttpRequest = .{ .conn = self, .head = head };
+            onRequest(h.ctx, &req, head.target);
+            if (req.answered) return parsed.len;
+        };
+        if (h.raw != null) return self.startRaw();
+        if (!is_get) {
             self.respond(405, "Method not allowed", .close, "Allow: GET, HEAD\r\n");
         } else if (head.hasBody()) {
             self.respond(400, "Unexpected request body", .close, null);
         } else {
-            const h = self.server.handlers;
-            if (h.request) |onRequest| {
-                var req: HttpRequest = .{ .conn = self, .head = head };
-                onRequest(h.ctx, &req, head.target);
-                if (req.answered) return parsed.len;
-            }
             self.serveStatic(head.target);
         }
         return parsed.len;
+    }
+
+    /// The connection is the handler's from here on. Uses none of the
+    /// head: `processRaw` hands it over, as the first bytes.
+    fn startRaw(self: *Conn) usize {
+        self.phase = .raw;
+        self.raw = .{ .raw_id = self.server.nextId(), .notified = false };
+        const h = self.server.handlers;
+        h.raw.?.open(h.ctx, &self.raw);
+        return 0;
+    }
+
+    /// The peer sent its last byte. The handler hears once all input before
+    /// it is handed over: input paused for it comes first. With `onRawEnd`
+    /// the connection stays open for its answer; without, it closes once
+    /// what is queued has gone.
+    fn rawEnd(self: *Conn) void {
+        if (self.raw.ended or self.unreadLen() > 0) return;
+        self.raw.ended = true;
+        const h = self.server.handlers;
+        if (h.raw.?.end) |end| return end(h.ctx, &self.raw);
+        self.finish(websocket.CloseCode.normal, .graceful);
+    }
+
+    /// Hands all of `buf` to the handler's `onRawData`.
+    fn processRaw(self: *Conn, buf: []u8) ?usize {
+        if (buf.len == 0 or self.raw.paused) return null;
+        const h = self.server.handlers;
+        h.raw.?.data(h.ctx, &self.raw, buf);
+        return buf.len;
     }
 
     fn handleUpgrade(self: *Conn, head: *const parser.RequestHead) void {
@@ -818,7 +977,7 @@ pub const Conn = struct {
         return switch (self.phase) {
             .head => self.unreadLen() == 0,
             .static_body => false,
-            .ws_open, .ws_closing, .closing, .moving => true,
+            .ws_open, .ws_closing, .raw, .closing, .moving => true,
         };
     }
 

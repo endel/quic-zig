@@ -25,7 +25,7 @@ same 3 INFORMATIONAL, 11 NON-STRICT (3.2, 3.3, 4.1.3, 4.1.4, 4.2.3, 4.2.4,
 |---|---|
 | `src/http1/websocket.zig` | Sans-IO codec: handshake checks, `acceptKey`, frame parser, `Decoder` (reassembly, control frames, UTF-8, close codes), frame header encoder |
 | `src/http1/parser.zig` | HTTP/1.1 request heads, ported from routez, keeping its request-smuggling checks |
-| `src/http1/conn.zig` | One TCP connection: TLS or plain, request heads, static files, the upgrade, the open WebSocket (`WsConn`, `WsRequest`) |
+| `src/http1/conn.zig` | One TCP connection: TLS or plain, request heads, static files, the upgrade, the open WebSocket (`WsConn`, `WsRequest`), or the bytes the handler serves itself (`RawConn`) |
 | `src/http1/server.zig` | The listener: accept on the loop, connection list, `drain` / `stop`, `handlersFor` |
 | `src/http1/socket.zig`, `timers.zig` | Non-blocking TCP on libxev and coarse deadlines, trimmed ports of routez's |
 | `src/http1/e2e_test.zig` | End-to-end tests against `event_loop.Server`, plain and TLS, WebTransport next to WebSocket |
@@ -58,6 +58,42 @@ pub fn onWsClose(self: *H, ws: *event_loop.WsConn, code: u16, reason: []const u8
   - with 1002 / 1007 / 1009 when the peer broke the protocol.
 - `onWsClose` never fires from inside a `WsConn` method.
 - `data` and `req` are valid only during their callback.
+
+Requests the listener doesn't answer itself can go to the handler as
+bytes, for a host with an HTTP/1.1 implementation of its own (Node's
+`http.Server`, in netcode-io):
+
+```zig
+pub fn onRawOpen(self: *H, raw: *event_loop.RawConn) void
+pub fn onRawData(self: *H, raw: *event_loop.RawConn, data: []const u8) void
+pub fn onRawClose(self: *H, raw: *event_loop.RawConn) void
+pub fn onRawDrain(self: *H, raw: *event_loop.RawConn) void // optional
+pub fn onRawEnd(self: *H, raw: *event_loop.RawConn) void   // optional
+```
+
+- A request that isn't an upgrade the handler takes, and that
+  `onHttpRequest` didn't answer, opens one, of any method and with its
+  body: `onRawData` gets the request line first, then everything after it
+  on the connection, TLS removed. The connection is the handler's to its
+  end, a later upgrade on it included.
+- `RawConn` has `id()` (the same counter again), `write` (queues all of it),
+  `close()` (sends what's queued first), `abort()` (drops it: a host's
+  `destroy()`; nothing after `close()`), `pauseReading` / `resumeReading`,
+  `bufferedAmount()`, `owesDrain()` and `peerAddress()`.
+- The peer's last byte (a FIN, or TLS's close_notify) reaches `onRawEnd`
+  after all input before it, and the connection stays open for the
+  handler's answer: HTTP/1.1 lets a client half-close after its request.
+  A handler without `onRawEnd` has the connection closed then, once what
+  it queued has gone. TCP can't tell a half-close from a peer that left;
+  a write to one that left fails, and `onRawClose` follows.
+- A write that leaves 64 KiB or more queued owes an `onRawDrain`, which
+  comes once the queue falls below it.
+- `onRawClose` fires exactly once: when the connection fails,
+  `Server.stop()`, or after `close()` or `abort()`, once the socket is closed. Never from inside a `RawConn`
+  method. Raw connections keep `drain()` from finishing until they close.
+- The shape follows Go's `http.Hijacker`, which hands a handler the
+  connection under a request; here the listener hands it over instead of
+  the handler asking, and with the request's own bytes.
 
 `README.md` ("HTTP/1.1 listener: static files and WebSockets") has the
 config table.
@@ -100,8 +136,9 @@ config table.
 - **Origin isn't checked.** `onWsUpgrade` can read it with
   `req.header("origin")`. A server that authenticates by cookie must check
   it (RFC 6455 §10.2).
-- **Request bodies are refused.** The listener serves GET and HEAD for
-  static files. A request with a body gets 400, and other methods get 405.
+- **Request bodies are refused**, unless the handler takes raw
+  connections. The listener serves GET and HEAD for static files. A
+  request with a body gets 400, and other methods get 405.
 - **The client side is a codec.** `Decoder` with `.role = .client`,
   `writeMaskedFrameHeader`, `clientKey`, `writeUpgradeRequest` and
   `checkUpgradeResponse` cover a client's frames and handshake. The caller

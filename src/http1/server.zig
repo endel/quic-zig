@@ -10,9 +10,12 @@
 //! without locks.
 //!
 //! Requests: `Upgrade: websocket` goes to `onWsUpgrade` when the handler has
-//! it; other GET and HEAD requests to `onHttpRequest`, if it has that, then
-//! to `static_dir` if it didn't answer (404 without one); other methods get
-//! 405. Request bodies are not supported.
+//! it; other GET and HEAD requests to `onHttpRequest`, if it has that. What
+//! neither answers, of any method and body included, goes with the rest of
+//! its connection to the handler's `onRawOpen` as bytes, if it has that
+//! (`RawConn`), for a host to serve with an HTTP/1.1 implementation of its
+//! own. Without it, the rest go to `static_dir` (404 without one), methods
+//! other than GET and HEAD get 405, and request bodies 400.
 //!
 //! A WebSocket can move to a listener on another loop and thread
 //! (`WsConn.handOver`, `onWsHandover`, `Server.adopt`): servers that share a
@@ -43,6 +46,8 @@ pub const WsAcceptOptions = conn_mod.AcceptOptions;
 pub const WsSendError = conn_mod.SendError;
 pub const WsHandover = conn_mod.WsHandover;
 pub const HttpRequest = conn_mod.HttpRequest;
+pub const RawConn = conn_mod.RawConn;
+pub const RawError = conn_mod.RawError;
 pub const WsHandoverError = conn_mod.HandoverError;
 pub const WsMessageKind = websocket.MessageKind;
 pub const WsCloseCode = websocket.CloseCode;
@@ -127,12 +132,24 @@ pub const Handlers = struct {
     handover: ?*const fn (ctx: *anyopaque, h: WsHandover) void = null,
     /// Null when the handler answers no plain request.
     request: ?*const fn (ctx: *anyopaque, req: *HttpRequest, target: []const u8) void = null,
+    /// Null when the handler serves no connection itself.
+    raw: ?RawHandlers = null,
+};
+
+pub const RawHandlers = struct {
+    open: *const fn (ctx: *anyopaque, raw: *RawConn) void,
+    data: *const fn (ctx: *anyopaque, raw: *RawConn, data: []const u8) void,
+    close: *const fn (ctx: *anyopaque, raw: *RawConn) void,
+    drain: ?*const fn (ctx: *anyopaque, raw: *RawConn) void = null,
+    end: ?*const fn (ctx: *anyopaque, raw: *RawConn) void = null,
 };
 
 /// Binds a handler's optional `onWsUpgrade(self, req, path)`,
 /// `onWsMessage(self, ws, data[, kind])`, `onWsClose(self, ws, code,
-/// reason)`, `onWsHandover(self, handover)` and `onHttpRequest(self, req,
-/// target)`.
+/// reason)`, `onWsHandover(self, handover)`, `onHttpRequest(self, req,
+/// target)`, and `onRawOpen(self, raw)` with `onRawData(self, raw, data)`,
+/// `onRawClose(self, raw)` and optionally `onRawDrain(self, raw)` and
+/// `onRawEnd(self, raw)`.
 pub fn handlersFor(comptime H: type, handler: *H) Handlers {
     const S = struct {
         fn upgrade(ctx: *anyopaque, req: *WsRequest, path: []const u8) void {
@@ -157,6 +174,21 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
         fn request(ctx: *anyopaque, req: *HttpRequest, target: []const u8) void {
             H.onHttpRequest(@ptrCast(@alignCast(ctx)), req, target);
         }
+        fn rawOpen(ctx: *anyopaque, raw: *RawConn) void {
+            H.onRawOpen(@ptrCast(@alignCast(ctx)), raw);
+        }
+        fn rawData(ctx: *anyopaque, raw: *RawConn, data: []const u8) void {
+            H.onRawData(@ptrCast(@alignCast(ctx)), raw, data);
+        }
+        fn rawClose(ctx: *anyopaque, raw: *RawConn) void {
+            H.onRawClose(@ptrCast(@alignCast(ctx)), raw);
+        }
+        fn rawDrain(ctx: *anyopaque, raw: *RawConn) void {
+            H.onRawDrain(@ptrCast(@alignCast(ctx)), raw);
+        }
+        fn rawEnd(ctx: *anyopaque, raw: *RawConn) void {
+            H.onRawEnd(@ptrCast(@alignCast(ctx)), raw);
+        }
     };
     return .{
         .ctx = handler,
@@ -165,6 +197,13 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
         .close = S.close,
         .handover = if (@hasDecl(H, "onWsHandover")) S.handover else null,
         .request = if (@hasDecl(H, "onHttpRequest")) S.request else null,
+        .raw = if (@hasDecl(H, "onRawOpen")) .{
+            .open = S.rawOpen,
+            .data = S.rawData,
+            .close = S.rawClose,
+            .drain = if (@hasDecl(H, "onRawDrain")) S.rawDrain else null,
+            .end = if (@hasDecl(H, "onRawEnd")) S.rawEnd else null,
+        } else null,
     };
 }
 
@@ -247,8 +286,9 @@ pub const Server = struct {
     /// `reuse_port` go to another listener on the port, rather than being
     /// accepted only to be closed. Requests in flight finish, answered with
     /// `Connection: close`; idle keep-alive connections close now, as
-    /// RFC 9112 §9.6 lets a server; WebSockets stay open until the handler or
-    /// the peer closes them, as WebTransport sessions do under drain.
+    /// RFC 9112 §9.6 lets a server; WebSockets and raw connections stay open
+    /// until the handler or the peer closes them, as WebTransport sessions do
+    /// under drain.
     pub fn drain(self: *Server) void {
         if (self.draining or self.stopping) return;
         self.draining = true;
@@ -260,11 +300,12 @@ pub const Server = struct {
         }
     }
 
-    /// True once no HTTP request is in flight and no WebSocket is open.
+    /// True once no HTTP request is in flight and no WebSocket or raw
+    /// connection is open.
     pub fn isDrained(self: *const Server) bool {
         var it = self.conns;
         while (it) |c| : (it = c.next) {
-            if (!c.isIdle() or c.phase == .ws_open or c.phase == .ws_closing) return false;
+            if (!c.isIdle() or c.phase == .ws_open or c.phase == .ws_closing or c.phase == .raw) return false;
         }
         return true;
     }
@@ -299,7 +340,7 @@ pub const Server = struct {
 
     /// Stop accepting and end every connection: each open WebSocket gets a
     /// Close with 1001 (sent if the socket takes it at once) and
-    /// `onWsClose(1001)`. On a loop the caller keeps running, `isStopped`
+    /// `onWsClose(1001)`, each raw connection `onRawClose`. On a loop the caller keeps running, `isStopped`
     /// turns true once every socket is closed.
     pub fn stop(self: *Server) void {
         if (self.stopping) return;
