@@ -36,6 +36,14 @@ const shared_read_buf = xev.backend == .epoll;
 /// costs, so it stays small.
 pub const read_buffer_size = if (shared_read_buf) 256 * 1024 else 16 * 1024;
 threadlocal var thread_read_buf: [read_buffer_size]u8 = undefined;
+
+/// The buffer every socket on this thread reads into, or null where each
+/// has its own. `onSocketData` bytes inside it stay valid until the next
+/// read on the thread: a host can hand them on without copying, as long
+/// as it is done with them by then.
+pub fn sharedReadBuffer() ?[]u8 {
+    return if (shared_read_buf) &thread_read_buf else null;
+}
 /// A library can't ignore SIGPIPE for its host process: MSG_NOSIGNAL on
 /// Linux, SO_NOSIGPIPE on Darwin.
 const send_flags: c_int = if (builtin.target.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0;
@@ -456,5 +464,13 @@ fn setNoSigpipe(fd: std.posix.socket_t) void {
     if (comptime builtin.target.os.tag.isDarwin()) {
         const one: c_int = 1;
         _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.c.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
+    }
+}
+
+test "sharedReadBuffer: the thread's one read buffer, only where reads share it" {
+    if (shared_read_buf) {
+        try std.testing.expectEqual(@as(usize, read_buffer_size), sharedReadBuffer().?.len);
+    } else {
+        try std.testing.expect(sharedReadBuffer() == null);
     }
 }

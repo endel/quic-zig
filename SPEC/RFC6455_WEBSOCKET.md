@@ -126,6 +126,11 @@ pub fn onHttpExchangeGone(self: *H, ex: *event_loop.HttpExchange) void
   `HttpExchange` method.
 - A pending exchange counts as a request in flight for `drain()`.
 
+`http1.sharedReadBuffer()` is the buffer every plain connection on the
+thread reads into (epoll; null on kqueue, where each has its own). A
+message parsed in place lies inside it, valid until the thread's next
+read: a host can hand it on without copying, if it's done with it by then.
+
 `README.md` ("HTTP/1.1 listener: static files and WebSockets") has the
 config table.
 

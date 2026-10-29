@@ -49,6 +49,7 @@ pub const HttpRequest = conn_mod.HttpRequest;
 pub const RawConn = conn_mod.RawConn;
 pub const HttpExchange = conn_mod.HttpExchange;
 pub const max_exchange_body = conn_mod.max_exchange_body;
+pub const sharedReadBuffer = socket.sharedReadBuffer;
 pub const RawError = conn_mod.RawError;
 pub const WsHandoverError = conn_mod.HandoverError;
 pub const WsMessageKind = websocket.MessageKind;
