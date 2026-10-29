@@ -27,6 +27,8 @@ pub const webtransport_flow_control = @import("webtransport/flow_control.zig");
 pub const webtransport_protocol = @import("webtransport/protocol.zig");
 pub const quic_lb = @import("quic/quic_lb.zig");
 pub const event_loop = @import("event_loop.zig");
+/// The libxev backend in use, and helpers for running its loop from a host's own.
+pub const xev_backend = @import("xev_backend.zig");
 pub const moq = struct {
     pub const wire = @import("moq/wire.zig");
     pub const message = @import("moq/message.zig");

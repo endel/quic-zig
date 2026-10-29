@@ -24,6 +24,7 @@ test {
     _ = @import("quic/quic_lb.zig");
     _ = @import("quic/lossy_link_test.zig");
     _ = @import("handover_test.zig");
+    _ = @import("xev_backend.zig");
     _ = @import("h3/frame.zig");
     _ = @import("h3/qpack.zig");
     _ = @import("h3/huffman.zig");
