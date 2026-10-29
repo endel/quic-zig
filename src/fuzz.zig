@@ -1892,9 +1892,9 @@ test "moq-lite FrameReader survives a randomized byte stream" {
 // ════════════════════════════════════════════════════════
 // AES-128-GCM packet protection against std
 //
-// `aes_gcm.Ctx` replaces std's CTR and, on arm64, its GHASH. Any
-// input must seal to std's exact bytes and tag, open again, and
-// refuse the same packet with one bit flipped.
+// `aes_gcm.Ctx` replaces std's CTR and, with PMULL or PCLMUL, its
+// GHASH and its two passes. Any input must seal to std's exact bytes
+// and tag, open again, and refuse the same packet with one bit flipped.
 // ════════════════════════════════════════════════════════
 
 test "fuzz: AES-128-GCM agrees with std" {

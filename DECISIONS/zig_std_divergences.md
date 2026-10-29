@@ -18,9 +18,11 @@ contributions" in `CLAUDE.md`.
 - **Master:** each section says what Codeberg `ziglang/zig` master showed on
   24 Sep 2026, or the date it gives.
 - **Benchmark hardware:** arm64 figures are native runs on an Apple M-series
-  core. x86_64 figures ran under Rosetta in Docker Desktop. They are good for
-  comparing one variant with another, not as absolute numbers. Confirm them on
-  native x86 before raising anything upstream.
+  core. x86_64 figures in items 10 and 15 are native, on a Xeon E-2286G
+  (Coffee Lake) held at 4.0 GHz with turbo off. Other x86_64 figures ran under
+  Rosetta in Docker Desktop. Those are good for comparing one variant with
+  another, not as absolute numbers. Confirm them on native x86 before raising
+  anything upstream.
 
 | # | Area | Our code | Kind | Upstream-worthy? |
 |---|------|----------|------|------------------|
@@ -33,11 +35,12 @@ contributions" in `CLAUDE.md`.
 | 7 | `std.net.Address` | `src/sockaddr.zig` | adapted copy of 0.15.2 code | no: migration choice |
 | 8 | Fixed-buffer reader/writer | `src/io_compat.zig` | kept our own stream | maybe: codegen observation |
 | 9 | `std.http.Server.WebSocket` | `src/http1/websocket.zig` | replacement: sans-IO codec | maybe: API scope |
-| 10 | GHASH on arm64 | `src/quic/aes_gcm.zig` (`ghashBlocks`) | GHASH in vector registers | yes: codegen |
+| 10 | GHASH in general-purpose registers | `src/quic/aes_gcm.zig` (`ghashBlocks`) | GHASH in vector registers, arm64 and x86_64 | yes: codegen |
 | 11 | 0.17 loads `[16]u8` as `u128` byte by byte | `src/quic/aes_gcm.zig` (`xorBlock`), `src/quic/ghash.zig` | `align(1)` pointer loads | yes: codegen regression |
 | 12 | ECDSA P-256 signing's k·G | `src/quic/ecdsa_p256.zig` | own signer: std's steps, fixed-base table | yes: perf |
 | 13 | Large allocations go straight to the kernel | `src/quic/stream.zig` (`SendLedger`) | send buffers kept for reuse | maybe: design question |
 | 14 | `std.os.linux.getauxval` under libc | `src/sys.zig` (`hwcap`) | `std.c.getauxval` instead | no: fixed on master |
+| 15 | AES-GCM in two passes | `src/quic/aes_gcm.zig` (`ctrGhash`) | CTR and GHASH in one loop; open writes before it verifies | yes: perf |
 
 Not a std divergence, but related: std picks the AES and GHASH
 implementation at **compile time** from the target's CPU features.
@@ -98,8 +101,9 @@ millions of messages, so this work repeats for nothing.
 **Ours:** `src/quic/aes_gcm.zig` `Ctx` does that work once, in `init(key)`,
 when the key is installed (`Open`/`Seal.prepareCtx()` in `crypto.zig`). The
 per-message code follows std's `encrypt`/`decrypt`, over its own CTR (item
-3) and, on arm64, its own GHASH (item 10), which reads the prepared powers of
-H in place. Elsewhere each message starts from a copy of the prepared GHASH
+3). With PMULL (arm64) or PCLMUL (x86_64) it has its own GHASH (item 10),
+which reads the prepared powers of H in place, in the same pass as the CTR
+(item 15). Elsewhere each message starts from a copy of the prepared GHASH
 state, about 300 bytes. We hold all 16 powers because that is what
 `Ghash.init` computes.
 
@@ -330,7 +334,7 @@ to raise if std ever wants its WebSocket to be conformant.
 **Master** (Codeberg `5b9147ed59`, 25 Sep 2026): the same design. Only the
 unmask loop changed (`[4]u8` chunks instead of an `align(1) u32` slice).
 
-## 10. GHASH on arm64 runs in general-purpose registers
+## 10. GHASH runs in general-purpose registers
 
 **std** (`lib/std/crypto/ghash_polyval.zig`, and our copy in
 `src/quic/ghash.zig`): the state and every intermediate are `u128`. On arm64
@@ -341,9 +345,11 @@ on general registers. In `update` in a ReleaseFast arm64 build, 205 of 826
 instructions move data between the two register files, against 122
 `pmull`s, and some values spill to the stack.
 
-**Ours** (`aes_gcm.zig` `ghashBlocks`, arm64 with the `aes` feature, not
-ReleaseSmall): the same schoolbook product and the same reduction as std,
-on `@Vector(2, u64)`. Blocks are byte-reversed with a vector shuffle.
+**Ours** (`aes_gcm.zig` `ghashBlocks`, arm64 with the `aes` feature or
+x86_64 with `pclmul` and `avx`, not ReleaseSmall): the same schoolbook
+product and the same reduction as std, on `@Vector(2, u64)`. On x86_64 the
+cross terms are `vpclmulqdq $0x01` and `$0x10`, which pick a lane of each
+operand, so the block's halves aren't swapped first as `pmull` needs. Blocks are byte-reversed with a vector shuffle.
 Batches of 8 blocks, the tail as one batch, and the length block rides in
 the message's last batch, so each of AD and message costs one reduction. It
 reads the powers of H that `Ghash.init` already computed, so `Ctx` layout
@@ -356,10 +362,13 @@ doesn't change.
 | `ghash.zig` | 403–433 ns | 409–472 ns |
 | `ghashBlocks` | 237 ns | 239–249 ns |
 
-**Upstream-shaped report:** a codegen observation more than a bug. On
-arm64, `ghash_polyval.zig` would do better with its state and accumulators
-as vectors. x86_64 likely has the same shape, with `u128` in general
-registers around `pclmulqdq`, but that has not been measured.
+x86_64 has the same shape: `u128` in general registers around each
+`vpclmulqdq`. There, vector GHASH alone took a 16 KB record from 4.81 to
+4.32 µs to seal; with item 15 the gain is much larger.
+
+**Upstream-shaped report:** a codegen observation more than a bug.
+`ghash_polyval.zig` would do better with its state and accumulators as
+vectors, on arm64 and x86_64.
 
 ---
 
@@ -401,11 +410,12 @@ at 16 KB, and its hot loop went from 7 `ldrb` to 291. AES-GCM's CTR is
 **What it cost us:** on 0.17.0-dev in September, `aes_gcm.zig`'s
 `@as(V, @bitCast(src.*))` on a `*const [16]u8` doubled CTR; since `a34c55a` it
 loads through an `align(1)` vector pointer (`xorBlock`). `ghash.zig`, which
-x86_64 packets use, read every block with `readInt(u128)`; since the 0.17
-port it loads through an `align(1)` `u128` pointer. `aes_gcm.Ctx` runs at the
-same speed on both compilers. TLS over TCP (`src/tls`) seals records with
-std's `Aes128Gcm`, so it pays std's cost: routez's HTTP/1.1-over-TLS 10 KB
-row lost 14% of its rate on 0.17 in a paired A/B.
+packets used on x86_64 before item 10 covered it, read every block with
+`readInt(u128)`; since the 0.17 port it loads through an `align(1)` `u128`
+pointer. `aes_gcm.Ctx` runs at the same speed on both compilers. TLS over
+TCP (`src/tls`) sealed records with std's `Aes128Gcm` until 6faa388 and paid
+std's cost: routez's HTTP/1.1-over-TLS 10 KB row lost 14% of its rate on 0.17
+in a paired A/B. It uses `aes_gcm.Ctx` for AES-128-GCM now.
 
 **Upstream-shaped report:** a codegen regression in 0.17.0 on aarch64 and
 x86_64: `@bitCast` between `[16]u8` and `u128` is lowered byte by byte,
@@ -501,22 +511,77 @@ epoll backend didn't, and its fix is the fork's `libc-clock` branch.
 compiler_rt. `std.os.linux.getauxval` is now a compile error under libc, so
 the `std.c` branch stays after the upgrade. Nothing to raise.
 
+## 15. AES-GCM in two passes
+
+**std** (`lib/std/crypto/aes_gcm.zig`): `encrypt` runs CTR over the whole
+message, then GHASH over the ciphertext. `decrypt` runs GHASH first, checks
+the tag, then runs CTR, so no plaintext is written for a forgery. Each is
+two passes over the data. AES rounds and carryless multiplies use different
+execution units (on x86, AES-NI on port 0 and PCLMUL on port 5), and each
+pass leaves the other's units idle.
+
+**Ours** (`aes_gcm.zig` `ctrGhash`, whenever item 10's GHASH is on): one
+loop, 8 blocks per step.
+- Sealing hashes each batch's ciphertext during the next batch's AES.
+- Opening hashes each batch during its own AES, before storing its
+  plaintext, so in-place decryption works.
+- On x86_64, `RoundHash` places one block's multiplies after each AES round
+  and the reduction after the last middle round, the order OpenSSL's
+  `aesni_gcm` uses. Hashing the batch after its AES, as arm64 does, leaves
+  port 0 dispatching about 2,200 of GHASH's XORs per 16 KB record that the AES
+  rounds needed (12,448 µops on port 0 against 10,240 rounds; 10,823 with
+  `RoundHash`, and OpenSSL's 10,389). On arm64, `RoundHash` measured 5%
+  slower: its four SIMD pipes all do both, and the extra live values spill.
+- Counter blocks step by a vector add on their low byte while it doesn't
+  carry, once every 32 batches. Building each from a general register needed
+  a `vpinsrq`, which competes with PCLMUL for port 5.
+
+`decrypt` writes plaintext before it checks the tag, as OpenSSL and
+BoringSSL do, and zeroes `m` when the check fails. Every caller already
+treats `m` as garbage after a failure. QUIC opens packets in place: the
+stateless-reset check that follows a failure reads the datagram's last 16
+bytes, which are the tag or a later packet, never the payload. A key update
+tries one key generation, not two. A TLS record that fails ends the
+connection.
+
+**Numbers** (seal plus open of one message, 20 B AD, ReleaseFast
+`-mcpu=native`, best of 5; before is items 2, 3 and 10 with std's two
+passes):
+
+| ns | 32 B | 256 B | 1200 B | 1452 B | 16 KB |
+|---|---|---|---|---|---|
+| x86_64 before (`ghash.zig`) | 165 | 286 | 895 | 1077 | 9,631 |
+| x86_64 now | 56 | 149 | 472 | 577 | 5,718 |
+| arm64 before | 34 | 109 | 414 | 506 | 5,800 |
+| arm64 now | 30 | 109 | 346 | 403 | 4,100 |
+
+A 16 KB seal on x86_64 runs at 5.9 GB/s, against `openssl speed -evp
+aes-128-gcm -bytes 16384` at 6.0 GB/s (OpenSSL 3.0.13) on the same core.
+
+**Upstream-shaped report:** std's AES-GCM could hash and encrypt in one
+loop. Writing plaintext before the tag is checked is a design choice std
+made the other way, so that half is a question, not a bug.
+
 ## Verifying the copies still match std
 
 - `aes_gcm.zig` is checked three ways, all run by `zig build test`:
   - Wycheproof's 67 AES-128-GCM vectors with 96-bit IVs (40 valid, 27
     modified tags), from `aes_gcm_vectors.zig`.
   - Against std's `Aes128Gcm` on 600 random keys, nonces and lengths
-    (messages to 2 KB, AD to 600 B), and on every message length from 0
-    to 320 B against AD lengths either side of each batch boundary. Each
-    case is sealed in place and not, opened, and refused with one flipped
-    bit in the tag, the message or the AD.
+    (messages to 2 KB, AD to 600 B), on every message length from 0 to
+    320 B against AD lengths either side of each batch boundary, and on
+    lengths either side of the first batch whose counters carry out of
+    their low byte (about 250 blocks, up to a 16 KB TLS record). Each case
+    is sealed in place and not, opened, and refused with one flipped bit
+    in the tag, the message or the AD. A refused message must leave zeros
+    in `m`.
   - A `zig build fuzz` target doing the same on arbitrary input.
 
   They pass in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall on arm64, on
   arm64 with `-mcpu baseline` (software AES) and as generic arm64 Linux, and
   on x86_64 with and without AES-NI (built with `-target x86_64-linux-musl
-  --test-no-exec`, run under Docker's amd64 emulation). A one-off
+  --test-no-exec`, run under Docker's amd64 emulation). Items 10 and 15 on
+  x86_64 were also checked natively (Xeon E-2286G). A one-off
   differential run of 250 million random cases against std (arm64 native
   and Linux, x86_64 AES-NI and software; 26 Sep 2026) found no difference
   and no accepted forgery.

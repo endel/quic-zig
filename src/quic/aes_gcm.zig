@@ -4,7 +4,9 @@
 //! millions of packets, so `Ctx` does that at key installation.
 //!
 //! The per-message steps follow std's `AesGcm.encrypt`/`decrypt` (Zig
-//! 0.16.0), including checking the tag before decrypting.
+//! 0.16.0), except with `stitch`: CTR and GHASH then share one pass, so
+//! decrypting writes the plaintext before the tag is checked, and wipes it
+//! when the check fails, as OpenSSL and BoringSSL do.
 //!
 //! With hardware AES, CTR runs 8 blocks at a time with the round keys held in
 //! registers, and the tail as one batch of exactly the blocks left, with the
@@ -12,8 +14,9 @@
 //! plus `aesmc`, a pair the core fuses. std's armcrypto rounds are `aese` with
 //! a zero key, `aesmc`, then an `eor` of the round key, with operands limited
 //! to v0-v15, so 6+ blocks and 11 round keys don't fit and keys get reloaded.
-//! On arm64 GHASH also runs in vector registers (see `vec_ghash`). Elsewhere
-//! GHASH is `ghash.zig`, and without hardware AES, CTR is std's.
+//! With PMULL (arm64) or PCLMUL (x86_64), GHASH also runs in vector registers
+//! (see `vec_ghash`). Elsewhere GHASH is `ghash.zig`, and without hardware
+//! AES, CTR is std's.
 //! See DECISIONS/zig_std_divergences.md.
 
 const std = @import("std");
@@ -33,10 +36,22 @@ const V = @Vector(2, u64);
 const wide = 8;
 const RoundKeys = [Aes128.rounds + 1]Block;
 
-/// arm64: GHASH in vector registers. `ghash.zig` does its arithmetic on u128,
-/// which LLVM keeps in general registers, so every multiply moves operands
-/// across and back. Same multiply and reduction, on vectors.
-const vec_ghash = fast and builtin.target.cpu.arch == .aarch64 and builtin.mode != .small;
+/// GHASH in vector registers. `ghash.zig` does its arithmetic on u128, which
+/// LLVM keeps in general registers, so every multiply moves operands across
+/// and back. Same multiply and reduction, on vectors.
+const vec_ghash = fast and builtin.mode != .small and switch (builtin.target.cpu.arch) {
+    .aarch64 => true,
+    // ghash.zig's own conditions for vpclmulqdq
+    .x86_64 => builtin.target.cpu.has(.x86, .pclmul) and builtin.target.cpu.has(.x86, .avx),
+    else => false,
+};
+/// CTR and GHASH in one loop, so one batch's AES overlaps another's GHASH:
+/// AES-NI and PCLMUL issue on different ports, and arm64 has the pipes too.
+const stitch = vec_ghash;
+/// x86: a batch's GHASH between the AES rounds of the next (`RoundHash`).
+/// On arm64 that measured 5% slower than hashing after the AES: its four
+/// SIMD pipes all run both, and the extra live registers spill.
+const per_round_ghash = builtin.target.cpu.arch == .x86_64;
 /// Powers of H that `Ghash.init` computes: H, H^2, ... H^16.
 const pc_count = @typeInfo(@FieldType(Ghash, "hx")).array.len;
 /// Byte order of GHASH's big-endian 128-bit integers.
@@ -48,6 +63,11 @@ const reversed: [16]i32 = blk: {
 
 inline fn loadBlock(b: *const [16]u8) V {
     return @bitCast(@shuffle(u8, @as(@Vector(16, u8), b.*), undefined, reversed));
+}
+
+/// GHASH's big-endian block from its bytes in memory order, and back.
+inline fn reverse(x: V) V {
+    return @bitCast(@shuffle(u8, @as(@Vector(16, u8), @bitCast(x)), undefined, reversed));
 }
 
 /// Copy a block's tail, at most 16 bytes, in fixed-size moves: @memcpy of a
@@ -62,7 +82,13 @@ inline fn copyTail(dst: []u8, src: []const u8) void {
     }
 }
 
+/// Carryless product of the low lanes of `x` and `y`.
 inline fn pmullLo(x: V, y: V) V {
+    if (builtin.target.cpu.arch == .x86_64) return asm ("vpclmulqdq $0x00, %[x], %[y], %[o]"
+        : [o] "=x" (-> V),
+        : [x] "x" (x),
+          [y] "x" (y),
+    );
     return asm ("pmull %[o].1q, %[x].1d, %[y].1d"
         : [o] "=w" (-> V),
         : [x] "w" (x),
@@ -70,12 +96,34 @@ inline fn pmullLo(x: V, y: V) V {
     );
 }
 
+/// Carryless product of the high lanes of `x` and `y`.
 inline fn pmullHi(x: V, y: V) V {
+    if (builtin.target.cpu.arch == .x86_64) return asm ("vpclmulqdq $0x11, %[x], %[y], %[o]"
+        : [o] "=x" (-> V),
+        : [x] "x" (x),
+          [y] "x" (y),
+    );
     return asm ("pmull2 %[o].1q, %[x].2d, %[y].2d"
         : [o] "=w" (-> V),
         : [x] "w" (x),
           [y] "w" (y),
     );
+}
+
+/// x.hi·y.lo ^ x.lo·y.hi. x86's PCLMUL picks either lane of each operand;
+/// PMULL only pairs like lanes, so arm64 swaps `x`'s halves first.
+inline fn pmullCross(x: V, y: V) V {
+    if (builtin.target.cpu.arch == .x86_64) return asm ("vpclmulqdq $0x01, %[x], %[y], %[o]"
+        : [o] "=x" (-> V),
+        : [x] "x" (x),
+          [y] "x" (y),
+    ) ^ asm ("vpclmulqdq $0x10, %[x], %[y], %[o]"
+        : [o] "=x" (-> V),
+        : [x] "x" (x),
+          [y] "x" (y),
+    );
+    const xs = swapHalves(x);
+    return pmullLo(xs, y) ^ pmullHi(xs, y);
 }
 
 inline fn swapHalves(x: V) V {
@@ -85,24 +133,59 @@ inline fn swapHalves(x: V) V {
 /// (acc ^ b[0])·H^k ^ b[1]·H^(k-1) ^ ... ^ b[k-1]·H, reduced once. The
 /// schoolbook product and `reduce` of `ghash.zig`.
 inline fn ghashBatch(comptime k: usize, hx: *const [pc_count]V, acc: V, b: [k]V) V {
-    var lo: V = @splat(0);
-    var hi: V = @splat(0);
-    var mid: V = @splat(0);
-    inline for (0..k) |j| {
-        const x = if (j == 0) b[0] ^ acc else b[j];
-        const h = hx[k - 1 - j];
-        lo ^= pmullLo(x, h);
-        hi ^= pmullHi(x, h);
-        const xs = swapHalves(x);
-        mid ^= pmullLo(xs, h) ^ pmullHi(xs, h);
-    }
-    const zero: V = @splat(0);
-    hi ^= @shuffle(u64, mid, zero, [2]i32{ 1, -1 }); // mid >> 64
-    lo ^= @shuffle(u64, mid, zero, [2]i32{ -1, 0 }); // mid << 64
-    const p64: V = .{ 0xc200000000000000, 0 };
-    const r = swapHalves(lo) ^ pmullLo(lo, p64);
-    return swapHalves(r) ^ pmullLo(r, p64) ^ hi;
+    var p: Products = .{};
+    inline for (0..k) |j| p.add(if (j == 0) b[0] ^ acc else b[j], hx[k - 1 - j]);
+    return p.reduce();
 }
+
+/// A batch's unreduced product, summed a block at a time.
+const Products = struct {
+    lo: V = @splat(0),
+    hi: V = @splat(0),
+    mid: V = @splat(0),
+
+    inline fn add(p: *Products, x: V, h: V) void {
+        p.lo ^= pmullLo(x, h);
+        p.hi ^= pmullHi(x, h);
+        p.mid ^= pmullCross(x, h);
+    }
+
+    inline fn reduce(p: Products) V {
+        const zero: V = @splat(0);
+        const hi = p.hi ^ @shuffle(u64, p.mid, zero, [2]i32{ 1, -1 }); // mid >> 64
+        const lo = p.lo ^ @shuffle(u64, p.mid, zero, [2]i32{ -1, 0 }); // mid << 64
+        const p64: V = .{ 0xc200000000000000, 0 };
+        const r = swapHalves(lo) ^ pmullLo(lo, p64);
+        return swapHalves(r) ^ pmullLo(r, p64) ^ hi;
+    }
+};
+
+/// One batch's GHASH spread over another batch's AES rounds, a block's
+/// multiplies per round and the reduction in the last, as OpenSSL orders
+/// them: with the AES and GHASH halves apart, x86 dispatches GHASH's XORs to
+/// port 0, which every AES round needs. `b[0]` already holds the running
+/// hash.
+const RoundHash = struct {
+    hx: *const [pc_count]V,
+    b: [wide]V,
+    p: Products = .{},
+    acc: V = undefined,
+
+    inline fn round(self: *RoundHash, comptime r: usize) void {
+        if (r < wide) self.p.add(self.b[r], self.hx[wide - 1 - r]);
+        if (r == wide) self.acc = self.p.reduce();
+    }
+
+    /// Every step at once, for a batch hashed apart from AES.
+    inline fn all(self: *RoundHash) V {
+        inline for (0..wide + 1) |r| self.round(r);
+        return self.acc;
+    }
+
+    comptime {
+        std.debug.assert(wide < Aes128.rounds - 1); // a middle round left for the reduction
+    }
+};
 
 /// GHASH `msg` into `acc`, its last block zero-padded. `extra`, when given,
 /// is one more block hashed in the same final batch.
@@ -142,8 +225,8 @@ pub const key_length = 16;
 pub const Ctx = struct {
     aes: @TypeOf(Aes128.initEnc(@as([key_length]u8, undefined))),
     h: [16]u8,
-    /// GHASH keyed with H, all powers precomputed. The arm64 path only reads
-    /// the powers; elsewhere this is copied per message.
+    /// GHASH keyed with H, all powers precomputed. `vec_ghash` only reads
+    /// the powers; otherwise this is copied per message.
     mac: Ghash,
 
     pub fn init(key: [key_length]u8) Ctx {
@@ -158,6 +241,10 @@ pub const Ctx = struct {
         std.debug.assert(c.len == m.len);
         std.debug.assert(m.len <= 16 * ((1 << 32) - 2));
 
+        if (stitch) {
+            tag.* = self.ctrGhash(true, c, m, ad, npub);
+            return;
+        }
         const t = self.ctr(true, c, m, npub);
         tag.* = self.ghashTag(ad, c[0..m.len], t);
     }
@@ -167,6 +254,15 @@ pub const Ctx = struct {
     pub fn decrypt(self: *const Ctx, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8) crypto.errors.AuthenticationError!void {
         std.debug.assert(c.len == m.len);
 
+        if (stitch) {
+            var computed_tag = self.ctrGhash(false, m, c, ad, npub);
+            if (!crypto.timing_safe.eql([tag_length]u8, computed_tag, tag)) {
+                crypto.secureZero(u8, &computed_tag);
+                crypto.secureZero(u8, m);
+                return error.AuthenticationFailed;
+            }
+            return;
+        }
         var computed_tag = self.ghashTag(ad, c, self.counterBlock(npub, 1));
         const verify = crypto.timing_safe.eql([tag_length]u8, computed_tag, tag);
         if (!verify) {
@@ -176,6 +272,47 @@ pub const Ctx = struct {
         }
 
         _ = self.ctr(false, m, c, npub);
+    }
+
+    /// CTR from `src` into `dst`, GHASHing the ciphertext in the same loop;
+    /// returns the tag. Sealing, a batch's ciphertext is hashed in the next
+    /// iteration, so GHASH never waits on the AES beside it. Opening hashes
+    /// each batch before its plaintext is stored, which may overwrite it.
+    fn ctrGhash(self: *const Ctx, comptime seal: bool, dst: []u8, src: []const u8, ad: []const u8, npub: [nonce_length]u8) [16]u8 {
+        const rk = self.aes.key_schedule.round_keys; // a local, so stores to dst can't alias it
+        const hx: *const [pc_count]V = @ptrCast(&self.mac.hx);
+        const base = counterBase(npub);
+        var acc = ghashBlocks(hx, @splat(0), ad, null);
+        var n: u32 = 2;
+        var i: usize = 0;
+        // sealing: ciphertext waiting to be hashed
+        var prev: [wide]V = @splat(@splat(0));
+        var pending = false;
+        while (i + 16 * wide <= src.len) : (i += 16 * wide) {
+            var rh: RoundHash = .{ .hx = hx, .b = prev };
+            if (!seal) inline for (0..wide) |j| {
+                rh.b[j] = loadBlock(src[i + 16 * j ..][0..16]);
+            };
+            rh.b[0] ^= acc;
+            const hashing = !seal or pending;
+            const ks = if (per_round_ghash and hashing)
+                encryptBlocks(wide, &rk, counters(wide, base, n), &rh)
+            else
+                encryptBlocks(wide, &rk, counters(wide, base, n), null);
+            if (hashing) acc = if (per_round_ghash) rh.acc else rh.all();
+            n +%= wide;
+            inline for (0..wide) |j| {
+                const ct = xorBlock(dst[i + 16 * j ..][0..16], src[i + 16 * j ..][0..16], ks[j]);
+                if (seal) prev[j] = reverse(ct);
+            }
+            pending = seal;
+        }
+        if (pending) acc = ghashBatch(wide, hx, acc, prev);
+        const len_block = loadBlock(&lengthBlock(ad.len, src.len));
+        if (!seal) acc = ghashBlocks(hx, acc, src[i..], len_block);
+        const t = ctrTail(true, &rk, dst[i..], src[i..], base, n);
+        if (seal) acc = ghashBlocks(hx, acc, dst[i..src.len], len_block);
+        return @as([16]u8, @bitCast(reverse(acc) ^ @as(V, @bitCast(t))));
     }
 
     /// GHASH(ad, c) XOR `mask`: the tag.
@@ -204,7 +341,7 @@ pub const Ctx = struct {
         var out: [16]u8 = undefined;
         if (fast) {
             const rk = self.aes.key_schedule.round_keys;
-            out = @bitCast(encryptBlocks(1, &rk, counters(1, counterBase(npub), n))[0]);
+            out = @bitCast(encryptBlocks(1, &rk, counters(1, counterBase(npub), n), null)[0]);
         } else {
             var j: [16]u8 = undefined;
             j[0..nonce_length].* = npub;
@@ -233,26 +370,31 @@ pub const Ctx = struct {
         var n: u32 = 2;
         var i: usize = 0;
         while (i + 16 * wide <= src.len) : (i += 16 * wide) {
-            const ks = encryptBlocks(wide, &rk, counters(wide, base, n));
+            const ks = encryptBlocks(wide, &rk, counters(wide, base, n), null);
             n +%= wide;
-            inline for (0..wide) |b| xorBlock(dst[i + 16 * b ..][0..16], src[i + 16 * b ..][0..16], ks[b]);
+            inline for (0..wide) |b| _ = xorBlock(dst[i + 16 * b ..][0..16], src[i + 16 * b ..][0..16], ks[b]);
         }
-        // The rest in one batch, the mask riding along as its last lane.
-        switch ((src.len - i + 15) / 16) {
+        return ctrTail(mask, &rk, dst[i..], src[i..], base, n);
+    }
+
+    /// CTR over `src`, fewer than `wide` blocks, in one batch, the mask
+    /// riding along as its last lane. `n` is the first block's counter.
+    fn ctrTail(comptime mask: bool, rk: *const RoundKeys, dst: []u8, src: []const u8, base: V, n: u32) [16]u8 {
+        switch ((src.len + 15) / 16) {
             inline 0...wide => |k| {
                 const lanes = k + @intFromBool(mask);
                 if (lanes == 0) return undefined;
                 var ctrs: [lanes]V = undefined;
                 ctrs[0..k].* = counters(k, base, n);
                 if (mask) ctrs[k] = counters(1, base, 1)[0];
-                const ks = encryptBlocks(lanes, &rk, ctrs);
+                const ks = encryptBlocks(lanes, rk, ctrs, null);
                 if (k > 0) {
-                    inline for (0..k - 1) |b| xorBlock(dst[i + 16 * b ..][0..16], src[i + 16 * b ..][0..16], ks[b]);
-                    const last = i + 16 * (k - 1);
+                    inline for (0..k - 1) |b| _ = xorBlock(dst[16 * b ..][0..16], src[16 * b ..][0..16], ks[b]);
+                    const last = 16 * (k - 1);
                     const r = src.len - last;
                     var buf: [16]u8 = @splat(0);
                     copyTail(buf[0..r], src[last..]);
-                    xorBlock(&buf, &buf, ks[k - 1]);
+                    _ = xorBlock(&buf, &buf, ks[k - 1]);
                     copyTail(dst[last..][0..r], &buf);
                 }
                 return if (mask) @bitCast(ks[k]) else undefined;
@@ -262,11 +404,14 @@ pub const Ctx = struct {
     }
 
     /// Unaligned vector load and store: on Zig 0.17-dev, `@bitCast(src.*)`
-    /// compiles to 16 byte loads, which doubles the cost of CTR.
-    inline fn xorBlock(dst: *[16]u8, src: *const [16]u8, ks: V) void {
+    /// compiles to 16 byte loads, which doubles the cost of CTR. Returns
+    /// what it stored.
+    inline fn xorBlock(dst: *[16]u8, src: *const [16]u8, ks: V) V {
         const in: *align(1) const V = @ptrCast(src);
         const out: *align(1) V = @ptrCast(dst);
-        out.* = in.* ^ ks;
+        const v = in.* ^ ks;
+        out.* = v;
+        return v;
     }
 
     /// npub || 00000000, so a counter is OR-ed into the top half of lane 1.
@@ -276,12 +421,21 @@ pub const Ctx = struct {
 
     inline fn counters(comptime k: usize, base: V, n: u32) [k]V {
         var out: [k]V = undefined;
+        // Byte 15, the counter's low byte, is the top of lane 1: while it
+        // doesn't carry, a vector add steps it without a general-register
+        // round trip (vpinsrq shares PCLMUL's port).
+        if (k > 1 and (n & 0xff) + (k - 1) <= 0xff) {
+            const first = base | V{ 0, @as(u64, @byteSwap(n)) << 32 };
+            inline for (0..k) |b| out[b] = first +% V{ 0, @as(u64, b) << 56 };
+            return out;
+        }
         inline for (0..k) |b| out[b] = base | V{ 0, @as(u64, @byteSwap(n +% @as(u32, b))) << 32 };
         return out;
     }
 
     /// AES-128 over `k` blocks, round by round so the blocks' rounds overlap.
-    inline fn encryptBlocks(comptime k: usize, rk: *const RoundKeys, in: [k]V) [k]V {
+    /// `hash`, when given, takes a step after each of the 9 middle rounds.
+    inline fn encryptBlocks(comptime k: usize, rk: *const RoundKeys, in: [k]V, hash: ?*RoundHash) [k]V {
         var s = in;
         if (builtin.target.cpu.arch == .aarch64) {
             inline for (0..Aes128.rounds - 1) |r| {
@@ -292,6 +446,7 @@ pub const Ctx = struct {
                     : [_] "0" (s[b]),
                       [rk] "w" (rk[r].repr),
                 );
+                if (hash) |h| h.round(r);
             }
             inline for (0..k) |b| s[b] = asm (
                 \\ aese %[s].16b, %[rk].16b
@@ -303,6 +458,7 @@ pub const Ctx = struct {
             inline for (0..k) |b| s[b] ^= rk[0].repr;
             inline for (1..Aes128.rounds) |r| {
                 inline for (0..k) |b| s[b] = (Block{ .repr = s[b] }).encrypt(rk[r]).repr;
+                if (hash) |h| h.round(r - 1);
             }
             inline for (0..k) |b| s[b] = (Block{ .repr = s[b] }).encryptLast(rk[Aes128.rounds]).repr;
         }
@@ -320,11 +476,14 @@ pub const Ctx = struct {
 const testing = std.testing;
 const StdGcm = crypto.aead.aes_gcm.Aes128Gcm;
 
+/// A TLS record's plaintext, with room past it.
+const check_max = 16384 + 256;
+
 /// Seals `m` with `ctx` and std, in place and not, and checks they agree;
 /// then opens it, and checks that a flipped tag, message or AD bit is refused.
 fn checkAgainstStd(ctx: *const Ctx, key: [16]u8, npub: [12]u8, m: []const u8, ad: []u8, flip: usize) !void {
-    var c_ours: [2048]u8 = undefined;
-    var c_std: [2048]u8 = undefined;
+    var c_ours: [check_max]u8 = undefined;
+    var c_std: [check_max]u8 = undefined;
     var tag_ours: [16]u8 = undefined;
     var tag_std: [16]u8 = undefined;
     ctx.encrypt(c_ours[0..m.len], &tag_ours, m, ad, npub);
@@ -333,7 +492,7 @@ fn checkAgainstStd(ctx: *const Ctx, key: [16]u8, npub: [12]u8, m: []const u8, ad
     try testing.expectEqualSlices(u8, &tag_std, &tag_ours);
 
     // in place, as packet protection uses it
-    var buf: [2048]u8 = undefined;
+    var buf: [check_max]u8 = undefined;
     @memcpy(buf[0..m.len], m);
     var tag_in_place: [16]u8 = undefined;
     ctx.encrypt(buf[0..m.len], &tag_in_place, buf[0..m.len], ad, npub);
@@ -346,6 +505,8 @@ fn checkAgainstStd(ctx: *const Ctx, key: [16]u8, npub: [12]u8, m: []const u8, ad
     bad_tag[flip % 16] ^= 1;
     @memcpy(buf[0..m.len], c_std[0..m.len]);
     try testing.expectError(error.AuthenticationFailed, ctx.decrypt(buf[0..m.len], buf[0..m.len], bad_tag, ad, npub));
+    // stitched, the plaintext was written before the tag failed
+    if (stitch) try testing.expect(mem.allEqual(u8, buf[0..m.len], 0));
     if (m.len > 0) {
         @memcpy(buf[0..m.len], c_std[0..m.len]);
         buf[flip % m.len] ^= 0x80;
@@ -376,6 +537,26 @@ test "Ctx matches std Aes128Gcm across lengths that cross every aggregation widt
         rand.bytes(ad[0..ad_len]);
         const ctx = Ctx.init(key);
         try checkAgainstStd(&ctx, key, npub, m[0..m_len], ad[0..ad_len], iter);
+    }
+}
+
+test "Ctx matches std Aes128Gcm where a batch's counters carry out of their low byte" {
+    // Counters start at 2, so the batch from 250 carries first: lengths
+    // around it put that batch mid-message or in the tail.
+    var prng = std.Random.DefaultPrng.init(0x853c49e6748fea9b);
+    const rand = prng.random();
+    var m: [check_max]u8 = undefined;
+    var ad: [13]u8 = undefined;
+    for (0..80) |iter| {
+        var key: [16]u8 = undefined;
+        var npub: [12]u8 = undefined;
+        rand.bytes(&key);
+        rand.bytes(&npub);
+        const m_len = if (iter < 48) (240 + iter / 2) * 16 + iter % 2 * 9 else rand.uintAtMost(usize, m.len);
+        rand.bytes(m[0..m_len]);
+        rand.bytes(&ad);
+        const ctx = Ctx.init(key);
+        try checkAgainstStd(&ctx, key, npub, m[0..m_len], &ad, iter);
     }
 }
 
