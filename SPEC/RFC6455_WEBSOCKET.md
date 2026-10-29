@@ -101,6 +101,31 @@ pub fn onRawEnd(self: *H, raw: *event_loop.RawConn) void   // optional
   connection under a request; here the listener hands it over instead of
   the handler asking, and with the request's own bytes.
 
+A handler can also answer requests itself, later, without taking the
+connection (a host routing some requests natively and the rest to its own
+HTTP implementation):
+
+```zig
+pub fn onHttpExchange(self: *H, ex: *event_loop.HttpExchange) void
+pub fn onHttpExchangeGone(self: *H, ex: *event_loop.HttpExchange) void
+```
+
+- A request that isn't an upgrade, and that `onHttpRequest` didn't answer,
+  is offered once its head and body have all arrived: bodies up to
+  `http1.max_exchange_body` (64 KiB) with a Content-Length. A chunked body,
+  a larger one, or `Expect: 100-continue` skips the offer.
+- During the call, `method()`, `target()`, `headers()`, `body()` and
+  `peerAddress()` describe it. `respond(status, headers, body)` answers,
+  then or later: header lines end in `\r\n`, Content-Length is added, and
+  the response leaves in one send. `pass()` serves it as if never offered,
+  from the request line: the raw handler gets its bytes, untouched.
+- Until one of those, nothing more is read on the connection; what the
+  peer pipelined waits. A peer's FIN still gets the answer, then the
+  connection ends. `onHttpExchangeGone` fires if the connection closes
+  first (a failed write, `Server.stop()`), never from inside an
+  `HttpExchange` method.
+- A pending exchange counts as a request in flight for `drain()`.
+
 `README.md` ("HTTP/1.1 listener: static files and WebSockets") has the
 config table.
 
@@ -143,7 +168,7 @@ config table.
   `req.header("origin")`. A server that authenticates by cookie must check
   it (RFC 6455 §10.2).
 - **Request bodies are refused**, unless the handler takes raw
-  connections. The listener serves GET and HEAD for static files. A
+  connections or exchanges. The listener serves GET and HEAD for static files. A
   request with a body gets 400, and other methods get 405.
 - **The client side is a codec.** `Decoder` with `.role = .client`,
   `writeMaskedFrameHeader`, `clientKey`, `writeUpgradeRequest` and

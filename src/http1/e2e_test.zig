@@ -1466,3 +1466,213 @@ test "http1: a raw connection's abort drops what was queued, and onRawClose foll
     try testing.expect(c.in.items.len + h.handler.queued_after_big <= h.handler.big_written);
     try h.handlerCloses(1);
 }
+
+/// Takes every request as an exchange: answers "/now" inside the callback,
+/// passes "/raw" there, and leaves the rest pending for the test.
+const ExchangeHandler = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+
+    offers: u32 = 0,
+    gone: u32 = 0,
+    pending: ?*event_loop.HttpExchange = null,
+    target_buf: [64]u8 = undefined,
+    target_len: usize = 0,
+    body_buf: [64]u8 = undefined,
+    body_len: usize = 0,
+    method_buf: [8]u8 = undefined,
+    method_len: usize = 0,
+    raw_opens: u32 = 0,
+    raw_received: std.ArrayList(u8) = .empty,
+
+    pub fn onWsUpgrade(_: *ExchangeHandler, req: *WsRequest, _: []const u8) void {
+        _ = req.accept(.{}) catch {};
+    }
+
+    pub fn onHttpExchange(self: *ExchangeHandler, ex: *event_loop.HttpExchange) void {
+        self.offers += 1;
+        self.target_len = @min(ex.target().len, self.target_buf.len);
+        @memcpy(self.target_buf[0..self.target_len], ex.target()[0..self.target_len]);
+        self.body_len = @min(ex.body().len, self.body_buf.len);
+        @memcpy(self.body_buf[0..self.body_len], ex.body()[0..self.body_len]);
+        self.method_len = @min(ex.method().len, self.method_buf.len);
+        @memcpy(self.method_buf[0..self.method_len], ex.method()[0..self.method_len]);
+        if (std.mem.eql(u8, ex.target(), "/now")) return ex.respond(200, "Content-Type: text/plain\r\n", "now");
+        if (std.mem.eql(u8, ex.target(), "/raw")) return ex.pass();
+        self.pending = ex;
+    }
+
+    pub fn onHttpExchangeGone(self: *ExchangeHandler, ex: *event_loop.HttpExchange) void {
+        self.gone += 1;
+        if (self.pending == ex) self.pending = null;
+    }
+
+    pub fn onRawOpen(self: *ExchangeHandler, _: *event_loop.RawConn) void {
+        self.raw_opens += 1;
+    }
+
+    pub fn onRawData(self: *ExchangeHandler, _: *event_loop.RawConn, data: []const u8) void {
+        self.raw_received.appendSlice(testing.allocator, data) catch unreachable;
+    }
+
+    pub fn onRawClose(_: *ExchangeHandler, _: *event_loop.RawConn) void {}
+
+    fn target(self: *const ExchangeHandler) []const u8 {
+        return self.target_buf[0..self.target_len];
+    }
+};
+
+const ExchangeHarness = HarnessFor(ExchangeHandler);
+
+fn offeredTwice(h: *ExchangeHarness) bool {
+    return h.handler.offers >= 2;
+}
+
+fn exchangePending(h: *ExchangeHarness) bool {
+    return h.handler.pending != null;
+}
+
+test "http1: an exchange is answered after its callback, then the request pipelined behind it is offered" {
+    var h: ExchangeHarness = undefined;
+    try h.init(29496, .{ .tls = false });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+
+    try c.send("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhiGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    try h.spinUntil(&h, exchangePending);
+    try testing.expectEqualStrings("POST", h.handler.method_buf[0..h.handler.method_len]);
+    try testing.expectEqualStrings("/a", h.handler.target());
+    try testing.expectEqualStrings("hi", h.handler.body_buf[0..h.handler.body_len]);
+    // The second waits for the first's answer.
+    for (0..20) |_| try h.step();
+    try testing.expectEqual(@as(u32, 1), h.handler.offers);
+
+    const first = h.handler.pending.?;
+    h.handler.pending = null;
+    first.respond(201, "Content-Type: text/plain\r\nX-Test: 1\r\n", "made");
+    const head1 = try h.head(&c);
+    try testing.expect(std.mem.startsWith(u8, head1, "HTTP/1.1 201 Created\r\n"));
+    try testing.expect(std.mem.indexOf(u8, head1, "Content-Length: 4\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, head1, "X-Test: 1\r\n") != null);
+    try testing.expectEqualStrings("made", try h.bytes(&c, 4));
+
+    try h.spinUntil(&h, exchangePending);
+    try testing.expectEqualStrings("/b", h.handler.target());
+    try testing.expectEqual(@as(usize, 0), h.handler.body_len);
+    h.handler.pending.?.respond(200, "", "");
+    const head2 = try h.head(&c);
+    try testing.expect(std.mem.startsWith(u8, head2, "HTTP/1.1 200 OK\r\n"));
+    try testing.expectEqual(@as(u32, 0), h.handler.gone);
+}
+
+test "http1: an exchange answered inside its callback, and passed ones reach the raw handler whole" {
+    var h: ExchangeHarness = undefined;
+    try h.init(29497, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.raw_received.deinit(testing.allocator);
+
+    var a: TestClient = .{};
+    defer a.deinit();
+    try a.connect(h.port, false);
+    try a.send("GET /now HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, try h.head(&a), "HTTP/1.1 200 OK\r\n"));
+    try testing.expectEqualStrings("now", try h.bytes(&a, 3));
+
+    // Passed inside the callback.
+    const raw_req = "POST /raw HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
+    var b: TestClient = .{};
+    defer b.deinit();
+    try b.connect(h.port, false);
+    try b.send(raw_req);
+    const W = struct {
+        fn got(hh: *ExchangeHarness, n: usize) bool {
+            return hh.handler.raw_received.items.len >= n;
+        }
+        fn first(hh: *ExchangeHarness) bool {
+            return got(hh, raw_req.len);
+        }
+        fn both(hh: *ExchangeHarness) bool {
+            return got(hh, 2 * raw_req.len - "/raw".len + "/later".len);
+        }
+    };
+    try h.spinUntil(&h, W.first);
+    try testing.expectEqualStrings(raw_req, h.handler.raw_received.items);
+
+    // Passed after it.
+    var d: TestClient = .{};
+    defer d.deinit();
+    try d.connect(h.port, false);
+    const later_req = "POST /later HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
+    try d.send(later_req);
+    try h.spinUntil(&h, exchangePending);
+    h.handler.pending.?.pass();
+    h.handler.pending = null;
+    try h.spinUntil(&h, W.both);
+    try testing.expectEqualStrings(later_req, h.handler.raw_received.items[raw_req.len..]);
+    try testing.expectEqual(@as(u32, 2), h.handler.raw_opens);
+}
+
+test "http1: a chunked request isn't offered; a half-closed peer still gets its answer; stop() ends a pending one" {
+    var h: ExchangeHarness = undefined;
+    try h.init(29498, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.raw_received.deinit(testing.allocator);
+
+    var a: TestClient = .{};
+    defer a.deinit();
+    try a.connect(h.port, false);
+    try a.send("POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n");
+    const W = struct {
+        fn rawOpened(hh: *ExchangeHarness) bool {
+            return hh.handler.raw_opens > 0;
+        }
+        fn isGone(hh: *ExchangeHarness) bool {
+            return hh.handler.gone > 0;
+        }
+    };
+    try h.spinUntil(&h, W.rawOpened);
+    try testing.expectEqual(@as(u32, 0), h.handler.offers);
+
+    // TCP can't tell a half-close from a peer that left: it waits.
+    var b: TestClient = .{};
+    defer b.deinit();
+    try b.connect(h.port, false);
+    try b.send("GET /half HTTP/1.1\r\nHost: x\r\n\r\n");
+    try h.spinUntil(&h, exchangePending);
+    b.halfClose();
+    for (0..20) |_| try h.step();
+    try testing.expectEqual(@as(u32, 0), h.handler.gone);
+    h.handler.pending.?.respond(200, "", "late");
+    h.handler.pending = null;
+    const head = try h.head(&b);
+    try testing.expect(std.mem.indexOf(u8, head, "Connection: close\r\n") != null);
+    try testing.expectEqualStrings("late", try h.bytes(&b, 4));
+    try h.eof(&b);
+
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+    try c.send("GET /wait HTTP/1.1\r\nHost: x\r\n\r\n");
+    try h.spinUntil(&h, exchangePending);
+    h.server.stop();
+    try h.spinUntil(&h, W.isGone);
+    try testing.expect(h.handler.pending == null);
+}
+
+test "http1: an exchange over TLS, answered after its callback" {
+    var h: ExchangeHarness = undefined;
+    try h.init(29499, .{});
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, true);
+    try h.handshake(&c);
+    try c.send("POST /tls HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    try h.spinUntil(&h, exchangePending);
+    try testing.expectEqualStrings("hello", h.handler.body_buf[0..h.handler.body_len]);
+    h.handler.pending.?.respond(200, "Content-Type: text/plain\r\n", "ok");
+    h.handler.pending = null;
+    try testing.expect(std.mem.startsWith(u8, try h.head(&c), "HTTP/1.1 200 OK\r\n"));
+    try testing.expectEqualStrings("ok", try h.bytes(&c, 2));
+}

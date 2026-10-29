@@ -48,6 +48,9 @@ const Phase = enum {
     ws_closing,
     /// The handler's, as bytes: see `RawConn`.
     raw,
+    /// A request offered to the handler (`HttpExchange`), waiting on its
+    /// answer; input after it waits too.
+    exchange,
     /// Flushing, lingering or aborting; nothing more is read or written.
     closing,
     /// A WebSocket handed over (`WsConn.handOver`), waiting for its socket
@@ -309,6 +312,84 @@ pub const HttpRequest = struct {
     }
 };
 
+/// Requests with bodies past this, or chunked ones, aren't offered as
+/// exchanges: they go on as if the handler took none.
+pub const max_exchange_body = 64 * 1024;
+
+/// A request the handler answers when it's ready, `onHttpExchange`'s: its
+/// head and body have all arrived when it's offered. The handler calls
+/// `respond`, or `pass` to have it served as if never offered: by the raw
+/// handler when there is one. Until then nothing more is read from the
+/// connection. Valid until one of those, or until `onHttpExchangeGone`
+/// says the connection closed first; use it only on the loop's thread.
+pub const HttpExchange = struct {
+    exchange_id: u64 = 0,
+    pending: bool = false,
+    /// Inside `onHttpExchange`: `head` and `body_bytes` are set.
+    offering: bool = false,
+    passed: bool = false,
+    /// The request's bytes, head and body, at the start of the input.
+    len: usize = 0,
+    head: ?*const parser.RequestHead = null,
+    body_bytes: []const u8 = &.{},
+
+    fn conn(self: *HttpExchange) *Conn {
+        return @alignCast(@fieldParentPtr("exchange", self));
+    }
+
+    /// From the counter `WsConn.id` draws from.
+    pub fn id(self: *const HttpExchange) u64 {
+        return self.exchange_id;
+    }
+
+    // The request, during `onHttpExchange` only.
+
+    pub fn method(self: *const HttpExchange) []const u8 {
+        return self.head.?.method;
+    }
+
+    pub fn target(self: *const HttpExchange) []const u8 {
+        return self.head.?.target;
+    }
+
+    pub fn headers(self: *const HttpExchange) []const parser.Header {
+        return self.head.?.headers;
+    }
+
+    pub fn body(self: *const HttpExchange) []const u8 {
+        return self.body_bytes;
+    }
+
+    pub fn peerAddress(self: *HttpExchange) *const posix.sockaddr.storage {
+        return &self.conn().peer;
+    }
+
+    /// Answers with `body` (left out for HEAD) after `extra_headers`: whole
+    /// header lines, each ending in `\r\n`. Content-Length is added, and
+    /// Connection as the request asked.
+    pub fn respond(self: *HttpExchange, status: u16, extra_headers: []const u8, response_body: []const u8) void {
+        if (!self.pending) return;
+        self.pending = false;
+        const c = self.conn();
+        if (!self.offering) c.consumeInput(self.len);
+        // Then what the peer pipelined behind it (`responseDone`).
+        c.answer(status, extra_headers, response_body);
+    }
+
+    /// Serves the request as if it had never been offered.
+    pub fn pass(self: *HttpExchange) void {
+        if (!self.pending) return;
+        self.pending = false;
+        self.passed = true;
+        const c = self.conn();
+        c.phase = .head;
+        if (self.offering) return;
+        // Parsed again from the input, which still holds it whole.
+        c.skip_exchange = true;
+        c.process();
+    }
+};
+
 pub const RawError = error{
     /// The connection is closing or gone.
     Closed,
@@ -449,6 +530,10 @@ pub const Conn = struct {
 
     ws: WsConn = .{},
     raw: RawConn = .{},
+    exchange: HttpExchange = .{},
+    /// The request at the start of the input was passed: serve it without
+    /// offering it again.
+    skip_exchange: bool = false,
 
     // The server's list.
     prev: ?*Conn = null,
@@ -545,6 +630,9 @@ pub const Conn = struct {
             // A WebSocket that ends without a Close frame is abnormal (1006).
             .static_body, .ws_open, .ws_closing => self.finish(websocket.CloseCode.abnormal, .abort),
             .raw => self.rawEnd(),
+            // Half-closed after its request: it still gets the answer, then
+            // the connection ends.
+            .exchange => self.keep_alive = false,
             // A failed write: the new server reads the end.
             .moving => {},
         }
@@ -573,7 +661,8 @@ pub const Conn = struct {
                 if (self.unreadLen() > 0) self.process();
                 self.sock.startReading();
             },
-            .closing, .moving => {},
+            // Its answer resumes reading, once it's written.
+            .exchange, .closing, .moving => {},
         }
     }
 
@@ -612,7 +701,7 @@ pub const Conn = struct {
             // Cleared by handOver.
             .moving => {},
             // Never set: the handler keeps its own time.
-            .raw => {},
+            .raw, .exchange => {},
             // Handshake, idle keep-alive, a stalled response, or linger.
             .head, .static_body, .closing => self.finish(websocket.CloseCode.abnormal, .abort),
         }
@@ -669,6 +758,11 @@ pub const Conn = struct {
     }
 
     fn notifyClose(self: *Conn, code: u16, reason: []const u8) void {
+        if (self.exchange.pending) {
+            self.exchange.pending = false;
+            const h = self.server.handlers;
+            h.exchange.?.gone(h.ctx, &self.exchange);
+        }
         if (!self.raw.notified) {
             self.raw.notified = true;
             const h = self.server.handlers;
@@ -712,7 +806,7 @@ pub const Conn = struct {
                 .head => self.processHead(buf[pos..]),
                 .ws_open, .ws_closing => self.processFrame(buf[pos..]),
                 .raw => self.processRaw(buf[pos..]),
-                .static_body, .closing, .moving => null,
+                .static_body, .exchange, .closing, .moving => null,
             } orelse break;
             pos += used;
         }
@@ -771,6 +865,21 @@ pub const Conn = struct {
             onRequest(h.ctx, &req, head.target);
             if (req.answered) return parsed.len;
         };
+        if (h.exchange) |ex| if (!self.skip_exchange and offerable(head)) {
+            const total = parsed.len + @as(usize, @intCast(head.content_length orelse 0));
+            if (buf.len < total) {
+                // The head is parsed again once the body is in.
+                self.server.timers.set(&self.deadline, self.server.config.handshake_timeout_ms);
+                return null;
+            }
+            switch (self.offer(ex, head, total, buf[parsed.len..total])) {
+                // Input stays put, the request at its start, for the answer.
+                .waiting => return 0,
+                .responded => return total,
+                .passed => {},
+            }
+        };
+        self.skip_exchange = false;
         if (h.raw != null) return self.startRaw();
         if (!is_get) {
             self.respond(405, "Method not allowed", .close, "Allow: GET, HEAD\r\n");
@@ -780,6 +889,48 @@ pub const Conn = struct {
             self.serveStatic(head.target);
         }
         return parsed.len;
+    }
+
+    fn offerable(head: *const parser.RequestHead) bool {
+        return !head.chunked and !head.expect_continue and (head.content_length orelse 0) <= max_exchange_body;
+    }
+
+    fn offer(self: *Conn, ex: anytype, head: *const parser.RequestHead, total: usize, body: []const u8) enum { waiting, responded, passed } {
+        self.phase = .exchange;
+        self.exchange = .{ .exchange_id = self.server.nextId(), .pending = true, .offering = true, .len = total, .head = head, .body_bytes = body };
+        const h = self.server.handlers;
+        ex.offer(h.ctx, &self.exchange);
+        self.exchange.offering = false;
+        self.exchange.head = null;
+        self.exchange.body_bytes = &.{};
+        if (self.exchange.pending) return .waiting;
+        return if (self.exchange.passed) .passed else .responded;
+    }
+
+    /// Drops the first `n` bytes of input: a request answered after its
+    /// read callback.
+    fn consumeInput(self: *Conn, n: usize) void {
+        if (self.tls) |t| return t.consume(n);
+        self.in_pos += n;
+        self.compactInput();
+    }
+
+    /// An exchange's response, head and body in one send.
+    fn answer(self: *Conn, status: u16, extra_headers: []const u8, body: []const u8) void {
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        const head = blk: {
+            w.print("HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\n", .{ status, parser.reason(status), body.len }) catch break :blk null;
+            w.writeAll(extra_headers) catch break :blk null;
+            self.writeCommonHeaders(&w, !self.keep_alive) catch break :blk null;
+            w.writeAll("\r\n") catch break :blk null;
+            break :blk w.buffered();
+        } orelse return self.respond(500, "Response headers too long", .close, null);
+        self.sock.cork();
+        self.output(head);
+        if (!self.head_only) self.output(body);
+        self.sock.uncork();
+        self.responseDone();
     }
 
     /// The connection is the handler's from here on. Uses none of the
@@ -998,7 +1149,7 @@ pub const Conn = struct {
     pub fn isIdle(self: *Conn) bool {
         return switch (self.phase) {
             .head => self.unreadLen() == 0,
-            .static_body => false,
+            .static_body, .exchange => false,
             .ws_open, .ws_closing, .raw, .closing, .moving => true,
         };
     }

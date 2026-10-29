@@ -66,6 +66,8 @@ pub const HttpRequest = http1.HttpRequest;
 /// An HTTP/1.1 connection the handler serves itself, for `onRawOpen`.
 pub const RawConn = http1.RawConn;
 pub const RawError = http1.RawError;
+/// A request the handler answers later, for `onHttpExchange`.
+pub const HttpExchange = http1.HttpExchange;
 pub const WsMessageKind = http1.WsMessageKind;
 pub const WsCloseCode = http1.WsCloseCode;
 
@@ -919,6 +921,7 @@ pub fn Server(comptime Handler: type) type {
             "onPass",             "onHandover",         "onWsHandover",
             "onHttpRequest",      "onRawOpen",          "onRawData",
             "onRawClose",         "onRawDrain",         "onRawEnd",
+            "onHttpExchange",     "onHttpExchangeGone",
         };
 
         for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
@@ -939,7 +942,8 @@ pub fn Server(comptime Handler: type) type {
                         "onStopSending, onWritable, onPollComplete, onConnectionClosed, " ++
                         "onQuicConnected, onH0Request, onH0Data, onH0Finished, " ++
                         "onWsUpgrade, onWsMessage, onWsClose, onPass, onHandover, onWsHandover, " ++
-                        "onHttpRequest, onRawOpen, onRawData, onRawClose, onRawDrain, onRawEnd");
+                        "onHttpRequest, onRawOpen, onRawData, onRawClose, onRawDrain, onRawEnd, " ++
+                        "onHttpExchange, onHttpExchangeGone");
                 }
             }
         }
@@ -1011,6 +1015,15 @@ pub fn Server(comptime Handler: type) type {
         }
         if (@hasDecl(Handler, "onRawEnd") and @TypeOf(Handler.onRawEnd) != fn (*Handler, *RawConn) void) {
             @compileError("onRawEnd must be fn (self: *Handler, raw: *RawConn) void");
+        }
+        if (@hasDecl(Handler, "onHttpExchange") != @hasDecl(Handler, "onHttpExchangeGone")) {
+            @compileError("a handler that takes exchanges needs both onHttpExchange and onHttpExchangeGone");
+        }
+        if (@hasDecl(Handler, "onHttpExchange") and @TypeOf(Handler.onHttpExchange) != fn (*Handler, *HttpExchange) void) {
+            @compileError("onHttpExchange must be fn (self: *Handler, ex: *HttpExchange) void");
+        }
+        if (@hasDecl(Handler, "onHttpExchangeGone") and @TypeOf(Handler.onHttpExchangeGone) != fn (*Handler, *HttpExchange) void) {
+            @compileError("onHttpExchangeGone must be fn (self: *Handler, ex: *HttpExchange) void");
         }
     }
 

@@ -47,6 +47,8 @@ pub const WsSendError = conn_mod.SendError;
 pub const WsHandover = conn_mod.WsHandover;
 pub const HttpRequest = conn_mod.HttpRequest;
 pub const RawConn = conn_mod.RawConn;
+pub const HttpExchange = conn_mod.HttpExchange;
+pub const max_exchange_body = conn_mod.max_exchange_body;
 pub const RawError = conn_mod.RawError;
 pub const WsHandoverError = conn_mod.HandoverError;
 pub const WsMessageKind = websocket.MessageKind;
@@ -134,6 +136,13 @@ pub const Handlers = struct {
     request: ?*const fn (ctx: *anyopaque, req: *HttpRequest, target: []const u8) void = null,
     /// Null when the handler serves no connection itself.
     raw: ?RawHandlers = null,
+    /// Null when the handler answers no request later.
+    exchange: ?ExchangeHandlers = null,
+};
+
+pub const ExchangeHandlers = struct {
+    offer: *const fn (ctx: *anyopaque, ex: *HttpExchange) void,
+    gone: *const fn (ctx: *anyopaque, ex: *HttpExchange) void,
 };
 
 pub const RawHandlers = struct {
@@ -189,6 +198,12 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
         fn rawEnd(ctx: *anyopaque, raw: *RawConn) void {
             H.onRawEnd(@ptrCast(@alignCast(ctx)), raw);
         }
+        fn exchangeOffer(ctx: *anyopaque, ex: *HttpExchange) void {
+            H.onHttpExchange(@ptrCast(@alignCast(ctx)), ex);
+        }
+        fn exchangeGone(ctx: *anyopaque, ex: *HttpExchange) void {
+            H.onHttpExchangeGone(@ptrCast(@alignCast(ctx)), ex);
+        }
     };
     return .{
         .ctx = handler,
@@ -204,6 +219,7 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
             .drain = if (@hasDecl(H, "onRawDrain")) S.rawDrain else null,
             .end = if (@hasDecl(H, "onRawEnd")) S.rawEnd else null,
         } else null,
+        .exchange = if (@hasDecl(H, "onHttpExchange")) .{ .offer = S.exchangeOffer, .gone = S.exchangeGone } else null,
     };
 }
 
