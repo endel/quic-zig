@@ -293,15 +293,17 @@ fn parseHeaderAs(role: Role, buf: []const u8, max_payload: usize) Error!?Header 
     };
 }
 
-/// XORs `data` with the repeating 4-byte `key`, a vector at a time.
+/// XORs `data` with the repeating 4-byte `key`, a vector at a time: the
+/// widest the target has (32 bytes with AVX2), then 16.
 pub fn unmask(data: []u8, key: [4]u8) void {
-    const lanes = 16;
-    const V = @Vector(lanes, u8);
-    const pattern: V = std.simd.repeat(lanes, key);
     var i: usize = 0;
-    while (i + lanes <= data.len) : (i += lanes) {
-        const chunk: V = data[i..][0..lanes].*;
-        data[i..][0..lanes].* = chunk ^ pattern;
+    inline for (.{ @max(16, std.simd.suggestVectorLength(u8) orelse 16), 16 }) |lanes| {
+        const V = @Vector(lanes, u8);
+        const pattern: V = std.simd.repeat(lanes, key);
+        while (i + lanes <= data.len) : (i += lanes) {
+            const chunk: V = data[i..][0..lanes].*;
+            data[i..][0..lanes].* = chunk ^ pattern;
+        }
     }
     // `i` is a multiple of 4 here, so the key restarts at index 0.
     for (data[i..], 0..) |*b, j| b.* ^= key[j & 3];
@@ -652,15 +654,18 @@ test "frame header: every length form" {
 }
 
 test "unmask matches the byte-wise definition" {
-    var data: [67]u8 = undefined;
-    var expect: [67]u8 = undefined;
+    // every length across the wide and 16-byte steps and the byte tail
     const key = [4]u8{ 1, 2, 0x80, 0xff };
-    for (&data, &expect, 0..) |*d, *e, i| {
-        d.* = @truncate(i * 31);
-        e.* = d.* ^ key[i % 4];
+    for (0..161) |len| {
+        var data: [160]u8 = undefined;
+        var expect: [160]u8 = undefined;
+        for (data[0..len], expect[0..len], 0..) |*d, *e, i| {
+            d.* = @truncate(i * 31 + len);
+            e.* = d.* ^ key[i % 4];
+        }
+        unmask(data[0..len], key);
+        try testing.expectEqualSlices(u8, expect[0..len], data[0..len]);
     }
-    unmask(&data, key);
-    try testing.expectEqualSlices(u8, &expect, &data);
 }
 
 test "frame errors" {
