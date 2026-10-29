@@ -43,6 +43,9 @@ const EchoHandler = struct {
     send_after_close: ?event_loop.WsSendError = null,
     flood_result: ?event_loop.WsSendError = null,
     flood_sent: usize = 0,
+    /// `bufferedAmount` while "corked" held three messages, and after.
+    corked_buffered: usize = 0,
+    uncorked_buffered: usize = 0,
     /// What "move" let go of, for the test to adopt or discard.
     handed: ?event_loop.WsHandover = null,
     /// A read or write of it was still in flight on this loop then.
@@ -89,6 +92,14 @@ const EchoHandler = struct {
             return;
         }
         if (std.mem.eql(u8, data, "move")) return ws.handOver() catch unreachable;
+        if (std.mem.eql(u8, data, "corked")) {
+            ws.cork();
+            for ([_][]const u8{ "a", "b", "c" }) |m| ws.send(m) catch unreachable;
+            self.corked_buffered = ws.bufferedAmount();
+            ws.uncork();
+            self.uncorked_buffered = ws.bufferedAmount();
+            return;
+        }
         switch (kind) {
             .binary => ws.send(data) catch {},
             .text => ws.sendText(data) catch {},
@@ -843,6 +854,28 @@ test "http1: a client that sends but never reads cannot grow the send queue with
     try testing.expect(conn.sock.buffered() <= socket.high_water + 16 * 1024);
 }
 
+fn corkedSendsLeaveTogether(port: u16, tls: bool) !void {
+    var h: Harness = undefined;
+    try h.init(port, if (tls) .{} else .{ .tls = false });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try h.upgrade(&c, "/", tls);
+    try c.sendFrame(.text, true, "corked");
+    for ([_][]const u8{ "a", "b", "c" }) |want| {
+        const f = try h.frame(&c);
+        try testing.expectEqualStrings(want, f.payload);
+    }
+    // Held while corked, then sent in one go: nothing was left queued.
+    try testing.expect(h.handler.corked_buffered > 0);
+    try testing.expectEqual(@as(usize, 0), h.handler.uncorked_buffered);
+}
+
+test "ws: corked sends wait for uncork, then leave in one send, plain and over TLS" {
+    try corkedSendsLeaveTogether(29493, false);
+    try corkedSendsLeaveTogether(29494, true);
+}
+
 test "ws: over TLS, with ALPN http/1.1" {
     var h: Harness = undefined;
     try h.init(29447, .{});
@@ -1175,6 +1208,19 @@ const RawHandler = struct {
             raw.write("bye") catch unreachable;
             return raw.close();
         }
+        if (std.mem.endsWith(u8, data, "corked")) {
+            // Past low water while corked: a drain is owed, and the uncork
+            // that sends it all must still pay it.
+            const chunk: [16 * 1024]u8 = @splat('c');
+            raw.cork();
+            while (raw.bufferedAmount() < socket.low_water) {
+                raw.write(&chunk) catch unreachable;
+                self.big_written += chunk.len;
+            }
+            self.queued_after_big = raw.bufferedAmount();
+            raw.uncork();
+            return;
+        }
         if (std.mem.endsWith(u8, data, "big")) {
             // Until something queues: the kernel's buffers take the first
             // megabytes on loopback, however many that is.
@@ -1318,6 +1364,30 @@ test "http1: a raw write that queues owes onRawDrain, paid once the peer reads i
     for (0..20) |_| try h.step();
     try testing.expectEqual(@as(u32, 1), h.handler.drains);
     try testing.expect(h.handler.queued_at_drain < socket.low_water);
+    try testing.expect(!h.handler.raw.?.owesDrain());
+}
+
+test "http1: a corked raw write past low water still owes onRawDrain, paid after the uncork" {
+    var h: RawHarness = undefined;
+    try h.init(29495, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.received.deinit(testing.allocator);
+
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+    try c.send("POST /c HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\n\r\ncorked");
+    try h.spinUntil(&h, rawOpened);
+    try testing.expect(h.handler.queued_after_big >= socket.low_water);
+
+    _ = try h.bytes(&c, h.handler.big_written);
+    const W = struct {
+        fn done(hh: *RawHarness) bool {
+            return hh.handler.drains > 0;
+        }
+    };
+    try h.spinUntil(&h, W.done);
+    try testing.expectEqual(@as(u32, 1), h.handler.drains);
     try testing.expect(!h.handler.raw.?.owesDrain());
 }
 

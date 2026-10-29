@@ -49,6 +49,10 @@ pub fn onWsClose(self: *H, ws: *event_loop.WsConn, code: u16, reason: []const u8
 - `WsConn` has `id()`, `send`, `sendText`, `close(code, reason)`,
   `bufferedAmount()`, `peerAddress()` and `rtt()` (the kernel's TCP
   estimate, in ns). `id()` comes from the counter behind `Session.id()`.
+- `cork()` holds a connection's output until `uncork()`, which sends it in
+  one go: one syscall and one segment for several messages, for a host
+  answering a batch of events. Sends still count against
+  `max_send_buffer` while corked.
 - `onWsClose` fires exactly once for every accepted WebSocket:
   - with the peer's code, or 1005 when its Close carried none;
   - with 1006 when there was no Close frame at all (a TCP reset, a TLS
@@ -79,7 +83,8 @@ pub fn onRawEnd(self: *H, raw: *event_loop.RawConn) void   // optional
 - `RawConn` has `id()` (the same counter again), `write` (queues all of it),
   `close()` (sends what's queued first), `abort()` (drops it: a host's
   `destroy()`; nothing after `close()`), `pauseReading` / `resumeReading`,
-  `bufferedAmount()`, `owesDrain()` and `peerAddress()`.
+  `cork` / `uncork` (as a WebSocket's), `bufferedAmount()`, `owesDrain()`
+  and `peerAddress()`.
 - The peer's last byte (a FIN, or TLS's close_notify) reaches `onRawEnd`
   after all input before it, and the connection stays open for the
   handler's answer: HTTP/1.1 lets a client half-close after its request.
@@ -87,7 +92,8 @@ pub fn onRawEnd(self: *H, raw: *event_loop.RawConn) void   // optional
   it queued has gone. TCP can't tell a half-close from a peer that left;
   a write to one that left fails, and `onRawClose` follows.
 - A write that leaves 64 KiB or more queued owes an `onRawDrain`, which
-  comes once the queue falls below it.
+  comes once the queue falls below it, also when an `uncork` sent it all at
+  once (from a deferred callback, then).
 - `onRawClose` fires exactly once: when the connection fails,
   `Server.stop()`, or after `close()` or `abort()`, once the socket is closed. Never from inside a `RawConn`
   method. Raw connections keep `drain()` from finishing until they close.

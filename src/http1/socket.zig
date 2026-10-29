@@ -17,8 +17,8 @@
 //!   - `onSocketParked(owner)`: after `park`, no read or write is left on
 //!     the loop, so the socket may move to another (`rebind`). Deferred too.
 //!
-//! A trimmed port of routez's `net/socket.zig`: no connect, sendfile, relay
-//! or corking.
+//! A trimmed port of routez's `net/socket.zig`: no connect, sendfile or
+//! relay.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -57,12 +57,15 @@ pub fn Socket(comptime Owner: type) type {
         write_c: xev.Completion = .{},
         closed_cb: timers.Deferred = .{ .callback = onDeferredClose },
         parked_cb: timers.Deferred = .{ .callback = onDeferredParked },
+        writable_cb: timers.Deferred = .{ .callback = onDeferredWritable },
 
         reading: bool = false,
         read_paused: bool = false,
         writing: bool = false,
         /// Leaving this loop: nothing more is armed on it while open.
         parked: bool = false,
+        /// Writes only queue until `uncork`, which sends them in one go.
+        corked: bool = false,
 
         /// Slice being written by the kernel; never appended to while `writing`.
         active: std.ArrayList(u8) = .empty,
@@ -165,7 +168,7 @@ pub fn Socket(comptime Owner: type) type {
             // Nothing queued: try the kernel directly. A write completion
             // costs an epoll registration round trip (and on epoll a dup of
             // the fd), which most writes to a healthy socket don't need.
-            if (!self.writing and self.buffered() == 0) {
+            if (!self.corked and !self.writing and self.buffered() == 0) {
                 const rc = std.c.send(self.tcp.fd, data.ptr, data.len, send_flags);
                 if (rc > 0) {
                     const n: usize = @intCast(rc);
@@ -186,7 +189,7 @@ pub fn Socket(comptime Owner: type) type {
         pub fn writeVec(self: *Self, parts: []const []const u8) void {
             if (self.state != .open) return;
             var sent: usize = 0;
-            if (!self.writing and self.buffered() == 0) {
+            if (!self.corked and !self.writing and self.buffered() == 0) {
                 var iov: [4]std.posix.iovec_const = undefined;
                 std.debug.assert(parts.len <= iov.len);
                 for (parts, 0..) |part, i| iov[i] = .{ .base = part.ptr, .len = part.len };
@@ -224,8 +227,41 @@ pub fn Socket(comptime Owner: type) type {
             return (self.active.items.len - self.active_off) + self.pending.items.len;
         }
 
+        /// Hold writes back until `uncork`, so what several writes queue
+        /// leaves in one send: one syscall here, one segment for the peer.
+        pub fn cork(self: *Self) void {
+            self.corked = true;
+        }
+
+        pub fn uncork(self: *Self) void {
+            if (!self.corked) return;
+            self.corked = false;
+            if (self.state != .open and self.state != .flushing) return;
+            // Owners that stopped above low water wait for onSocketWritable,
+            // which otherwise only a write completion gives them.
+            const was_full = self.buffered() >= low_water;
+            if (!self.writing and !self.held() and self.active_off >= self.active.items.len and self.pending.items.len > 0) {
+                const rc = std.c.send(self.tcp.fd, self.pending.items.ptr, self.pending.items.len, send_flags);
+                // An error (not EAGAIN) resurfaces on the queued write below.
+                if (rc > 0) {
+                    const n: usize = @intCast(rc);
+                    self.drained += n;
+                    const rest = self.pending.items.len - n;
+                    std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[n..]);
+                    self.pending.items.len = rest;
+                }
+            }
+            self.kickWrite();
+            if (was_full and self.state == .open and self.buffered() < low_water) self.timers.defer_(&self.writable_cb);
+        }
+
+        fn onDeferredWritable(d: *timers.Deferred) void {
+            const self: *Self = @fieldParentPtr("writable_cb", d);
+            if (self.state == .open and self.buffered() < low_water) Owner.onSocketWritable(self.owner);
+        }
+
         fn kickWrite(self: *Self) void {
-            if (self.writing or self.held()) return;
+            if (self.writing or self.held() or self.corked) return;
             if (self.state == .closing or self.state == .closed or self.state == .lingering) return;
             if (self.active_off >= self.active.items.len) {
                 self.active.clearRetainingCapacity();

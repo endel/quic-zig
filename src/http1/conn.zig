@@ -124,6 +124,18 @@ pub const WsConn = struct {
         self.conn().closeWebSocket(code, reason);
     }
 
+    /// Hold this connection's output until `uncork`, which sends it in one
+    /// go: for a host with several messages for it at once, such as one
+    /// answering a batch of events. Sends still count against
+    /// `max_send_buffer` meanwhile.
+    pub fn cork(self: *WsConn) void {
+        self.conn().sock.cork();
+    }
+
+    pub fn uncork(self: *WsConn) void {
+        self.conn().sock.uncork();
+    }
+
     /// Bytes queued for the socket and not yet taken by the kernel,
     /// counting TLS framing. What a producer compares against its own
     /// high-water mark before sending something it may drop.
@@ -378,6 +390,16 @@ pub const RawConn = struct {
         if (c.phase != .raw or c.sock.buffered() > socket.high_water) return;
         c.sock.read_paused = false;
         c.server.timers.defer_(&c.resume_cb);
+    }
+
+    /// Hold this connection's output until `uncork`, which sends it in one
+    /// go. A drain a corked write owes still comes, after the uncork.
+    pub fn cork(self: *RawConn) void {
+        self.conn().sock.cork();
+    }
+
+    pub fn uncork(self: *RawConn) void {
+        self.conn().sock.uncork();
     }
 
     /// Bytes queued for the socket and not yet taken by the kernel,
