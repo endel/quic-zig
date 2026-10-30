@@ -448,17 +448,7 @@ pub const SendBatch = struct {
     fn sendEach(self: *SendBatch, from: usize, to: usize) void {
         for (from..to) |i| {
             const data = self.data_buf[self.offsets[i]..][0..self.lengths[i]];
-            var iov = [1]posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
-            const msg = std.c.msghdr_const{
-                .name = @ptrCast(&self.addrs[i]),
-                .namelen = self.addr_lens[i],
-                .iov = &iov,
-                .iovlen = 1,
-                .control = null,
-                .controllen = 0,
-                .flags = 0,
-            };
-            _ = std.c.sendmsg(self.sockfd, &msg, 0);
+            sendDatagram(self.sockfd, data, &self.addrs[i], self.addr_lens[i]);
         }
     }
 
@@ -592,10 +582,34 @@ fn cmsgSpace(len: usize) usize {
     return std.mem.alignForward(usize, cmsgLen(len), @alignOf(usize));
 }
 
-// Tests — ECN ancillary data tests only run on POSIX platforms.
+/// One datagram out, best effort. POSIX uses sendmsg (matches quic-go), which
+/// delivered more reliably than sendto on macOS loopback. Winsock has no
+/// sendmsg, and without control data sendto is all WSASendMsg would add up to.
+fn sendDatagram(sockfd: posix.socket_t, data: []const u8, addr: *const posix.sockaddr.storage, addr_len: posix.socklen_t) void {
+    if (comptime is_windows) {
+        _ = sys.sendto(sockfd, data, 0, @ptrCast(addr), addr_len) catch {};
+        return;
+    }
+    var iov = [1]posix.iovec_const{.{
+        .base = data.ptr,
+        .len = data.len,
+    }};
+    const msg = std.c.msghdr_const{
+        .name = @ptrCast(addr),
+        .namelen = addr_len,
+        .iov = &iov,
+        .iovlen = 1,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    _ = std.c.sendmsg(sockfd, &msg, 0);
+}
+
+// On Windows the ECN calls are no-ops and receive falls back to recvfrom, so
+// these check the sockets work rather than the ancillary data.
 test "enableEcnRecv on a real socket" {
-    if (comptime is_windows) return error.SkipZigTest;
-    const sockfd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sockfd = try sys.udpSocket(posix.AF.INET, .{});
     defer sys.close(sockfd);
 
     const addr = try net.Address.parseIp4("127.0.0.1", 0);
@@ -605,8 +619,7 @@ test "enableEcnRecv on a real socket" {
 }
 
 test "setEcnMark on a real socket" {
-    if (comptime is_windows) return error.SkipZigTest;
-    const sockfd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sockfd = try sys.udpSocket(posix.AF.INET, .{});
     defer sys.close(sockfd);
 
     const addr = try net.Address.parseIp4("127.0.0.1", 0);
@@ -619,8 +632,7 @@ test "setEcnMark on a real socket" {
 }
 
 test "recvmsgEcn returns WouldBlock on empty socket" {
-    if (comptime is_windows) return error.SkipZigTest;
-    const sockfd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const sockfd = try sys.udpSocket(posix.AF.INET, .{});
     defer sys.close(sockfd);
 
     const addr = try net.Address.parseIp4("127.0.0.1", 0);
@@ -633,6 +645,7 @@ test "recvmsgEcn returns WouldBlock on empty socket" {
 }
 
 test "RecvBatch: datagrams from two senders arrive whole, in order, with their sources" {
+    if (comptime is_windows) return error.SkipZigTest; // no recvmmsg
     if (comptime is_windows) return error.SkipZigTest;
     const loopback = try net.Address.parseIp4("127.0.0.1", 0);
     const rx = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
@@ -688,7 +701,7 @@ test "RecvBatch: datagrams from two senders arrive whole, in order, with their s
 }
 
 test "SendBatch.segmentEnd: equal packets and one shorter last" {
-    var b = SendBatch.init(0);
+    var b = SendBatch.init(sys.invalid_socket);
     @memset(&b.addr_lens, 0); // one address for all
     const cases = [_]struct { lens: []const u32, from: usize, want: usize }{
         // All the same size: the whole run.

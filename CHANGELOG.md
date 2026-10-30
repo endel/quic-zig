@@ -371,6 +371,9 @@ need a design decision. Thanks @notramo for suggesting it
   @wallace0409 ([#45](https://github.com/endel/quic-zig/issues/45)).
 - A peer that acknowledged nothing could run the server out of memory. Thanks
   @wallace0409 ([#46](https://github.com/endel/quic-zig/issues/46)).
+- Windows. The library, its tests and the apps build and run natively: sockets
+  on Winsock, the event loop on libxev's IOCP backend. ECN is not read or set
+  on Windows yet. See [SPEC/STATUS.md](SPEC/STATUS.md#platforms).
 
 ## 0.5.0
 

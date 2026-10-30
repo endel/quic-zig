@@ -328,7 +328,7 @@ const Relay = struct {
     thread: std.Thread = undefined,
 
     fn udp(port: u16) !posix.socket_t {
-        const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+        const fd = try sys.udpSocket(posix.AF.INET, .{});
         errdefer sys.close(fd);
         const addr = try net.Address.parseIp4("127.0.0.1", port);
         try sys.bind(fd, &addr.any, addr.getOsSockLen());

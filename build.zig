@@ -7,8 +7,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Link libc on platforms that need it (Linux requires explicit libc for std.c.recvmsg).
-    const need_libc: ?bool = if (target.result.os.tag == .windows) null else true;
+    // Linux requires explicit libc for std.c.recvmsg; tests use it everywhere.
+    const need_libc: ?bool = true;
 
     // libxev dependency (used by event-loop-based servers)
     const xev_dep = b.dependency("libxev", .{ .target = target, .optimize = optimize });

@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var tickets = false;
     var client_ca: ?[]const u8 = null;
     var client_mode: tls13.ClientAuth.Mode = .required;
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = sys.argsIterator(init.args);
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
@@ -76,8 +76,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const addr = try quic.sockaddr.Address.parseIp4("127.0.0.1", port);
     const listener = try sys.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    const yes: c_int = 1;
-    posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes)) catch {};
+    sys.setReuseAddr(listener);
     try sys.bind(listener, &addr.any, addr.getOsSockLen());
     try sys.listen(listener, 128);
     log.info("listening on 127.0.0.1:{d}", .{port});

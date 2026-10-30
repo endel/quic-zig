@@ -24,6 +24,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const xev = @import("../xev_backend.zig").xev;
 const timers = @import("timers.zig");
+const sys = @import("../sys.zig");
 
 /// With epoll every socket on a thread reads into one buffer, so an idle
 /// connection doesn't hold one: epoll reads only just before running that
@@ -177,7 +178,7 @@ pub fn Socket(comptime Owner: type) type {
             // costs an epoll registration round trip (and on epoll a dup of
             // the fd), which most writes to a healthy socket don't need.
             if (!self.corked and !self.writing and self.buffered() == 0) {
-                const rc = std.c.send(self.tcp.fd, data.ptr, data.len, send_flags);
+                const rc = sys.send(self.tcp.fd, data, send_flags);
                 if (rc > 0) {
                     const n: usize = @intCast(rc);
                     if (n == data.len) return;
@@ -198,19 +199,7 @@ pub fn Socket(comptime Owner: type) type {
             if (self.state != .open) return;
             var sent: usize = 0;
             if (!self.corked and !self.writing and self.buffered() == 0) {
-                var iov: [4]std.posix.iovec_const = undefined;
-                std.debug.assert(parts.len <= iov.len);
-                for (parts, 0..) |part, i| iov[i] = .{ .base = part.ptr, .len = part.len };
-                const msg: std.c.msghdr_const = .{
-                    .name = null,
-                    .namelen = 0,
-                    .iov = &iov,
-                    .iovlen = @intCast(parts.len),
-                    .control = null,
-                    .controllen = 0,
-                    .flags = 0,
-                };
-                const rc = std.c.sendmsg(self.tcp.fd, &msg, @intCast(send_flags));
+                const rc = sys.sendVec(self.tcp.fd, parts, send_flags);
                 // An error (not EAGAIN) resurfaces on the queued write below.
                 if (rc > 0) sent = @intCast(rc);
             }
@@ -249,7 +238,7 @@ pub fn Socket(comptime Owner: type) type {
             // which otherwise only a write completion gives them.
             const was_full = self.buffered() >= low_water;
             if (!self.writing and !self.held() and self.active_off >= self.active.items.len and self.pending.items.len > 0) {
-                const rc = std.c.send(self.tcp.fd, self.pending.items.ptr, self.pending.items.len, send_flags);
+                const rc = sys.send(self.tcp.fd, self.pending.items, send_flags);
                 // An error (not EAGAIN) resurfaces on the queued write below.
                 if (rc > 0) {
                     const n: usize = @intCast(rc);
@@ -350,7 +339,7 @@ pub fn Socket(comptime Owner: type) type {
         fn finishFlush(self: *Self) void {
             // Half-close so the peer sees everything we sent before any RST
             // that closing with unread input would trigger.
-            _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.WR);
+            sys.shutdown(self.tcp.fd, .send);
             self.state = .lingering;
             self.read_paused = false;
             self.startReading();
@@ -365,7 +354,7 @@ pub fn Socket(comptime Owner: type) type {
             self.state = .closing;
             self.dropOutput();
             // Wakes any in-flight read or write so it completes promptly.
-            _ = std.c.shutdown(self.tcp.fd, std.posix.SHUT.RDWR);
+            sys.shutdown(self.tcp.fd, .both);
             self.maybeFinishClose();
         }
 
@@ -407,7 +396,7 @@ pub fn Socket(comptime Owner: type) type {
         pub fn closeFd(self: *Self) void {
             if (self.fd_closed) return;
             self.fd_closed = true;
-            _ = std.c.close(self.tcp.fd);
+            sys.close(self.tcp.fd);
         }
 
         /// Free the buffers without touching the fd; see `closeFd`.
@@ -421,26 +410,24 @@ pub fn Socket(comptime Owner: type) type {
 
 /// Accept one queued connection without waiting; null when none is queued.
 pub fn acceptNow(listen_fd: std.posix.socket_t) ?std.posix.socket_t {
+    if (comptime builtin.target.os.tag == .windows) {
+        const fd = sys.accept(listen_fd) catch return null;
+        sys.setNonBlocking(fd);
+        return fd;
+    }
     if (comptime builtin.target.os.tag == .linux) {
         const fd = std.c.accept4(listen_fd, null, null, std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC);
         return if (fd < 0) null else fd;
     }
     const fd = std.c.accept(listen_fd, null, null);
     if (fd < 0) return null;
-    setNonBlocking(fd);
+    sys.setNonBlocking(fd);
     _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
     return fd;
 }
 
-pub fn setNonBlocking(fd: std.posix.socket_t) void {
-    const nonblock: u32 = @bitCast(std.c.O{ .NONBLOCK = true });
-    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
-    _ = std.c.fcntl(fd, std.c.F.SETFL, flags | @as(c_int, @bitCast(nonblock)));
-}
-
 pub fn setNoDelay(fd: std.posix.socket_t) void {
-    const one: c_int = 1;
-    _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
+    sys.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
 }
 
 /// The kernel's smoothed round trip for a TCP socket, in nanoseconds, at the

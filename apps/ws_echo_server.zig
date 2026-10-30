@@ -57,7 +57,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var static_dir: ?[]const u8 = null;
     var plain = false;
 
-    var args = std.process.Args.Iterator.init(init.args);
+    var args = quic.sys.argsIterator(init.args);
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {

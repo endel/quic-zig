@@ -82,6 +82,14 @@ const MAX_RECV_DATAGRAM: usize = (transport_params.TransportParams{}).max_udp_pa
 /// test, where the OS default receive buffer holds only a few hundred.
 const max_recv_per_pass: usize = if (builtin.is_test) 64 else 1024;
 
+/// A nonblocking UDP socket bound to `addr`.
+fn bindUdp(addr: net.Address, options: sys.UdpSocketOptions) !posix.socket_t {
+    const fd = try sys.udpSocket(addr.any.family, options);
+    errdefer sys.close(fd);
+    try sys.bind(fd, &addr.any, addr.getOsSockLen());
+    return fd;
+}
+
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
     port: u16 = 4433,
@@ -1817,9 +1825,11 @@ pub fn Server(comptime Handler: type) type {
             r: xev.PollError!xev.PollEvent,
         ) xev.CallbackAction {
             forgetPollResult(c);
-            _ = r catch return .rearm;
             const self = self_opt orelse return .disarm;
+            // Before the result: a cancelled watch gets its error on some
+            // backends, and rearming it would put the watch back.
             if (self.halted) return halted_poll_action;
+            _ = r catch return .rearm;
             const began = sys.nanoTimestamp();
             self.in_callback = true;
 
@@ -2678,19 +2688,11 @@ fn openUdpSocket(config: Config, port: u16) !struct { posix.socket_t, net.Addres
     else
         try net.Address.parseIp4(config.address, port);
     const family: u32 = if (config.ipv6) posix.AF.INET6 else posix.AF.INET;
-    const fd = try sys.socket(family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const fd = try sys.udpSocket(family, .{ .reuse_addr = true });
     errdefer sys.close(fd);
 
-    if (config.ipv6) {
-        // Dual-stack: also accept IPv4 peers.
-        const IPV6_V6ONLY: u32 = if (builtin.target.os.tag == .linux) 26 else 27;
-        posix.setsockopt(fd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&@as(c_int, 0))) catch {};
-    }
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1))) catch {};
     // Asked for explicitly, so a failure is the caller's to see.
-    if (config.reuse_port) {
-        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&@as(c_int, 1)));
-    }
+    if (config.reuse_port) try sys.setReusePort(fd);
     if (config.recv_buffer_size) |n| try setBufferSize(fd, .recv, n);
     if (config.send_buffer_size) |n| try setBufferSize(fd, .send, n);
 
@@ -2707,7 +2709,7 @@ fn openUdpSocket(config: Config, port: u16) !struct { posix.socket_t, net.Addres
 fn setBufferSize(fd: posix.socket_t, comptime which: enum { recv, send }, n: u32) !void {
     const opt = if (which == .recv) posix.SO.RCVBUF else posix.SO.SNDBUF;
     const v: c_int = @intCast(@min(n, std.math.maxInt(c_int)));
-    try posix.setsockopt(fd, posix.SOL.SOCKET, opt, std.mem.asBytes(&v));
+    try sys.setsockopt(fd, posix.SOL.SOCKET, opt, std.mem.asBytes(&v));
     if (builtin.target.os.tag != .linux or bufferSize(fd, opt) >= n) return;
     const force: u32 = if (which == .recv) 33 else 32; // SO_RCVBUFFORCE, SO_SNDBUFFORCE
     posix.setsockopt(fd, posix.SOL.SOCKET, force, std.mem.asBytes(&v)) catch {};
@@ -3342,22 +3344,11 @@ pub fn Client(comptime Handler: type) type {
             };
 
             // Create non-blocking UDP socket, bind to ephemeral port
-            const sockfd, const local_addr = if (config.ipv6) blk: {
-                const addr6 = try net.Address.parseIp6("::", 0);
-                const fd = try sys.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-                errdefer sys.close(fd);
-                const IPV6_V6ONLY: u32 = if (@import("builtin").target.os.tag == .linux) 26 else 27;
-                const zero_val: c_int = 0;
-                posix.setsockopt(fd, posix.IPPROTO.IPV6, IPV6_V6ONLY, std.mem.asBytes(&zero_val)) catch {};
-                try sys.bind(fd, &addr6.any, addr6.getOsSockLen());
-                break :blk .{ fd, addr6 };
-            } else blk: {
-                const addr4 = try net.Address.parseIp4("0.0.0.0", 0);
-                const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
-                errdefer sys.close(fd);
-                try sys.bind(fd, &addr4.any, addr4.getOsSockLen());
-                break :blk .{ fd, addr4 };
-            };
+            const local_addr = if (config.ipv6)
+                try net.Address.parseIp6("::", 0)
+            else
+                try net.Address.parseIp4("0.0.0.0", 0);
+            const sockfd = try bindUdp(local_addr, .{});
             errdefer sys.close(sockfd);
             ecn_socket.enableEcnRecv(sockfd) catch {};
             ecn_socket.setDontFragment(sockfd);
@@ -3600,9 +3591,11 @@ pub fn Client(comptime Handler: type) type {
             r: xev.PollError!xev.PollEvent,
         ) xev.CallbackAction {
             forgetPollResult(c);
-            _ = r catch return .rearm;
             const self = self_opt orelse return .disarm;
+            // Before the result: a cancelled watch gets its error on some
+            // backends, and rearming it would put the watch back.
             if (self.halted) return halted_poll_action;
+            _ = r catch return .rearm;
             self.in_callback = true;
 
             // Process loop: catch packets arriving during processing
@@ -5140,6 +5133,7 @@ test "e2e: an RSA certificate, picked by SNI next to an EC one" {
 }
 
 test "Server: socket options, ALPN and connection cap come from Config" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT
     const alpn = [_][]const u8{ "h3", "hq-interop" };
     var handler = TestH3Handler{};
     const S = Server(TestH3Handler);
@@ -5170,6 +5164,7 @@ test "Server: socket options, ALPN and connection cap come from Config" {
 }
 
 test "Server: serves on a socket it is given" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no dup for sockets
     var handler = TestH3Handler{};
     const S = Server(TestH3Handler);
     var a = try S.init(testing.allocator, &handler, .{ .port = 29416 });
@@ -5184,6 +5179,7 @@ test "Server: serves on a socket it is given" {
 }
 
 test "Server: port 0 takes one the kernel picks, which port() names for siblings to join" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT
     var handler = TestH3Handler{};
     const S = Server(TestH3Handler);
     var a = try S.init(testing.allocator, &handler, .{ .port = 0, .reuse_port = true });
@@ -7512,6 +7508,7 @@ test "e2e: a client and server that both offer QUIC v2 finish the handshake in i
 }
 
 test "Server: workers sharing a reset key, given or derived, send no resets unless they steer" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT
     // A packet for one worker's connection can reach another, whose reset
     // handed the sender that connection's token (RFC 9000 §21.11).
     var handler = HelloServer{};
@@ -7571,7 +7568,8 @@ test "e2e: a flood of datagrams can't keep a server reading" {
     const Waiting = struct {
         fn f(srv: *Server(HelloServer)) bool {
             var peek: [1]u8 = undefined;
-            return std.c.recv(srv.sockfd, &peek, 1, std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT) > 0;
+            const dontwait = if (builtin.target.os.tag == .windows) 0 else std.posix.MSG.DONTWAIT;
+            return std.c.recv(srv.sockfd, &peek, 1, std.posix.MSG.PEEK | dontwait) > 0;
         }
         fn not(srv: *Server(HelloServer)) bool {
             return !f(srv);
@@ -7852,7 +7850,7 @@ const RebindingRelay = struct {
     client_len: posix.socklen_t = 0,
 
     fn udp(port: u16) !posix.socket_t {
-        const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+        const fd = try sys.udpSocket(posix.AF.INET, .{});
         errdefer sys.close(fd);
         const addr = try net.Address.parseIp4("127.0.0.1", port);
         try sys.bind(fd, &addr.any, addr.getOsSockLen());
@@ -7887,6 +7885,7 @@ const RebindingRelay = struct {
 };
 
 test "e2e: a migrated peer landing on the wrong worker is steered to its owner" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT
     const relay_port: u16 = 29430;
     const ports = [2]u16{ 29431, 29432 };
 
