@@ -140,11 +140,14 @@ const bpf = struct {
 /// leaves it to the kernel's 4-tuple hash. Only a DCID with this config's
 /// length and first octet counts, so a client's random first DCID is
 /// hashed as it would be without a program, and so is anything too short
-/// to read. Needs plaintext CIDs and a one-byte server id: the kernel
-/// can't decrypt.
+/// to read. Needs plaintext CIDs: the kernel can't decrypt. A socket's id
+/// is the server id's last byte, so what comes before it can name the
+/// process to a balancer in front; the group never looks at that.
 pub fn reuseportProgram(config: *const Config, servers: usize) error{Unsteerable}![20]SockFilter {
-    if (config.key != null or config.server_id_len != 1 or servers == 0 or servers > 256) return error.Unsteerable;
+    if (config.key != null or servers == 0 or servers > 256) return error.Unsteerable;
     const cid_len = cidLength(config);
+    const short_id: u32 = 1 + @as(u32, config.server_id_len);
+    const long_id: u32 = 6 + @as(u32, config.server_id_len);
     // Without the length in it, the first octet's low bits are random.
     const mask: u32 = if (config.encode_length) 0xff else 0xe0;
     const first: u32 = @as(u32, config.config_id) << 5 | if (config.encode_length) cid_len - 1 else 0;
@@ -154,24 +157,24 @@ pub fn reuseportProgram(config: *const Config, servers: usize) error{Unsteerable
     const hash = 19;
     return .{
         bpf.op(bpf.ld_len, 0),
-        bpf.jump(bpf.jge, 3, 1, 2, hash),
+        bpf.jump(bpf.jge, short_id + 1, 1, 2, hash),
         bpf.op(bpf.ldb, 0),
         bpf.jump(bpf.jset, 0x80, 3, long, 4),
         // Short header: the DCID starts at byte 1.
         bpf.op(bpf.ldb, 1),
         bpf.op(bpf.and_k, mask),
         bpf.jump(bpf.jeq, first, 6, 7, hash),
-        bpf.op(bpf.ldb, 2),
+        bpf.op(bpf.ldb, short_id),
         bpf.jump(bpf.jge, n, 8, hash, by_id),
         // Long header: version, then the DCID's length at byte 5.
         bpf.op(bpf.ld_len, 0),
-        bpf.jump(bpf.jge, 8, 10, 11, hash),
+        bpf.jump(bpf.jge, long_id + 1, 10, 11, hash),
         bpf.op(bpf.ldb, 5),
         bpf.jump(bpf.jeq, cid_len, 12, 13, hash),
         bpf.op(bpf.ldb, 6),
         bpf.op(bpf.and_k, mask),
         bpf.jump(bpf.jeq, first, 15, 16, hash),
-        bpf.op(bpf.ldb, 7),
+        bpf.op(bpf.ldb, long_id),
         bpf.jump(bpf.jge, n, 17, hash, by_id),
         bpf.op(bpf.ret_a, 0),
         bpf.op(bpf.ret_k, 0xffff_ffff),
@@ -623,11 +626,33 @@ test "reuseportProgram: without the length in the first octet only its config bi
 
     try std.testing.expectError(error.Unsteerable, reuseportProgram(&workerConfig(0), 0));
     try std.testing.expectError(error.Unsteerable, reuseportProgram(&workerConfig(0), 257));
-    cfg.server_id_len = 2;
-    try std.testing.expectError(error.Unsteerable, reuseportProgram(&cfg, 2));
-    cfg.server_id_len = 1;
     cfg.key = @splat(1);
     try std.testing.expectError(error.Unsteerable, reuseportProgram(&cfg, 2));
+}
+
+test "reuseportProgram: a longer server id picks its socket by its last byte" {
+    var cfg: Config = .{ .config_id = 0, .server_id_len = 2, .nonce_len = 6 };
+    cfg.server_id[0] = 200;
+    const prog = try reuseportProgram(&cfg, 3);
+    const hash: u32 = 0xffff_ffff;
+    var buf: [64]u8 = undefined;
+    var cid: [9]u8 = undefined;
+    for (0..3) |w| {
+        cfg.server_id[1] = @intCast(w);
+        generateCid(&cfg, &cid);
+        try std.testing.expectEqual(@as(u32, @intCast(w)), runFilter(&prog, steeringPacket(&buf, false, &cid)));
+        try std.testing.expectEqual(@as(u32, @intCast(w)), runFilter(&prog, steeringPacket(&buf, true, &cid)));
+    }
+    cfg.server_id[1] = 3; // past the group
+    generateCid(&cfg, &cid);
+    try std.testing.expectEqual(hash, runFilter(&prog, steeringPacket(&buf, false, &cid)));
+    // A client's first DCID, of another length, and too short to read.
+    const client_dcid = [_]u8{ 0x08, 1, 2, 3, 4, 5, 6, 7 };
+    try std.testing.expectEqual(hash, runFilter(&prog, steeringPacket(&buf, true, &client_dcid)));
+    try std.testing.expectEqual(hash, runFilter(&prog, &.{ 0x40, 0x08, 200 }));
+    try std.testing.expectEqual(hash, runFilter(&prog, &.{ 0xc0, 0, 0, 0, 1, 9, 0x08, 200 }));
+    try std.testing.expectEqual(@as(u32, 2), runFilter(&prog, &.{ 0x40, 0x08, 200, 2 }));
+    try std.testing.expectEqual(@as(u32, 2), runFilter(&prog, &.{ 0xc0, 0, 0, 0, 1, 9, 0x08, 200, 2 }));
 }
 
 test "steerReuseportGroup: the kernel delivers by server id, in bind order, and hashes the rest" {
