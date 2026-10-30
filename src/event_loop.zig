@@ -1445,9 +1445,21 @@ pub fn Server(comptime Handler: type) type {
         /// Build and send whatever is queued, now. Writes made through a
         /// Session outside our callbacks already schedule a send for the next
         /// loop iteration; call this to skip that wait, or when the loop is
-        /// not being run (a C API caller between ticks).
+        /// not being run (a C API caller between ticks). Visits only the
+        /// connections a Session wrote to since the last pass, or every one
+        /// while draining or stopping, and for a handler with
+        /// `onPollComplete`.
         pub fn flush(self: *Self) void {
-            for (self.conn_mgr.entries.items) |entry| {
+            // Sparse, only what was written to since the last pass: a host
+            // flushing after each batch of commands would otherwise pay for
+            // every connection on every batch. The marks stay for that pass.
+            const all = self.visitsAll();
+            const list = self.passList();
+            var i: usize = 0;
+            while (i < list.items.len) : (i += 1) {
+                const entry = list.items[i];
+                if (!all and !entry.needs_visit) continue;
+                self.examined += 1;
                 const conn = entry.conn;
                 if (conn.isClosed()) continue;
                 const batch = self.batchForConn(conn);
@@ -7197,6 +7209,58 @@ fn quietEntry(e: *ConnEntry) bool {
 
 fn ptoFired(e: *ConnEntry) bool {
     return e.conn.pkt_handler.pto_count > 0;
+}
+
+test "e2e: flush() sends for the connections written to, not every connection" {
+    var h = QuicCounter{};
+    var a_handler = QuicIdleClient{};
+    var e2e: E2e(QuicCounter, QuicIdleClient) = undefined;
+    try e2e.init(29516, &h, &a_handler);
+    defer e2e.deinit();
+
+    const C = Client(QuicIdleClient);
+    const idle_count = 16;
+    var idle_handlers: [idle_count]QuicIdleClient = @splat(.{});
+    var idle: [idle_count]C = undefined;
+    for (&idle, &idle_handlers, 0..) |*c, *ih, i| {
+        c.* = try C.init(testing.allocator, ih, .{ .port = 29516, .skip_cert_verify = true, .loop = &e2e.loop });
+        errdefer for (idle[0..i]) |*prev| prev.deinit();
+        c.start();
+    }
+    defer {
+        for (&idle) |*c| c.stop();
+        const Stopped = struct {
+            fn f(cs: []C) bool {
+                for (cs) |*c| if (!c.isStopped()) return false;
+                return true;
+            }
+        };
+        runUntil(&e2e.loop, @as([]C, &idle), Stopped.f, 5_000) catch @panic("did not stop");
+        for (&idle) |*c| c.deinit();
+    }
+
+    const Quiet = struct {
+        fn f(s: *Server(QuicCounter)) bool {
+            const m = &s.conn_mgr;
+            if (m.connectionCount() != idle_count + 1 or m.to_visit.items.len > 0) return false;
+            for (m.entries.items) |e| if (!e.conn.isEstablished() or !quietEntry(e)) return false;
+            return true;
+        }
+    };
+    try runUntil(&e2e.loop, &e2e.server, Quiet.f, 10_000);
+
+    // A host's command, outside the loop's callbacks, then the flush that
+    // sends it at once.
+    const entry = e2e.server.conn_mgr.entries.items[0];
+    var session = Session{ .entry = entry };
+    const sent = entry.conn.total_packets_sent;
+    const before = e2e.server.examined;
+    try session.sendDatagram(0, "d");
+    e2e.server.flush();
+    try testing.expect(entry.conn.total_packets_sent > sent);
+    // Through all 17, a host flushing after each batch of commands pays for
+    // every connection on every batch.
+    try testing.expect(e2e.server.examined - before <= 1);
 }
 
 test "e2e: a write from another connection's callback arms the timer it starts" {
