@@ -246,6 +246,7 @@ var server = try event_loop.Server(MyHandler).init(alloc, &handler, .{
 |---|---|---|
 | `static_dir` | `null` | Directory GET/HEAD serve from; without one, only WebSockets (other requests get 404) |
 | `port` | same as QUIC | TCP port override |
+| `unix_path` | `null` | Unix socket to listen on instead of `port`, for a proxy on the same host |
 | `alt_svc` | `true` | Send `Alt-Svc: h3=":port"` |
 | `tls` | `true` | `false` serves plain `http://` / `ws://`: for localhost, where a browser can't pin a certificate hash for WebSocket as it can for WebTransport, or behind a TLS-terminating proxy |
 | `max_connections` | `4096` | Open TCP connections past which new ones are closed |

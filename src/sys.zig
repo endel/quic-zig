@@ -298,6 +298,22 @@ pub fn read(fd: fd_t, dest: []u8) ReadError!usize {
     }
 }
 
+/// Whether `path` is a Unix socket. statx on Linux, where `std.c.Stat` is
+/// void; stat elsewhere.
+pub fn isSocketFile(path: [*:0]const u8) bool {
+    const mode: u32 = if (builtin.target.os.tag == .linux) blk: {
+        const linux = std.os.linux;
+        var stx: linux.Statx = undefined;
+        if (linux.errno(linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &stx)) != .SUCCESS) return false;
+        break :blk stx.mode;
+    } else blk: {
+        var st: c.Stat = undefined;
+        if (c.stat(path, &st) != 0) return false;
+        break :blk @intCast(st.mode);
+    };
+    return c.S.ISSOCK(mode);
+}
+
 pub const ListenError = error{
     AddressInUse,
     FileDescriptorNotASocket,

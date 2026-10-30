@@ -13,6 +13,7 @@ const event_loop = @import("../event_loop.zig");
 const tls13 = @import("../quic/tls13.zig");
 const tls_client = @import("../tls/client.zig");
 const test_certs = @import("../tls/test_certs.zig");
+const http1 = @import("server.zig");
 const websocket = @import("websocket.zig");
 const socket = @import("socket.zig");
 
@@ -377,6 +378,17 @@ const TestClient = struct {
         }
     }
 
+    fn connectUnix(self: *TestClient, path: []const u8) !void {
+        self.* = .{};
+        const fd = try sys.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        errdefer sys.close(fd);
+        var addr: posix.sockaddr.un = .{ .path = @splat(0) };
+        @memcpy(addr.path[0..path.len], path);
+        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) != 0) return error.ConnectionRefused;
+        socket.setNonBlocking(fd);
+        self.fd = fd;
+    }
+
     fn deinit(self: *TestClient) void {
         if (self.tls) |*t| t.deinit();
         self.in.deinit(testing.allocator);
@@ -574,6 +586,71 @@ test "ws: upgrade, echo, a fragmented message with a ping inside, and the client
     try testing.expectEqual(@as(u16, 1000), h.handler.close_code);
     try testing.expectEqualStrings("bye", h.handler.closeReason());
     try testing.expectEqual(@as(u32, 1), h.handler.closes);
+}
+
+fn pathExists(path: [*:0]const u8) bool {
+    return std.c.access(path, 0) == 0;
+}
+
+test "unix socket: a WebSocket and a request, and stop() removes the file" {
+    const path = "/tmp/quic-zig-e2e-29620.sock";
+    var h: Harness = undefined;
+    try h.init(29620, .{ .tls = false, .unix_path = path });
+    var stopped = false;
+    defer if (!stopped) h.deinit();
+    try testing.expectEqual(@as(u16, 0), h.server.http1_server.?.port());
+    try testing.expect(pathExists(path));
+
+    var ws: TestClient = undefined;
+    try ws.connectUnix(path);
+    defer ws.deinit();
+    try ws.sendRequest("/chat", "13", null);
+    try testing.expect(std.mem.startsWith(u8, try h.head(&ws), "HTTP/1.1 101"));
+    try testing.expectEqualStrings("hello", (try h.frame(&ws)).payload);
+    try ws.sendFrame(.text, true, "over a file");
+    try testing.expectEqualStrings("over a file", (try h.frame(&ws)).payload);
+    try testing.expectEqual(posix.AF.UNIX, h.handler.ws.?.peerAddress().family);
+    try testing.expectEqual(@as(?u64, null), h.handler.ws.?.rtt());
+
+    var http: TestClient = undefined;
+    try http.connectUnix(path);
+    defer http.deinit();
+    try http.send("GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, try h.head(&http), "HTTP/1.1 200"));
+
+    h.deinit();
+    stopped = true;
+    try testing.expect(!pathExists(path));
+}
+
+test "unix socket: replaces a dead server's file, not a live server's or a regular file" {
+    const path = "/tmp/quic-zig-e2e-29622.sock";
+    const opts: http1.ListenOptions = .{ .quic_port = 0 };
+    const config: http1.Config = .{ .tls = false, .unix_path = path };
+
+    var addr: posix.sockaddr.un = .{ .path = @splat(0) };
+    @memcpy(addr.path[0..path.len], path);
+    _ = std.c.unlink(path);
+    const dead = try sys.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    try sys.bind(dead, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+    sys.close(dead);
+    try testing.expect(pathExists(path));
+
+    var live = try http1.Server.init(testing.allocator, config, opts);
+    try testing.expectError(error.AddressInUse, http1.Server.init(testing.allocator, config, opts));
+    live.deinit();
+    try testing.expect(!pathExists(path));
+
+    const file = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(std.c.mode_t, 0o600));
+    try testing.expect(file >= 0);
+    sys.close(file);
+    defer _ = std.c.unlink(path);
+    try testing.expectError(error.AddressInUse, http1.Server.init(testing.allocator, config, opts));
+    try testing.expect(pathExists(path));
+
+    const long: [@sizeOf(posix.sockaddr.un)]u8 = @splat('x');
+    try testing.expectError(error.NameTooLong, http1.Server.init(testing.allocator, .{ .tls = false, .unix_path = &long }, opts));
+    try testing.expectError(error.FileNotFound, http1.Server.init(testing.allocator, .{ .tls = false, .unix_path = "" }, opts));
 }
 
 test "ws: rtt() reads the kernel's round trip for the TCP connection" {

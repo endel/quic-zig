@@ -62,6 +62,11 @@ pub const Config = struct {
     static_dir: ?[]const u8 = null,
     /// TCP port. Null means the QUIC port.
     port: ?u16 = null,
+    /// A Unix socket to listen on instead of `port`, for a proxy on the same
+    /// host. Closing removes the file. One left by a process that died is
+    /// replaced; anything else at the path is `error.AddressInUse`. Peers
+    /// have no address, so `peerAddress` is of no use on these connections.
+    unix_path: ?[]const u8 = null,
     /// Send `Alt-Svc: h3=":<quic port>"` to advertise HTTP/3.
     alt_svc: bool = true,
     /// TLS 1.3 with the QUIC server's certificates. False serves plain
@@ -229,6 +234,8 @@ pub const Server = struct {
     config: Config,
     listen_fd: posix.socket_t,
     listen_file: xev.File,
+    /// Set on a Unix socket: what `closeListenFd` removes.
+    unix_addr: ?posix.sockaddr.un = null,
     poll_c: xev.Completion = .{},
     poll_cancel_c: xev.Completion = .{},
 
@@ -259,7 +266,8 @@ pub const Server = struct {
     /// Opens and binds the listening socket; nothing runs until `start`.
     pub fn init(alloc: std.mem.Allocator, config: Config, opts: ListenOptions) !Server {
         if (config.tls and opts.certs == null) return error.Http1TlsNeedsCertificate;
-        const fd = try openListener(opts, config.port orelse opts.quic_port);
+        const unix_addr: ?posix.sockaddr.un = if (config.unix_path) |path| try unixAddress(path) else null;
+        const fd = if (unix_addr) |*addr| try openUnixListener(addr) else try openListener(opts, config.port orelse opts.quic_port);
         errdefer sys.close(fd);
 
         var self: Server = .{
@@ -267,6 +275,7 @@ pub const Server = struct {
             .config = config,
             .listen_fd = fd,
             .listen_file = xev.File.initFd(fd),
+            .unix_addr = unix_addr,
             .certs = if (config.tls) opts.certs else null,
             // Our own key: a QUIC ticket must not resume a TCP session.
             .ticket_key = config.ticket_key orelse undefined,
@@ -349,6 +358,8 @@ pub const Server = struct {
 
     fn closeListenFd(self: *Server) void {
         if (self.listen_fd == closed_fd) return;
+        // Before the close: past it, the path may be a new server's.
+        if (self.unix_addr) |*addr| _ = std.c.unlink(@ptrCast(&addr.path));
         sys.close(self.listen_fd);
         self.listen_fd = closed_fd;
     }
@@ -415,9 +426,9 @@ pub const Server = struct {
         return &c.ws;
     }
 
-    /// The TCP port the listener is bound to.
+    /// The TCP port the listener is bound to; 0 on a Unix socket.
     pub fn port(self: *const Server) u16 {
-        if (self.listen_fd == closed_fd) return 0;
+        if (self.listen_fd == closed_fd or self.unix_addr != null) return 0;
         var addr: net.Address = undefined;
         var len: posix.socklen_t = @sizeOf(net.Address);
         if (std.c.getsockname(self.listen_fd, &addr.any, &len) != 0) return 0;
@@ -510,6 +521,38 @@ fn openListener(opts: ListenOptions, tcp_port: u16) !posix.socket_t {
     try sys.bind(fd, &addr.any, addr.getOsSockLen());
     try sys.listen(fd, 1024);
     return fd;
+}
+
+fn unixAddress(path: []const u8) !posix.sockaddr.un {
+    var addr: posix.sockaddr.un = .{ .path = @splat(0) };
+    // Linux would bind an all-NUL path as an abstract socket, no file at all.
+    if (path.len == 0) return error.FileNotFound;
+    // Past this `path` wouldn't end in the NUL `unlink` relies on.
+    if (path.len >= addr.path.len) return error.NameTooLong;
+    @memcpy(addr.path[0..path.len], path);
+    return addr;
+}
+
+fn openUnixListener(addr: *const posix.sockaddr.un) !posix.socket_t {
+    const fd = try sys.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    errdefer sys.close(fd);
+    sys.bind(fd, @ptrCast(addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+        if (err != error.AddressInUse or !isDeadSocket(addr)) return err;
+        _ = std.c.unlink(@ptrCast(&addr.path));
+        try sys.bind(fd, @ptrCast(addr), @sizeOf(posix.sockaddr.un));
+    };
+    try sys.listen(fd, 1024);
+    return fd;
+}
+
+/// A socket file nothing listens on, which outlives a process that died:
+/// connecting is refused. Linux refuses a regular file too, hence the mode.
+fn isDeadSocket(addr: *const posix.sockaddr.un) bool {
+    if (!sys.isSocketFile(@ptrCast(&addr.path))) return false;
+    // Nonblocking: a live server's full backlog mustn't hang us.
+    const probe = sys.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch return false;
+    defer sys.close(probe);
+    return posix.errno(std.c.connect(probe, @ptrCast(addr), @sizeOf(posix.sockaddr.un))) == .CONNREFUSED;
 }
 
 test {
