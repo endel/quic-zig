@@ -264,6 +264,39 @@ pub fn wouldBlock() bool {
     return posix.errno(@as(isize, -1)) == .AGAIN;
 }
 
+/// Whether the last socket call was cut short by a signal, and can go again.
+pub fn interrupted() bool {
+    if (is_windows) return windows.interrupted();
+    return posix.errno(@as(isize, -1)) == .INTR;
+}
+
+/// `recv`, for a nonblocking TCP socket: 0 at EOF, negative on failure,
+/// would-block included, which `read` can't tell from EOF.
+pub fn recv(sock: socket_t, dest: []u8) isize {
+    if (is_windows) return windows.recv(sock, dest);
+    return c.recv(sock, dest.ptr, dest.len, 0);
+}
+
+/// Starts connecting a nonblocking TCP socket. False when that's failed
+/// already; `connectState` says how it gets on.
+pub fn connect(sock: socket_t, addr: *const sockaddr, len: socklen_t) bool {
+    if (is_windows) return windows.connect(sock, addr, len);
+    return c.connect(sock, addr, len) == 0 or posix.errno(@as(isize, -1)) == .INPROGRESS;
+}
+
+pub const ConnectState = enum { pending, connected, failed };
+
+/// How a `connect` is getting on. Never blocks.
+pub fn connectState(sock: socket_t) ConnectState {
+    if (is_windows) return windows.connectState(sock);
+    var pfd = [_]c.pollfd{.{ .fd = sock, .events = c.POLL.OUT, .revents = 0 }};
+    if (c.poll(&pfd, 1, 0) <= 0) return .pending;
+    var err: c_int = 0;
+    var len: c.socklen_t = @sizeOf(c_int);
+    _ = c.getsockopt(sock, c.SOL.SOCKET, c.SO.ERROR, &err, &len);
+    return if (err == 0) .connected else .failed;
+}
+
 pub const ShutdownHow = enum { send, both };
 
 /// Shut a TCP socket down. `.both` also wakes reads and writes in flight on
@@ -1064,4 +1097,56 @@ test "udpSocket round-trips a datagram over loopback" {
         break;
     }
     try std.testing.expectEqualStrings("ping", buf[0..n]);
+}
+
+test "a nonblocking connect gets through to a listener, and recv tells nothing yet from the end" {
+    const net = @import("sockaddr.zig");
+    const listener = try tcpSocket(posix.AF.INET);
+    const any = try net.Address.parseIp4("127.0.0.1", 0);
+    try bind(listener, &any.any, any.getOsSockLen());
+    try listen(listener, 1);
+    var bound: posix.sockaddr.storage = undefined;
+    var bound_len: socklen_t = @sizeOf(posix.sockaddr.storage);
+    try getsockname(listener, @ptrCast(&bound), &bound_len);
+
+    const client = try tcpSocket(posix.AF.INET);
+    defer close(client);
+    try std.testing.expect(connect(client, @ptrCast(&bound), bound_len));
+    try std.testing.expectEqual(ConnectState.connected, try settled(client));
+
+    const conn = for (0..1000) |_| {
+        break accept(listener) catch |err| switch (err) {
+            error.WouldBlock => {
+                sleepNs(std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+    } else return error.Timeout;
+
+    var buf: [8]u8 = undefined;
+    try std.testing.expect(recv(client, &buf) < 0);
+    try std.testing.expect(wouldBlock());
+    close(conn);
+    for (0..1000) |_| {
+        const n = recv(client, &buf);
+        if (n == 0) break;
+        try std.testing.expect(wouldBlock());
+        sleepNs(std.time.ns_per_ms);
+    } else return error.Timeout;
+
+    // Nobody's on that port now.
+    close(listener);
+    const refused = try tcpSocket(posix.AF.INET);
+    defer close(refused);
+    if (connect(refused, @ptrCast(&bound), bound_len)) try std.testing.expectEqual(ConnectState.failed, try settled(refused));
+}
+
+fn settled(sock: socket_t) !ConnectState {
+    for (0..1000) |_| {
+        const state = connectState(sock);
+        if (state != .pending) return state;
+        sleepNs(std.time.ns_per_ms);
+    }
+    return error.Timeout;
 }
