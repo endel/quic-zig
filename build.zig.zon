@@ -1,6 +1,6 @@
 .{
     .name = .quic,
-    .version = "0.5.0",
+    .version = "0.6.0",
     .dependencies = .{
         // endel/libxev tag quic-zig-2026-10-30: upstream plus the PRs in its
         // fork/patches. See "libxev" in CLAUDE.md before changing this.

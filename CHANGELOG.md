@@ -3,10 +3,19 @@
 Notable changes to quic-zig. Versions follow [semantic versioning](https://semver.org);
 `Unreleased` collects what has landed on `main` since the last tag.
 
-## Unreleased
+## 0.6.0
+
+Ready for the open internet: the fixes from a security review, a cap on each
+source's handshakes, JA4 fingerprints and source filters that refuse a client
+before key exchange, and `drain()` for a graceful exit. quic-zig now needs Zig
+0.17 and runs natively on Windows, and gains TLS 1.3 over TCP, SNI, RSA and
+client certificates, shared event loops and connection handover between servers.
 
 ### Added
 
+- Windows. The library, its tests and the apps build and run natively: sockets
+  on Winsock, the event loop on libxev's IOCP backend. ECN is not read or set
+  on Windows yet. See [SPEC/STATUS.md](SPEC/STATUS.md#platforms).
 - JA4 client fingerprints. Set `fingerprint_filter` in `tls_server.Config`
   or a QUIC server's `TlsConfig`, and each connection's first ClientHello
   is fingerprinted and offered to it before any key exchange; false fails
@@ -376,9 +385,6 @@ need a design decision. Thanks @notramo for suggesting it
   @wallace0409 ([#45](https://github.com/endel/quic-zig/issues/45)).
 - A peer that acknowledged nothing could run the server out of memory. Thanks
   @wallace0409 ([#46](https://github.com/endel/quic-zig/issues/46)).
-- Windows. The library, its tests and the apps build and run natively: sockets
-  on Winsock, the event loop on libxev's IOCP backend. ECN is not read or set
-  on Windows yet. See [SPEC/STATUS.md](SPEC/STATUS.md#platforms).
 
 ## 0.5.0
 
