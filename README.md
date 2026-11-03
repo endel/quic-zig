@@ -267,9 +267,11 @@ non-strict. `./tools/autobahn.sh` reruns it, and CI runs it too; see
 
 ### Graceful shutdown
 
-The server exposes `stop()` for graceful shutdown — it sends CONNECTION_CLOSE to
-all active connections, waits for the drain period (3×PTO), then exits. Signal
-handling is the application's responsibility:
+`stop()` sends CONNECTION_CLOSE to every connection, waits out their closing
+period (3×PTO), and `run()` returns. Like the rest of the server it runs on the
+loop thread, so a signal handler or another thread calls `requestStop()`
+instead, which wakes the loop to stop. Signal handling is the application's
+responsibility:
 
 ```zig
 const std = @import("std");
@@ -278,8 +280,8 @@ const quic = @import("quic");
 
 var server_instance: ?*MyServer = null;
 
-fn handleSignal(_: c_int) callconv(.c) void {
-    if (server_instance) |s| s.stop();
+fn handleSignal(_: posix.SIG) callconv(.c) void {
+    if (server_instance) |s| s.requestStop();
 }
 
 pub fn main() !void {
@@ -287,8 +289,8 @@ pub fn main() !void {
     var server = try quic.event_loop.Server(MyHandler).init(alloc, &handler, .{ .port = 4433 });
     defer server.deinit();
     server_instance = &server;
+    defer server_instance = null; // runs before deinit()
 
-    // Install signal handlers
     const act = posix.Sigaction{
         .handler = .{ .handler = handleSignal },
         .mask = std.mem.zeroes(posix.sigset_t),
@@ -297,14 +299,16 @@ pub fn main() !void {
     posix.sigaction(posix.SIG.TERM, &act, null);
     posix.sigaction(posix.SIG.INT, &act, null);
 
-    try server.run(); // blocks until stop() is called and all connections drain
+    try server.run(); // returns once the stop has finished
 }
 ```
 
 `stop()` cuts off requests in flight. For an HTTP/3 server, `drain()` is the
-gentler first step: it sends GOAWAY, refuses new connections, lets in-flight
-requests finish and closes each connection once it has none left. Wait on
-`isDrained()` with a deadline of your own, then call `stop()` either way.
+gentler first step (`requestDrain()` from a signal handler): it sends GOAWAY,
+refuses new connections, lets in-flight requests finish and closes each
+connection once it has none left. Wait on `isDrained()` with a deadline of your
+own, from `onPass`, then call `stop()` either way. `Client` has `requestStop()`
+too. With `Config.loop` the loop is yours to wake: call `stop()` from there.
 
 A handler that cannot keep up with a request body — a proxy with a slow
 upstream — can `session.pauseRequestBody(stream_id)` and later

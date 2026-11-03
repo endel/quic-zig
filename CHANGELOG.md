@@ -209,6 +209,11 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A signal handler can now end `Server.run()`: call the new `requestStop()` or
+  `requestDrain()` there, or from another thread. `stop()`, as the README
+  showed, left an idle server's `run()` waiting forever. `Client.requestStop()`
+  too. Thanks @ChrisTrenkamp! [#48](https://github.com/endel/quic-zig/issues/48)
+
 - Bytes after a peer's WT_CLOSE_SESSION now reset the CONNECT stream with
   H3_MESSAGE_ERROR whichever packet brings them; only the capsule's own read
   was checked.

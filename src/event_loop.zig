@@ -846,6 +846,38 @@ pub const DrainOptions = struct {
     signal_peers: bool = true,
 };
 
+/// What `requestStop` or `requestDrain` asked of a server or client that owns
+/// its loop, from outside the loop thread, and the wakeup that carries it
+/// there. A shared loop's owner has a wakeup of its own for this.
+const Shutdown = struct {
+    const stop: u8 = 1;
+    const drain: u8 = 2;
+    /// `DrainOptions.signal_peers` off.
+    const drain_quietly: u8 = 4;
+
+    pending: std.atomic.Value(u8) = .init(0),
+    wakeup: xev.Async,
+    completion: xev.Completion = .{},
+
+    fn init() !Shutdown {
+        return .{ .wakeup = try xev.Async.init() };
+    }
+
+    fn deinit(self: *Shutdown) void {
+        self.wakeup.deinit();
+    }
+
+    /// Async-signal-safe; see `Server.requestStop`.
+    fn post(self: *Shutdown, what: u8) void {
+        _ = self.pending.fetchOr(what, .release);
+        self.wakeup.notify() catch {}; // nothing a signal handler could do with an error
+    }
+
+    fn take(self: *Shutdown) u8 {
+        return self.pending.swap(0, .acquire);
+    }
+};
+
 /// Begin one connection's HTTP/3 shutdown; see `Session.drainConnection`.
 /// Its sessions get WT_DRAIN_SESSION now and the connection its GOAWAY once
 /// the peer has acked what its CONNECT streams carry, or 3 PTO on: Firefox
@@ -1093,6 +1125,8 @@ pub fn Server(comptime Handler: type) type {
         /// on its way off the loop, and nothing may re-arm.
         halted: bool,
         cancel_completions: [4]xev.Completion,
+        /// Unused on a shared loop, like `own_loop`.
+        shutdown: Shutdown,
 
         // I/O (our own, for ECN support)
         sockfd: posix.socket_t,
@@ -1270,6 +1304,8 @@ pub fn Server(comptime Handler: type) type {
             const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
             const file_handle = xev.File.initFd(sockfd);
             const timer_handle = try xev.Timer.init();
+            var shutdown: Shutdown = if (config.loop == null) try Shutdown.init() else undefined;
+            errdefer if (config.loop == null) shutdown.deinit();
 
             const http1_server: ?http1.Server = if (config.http1) |h1cfg|
                 try http1.Server.init(alloc, h1cfg, .{
@@ -1312,6 +1348,7 @@ pub fn Server(comptime Handler: type) type {
                 .quic_poll_ids = .empty,
                 .halted = false,
                 .cancel_completions = .{ .{}, .{}, .{}, .{} },
+                .shutdown = shutdown,
                 .sockfd = sockfd,
                 .local_addr = connection.sockaddrToStorage(&local_addr.any),
                 .batch = ecn_socket.SendBatch.init(sockfd),
@@ -1348,7 +1385,10 @@ pub fn Server(comptime Handler: type) type {
             }
 
             self.timer.deinit();
-            if (self.shared_loop == null) self.own_loop.deinit();
+            if (self.shared_loop == null) {
+                self.own_loop.deinit();
+                self.shutdown.deinit();
+            }
             sys.close(self.sockfd);
             if (self.preferred) |p| sys.close(p.sockfd);
             self.conn_mgr.deinit();
@@ -1389,6 +1429,7 @@ pub fn Server(comptime Handler: type) type {
             }
             // Arm initial timer (1ms to kick things off)
             self.timer.run(loop, &self.timer_completion, 1, Self, self, onTimer);
+            if (self.shared_loop == null) self.shutdown.wakeup.wait(loop, &self.shutdown.completion, Self, self, onShutdownPosted);
             self.timer_armed = true;
             self.started = true;
         }
@@ -1553,7 +1594,8 @@ pub fn Server(comptime Handler: type) type {
         /// Both may be called from the handler's own callbacks, `onPass`
         /// included, as from outside them, on the server's own loop or a
         /// shared one: checking `isDrained()` and the deadline in `onPass`
-        /// and calling `stop()` there is the intended shape.
+        /// and calling `stop()` there is the intended shape. Loop thread
+        /// only: from a signal handler or another thread, see `requestDrain()`.
         pub fn drain(self: *Self, options: DrainOptions) void {
             if (self.draining or self.stopping) return;
             self.draining = true;
@@ -1623,7 +1665,8 @@ pub fn Server(comptime Handler: type) type {
         /// Once the connections' closing periods are over, the loop exits,
         /// or on a shared loop the server takes itself off it: keep running
         /// it until `isStopped()`. Callable from a handler callback, `onPass`
-        /// included: the pass it is called in finishes first.
+        /// included: the pass it is called in finishes first. Loop thread
+        /// only: from a signal handler or another thread, see `requestStop()`.
         pub fn stop(self: *Self) void {
             self.stopping = true;
             if (self.http1_server) |*h1| h1.stop();
@@ -1643,6 +1686,48 @@ pub fn Server(comptime Handler: type) type {
             // In a callback, the pass's own end finishes it: a watch can't
             // be cancelled from inside its callback.
             if (self.started and !self.in_callback and self.allConnectionsClosed()) self.finishStop(null);
+        }
+
+        /// `stop()`, for a signal handler or another thread: it wakes the
+        /// loop and returns, and `stop()` runs on the loop thread. The way
+        /// to end `run()` on SIGINT or SIGTERM. Nothing else here may be
+        /// called from those places, `stop()` included: it would run the
+        /// shutdown in the middle of whatever the loop was doing, and a loop
+        /// waiting in the kernel would not wake to finish it.
+        ///
+        /// Async-signal-safe, and safe from any thread (a Windows console
+        /// control handler runs on one of its own), any time from `init()`
+        /// until `deinit()`: clear the pointer a signal handler calls it
+        /// through before then. Made before `start()`, it takes effect as
+        /// the loop starts.
+        ///
+        /// Only for a server that owns its loop, like `run()`. A shared
+        /// loop's owner wakes it with an `xev.Async` of its own, once for
+        /// everything on it, and calls `stop()` there.
+        pub fn requestStop(self: *Self) void {
+            std.debug.assert(self.shared_loop == null);
+            self.shutdown.post(Shutdown.stop);
+        }
+
+        /// `drain(options)`, for a signal handler or another thread: the
+        /// usual answer to SIGTERM under a process manager. See
+        /// `requestStop`.
+        pub fn requestDrain(self: *Self, options: DrainOptions) void {
+            std.debug.assert(self.shared_loop == null);
+            self.shutdown.post(Shutdown.drain | if (options.signal_peers) 0 else Shutdown.drain_quietly);
+        }
+
+        fn onShutdownPosted(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.Async.WaitError!void, // the flags say what was asked
+        ) xev.CallbackAction {
+            const self = self_opt orelse return .disarm;
+            const asked = self.shutdown.take();
+            if (asked & Shutdown.drain != 0) self.drain(.{ .signal_peers = asked & Shutdown.drain_quietly == 0 });
+            if (asked & Shutdown.stop != 0) self.stop();
+            return .rearm; // an own loop ends by stopping, armed or not
         }
 
         /// The last step of `stop()`, once every connection has closed. Our
@@ -3216,6 +3301,8 @@ pub fn Client(comptime Handler: type) type {
         /// and nothing may re-arm.
         halted: bool,
         cancel_completions: [3]xev.Completion,
+        /// Unused on a shared loop, like `own_loop`.
+        shutdown: Shutdown,
 
         // I/O
         sockfd: posix.socket_t,
@@ -3357,6 +3444,7 @@ pub fn Client(comptime Handler: type) type {
             const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
             const file_handle = xev.File.initFd(sockfd);
             const timer_handle = try xev.Timer.init();
+            const shutdown: Shutdown = if (config.loop == null) try Shutdown.init() else undefined;
 
             return .{
                 .allocator = alloc,
@@ -3376,6 +3464,7 @@ pub fn Client(comptime Handler: type) type {
                 .in_callback = false,
                 .halted = false,
                 .cancel_completions = .{ .{}, .{}, .{} },
+                .shutdown = shutdown,
                 .sockfd = sockfd,
                 .local_addr = connection.sockaddrToStorage(&local_addr.any),
                 .batch = ecn_socket.SendBatch.init(sockfd),
@@ -3414,7 +3503,10 @@ pub fn Client(comptime Handler: type) type {
             self.finished_streams.deinit(self.allocator);
             self.quic_poll_ids.deinit(self.allocator);
             self.timer.deinit();
-            if (self.shared_loop == null) self.own_loop.deinit();
+            if (self.shared_loop == null) {
+                self.own_loop.deinit();
+                self.shutdown.deinit();
+            }
             sys.close(self.sockfd);
             self.conn.deinit();
             self.allocator.destroy(self.conn);
@@ -3429,6 +3521,7 @@ pub fn Client(comptime Handler: type) type {
             const loop = self.eventLoop();
             self.file.poll(loop, &self.poll_completion, .read, Self, self, onReadable);
             self.timer.run(loop, &self.timer_completion, 1, Self, self, onTimer);
+            if (self.shared_loop == null) self.shutdown.wakeup.wait(loop, &self.shutdown.completion, Self, self, onShutdownPosted);
             self.timer_armed = true;
             self.started = true;
         }
@@ -3570,7 +3663,8 @@ pub fn Client(comptime Handler: type) type {
         /// See the note on the server's stop() for why it flushes here.
         ///
         /// On a shared loop, keep running the loop until `isStopped()` before
-        /// `deinit()`: the closing period still needs the loop.
+        /// `deinit()`: the closing period still needs the loop. Loop thread
+        /// only: from a signal handler or another thread, see `requestStop()`.
         pub fn stop(self: *Self) void {
             self.stopping = true;
             const conn = self.conn;
@@ -3579,6 +3673,24 @@ pub fn Client(comptime Handler: type) type {
             }
             self.flush();
             if (self.shared_loop != null and self.started and conn.isClosed()) self.finishStop(null);
+        }
+
+        /// `stop()`, for a signal handler or another thread, on a client
+        /// that owns its loop; see `Server.requestStop`.
+        pub fn requestStop(self: *Self) void {
+            std.debug.assert(self.shared_loop == null);
+            self.shutdown.post(Shutdown.stop);
+        }
+
+        fn onShutdownPosted(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.Async.WaitError!void, // the flags say what was asked
+        ) xev.CallbackAction {
+            const self = self_opt orelse return .disarm;
+            if (self.shutdown.take() & Shutdown.stop != 0) self.stop();
+            return .rearm; // an own loop ends by stopping, armed or not
         }
 
         // ---- Internal callbacks ----
@@ -6950,6 +7062,106 @@ test "e2e: drain() then stop() from onPass, once the client has ended its sessio
     try runUntil(&e2e.loop, &e2e.server, shutdownServerStopped, 5000);
     try testing.expect(sh.stopped_in_pass);
     try testing.expectEqual(@as(u32, 1), ch.closed);
+}
+
+/// `Server.run()` on a thread of its own, as `main` runs it.
+const RunThread = struct {
+    server: *Server(ShutdownOnPass),
+    thread: std.Thread = undefined,
+    returned: std.atomic.Value(bool) = .init(false),
+
+    fn spawn(self: *RunThread) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *RunThread) void {
+        self.server.run() catch |err| std.debug.panic("run: {any}", .{err});
+        self.returned.store(true, .release);
+    }
+
+    /// Waits for `run()` to return, or panics: a thread whose loop never
+    /// stopped can't be joined.
+    fn join(self: *RunThread, timeout_ms: i64) void {
+        const deadline = sys.nanoTimestamp() + timeout_ms * std.time.ns_per_ms;
+        while (!self.returned.load(.acquire)) {
+            if (sys.nanoTimestamp() > deadline) @panic("run() did not return");
+            sys.sleepNs(std.time.ns_per_ms);
+        }
+        self.thread.join();
+    }
+};
+
+test "e2e: requestStop() from a signal handler ends run() on an idle server" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no POSIX signals
+    var sh = ShutdownOnPass{ .ticking = false }; // no timer: idle, it waits in the kernel for good
+    var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = 29542, .tls_config = makeTestTlsConfig() });
+    defer server.deinit();
+
+    const OnSignal = struct {
+        var target: ?*Server(ShutdownOnPass) = null;
+        fn handle(_: posix.SIG) callconv(.c) void {
+            if (target) |s| s.requestStop();
+        }
+    };
+    OnSignal.target = &server;
+    defer OnSignal.target = null;
+    const act = posix.Sigaction{
+        .handler = .{ .handler = OnSignal.handle },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    var old: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.USR1, &act, &old);
+    defer posix.sigaction(posix.SIG.USR1, &old, null);
+
+    var rt = RunThread{ .server = &server };
+    try rt.spawn();
+    sys.sleepNs(50 * std.time.ns_per_ms); // parked in kevent/epoll_wait
+    // On the loop's own thread, interrupting that wait, as in issue #48.
+    _ = std.c.pthread_kill(rt.thread.getHandle(), posix.SIG.USR1);
+    rt.join(2000);
+}
+
+test "e2e: requestStop() from another thread ends run(), made before it or during it" {
+    for ([_]bool{ false, true }, [_]u16{ 29543, 29544 }) |during, port| {
+        var sh = ShutdownOnPass{ .ticking = false };
+        var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = port, .tls_config = makeTestTlsConfig() });
+        defer server.deinit();
+        var rt = RunThread{ .server = &server };
+        if (during) {
+            try rt.spawn();
+            sys.sleepNs(50 * std.time.ns_per_ms);
+            server.requestStop();
+        } else {
+            server.requestStop();
+            try rt.spawn();
+        }
+        rt.join(2000);
+    }
+}
+
+test "e2e: requestDrain() and requestStop() reach a server and a client that own their loops" {
+    var sh = ShutdownOnPass{ .ticking = false };
+    var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = 29545, .tls_config = makeTestTlsConfig() });
+    defer server.deinit();
+    server.start();
+    var ch = WtDrainClient{};
+    var client = try Client(WtDrainClient).init(testing.allocator, &ch, .{ .port = 29545, .skip_cert_verify = true });
+    defer client.deinit();
+    client.start();
+    try runUntil2(server.eventLoop(), client.eventLoop(), &ch, WtDrainClient.ready, 10_000);
+
+    server.requestDrain(.{});
+    try runUntil2(server.eventLoop(), client.eventLoop(), &ch, struct {
+        fn f(c: *WtDrainClient) bool {
+            return c.drainings == 1; // the peer was told: signal_peers made it across
+        }
+    }.f, 3000);
+
+    client.requestStop();
+    try runUntil2(server.eventLoop(), client.eventLoop(), client.eventLoop(), xev.Loop.stopped, 5000);
+    server.requestStop();
+    try runUntil(server.eventLoop(), server.eventLoop(), xev.Loop.stopped, 5000);
 }
 
 test "e2e: a WT_STREAMS_BLOCKED is answered with nothing more from the peer" {
