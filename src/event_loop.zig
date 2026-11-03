@@ -6775,6 +6775,10 @@ const WtDrainClient = struct {
     fn ready(self: *@This()) bool {
         return self.session_id != null;
     }
+
+    fn toldToDrain(self: *@This()) bool {
+        return self.drainings > 0;
+    }
 };
 
 fn refusedOrUp(c: *Client(WtDrainClient)) bool {
@@ -6920,9 +6924,14 @@ const ShutdownOnPass = struct {
     pub const protocol: Protocol = .webtransport;
     /// The `Server(ShutdownOnPass)`: its type can't be named in a field here.
     server: ?*anyopaque = null,
-    plan: enum { none, stop, drain_then_stop } = .none,
+    plan: enum { none, stop, drain_then_stop, stop_once_drained } = .none,
     drained: bool = false,
     stopped_in_pass: bool = false,
+    /// `.stop_once_drained`: how long after the drain began to stop anyway,
+    /// when it began, and whether it ended drained or at that deadline.
+    drain_grace_ns: i64 = 300 * std.time.ns_per_ms,
+    drain_began: ?i64 = null,
+    stopped_drained: bool = false,
     /// Off, it asks for no passes of its own: only a packet brings one.
     ticking: bool = true,
     session: ?Session = null,
@@ -6951,13 +6960,40 @@ const ShutdownOnPass = struct {
                 server.stop();
                 self.stopped_in_pass = true;
             },
+            // The README's recipe, for a drain begun elsewhere: `requestDrain()`.
+            .stop_once_drained => if (server.draining) {
+                const began = self.drain_began orelse now_ns;
+                self.drain_began = began;
+                if (server.isDrained() or now_ns - began > self.drain_grace_ns) {
+                    self.plan = .none;
+                    self.stopped_drained = server.isDrained();
+                    server.stop();
+                    self.stopped_in_pass = true;
+                }
+            },
         }
         return if (self.ticking) now_ns + 5 * std.time.ns_per_ms else null; // a game's tick
+    }
+
+    fn hasSession(self: *@This()) bool {
+        return self.session != null;
     }
 };
 
 fn shutdownServerStopped(s: *Server(ShutdownOnPass)) bool {
     return s.isStopped();
+}
+
+fn shutdownServerStopping(s: *Server(ShutdownOnPass)) bool {
+    return s.isStopping();
+}
+
+fn shutdownServerDraining(s: *Server(ShutdownOnPass)) bool {
+    return s.draining;
+}
+
+fn shutdownServerEmpty(s: *Server(ShutdownOnPass)) bool {
+    return s.conn_mgr.connectionCount() == 0;
 }
 
 test "e2e: stop() from onPass takes a server off a shared loop, with a connection open or none" {
@@ -7064,32 +7100,42 @@ test "e2e: drain() then stop() from onPass, once the client has ended its sessio
     try testing.expectEqual(@as(u32, 1), ch.closed);
 }
 
-/// `Server.run()` on a thread of its own, as `main` runs it.
-const RunThread = struct {
-    server: *Server(ShutdownOnPass),
-    thread: std.Thread = undefined,
-    returned: std.atomic.Value(bool) = .init(false),
+/// `run()` on a thread of its own, as `main` runs it.
+fn RunThread(comptime T: type) type {
+    return struct {
+        const Self = @This();
 
-    fn spawn(self: *RunThread) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
-    }
+        target: *T,
+        thread: std.Thread = undefined,
+        returned: std.atomic.Value(bool) = .init(false),
 
-    fn run(self: *RunThread) void {
-        self.server.run() catch |err| std.debug.panic("run: {any}", .{err});
-        self.returned.store(true, .release);
-    }
-
-    /// Waits for `run()` to return, or panics: a thread whose loop never
-    /// stopped can't be joined.
-    fn join(self: *RunThread, timeout_ms: i64) void {
-        const deadline = sys.nanoTimestamp() + timeout_ms * std.time.ns_per_ms;
-        while (!self.returned.load(.acquire)) {
-            if (sys.nanoTimestamp() > deadline) @panic("run() did not return");
-            sys.sleepNs(std.time.ns_per_ms);
+        fn spawn(self: *Self) !void {
+            self.thread = try std.Thread.spawn(.{}, run, .{self});
         }
-        self.thread.join();
-    }
-};
+
+        fn run(self: *Self) void {
+            self.target.run() catch |err| std.debug.panic("run: {any}", .{err});
+            self.returned.store(true, .release);
+        }
+
+        fn hasReturned(self: *Self) bool {
+            return self.returned.load(.acquire);
+        }
+
+        /// Waits for `run()` to return, or panics: a thread whose loop never
+        /// stopped can't be joined.
+        fn join(self: *Self, timeout_ms: i64) void {
+            const deadline = sys.nanoTimestamp() + timeout_ms * std.time.ns_per_ms;
+            while (!self.hasReturned()) {
+                if (sys.nanoTimestamp() > deadline) @panic("run() did not return");
+                sys.sleepNs(std.time.ns_per_ms);
+            }
+            self.thread.join();
+        }
+    };
+}
+
+const ServerThread = RunThread(Server(ShutdownOnPass));
 
 test "e2e: requestStop() from a signal handler ends run() on an idle server" {
     if (builtin.os.tag == .windows) return error.SkipZigTest; // no POSIX signals
@@ -7114,7 +7160,7 @@ test "e2e: requestStop() from a signal handler ends run() on an idle server" {
     posix.sigaction(posix.SIG.USR1, &act, &old);
     defer posix.sigaction(posix.SIG.USR1, &old, null);
 
-    var rt = RunThread{ .server = &server };
+    var rt = ServerThread{ .target = &server };
     try rt.spawn();
     sys.sleepNs(50 * std.time.ns_per_ms); // parked in kevent/epoll_wait
     // On the loop's own thread, interrupting that wait, as in issue #48.
@@ -7127,7 +7173,7 @@ test "e2e: requestStop() from another thread ends run(), made before it or durin
         var sh = ShutdownOnPass{ .ticking = false };
         var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = port, .tls_config = makeTestTlsConfig() });
         defer server.deinit();
-        var rt = RunThread{ .server = &server };
+        var rt = ServerThread{ .target = &server };
         if (during) {
             try rt.spawn();
             sys.sleepNs(50 * std.time.ns_per_ms);
@@ -7140,28 +7186,153 @@ test "e2e: requestStop() from another thread ends run(), made before it or durin
     }
 }
 
+/// A wait that spans a closing period: 3 PTO, which follows the measured RTT
+/// and so stretches on a loaded machine.
+const closing_ms = 10_000;
+
+/// A server and a client with a session between them, each on a loop of its
+/// own and both run from the test's thread.
+const OwnLoops = struct {
+    sh: ShutdownOnPass = .{ .ticking = false },
+    ch: WtDrainClient = .{},
+    server: Server(ShutdownOnPass) = undefined,
+    client: Client(WtDrainClient) = undefined,
+
+    /// In place: both keep pointers into `self`.
+    fn init(self: *OwnLoops, port: u16) !void {
+        self.* = .{};
+        self.server = try Server(ShutdownOnPass).init(testing.allocator, &self.sh, .{ .port = port, .tls_config = makeTestTlsConfig() });
+        errdefer self.server.deinit();
+        self.client = try Client(WtDrainClient).init(testing.allocator, &self.ch, .{ .port = port, .skip_cert_verify = true });
+        errdefer self.client.deinit();
+        self.server.start();
+        self.client.start();
+        try self.runUntil(&self.ch, WtDrainClient.ready, 10_000);
+    }
+
+    fn deinit(self: *OwnLoops) void {
+        self.client.deinit();
+        self.server.deinit();
+    }
+
+    fn runUntil(self: *OwnLoops, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool, timeout_ms: i64) !void {
+        return runUntil2(self.server.eventLoop(), self.client.eventLoop(), ctx, done, timeout_ms);
+    }
+
+    fn runFor(self: *OwnLoops, ms: i64) !void {
+        const until = sys.nanoTimestamp() + ms * std.time.ns_per_ms;
+        while (sys.nanoTimestamp() < until) {
+            try self.server.eventLoop().run(.no_wait);
+            try self.client.eventLoop().run(.no_wait);
+            sys.sleepNs(50 * std.time.ns_per_us);
+        }
+    }
+};
+
 test "e2e: requestDrain() and requestStop() reach a server and a client that own their loops" {
+    var o: OwnLoops = undefined;
+    try o.init(29545);
+    defer o.deinit();
+
+    o.server.requestDrain(.{});
+    try o.runUntil(&o.ch, WtDrainClient.toldToDrain, 3000);
+
+    o.client.requestStop();
+    try o.runUntil(o.client.eventLoop(), xev.Loop.stopped, closing_ms);
+    o.server.requestStop();
+    try runUntil(o.server.eventLoop(), o.server.eventLoop(), xev.Loop.stopped, closing_ms);
+}
+
+test "e2e: requestDrain() with signal_peers off drains without telling the peer" {
+    var o: OwnLoops = undefined;
+    try o.init(29546);
+    defer o.deinit();
+
+    o.server.requestDrain(.{ .signal_peers = false });
+    try o.runUntil(&o.server, shutdownServerDraining, 3000);
+    try o.runFor(200);
+    try testing.expectEqual(@as(u32, 0), o.ch.drainings);
+    try testing.expectEqual(@as(?u64, null), o.client.h3_conn.?.peer_goaway_id);
+}
+
+test "e2e: a second requestStop(), or a requestDrain(), while the stop finishes changes nothing" {
+    var o: OwnLoops = undefined;
+    try o.init(29547);
+    defer o.deinit();
+
+    o.server.requestStop();
+    try o.runUntil(&o.server, shutdownServerStopping, 3000);
+    try testing.expect(!o.server.eventLoop().stopped()); // in its closing period
+    // A second Ctrl+C, or a SIGTERM after a SIGINT.
+    o.server.requestStop();
+    o.server.requestDrain(.{});
+    try o.runUntil(o.server.eventLoop(), xev.Loop.stopped, closing_ms);
+    try testing.expect(!o.server.draining);
+    try testing.expectEqual(@as(u32, 0), o.ch.drainings);
+    try testing.expectEqual(@as(u32, 1), o.ch.closed);
+    try testing.expectEqual(@as(usize, 0), o.server.conn_mgr.connectionCount());
+}
+
+test "e2e: requestDrain() from another thread, then stop() in onPass once drained or at a deadline, ends run()" {
+    // The README's shutdown, on a server that blocks in run().
+    for ([_]bool{ true, false }, [_]u16{ 29548, 29549 }) |client_leaves, port| {
+        var sh = ShutdownOnPass{ .plan = .stop_once_drained };
+        var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = port, .tls_config = makeTestTlsConfig() });
+        defer server.deinit();
+        sh.server = &server;
+        var ch = WtDrainClient{};
+        var client = try Client(WtDrainClient).init(testing.allocator, &ch, .{ .port = port, .skip_cert_verify = true });
+        defer client.deinit();
+        client.start();
+
+        var rt = ServerThread{ .target = &server };
+        {
+            try rt.spawn();
+            errdefer {
+                server.requestStop();
+                rt.join(5000);
+            }
+            try runUntil(client.eventLoop(), &ch, WtDrainClient.ready, 10_000);
+            server.requestDrain(.{});
+            try runUntil(client.eventLoop(), &ch, WtDrainClient.toldToDrain, 3000);
+            if (client_leaves) {
+                var cs = client.clientSession();
+                try cs.closeSessionWithError(ch.session_id.?, 0, "leaving");
+            }
+            try runUntil(client.eventLoop(), &rt, ServerThread.hasReturned, closing_ms);
+        }
+        rt.join(1000);
+        try testing.expect(sh.stopped_in_pass);
+        try testing.expectEqual(client_leaves, sh.stopped_drained);
+        try testing.expectEqual(@as(u32, 1), ch.closed);
+    }
+}
+
+test "e2e: Client.requestStop() from another thread ends Client.run(), and the server hears it go" {
     var sh = ShutdownOnPass{ .ticking = false };
-    var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = 29545, .tls_config = makeTestTlsConfig() });
+    var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = 29550, .tls_config = makeTestTlsConfig() });
     defer server.deinit();
     server.start();
     var ch = WtDrainClient{};
-    var client = try Client(WtDrainClient).init(testing.allocator, &ch, .{ .port = 29545, .skip_cert_verify = true });
+    var client = try Client(WtDrainClient).init(testing.allocator, &ch, .{ .port = 29550, .skip_cert_verify = true });
     defer client.deinit();
-    client.start();
-    try runUntil2(server.eventLoop(), client.eventLoop(), &ch, WtDrainClient.ready, 10_000);
 
-    server.requestDrain(.{});
-    try runUntil2(server.eventLoop(), client.eventLoop(), &ch, struct {
-        fn f(c: *WtDrainClient) bool {
-            return c.drainings == 1; // the peer was told: signal_peers made it across
+    const ClientThread = RunThread(Client(WtDrainClient));
+    var rt = ClientThread{ .target = &client };
+    {
+        try rt.spawn();
+        errdefer {
+            client.requestStop();
+            rt.join(5000);
         }
-    }.f, 3000);
-
-    client.requestStop();
-    try runUntil2(server.eventLoop(), client.eventLoop(), client.eventLoop(), xev.Loop.stopped, 5000);
-    server.requestStop();
-    try runUntil(server.eventLoop(), server.eventLoop(), xev.Loop.stopped, 5000);
+        try runUntil(server.eventLoop(), &sh, ShutdownOnPass.hasSession, 10_000);
+        client.requestStop();
+        try runUntil(server.eventLoop(), &rt, ClientThread.hasReturned, closing_ms);
+    }
+    rt.join(1000);
+    try testing.expect(client.conn.isClosed());
+    // Its CONNECTION_CLOSE, not an idle timeout, ends the server's side.
+    try runUntil(server.eventLoop(), &server, shutdownServerEmpty, closing_ms);
 }
 
 test "e2e: a WT_STREAMS_BLOCKED is answered with nothing more from the peer" {

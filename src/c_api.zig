@@ -418,21 +418,20 @@ export fn qz_server_create(
     cert: ?[*:0]const u8,
     key: ?[*:0]const u8,
 ) ?*anyopaque {
-    const allocator = std.heap.c_allocator;
-    const address = std.mem.span(addr orelse return null);
-    const cert_path = std.mem.span(cert orelse return null);
-    const key_path = std.mem.span(key orelse return null);
+    return createServer(std.heap.c_allocator, .{
+        .address = std.mem.span(addr orelse return null),
+        .port = port,
+        .cert_path = std.mem.span(cert orelse return null),
+        .key_path = std.mem.span(key orelse return null),
+    });
+}
 
+fn createServer(allocator: Allocator, config: event_loop.Config) ?*WtServer {
     const ws = allocator.create(WtServer) catch return null;
 
     ws.handler = .{ .allocator = allocator };
     ws.allocator = allocator;
-    ws.server = event_loop.Server(CApiHandler).init(allocator, &ws.handler, .{
-        .address = address,
-        .port = port,
-        .cert_path = cert_path,
-        .key_path = key_path,
-    }) catch {
+    ws.server = event_loop.Server(CApiHandler).init(allocator, &ws.handler, config) catch {
         ws.handler.deinit();
         allocator.destroy(ws);
         return null;
@@ -828,4 +827,90 @@ test "c_api: NULL from C is refused, not dereferenced" {
     try testing.expectEqual(ERR_INVALID_ARG, qz_stream_send(&ws, 1, 0, null, 5));
     try testing.expectEqual(ERR_INVALID_ARG, qz_datagram_send(&ws, 1, 0, null, 5));
     try testing.expectEqual(ERR_INVALID_ARG, qz_session_close_error(&ws, 1, 0, 0, null, 5));
+}
+
+/// A browser's side of a session with the C API's server.
+const ShutdownClient = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+    session_id: ?u64 = null,
+    drainings: u32 = 0,
+    closed: u32 = 0,
+
+    pub fn onSessionReady(self: *ShutdownClient, _: *event_loop.ClientSession, session_id: u64) void {
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *ShutdownClient, _: *event_loop.ClientSession, _: u64, _: []const u8, _: bool) void {}
+    pub fn onSessionDraining(self: *ShutdownClient, _: *event_loop.ClientSession, _: u64) void {
+        self.drainings += 1;
+    }
+    pub fn onSessionClosed(self: *ShutdownClient, _: *event_loop.ClientSession, _: u64, _: u32, _: []const u8) void {
+        self.closed += 1;
+    }
+
+    fn ready(self: *ShutdownClient) bool {
+        return self.session_id != null;
+    }
+    fn toldToDrain(self: *ShutdownClient) bool {
+        return self.drainings > 0;
+    }
+    fn sessionOver(self: *ShutdownClient) bool {
+        return self.closed > 0;
+    }
+};
+
+/// A generated key, offered as a raw public key: the client skips verification.
+fn testTlsConfig() quic.tls13.TlsConfig {
+    const S = struct {
+        var secret_key: [32]u8 = undefined;
+        var public_key: [65]u8 = undefined;
+        var cert_chain: [1][]const u8 = undefined;
+        var alpn: [1][]const u8 = .{"h3"};
+        var ticket_key: [16]u8 = undefined;
+    };
+    const kp = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.generate(std.testing.io);
+    S.secret_key = kp.secret_key.toBytes();
+    S.public_key = kp.public_key.toUncompressedSec1();
+    S.cert_chain = .{&S.public_key};
+    quic.sys.randomBytes(&S.ticket_key);
+    return .{ .cert_chain_der = &S.cert_chain, .private_key_bytes = &S.secret_key, .alpn = &S.alpn, .ticket_key = S.ticket_key };
+}
+
+/// What a C host does each frame: tick, then take every event, accepting
+/// each session asked for. The client runs between frames.
+fn hostUntil(ws: *WtServer, client: anytype, ch: *ShutdownClient, comptime done: fn (*ShutdownClient) bool, timeout_ms: i64) !void {
+    const deadline = quic.sys.nanoTimestamp() + timeout_ms * std.time.ns_per_ms;
+    var buf: [4096]u8 = undefined;
+    while (!done(ch)) {
+        if (quic.sys.nanoTimestamp() > deadline) return error.Timeout;
+        try testing.expectEqual(@as(i32, 0), qz_server_tick(ws));
+        while (qz_server_poll(ws, &buf, buf.len) > 0) {
+            if (buf[0] != @backingInt(EventType.connect_request)) continue;
+            const client_id = std.mem.readInt(u64, buf[8..16], .little);
+            const session_id = std.mem.readInt(u64, buf[16..24], .little);
+            try testing.expectEqual(ERR_OK, qz_session_accept(ws, client_id, session_id));
+        }
+        try client.tick();
+        quic.sys.sleepNs(50 * std.time.ns_per_us);
+    }
+}
+
+test "c_api: drain, is_drained and stop take a host's server down gracefully" {
+    const ws = createServer(testing.allocator, .{ .port = 29551, .tls_config = testTlsConfig() }) orelse return error.TestUnexpectedResult;
+    defer qz_server_destroy(ws);
+    var ch = ShutdownClient{};
+    var client = try event_loop.Client(ShutdownClient).init(testing.allocator, &ch, .{ .port = 29551, .skip_cert_verify = true });
+    defer client.deinit();
+    client.start();
+    try hostUntil(ws, &client, &ch, ShutdownClient.ready, 10_000);
+
+    qz_server_drain(ws);
+    try hostUntil(ws, &client, &ch, ShutdownClient.toldToDrain, 3000);
+    try testing.expectEqual(@as(i32, 0), qz_server_is_drained(ws)); // the session is still open
+    try testing.expectEqual(@as(u32, 1), qz_server_connection_count(ws));
+
+    // The host's deadline passes with the session open: stop() closes it at once.
+    qz_server_stop(ws);
+    try testing.expectEqual(@as(i32, 1), qz_server_is_drained(ws));
+    try hostUntil(ws, &client, &ch, ShutdownClient.sessionOver, 3000);
+    try testing.expect(client.conn.state != .connected);
 }
