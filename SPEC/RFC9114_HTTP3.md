@@ -230,10 +230,12 @@ What a server does on SIGTERM, the first of two steps, closing nothing in use.
 `isDrained()` is true once every connection is closing or closed and no
 HTTP/1.1 request or WebSocket is open; the caller waits on it against its own
 deadline, from `onPass` if it likes, and then calls `stop()`, which is also the
-fallback when the deadline passes first. WebTransport sessions keep their
-connection open until the handler or the peer closes them, and the connection
-then closes as `Config.wt_close_after_sessions` says. `Session.drainConnection`
-runs steps 2-4 for one connection.
+fallback when the deadline passes first. On a server that owns its loop, a
+signal handler or another thread starts it with `requestDrain()` and ends it
+with `requestStop()`, which wake the loop to do it there. WebTransport sessions
+keep their connection open until the handler or the peer closes them, and the
+connection then closes as `Config.wt_close_after_sessions` says.
+`Session.drainConnection` runs steps 2-4 for one connection.
 
 ## Request-body backpressure
 
