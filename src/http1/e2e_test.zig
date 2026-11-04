@@ -365,9 +365,17 @@ const TestClient = struct {
 
     /// In place: the TLS connection points at `tls_config`.
     fn connect(self: *TestClient, port: u16, use_tls: bool) !void {
+        return self.connectWith(port, use_tls, null);
+    }
+
+    /// `rcvbuf` is set before the handshake, so the window stays that small:
+    /// Linux grows loopback buffers to MiBs, which would take a long answer
+    /// whole and leave the server nothing to pace.
+    fn connectWith(self: *TestClient, port: u16, use_tls: bool, rcvbuf: ?c_int) !void {
         self.* = .{};
         const fd = try sys.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer sys.close(fd);
+        if (rcvbuf) |n| try sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&n));
         const addr = try net.Address.parseIp4("127.0.0.1", port);
         if (std.c.connect(fd, &addr.any, addr.getOsSockLen()) != 0) return error.ConnectionRefused;
         sys.setNonBlocking(fd);
@@ -1860,9 +1868,13 @@ test "http1: an answer without a length goes chunked, paced by onHttpWritable" {
     try h.init(29551, .{ .tls = false });
     defer h.deinit();
     defer h.handler.body.deinit(testing.allocator);
+    // Small kernel buffers both ways, so they can't take the whole answer;
+    // the listener's send buffer carries to the socket it accepts.
+    const sndbuf: c_int = 32 * 1024;
+    try sys.setsockopt(h.server.http1_server.?.listen_fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
     var c: TestClient = .{};
     defer c.deinit();
-    try c.connect(h.port, false);
+    try c.connectWith(h.port, false, 16 * 1024);
 
     try c.send("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n");
     try testing.expect(std.mem.indexOf(u8, try h.head(&c), "Transfer-Encoding: chunked\r\n") != null);
