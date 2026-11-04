@@ -16,6 +16,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   waits for what's owed.
 - `sys.connect` and `sys.connectState`: nonblocking TCP connects on every
   platform, for TCP clients.
+- `Config.new_while_draining`: a draining server hands a new connection's
+  first datagram to one still taking connections, rather than refusing it,
+  so a reload beside it under `reuse_port` turns no one away.
 
 ## 0.6.0
 

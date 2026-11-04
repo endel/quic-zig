@@ -286,8 +286,24 @@ pub const Config = struct {
     /// copies the bytes (they are only valid for the call), moves them to the
     /// owner's thread — a queue plus an `xev.Async`, say — and there calls
     /// the owner's `injectDatagram`. Initials are never reported: whichever
-    /// server receives one accepts the connection.
+    /// server receives one accepts the connection, or while it drains offers
+    /// it to `new_while_draining`.
     foreign_datagram: ?ForeignDatagramHook = null,
+
+    /// While this server drains (from `drain()` until `stop()`), offered each
+    /// new connection's first datagram before it is refused. Return true once
+    /// it is on its way to a server still taking connections, which takes it
+    /// in through `injectDatagram`; false refuses it, as without the hook.
+    /// `server_id` is empty, and the bytes are valid only for the call.
+    ///
+    /// Under `reuse_port` the kernel goes on giving a draining server its
+    /// share of new peers, so a reload that starts servers beside the old
+    /// ones would refuse those for as long as the old ones drain; this lets
+    /// them go to a new one. A datagram that came in through `injectDatagram`
+    /// is never offered, so draining servers can't pass one back and forth.
+    /// The peer's later packets carry its new server's connection ids, which
+    /// `foreign_datagram` steers.
+    new_while_draining: ?NewDatagramHook = null,
 
     /// The CIDs of connections handed between the servers on this port,
     /// shared by all of them: with it, `Session.handOver` moves a connection
@@ -335,13 +351,19 @@ pub const ForeignDatagram = struct {
     ecn: u2,
     /// The QUIC-LB server id the DCID decodes to, `quic_lb.server_id_len`
     /// bytes. Nothing checks that such a server exists: the hook drops
-    /// what it cannot route.
+    /// what it cannot route. Empty for `Config.new_while_draining`.
     server_id: []const u8,
 };
 
 pub const ForeignDatagramHook = struct {
     ctx: ?*anyopaque = null,
     func: *const fn (ctx: ?*anyopaque, datagram: *const ForeignDatagram) void,
+};
+
+/// `Config.new_while_draining`: true when another server takes the datagram.
+pub const NewDatagramHook = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, datagram: *const ForeignDatagram) bool,
 };
 
 /// A connection on its way from one server to another: from the old one's
@@ -1179,6 +1201,7 @@ pub fn Server(comptime Handler: type) type {
         mailbox: if (takes_heads) Mailbox else void,
 
         foreign_hook: ?ForeignDatagramHook,
+        new_hook: ?NewDatagramHook,
 
         /// WebTransport SETTINGS advertised to every peer, and what is done
         /// with a connection its sessions are over with, from Config.
@@ -1382,6 +1405,7 @@ pub fn Server(comptime Handler: type) type {
                 .http1_server = http1_server,
                 .mailbox = if (comptime takes_heads) try Mailbox.init() else {},
                 .foreign_hook = config.foreign_datagram,
+                .new_hook = config.new_while_draining,
                 .wt_settings = .{
                     .max_sessions = config.webtransport_max_sessions,
                     .legacy = config.wt_legacy_settings,
@@ -1587,7 +1611,8 @@ pub fn Server(comptime Handler: type) type {
         /// in use:
         ///
         /// - New QUIC connections are refused, each Initial answered with
-        ///   CONNECTION_REFUSED (RFC 9000 §5.2.2), and the HTTP/1.1 listener
+        ///   CONNECTION_REFUSED (RFC 9000 §5.2.2) unless
+        ///   `Config.new_while_draining` hands it on, and the HTTP/1.1 listener
         ///   closes its socket, so new TCP connections are refused by the
         ///   kernel, or under `reuse_port` go to another server on the port.
         /// - Every HTTP/3 connection gets a GOAWAY (RFC 9114 §5.2) and every
@@ -1629,12 +1654,21 @@ pub fn Server(comptime Handler: type) type {
             self.draining = true;
             self.drain_signals = options.signal_peers;
             self.conn_mgr.refuse_new = true;
+            // Set here, not at init: `self` has stopped moving by now.
+            if (self.new_hook != null) self.conn_mgr.hand_new = .{ .ctx = self, .func = offerNew };
             if (self.http1_server) |*h1| h1.drain();
             if (options.signal_peers) {
                 const now: i64 = sys.nanoTimestamp();
                 for (self.conn_mgr.entries.items) |entry| beginDrain(entry, now);
             }
             self.flush();
+        }
+
+        fn offerNew(ctx: ?*anyopaque, bytes: []const u8, peer: *const posix.sockaddr.storage, local: *const posix.sockaddr.storage, ecn: u2) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            const hook = self.new_hook orelse return false;
+            const dg: ForeignDatagram = .{ .bytes = bytes, .peer = peer.*, .local = local.*, .ecn = ecn, .server_id = &.{} };
+            return hook.func(hook.ctx, &dg);
         }
 
         /// True once `drain()` has left nothing in flight: every QUIC
@@ -1699,6 +1733,7 @@ pub fn Server(comptime Handler: type) type {
             self.stopping = true;
             if (self.http1_server) |*h1| h1.stop();
             self.conn_mgr.refuse_new = true; // or arrivals keep stop() from finishing
+            self.conn_mgr.hand_new = null;
             for (self.conn_mgr.entries.items) |entry| {
                 const conn = entry.conn;
                 if (!conn.isClosed() and conn.state != .closing and conn.state != .draining) {
@@ -8483,9 +8518,12 @@ const SteerWorker = struct {
 
     /// Owner thread only; read after join.
     injected: usize = 0,
+    /// Drain at once, on the worker's own thread.
+    drain_first: bool = false,
 
     fn run(self: *SteerWorker) void {
         self.server.start();
+        if (self.drain_first) self.server.drain(.{});
         self.wakeup.wait(self.server.eventLoop(), &self.wakeup_c, SteerWorker, self, onWakeup);
         self.server.eventLoop().run(.until_done) catch {};
     }
@@ -8535,6 +8573,15 @@ const SteerWorker = struct {
 const SteerRouter = struct {
     workers: [2]*SteerWorker,
     forwarded: std.atomic.Value(usize) = .init(0),
+    handed_new: std.atomic.Value(usize) = .init(0),
+
+    /// New connections go to the second worker, the one taking them.
+    fn onNew(ctx: ?*anyopaque, dg: *const ForeignDatagram) bool {
+        const self: *SteerRouter = @ptrCast(@alignCast(ctx.?));
+        _ = self.handed_new.fetchAdd(1, .monotonic);
+        self.workers[1].hand(dg);
+        return true;
+    }
 
     fn onForeign(ctx: ?*anyopaque, dg: *const ForeignDatagram) void {
         const self: *SteerRouter = @ptrCast(@alignCast(ctx.?));
@@ -8670,6 +8717,79 @@ test "e2e: a migrated peer landing on the wrong worker is steered to its owner" 
     try testing.expectEqual(router.forwarded.load(.monotonic), router.workers[0].injected);
     try testing.expectEqual(@as(usize, 0), router.workers[1].injected);
     try testing.expectEqual(@as(usize, 0), router.workers[1].server.conn_mgr.connectionCount());
+}
+
+test "e2e: a draining worker hands a new connection to one taking them" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT
+    const relay_port: u16 = 29440;
+    const ports = [2]u16{ 29442, 29443 };
+
+    var handler = HelloServer{};
+    var router: SteerRouter = .{ .workers = undefined };
+    for (&router.workers, ports, 1..) |*w, port, id| {
+        w.* = try testing.allocator.create(SteerWorker);
+        w.*.* = .{
+            .server = try Server(HelloServer).init(testing.allocator, &handler, .{
+                .port = port,
+                .reuse_port = true,
+                .tls_config = makeTestTlsConfig(),
+                .quic_lb = steerLbConfig(@intCast(id)),
+                .foreign_datagram = .{ .ctx = &router, .func = SteerRouter.onForeign },
+                .new_while_draining = .{ .ctx = &router, .func = SteerRouter.onNew },
+            }),
+            .wakeup = try xev.Async.init(),
+            .drain_first = id == 1,
+        };
+    }
+    defer for (router.workers) |w| {
+        w.wakeup.deinit();
+        w.server.deinit();
+        testing.allocator.destroy(w);
+    };
+
+    // Every client packet reaches the draining worker, as the kernel would
+    // go on sending it a peer's under SO_REUSEPORT; replies from either
+    // worker reach the client from the relay's one address.
+    var relay: RebindingRelay = .{
+        .front = try RebindingRelay.udp(relay_port),
+        .up = .{ try RebindingRelay.udp(0), try RebindingRelay.udp(0) },
+        .targets = .{ try net.Address.parseIp4("127.0.0.1", ports[0]), try net.Address.parseIp4("127.0.0.1", ports[1]) },
+    };
+    defer for ([_]posix.socket_t{ relay.front, relay.up[0], relay.up[1] }) |fd| sys.close(fd);
+
+    for (router.workers) |w| w.thread = try std.Thread.spawn(.{}, SteerWorker.run, .{w});
+    const relay_thread = try std.Thread.spawn(.{}, RebindingRelay.run, .{&relay});
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var client_handler = CheckingClient{};
+    var client = try Client(CheckingClient).init(testing.allocator, &client_handler, .{
+        .port = relay_port,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    client.start();
+    const got = runUntil(&loop, &client_handler, CheckingClient.done, 10_000);
+
+    client.stop();
+    runUntil(&loop, &client, Client(CheckingClient).isStopped, 5000) catch {};
+    client.deinit();
+    for (router.workers) |w| {
+        w.quit.store(true, .release);
+        w.wakeup.notify() catch {};
+    }
+    for (router.workers) |w| w.thread.join();
+    relay.quit.store(true, .release);
+    relay_thread.join();
+
+    try got;
+    try testing.expectEqualStrings("hello", client_handler.body[0..client_handler.received]);
+    try testing.expect(router.handed_new.load(.monotonic) > 0);
+    // The rest came to the draining worker too, and went on by its ids.
+    try testing.expect(router.forwarded.load(.monotonic) > 0);
+    try testing.expectEqual(router.handed_new.load(.monotonic) + router.forwarded.load(.monotonic), router.workers[1].injected);
+    try testing.expectEqual(@as(usize, 0), router.workers[0].injected);
+    try testing.expectEqual(@as(usize, 0), router.workers[0].server.conn_mgr.connectionCount());
 }
 
 test "client: run() returns once its connection closes on its own" {
