@@ -10,8 +10,10 @@
 //! without locks.
 //!
 //! Requests: `Upgrade: websocket` goes to `onWsUpgrade` when the handler has
-//! it; other GET and HEAD requests to `onHttpRequest`, if it has that. What
-//! neither answers, of any method and body included, goes with the rest of
+//! it; other GET and HEAD requests to `onHttpRequest`, if it has that. Then
+//! any request to `onHttpHead`, if it has that, with its body streamed
+//! (`http/exchange.zig`), or, with `onHttpExchange`, whole. What none of
+//! them answers, of any method and body included, goes with the rest of
 //! its connection to the handler's `onRawOpen` as bytes, if it has that
 //! (`RawConn`), for a host to serve with an HTTP/1.1 implementation of its
 //! own. Without it, the rest go to `static_dir` (404 without one), methods
@@ -55,6 +57,8 @@ pub const WsHandoverError = conn_mod.HandoverError;
 pub const WsMessageKind = websocket.MessageKind;
 pub const WsCloseCode = websocket.CloseCode;
 pub const mimeType = conn_mod.mimeType;
+pub const Exchange = @import("../http/exchange.zig").Exchange;
+const Mailbox = @import("../mailbox.zig").Mailbox;
 
 pub const Config = struct {
     /// Directory GET and HEAD are served from. Null serves none: requests
@@ -144,6 +148,16 @@ pub const Handlers = struct {
     raw: ?RawHandlers = null,
     /// Null when the handler answers no request later.
     exchange: ?ExchangeHandlers = null,
+    /// Null when the handler takes no request at its head.
+    stream: ?StreamHandlers = null,
+};
+
+pub const StreamHandlers = struct {
+    head: *const fn (ctx: *anyopaque, ex: *Exchange) void,
+    body: *const fn (ctx: *anyopaque, ex: *Exchange, data: []const u8) void,
+    end: *const fn (ctx: *anyopaque, ex: *Exchange) void,
+    gone: *const fn (ctx: *anyopaque, ex: *Exchange) void,
+    writable: ?*const fn (ctx: *anyopaque, ex: *Exchange) void = null,
 };
 
 pub const ExchangeHandlers = struct {
@@ -166,6 +180,7 @@ pub const RawHandlers = struct {
 /// `onRawClose(self, raw)` and optionally `onRawDrain(self, raw)` and
 /// `onRawEnd(self, raw)`.
 pub fn handlersFor(comptime H: type, handler: *H) Handlers {
+    comptime checkHeads(H);
     const S = struct {
         fn upgrade(ctx: *anyopaque, req: *WsRequest, path: []const u8) void {
             H.onWsUpgrade(@ptrCast(@alignCast(ctx)), req, path);
@@ -210,6 +225,21 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
         fn exchangeGone(ctx: *anyopaque, ex: *HttpExchange) void {
             H.onHttpExchangeGone(@ptrCast(@alignCast(ctx)), ex);
         }
+        fn httpHead(ctx: *anyopaque, ex: *Exchange) void {
+            H.onHttpHead(@ptrCast(@alignCast(ctx)), ex);
+        }
+        fn httpBody(ctx: *anyopaque, ex: *Exchange, data: []const u8) void {
+            H.onHttpBody(@ptrCast(@alignCast(ctx)), ex, data);
+        }
+        fn httpEnd(ctx: *anyopaque, ex: *Exchange) void {
+            H.onHttpEnd(@ptrCast(@alignCast(ctx)), ex);
+        }
+        fn httpGone(ctx: *anyopaque, ex: *Exchange) void {
+            H.onHttpGone(@ptrCast(@alignCast(ctx)), ex);
+        }
+        fn httpWritable(ctx: *anyopaque, ex: *Exchange) void {
+            H.onHttpWritable(@ptrCast(@alignCast(ctx)), ex);
+        }
     };
     return .{
         .ctx = handler,
@@ -226,7 +256,36 @@ pub fn handlersFor(comptime H: type, handler: *H) Handlers {
             .end = if (@hasDecl(H, "onRawEnd")) S.rawEnd else null,
         } else null,
         .exchange = if (@hasDecl(H, "onHttpExchange")) .{ .offer = S.exchangeOffer, .gone = S.exchangeGone } else null,
+        .stream = if (@hasDecl(H, "onHttpHead")) .{
+            .head = S.httpHead,
+            .body = S.httpBody,
+            .end = S.httpEnd,
+            .gone = S.httpGone,
+            .writable = if (@hasDecl(H, "onHttpWritable")) S.httpWritable else null,
+        } else null,
     };
+}
+
+/// A handler takes requests at their head with all of `onHttpHead`,
+/// `onHttpBody`, `onHttpEnd` and `onHttpGone`, and then takes every one: no
+/// other tier may share them.
+fn checkHeads(comptime H: type) void {
+    const names = [_][]const u8{ "onHttpHead", "onHttpBody", "onHttpEnd", "onHttpGone" };
+    var has = 0;
+    for (names) |n| if (@hasDecl(H, n)) {
+        has += 1;
+    };
+    if (has == 0 and !@hasDecl(H, "onHttpWritable")) return;
+    if (has != names.len) @compileError("a handler that takes requests at their head needs onHttpHead, onHttpBody, onHttpEnd and onHttpGone");
+    if (@hasDecl(H, "onHttpExchange") or @hasDecl(H, "onHttpRequest")) {
+        @compileError("onHttpHead takes every request: drop onHttpExchange and onHttpRequest");
+    }
+    for ([_][]const u8{ "onHttpHead", "onHttpEnd", "onHttpGone", "onHttpWritable" }) |n| if (@hasDecl(H, n) and @TypeOf(@field(H, n)) != fn (*H, *Exchange) void) {
+        @compileError(n ++ " must be fn (self: *Handler, ex: *Exchange) void");
+    };
+    if (@TypeOf(H.onHttpBody) != fn (*H, *Exchange, []const u8) void) {
+        @compileError("onHttpBody must be fn (self: *Handler, ex: *Exchange, data: []const u8) void");
+    }
 }
 
 pub const Server = struct {
@@ -243,6 +302,8 @@ pub const Server = struct {
     loop: *xev.Loop = undefined,
     timers: timers.Timers = undefined,
     handlers: Handlers = undefined,
+    /// Its exchanges' (`Exchange.mailbox`).
+    mailbox: Mailbox,
     next_id: *u64 = undefined,
     tls_conf: tls_server.Config = undefined,
 
@@ -276,6 +337,7 @@ pub const Server = struct {
             .listen_fd = fd,
             .listen_file = xev.File.initFd(fd),
             .unix_addr = unix_addr,
+            .mailbox = try Mailbox.init(),
             .certs = if (config.tls) opts.certs else null,
             // Our own key: a QUIC ticket must not resume a TCP session.
             .ticket_key = config.ticket_key orelse undefined,
@@ -295,6 +357,7 @@ pub const Server = struct {
         self.loop = loop;
         self.handlers = handlers;
         self.next_id = id_counter orelse &self.own_next_id;
+        self.mailbox.loop = loop;
         self.timers = try timers.Timers.init(loop);
         if (self.certs) |c| {
             const entries = if (c.entries.len > 0) c.entries else blk: {
@@ -389,7 +452,7 @@ pub const Server = struct {
     pub fn isStopped(self: *const Server) bool {
         if (!self.started) return true;
         return self.stopping and self.conn_count == 0 and self.timers.isIdle() and
-            self.poll_c.state() == .dead and self.poll_cancel_c.state() == .dead;
+            self.poll_c.state() == .dead and self.poll_cancel_c.state() == .dead and !self.mailbox.watching;
     }
 
     /// Frees everything. On a loop that will run again, `isStopped` must be
@@ -407,6 +470,7 @@ pub const Server = struct {
             }
             self.timers.deinit();
         }
+        self.mailbox.deinit();
         self.closeListenFd();
     }
 

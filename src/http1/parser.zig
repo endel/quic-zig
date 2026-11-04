@@ -13,10 +13,8 @@
 
 const std = @import("std");
 
-pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
+/// The same as HTTP/3's, so a request's headers pass between them as they are.
+pub const Header = @import("../http/exchange.zig").Header;
 
 pub const Version = enum {
     http10,
@@ -318,7 +316,154 @@ pub fn reason(status: u16) []const u8 {
     };
 }
 
+/// A request body as it arrives, framed by Content-Length or chunked.
+pub const BodyDecoder = struct {
+    chunked: bool,
+    remaining: u64 = 0,
+    state: ChunkState = .size,
+    digits: u8 = 0,
+    ext_bytes: u16 = 0,
+    trailer_bytes: u16 = 0,
+    done: bool = false,
+
+    const ChunkState = enum { size, ext, size_lf, data, data_cr, data_lf, trailer_start, trailer, trailer_lf, final_lf };
+
+    pub const Step = struct { consumed: usize, data: []const u8 };
+
+    pub fn of(head: *const RequestHead) BodyDecoder {
+        if (head.chunked) return .{ .chunked = true };
+        const n = head.content_length orelse 0;
+        return .{ .chunked = false, .remaining = n, .done = n == 0 };
+    }
+
+    /// How much of `input` it took, and at most one run of body bytes in it.
+    pub fn decode(self: *BodyDecoder, input: []const u8) error{BadChunk}!Step {
+        if (self.done) return .{ .consumed = 0, .data = &.{} };
+        if (!self.chunked) {
+            const n: usize = @intCast(@min(self.remaining, input.len));
+            self.remaining -= n;
+            self.done = self.remaining == 0;
+            return .{ .consumed = n, .data = input[0..n] };
+        }
+        var i: usize = 0;
+        while (i < input.len) {
+            const c = input[i];
+            switch (self.state) {
+                .size => {
+                    if (std.fmt.charToDigit(c, 16)) |d| {
+                        if (self.digits == 16) return error.BadChunk;
+                        self.remaining = (self.remaining << 4) | d;
+                        self.digits += 1;
+                    } else |_| {
+                        if (self.digits == 0) return error.BadChunk;
+                        self.state = switch (c) {
+                            ';', ' ', '\t' => .ext,
+                            '\r' => .size_lf,
+                            else => return error.BadChunk,
+                        };
+                    }
+                    i += 1;
+                },
+                .ext => {
+                    if (c == '\n') return error.BadChunk;
+                    if (c == '\r') self.state = .size_lf else {
+                        self.ext_bytes += 1;
+                        if (self.ext_bytes > 4096) return error.BadChunk;
+                    }
+                    i += 1;
+                },
+                .size_lf => {
+                    if (c != '\n') return error.BadChunk;
+                    i += 1;
+                    self.digits = 0;
+                    self.ext_bytes = 0;
+                    self.state = if (self.remaining == 0) .trailer_start else .data;
+                },
+                .data => {
+                    const n: usize = @intCast(@min(self.remaining, input.len - i));
+                    self.remaining -= n;
+                    if (self.remaining == 0) self.state = .data_cr;
+                    return .{ .consumed = i + n, .data = input[i .. i + n] };
+                },
+                .data_cr => {
+                    if (c != '\r') return error.BadChunk;
+                    self.state = .data_lf;
+                    i += 1;
+                },
+                .data_lf => {
+                    if (c != '\n') return error.BadChunk;
+                    self.state = .size;
+                    i += 1;
+                },
+                .trailer_start => {
+                    if (c == '\n') return error.BadChunk;
+                    self.state = if (c == '\r') .final_lf else .trailer;
+                    i += 1;
+                },
+                .trailer => {
+                    if (c == '\n') return error.BadChunk;
+                    if (c == '\r') self.state = .trailer_lf;
+                    self.trailer_bytes += 1;
+                    if (self.trailer_bytes > 8192) return error.BadChunk;
+                    i += 1;
+                },
+                .trailer_lf => {
+                    if (c != '\n') return error.BadChunk;
+                    self.state = .trailer_start;
+                    i += 1;
+                },
+                .final_lf => {
+                    if (c != '\n') return error.BadChunk;
+                    self.done = true;
+                    return .{ .consumed = i + 1, .data = &.{} };
+                },
+            }
+        }
+        return .{ .consumed = i, .data = &.{} };
+    }
+};
+
 const testing = std.testing;
+
+fn decodeAll(dec: *BodyDecoder, input: []const u8, step: usize, out: *std.ArrayList(u8)) !void {
+    var pos: usize = 0;
+    while (pos < input.len and !dec.done) {
+        var piece = input[pos..@min(pos + step, input.len)];
+        while (piece.len > 0 and !dec.done) {
+            const s = try dec.decode(piece);
+            try out.appendSlice(testing.allocator, s.data);
+            piece = piece[s.consumed..];
+            pos += s.consumed;
+            if (s.consumed == 0) break;
+        }
+    }
+}
+
+test "a chunked body decodes however it's split" {
+    const body = "4\r\nWiki\r\n5;ext=1\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\nTrailer: x\r\n\r\n";
+    for (1..body.len + 1) |step| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        var dec: BodyDecoder = .{ .chunked = true };
+        try decodeAll(&dec, body, step, &out);
+        try testing.expect(dec.done);
+        try testing.expectEqualStrings("Wikipedia in\r\n\r\nchunks.", out.items);
+    }
+}
+
+test "a bad chunk is refused; a sized body stops at its length" {
+    var a: BodyDecoder = .{ .chunked = true };
+    try testing.expectError(error.BadChunk, a.decode("zz\r\n"));
+    var b: BodyDecoder = .{ .chunked = true };
+    try testing.expectError(error.BadChunk, b.decode("11111111111111111\r\n"));
+    var c: BodyDecoder = .{ .chunked = true };
+    const s = try c.decode("1\r\nab");
+    try testing.expectEqualStrings("a", s.data);
+    try testing.expectError(error.BadChunk, c.decode("1\r\nab"[s.consumed..]));
+    var d: BodyDecoder = .{ .chunked = false, .remaining = 3 };
+    try testing.expectEqualStrings("abc", (try d.decode("abcdef")).data);
+    try testing.expect(d.done);
+}
 
 test "parse simple request" {
     var hb: [16]Header = undefined;

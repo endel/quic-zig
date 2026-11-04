@@ -1,6 +1,7 @@
 // Test entry point: imports all library modules to discover their tests.
 test {
     _ = @import("quic/connection.zig");
+    _ = @import("mailbox.zig");
     _ = @import("quic/packet.zig");
     _ = @import("quic/protocol.zig");
     _ = @import("quic/frame.zig");

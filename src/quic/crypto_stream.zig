@@ -47,7 +47,7 @@ pub const CryptoStream = struct {
 
     /// Handle an incoming CRYPTO frame.
     pub fn handleCryptoFrame(self: *CryptoStream, offset: u64, data: []const u8) !void {
-        std.log.info("CryptoStream.handleCryptoFrame: offset={d} len={d}", .{ offset, data.len });
+        std.log.debug("CryptoStream.handleCryptoFrame: offset={d} len={d}", .{ offset, data.len });
         // RFC 9000 7.5: CRYPTO frames are not flow controlled, so this ceiling
         // is the only thing bounding reassembly memory before the handshake
         // completes — and the peer is unauthenticated until it does. Measured

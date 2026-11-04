@@ -3,6 +3,20 @@
 Notable changes to quic-zig. Versions follow [semantic versioning](https://semver.org);
 `Unreleased` collects what has landed on `main` since the last tag.
 
+## Unreleased
+
+### Added
+
+- `onHttpHead`, `onHttpBody`, `onHttpEnd` and `onHttpGone`: a handler takes
+  each request at its head, its body as it arrives (sized or chunked), and
+  answers in one go or streamed (`event_loop.Exchange`), over HTTP/1.1 and
+  HTTP/3 alike. `onHttpWritable` paces a long answer.
+- `quic.Mailbox`: work handed back to a loop's thread from other threads.
+  An exchange carries its loop's (`Exchange.mailbox`); a server stopping
+  waits for what's owed.
+- `sys.connect` and `sys.connectState`: nonblocking TCP connects on every
+  platform, for TCP clients.
+
 ## 0.6.0
 
 Ready for the open internet: the fixes from a security review, a cap on each

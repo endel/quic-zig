@@ -83,6 +83,16 @@ const WSABUF = extern struct {
     buf: [*]const u8,
 };
 
+const fd_set = extern struct {
+    fd_count: u32,
+    fd_array: [64]socket_t,
+};
+
+const timeval = extern struct {
+    tv_sec: i32,
+    tv_usec: i32,
+};
+
 extern "bcrypt" fn BCryptGenRandom(algorithm: ?*anyopaque, buf: [*]u8, len: u32, flags: u32) callconv(.winapi) i32;
 extern "kernel32" fn SwitchToThread() callconv(.winapi) i32;
 extern "kernel32" fn CancelIoEx(handle: fd_t, overlapped: ?*anyopaque) callconv(.winapi) i32;
@@ -97,6 +107,8 @@ const ws2 = struct {
     extern "ws2_32" fn accept(s: socket_t, addr: ?*sockaddr, addrlen: ?*i32) callconv(.winapi) socket_t;
     extern "ws2_32" fn send(s: socket_t, buf: [*]const u8, len: i32, flags: i32) callconv(.winapi) i32;
     extern "ws2_32" fn recv(s: socket_t, buf: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(s: socket_t, name: *const sockaddr, namelen: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn select(nfds: i32, read: ?*fd_set, write: ?*fd_set, except: ?*fd_set, timeout: *const timeval) callconv(.winapi) i32;
     extern "ws2_32" fn sendto(s: socket_t, buf: [*]const u8, len: i32, flags: i32, to: ?*const sockaddr, tolen: i32) callconv(.winapi) i32;
     extern "ws2_32" fn recvfrom(s: socket_t, buf: [*]u8, len: i32, flags: i32, from: ?*sockaddr, fromlen: ?*i32) callconv(.winapi) i32;
     extern "ws2_32" fn getsockname(s: socket_t, name: *sockaddr, namelen: *i32) callconv(.winapi) i32;
@@ -197,6 +209,28 @@ pub fn setNonBlocking(s: socket_t) void {
 
 pub fn wouldBlock() bool {
     return ws2.WSAGetLastError() == .WSAEWOULDBLOCK;
+}
+
+pub fn interrupted() bool {
+    return ws2.WSAGetLastError() == .WSAEINTR;
+}
+
+pub fn recv(s: socket_t, dest: []u8) isize {
+    return ws2.recv(s, dest.ptr, len32(dest.len), 0);
+}
+
+pub fn connect(s: socket_t, addr: *const sockaddr, len: socklen_t) bool {
+    return ws2.connect(s, addr, @intCast(len)) == 0 or wouldBlock();
+}
+
+/// `select`, as `WSAPoll` misses a failed connect before Windows 10 2004.
+pub fn connectState(s: socket_t) sys.ConnectState {
+    var writable: fd_set = .{ .fd_count = 1, .fd_array = undefined };
+    writable.fd_array[0] = s;
+    var failed = writable;
+    const now: timeval = .{ .tv_sec = 0, .tv_usec = 0 };
+    if (ws2.select(0, null, &writable, &failed, &now) <= 0) return .pending;
+    return if (failed.fd_count != 0) .failed else .connected;
 }
 
 pub fn send(s: socket_t, bytes: []const u8) isize {

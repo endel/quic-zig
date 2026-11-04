@@ -15,6 +15,7 @@ const tls_client = @import("../tls/client.zig");
 const test_certs = @import("../tls/test_certs.zig");
 const http1 = @import("server.zig");
 const websocket = @import("websocket.zig");
+const parser = @import("parser.zig");
 const socket = @import("socket.zig");
 
 const xev = event_loop.Xev;
@@ -1759,4 +1760,183 @@ test "http1: an exchange over TLS, answered after its callback" {
     h.handler.pending = null;
     try testing.expect(std.mem.startsWith(u8, try h.head(&c), "HTTP/1.1 200 OK\r\n"));
     try testing.expectEqualStrings("ok", try h.bytes(&c, 2));
+}
+
+/// Takes requests at their head (`onHttpHead`), each body streamed in.
+const HeadHandler = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+
+    heads: u32 = 0,
+    ends: u32 = 0,
+    gone: u32 = 0,
+    writable: u32 = 0,
+    mode: enum { echo, later, stream } = .echo,
+    body: std.ArrayList(u8) = .empty,
+    pending: ?*event_loop.Exchange = null,
+    sent: usize = 0,
+
+    const stream_total = 1 << 20;
+
+    pub fn onHttpHead(self: *HeadHandler, ex: *event_loop.Exchange) void {
+        self.heads += 1;
+        self.body.clearRetainingCapacity();
+        if (std.mem.eql(u8, ex.target, "/pass")) return ex.pass();
+        if (std.mem.eql(u8, ex.target, "/early")) return ex.respond(413, &.{}, "too big\n");
+        self.mode = if (std.mem.eql(u8, ex.target, "/stream")) .stream else if (std.mem.eql(u8, ex.target, "/later")) .later else .echo;
+    }
+
+    pub fn onHttpBody(self: *HeadHandler, _: *event_loop.Exchange, data: []const u8) void {
+        self.body.appendSlice(testing.allocator, data) catch unreachable;
+    }
+
+    pub fn onHttpEnd(self: *HeadHandler, ex: *event_loop.Exchange) void {
+        self.ends += 1;
+        switch (self.mode) {
+            .echo => ex.respond(200, &.{.{ .name = "X-Echo", .value = "1" }}, self.body.items),
+            .later => self.pending = ex,
+            .stream => {
+                ex.sendHead(200, &.{}, null) catch return;
+                self.pending = ex;
+                self.pump();
+            },
+        }
+    }
+
+    pub fn onHttpGone(self: *HeadHandler, ex: *event_loop.Exchange) void {
+        self.gone += 1;
+        if (self.pending == ex) self.pending = null;
+    }
+
+    pub fn onHttpWritable(self: *HeadHandler, ex: *event_loop.Exchange) void {
+        self.writable += 1;
+        if (self.pending == ex) self.pump();
+    }
+
+    /// Writes until a quarter MiB waits, then again once it drains.
+    fn pump(self: *HeadHandler) void {
+        const ex = self.pending orelse return;
+        var chunk: [16 * 1024]u8 = undefined;
+        while (self.sent < stream_total) {
+            if (ex.bufferedAmount() >= 256 * 1024) return;
+            const n = @min(chunk.len, stream_total - self.sent);
+            for (chunk[0..n], self.sent..) |*b, off| b.* = @truncate(off *% 31);
+            ex.write(chunk[0..n]) catch return;
+            self.sent += n;
+        }
+        self.pending = null;
+        ex.finish();
+    }
+};
+
+const HeadHarness = HarnessFor(HeadHandler);
+
+fn headEnded(h: *HeadHarness) bool {
+    return h.handler.pending != null;
+}
+
+test "http1: onHttpHead takes a request at its head, its body sized or chunked, then onHttpEnd" {
+    var h: HeadHarness = undefined;
+    try h.init(29550, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.body.deinit(testing.allocator);
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+
+    try c.send("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello" ++
+        "POST /b HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\n\r\n");
+    const first = try h.head(&c);
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, first, "X-Echo: 1\r\nContent-Length: 5\r\n") != null);
+    try testing.expectEqualStrings("hello", try h.bytes(&c, 5));
+    _ = try h.head(&c);
+    try testing.expectEqualStrings("Wikipedia", try h.bytes(&c, 9));
+    try testing.expectEqual(@as(u32, 2), h.handler.ends);
+    try testing.expectEqual(@as(u32, 0), h.handler.gone);
+}
+
+test "http1: an answer without a length goes chunked, paced by onHttpWritable" {
+    var h: HeadHarness = undefined;
+    try h.init(29551, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.body.deinit(testing.allocator);
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+
+    try c.send("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, try h.head(&c), "Transfer-Encoding: chunked\r\n") != null);
+    var dec: parser.BodyDecoder = .{ .chunked = true };
+    var got: usize = 0;
+    var wrong: usize = 0;
+    const deadline = sys.nanoTimestamp() + 20 * std.time.ns_per_s;
+    while (!dec.done) {
+        if (sys.nanoTimestamp() > deadline) return error.Timeout;
+        try h.step();
+        c.poll();
+        while (c.pos < c.in.items.len and !dec.done) {
+            const s = try dec.decode(c.in.items[c.pos..]);
+            for (s.data, got..) |b, off| {
+                if (b != @as(u8, @truncate(off *% 31))) wrong += 1;
+            }
+            got += s.data.len;
+            c.pos += s.consumed;
+            if (s.consumed == 0) break;
+        }
+    }
+    try testing.expectEqual(@as(usize, HeadHandler.stream_total), got);
+    try testing.expectEqual(@as(usize, 0), wrong);
+    try testing.expect(h.handler.writable > 0);
+}
+
+test "http1: an answer before the body ends closes after it; Expect gets 100 Continue; a pass reaches the 404" {
+    var h: HeadHarness = undefined;
+    try h.init(29552, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.body.deinit(testing.allocator);
+
+    var a: TestClient = .{};
+    defer a.deinit();
+    try a.connect(h.port, false);
+    try a.send("POST /early HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\n\r\nsome");
+    try testing.expect(std.mem.startsWith(u8, try h.head(&a), "HTTP/1.1 413 "));
+    try h.eof(&a);
+
+    var b: TestClient = .{};
+    defer b.deinit();
+    try b.connect(h.port, false);
+    try b.send("PUT /later HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, try h.head(&b), "HTTP/1.1 100 Continue"));
+    try b.send("abc");
+    try h.spinUntil(&h, headEnded);
+    try testing.expectEqualStrings("abc", h.handler.body.items);
+    h.handler.pending.?.respond(201, &.{}, "");
+    h.handler.pending = null;
+    try testing.expect(std.mem.startsWith(u8, try h.head(&b), "HTTP/1.1 201 Created\r\n"));
+
+    try b.send("GET /pass HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, try h.head(&b), "HTTP/1.1 404 "));
+}
+
+test "http1: a peer that leaves mid-body reaches onHttpGone" {
+    var h: HeadHarness = undefined;
+    try h.init(29553, .{ .tls = false });
+    defer h.deinit();
+    defer h.handler.body.deinit(testing.allocator);
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connect(h.port, false);
+    try c.send("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n0123456789");
+    const W = struct {
+        fn heard(hh: *HeadHarness) bool {
+            return hh.handler.body.items.len == 10;
+        }
+        fn gone(hh: *HeadHarness) bool {
+            return hh.handler.gone == 1;
+        }
+    };
+    try h.spinUntil(&h, W.heard);
+    c.abort();
+    try h.spinUntil(&h, W.gone);
+    try testing.expectEqual(@as(u32, 0), h.handler.ends);
 }

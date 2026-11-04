@@ -16,6 +16,9 @@ const websocket = @import("websocket.zig");
 const socket = @import("socket.zig");
 const timers = @import("timers.zig");
 const Server = @import("server.zig").Server;
+const StreamHandlers = @import("server.zig").StreamHandlers;
+const http = @import("../http/exchange.zig");
+const Exchange = http.Exchange;
 
 const log = std.log.scoped(.http1);
 
@@ -51,6 +54,9 @@ const Phase = enum {
     /// A request offered to the handler (`HttpExchange`), waiting on its
     /// answer; input after it waits too.
     exchange,
+    /// A request offered at its head (`onHttpHead`): its body goes to the
+    /// handler as it arrives; input after the body waits for the answer.
+    stream,
     /// Flushing, lingering or aborting; nothing more is read or written.
     closing,
     /// A WebSocket handed over (`WsConn.handOver`), waiting for its socket
@@ -500,6 +506,20 @@ pub const RawConn = struct {
     }
 };
 
+/// The request `onHttpHead` was offered: its body as it comes in, and how
+/// the answer goes out.
+const Stream = struct {
+    ex: Exchange = .idle,
+    body: parser.BodyDecoder = .{ .chunked = false, .done = true },
+    chunked: bool = false,
+    /// A write left `socket.low_water` or more queued: `onHttpWritable` is owed.
+    full: bool = false,
+
+    fn live(s: *const Stream) bool {
+        return s.ex.answer != .done;
+    }
+};
+
 pub const Conn = struct {
     server: *Server,
     sock: socket.Socket(Conn),
@@ -534,6 +554,7 @@ pub const Conn = struct {
     /// The request at the start of the input was passed: serve it without
     /// offering it again.
     skip_exchange: bool = false,
+    stream: Stream = .{},
 
     // The server's list.
     prev: ?*Conn = null,
@@ -633,6 +654,9 @@ pub const Conn = struct {
             // Half-closed after its request: it still gets the answer, then
             // the connection ends.
             .exchange => self.keep_alive = false,
+            .stream => if (self.stream.body.done) {
+                self.keep_alive = false;
+            } else self.finish(websocket.CloseCode.abnormal, .abort),
             // A failed write: the new server reads the end.
             .moving => {},
         }
@@ -644,26 +668,35 @@ pub const Conn = struct {
             // Output drained after afterInput paused for it: answer what was
             // left buffered, then read again. In that order, so a message
             // that hands the WebSocket over finds no read armed.
-            .head, .ws_open, .ws_closing => {
-                if (!self.sock.read_paused) return;
-                self.sock.read_paused = false;
-                if (self.unreadLen() > 0) self.process();
-                self.sock.startReading();
-            },
+            .head, .ws_open, .ws_closing => self.readAgain(),
             .raw => {
                 if (self.raw.full) {
                     self.raw.full = false;
                     const h = self.server.handlers;
                     if (h.raw.?.drain) |drain| drain(h.ctx, &self.raw);
                 }
-                if (self.phase != .raw or !self.sock.read_paused or self.raw.paused) return;
-                self.sock.read_paused = false;
-                if (self.unreadLen() > 0) self.process();
-                self.sock.startReading();
+                if (self.phase == .raw and !self.raw.paused) self.readAgain();
+            },
+            .stream => {
+                if (self.stream.full) {
+                    self.stream.full = false;
+                    const h = self.server.handlers;
+                    if (h.stream.?.writable) |writable| writable(h.ctx, &self.stream.ex);
+                }
+                if (self.phase == .stream) self.readAgain();
             },
             // Its answer resumes reading, once it's written.
             .exchange, .closing, .moving => {},
         }
+    }
+
+    /// Reading stopped while output drained: answer what was left buffered,
+    /// then read on.
+    fn readAgain(self: *Conn) void {
+        if (!self.sock.read_paused) return;
+        self.sock.read_paused = false;
+        if (self.unreadLen() > 0) self.process();
+        self.sock.startReading();
     }
 
     /// A WebSocket handed over has its socket off the loop: it leaves for
@@ -702,8 +735,8 @@ pub const Conn = struct {
             .moving => {},
             // Never set: the handler keeps its own time.
             .raw, .exchange => {},
-            // Handshake, idle keep-alive, a stalled response, or linger.
-            .head, .static_body, .closing => self.finish(websocket.CloseCode.abnormal, .abort),
+            // Handshake, idle keep-alive, a stalled response or body, or linger.
+            .head, .static_body, .stream, .closing => self.finish(websocket.CloseCode.abnormal, .abort),
         }
     }
 
@@ -758,6 +791,11 @@ pub const Conn = struct {
     }
 
     fn notifyClose(self: *Conn, code: u16, reason: []const u8) void {
+        if (self.stream.live()) {
+            self.stream.ex.answer = .done;
+            const h = self.server.handlers;
+            h.stream.?.gone(h.ctx, &self.stream.ex);
+        }
         if (self.exchange.pending) {
             self.exchange.pending = false;
             const h = self.server.handlers;
@@ -806,6 +844,7 @@ pub const Conn = struct {
                 .head => self.processHead(buf[pos..]),
                 .ws_open, .ws_closing => self.processFrame(buf[pos..]),
                 .raw => self.processRaw(buf[pos..]),
+                .stream => self.processStreamBody(buf[pos..]),
                 .static_body, .exchange, .closing, .moving => null,
             } orelse break;
             pos += used;
@@ -819,7 +858,7 @@ pub const Conn = struct {
     }
 
     fn afterInput(self: *Conn) void {
-        if (self.phase == .static_body and self.unreadLen() > max_pipelined_input) self.sock.pauseRead();
+        if ((self.phase == .static_body or self.phase == .stream) and self.unreadLen() > max_pipelined_input) self.sock.pauseRead();
         // Resumed by onSocketWritable once the output drains.
         if (self.sock.buffered() > socket.high_water) self.sock.pauseRead();
     }
@@ -865,6 +904,7 @@ pub const Conn = struct {
             onRequest(h.ctx, &req, head.target);
             if (req.answered) return parsed.len;
         };
+        if (h.stream) |st| if (self.startStream(st, head) == .taken) return parsed.len;
         if (h.exchange) |ex| if (!self.skip_exchange and offerable(head)) {
             const total = parsed.len + @as(usize, @intCast(head.content_length orelse 0));
             if (buf.len < total) {
@@ -931,6 +971,140 @@ pub const Conn = struct {
         if (!self.head_only) self.output(body);
         self.sock.uncork();
         self.responseDone();
+    }
+
+    /// Offers the request to `onHttpHead`; its slices are valid only there.
+    fn startStream(self: *Conn, st: StreamHandlers, head: *const parser.RequestHead) enum { taken, passed } {
+        self.phase = .stream;
+        self.stream = .{
+            .body = .of(head),
+            .ex = .{
+                .method = head.method,
+                .target = head.target,
+                .headers = head.headers,
+                .content_length = if (head.chunked) null else head.content_length orelse 0,
+                .head_only = self.head_only,
+                .mailbox = &self.server.mailbox,
+                .impl = self,
+                .vtable = &stream_vtable,
+            },
+        };
+        const s = &self.stream;
+        st.head(self.server.handlers.ctx, &s.ex);
+        s.ex.method = "";
+        s.ex.target = "";
+        s.ex.headers = &.{};
+        if (s.ex.passed) {
+            s.ex.answer = .done;
+            self.phase = .head;
+            return .passed;
+        }
+        if (!s.live()) return .taken;
+        if (s.body.done) {
+            self.endStream();
+        } else {
+            if (head.expect_continue) self.output("HTTP/1.1 100 Continue\r\n\r\n");
+            self.server.timers.set(&self.deadline, io_timeout_ms);
+        }
+        return .taken;
+    }
+
+    /// Hands the body in `buf` to `onHttpBody`; nothing past its end.
+    fn processStreamBody(self: *Conn, buf: []u8) ?usize {
+        const s = &self.stream;
+        if (s.body.done or buf.len == 0) return null;
+        const step = s.body.decode(buf) catch {
+            self.finish(websocket.CloseCode.abnormal, .abort);
+            return null;
+        };
+        self.server.timers.set(&self.deadline, io_timeout_ms);
+        const h = self.server.handlers;
+        if (step.data.len > 0) h.stream.?.body(h.ctx, &s.ex, step.data);
+        if (s.live() and s.body.done) self.endStream();
+        return if (step.consumed > 0) step.consumed else null;
+    }
+
+    fn endStream(self: *Conn) void {
+        self.server.timers.clear(&self.deadline); // the handler's time now
+        const h = self.server.handlers;
+        h.stream.?.end(h.ctx, &self.stream.ex);
+    }
+
+    const stream_vtable: Exchange.VTable = .{
+        .peer = streamPeer,
+        .head = streamHead,
+        .body = streamBody,
+        .end = streamEnd,
+        .reset = streamReset,
+        .buffered = streamBuffered,
+        .cork = streamCork,
+    };
+
+    fn streamConn(ptr: *anyopaque) *Conn {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn streamPeer(ptr: *anyopaque) *const posix.sockaddr.storage {
+        return &streamConn(ptr).peer;
+    }
+
+    fn streamHead(ptr: *anyopaque, status: u16, headers: []const Header, framing: Exchange.Framing) Exchange.WriteError!void {
+        const self = streamConn(ptr);
+        // Answered before its body is in: no request can follow on this connection.
+        if (!self.stream.body.done) self.keep_alive = false;
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.print("HTTP/1.1 {d} {s}\r\n", .{ status, parser.reason(status) }) catch return error.Closed;
+        for (headers) |hd| if (!http.transportsOwn(hd.name)) w.print("{s}: {s}\r\n", .{ hd.name, hd.value }) catch return error.Closed;
+        switch (framing) {
+            .none => {},
+            .length => |n| w.print("Content-Length: {d}\r\n", .{n}) catch return error.Closed,
+            .unknown => if (self.http10) {
+                self.keep_alive = false; // the body ends with the connection
+            } else {
+                w.writeAll("Transfer-Encoding: chunked\r\n") catch return error.Closed;
+                self.stream.chunked = !self.head_only;
+            },
+        }
+        self.writeCommonHeaders(&w, !self.keep_alive) catch return error.Closed;
+        w.writeAll("\r\n") catch return error.Closed;
+        self.output(w.buffered());
+        if (!self.sock.isOpen()) return error.Closed;
+    }
+
+    fn streamBody(ptr: *anyopaque, data: []const u8) Exchange.WriteError!void {
+        const self = streamConn(ptr);
+        if (self.stream.chunked) {
+            var size: [20]u8 = undefined;
+            self.sock.cork();
+            self.output(std.fmt.bufPrint(&size, "{x}\r\n", .{data.len}) catch unreachable);
+            self.output(data);
+            self.output("\r\n");
+            self.sock.uncork();
+        } else {
+            self.output(data);
+        }
+        if (!self.sock.isOpen()) return error.Closed;
+        if (self.sock.buffered() >= socket.low_water) self.stream.full = true;
+    }
+
+    fn streamEnd(ptr: *anyopaque) void {
+        const self = streamConn(ptr);
+        if (self.stream.chunked) self.output("0\r\n\r\n");
+        self.responseDone();
+    }
+
+    fn streamReset(ptr: *anyopaque) void {
+        streamConn(ptr).enterClosing(.abort);
+    }
+
+    fn streamBuffered(ptr: *anyopaque) usize {
+        return streamConn(ptr).sock.buffered();
+    }
+
+    fn streamCork(ptr: *anyopaque, on: bool) void {
+        const self = streamConn(ptr);
+        if (on) self.sock.cork() else self.sock.uncork();
     }
 
     /// The connection is the handler's from here on. Uses none of the
@@ -1149,7 +1323,7 @@ pub const Conn = struct {
     pub fn isIdle(self: *Conn) bool {
         return switch (self.phase) {
             .head => self.unreadLen() == 0,
-            .static_body, .exchange => false,
+            .static_body, .exchange, .stream => false,
             .ws_open, .ws_closing, .raw, .closing, .moving => true,
         };
     }

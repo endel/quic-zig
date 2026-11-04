@@ -490,7 +490,7 @@ pub const H3Connection = struct {
 
     /// The content-length a header section declares: digits only, and every
     /// copy the same (RFC 9110 §8.6). Null when there is none, or on CONNECT.
-    fn contentLength(headers: []const qpack.Header) error{Invalid}!?u64 {
+    pub fn contentLength(headers: []const qpack.Header) error{Invalid}!?u64 {
         var n: ?u64 = null;
         for (headers) |h| {
             if (std.mem.eql(u8, h.name, ":method") and std.mem.eql(u8, h.value, "CONNECT")) return null;

@@ -91,7 +91,7 @@ pub const EcnValidator = struct {
         // Valid — transition unknown→capable
         if (self.state == .unknown and ect0_delta + ce_delta > 0) {
             self.state = .capable;
-            std.log.info("ECN validation: path is ECN-capable", .{});
+            std.log.debug("ECN validation: path is ECN-capable", .{});
         }
 
         self.acked_ect0_count += newly_acked_ect0;
