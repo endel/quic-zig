@@ -88,10 +88,7 @@ const fd_set = extern struct {
     fd_array: [64]socket_t,
 };
 
-const timeval = extern struct {
-    tv_sec: i32,
-    tv_usec: i32,
-};
+const timeval = std.os.windows.ws2_32.timeval;
 
 extern "bcrypt" fn BCryptGenRandom(algorithm: ?*anyopaque, buf: [*]u8, len: u32, flags: u32) callconv(.winapi) i32;
 extern "kernel32" fn SwitchToThread() callconv(.winapi) i32;
@@ -211,14 +208,6 @@ pub fn wouldBlock() bool {
     return ws2.WSAGetLastError() == .WSAEWOULDBLOCK;
 }
 
-pub fn interrupted() bool {
-    return ws2.WSAGetLastError() == .WSAEINTR;
-}
-
-pub fn recv(s: socket_t, dest: []u8) isize {
-    return ws2.recv(s, dest.ptr, len32(dest.len), 0);
-}
-
 pub fn connect(s: socket_t, addr: *const sockaddr, len: socklen_t) bool {
     return ws2.connect(s, addr, @intCast(len)) == 0 or wouldBlock();
 }
@@ -228,7 +217,7 @@ pub fn connectState(s: socket_t) sys.ConnectState {
     var writable: fd_set = .{ .fd_count = 1, .fd_array = undefined };
     writable.fd_array[0] = s;
     var failed = writable;
-    const now: timeval = .{ .tv_sec = 0, .tv_usec = 0 };
+    const now: timeval = .{ .sec = 0, .usec = 0 };
     if (ws2.select(0, null, &writable, &failed, &now) <= 0) return .pending;
     return if (failed.fd_count != 0) .failed else .connected;
 }
