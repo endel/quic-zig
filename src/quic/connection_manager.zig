@@ -63,6 +63,12 @@ pub const SourceFilter = struct {
     func: *const fn (ctx: ?*anyopaque, peer: *const posix.sockaddr.storage) bool,
 };
 
+/// `ConnectionManager.hand_new`.
+pub const HandNew = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, datagram: []const u8, peer: *const posix.sockaddr.storage, local: *const posix.sockaddr.storage, ecn: u2) bool,
+};
+
 pub const SourceKeyContext = struct {
     seed: u64 = 0,
 
@@ -500,6 +506,11 @@ pub const ConnectionManager = struct {
     /// When true, every new connection is answered with CONNECTION_REFUSED,
     /// as it is at `max_connections`. Set while a server drains.
     refuse_new: bool = false,
+    /// While `refuse_new` is set, offered the datagram of a connection it
+    /// would refuse: true means another server takes it, so no refusal goes
+    /// out. Never asked about a datagram handed in (`recvHandedOver`), so
+    /// two draining servers can't pass one back and forth.
+    hand_new: ?HandNew = null,
     /// Connections refused at `max_connections` since the last warning.
     refused_full: u64 = 0,
     refused_full_warned_at: ?i64 = null,
@@ -1096,7 +1107,7 @@ pub const ConnectionManager = struct {
         ecn_val: u2,
         out_buf: []u8,
     ) RecvAction {
-        return self.route(bytes, from, local, ecn_val, out_buf, self.steer_foreign);
+        return self.route(bytes, from, local, ecn_val, out_buf, self.steer_foreign, false);
     }
 
     /// `recvDatagram` for a datagram another server already reported as
@@ -1111,7 +1122,7 @@ pub const ConnectionManager = struct {
         ecn_val: u2,
         out_buf: []u8,
     ) RecvAction {
-        return self.route(bytes, from, local, ecn_val, out_buf, false);
+        return self.route(bytes, from, local, ecn_val, out_buf, false, true);
     }
 
     fn route(
@@ -1122,6 +1133,7 @@ pub const ConnectionManager = struct {
         ecn_val: u2,
         out_buf: []u8,
         steer: bool,
+        handed_in: bool,
     ) RecvAction {
         var fbs = io.fixedBufferStream(bytes);
         var current_entry: ?*ConnEntry = null;
@@ -1197,6 +1209,9 @@ pub const ConnectionManager = struct {
 
                 if (self.refuse_new or self.entries.items.len >= self.max_connections) {
                     if (!self.refuse_new) self.noteFull();
+                    if (self.refuse_new and !handed_in) if (self.hand_new) |h| {
+                        if (h.func(h.ctx, bytes, &from, &local, ecn_val)) return .{ .dropped = {} };
+                    };
                     return self.refuse(header, out_buf);
                 }
 
@@ -2006,6 +2021,43 @@ test "refuse_new turns away new connections while existing ones keep routing" {
     var out: [1500]u8 = undefined;
     try std.testing.expect(mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out) == .send_response);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+}
+
+test "hand_new spares a draining server's refusal, but is never offered a datagram handed in" {
+    const alloc = std.testing.allocator;
+    var mgr = testManager(alloc);
+    defer mgr.deinit();
+    mgr.refuse_new = true;
+    const Taker = struct {
+        var taken: usize = 0;
+        fn take(_: ?*anyopaque, datagram: []const u8, _: *const posix.sockaddr.storage, _: *const posix.sockaddr.storage, _: u2) bool {
+            std.debug.assert(datagram.len >= MIN_INITIAL_DATAGRAM);
+            taken += 1;
+            return true;
+        }
+    };
+    mgr.hand_new = .{ .func = Taker.take };
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+
+    var buf: [1500]u8 = undefined;
+    const client = try clientInitial(alloc, &buf);
+    defer {
+        client.conn.deinit();
+        alloc.destroy(client.conn);
+    }
+    try std.testing.expect(mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out) == .dropped);
+    try std.testing.expectEqual(@as(usize, 1), Taker.taken);
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+
+    var again: [1500]u8 = undefined;
+    const other = try clientInitial(alloc, &again);
+    defer {
+        other.conn.deinit();
+        alloc.destroy(other.conn);
+    }
+    try std.testing.expect(mgr.recvHandedOver(again[0..other.len], addr, addr, 0, &out) == .send_response);
+    try std.testing.expectEqual(@as(usize, 1), Taker.taken);
 }
 
 test "source_filter drops a refused source's Initial before Retry, and lets others in" {

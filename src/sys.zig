@@ -264,19 +264,6 @@ pub fn wouldBlock() bool {
     return posix.errno(@as(isize, -1)) == .AGAIN;
 }
 
-/// Whether the last socket call was cut short by a signal, and can go again.
-pub fn interrupted() bool {
-    if (is_windows) return windows.interrupted();
-    return posix.errno(@as(isize, -1)) == .INTR;
-}
-
-/// `recv`, for a nonblocking TCP socket: 0 at EOF, negative on failure,
-/// would-block included, which `read` can't tell from EOF.
-pub fn recv(sock: socket_t, dest: []u8) isize {
-    if (is_windows) return windows.recv(sock, dest);
-    return c.recv(sock, dest.ptr, dest.len, 0);
-}
-
 /// Starts connecting a nonblocking TCP socket. False when that's failed
 /// already; `connectState` says how it gets on.
 pub fn connect(sock: socket_t, addr: *const sockaddr, len: socklen_t) bool {
@@ -286,15 +273,18 @@ pub fn connect(sock: socket_t, addr: *const sockaddr, len: socklen_t) bool {
 
 pub const ConnectState = enum { pending, connected, failed };
 
-/// How a `connect` is getting on. Never blocks.
+/// How a `connect` is getting on. Never blocks. A failure is reported once,
+/// as asking clears it.
 pub fn connectState(sock: socket_t) ConnectState {
     if (is_windows) return windows.connectState(sock);
-    var pfd = [_]c.pollfd{.{ .fd = sock, .events = c.POLL.OUT, .revents = 0 }};
-    if (c.poll(&pfd, 1, 0) <= 0) return .pending;
+    // Not `poll`: on macOS, finding nothing ready costs 15-30x this.
+    var peer: posix.sockaddr.storage = undefined;
+    var peer_len: socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (c.getpeername(sock, @ptrCast(&peer), &peer_len) == 0) return .connected;
     var err: c_int = 0;
-    var len: c.socklen_t = @sizeOf(c_int);
-    _ = c.getsockopt(sock, c.SOL.SOCKET, c.SO.ERROR, &err, &len);
-    return if (err == 0) .connected else .failed;
+    var len: socklen_t = @sizeOf(c_int);
+    _ = c.getsockopt(sock, posix.SOL.SOCKET, posix.SO.ERROR, &err, &len);
+    return if (err == 0) .pending else .failed;
 }
 
 pub const ShutdownHow = enum { send, both };
@@ -1099,9 +1089,9 @@ test "udpSocket round-trips a datagram over loopback" {
     try std.testing.expectEqualStrings("ping", buf[0..n]);
 }
 
-test "a nonblocking connect gets through to a listener, and recv tells nothing yet from the end" {
+test "a nonblocking connect gets through to a listener, and recvfrom tells nothing yet from the end" {
     const net = @import("sockaddr.zig");
-    const listener = try tcpSocket(posix.AF.INET);
+    const listener = try socket(posix.AF.INET, posix.SOCK.STREAM, 0); // blocking, so accept waits
     const any = try net.Address.parseIp4("127.0.0.1", 0);
     try bind(listener, &any.any, any.getOsSockLen());
     try listen(listener, 1);
@@ -1114,26 +1104,22 @@ test "a nonblocking connect gets through to a listener, and recv tells nothing y
     try std.testing.expect(connect(client, @ptrCast(&bound), bound_len));
     try std.testing.expectEqual(ConnectState.connected, try settled(client));
 
-    const conn = for (0..1000) |_| {
-        break accept(listener) catch |err| switch (err) {
-            error.WouldBlock => {
-                sleepNs(std.time.ns_per_ms);
-                continue;
-            },
-            else => return err,
-        };
-    } else return error.Timeout;
+    const conn = try accept(listener);
 
     var buf: [8]u8 = undefined;
-    try std.testing.expect(recv(client, &buf) < 0);
-    try std.testing.expect(wouldBlock());
+    try std.testing.expectError(error.WouldBlock, recvfrom(client, &buf, 0, null, null));
+    try std.testing.expectEqual(2, send(conn, "hi", 0));
     close(conn);
+    var got: usize = 0;
     for (0..1000) |_| {
-        const n = recv(client, &buf);
+        const n = recvfrom(client, &buf, 0, null, null) catch {
+            sleepNs(std.time.ns_per_ms);
+            continue;
+        };
         if (n == 0) break;
-        try std.testing.expect(wouldBlock());
-        sleepNs(std.time.ns_per_ms);
+        got += n;
     } else return error.Timeout;
+    try std.testing.expectEqual(2, got);
 
     // Nobody's on that port now.
     close(listener);

@@ -1204,13 +1204,15 @@ pub const Connection = struct {
     fn requestAckFrequency(self: *Connection) void {
         const peer = self.peer_params orelse return;
         if (peer.min_ack_delay == null) return;
-        self.pushReliable(.{ .ack_frequency = .{
-            .sequence_number = self.ack_freq_send_seq,
-            .ack_eliciting_threshold = ACK_FREQUENCY_THRESHOLD,
-            // Never under its min_ack_delay, which may not exceed it.
-            .request_max_ack_delay = peer.max_ack_delay * std.time.us_per_ms,
-            .reordering_threshold = 1,
-        } });
+        self.pushReliable(.{
+            .ack_frequency = .{
+                .sequence_number = self.ack_freq_send_seq,
+                .ack_eliciting_threshold = ACK_FREQUENCY_THRESHOLD,
+                // Never under its min_ack_delay, which may not exceed it.
+                .request_max_ack_delay = peer.max_ack_delay * std.time.us_per_ms,
+                .reordering_threshold = 1,
+            },
+        });
         self.ack_freq_send_seq += 1;
     }
 
