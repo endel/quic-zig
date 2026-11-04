@@ -7,6 +7,13 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Added
 
+- `onHttpHead`, `onHttpBody`, `onHttpEnd` and `onHttpGone`: a handler takes
+  each request at its head, its body as it arrives (sized or chunked), and
+  answers in one go or streamed (`event_loop.Exchange`), over HTTP/1.1 and
+  HTTP/3 alike. `onHttpWritable` paces a long answer.
+- `quic.Mailbox`: work handed back to a loop's thread from other threads.
+  An exchange carries its loop's (`Exchange.mailbox`); a server stopping
+  waits for what's owed.
 - JA4 client fingerprints. Set `fingerprint_filter` in `tls_server.Config`
   or a QUIC server's `TlsConfig`, and each connection's first ClientHello
   is fingerprinted and offered to it before any key exchange; false fails

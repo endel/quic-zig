@@ -27,6 +27,8 @@ const tls13 = @import("quic/tls13.zig");
 const ja4 = @import("tls/ja4.zig");
 const ecn_socket = @import("quic/ecn_socket.zig");
 const h3 = @import("h3/connection.zig");
+const http = @import("http/exchange.zig");
+const Mailbox = @import("mailbox.zig").Mailbox;
 
 /// Packets of one send burst per clock read. A read for each packet was 3-6%
 /// of a busy server's CPU; this keeps sent times, and so RTT samples, within
@@ -68,6 +70,9 @@ pub const RawConn = http1.RawConn;
 pub const RawError = http1.RawError;
 /// A request the handler answers later, for `onHttpExchange`.
 pub const HttpExchange = http1.HttpExchange;
+/// A request offered at its head with its body streamed, over HTTP/1.1 and
+/// HTTP/3 alike, for `onHttpHead`; see `http/exchange.zig`.
+pub const Exchange = http.Exchange;
 pub const WsMessageKind = http1.WsMessageKind;
 pub const WsCloseCode = http1.WsCloseCode;
 
@@ -170,6 +175,9 @@ pub const Config = struct {
     /// datagrams are not held behind a backlogged stream. Ignored when
     /// `conn_config` is set.
     datagrams_before_streams: bool = false,
+    /// `ConnectionConfig.max_idle_timeout` for every connection, in
+    /// milliseconds. Ignored when `conn_config` is set.
+    max_idle_timeout: u64 = 30_000,
 
     // Advanced: provide pre-built TLS and connection configs directly.
     // When tls_config is set, cert_path/key_path are ignored.
@@ -929,7 +937,9 @@ pub fn Server(comptime Handler: type) type {
             "onPass",             "onHandover",         "onWsHandover",
             "onHttpRequest",      "onRawOpen",          "onRawData",
             "onRawClose",         "onRawDrain",         "onRawEnd",
-            "onHttpExchange",     "onHttpExchangeGone",
+            "onHttpExchange",     "onHttpExchangeGone", "onHttpHead",
+            "onHttpBody",         "onHttpEnd",          "onHttpGone",
+            "onHttpWritable",
         };
 
         for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
@@ -951,7 +961,8 @@ pub fn Server(comptime Handler: type) type {
                         "onQuicConnected, onH0Request, onH0Data, onH0Finished, " ++
                         "onWsUpgrade, onWsMessage, onWsClose, onPass, onHandover, onWsHandover, " ++
                         "onHttpRequest, onRawOpen, onRawData, onRawClose, onRawDrain, onRawEnd, " ++
-                        "onHttpExchange, onHttpExchangeGone");
+                        "onHttpExchange, onHttpExchangeGone, onHttpHead, onHttpBody, onHttpEnd, " ++
+                        "onHttpGone, onHttpWritable");
                 }
             }
         }
@@ -1033,10 +1044,15 @@ pub fn Server(comptime Handler: type) type {
         if (@hasDecl(Handler, "onHttpExchangeGone") and @TypeOf(Handler.onHttpExchangeGone) != fn (*Handler, *HttpExchange) void) {
             @compileError("onHttpExchangeGone must be fn (self: *Handler, ex: *HttpExchange) void");
         }
+        // The rest of onHttpHead's rules are http1.handlersFor's.
+        if (@hasDecl(Handler, "onHttpHead") and (@hasDecl(Handler, "onRequest") or @hasDecl(Handler, "onData") or @hasDecl(Handler, "onRequestEnd"))) {
+            @compileError("onHttpHead takes HTTP/3 requests too: drop onRequest, onData and onRequestEnd");
+        }
     }
 
     return struct {
         const Self = @This();
+        const takes_heads = @hasDecl(Handler, "onHttpHead");
 
         allocator: std.mem.Allocator,
         handler: *Handler,
@@ -1123,6 +1139,10 @@ pub fn Server(comptime Handler: type) type {
 
         /// Optional HTTP/1.1 listener on the same loop; see `Config.http1`.
         http1_server: ?http1.Server,
+        /// HTTP/3 requests offered at their head (`onHttpHead`), not yet answered.
+        h3_streams: if (takes_heads) std.AutoHashMapUnmanaged(StreamKey, *H3Stream) else void = if (takes_heads) .empty else {},
+        /// The HTTP/3 exchanges' (`Exchange.mailbox`).
+        mailbox: if (takes_heads) Mailbox else void,
 
         foreign_hook: ?ForeignDatagramHook,
 
@@ -1200,6 +1220,7 @@ pub fn Server(comptime Handler: type) type {
                     .ack_bytes_threshold = config.ack_bytes_threshold,
                     .request_ack_frequency = config.request_ack_frequency,
                     .datagrams_before_streams = config.datagrams_before_streams,
+                    .max_idle_timeout = config.max_idle_timeout,
                 };
                 if (Handler.protocol == .webtransport or Handler.protocol == .quic) {
                     cc.max_datagram_frame_size = config.max_datagram_frame_size;
@@ -1322,6 +1343,7 @@ pub fn Server(comptime Handler: type) type {
                 .owned_tls = owned_tls,
                 .preferred = preferred,
                 .http1_server = http1_server,
+                .mailbox = if (comptime takes_heads) try Mailbox.init() else {},
                 .foreign_hook = config.foreign_datagram,
                 .wt_settings = .{
                     .max_sessions = config.webtransport_max_sessions,
@@ -1352,6 +1374,10 @@ pub fn Server(comptime Handler: type) type {
             sys.close(self.sockfd);
             if (self.preferred) |p| sys.close(p.sockfd);
             self.conn_mgr.deinit();
+            if (comptime takes_heads) {
+                self.h3_streams.deinit(self.allocator);
+                self.mailbox.deinit();
+            }
             self.quic_poll_ids.deinit(self.allocator);
             self.recv_batch.deinit(self.allocator);
             // Last: live connections hold slices into this material.
@@ -1387,6 +1413,7 @@ pub fn Server(comptime Handler: type) type {
                     log.err("Failed to start HTTP/1.1 listener: {any}", .{err});
                 };
             }
+            if (comptime takes_heads) self.mailbox.loop = loop;
             // Arm initial timer (1ms to kick things off)
             self.timer.run(loop, &self.timer_completion, 1, Self, self, onTimer);
             self.timer_armed = true;
@@ -1433,6 +1460,7 @@ pub fn Server(comptime Handler: type) type {
             if (self.preferred) |*p| if (p.poll_completion.state() != .dead) return false;
             for (&self.cancel_completions) |*c| if (c.state() != .dead) return false;
             if (self.http1_server) |*h1| if (!h1.isStopped()) return false;
+            if (comptime takes_heads) if (self.mailbox.watching) return false;
             return true;
         }
 
@@ -1736,6 +1764,8 @@ pub fn Server(comptime Handler: type) type {
                 // Closing, or we are: it ends here, with the rest.
                 if (self.stopping or self.draining or conn.isClosed() or
                     conn.state == .closing or conn.state == .draining) continue;
+                // Its requests' streams stay on this server: they end here.
+                self.dropStreams(entry.id);
                 mgr.detach(entry, h.to);
                 if (comptime @hasDecl(Handler, "onHandover")) self.handler.onHandover(.{ .entry = entry, .moved = mgr.moved.? });
             }
@@ -2255,15 +2285,14 @@ pub fn Server(comptime Handler: type) type {
                         }
                     },
                     .writable => |w| {
+                        if (w.stream_id) |sid| if (self.streamWritable(&session, sid)) continue;
                         if (@hasDecl(Handler, "onWritable")) {
                             self.handler.onWritable(&session, w.session_id, w.stream_id);
                         }
                     },
                     .session_rejected => {},
                     .request => |req| self.dispatchRequest(&session, req.stream_id, req.headers),
-                    .request_data => |d| {
-                        if (@hasDecl(Handler, "onData")) self.handler.onData(&session, d.stream_id, d.data);
-                    },
+                    .request_data => |d| self.dispatchRequestData(&session, d.stream_id, d.data),
                     .request_end => |sid| self.dispatchRequestEnd(&session, sid),
                     .request_cancelled => |rc| self.dispatchRequestCancelled(&session, rc.stream_id, rc.error_code),
                 }
@@ -2280,7 +2309,9 @@ pub fn Server(comptime Handler: type) type {
 
         fn dispatchRequest(self: *Self, session: *Session, stream_id: u64, headers: []const qpack.Header) void {
             defer self.forgetHeaders();
-            if (@hasDecl(Handler, "onRequest")) {
+            if (comptime takes_heads) {
+                self.startStream(session, stream_id, headers);
+            } else if (@hasDecl(Handler, "onRequest")) {
                 self.handler.onRequest(session, stream_id, headers);
             } else {
                 // Nobody will answer it, so say so instead of leaving it open.
@@ -2289,11 +2320,183 @@ pub fn Server(comptime Handler: type) type {
         }
 
         fn dispatchRequestEnd(self: *Self, session: *Session, stream_id: u64) void {
-            if (@hasDecl(Handler, "onRequestEnd")) self.handler.onRequestEnd(session, stream_id);
+            if (comptime takes_heads) {
+                if (self.h3Stream(session, stream_id)) |st| self.handler.onHttpEnd(&st.ex);
+            } else if (@hasDecl(Handler, "onRequestEnd")) self.handler.onRequestEnd(session, stream_id);
         }
 
         fn dispatchRequestCancelled(self: *Self, session: *Session, stream_id: u64, error_code: u64) void {
+            if (comptime takes_heads) {
+                if (self.h3Stream(session, stream_id)) |st| st.hearGone();
+            }
             if (@hasDecl(Handler, "onRequestCancelled")) self.handler.onRequestCancelled(session, stream_id, error_code);
+        }
+
+        fn dispatchRequestData(self: *Self, session: *Session, stream_id: u64, data: []const u8) void {
+            if (comptime takes_heads) {
+                if (self.h3Stream(session, stream_id)) |st| self.handler.onHttpBody(&st.ex, data);
+            } else if (@hasDecl(Handler, "onData")) self.handler.onData(session, stream_id, data);
+        }
+
+        const StreamKey = struct { conn: u64, stream: u64 };
+
+        fn h3Stream(self: *Self, session: *const Session, stream_id: u64) ?*H3Stream {
+            return self.h3_streams.get(.{ .conn = session.id(), .stream = stream_id });
+        }
+
+        /// An HTTP/3 request offered at its head (`onHttpHead`). Freed once
+        /// answered or gone; its connection's entry outlives it, since
+        /// `endConnection` ends the streams first.
+        const H3Stream = struct {
+            ex: Exchange,
+            server: *Self,
+            session: Session,
+            stream_id: u64,
+
+            /// Below this much unsent, `onHttpWritable` says go on.
+            const writable_mark = 64 * 1024;
+
+            const vtable: Exchange.VTable = .{
+                .peer = peer,
+                .head = head,
+                .body = body,
+                .end = end,
+                .reset = reset,
+                .buffered = buffered,
+                .cork = cork,
+            };
+
+            fn of(ptr: *anyopaque) *H3Stream {
+                return @ptrCast(@alignCast(ptr));
+            }
+
+            fn release(self: *H3Stream) void {
+                _ = self.server.h3_streams.remove(.{ .conn = self.session.id(), .stream = self.stream_id });
+                self.server.allocator.destroy(self);
+            }
+
+            fn hearGone(self: *H3Stream) void {
+                self.ex.answer = .done;
+                self.server.handler.onHttpGone(&self.ex);
+                self.release();
+            }
+
+            fn peer(ptr: *anyopaque) *const posix.sockaddr.storage {
+                return of(ptr).session.entry.conn.peerAddress();
+            }
+
+            fn head(ptr: *anyopaque, status: u16, headers: []const http.Header, framing: Exchange.Framing) Exchange.WriteError!void {
+                const self = of(ptr);
+                var fields: [h3.MAX_HEADERS]qpack.Header = undefined;
+                var names: [4096]u8 = undefined;
+                var status_text: [3]u8 = undefined;
+                var length_text: [20]u8 = undefined;
+                fields[0] = .{ .name = ":status", .value = std.fmt.bufPrint(&status_text, "{d}", .{status}) catch return error.Closed };
+                var n: usize = 1;
+                var used: usize = 0;
+                for (headers) |h| {
+                    if (http.transportsOwn(h.name)) continue;
+                    if (n + 1 == fields.len or used + h.name.len > names.len) return error.Closed;
+                    fields[n] = .{ .name = std.ascii.lowerString(names[used..][0..h.name.len], h.name), .value = h.value };
+                    used += h.name.len;
+                    n += 1;
+                }
+                if (framing == .length) {
+                    fields[n] = .{ .name = "content-length", .value = std.fmt.bufPrint(&length_text, "{d}", .{framing.length}) catch unreachable };
+                    n += 1;
+                }
+                self.session.sendResponseHeaders(self.stream_id, fields[0..n]) catch return error.Closed;
+            }
+
+            fn body(ptr: *anyopaque, data: []const u8) Exchange.WriteError!void {
+                const self = of(ptr);
+                self.session.sendResponseData(self.stream_id, data) catch return error.Closed;
+                if ((self.session.streamBufferedBytes(self.stream_id) orelse 0) >= writable_mark) {
+                    self.session.notifyWritable(0, self.stream_id, writable_mark) catch {};
+                }
+            }
+
+            fn end(ptr: *anyopaque) void {
+                const self = of(ptr);
+                self.session.finishResponse(self.stream_id, null) catch {};
+                self.release();
+            }
+
+            fn reset(ptr: *anyopaque) void {
+                const self = of(ptr);
+                self.session.resetRequest(self.stream_id, @backingInt(h3.H3Error.internal_error));
+                self.release();
+            }
+
+            fn buffered(ptr: *anyopaque) usize {
+                const self = of(ptr);
+                return @intCast(self.session.streamBufferedBytes(self.stream_id) orelse 0);
+            }
+
+            /// A pass's writes leave together already.
+            fn cork(_: *anyopaque, _: bool) void {}
+        };
+
+        /// Offers an HTTP/3 request to `onHttpHead`; its head's slices are
+        /// valid only there.
+        fn startStream(self: *Self, session: *Session, stream_id: u64, headers: []const qpack.Header) void {
+            var method: []const u8 = "";
+            var path: []const u8 = "";
+            // Pseudo-headers come first: what follows them is the request's own.
+            var first: usize = 0;
+            for (headers, 0..) |h, i| {
+                if (h.name.len == 0 or h.name[0] != ':') break;
+                if (std.mem.eql(u8, h.name, ":method")) method = h.value;
+                if (std.mem.eql(u8, h.name, ":path")) path = h.value;
+                first = i + 1;
+            }
+            if (method.len == 0 or path.len == 0) return session.resetRequest(stream_id, @backingInt(h3.H3Error.message_error));
+            const st = self.allocator.create(H3Stream) catch return session.resetRequest(stream_id, @backingInt(h3.H3Error.internal_error));
+            st.* = .{
+                .server = self,
+                .session = session.*,
+                .stream_id = stream_id,
+                .ex = .{
+                    .method = method,
+                    .target = path,
+                    .headers = headers[first..],
+                    .content_length = h3.H3Connection.contentLength(headers) catch null,
+                    .head_only = std.mem.eql(u8, method, "HEAD"),
+                    .mailbox = &self.mailbox,
+                    .impl = st,
+                    .vtable = &H3Stream.vtable,
+                },
+            };
+            self.h3_streams.put(self.allocator, .{ .conn = session.id(), .stream = stream_id }, st) catch {
+                self.allocator.destroy(st);
+                return session.resetRequest(stream_id, @backingInt(h3.H3Error.internal_error));
+            };
+            self.handler.onHttpHead(&st.ex);
+            const live = self.h3Stream(session, stream_id) orelse return; // answered already
+            live.ex.method = "";
+            live.ex.target = "";
+            live.ex.headers = &.{};
+            if (live.ex.passed) live.ex.respond(404, &.{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }}, "Not found\n");
+        }
+
+        /// Whether `stream_id` was an exchange's, told it may write again.
+        fn streamWritable(self: *Self, session: *Session, stream_id: u64) bool {
+            if (comptime !takes_heads) return false;
+            const st = self.h3Stream(session, stream_id) orelse return false;
+            if (@hasDecl(Handler, "onHttpWritable")) self.handler.onHttpWritable(&st.ex);
+            return true;
+        }
+
+        /// `onHttpGone` for every exchange on connection `conn`.
+        fn dropStreams(self: *Self, conn: u64) void {
+            if (comptime !takes_heads) return;
+            while (self.h3_streams.count() > 0) {
+                var it = self.h3_streams.iterator();
+                const st = while (it.next()) |e| {
+                    if (e.key_ptr.conn == conn) break e.value_ptr.*;
+                } else return;
+                st.hearGone();
+            }
         }
 
         fn dispatchStreamData(self: *Self, session: *Session, stream_id: u64, data: []const u8, fin: bool) void {
@@ -2344,6 +2547,7 @@ pub fn Server(comptime Handler: type) type {
         /// The handler's last word on a connection before its entry goes:
         /// each WebTransport session it still holds ends, then the connection.
         fn endConnection(self: *Self, session: *Session) void {
+            self.dropStreams(session.id());
             if (session.entry.wt_conn) |wtc| {
                 while (wtc.nextLostSession()) |ev| switch (ev) {
                     .session_closed => |c| self.dispatchSessionClosed(session, c.session_id, c.error_code, c.reason, c.abrupt),
@@ -2367,12 +2571,12 @@ pub fn Server(comptime Handler: type) type {
                     // We never offer Extended CONNECT, so this is a peer's own idea.
                     .connect_request => |req| self.dispatchRequest(&session, req.stream_id, req.headers),
                     .data => |d| {
-                        if (@hasDecl(Handler, "onData")) {
+                        if (comptime takes_heads or @hasDecl(Handler, "onData")) {
                             var body_buf: [8192]u8 = undefined;
                             while (true) {
                                 const n = h3c.recvBody(&body_buf);
                                 if (n == 0) break;
-                                self.handler.onData(&session, d.stream_id, body_buf[0..n]);
+                                self.dispatchRequestData(&session, d.stream_id, body_buf[0..n]);
                             }
                         } else {
                             // Drain body even if handler doesn't consume it
@@ -2383,6 +2587,7 @@ pub fn Server(comptime Handler: type) type {
                     .finished => |sid| self.dispatchRequestEnd(&session, sid),
                     .request_cancelled => |rc| self.dispatchRequestCancelled(&session, rc.stream_id, rc.error_code),
                     .writable => |sid| {
+                        if (self.streamWritable(&session, sid)) continue;
                         if (@hasDecl(Handler, "onWritable")) self.handler.onWritable(&session, sid, sid);
                     },
                     .settings, .goaway, .shutdown_complete => {},
@@ -4610,12 +4815,7 @@ fn e2eBodyByte(offset: usize) u8 {
     return @truncate(offset *% 31 +% (offset >> 12));
 }
 
-const get_request = [_]qpack.Header{
-    .{ .name = ":method", .value = "GET" },
-    .{ .name = ":scheme", .value = "https" },
-    .{ .name = ":authority", .value = "localhost" },
-    .{ .name = ":path", .value = "/" },
-};
+const get_request = requestTo("GET", "/");
 
 /// Answers with headers at once, then streams the body from a timer on the
 /// shared loop — outside any server callback — paced by `onWritable`.
@@ -4973,6 +5173,132 @@ test "e2e: a WebTransport listener serves a plain GET" {
     try testing.expectEqual(@as(u32, 0), server_handler.connects);
     try testing.expectEqualStrings("200", &client_handler.status);
     try testing.expectEqualStrings("hello world", client_handler.body[0..client_handler.received]);
+}
+
+/// Takes requests at their head (`onHttpHead`): checks a patterned body as
+/// it streams in and answers with its length, or streams `E2E_BODY` back
+/// without one.
+fn HeadServer(comptime proto: Protocol) type {
+    return struct {
+        pub const protocol: Protocol = proto;
+
+        heads: u32 = 0,
+        received: usize = 0,
+        body_ok: bool = true,
+        gone: u32 = 0,
+        writable: u32 = 0,
+        streaming: ?*Exchange = null,
+        sent: usize = 0,
+        stream_back: bool = false,
+
+        pub fn onHttpHead(self: *@This(), ex: *Exchange) void {
+            self.heads += 1;
+            if (std.mem.eql(u8, ex.target, "/pass")) return ex.pass();
+            if (std.mem.eql(u8, ex.target, "/early")) return ex.respond(413, &.{}, "too big\n");
+            self.stream_back = std.mem.eql(u8, ex.target, "/stream");
+        }
+
+        pub fn onHttpBody(self: *@This(), _: *Exchange, data: []const u8) void {
+            for (data, self.received..) |b, off| {
+                if (b != e2eBodyByte(off)) self.body_ok = false;
+            }
+            self.received += data.len;
+        }
+
+        pub fn onHttpEnd(self: *@This(), ex: *Exchange) void {
+            if (!self.stream_back) {
+                var text: [20]u8 = undefined;
+                return ex.respond(200, &.{.{ .name = "Content-Type", .value = "text/plain" }}, std.fmt.bufPrint(&text, "{d}", .{self.received}) catch unreachable);
+            }
+            ex.sendHead(200, &.{}, null) catch return;
+            self.streaming = ex;
+            self.pump();
+        }
+
+        pub fn onHttpGone(self: *@This(), ex: *Exchange) void {
+            self.gone += 1;
+            if (self.streaming == ex) self.streaming = null;
+        }
+
+        pub fn onHttpWritable(self: *@This(), ex: *Exchange) void {
+            self.writable += 1;
+            if (self.streaming == ex) self.pump();
+        }
+
+        fn pump(self: *@This()) void {
+            const ex = self.streaming orelse return;
+            var chunk: [16 * 1024]u8 = undefined;
+            while (self.sent < E2E_BODY) {
+                if (ex.bufferedAmount() >= 128 * 1024) return;
+                const n = @min(chunk.len, E2E_BODY - self.sent);
+                for (chunk[0..n], self.sent..) |*b, off| b.* = e2eBodyByte(off);
+                ex.write(chunk[0..n]) catch return;
+                self.sent += n;
+            }
+            self.streaming = null;
+            ex.finish();
+        }
+    };
+}
+
+fn requestTo(comptime method: []const u8, comptime path: []const u8) [4]qpack.Header {
+    return .{
+        .{ .name = ":method", .value = method },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = ":path", .value = path },
+    };
+}
+
+test "e2e: onHttpHead takes an HTTP/3 POST, its body in pieces, then onHttpEnd, on .h3 and .webtransport alike" {
+    const body = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = e2eBodyByte(i);
+    const request = requestTo("POST", "/upload");
+    inline for (.{ Protocol.h3, Protocol.webtransport }, .{ 29554, 29558 }) |proto, port| {
+        var client_handler = CheckingClient{ .request = &request, .request_body = body };
+        var server_handler = HeadServer(proto){};
+        var e2e: E2e(HeadServer(proto), CheckingClient) = undefined;
+        try e2e.init(port, &server_handler, &client_handler);
+        defer e2e.deinit();
+
+        try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 10_000);
+        try testing.expectEqualStrings("200", &client_handler.status);
+        try testing.expectEqualStrings("100000", client_handler.body[0..client_handler.received]);
+        try testing.expect(server_handler.body_ok);
+        try testing.expectEqual(@as(u32, 0), server_handler.gone);
+    }
+}
+
+test "e2e: an HTTP/3 answer without a length streams whole, paced by onHttpWritable" {
+    const request = requestTo("GET", "/stream");
+    var client_handler = CheckingClient{ .request = &request, .patterned = true };
+    var server_handler = HeadServer(.h3){};
+    var e2e: E2e(HeadServer(.h3), CheckingClient) = undefined;
+    try e2e.init(29555, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 20_000);
+    try testing.expectEqual(E2E_BODY, client_handler.received);
+    try testing.expectEqual(@as(usize, 0), client_handler.mismatches);
+    try testing.expect(server_handler.writable > 0);
+}
+
+test "e2e: over HTTP/3, an answer from onHttpHead and a pass are 413 and 404" {
+    const early = requestTo("POST", "/early");
+    const passed = requestTo("GET", "/pass");
+    const unread: [64]u8 = @splat('x');
+    for ([_][]const qpack.Header{ &early, &passed }, [_]?[]const u8{ &unread, null }, [_][]const u8{ "413", "404" }, [_]u16{ 29556, 29557 }) |request, body, status, port| {
+        var client_handler = CheckingClient{ .request = request, .request_body = body };
+        var server_handler = HeadServer(.h3){};
+        var e2e: E2e(HeadServer(.h3), CheckingClient) = undefined;
+        try e2e.init(port, &server_handler, &client_handler);
+        defer e2e.deinit();
+
+        try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 10_000);
+        try testing.expectEqualStrings(status, &client_handler.status);
+        try testing.expectEqual(@as(u32, 1), server_handler.heads);
+    }
 }
 
 /// One session per connection, as netcode keeps it: any later CONNECT is
