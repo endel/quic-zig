@@ -791,6 +791,11 @@ pub const TranscriptHash = struct {
         var copy = self.state;
         return copy.finalResult();
     }
+
+    /// `current()` in hex, for `{f}`: worked out only when the line is printed.
+    pub fn format(self: *const TranscriptHash, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{x}", .{self.current()});
+    }
 };
 
 // ─── KeySchedule ─────────────────────────────────────────────────────
@@ -2210,7 +2215,7 @@ pub const Tls13Handshake = struct {
         if (session_id_len > 0 and session_id_len <= 32) {
             self.peer_session_id_len = session_id_len;
             @memcpy(self.peer_session_id[0..session_id_len], body[pos..][0..session_id_len]);
-            std.log.info("ClientHello: legacy_session_id len={d}", .{session_id_len});
+            std.log.debug("ClientHello: legacy_session_id len={d}", .{session_id_len});
         }
         pos += session_id_len; // skip session_id
 
@@ -2360,12 +2365,12 @@ pub const Tls13Handshake = struct {
         // Try to process PSK extension if present and we have a ticket key.
         // A ticket carries no client identity: with client auth, always a full handshake.
         if (psk_ext_offset != null and self.config.ticket_key != null and self.client_auth == null) {
-            std.log.info("PSK extension found, attempting PSK processing", .{});
+            std.log.debug("PSK extension found, attempting PSK processing", .{});
             self.tryProcessPsk(msg, body, pos, ext_data, psk_ext_offset.?, psk_ext_len);
             if (self.using_psk) {
-                std.log.info("PSK accepted, using resumption", .{});
+                std.log.debug("PSK accepted, using resumption", .{});
             } else {
-                std.log.info("PSK rejected, full handshake", .{});
+                std.log.debug("PSK rejected, full handshake", .{});
             }
         }
 
@@ -2378,7 +2383,7 @@ pub const Tls13Handshake = struct {
 
         // Update transcript with ClientHello
         self.transcript.update(msg);
-        std.log.info("transcript after CH: {x}", .{self.transcript.current()});
+        std.log.debug("transcript after CH: {f}", .{&self.transcript});
 
         // If PSK accepted, derive early data secret for 0-RTT decryption.
         // Not after a retry: that rejected 0-RTT (RFC 8446 4.2.10).
@@ -2482,7 +2487,7 @@ pub const Tls13Handshake = struct {
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
-        std.log.info("server transcript after SH ({d} bytes): {x}", .{ msg.len, self.transcript.current() });
+        std.log.debug("server transcript after SH ({d} bytes): {f}", .{ msg.len, &self.transcript });
 
         // Compute shared secret based on negotiated group
         var shared_secret: [32]u8 = undefined;
@@ -2531,11 +2536,7 @@ pub const Tls13Handshake = struct {
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
-        {
-            var ee_sha: [32]u8 = undefined;
-            crypto.hash.sha2.Sha256.hash(msg, &ee_sha, .{});
-            std.log.info("transcript after EE ({d} bytes): {x}, msg_sha256={x}", .{ msg.len, self.transcript.current(), ee_sha });
-        }
+        std.log.debug("transcript after EE ({d} bytes): {f}", .{ msg.len, &self.transcript });
 
         @memcpy(self.out_buf[0..msg.len], msg);
         self.out_len = msg.len;
@@ -2572,11 +2573,7 @@ pub const Tls13Handshake = struct {
         self.out_len = msg.len;
 
         self.transcript.update(msg);
-        {
-            var cert_sha: [32]u8 = undefined;
-            crypto.hash.sha2.Sha256.hash(msg, &cert_sha, .{});
-            std.log.info("transcript after Cert ({d} bytes): {x}, msg_sha256={x}", .{ msg.len, self.transcript.current(), cert_sha });
-        }
+        std.log.debug("transcript after Cert ({d} bytes): {f}", .{ msg.len, &self.transcript });
 
         self.state = .server_send_certificate_verify;
         return Action{ .send_data = .{
@@ -2935,7 +2932,7 @@ pub const Tls13Handshake = struct {
         self.key_schedule = temp_ks;
         self.using_psk = true;
         self.zero_rtt_accepted = self.early_data_offered;
-        std.log.info("PSK resumption accepted (0-RTT {s})", .{
+        std.log.debug("PSK resumption accepted (0-RTT {s})", .{
             if (self.zero_rtt_accepted) @as([]const u8, "enabled") else "not offered",
         });
     }

@@ -1354,7 +1354,7 @@ pub const Connection = struct {
     /// Decrypt and process a single 0-RTT packet (early data). Caller must
     /// have `early_data_open` installed. Does not advance the handshake.
     fn processZeroRttPacket(self: *Connection, header: *packet.Header, fbs: anytype, info: RecvInfo) !void {
-        std.log.info("recv: processing 0-RTT packet (early data)", .{});
+        std.log.debug("recv: processing 0-RTT packet (early data)", .{});
         // 0-RTT uses pkt_num_spaces[2] (application) for PN tracking
         var space = self.pkt_num_spaces[2];
         const saved_open = space.crypto_open;
@@ -1605,7 +1605,7 @@ pub const Connection = struct {
         // Lift the anti-amplification limit immediately.
         if (self.is_server and epoch == .handshake and !self.paths[self.active_path_idx].is_validated) {
             self.paths[self.active_path_idx].is_validated = true;
-            std.log.info("path validated via Handshake packet (amplification limit lifted)", .{});
+            std.log.debug("path validated via Handshake packet (amplification limit lifted)", .{});
         }
 
         // Handle key phase change for 1-RTT packets (RFC 9001 Section 6)
@@ -1619,7 +1619,7 @@ pub const Connection = struct {
                     .next => {
                         ku.rollKeys();
                         self.packer.key_phase = ku.key_phase;
-                        std.log.info("key update: peer-initiated, new key_phase={}", .{ku.key_phase});
+                        std.log.debug("key update: peer-initiated, new key_phase={}", .{ku.key_phase});
                         ku.onCurrentPacketOpened(header.packet_number, now, pto_ns);
                     },
                     .current => ku.onCurrentPacketOpened(header.packet_number, now, pto_ns),
@@ -1666,7 +1666,7 @@ pub const Connection = struct {
         // (A server's accept() read it off a packet not yet decrypted.)
         if (header.packet_type != .one_rtt) {
             if (!self.got_peer_conn_id) {
-                std.log.info("recv: peer SCID={any}", .{header.scid});
+                std.log.debug("recv: peer SCID={any}", .{header.scid});
                 self.dcid_len = @intCast(header.scid.len);
                 @memcpy(self.dcid[0..header.scid.len], header.scid);
                 self.packer.updateDcid(header.scid);
@@ -1947,7 +1947,7 @@ pub const Connection = struct {
                         self.packer.max_packet_size = new_mtu;
                         self.cc.setMaxDatagramSize(new_mtu);
                         self.pacer.max_datagram_size = new_mtu;
-                        std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
+                        std.log.debug("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
                     }
 
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent, now);
@@ -2089,7 +2089,7 @@ pub const Connection = struct {
                         self.packer.max_packet_size = new_mtu;
                         self.cc.setMaxDatagramSize(new_mtu);
                         self.pacer.max_datagram_size = new_mtu;
-                        std.log.info("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
+                        std.log.debug("PMTUD: probe ACK'd, MTU raised to {d}", .{new_mtu});
                     }
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent, now);
                     for (pkt.getControlFrames()) |cf| switch (cf) {
@@ -2321,7 +2321,7 @@ pub const Connection = struct {
                 if (token.len <= self.new_token_buf.len) {
                     @memcpy(self.new_token_buf[0..token.len], token);
                     self.new_token_len = @intCast(token.len);
-                    std.log.info("stored NEW_TOKEN from server ({d} bytes)", .{token.len});
+                    std.log.debug("stored NEW_TOKEN from server ({d} bytes)", .{token.len});
                 }
             },
 
@@ -2521,7 +2521,7 @@ pub const Connection = struct {
                 // A retransmitted frame repeats a CID we already hold.
                 if (!self.peer_cid_pool.contains(ncid.seq_num)) {
                     self.peer_cid_pool.addPeerCid(ncid.seq_num, ncid.conn_id, ncid.stateless_reset_token);
-                    std.log.info("stored peer CID in pool from NEW_CONNECTION_ID seq={d}, pool_size={d}", .{ ncid.seq_num, self.peer_cid_pool.count() });
+                    std.log.debug("stored peer CID in pool from NEW_CONNECTION_ID seq={d}, pool_size={d}", .{ ncid.seq_num, self.peer_cid_pool.count() });
                 }
 
                 // RFC 9000 §5.1.1: what is left active must fit the limit we
@@ -2546,14 +2546,14 @@ pub const Connection = struct {
                     self.closeWithTransportError(@backingInt(TransportError.protocol_violation), @backingInt(FrameType.retire_connection_id), "RETIRE_CONNECTION_ID for a CID not ours to retire");
                     return error.ProtocolViolation;
                 }
-                std.log.info("peer retired connection ID seq={d}", .{rcid.seq_num});
+                std.log.debug("peer retired connection ID seq={d}", .{rcid.seq_num});
                 self.local_cid_pool.retireBySeq(rcid.seq_num);
 
                 // Issue a replacement CID to stay at the peer's limit
                 if (self.local_cid_pool.liveCount() < self.wantedLocalCids()) {
                     if (self.issueLocalCid()) |entry| {
                         self.pushReliable(self.newConnectionIdFrame(entry));
-                        std.log.info("issued replacement NEW_CONNECTION_ID seq={d}", .{entry.seq_num});
+                        std.log.debug("issued replacement NEW_CONNECTION_ID seq={d}", .{entry.seq_num});
                     }
                 }
             },
@@ -2566,7 +2566,7 @@ pub const Connection = struct {
                 for (&self.paths) |*path| {
                     if (path.validator.handleResponse(data)) {
                         path.is_validated = true;
-                        std.log.info("path validated via PATH_RESPONSE", .{});
+                        std.log.debug("path validated via PATH_RESPONSE", .{});
                         break;
                     }
                 }
@@ -2586,7 +2586,7 @@ pub const Connection = struct {
             },
 
             .application_close => |ac| {
-                std.log.info("peer APPLICATION_CLOSE: error_code=0x{x}, reason_len={d}", .{ ac.error_code, ac.reason.len });
+                std.log.debug("peer APPLICATION_CLOSE: error_code=0x{x}, reason_len={d}", .{ ac.error_code, ac.reason.len });
                 self.state = .draining;
                 self.closing_start_time = now;
                 self.local_err = .init(true, ac.error_code, ac.reason);
@@ -2659,7 +2659,7 @@ pub const Connection = struct {
                     af.reordering_threshold,
                 );
                 if (applied) {
-                    std.log.info("ACK_FREQUENCY applied: seq={d} threshold={d} max_delay={d}µs reorder={d}", .{
+                    std.log.debug("ACK_FREQUENCY applied: seq={d} threshold={d} max_delay={d}µs reorder={d}", .{
                         af.sequence_number, af.ack_eliciting_threshold, af.request_max_ack_delay, af.reordering_threshold,
                     });
                 }
@@ -2724,7 +2724,7 @@ pub const Connection = struct {
                         .complete => {
                             if (hs.received_ticket) |ticket| {
                                 self.session_ticket = ticket;
-                                std.log.info("stored session ticket from server (lifetime={d}s)", .{ticket.lifetime});
+                                std.log.debug("stored session ticket from server (lifetime={d}s)", .{ticket.lifetime});
                             }
                             break;
                         },
@@ -2816,7 +2816,7 @@ pub const Connection = struct {
                             if (self.is_server) {
                                 self.early_data_open = ik.open;
                                 self.pending_replay_undecryptable = true;
-                                std.log.info("installed 0-RTT decrypt keys (server)", .{});
+                                std.log.debug("installed 0-RTT decrypt keys (server)", .{});
                             } else {
                                 self.early_data_seal = ik.seal;
                                 // RFC 9000 §7.4.1: restore remembered transport params for 0-RTT
@@ -2828,12 +2828,12 @@ pub const Connection = struct {
                                         rp.initial_max_stream_data_uni,
                                     );
                                     self.conn_flow_ctrl.base.send_window = rp.initial_max_data;
-                                    std.log.info("installed 0-RTT keys (client), restored remembered params: max_bidi={d}, max_uni={d}, max_data={d}", .{
+                                    std.log.debug("installed 0-RTT keys (client), restored remembered params: max_bidi={d}, max_uni={d}, max_data={d}", .{
                                         rp.initial_max_streams_bidi, rp.initial_max_streams_uni, rp.initial_max_data,
                                     });
                                 } else {
                                     self.streams.setMaxStreams(100, 100);
-                                    std.log.info("installed 0-RTT encrypt keys (client), default stream limits", .{});
+                                    std.log.debug("installed 0-RTT encrypt keys (client), default stream limits", .{});
                                 }
                             }
                             if (self.qlog_writer) |*ql| {
@@ -2932,7 +2932,7 @@ pub const Connection = struct {
                     // Store received session ticket if any
                     if (hs.received_ticket) |ticket| {
                         self.session_ticket = ticket;
-                        std.log.info("stored session ticket (lifetime={d}s)", .{ticket.lifetime});
+                        std.log.debug("stored session ticket (lifetime={d}s)", .{ticket.lifetime});
                     }
 
                     // Initialize KeyUpdateManager from TLS traffic secrets (RFC 9001 Section 6)
@@ -2958,7 +2958,7 @@ pub const Connection = struct {
                             hs.negotiated_cipher_suite,
                             self.version,
                         );
-                        std.log.info("KeyUpdateManager initialized for 1-RTT key rotation", .{});
+                        std.log.debug("KeyUpdateManager initialized for 1-RTT key rotation", .{});
                     }
 
                     // Store peer transport parameters and apply stream limits
@@ -2981,7 +2981,7 @@ pub const Connection = struct {
                         // Enable DATAGRAM support if both sides advertise max_datagram_frame_size
                         if (peer_tp.max_datagram_frame_size != null and self.local_params.max_datagram_frame_size != null) {
                             self.datagrams_enabled = true;
-                            std.log.info("DATAGRAM support enabled (peer max_dgram={d}, local max_dgram={d})", .{
+                            std.log.debug("DATAGRAM support enabled (peer max_dgram={d}, local max_dgram={d})", .{
                                 peer_tp.max_datagram_frame_size.?,
                                 self.local_params.max_datagram_frame_size.?,
                             });
@@ -3008,10 +3008,10 @@ pub const Connection = struct {
                         // Server sends this in transport params; client stores it for detection
                         if (peer_tp.stateless_reset_token) |token| {
                             self.peer_cid_pool.addPeerCid(0, self.dcid[0..self.dcid_len], token);
-                            std.log.info("stored peer stateless reset token from transport params", .{});
+                            std.log.debug("stored peer stateless reset token from transport params", .{});
                         }
 
-                        std.log.info("applied peer transport params: max_bidi={d}, max_uni={d}, max_data={d}", .{
+                        std.log.debug("applied peer transport params: max_bidi={d}, max_uni={d}, max_data={d}", .{
                             peer_tp.initial_max_streams_bidi,
                             peer_tp.initial_max_streams_uni,
                             peer_tp.initial_max_data,
@@ -3073,14 +3073,14 @@ pub const Connection = struct {
                     while (self.local_cid_pool.liveCount() < self.wantedLocalCids()) {
                         const entry = self.issueLocalCid() orelse break; // pool full
                         self.pushReliable(self.newConnectionIdFrame(entry));
-                        std.log.info("issued NEW_CONNECTION_ID seq={d}, cid_len={d}", .{ entry.seq_num, entry.cid_len });
+                        std.log.debug("issued NEW_CONNECTION_ID seq={d}, cid_len={d}", .{ entry.seq_num, entry.cid_len });
                     }
 
                     // Server: issue NEW_TOKEN for client address validation (RFC 9000 §8.1.3)
                     if (self.is_server) {
                         if (self.newTokenFrame()) |pcf| {
                             self.pushReliable(pcf);
-                            std.log.info("issued NEW_TOKEN ({d} bytes)", .{pcf.new_token.token_len});
+                            std.log.debug("issued NEW_TOKEN ({d} bytes)", .{pcf.new_token.token_len});
                         }
                     }
 
@@ -3159,7 +3159,7 @@ pub const Connection = struct {
         // Packet number space index 1 = Handshake
         self.pkt_num_spaces[1].crypto_open = open;
         self.pkt_num_spaces[1].crypto_seal = seal;
-        std.log.info("installHandshakeKeys: keys installed for space 1", .{});
+        std.log.debug("installHandshakeKeys: keys installed for space 1", .{});
     }
 
     /// Install 1-RTT (Application) encryption keys.
@@ -3202,7 +3202,7 @@ pub const Connection = struct {
         // Packet number space index 2 = Application (1-RTT)
         self.pkt_num_spaces[2].crypto_open = open;
         self.pkt_num_spaces[2].crypto_seal = seal;
-        std.log.info("installAppKeys: keys installed for space 2", .{});
+        std.log.debug("installAppKeys: keys installed for space 2", .{});
     }
 
     /// STREAM_DATA_BLOCKED and RESET_STREAM for one stream we send on, bidi or
@@ -3703,7 +3703,7 @@ pub const Connection = struct {
             if (ku.shouldInitiateUpdate() and ku.canUpdate()) {
                 ku.rollKeys();
                 self.packer.key_phase = ku.key_phase;
-                std.log.info("key update: self-initiated at {d} packets, new key_phase={}", .{
+                std.log.debug("key update: self-initiated at {d} packets, new key_phase={}", .{
                     quic_crypto.CONFIDENTIALITY_LIMIT,
                     ku.key_phase,
                 });
@@ -3964,7 +3964,7 @@ pub const Connection = struct {
                 const drain_timeout = 3 * pto_ns;
                 if (now - self.closing_start_time > drain_timeout) {
                     self.state = .terminated;
-                    std.log.info("connection terminated after draining period", .{});
+                    std.log.debug("connection terminated after draining period", .{});
                 }
             }
             return;
@@ -3972,7 +3972,7 @@ pub const Connection = struct {
 
         if (self.handshakeDeadline()) |deadline| {
             if (now >= deadline) {
-                std.log.info("handshake not complete after {d} ms; closing", .{@divTrunc(self.handshake_timeout_ns, std.time.ns_per_ms)});
+                std.log.debug("handshake not complete after {d} ms; closing", .{@divTrunc(self.handshake_timeout_ns, std.time.ns_per_ms)});
                 self.state = .terminated;
                 return;
             }
@@ -4779,7 +4779,7 @@ pub const Connection = struct {
             // before receiving the client's Handshake Finished. Dropping keys here
             // would prevent the client from retransmitting the Finished if lost.
             // The auto-clear in emitPackets() handles key discard safely.
-            std.log.info("handshake confirmed via 1-RTT ACK", .{});
+            std.log.debug("handshake confirmed via 1-RTT ACK", .{});
         }
     }
 
@@ -4897,7 +4897,7 @@ pub const Connection = struct {
         const entry = best orelse return; // replacement not here yet
         entry.in_use = true;
         self.useDcid(entry);
-        std.log.info("updated DCID to seq={d}, the previous one was retired", .{entry.seq_num});
+        std.log.debug("updated DCID to seq={d}, the previous one was retired", .{entry.seq_num});
     }
 
     fn useDcid(self: *Connection, entry: *const ConnectionIdEntry) void {
@@ -5196,7 +5196,7 @@ pub fn connectInto(
     sys.randomBytes(&conn.static_reset_key);
     conn.local_cid_pool.registerInitialCid(conn.scid[0..conn.scid_len], conn.static_reset_key);
 
-    std.log.info("connection.connect: dcid={any}, scid={any}", .{ dcid, scid });
+    std.log.debug("connection.connect: dcid={any}, scid={any}", .{ dcid, scid });
 
     // Derive Initial encryption keys from the DCID we chose
     try conn.pkt_num_spaces[@backingInt(packet.Epoch.initial)].setupInitial(
@@ -5220,7 +5220,7 @@ pub fn connectInto(
         @memcpy(conn.retry_token_buf[0..len], token[0..len]);
         conn.retry_token_len = @intCast(len);
         conn.packer.initial_token = conn.retry_token_buf[0..len];
-        std.log.info("using NEW_TOKEN from previous connection ({d} bytes)", .{len});
+        std.log.debug("using NEW_TOKEN from previous connection ({d} bytes)", .{len});
     }
 
     // Configure stream limits
