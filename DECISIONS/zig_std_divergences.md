@@ -13,8 +13,12 @@ what upstream has fixed. Second, it is the material for raising these points
 with the Zig project, which a person does, not an AI agent. See "Upstream
 contributions" in `CLAUDE.md`.
 
-- **Baseline:** Zig 0.17.0, the version this repo builds against. Every
-  section was re-checked against it on 3 Oct 2026.
+- **Baseline:** Zig 0.17.1, the version this repo builds against. Every
+  section was re-checked against 0.17.0 on 3 Oct 2026. 0.17.1 (5 Nov 2026)
+  changed none of the std files these sections copy or work around except
+  `std.crypto.ff`, and there only `pow`, `powPublic`, `eql`, `compare` and
+  `isOdd`; item 4's bench calls `powWithEncodedExponent`, which is
+  unchanged. Item 11's reproduction compiles to the same code.
 - **Master:** each section says what Codeberg `ziglang/zig` master showed on
   24 Sep 2026, or the date it gives.
 - **Benchmark hardware:** arm64 figures are native runs on an Apple M-series

@@ -20,6 +20,11 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   first datagram to one still taking connections, rather than refusing it,
   so a reload beside it under `reuse_port` turns no one away.
 
+### Changed
+
+- Built and tested with Zig 0.17.1. Nothing needed changing, and 0.17.0
+  still builds it.
+
 ## 0.6.0
 
 Ready for the open internet: the fixes from a security review, a cap on each
