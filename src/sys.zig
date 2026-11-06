@@ -287,13 +287,17 @@ pub fn connectState(sock: socket_t) ConnectState {
     return if (err == 0) .pending else .failed;
 }
 
-pub const ShutdownHow = enum { send, both };
+pub const ShutdownHow = enum { send, receive, both };
 
 /// Shut a TCP socket down. `.both` also wakes reads and writes in flight on
 /// the socket's event loop.
 pub fn shutdown(sock: socket_t, how: ShutdownHow) void {
     if (is_windows) return windows.shutdown(sock, how);
-    _ = c.shutdown(sock, if (how == .send) posix.SHUT.WR else posix.SHUT.RDWR);
+    _ = c.shutdown(sock, switch (how) {
+        .send => posix.SHUT.WR,
+        .receive => posix.SHUT.RD,
+        .both => posix.SHUT.RDWR,
+    });
 }
 
 pub fn getpeername(sock: socket_t, addr: *sockaddr, addrlen: *socklen_t) GetSockNameError!void {
@@ -478,10 +482,10 @@ pub const ResolveError = error{
 };
 
 /// getaddrinfo, however the target spells it.
-const netdb = if (is_windows) windows else struct {
-    const addrinfo = c.addrinfo;
-    const freeaddrinfo = c.freeaddrinfo;
-    fn getaddrinfo(node: ?[*:0]const u8, service: ?[*:0]const u8, hints: ?*const addrinfo, result: *?*addrinfo) i32 {
+pub const netdb = if (is_windows) windows else struct {
+    pub const addrinfo = c.addrinfo;
+    pub const freeaddrinfo = c.freeaddrinfo;
+    pub fn getaddrinfo(node: ?[*:0]const u8, service: ?[*:0]const u8, hints: ?*const addrinfo, result: *?*addrinfo) i32 {
         return @backingInt(c.getaddrinfo(node, service, hints, result));
     }
 };
@@ -856,6 +860,11 @@ pub const File = struct {
 /// The process's standard output.
 pub fn stdout() File {
     return .{ .fd = if (is_windows) windows.stdout() else posix.STDOUT_FILENO };
+}
+
+/// The process's standard error.
+pub fn stderr() File {
+    return .{ .fd = if (is_windows) windows.stderr() else posix.STDERR_FILENO };
 }
 
 fn closeFd(fd: fd_t) void {
