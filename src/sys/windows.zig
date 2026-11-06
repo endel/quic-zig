@@ -238,8 +238,13 @@ pub fn sendVec(s: socket_t, parts: []const []const u8) isize {
 /// Unlike POSIX, shutdown leaves an overlapped read pending: it would hold
 /// the socket's close until the peer sent something.
 pub fn shutdown(s: socket_t, how: sys.ShutdownHow) void {
-    _ = ws2.shutdown(s, if (how == .send) 1 else 2);
-    if (how == .both) _ = CancelIoEx(s, null);
+    _ = ws2.shutdown(s, switch (how) {
+        .send => 1,
+        .receive => 0,
+        .both => 2,
+    });
+    // An overlapped read doesn't wake on shutdown alone.
+    if (how != .send) _ = CancelIoEx(s, null);
 }
 
 pub fn getpeername(s: socket_t, addr: *sockaddr, addrlen: *socklen_t) sys.GetSockNameError!void {
@@ -444,6 +449,10 @@ fn ioFile(handle: fd_t) Io.File {
 
 pub fn stdout() fd_t {
     return Io.File.stdout().handle;
+}
+
+pub fn stderr() fd_t {
+    return Io.File.stderr().handle;
 }
 
 pub fn closeFile(handle: fd_t) void {
