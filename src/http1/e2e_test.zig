@@ -48,6 +48,8 @@ const EchoHandler = struct {
     /// `bufferedAmount` while "corked" held three messages, and after.
     corked_buffered: usize = 0,
     uncorked_buffered: usize = 0,
+    /// "hold" left the WebSocket corked.
+    holding: bool = false,
     /// What "move" let go of, for the test to adopt or discard.
     handed: ?event_loop.WsHandover = null,
     /// A read or write of it was still in flight on this loop then.
@@ -102,6 +104,13 @@ const EchoHandler = struct {
             self.uncorked_buffered = ws.bufferedAmount();
             return;
         }
+        // Corked here, uncorked by a later message.
+        if (std.mem.eql(u8, data, "hold")) {
+            ws.cork();
+            self.holding = true;
+            return ws.send("held") catch unreachable;
+        }
+        if (std.mem.eql(u8, data, "release")) return ws.uncork();
         switch (kind) {
             .binary => ws.send(data) catch {},
             .text => ws.sendText(data) catch {},
@@ -954,14 +963,78 @@ fn corkedSendsLeaveTogether(port: u16, tls: bool) !void {
         const f = try h.frame(&c);
         try testing.expectEqualStrings(want, f.payload);
     }
-    // Held while corked, then sent in one go: nothing was left queued.
+    // Held while corked, and past the uncork: the read's answers leave together.
     try testing.expect(h.handler.corked_buffered > 0);
-    try testing.expectEqual(@as(usize, 0), h.handler.uncorked_buffered);
+    try testing.expectEqual(h.handler.corked_buffered, h.handler.uncorked_buffered);
 }
 
 test "ws: corked sends wait for uncork, then leave in one send, plain and over TLS" {
     try corkedSendsLeaveTogether(29493, false);
     try corkedSendsLeaveTogether(29494, true);
+}
+
+test "ws: a cork taken in onWsMessage holds past the frames it came with" {
+    var h: Harness = undefined;
+    try h.init(29452, .{ .tls = false });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try h.upgrade(&c, "/", false);
+
+    try c.sendFrame(.text, true, "hold");
+    const W = struct {
+        fn done(hh: *Harness) bool {
+            return hh.handler.holding;
+        }
+    };
+    try h.spinUntil(&h, W.done);
+    try testing.expect(h.handler.ws.?.bufferedAmount() > 0);
+
+    try c.sendFrame(.text, true, "release");
+    try testing.expectEqualStrings("held", (try h.frame(&c)).payload);
+}
+
+test "ws: frames behind one whose answer passes high water are answered too" {
+    var h: Harness = undefined;
+    try h.init(29456, .{ .tls = false });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try h.upgrade(&c, "/", false);
+
+    // Sent in one go, so the big one's tail and the small one share a read.
+    const big = try testing.allocator.alloc(u8, socket.high_water + 64 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    const frames = try testing.allocator.alloc(u8, big.len + 64);
+    defer testing.allocator.free(frames);
+    var n = maskedFrame(frames, .binary, big).len;
+    n += maskedFrame(frames[n..], .binary, "small").len;
+    var off: usize = 0;
+    while (off < n) {
+        const rc = std.c.send(c.fd, frames[off..n].ptr, n - off, 0);
+        if (rc > 0) off += @intCast(rc);
+        try h.step();
+    }
+
+    try testing.expectEqual(big.len, (try h.frame(&c)).payload.len);
+    try testing.expectEqualStrings("small", (try h.frame(&c)).payload);
+}
+
+test "ws: frames answered together count only the peer's backlog against max_send_buffer" {
+    var h: Harness = undefined;
+    try h.init(29458, .{ .tls = false, .websocket = .{ .max_send_buffer = 4096 } });
+    defer h.deinit();
+    var c: TestClient = .{};
+    defer c.deinit();
+    try h.upgrade(&c, "/", false);
+
+    const payload: [1000]u8 = @splat('p');
+    var frames: [12 * 1010]u8 = undefined;
+    var n: usize = 0;
+    for (0..12) |_| n += maskedFrame(frames[n..], .binary, &payload).len;
+    try c.send(frames[0..n]);
+    for (0..12) |_| try testing.expectEqual(payload.len, (try h.frame(&c)).payload.len);
 }
 
 test "ws: over TLS, with ALPN http/1.1" {

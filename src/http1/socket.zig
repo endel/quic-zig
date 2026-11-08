@@ -75,6 +75,8 @@ pub fn Socket(comptime Owner: type) type {
         parked: bool = false,
         /// Writes only queue until `uncork`, which sends them in one go.
         corked: bool = false,
+        /// `batch`: the owner's own hold, apart from its user's `cork`.
+        batched: bool = false,
 
         /// Slice being written by the kernel; never appended to while `writing`.
         active: std.ArrayList(u8) = .empty,
@@ -177,7 +179,7 @@ pub fn Socket(comptime Owner: type) type {
             // Nothing queued: try the kernel directly. A write completion
             // costs an epoll registration round trip (and on epoll a dup of
             // the fd), which most writes to a healthy socket don't need.
-            if (!self.corked and !self.writing and self.buffered() == 0) {
+            if (self.sendsNow(&.{data})) {
                 const rc = sys.send(self.tcp.fd, data, send_flags);
                 if (rc > 0) {
                     const n: usize = @intCast(rc);
@@ -198,7 +200,7 @@ pub fn Socket(comptime Owner: type) type {
         pub fn writeVec(self: *Self, parts: []const []const u8) void {
             if (self.state != .open) return;
             var sent: usize = 0;
-            if (!self.corked and !self.writing and self.buffered() == 0) {
+            if (self.sendsNow(parts)) {
                 const rc = sys.sendVec(self.tcp.fd, parts, send_flags);
                 // An error (not EAGAIN) resurfaces on the queued write below.
                 if (rc > 0) sent = @intCast(rc);
@@ -230,10 +232,31 @@ pub fn Socket(comptime Owner: type) type {
             self.corked = true;
         }
 
+        /// Inside a batch, what was corked leaves as the batch ends.
         pub fn uncork(self: *Self) void {
             if (!self.corked) return;
             self.corked = false;
+            if (!self.batched) self.flush();
+        }
+
+        /// `cork` for the owner itself, so what it answers a burst of input
+        /// with leaves in one send; a user's cork outlives it. It holds no
+        /// more than low water, so `buffered` past high water is all the
+        /// kernel's refusal.
+        pub fn batch(self: *Self, on: bool) void {
+            if (self.batched == on) return;
+            self.batched = on;
+            if (!on) self.flush();
+        }
+
+        /// Sends what is queued unless corked; a batch goes on.
+        pub fn flush(self: *Self) void {
+            if (self.corked) return;
             if (self.state != .open and self.state != .flushing) return;
+            // kickWrite holds back while batched.
+            const batched = self.batched;
+            self.batched = false;
+            defer self.batched = batched;
             // Owners that stopped above low water wait for onSocketWritable,
             // which otherwise only a write completion gives them.
             const was_full = self.buffered() >= low_water;
@@ -241,15 +264,29 @@ pub fn Socket(comptime Owner: type) type {
                 const rc = sys.send(self.tcp.fd, self.pending.items, send_flags);
                 // An error (not EAGAIN) resurfaces on the queued write below.
                 if (rc > 0) {
-                    const n: usize = @intCast(rc);
-                    self.drained += n;
-                    const rest = self.pending.items.len - n;
-                    std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[n..]);
-                    self.pending.items.len = rest;
+                    self.drained += @intCast(rc);
+                    // The rest is written from where the kernel stopped, uncopied.
+                    self.active.clearRetainingCapacity();
+                    std.mem.swap(std.ArrayList(u8), &self.active, &self.pending);
+                    self.active_off = @intCast(rc);
                 }
             }
             self.kickWrite();
             if (was_full and self.state == .open and self.buffered() < low_water) self.timers.defer_(&self.writable_cb);
+        }
+
+        /// Whether a write of `parts` goes to the kernel now. Past low
+        /// water a batch sends what it holds first, and the write after it
+        /// uncopied.
+        fn sendsNow(self: *Self, parts: []const []const u8) bool {
+            if (self.corked or self.writing) return false;
+            if (self.batched) {
+                var len = self.buffered();
+                for (parts) |p| len += p.len;
+                if (len <= low_water) return false;
+                self.flush();
+            }
+            return !self.writing and self.buffered() == 0;
         }
 
         fn onDeferredWritable(d: *timers.Deferred) void {
@@ -258,7 +295,7 @@ pub fn Socket(comptime Owner: type) type {
         }
 
         fn kickWrite(self: *Self) void {
-            if (self.writing or self.held() or self.corked) return;
+            if (self.writing or self.held() or self.corked or self.batched) return;
             if (self.state == .closing or self.state == .closed or self.state == .lingering) return;
             if (self.active_off >= self.active.items.len) {
                 self.active.clearRetainingCapacity();

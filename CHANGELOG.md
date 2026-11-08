@@ -22,6 +22,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Changed
 
+- A WebSocket's answers to frames that arrive together leave in one send,
+  not a syscall each: pipelined echo runs 6× faster or more. In
+  `onWsMessage`, `uncork` now sends with the rest of that read's answers.
 - Built and tested with Zig 0.17.1. Nothing needed changing, and 0.17.0
   still builds it.
 

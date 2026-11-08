@@ -137,6 +137,10 @@ pub const WsConn = struct {
     /// go: for a host with several messages for it at once, such as one
     /// answering a batch of events. Sends still count against
     /// `max_send_buffer` meanwhile.
+    ///
+    /// What `onWsMessage` sends leaves without it, together with the
+    /// answers to the other frames of the same read; an uncork there sends
+    /// with them.
     pub fn cork(self: *WsConn) void {
         self.conn().sock.cork();
     }
@@ -147,7 +151,9 @@ pub const WsConn = struct {
 
     /// Bytes queued for the socket and not yet taken by the kernel,
     /// counting TLS framing. What a producer compares against its own
-    /// high-water mark before sending something it may drop.
+    /// high-water mark before sending something it may drop. In
+    /// `onWsMessage` it counts the read's answers held to leave together
+    /// too, up to 64 KiB.
     pub fn bufferedAmount(self: *const WsConn) usize {
         return self.constConn().sock.buffered();
     }
@@ -836,6 +842,9 @@ pub const Conn = struct {
         if (self.processing) return null;
         self.processing = true;
         defer self.processing = false;
+        // A WebSocket's answers to frames read together leave in one send.
+        self.sock.batch(self.phase == .ws_open);
+        defer self.sock.batch(false);
         var pos: usize = 0;
         // Past high_water the rest waits: a peer that sends and never reads
         // would otherwise have every pipelined request answered into memory.
@@ -1267,7 +1276,11 @@ pub const Conn = struct {
 
     fn sendMessage(self: *Conn, kind: websocket.MessageKind, data: []const u8) SendError!void {
         if (self.ws.notified or self.phase != .ws_open or !self.sock.isOpen()) return error.Closed;
-        if (self.sock.buffered() + data.len > self.server.config.websocket.max_send_buffer) return error.SendBufferFull;
+        const max = self.server.config.websocket.max_send_buffer;
+        if (self.sock.buffered() + data.len > max) {
+            self.sock.flush(); // what a batch holds is no backlog of the peer's
+            if (self.sock.buffered() + data.len > max) return error.SendBufferFull;
+        }
         self.sendFrame(if (kind == .text) .text else .binary, data);
         // A failed write aborts; `onWsClose` follows from the deferred close.
         if (!self.sock.isOpen()) return error.Closed;
