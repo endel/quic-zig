@@ -520,7 +520,7 @@ pub const H3Connection = struct {
     }
 
     /// QPACK-encode `headers` into a HEADERS frame on `send`.
-    fn writeHeadersFrame(self: *H3Connection, send: *stream_mod.SendStream, headers: []const qpack.Header) !void {
+    pub fn writeHeadersFrame(self: *H3Connection, send: *stream_mod.SendStream, headers: []const qpack.Header) !void {
         var stack_buf: [4096]u8 = undefined;
         const need = qpack.maxEncodedLen(headers);
         const block_buf = if (need <= stack_buf.len) stack_buf[0..] else try self.allocator.alloc(u8, need);

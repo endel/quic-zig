@@ -89,6 +89,13 @@ pub const Config = struct {
     handshake_timeout_ms: u32 = 10_000,
     /// How long an idle connection waits for its next request.
     keepalive_timeout_ms: u32 = 15_000,
+    /// Bytes per second, over each `stall_timeout_ms`, a request body still
+    /// arriving must keep up, or its connection is cut off. Zero takes any
+    /// byte, for clients that upload slower than this.
+    min_body_rate: u32 = 500,
+    /// The window `min_body_rate` is held over, and the longest a file or a
+    /// streamed answer waits for its client to make room for more.
+    stall_timeout_ms: u32 = 30_000,
     websocket: WebSocketConfig = .{},
 };
 

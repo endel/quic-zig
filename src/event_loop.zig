@@ -52,6 +52,10 @@ pub const Protocol = enum { quic, h3, h0, webtransport };
 /// HTTP/3 error codes, for `Session.resetRequest` and `onRequestCancelled`.
 pub const H3Error = h3.H3Error;
 
+fn nowMs() i64 {
+    return @divTrunc(sys.nanoTimestamp(), std.time.ns_per_ms);
+}
+
 pub const Http1Config = http1.Config;
 pub const Http1WebSocketConfig = http1.WebSocketConfig;
 
@@ -178,6 +182,14 @@ pub const Config = struct {
     /// `ConnectionConfig.max_idle_timeout` for every connection, in
     /// milliseconds. Ignored when `conn_config` is set.
     max_idle_timeout: u64 = 30_000,
+    /// Bytes per second, over each `stall_timeout_ms`, an HTTP/3 request
+    /// body still arriving must keep up, or its stream is reset: for a
+    /// handler that takes requests at their head (`onHttpHead`). Zero
+    /// takes any byte.
+    min_body_rate: u32 = 500,
+    /// The window `min_body_rate` is held over, and the longest such a
+    /// handler's answer waits for its client to make room for more.
+    stall_timeout_ms: u32 = 30_000,
 
     // Advanced: provide pre-built TLS and connection configs directly.
     // When tls_config is set, cert_path/key_path are ignored.
@@ -1199,6 +1211,11 @@ pub fn Server(comptime Handler: type) type {
         h3_streams: if (takes_heads) std.AutoHashMapUnmanaged(StreamKey, *H3Stream) else void = if (takes_heads) .empty else {},
         /// The HTTP/3 exchanges' (`Exchange.mailbox`).
         mailbox: if (takes_heads) Mailbox else void,
+        /// `Config.min_body_rate` and `stall_timeout_ms`, for `h3_streams`.
+        min_body_rate: u32,
+        stall_timeout_ms: u32,
+        /// When `sweepStreams` looks at `h3_streams` next.
+        next_sweep_ns: i64 = 0,
 
         foreign_hook: ?ForeignDatagramHook,
         new_hook: ?NewDatagramHook,
@@ -1404,6 +1421,8 @@ pub fn Server(comptime Handler: type) type {
                 .preferred = preferred,
                 .http1_server = http1_server,
                 .mailbox = if (comptime takes_heads) try Mailbox.init() else {},
+                .min_body_rate = config.min_body_rate,
+                .stall_timeout_ms = config.stall_timeout_ms,
                 .foreign_hook = config.foreign_datagram,
                 .new_hook = config.new_while_draining,
                 .wt_settings = .{
@@ -2441,7 +2460,10 @@ pub fn Server(comptime Handler: type) type {
 
         fn dispatchRequestEnd(self: *Self, session: *Session, stream_id: u64) void {
             if (comptime takes_heads) {
-                if (self.h3Stream(session, stream_id)) |st| self.handler.onHttpEnd(&st.ex);
+                if (self.h3Stream(session, stream_id)) |st| {
+                    st.body_window = null;
+                    self.handler.onHttpEnd(&st.ex);
+                }
             } else if (@hasDecl(Handler, "onRequestEnd")) self.handler.onRequestEnd(session, stream_id);
         }
 
@@ -2454,7 +2476,10 @@ pub fn Server(comptime Handler: type) type {
 
         fn dispatchRequestData(self: *Self, session: *Session, stream_id: u64, data: []const u8) void {
             if (comptime takes_heads) {
-                if (self.h3Stream(session, stream_id)) |st| self.handler.onHttpBody(&st.ex, data);
+                if (self.h3Stream(session, stream_id)) |st| {
+                    if (st.body_window) |*w| w.got += data.len;
+                    self.handler.onHttpBody(&st.ex, data);
+                }
             } else if (@hasDecl(Handler, "onData")) self.handler.onData(session, stream_id, data);
         }
 
@@ -2472,6 +2497,10 @@ pub fn Server(comptime Handler: type) type {
             server: *Self,
             session: Session,
             stream_id: u64,
+            /// Its body on its way in; null once it has ended.
+            body_window: ?http.BodyWindow,
+            /// Since when its answer has waited for the client to make room.
+            stalled_ms: ?i64 = null,
 
             /// Below this much unsent, `onHttpWritable` says go on.
             const writable_mark = 64 * 1024;
@@ -2533,6 +2562,7 @@ pub fn Server(comptime Handler: type) type {
                 self.session.sendResponseData(self.stream_id, data) catch return error.Closed;
                 if ((self.session.streamBufferedBytes(self.stream_id) orelse 0) >= writable_mark) {
                     self.session.notifyWritable(0, self.stream_id, writable_mark) catch {};
+                    if (self.stalled_ms == null) self.stalled_ms = nowMs();
                 }
             }
 
@@ -2576,6 +2606,7 @@ pub fn Server(comptime Handler: type) type {
                 .server = self,
                 .session = session.*,
                 .stream_id = stream_id,
+                .body_window = .start(nowMs(), self.stall_timeout_ms),
                 .ex = .{
                     .method = method,
                     .target = path,
@@ -2603,8 +2634,46 @@ pub fn Server(comptime Handler: type) type {
         fn streamWritable(self: *Self, session: *Session, stream_id: u64) bool {
             if (comptime !takes_heads) return false;
             const st = self.h3Stream(session, stream_id) orelse return false;
+            st.stalled_ms = null;
             if (@hasDecl(Handler, "onHttpWritable")) self.handler.onHttpWritable(&st.ex);
             return true;
+        }
+
+        const sweep_every_ns = 500 * std.time.ns_per_ms;
+
+        /// Resets the requests whose body fell under `min_body_rate` over its
+        /// last window, or whose answer has waited `stall_timeout_ms` for its client;
+        /// their handler hears they're gone. At most every `sweep_every_ns`.
+        fn sweepStreams(self: *Self, now_ns: i64) void {
+            if (comptime !takes_heads) return;
+            if (now_ns < self.next_sweep_ns or self.h3_streams.count() == 0) return;
+            self.next_sweep_ns = now_ns + sweep_every_ns;
+            const now_ms = @divTrunc(now_ns, std.time.ns_per_ms);
+            var doomed: [32]struct { st: *H3Stream, code: h3.H3Error } = undefined;
+            var n: usize = 0;
+            var it = self.h3_streams.valueIterator();
+            while (it.next()) |p| {
+                const st = p.*;
+                const code: h3.H3Error = if (st.body_window) |*w| code: {
+                    if (now_ms < w.ends_ms) continue;
+                    if (w.keptUp(now_ms, self.min_body_rate, self.stall_timeout_ms)) continue;
+                    break :code .request_incomplete;
+                } else code: {
+                    const since = st.stalled_ms orelse continue;
+                    if (now_ms - since < self.stall_timeout_ms) continue;
+                    break :code .request_cancelled;
+                };
+                doomed[n] = .{ .st = st, .code = code };
+                n += 1;
+                if (n == doomed.len) {
+                    self.next_sweep_ns = now_ns; // the rest on the next pass
+                    break;
+                }
+            }
+            for (doomed[0..n]) |d| {
+                d.st.session.resetRequest(d.st.stream_id, @backingInt(d.code));
+                d.st.hearGone();
+            }
         }
 
         /// `onHttpGone` for every exchange on connection `conn`.
@@ -2835,6 +2904,7 @@ pub fn Server(comptime Handler: type) type {
             // One clock read for the pass: a deadline check does not need a
             // fresher now than this, and reading it per connection showed up.
             const pass_now_ns: i64 = sys.nanoTimestamp();
+            self.sweepStreams(pass_now_ns);
             // Send times share a read across connections too, refreshed every
             // `packets_per_clock_read` packets or connections with nothing to send.
             var now_ns: i64 = pass_now_ns;
@@ -2980,6 +3050,10 @@ pub fn Server(comptime Handler: type) type {
             if (self.handlerDeadline()) |deadline| {
                 if (earliest == null or deadline < earliest.?) earliest = deadline;
             }
+            // Swept on time though no packet comes.
+            if (comptime takes_heads) if (self.h3_streams.count() > 0) {
+                if (earliest == null or self.next_sweep_ns < earliest.?) earliest = self.next_sweep_ns;
+            };
 
             // A handler with its own deadlines — a publisher on a tick, a
             // relay holding a subscription open — cannot rely on QUIC having
@@ -5050,6 +5124,8 @@ const CheckingClient = struct {
     patterned: bool = false,
     /// Cancel the request as soon as the response headers arrive.
     cancel_on_headers: bool = false,
+    /// Never read the answer's body: its stream's window stays shut.
+    unread: bool = false,
 
     stream_id: ?u64 = null,
     status: [3]u8 = .{ 0, 0, 0 },
@@ -5072,6 +5148,7 @@ const CheckingClient = struct {
     }
 
     pub fn onData(self: *@This(), session: *ClientSession, _: u64, _: usize) void {
+        if (self.unread) return;
         var buf: [4096]u8 = undefined;
         while (true) {
             const n = session.recvBody(&buf);
@@ -5429,6 +5506,49 @@ test "e2e: an HTTP/3 answer without a length streams whole, paced by onHttpWrita
     try testing.expectEqual(E2E_BODY, client_handler.received);
     try testing.expectEqual(@as(usize, 0), client_handler.mismatches);
     try testing.expect(server_handler.writable > 0);
+}
+
+/// Sends a POST's head and none of its body, its stream left open.
+const HoldingClient = struct {
+    pub const protocol: Protocol = .h3;
+
+    const request = requestTo("POST", "/upload");
+
+    pub fn onConnected(_: *@This(), session: *ClientSession) void {
+        const h3c = session.h3_conn orelse return;
+        const stream = h3c.quic_conn.openStream() catch return;
+        h3c.writeHeadersFrame(&stream.send, &request) catch return;
+        session.wake();
+    }
+};
+
+fn headServerGone(h: *HeadServer(.h3)) bool {
+    return h.gone == 1;
+}
+
+test "e2e: over HTTP/3, a body that doesn't come is reset after its first window, its handler told" {
+    var client_handler = HoldingClient{};
+    var server_handler = HeadServer(.h3){};
+    var e2e: E2e(HeadServer(.h3), HoldingClient) = undefined;
+    try e2e.initServer(29692, &server_handler, &client_handler, .{ .stall_timeout_ms = 300 }, null);
+    defer e2e.deinit();
+
+    const start = sys.nanoTimestamp();
+    try runUntil(&e2e.loop, &server_handler, headServerGone, 5_000);
+    try testing.expect(sys.nanoTimestamp() - start >= 300 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 1), server_handler.heads);
+}
+
+test "e2e: over HTTP/3, a streamed answer its client stops reading is reset after stall_timeout_ms" {
+    const request = requestTo("GET", "/stream");
+    var client_handler = CheckingClient{ .request = &request, .unread = true };
+    var server_handler = HeadServer(.h3){};
+    var e2e: E2e(HeadServer(.h3), CheckingClient) = undefined;
+    try e2e.initServer(29693, &server_handler, &client_handler, .{ .stall_timeout_ms = 300 }, .{ .initial_max_stream_data_bidi_local = 64 * 1024 });
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, headServerGone, 5_000);
+    try testing.expect(server_handler.sent < E2E_BODY);
 }
 
 test "e2e: over HTTP/3, an answer from onHttpHead and a pass are 413 and 404" {

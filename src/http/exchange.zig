@@ -159,3 +159,42 @@ pub fn transportsOwn(name: []const u8) bool {
     }
     return false;
 }
+
+/// A request body still on its way in, held to a rate over each window
+/// (`min_body_rate`, `stall_timeout_ms`), as `websocket.min_receive_rate`
+/// holds a message: a client can't keep a request open by trickling its
+/// body, or by sending none. A body the app reads slowly doesn't count:
+/// the transport hands it on as it comes.
+pub const BodyWindow = struct {
+    got: u64 = 0,
+    /// `got` when the window began.
+    mark: u64 = 0,
+    ends_ms: i64,
+
+    pub fn start(now_ms: i64, window_ms: u32) BodyWindow {
+        return .{ .ends_ms = now_ms + window_ms };
+    }
+
+    /// At the window's end: whether the body kept up `min_rate` bytes a
+    /// second over it, at least a byte. If so the next window begins.
+    pub fn keptUp(self: *BodyWindow, now_ms: i64, min_rate: u32, window_ms: u32) bool {
+        const floor = @max(@as(u64, min_rate) * window_ms / 1000, 1);
+        if (self.got - self.mark < floor) return false;
+        self.mark = self.got;
+        self.ends_ms = now_ms + window_ms;
+        return true;
+    }
+};
+
+test "a body window: kept up at the rate, or at a byte with none; the next one counts afresh" {
+    var w: BodyWindow = .start(0, 1000);
+    try std.testing.expectEqual(@as(i64, 1000), w.ends_ms);
+    w.got = 500;
+    try std.testing.expect(w.keptUp(1000, 500, 1000));
+    try std.testing.expectEqual(@as(i64, 2000), w.ends_ms);
+    w.got = 999;
+    try std.testing.expect(!w.keptUp(2000, 500, 1000));
+    w.got = 1000;
+    try std.testing.expect(w.keptUp(2000, 0, 1000));
+    try std.testing.expect(!w.keptUp(3000, 0, 1000));
+}

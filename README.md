@@ -252,6 +252,8 @@ var server = try event_loop.Server(MyHandler).init(alloc, &handler, .{
 | `max_connections` | `4096` | Open TCP connections past which new ones are closed |
 | `handshake_timeout_ms` | `10000` | TLS handshake plus the first request head |
 | `keepalive_timeout_ms` | `15000` | Idle time between requests |
+| `min_body_rate` | `500` | Bytes/s, over each `stall_timeout_ms`, a request body still arriving must keep up, or the connection is cut. `0` takes any byte. The QUIC server's `Config` has its own, for HTTP/3 |
+| `stall_timeout_ms` | `30000` | That window, and the longest a file or a streamed answer waits for its client to read |
 | `websocket.max_message_size` | 1 MiB | Larger messages close with 1009 |
 | `websocket.max_send_buffer` | 4 MiB | Bytes `send` may leave queued for a slow peer |
 | `websocket.ping_interval_ms` | `30000` | Ping after this much silence; drop (1006) after twice it. `0` disables |

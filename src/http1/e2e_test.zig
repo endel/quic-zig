@@ -2025,3 +2025,71 @@ test "http1: a peer that leaves mid-body reaches onHttpGone" {
     try h.spinUntil(&h, W.gone);
     try testing.expectEqual(@as(u32, 0), h.handler.ends);
 }
+
+test "http1: a body trickling in under min_body_rate is cut off, its handler told; one at pace is answered" {
+    var h: HeadHarness = undefined;
+    try h.init(29690, .{ .tls = false, .min_body_rate = 1000, .stall_timeout_ms = 300 });
+    defer h.deinit();
+    defer h.handler.body.deinit(testing.allocator);
+
+    var fast: TestClient = .{};
+    defer fast.deinit();
+    try fast.connect(h.port, false);
+    try fast.send("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    try testing.expect(std.mem.startsWith(u8, try h.head(&fast), "HTTP/1.1 200 OK\r\n"));
+
+    // 50 bytes every 20 ms, over several windows: 2500 a second.
+    var steady: TestClient = .{};
+    defer steady.deinit();
+    try steady.connect(h.port, false);
+    try steady.send("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 2500\r\n\r\n");
+    const piece: [50]u8 = @splat('s');
+    for (0..50) |_| {
+        try steady.send(&piece);
+        const until = sys.nanoTimestamp() + 20 * std.time.ns_per_ms;
+        while (sys.nanoTimestamp() < until) try h.step();
+    }
+    try testing.expect(std.mem.startsWith(u8, try h.head(&steady), "HTTP/1.1 200 OK\r\n"));
+    try testing.expectEqual(@as(u32, 0), h.handler.gone);
+
+    var slow: TestClient = .{};
+    defer slow.deinit();
+    try slow.connect(h.port, false);
+    try slow.send("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n0123456789");
+    // A byte every 50 ms: 20 a second, where 1000 are owed.
+    const start = sys.nanoTimestamp();
+    var next = start;
+    while (h.handler.gone == 0) {
+        const now = sys.nanoTimestamp();
+        if (now - start > 5 * std.time.ns_per_s) return error.Timeout;
+        if (now >= next) {
+            slow.send("x") catch {};
+            next = now + 50 * std.time.ns_per_ms;
+        }
+        try h.step();
+    }
+    try testing.expect(sys.nanoTimestamp() - start >= 300 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 2), h.handler.ends);
+    try h.eof(&slow);
+}
+
+test "http1: a streamed answer its client stops reading is cut off after stall_timeout_ms" {
+    var h: HeadHarness = undefined;
+    try h.init(29691, .{ .tls = false, .stall_timeout_ms = 300 });
+    defer h.deinit();
+    defer h.handler.body.deinit(testing.allocator);
+    const sndbuf: c_int = 32 * 1024;
+    try sys.setsockopt(h.server.http1_server.?.listen_fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+    var c: TestClient = .{};
+    defer c.deinit();
+    try c.connectWith(h.port, false, 16 * 1024);
+
+    try c.send("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n");
+    const W = struct {
+        fn gone(hh: *HeadHarness) bool {
+            return hh.handler.gone == 1;
+        }
+    };
+    try h.spinUntil(&h, W.gone); // never reading
+    try testing.expect(h.handler.sent < HeadHandler.stream_total);
+}

@@ -28,8 +28,6 @@ pub const Header = parser.Header;
 const close_timeout_ms = 5_000;
 /// Waiting for the peer's FIN after ours.
 const linger_ms = 5_000;
-/// A static response the client stopped reading.
-const io_timeout_ms = 30_000;
 /// Stop reading pipelined requests past this much unread input.
 const max_pipelined_input = 64 * 1024;
 /// An emptied input buffer keeps up to this much capacity, so a stream of
@@ -541,6 +539,8 @@ pub const Conn = struct {
     in_pos: usize = 0,
     phase: Phase = .head,
     deadline: timers.Deadline = .{ .callback = onDeadline },
+    /// The request body on its way in, against `Config.min_body_rate`.
+    body_window: ?http.BodyWindow = null,
     processing: bool = false,
     /// Inside the handler's `onWsMessage`.
     in_message: bool = false,
@@ -689,7 +689,10 @@ pub const Conn = struct {
                     const h = self.server.handlers;
                     if (h.stream.?.writable) |writable| writable(h.ctx, &self.stream.ex);
                 }
-                if (self.phase == .stream) self.readAgain();
+                if (self.phase == .stream) {
+                    self.armStream();
+                    self.readAgain();
+                }
             },
             // Its answer resumes reading, once it's written.
             .exchange, .closing, .moving => {},
@@ -741,8 +744,10 @@ pub const Conn = struct {
             .moving => {},
             // Never set: the handler keeps its own time.
             .raw, .exchange => {},
-            // Handshake, idle keep-alive, a stalled response or body, or linger.
-            .head, .static_body, .stream, .closing => self.finish(websocket.CloseCode.abnormal, .abort),
+            // A body that kept up gets another window.
+            .head, .stream => if (self.bodyKeptUp()) self.armBodyWindow() else self.finish(websocket.CloseCode.abnormal, .abort),
+            // Handshake, idle keep-alive, a stalled answer, or linger.
+            .static_body, .closing => self.finish(websocket.CloseCode.abnormal, .abort),
         }
     }
 
@@ -918,9 +923,12 @@ pub const Conn = struct {
             const total = parsed.len + @as(usize, @intCast(head.content_length orelse 0));
             if (buf.len < total) {
                 // The head is parsed again once the body is in.
-                self.server.timers.set(&self.deadline, self.server.config.handshake_timeout_ms);
+                if (self.body_window == null) self.body_window = .start(timers.nowMs(), self.server.config.stall_timeout_ms);
+                self.body_window.?.got = buf.len - parsed.len;
+                self.armBodyWindow();
                 return null;
             }
+            self.body_window = null;
             switch (self.offer(ex, head, total, buf[parsed.len..total])) {
                 // Input stays put, the request at its start, for the answer.
                 .waiting => return 0,
@@ -1013,7 +1021,8 @@ pub const Conn = struct {
             self.endStream();
         } else {
             if (head.expect_continue) self.output("HTTP/1.1 100 Continue\r\n\r\n");
-            self.server.timers.set(&self.deadline, io_timeout_ms);
+            self.body_window = .start(timers.nowMs(), self.server.config.stall_timeout_ms);
+            self.armBodyWindow();
         }
         return .taken;
     }
@@ -1026,7 +1035,7 @@ pub const Conn = struct {
             self.finish(websocket.CloseCode.abnormal, .abort);
             return null;
         };
-        self.server.timers.set(&self.deadline, io_timeout_ms);
+        if (self.body_window) |*w| w.got += step.consumed;
         const h = self.server.handlers;
         if (step.data.len > 0) h.stream.?.body(h.ctx, &s.ex, step.data);
         if (s.live() and s.body.done) self.endStream();
@@ -1034,7 +1043,8 @@ pub const Conn = struct {
     }
 
     fn endStream(self: *Conn) void {
-        self.server.timers.clear(&self.deadline); // the handler's time now
+        self.body_window = null;
+        self.armStream();
         const h = self.server.handlers;
         h.stream.?.end(h.ctx, &self.stream.ex);
     }
@@ -1094,7 +1104,29 @@ pub const Conn = struct {
             self.output(data);
         }
         if (!self.sock.isOpen()) return error.Closed;
-        if (self.sock.buffered() >= socket.low_water) self.stream.full = true;
+        if (!self.stream.full and self.sock.buffered() >= socket.low_water) {
+            self.stream.full = true;
+            self.armStream();
+        }
+    }
+
+    /// Once the body is in, the stream's deadline: the handler's time,
+    /// unless the client stops making room for the answer.
+    fn armStream(self: *Conn) void {
+        if (!self.stream.body.done) return; // its window's
+        if (self.stream.full) return self.server.timers.set(&self.deadline, self.server.config.stall_timeout_ms);
+        self.server.timers.clear(&self.deadline);
+    }
+
+    fn armBodyWindow(self: *Conn) void {
+        const left = self.body_window.?.ends_ms - timers.nowMs();
+        self.server.timers.set(&self.deadline, @intCast(std.math.clamp(left, 0, self.server.config.stall_timeout_ms)));
+    }
+
+    /// At its window's end: whether a request body still coming kept up.
+    fn bodyKeptUp(self: *Conn) bool {
+        const w = if (self.body_window) |*w| w else return false;
+        return w.keptUp(timers.nowMs(), self.server.config.min_body_rate, self.server.config.stall_timeout_ms);
     }
 
     fn streamEnd(ptr: *anyopaque) void {
@@ -1444,7 +1476,7 @@ pub const Conn = struct {
         }
         if (!self.sock.isOpen()) return;
         if (self.file_remaining > 0) {
-            self.server.timers.set(&self.deadline, io_timeout_ms);
+            self.server.timers.set(&self.deadline, self.server.config.stall_timeout_ms);
             return;
         }
         self.closeFile();
@@ -1458,6 +1490,7 @@ pub const Conn = struct {
 
     /// A response is fully queued: wait for the next request, or close.
     fn responseDone(self: *Conn) void {
+        self.body_window = null;
         if (self.phase == .closing) return;
         if (!self.keep_alive or self.server.stopping) return self.enterClosing(.graceful);
         self.phase = .head;
