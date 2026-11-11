@@ -655,9 +655,9 @@ details, and [moq-interop.md](moq-interop.md) for the interop runner.
 | WebTransport browser client/server + protocol negotiation | ✅ Done |
 | Interop test client (10 cases incl. namespace discovery and `data-subgroup-basic`, TAP 14, containerised) | ✅ Done |
 | Datagram objects, relayed with alias remapping | ✅ Done |
-| FETCH request/response runtime | ⚠ Codec only |
+| FETCH (standalone, joining, draft-22 fills) and TRACK_STATUS, from the relay's cache or its publisher | ✅ Done — aiomoqt `fetch` and `join` pass at drafts 18 and 22 |
 | draft-18, alongside draft-17 | ✅ Done — chosen by ALPN, per peer |
-| draft-22 (LOCATION_FILTER, new parameters, FIN semantics, resuming paused publications) | ✅ Done — FETCH's new shape and fill streams not yet |
+| draft-22 (LOCATION_FILTER, new parameters, FIN semantics, resuming paused publications, FETCH's new shape, fills) | ✅ Done — PUBLISH_STATE_NOTIFY not yet |
 | Interop: our relay, both transports, both drafts | ✅ 7/7 each |
 | Interop: our relay against every registered draft-18 client | ✅ all pass (23 Sep 2026) |
 | Interop: moq-relay v0.14.16 (both transports, both drafts) | ⚠ 6/7 — their non-standard error code |

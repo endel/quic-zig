@@ -25,6 +25,8 @@ const moq_msg = quic.moq.message;
 const moq_codes = quic.moq.message_codes;
 const moq_obj = quic.moq.object;
 const moq_version = quic.moq.version;
+const moq_track = quic.moq.track;
+const Location = moq_track.Location;
 const relay_test = @import("relay_test.zig");
 
 pub const std_options: std.Options = .{ .log_level = .err };
@@ -40,6 +42,8 @@ const MAX_STREAMS_PER_CLIENT: usize = 64;
 const MAX_NAMESPACES: usize = 32;
 const MAX_PENDING_SUBS: usize = 16;
 const MAX_NAMESPACE_SUBS: usize = 16;
+const MAX_STATUS_FWDS: usize = 16;
+const MAX_FETCH_FWDS: usize = 16;
 const DUMP_HEAD_BYTES: usize = 48; // of an undecodable message, for the log
 const STREAM_BUF_SIZE: usize = 65_536; // VP8 keyframes typically ≤ 16 KB
 const N_CACHED_GROUPS: usize = 2; // number of completed groups retained per track
@@ -59,8 +63,13 @@ const HELD_DATAGRAM_SIZE: usize = 1500;
 
 /// `upstream`: a SUBSCRIBE the relay sent a namespace's publisher, whose
 /// answer comes back on the same stream. `offer`: a PUBLISH the relay sent
-/// a SUBSCRIBE_TRACKS subscriber, answered the same way.
-const StreamRole = enum { control, request, upstream, offer, data, unknown };
+/// a SUBSCRIBE_TRACKS subscriber, answered the same way. `answered`: a
+/// request the relay has answered in full and closed its half of; the slot
+/// goes once the requester closes its own. `status`: a TRACK_STATUS the relay
+/// passed on to a namespace's publisher. `fetch_up`: a FETCH the relay
+/// passed on to a track's publisher; `fetch_in`: that publisher's answering
+/// FETCH stream.
+const StreamRole = enum { control, request, upstream, offer, data, answered, status, fetch_up, fetch_in, unknown };
 
 // One completed (or in-progress) group's worth of object payload bytes cached
 // at the relay, with the header the publisher opened the stream with — a late
@@ -84,9 +93,41 @@ const CachedGroup = struct {
     }
 };
 
+/// The objects of one cached group, in the order they arrived.
+const CachedObjects = struct {
+    g: *const CachedGroup,
+    pos: usize = 0,
+    prev: ?u64 = null,
+    first: ?u64 = null,
+
+    /// Null past the last whole object: a group is cut short at
+    /// CACHE_GROUP_SIZE, and the live one is still arriving.
+    fn next(self: *CachedObjects) ?moq_obj.SubgroupObject {
+        const data = self.g.payload[self.pos..self.g.payload_len];
+        const r = (moq_obj.readSubgroupObject(data, self.prev, self.g.hdr.per_object_properties) catch return null) orelse return null;
+        self.pos += r.consumed;
+        self.prev = r.object.id;
+        if (self.first == null) self.first = r.object.id;
+        return r.object;
+    }
+
+    /// A header without one names the subgroup by its first object.
+    fn subgroup(self: *const CachedObjects) u64 {
+        return self.g.hdr.subgroup orelse self.first orelse 0;
+    }
+};
+
 /// One subscriber of a track.
 const Sub = struct {
     client_idx: usize = 0,
+    /// Its SUBSCRIBE's, which a joining FETCH names.
+    request_id: u64 = 0,
+    /// Largest Object when it was answered: where a joining FETCH ends.
+    joined_at: ?Location = null,
+    /// draft-22 FILL_PARAMETERS, and the filter a fill without its own
+    /// range takes, until SUBSCRIBE_OK goes out.
+    fill: ?moq_msg.Subscribe.Fill = null,
+    filter: ?moq_msg.Filter = null,
     alias: u64 = 0,
     /// Its SUBSCRIBE stream — where its PUBLISH_DONE goes.
     stream_id: u64 = 0,
@@ -117,6 +158,9 @@ const Track = struct {
     upstream_pending: bool = false,
     /// Its PUBLISH said FORWARD=0 and nothing has resumed it yet.
     pub_paused: bool = false,
+    /// LARGEST_OBJECT from its PUBLISH or our SUBSCRIBE's answer: what the
+    /// publisher had before the relay saw any of it.
+    upstream_largest: ?Location = null,
     active: bool = false,
     /// Moves on whenever the slot's publication changes, reuse included: a
     /// data stream feeds the cache only while the one it began in stands.
@@ -165,6 +209,7 @@ const Track = struct {
         self.pub_alias = 0;
         self.pub_stream_id = null;
         self.pub_paused = false;
+        self.upstream_largest = null;
         self.upstream_idx = null;
         self.upstream_pending = false;
         for (&self.cached) |*g| g.valid = false;
@@ -178,6 +223,47 @@ const Track = struct {
         self.cached[self.next_cache_idx] = src.*;
         self.cached[self.next_cache_idx].valid = true;
         self.next_cache_idx = (self.next_cache_idx + 1) % N_CACHED_GROUPS;
+    }
+
+    /// The cached groups and the one arriving, lowest group first.
+    fn heldGroups(self: *const Track, out: *[N_CACHED_GROUPS + 1]*const CachedGroup) []*const CachedGroup {
+        var n = self.cachedInOrder(out[0..N_CACHED_GROUPS]);
+        if (self.live_owner != null and self.live.payload_len > 0) {
+            out[n] = &self.live;
+            n += 1;
+        }
+        std.mem.sort(*const CachedGroup, out[0..n], {}, struct {
+            fn lt(_: void, a: *const CachedGroup, b: *const CachedGroup) bool {
+                return a.hdr.group < b.hdr.group;
+            }
+        }.lt);
+        return out[0..n];
+    }
+
+    /// §3.1.4 Largest Object: the larger of what the publisher reported and
+    /// what the relay has received (§9.20.17).
+    fn largest(self: *const Track) ?Location {
+        var held: [N_CACHED_GROUPS + 1]*const CachedGroup = undefined;
+        var best: ?Location = self.upstream_largest;
+        for (self.heldGroups(&held)) |g| {
+            var it = CachedObjects{ .g = g };
+            var last: ?u64 = null;
+            while (it.next()) |o| last = o.id;
+            const at: Location = .{ .group = g.hdr.group, .object = last orelse continue };
+            if (best == null or at.order(best.?) == .gt) best = at;
+        }
+        return best;
+    }
+
+    /// The lowest Location the relay holds.
+    fn firstHeld(self: *const Track) ?Location {
+        var held: [N_CACHED_GROUPS + 1]*const CachedGroup = undefined;
+        for (self.heldGroups(&held)) |g| {
+            var it = CachedObjects{ .g = g };
+            const o = it.next() orelse continue;
+            return .{ .group = g.hdr.group, .object = o.id };
+        }
+        return null;
     }
 
     // Iterate cached groups from oldest to newest.
@@ -393,10 +479,43 @@ const PendingSub = struct {
     name_len: usize = 0,
     client_idx: usize = 0,
     stream_id: u64 = 0,
+    request_id: u64 = 0,
     deadline_ns: i128 = 0,
     forward: bool = true,
     filter: ?moq_msg.Filter = null,
+    fill: ?moq_msg.Subscribe.Fill = null,
     active: bool = false,
+};
+
+/// A FETCH passed to the track's publisher for Locations the relay doesn't
+/// hold, and whose it was.
+const FetchFwd = struct {
+    active: bool = false,
+    up_ci: usize = 0,
+    /// Our FETCH's stream, and the publisher's FETCH stream answering it.
+    up_sid: u64 = 0,
+    up_request_id: u64 = 0,
+    up_data: ?u64 = null,
+    down_ci: usize = 0,
+    down_sid: u64 = 0,
+    down_request_id: u64 = 0,
+    /// Our FETCH stream to the requester.
+    out: ?u64 = null,
+    /// FETCH_OK or REQUEST_ERROR passed down.
+    answered: bool = false,
+    /// Fetch objects are re-encoded only between drafts that write them
+    /// differently.
+    up_cursor: moq_obj.FetchCursor = .{ .deltas = true },
+    down_cursor: moq_obj.FetchCursor = .{ .deltas = true },
+};
+
+/// A TRACK_STATUS passed to the namespace's publisher, and whose it was.
+const StatusFwd = struct {
+    active: bool = false,
+    up_ci: usize = 0,
+    up_sid: u64 = 0,
+    down_ci: usize = 0,
+    down_sid: u64 = 0,
 };
 
 const HeldDatagram = struct {
@@ -423,6 +542,8 @@ const RelayHandler = struct {
     ns_subs: [MAX_NAMESPACE_SUBS]NamespaceSub = @splat(.{}),
     ns_seq: u64 = 0,
     held_dgrams: [MAX_HELD_DATAGRAMS]HeldDatagram = @splat(.{}),
+    status_fwds: [MAX_STATUS_FWDS]StatusFwd = @splat(.{}),
+    fetch_fwds: [MAX_FETCH_FWDS]FetchFwd = @splat(.{}),
 
     /// A WebTransport client is its one session.
     pub fn onSessionClosed(self: *RelayHandler, session: *event_loop.Session, _: u64, _: u32, _: []const u8) void {
@@ -477,6 +598,14 @@ const RelayHandler = struct {
         }
         for (&self.pending) |*pn| {
             if (pn.active and pn.client_idx == ci) pn.active = false;
+        }
+        for (&self.status_fwds) |*f| {
+            if (!f.active) continue;
+            if (f.up_ci == ci) self.statusFailed(f) else if (f.down_ci == ci) f.active = false;
+        }
+        for (&self.fetch_fwds) |*f| {
+            if (!f.active) continue;
+            if (f.up_ci == ci) self.fetchFailed(f) else if (f.down_ci == ci) self.cancelFetchFwd(f);
         }
         // The slot's next client would have these read under its aliases.
         for (&self.held_dgrams) |*d| {
@@ -644,6 +773,10 @@ const RelayHandler = struct {
             .upstream => self.tryParseUpstream(ci, stream_id),
             .offer => self.tryParseOffer(ci, stream_id),
             .data => self.tryForwardData(ci, stream_id, fin),
+            .status => self.tryParseStatus(ci, stream_id),
+            .fetch_up => self.tryParseFetchUp(ci, stream_id),
+            .fetch_in => self.tryForwardFetch(ci, stream_id, fin),
+            .answered => if (self.clients[ci].buffer(stream_id)) |b| b.reset(),
         }
 
         // Reclaim slot when stream is done — data streams close after each object.
@@ -655,7 +788,16 @@ const RelayHandler = struct {
                     c.clearSlot(stream_id);
                 },
                 .data => if (!self.holdUnrouted(ci, stream_id)) c.clearSlot(stream_id),
-                .unknown => c.clearSlot(stream_id),
+                .unknown, .answered => c.clearSlot(stream_id),
+                .status => {
+                    if (self.findStatusFwd(ci, stream_id)) |f| self.statusFailed(f);
+                    c.clearSlot(stream_id);
+                },
+                .fetch_up => {
+                    if (self.findFetchFwd(ci, stream_id)) |f| if (!f.answered) self.fetchFailed(f);
+                    c.clearSlot(stream_id);
+                },
+                .fetch_in => c.clearSlot(stream_id),
                 .request => if (moq_version.Rules.of(c.draft).fin_withdraws_request) self.requestFinished(ci, stream_id),
                 .control, .offer => {},
             }
@@ -754,6 +896,12 @@ const RelayHandler = struct {
             return;
         };
 
+        if (first_varint == moq_codes.STREAM_FETCH) {
+            self.clients[ci].setRole(stream_id, .fetch_in);
+            self.tryForwardFetch(ci, stream_id, fin);
+            return;
+        }
+
         if (first_varint == moq_codes.MSG_SETUP) {
             // Confirm by parsing the full envelope.
             if (moq_msg.parseEnvelope(buf.slice())) |parsed| {
@@ -796,12 +944,14 @@ const RelayHandler = struct {
             moq_codes.MSG_SUBSCRIBE_TRACKS => if (moq_version.Rules.of(self.clients[ci].draft).has_subscribe_tracks) {
                 self.handleSubscribeNamespace(ci, session, stream_id, env.type, env.payload);
             } else {
-                std.debug.print("[relay] client {d} SUBSCRIBE_TRACKS before draft-18\n", .{ci});
+                self.notSupported(ci, stream_id, env.type);
             },
             moq_codes.MSG_REQUEST_UPDATE => self.handleRequestUpdate(ci, stream_id, env.payload),
+            moq_codes.MSG_FETCH => self.handleFetch(ci, session, stream_id, env.payload),
+            moq_codes.MSG_TRACK_STATUS => self.handleTrackStatus(ci, session, stream_id, env.payload),
             // A publisher answering the REQUEST_UPDATE that resumed it.
             moq_codes.MSG_REQUEST_OK, moq_codes.MSG_REQUEST_ERROR => {},
-            else => std.debug.print("[relay] client {d} request type=0x{x}\n", .{ ci, env.type }),
+            else => self.notSupported(ci, stream_id, env.type),
         }
     }
 
@@ -826,6 +976,414 @@ const RelayHandler = struct {
             }
             if (fwd) self.resumeIfWanted(t);
         }
+    }
+
+    /// A request type the relay doesn't serve gets an answer rather than a
+    /// requester left to time out. Anything else on a live request's stream
+    /// is only logged: an error there would read as that request's.
+    fn notSupported(self: *RelayHandler, ci: usize, stream_id: u64, msg_type: u64) void {
+        std.debug.print("[relay] client {d} request type=0x{x}: not supported\n", .{ ci, msg_type });
+        if (self.findSub(ci, stream_id) != null) return;
+        for (&self.namespaces) |*n| if (n.active and n.client_idx == ci and n.stream_id == stream_id) return;
+        for (&self.ns_subs) |*n| if (n.active and n.client_idx == ci and n.stream_id == stream_id) return;
+        self.failRequest(ci, stream_id, moq_codes.ERR_NOT_SUPPORTED, "not supported");
+    }
+
+    /// REQUEST_ERROR, and the stream closed: nothing more comes of it.
+    fn failRequest(self: *RelayHandler, ci: usize, stream_id: u64, code: u64, reason: []const u8) void {
+        self.sendToClientError(ci, stream_id, code, reason);
+        self.finishAnswered(ci, stream_id);
+    }
+
+    fn finishAnswered(self: *RelayHandler, ci: usize, stream_id: u64) void {
+        var l = self.link(ci) orelse return;
+        l.finish(stream_id);
+        // A slot the peer's own FIN already freed stays freed.
+        const c = &self.clients[ci];
+        if (c.slotOf(stream_id)) |i| c.stream_roles[i] = .answered;
+    }
+
+    /// §9.11 FETCH, answered from the groups the relay holds. Drafts 17 and
+    /// 18's joining forms end where their subscription began.
+    fn handleFetch(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
+        const draft = self.clients[ci].draft;
+        var ns_buf: moq_msg.NamespaceBuf = undefined;
+        const f = moq_msg.decodeFetch(payload, &ns_buf, draft) catch |e| {
+            self.rejectRequest(ci, session, stream_id, e, "fetch", payload);
+            return;
+        };
+        var t: *const Track = undefined;
+        var start: Location = undefined;
+        var end: Location = undefined;
+        switch (f.body) {
+            .standalone => |s| {
+                var ns_key: [256]u8 = undefined;
+                const ns_len = moq_wire.flattenNamespace(s.track_namespace, &ns_key) orelse
+                    return self.failRequest(ci, stream_id, moq_codes.ERR_NAMESPACE_TOO_LARGE, "namespace too long");
+                const ti = self.findTrack(ns_key[0..ns_len], s.track_name) orelse
+                    return self.failRequest(ci, stream_id, moq_codes.ERR_DOES_NOT_EXIST, "no such track");
+                t = &self.tracks[ti];
+                const r = s.range.resolve(t.largest()) orelse
+                    return self.failRequest(ci, stream_id, moq_codes.ERR_INVALID_RANGE, "nothing published in that range");
+                start = r.start;
+                end = r.end;
+            },
+            .relative_joining, .absolute_joining => |j| {
+                const found = self.findSubByRequest(ci, j.joining_request_id) orelse
+                    return self.failRequest(ci, stream_id, moq_codes.ERR_INVALID_JOINING_REQUEST_ID, "no such subscription");
+                // §10.12.2: only a forwarding subscription with something
+                // published before it can be joined.
+                const at = (if (found.sub.forward) found.sub.joined_at else null) orelse
+                    return self.failRequest(ci, stream_id, moq_codes.ERR_INVALID_RANGE, "nothing to join");
+                const g = if (std.meta.activeTag(f.body) == .relative_joining) at.group -| j.joining_start else j.joining_start;
+                start = .{ .group = g, .object = 0 };
+                end = at;
+                if (start.order(end) == .gt) return self.failRequest(ci, stream_id, moq_codes.ERR_INVALID_RANGE, "starts after the subscription");
+                t = found.track;
+            },
+        }
+
+        const descending = (f.group_order orelse .ascending) == .descending;
+        // §10.12.3 (draft-18): what the cache doesn't hold, the relay asks
+        // upstream for rather than guess at.
+        const held = t.firstHeld();
+        const covered = if (held) |h| h.order(start) != .gt else false;
+        if (!covered and self.forwardFetch(t, ci, stream_id, f.request_id, start, end, descending)) return;
+
+        var l = self.link(ci) orelse return;
+        if (l.s.sendBufferedBytes() > MAX_SUB_BACKLOG) return self.failRequest(ci, stream_id, moq_codes.ERR_EXCESSIVE_LOAD, "subscriber backlog");
+        var buf: [64]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&buf);
+        moq_msg.writeFetchOk(&fbs, .{ .end = end }, draft) catch return;
+        l.send(stream_id, buf[0..fbs.seek]) catch return;
+        const n = self.serveFetch(&l, draft, t, f.request_id, start, end, descending);
+        std.debug.print("[relay] FETCH client={d} {d}/{d}..{d}/{d}: {d} objects\n", .{ ci, start.group, start.object, end.group, end.object, n });
+        self.finishAnswered(ci, stream_id);
+    }
+
+    fn findSubByRequest(self: *RelayHandler, ci: usize, request_id: u64) ?struct { track: *Track, sub: *Sub } {
+        for (self.tracks[0..self.track_count]) |*t| {
+            if (!t.active) continue;
+            for (t.subs[0..t.sub_count]) |*sub| {
+                if (sub.client_idx == ci and sub.request_id == request_id) return .{ .track = t, .sub = sub };
+            }
+        }
+        return null;
+    }
+
+    /// One FETCH stream from the held groups; returns the objects sent. In
+    /// ascending order a FIN'd gap reads as objects that don't exist (§3.2),
+    /// so whatever the cache can't vouch for is said to be unknown instead.
+    fn serveFetch(_: *RelayHandler, l: *Link, draft: moq_version.Draft, t: *const Track, request_id: u64, start: Location, end: Location, descending: bool) usize {
+        const out = l.openUni() catch return 0;
+        var head: [1024]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&head);
+        moq_obj.writeFetchStreamHeader(&fbs, request_id) catch return 0;
+        l.send(out, head[0..fbs.seek]) catch return 0;
+
+        var held: [N_CACHED_GROUPS + 1]*const CachedGroup = undefined;
+        const groups = t.heldGroups(&held);
+        if (descending) std.mem.reverse(*const CachedGroup, groups);
+        var c = moq_obj.FetchCursor.init(draft, descending);
+        var sent: usize = 0;
+        for (groups) |g| {
+            if (g.hdr.group < start.group or g.hdr.group > end.group) continue;
+            var it = CachedObjects{ .g = g };
+            while (it.next()) |o| {
+                if (o.status != 0) continue; // a status, not an object to fetch
+                const at: Location = .{ .group = g.hdr.group, .object = o.id };
+                if (at.order(start) == .lt or at.order(end) == .gt) continue;
+                fbs.seek = 0;
+                if (!descending) if (unknownBefore(c.at, start, at)) |gap| {
+                    moq_obj.writeFetchItemHead(&fbs, .{ .end_of_range = .{ .kind = .unknown, .at = gap } }, &c) catch {};
+                };
+                moq_obj.writeFetchItemHead(&fbs, .{ .object = .{
+                    .group = at.group,
+                    .subgroup = it.subgroup(),
+                    .id = at.object,
+                    .publisher_priority = g.hdr.publisher_priority orelse 128,
+                    .properties = if (g.hdr.per_object_properties) o.properties else null,
+                    .payload = o.payload,
+                } }, &c) catch continue;
+                l.send(out, head[0..fbs.seek]) catch return sent;
+                l.send(out, o.payload) catch return sent;
+                sent += 1;
+            }
+        }
+        // Up to the range's end, past the groups held: the publisher's
+        // Largest Object can be further on than anything the relay has.
+        const tail_unknown = if (c.at) |p| end.group > p.group else true;
+        if (!descending and tail_unknown) {
+            fbs.seek = 0;
+            moq_obj.writeFetchItemHead(&fbs, .{ .end_of_range = .{ .kind = .unknown, .at = end } }, &c) catch {};
+            l.send(out, head[0..fbs.seek]) catch {};
+        }
+        l.finish(out);
+        return sent;
+    }
+
+    /// §9.13: what a SUBSCRIBE would learn, without subscribing. A track the
+    /// relay has no state for is asked of its namespace's publisher.
+    fn handleTrackStatus(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64, payload: []const u8) void {
+        const draft = self.clients[ci].draft;
+        var ns_buf: moq_msg.NamespaceBuf = undefined;
+        const ts = moq_msg.decodeTrackStatus(payload, &ns_buf, draft) catch |e| {
+            self.rejectRequest(ci, session, stream_id, e, "track status", payload);
+            return;
+        };
+        var ns_key: [256]u8 = undefined;
+        const ns_len = moq_wire.flattenNamespace(ts.track_namespace, &ns_key) orelse
+            return self.failRequest(ci, stream_id, moq_codes.ERR_NAMESPACE_TOO_LARGE, "namespace too long");
+        const ns = ns_key[0..ns_len];
+        if (self.findTrack(ns, ts.track_name)) |ti| {
+            const t = &self.tracks[ti];
+            const largest = t.largest();
+            if (t.publisher_idx != null or largest != null) {
+                var params: [1]moq_msg.Param = undefined;
+                var n: usize = 0;
+                if (largest) |at| {
+                    params[0] = .{ .type = moq_msg.ParamType.LARGEST_OBJECT, .value = .{ .location = at } };
+                    n = 1;
+                }
+                var buf: [64]u8 = undefined;
+                var fbs = io_compat.fixedBufferStream(&buf);
+                moq_msg.writeRequestOk(&fbs, .{ .params = params[0..n] }) catch return;
+                self.sendToClient(ci, stream_id, buf[0..fbs.seek]);
+                return self.finishAnswered(ci, stream_id);
+            }
+        }
+        if (self.namespaceOwner(ns)) |owner| if (owner != ci and self.forwardStatus(owner, ci, stream_id, ts)) return;
+        self.failRequest(ci, stream_id, moq_codes.ERR_DOES_NOT_EXIST, "no such track");
+    }
+
+    fn forwardStatus(self: *RelayHandler, owner: usize, ci: usize, stream_id: u64, ts: moq_msg.TrackStatus) bool {
+        const slot = for (&self.status_fwds) |*f| {
+            if (!f.active) break f;
+        } else return false;
+        var l = self.link(owner) orelse return false;
+        var buf: [512]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&buf);
+        moq_msg.writeTrackStatus(&fbs, .{
+            .request_id = self.clients[owner].next_request_id,
+            .track_namespace = ts.track_namespace,
+            .track_name = ts.track_name,
+        }, self.clients[owner].draft) catch return false;
+        const sid = l.openBidi() catch return false;
+        l.send(sid, buf[0..fbs.seek]) catch return false;
+        self.clients[owner].next_request_id += 2;
+        self.clients[owner].setRole(sid, .status);
+        slot.* = .{ .active = true, .up_ci = owner, .up_sid = sid, .down_ci = ci, .down_sid = stream_id };
+        std.debug.print("[relay] TRACK_STATUS client {d} → publisher client {d}\n", .{ ci, owner });
+        return true;
+    }
+
+    fn findStatusFwd(self: *RelayHandler, ci: usize, stream_id: u64) ?*StatusFwd {
+        for (&self.status_fwds) |*f| {
+            if (f.active and f.up_ci == ci and f.up_sid == stream_id) return f;
+        }
+        return null;
+    }
+
+    /// The publisher's answer to a TRACK_STATUS we passed on, re-encoded in
+    /// the requester's draft.
+    fn tryParseStatus(self: *RelayHandler, ci: usize, stream_id: u64) void {
+        const buf = self.clients[ci].buffer(stream_id) orelse return;
+        const parsed = moq_msg.parseEnvelope(buf.slice()) catch return;
+        const f = self.findStatusFwd(ci, stream_id) orelse return buf.reset();
+        var out: [512]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&out);
+        switch (parsed.env.type) {
+            moq_codes.MSG_REQUEST_OK => {
+                var params: [8]moq_msg.Param = undefined;
+                const ok = moq_msg.decodeRequestOk(parsed.env.payload, &params, self.clients[ci].draft) catch return self.statusFailed(f);
+                moq_msg.writeRequestOk(&fbs, ok) catch return self.statusFailed(f);
+            },
+            moq_codes.MSG_REQUEST_ERROR => {
+                const e = moq_msg.decodeRequestError(parsed.env.payload) catch return self.statusFailed(f);
+                moq_msg.writeRequestError(&fbs, e) catch return self.statusFailed(f);
+            },
+            else => return self.statusFailed(f),
+        }
+        self.sendToClient(f.down_ci, f.down_sid, out[0..fbs.seek]);
+        self.finishAnswered(f.down_ci, f.down_sid);
+        self.finishAnswered(ci, stream_id);
+        buf.reset();
+        f.active = false;
+    }
+
+    /// The publisher closed, reset or garbled a TRACK_STATUS we passed on.
+    fn statusFailed(self: *RelayHandler, f: *StatusFwd) void {
+        f.active = false;
+        self.failRequest(f.down_ci, f.down_sid, moq_codes.ERR_INTERNAL_ERROR, "publisher gave no answer");
+    }
+
+    /// Passes a FETCH the relay can't answer from its cache to the track's
+    /// publisher, as an absolute range it can't misread.
+    fn forwardFetch(self: *RelayHandler, t: *const Track, ci: usize, stream_id: u64, request_id: u64, start: Location, end: Location, descending: bool) bool {
+        const owner = t.publisher_idx orelse return false;
+        if (owner == ci) return false;
+        const slot = for (&self.fetch_fwds) |*f| {
+            if (!f.active) break f;
+        } else return false;
+        var l = self.link(owner) orelse return false;
+
+        var range = moq_msg.LocationFilter{
+            .type = moq_msg.LocationFilter.ABSOLUTE_RANGE,
+            .start_group = start.group,
+            .start_object = start.object,
+            .end_group_delta = end.group - start.group,
+            .end_object = end.object,
+        };
+        if (end.object == moq_msg.WHOLE_GROUP) range.type = moq_msg.LocationFilter.ABSOLUTE_START_GROUP_END;
+        var parts: [moq_wire.MAX_TUPLE_PARTS][]const u8 = undefined;
+        var fields: [256]u8 = undefined;
+        var buf: [512]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&buf);
+        const up_rid = self.clients[owner].next_request_id;
+        moq_msg.writeFetch(&fbs, .{
+            .request_id = up_rid,
+            .body = .{ .standalone = .{
+                .track_namespace = moq_wire.splitNamespace(t.namespace_buf[0..t.namespace_len], &parts, &fields),
+                .track_name = t.name_buf[0..t.name_len],
+                .range = range,
+            } },
+            .group_order = if (descending) .descending else null,
+        }, self.clients[owner].draft) catch return false;
+        const sid = l.openBidi() catch return false;
+        l.send(sid, buf[0..fbs.seek]) catch return false;
+        self.clients[owner].next_request_id += 2;
+        self.clients[owner].setRole(sid, .fetch_up);
+        slot.* = .{
+            .active = true,
+            .up_ci = owner,
+            .up_sid = sid,
+            .up_request_id = up_rid,
+            .down_ci = ci,
+            .down_sid = stream_id,
+            .down_request_id = request_id,
+            .up_cursor = moq_obj.FetchCursor.init(self.clients[owner].draft, descending),
+            .down_cursor = moq_obj.FetchCursor.init(self.clients[ci].draft, descending),
+        };
+        std.debug.print("[relay] FETCH client {d} {d}/{d}..{d}/{d} → publisher client {d}\n", .{ ci, start.group, start.object, end.group, end.object, owner });
+        return true;
+    }
+
+    fn findFetchFwd(self: *RelayHandler, ci: usize, stream_id: u64) ?*FetchFwd {
+        for (&self.fetch_fwds) |*f| {
+            if (f.active and f.up_ci == ci and f.up_sid == stream_id) return f;
+        }
+        return null;
+    }
+
+    /// The publisher's FETCH_OK or REQUEST_ERROR, re-encoded for the
+    /// requester's draft.
+    fn tryParseFetchUp(self: *RelayHandler, ci: usize, stream_id: u64) void {
+        const buf = self.clients[ci].buffer(stream_id) orelse return;
+        const parsed = moq_msg.parseEnvelope(buf.slice()) catch return;
+        const f = self.findFetchFwd(ci, stream_id) orelse return buf.reset();
+        var out: [512]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&out);
+        switch (parsed.env.type) {
+            moq_codes.MSG_FETCH_OK => {
+                const ok = moq_msg.decodeFetchOk(parsed.env.payload, self.clients[ci].draft) catch return self.fetchFailed(f);
+                moq_msg.writeFetchOk(&fbs, ok, self.clients[f.down_ci].draft) catch return self.fetchFailed(f);
+                self.sendToClient(f.down_ci, f.down_sid, out[0..fbs.seek]);
+                self.finishAnswered(f.down_ci, f.down_sid);
+                f.answered = true;
+            },
+            moq_codes.MSG_REQUEST_ERROR => {
+                const e = moq_msg.decodeRequestError(parsed.env.payload) catch return self.fetchFailed(f);
+                moq_msg.writeRequestError(&fbs, e) catch return self.fetchFailed(f);
+                self.sendToClient(f.down_ci, f.down_sid, out[0..fbs.seek]);
+                self.finishAnswered(f.down_ci, f.down_sid);
+                self.finishAnswered(ci, stream_id);
+                f.active = false;
+            },
+            else => {},
+        }
+        const remaining = buf.slice()[parsed.consumed..];
+        std.mem.copyForwards(u8, &buf.data, remaining);
+        buf.len = remaining.len;
+    }
+
+    /// The publisher's FETCH stream, passed to the requester under its own
+    /// Request ID.
+    fn tryForwardFetch(self: *RelayHandler, ci: usize, stream_id: u64, fin: bool) void {
+        const buf = self.clients[ci].buffer(stream_id) orelse return;
+        const f = for (&self.fetch_fwds) |*f| {
+            if (f.active and f.up_ci == ci and f.up_data == stream_id) break f;
+        } else blk: {
+            var fbs = io_compat.fixedBufferStream(@as([]const u8, buf.slice()));
+            const rid = moq_obj.readFetchStreamHeader(&fbs) catch |e| {
+                if (e == error.BufferTooShort and !fin) return;
+                return self.refuseFetchStream(ci, stream_id);
+            };
+            const f = for (&self.fetch_fwds) |*f| {
+                if (f.active and f.up_ci == ci and f.up_request_id == rid and f.up_data == null) break f;
+            } else return self.refuseFetchStream(ci, stream_id);
+            var dl = self.link(f.down_ci) orelse return self.refuseFetchStream(ci, stream_id);
+            const out = dl.openUni() catch return self.refuseFetchStream(ci, stream_id);
+            var hdr: [16]u8 = undefined;
+            var hfbs = io_compat.fixedBufferStream(&hdr);
+            moq_obj.writeFetchStreamHeader(&hfbs, f.down_request_id) catch {};
+            dl.send(out, hdr[0..hfbs.seek]) catch {};
+            f.up_data = stream_id;
+            f.out = out;
+            const remaining = buf.slice()[fbs.seek..];
+            std.mem.copyForwards(u8, &buf.data, remaining);
+            buf.len = remaining.len;
+            break :blk f;
+        };
+        var dl = self.link(f.down_ci) orelse return;
+        const out = f.out.?;
+        var pos: usize = 0;
+        if (f.up_cursor.deltas == f.down_cursor.deltas) {
+            dl.send(out, buf.slice()) catch {};
+            pos = buf.len;
+        } else while (moq_obj.readFetchItem(buf.slice()[pos..], &f.up_cursor) catch null) |r| {
+            var head: [1024]u8 = undefined;
+            var hfbs = io_compat.fixedBufferStream(&head);
+            moq_obj.writeFetchItemHead(&hfbs, r.item, &f.down_cursor) catch {};
+            dl.send(out, head[0..hfbs.seek]) catch {};
+            if (r.item == .object) dl.send(out, r.item.object.payload) catch {};
+            pos += r.consumed;
+        }
+        const remaining = buf.slice()[pos..];
+        std.mem.copyForwards(u8, &buf.data, remaining);
+        buf.len = remaining.len;
+        if (fin) {
+            dl.finish(out);
+            self.finishAnswered(ci, f.up_sid);
+            f.active = false;
+        }
+    }
+
+    fn refuseFetchStream(self: *RelayHandler, ci: usize, stream_id: u64) void {
+        if (self.link(ci)) |l_| {
+            var l = l_;
+            l.stopSending(stream_id, 0x1); // CANCELLED
+        }
+        if (self.clients[ci].buffer(stream_id)) |b| b.reset();
+        self.clients[ci].setRole(stream_id, .answered);
+    }
+
+    /// The publisher is gone, or ended our FETCH without an answer: the
+    /// requester hears so, on whichever stream still can.
+    fn fetchFailed(self: *RelayHandler, f: *FetchFwd) void {
+        f.active = false;
+        if (!f.answered) return self.failRequest(f.down_ci, f.down_sid, moq_codes.ERR_INTERNAL_ERROR, "publisher gave no answer");
+        if (f.out) |out| if (self.link(f.down_ci)) |l_| {
+            var l = l_;
+            l.reset(out, moq_codes.ERR_INTERNAL_ERROR);
+        };
+    }
+
+    /// The requester went away or cancelled: so does our FETCH.
+    fn cancelFetchFwd(self: *RelayHandler, f: *FetchFwd) void {
+        f.active = false;
+        var l = self.link(f.up_ci) orelse return;
+        l.reset(f.up_sid, 0x1);
+        if (f.up_data) |d| l.stopSending(d, 0x1);
     }
 
     fn sendOnStream(_: *RelayHandler, session: *event_loop.Session, stream_id: u64, bytes: []const u8) void {
@@ -1164,7 +1722,7 @@ const RelayHandler = struct {
         return false;
     }
 
-    fn holdPending(self: *RelayHandler, ci: usize, stream_id: u64, ns: []const u8, name: []const u8, wait_ms: u64, forward: bool, filter: ?moq_msg.Filter) bool {
+    fn holdPending(self: *RelayHandler, ci: usize, stream_id: u64, request_id: u64, ns: []const u8, name: []const u8, wait_ms: u64, forward: bool, filter: ?moq_msg.Filter, fill: ?moq_msg.Subscribe.Fill) bool {
         if (ns.len > 256 or name.len > 128) return false;
         for (&self.pending) |*p| {
             if (p.active) continue;
@@ -1174,9 +1732,11 @@ const RelayHandler = struct {
             p.name_len = name.len;
             p.client_idx = ci;
             p.stream_id = stream_id;
+            p.request_id = request_id;
             p.deadline_ns = sys.nanoTimestamp() + @as(i128, @intCast(wait_ms)) * 1_000_000;
             p.forward = forward;
             p.filter = filter;
+            p.fill = fill;
             p.active = true;
             return true;
         }
@@ -1191,7 +1751,7 @@ const RelayHandler = struct {
             if (!p.active) continue;
             if (!std.mem.startsWith(u8, p.ns_buf[0..p.ns_len], ns_key)) continue;
             p.active = false;
-            self.admitSubscriber(p.client_idx, p.stream_id, p.ns_buf[0..p.ns_len], p.name_buf[0..p.name_len], p.forward, p.filter);
+            self.admitSubscriber(p.client_idx, p.stream_id, p.request_id, p.ns_buf[0..p.ns_len], p.name_buf[0..p.name_len], p.forward, p.filter, p.fill);
         }
     }
 
@@ -1240,13 +1800,13 @@ const RelayHandler = struct {
                 self.sendRequestError(session, stream_id, moq_codes.ERR_DOES_NOT_EXIST, "no such namespace");
                 return;
             }
-            if (!self.holdPending(ci, stream_id, ns_key[0..ns_len], sub.track_name, wait_ms, sub.forward orelse true, sub.filter)) {
+            if (!self.holdPending(ci, stream_id, sub.request_id, ns_key[0..ns_len], sub.track_name, wait_ms, sub.forward orelse true, sub.filter, sub.fill)) {
                 self.sendRequestError(session, stream_id, moq_codes.ERR_EXCESSIVE_LOAD, "too many pending subscriptions");
             }
             return;
         }
 
-        self.admitSubscriber(ci, stream_id, ns_key[0..ns_len], sub.track_name, sub.forward orelse true, sub.filter);
+        self.admitSubscriber(ci, stream_id, sub.request_id, ns_key[0..ns_len], sub.track_name, sub.forward orelse true, sub.filter, sub.fill);
     }
 
     /// A free track slot, reusing one a finished track left behind.
@@ -1300,6 +1860,16 @@ const RelayHandler = struct {
         } else return;
         self.abandonForward(ci, stream_id, code);
         self.requestWithdrawn(ci, stream_id);
+        for (&self.status_fwds) |*f| {
+            if (!f.active) continue;
+            if (f.up_ci == ci and f.up_sid == stream_id) self.statusFailed(f);
+            if (f.down_ci == ci and f.down_sid == stream_id) f.active = false;
+        }
+        for (&self.fetch_fwds) |*f| {
+            if (!f.active) continue;
+            if (f.up_ci == ci and (f.up_sid == stream_id or f.up_data == stream_id)) self.fetchFailed(f);
+            if (f.down_ci == ci and f.down_sid == stream_id) self.cancelFetchFwd(f);
+        }
         self.clients[ci].clearSlot(stream_id);
     }
 
@@ -1444,11 +2014,14 @@ const RelayHandler = struct {
                         tr.upstream_pending = false;
                         tr.publisher_idx = ci;
                         tr.pub_alias = ok.track_alias;
+                        tr.upstream_largest = ok.largest;
                         std.debug.print("[relay] SUBSCRIBE_OK ← publisher client {d} alias={d}\n", .{ ci, ok.track_alias });
                         for (tr.subs[0..tr.sub_count]) |*sub| {
                             if (sub.answered) continue;
                             sub.answered = true;
+                            sub.joined_at = tr.largest();
                             self.sendSubscribeOk(sub);
+                            self.openFill(tr, sub);
                         }
                         self.retryHeld(ci);
                     } else |e| {
@@ -1503,13 +2076,28 @@ const RelayHandler = struct {
     fn sendSubscribeOk(self: *RelayHandler, sub: *const Sub) void {
         var buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
-        moq_msg.writeSubscribeOk(&fbs, .{ .track_alias = sub.alias }) catch return;
+        moq_msg.writeSubscribeOk(&fbs, .{ .track_alias = sub.alias, .largest = sub.joined_at }) catch return;
         self.sendToClient(sub.client_idx, sub.stream_id, buf[0..fbs.seek]);
+    }
+
+    /// draft-22 §3.4: a SUBSCRIBE with FILL_PARAMETERS gets its fill range as
+    /// a FETCH response under the SUBSCRIBE's Request ID; an empty range
+    /// opens no stream, and nor does a paused subscription.
+    fn openFill(self: *RelayHandler, t: *const Track, sub: *Sub) void {
+        const fill = sub.fill orelse return;
+        sub.fill = null;
+        if (!sub.forward) return;
+        const range = fill.range orelse if (sub.filter) |f| f.toLocation() else moq_msg.LocationFilter{};
+        const r = range.resolve(sub.joined_at) orelse return;
+        var l = self.link(sub.client_idx) orelse return;
+        const descending = (fill.group_order orelse .ascending) == .descending;
+        const n = self.serveFetch(&l, self.clients[sub.client_idx].draft, t, sub.request_id, r.start, r.end, descending);
+        std.debug.print("[relay] fill client={d} {d}/{d}..{d}/{d}: {d} objects\n", .{ sub.client_idx, r.start.group, r.start.object, r.end.group, r.end.object, n });
     }
 
     /// `filter` is the subscriber's, null when it sent none; the first
     /// subscriber's goes upstream as it came (§10.2.9: absent is unfiltered).
-    fn admitSubscriber(self: *RelayHandler, ci: usize, stream_id: u64, ns_key: []const u8, track_name: []const u8, forward: bool, filter: ?moq_msg.Filter) void {
+    fn admitSubscriber(self: *RelayHandler, ci: usize, stream_id: u64, request_id: u64, ns_key: []const u8, track_name: []const u8, forward: bool, filter: ?moq_msg.Filter, fill: ?moq_msg.Subscribe.Fill) void {
         const ti = self.findTrack(ns_key, track_name) orelse
             self.allocTrack(ns_key, track_name) orelse {
             self.sendToClientError(ci, stream_id, moq_codes.ERR_EXCESSIVE_LOAD, "track table full");
@@ -1527,25 +2115,27 @@ const RelayHandler = struct {
             self.clients[ci].next_alias += 1;
             t.subs[t.sub_count] = .{
                 .client_idx = ci,
+                .request_id = request_id,
                 .alias = alias,
                 .stream_id = stream_id,
                 .answered = !t.upstream_pending,
                 .forward = forward,
+                .fill = fill,
+                .filter = filter,
             };
             t.sub_count += 1;
             if (t.upstream_pending) return; // answered once the publisher does
-
-            var buf: [256]u8 = undefined;
-            var fbs = io_compat.fixedBufferStream(&buf);
-            moq_msg.writeSubscribeOk(&fbs, .{ .track_alias = alias }) catch return;
-            self.sendToClient(ci, stream_id, buf[0..fbs.seek]);
+            const sub = &t.subs[t.sub_count - 1];
+            sub.joined_at = t.largest();
+            self.sendSubscribeOk(sub);
             std.debug.print("[relay] SUBSCRIBE_OK → client {d} alias={d} (track {d}, {d} subs, pub={?d})\n", .{
                 ci, alias, ti, t.sub_count, t.publisher_idx,
             });
 
+            self.openFill(t, sub);
             // Replay any cached groups to this new subscriber so it starts
             // playback immediately instead of waiting for the next keyframe.
-            self.replayCachedGroups(t, &t.subs[t.sub_count - 1]);
+            self.replayCachedGroups(t, sub);
             self.resumeIfWanted(t);
         }
     }
@@ -1666,6 +2256,7 @@ const RelayHandler = struct {
         }
         t.publisher_idx = ci;
         t.pub_alias = pub_msg.track_alias;
+        t.upstream_largest = pub_msg.largest;
         t.pub_stream_id = stream_id;
         // Our answer resumes it where it can carry FORWARD; otherwise it
         // stays paused until someone wants its objects.
@@ -2013,6 +2604,19 @@ test "a subscriber leaving takes its outputs with it" {
 
 /// Native-QUIC client 0 publishes track 0 under alias 5 from its request
 /// stream 0; client 1 subscribes to it from its request stream 4.
+/// The Location just before `at`, when nothing sent so far on a FETCH
+/// stream accounts for what lies between `prev`, or the range's start, and
+/// it: the relay doesn't hold those Locations, so it can't say they don't
+/// exist.
+fn unknownBefore(prev: ?Location, start: Location, at: Location) ?Location {
+    if (prev) |p| {
+        if (at.group == p.group) return null;
+        if (at.group == p.group +| 1 and at.object == 0) return null;
+    } else if (at.order(start) != .gt) return null;
+    if (at.object > 0) return .{ .group = at.group, .object = at.object - 1 };
+    return .{ .group = at.group - 1, .object = moq_msg.WHOLE_GROUP };
+}
+
 const TestRelay = struct {
     r: *RelayHandler,
     conns: [2]*connection_mod.Connection,
@@ -2209,7 +2813,7 @@ test "resubscribing can't make the relay queue replays without end" {
     var subscriber = tr.session(1);
     for (0..20) |i| {
         const sid: u64 = 8 + 4 * i;
-        r.admitSubscriber(1, sid, "", "", true, null);
+        r.admitSubscriber(1, sid, 0, "", "", true, null, null);
         r.onStreamReset(&subscriber, 0, sid, 0);
     }
     try std.testing.expect(tr.conns[1].sendBufferedBytes() <= MAX_SUB_BACKLOG + N_CACHED_GROUPS * CACHE_GROUP_SIZE + 4096);
@@ -2626,4 +3230,298 @@ test "a paused draft-22 publication is resumed for a subscriber that wants objec
         try std.testing.expectEqual(@as(?bool, true), u.forward);
         try std.testing.expectEqual(@as(u64, 1), u.request_id & 1); // a server's request id
     }
+}
+
+/// Publisher (client 0) sends group `group` of track alias 5 on its uni
+/// stream `sid`, one object per payload.
+fn publishGroup(tr: *TestRelay, sid: u64, group: u64, objects: []const []const u8, fin: bool) !void {
+    var buf: [256]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    try moq_obj.writeSubgroupHeader(&fbs, .{
+        .track_alias = 5,
+        .group = group,
+        .subgroup = 0,
+        .publisher_priority = 128,
+        .end_of_group = false,
+        .per_object_properties = false,
+    }, tr.r.clients[0].draft);
+    for (objects, 0..) |o, i| try moq_obj.writeSubgroupObject(&fbs, .{ .id = i, .payload = o }, if (i == 0) null else i - 1, false);
+    var s = tr.session(0);
+    tr.r.onStreamData(&s, sid, buf[0..fbs.seek], fin);
+}
+
+/// What the relay sent client 1 on its FETCH stream `sid`.
+fn fetched(tr: *TestRelay, sid: u64, out: []moq_obj.FetchItem) ![]moq_obj.FetchItem {
+    const ss = tr.conns[1].streams.send_streams.get(sid) orelse return error.NoOutput;
+    const all = ss.write_buffer.items;
+    var fbs = io_compat.fixedBufferStream(@as([]const u8, all));
+    _ = try moq_obj.readFetchStreamHeader(&fbs);
+    var c = moq_obj.FetchCursor.init(tr.r.clients[1].draft, false);
+    var data = all[fbs.seek..];
+    var n: usize = 0;
+    while (data.len > 0) : (n += 1) {
+        const r = (try moq_obj.readFetchItem(data, &c)) orelse return error.Truncated;
+        out[n] = r.item;
+        data = data[r.consumed..];
+    }
+    return out[0..n];
+}
+
+fn expectFetched(item: moq_obj.FetchItem, group: u64, id: u64, payload: []const u8) !void {
+    try std.testing.expectEqual(Location{ .group = group, .object = id }, Location{ .group = item.object.group, .object = item.object.id });
+    try std.testing.expectEqualStrings(payload, item.object.payload);
+}
+
+const test_ns: []const []const u8 = &.{"ns"};
+
+test "FETCH is answered from the groups the relay holds, in each draft" {
+    // A FETCH went unanswered: the requester waited out its timeout.
+    for ([_]moq_version.Draft{ .draft_17, .draft_18, .draft_22 }) |d| {
+        var tr: TestRelay = undefined;
+        try tr.init();
+        defer tr.deinit();
+        setDraft(&tr, d);
+        _ = namedTrack(&tr);
+        try publishGroup(&tr, 2, 3, &.{ "a", "b" }, true);
+        try publishGroup(&tr, 6, 4, &.{"c"}, true);
+        try publishGroup(&tr, 10, 5, &.{"d"}, false); // still arriving
+
+        try sendRequest(&tr, 1, 8, moq_msg.writeFetch, moq_msg.Fetch{ .request_id = 8, .body = .{ .standalone = .{
+            .track_namespace = test_ns,
+            .track_name = "t",
+            .range = .{ .type = moq_msg.LocationFilter.ABSOLUTE_START, .start_group = 3, .start_object = 1 },
+        } } });
+        const st = tr.conns[1].streams.getStream(8).?;
+        const p = try moq_msg.parseEnvelope(st.send.write_buffer.items);
+        try std.testing.expectEqual(moq_codes.MSG_FETCH_OK, p.env.type);
+        // Open-ended: it stops at Largest Object, in the live group.
+        try std.testing.expectEqual(Location{ .group = 5, .object = 0 }, (try moq_msg.decodeFetchOk(p.env.payload, d)).end);
+        try std.testing.expect(st.send.fin_queued);
+
+        var items: [8]moq_obj.FetchItem = undefined;
+        const got = try fetched(&tr, 3, &items);
+        try std.testing.expectEqual(@as(usize, 3), got.len);
+        try expectFetched(got[0], 3, 1, "b");
+        try expectFetched(got[1], 4, 0, "c");
+        try expectFetched(got[2], 5, 0, "d");
+        try std.testing.expect(tr.conns[1].streams.send_streams.get(3).?.fin_queued);
+    }
+}
+
+test "what a FETCH asks for and the relay doesn't hold is unknown, not absent" {
+    // A FIN'd FETCH stream says every Location it skips does not exist.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    setDraft(&tr, .draft_18);
+    const t = namedTrack(&tr);
+    try publishGroup(&tr, 2, 3, &.{ "a", "b" }, true);
+    try publishGroup(&tr, 6, 5, &.{"c"}, true);
+    // Nobody to ask about the rest.
+    t.publisher_idx = null;
+
+    try sendRequest(&tr, 1, 8, moq_msg.writeFetch, moq_msg.Fetch{ .request_id = 8, .body = .{ .standalone = .{
+        .track_namespace = test_ns,
+        .track_name = "t",
+        .range = .{ .type = moq_msg.LocationFilter.ABSOLUTE_START, .start_group = 1 },
+    } } });
+    var items: [8]moq_obj.FetchItem = undefined;
+    const got = try fetched(&tr, 3, &items);
+    try std.testing.expectEqual(@as(usize, 5), got.len);
+    try std.testing.expectEqual(moq_obj.FetchRangeKind.unknown, got[0].end_of_range.kind);
+    try std.testing.expectEqual(Location{ .group = 2, .object = moq_msg.WHOLE_GROUP }, got[0].end_of_range.at);
+    try expectFetched(got[1], 3, 0, "a");
+    try expectFetched(got[2], 3, 1, "b");
+    try std.testing.expectEqual(Location{ .group = 4, .object = moq_msg.WHOLE_GROUP }, got[3].end_of_range.at);
+    try expectFetched(got[4], 5, 0, "c");
+}
+
+test "a joining FETCH ends where its subscription began" {
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    setDraft(&tr, .draft_18);
+    _ = namedTrack(&tr);
+    try publishGroup(&tr, 2, 3, &.{ "a", "b" }, true);
+    try publishGroup(&tr, 6, 4, &.{"c"}, true);
+
+    try sendRequest(&tr, 1, 12, moq_msg.writeSubscribe, moq_msg.Subscribe{ .request_id = 12, .track_namespace = test_ns, .track_name = "t" });
+    // Joined at {4, 0}; a group after it is not the FETCH's. Left open, so
+    // the two-group cache still has group 3.
+    try publishGroup(&tr, 10, 5, &.{"d"}, false);
+    try sendRequest(&tr, 1, 16, moq_msg.writeFetch, moq_msg.Fetch{
+        .request_id = 16,
+        .body = .{ .relative_joining = .{ .joining_request_id = 12, .joining_start = 1 } },
+    });
+
+    // Uni streams 3 and 7 replayed the cache, 11 forwarded group 5.
+    var items: [8]moq_obj.FetchItem = undefined;
+    const got = try fetched(&tr, 15, &items);
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    try expectFetched(got[0], 3, 0, "a");
+    try expectFetched(got[2], 4, 0, "c");
+
+    try sendRequest(&tr, 1, 20, moq_msg.writeFetch, moq_msg.Fetch{
+        .request_id = 20,
+        .body = .{ .relative_joining = .{ .joining_request_id = 99, .joining_start = 1 } },
+    });
+    const e = try moq_msg.parseEnvelope(tr.conns[1].streams.getStream(20).?.send.write_buffer.items);
+    try std.testing.expectEqual(moq_codes.ERR_INVALID_JOINING_REQUEST_ID, (try moq_msg.decodeRequestError(e.env.payload)).error_code);
+}
+
+test "TRACK_STATUS reports Largest Object, asking the publisher when the relay doesn't know" {
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    setDraft(&tr, .draft_18);
+    _ = namedTrack(&tr);
+    try publishGroup(&tr, 2, 3, &.{ "a", "b" }, true);
+
+    var params: [4]moq_msg.Param = undefined;
+    try sendRequest(&tr, 1, 8, moq_msg.writeTrackStatus, moq_msg.TrackStatus{ .track_namespace = test_ns, .track_name = "t" });
+    const st = tr.conns[1].streams.getStream(8).?;
+    var p = try moq_msg.parseEnvelope(st.send.write_buffer.items);
+    try std.testing.expectEqual(moq_codes.MSG_REQUEST_OK, p.env.type);
+    var ok = try moq_msg.decodeRequestOk(p.env.payload, &params, .draft_18);
+    try std.testing.expectEqual(Location{ .group = 3, .object = 1 }, ok.params[0].value.location);
+    try std.testing.expect(st.send.fin_queued);
+
+    // A track it has no state for, in a namespace someone publishes.
+    try sendRequest(&tr, 0, 12, moq_msg.writePublishNamespace, moq_msg.PublishNamespace{ .track_namespace = test_ns });
+    try sendRequest(&tr, 1, 16, moq_msg.writeTrackStatus, moq_msg.TrackStatus{ .track_namespace = test_ns, .track_name = "u" });
+    const f = tr.r.status_fwds[0];
+    try std.testing.expect(f.active and f.up_ci == 0);
+    var types: [2]u64 = undefined;
+    try std.testing.expectEqualSlices(u64, &.{moq_codes.MSG_TRACK_STATUS}, sentTypes(tr.conns[0], f.up_sid, &types));
+
+    var buf: [64]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    try moq_msg.writeRequestOk(&fbs, .{ .params = &.{.{ .type = moq_msg.ParamType.LARGEST_OBJECT, .value = .{ .location = .{ .group = 7, .object = 2 } } }} });
+    var publisher = tr.session(0);
+    tr.r.onStreamData(&publisher, f.up_sid, buf[0..fbs.seek], true);
+    const down = tr.conns[1].streams.getStream(16).?;
+    p = try moq_msg.parseEnvelope(down.send.write_buffer.items);
+    ok = try moq_msg.decodeRequestOk(p.env.payload, &params, .draft_18);
+    try std.testing.expectEqual(Location{ .group = 7, .object = 2 }, ok.params[0].value.location);
+    try std.testing.expect(down.send.fin_queued);
+    try std.testing.expect(!tr.r.status_fwds[0].active);
+    try std.testing.expect(tr.r.clients[0].slotOf(f.up_sid) == null);
+
+    // Nobody publishes the namespace at all.
+    try sendRequest(&tr, 1, 20, moq_msg.writeTrackStatus, moq_msg.TrackStatus{ .track_namespace = &.{"none"}, .track_name = "t" });
+    p = try moq_msg.parseEnvelope(tr.conns[1].streams.getStream(20).?.send.write_buffer.items);
+    try std.testing.expectEqual(moq_codes.ERR_DOES_NOT_EXIST, (try moq_msg.decodeRequestError(p.env.payload)).error_code);
+}
+
+test "a request type the relay doesn't serve is refused, not ignored" {
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    _ = try tr.conns[1].streams.getOrCreateStream(8);
+    var buf: [16]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    try moq_msg.writeEnvelope(&fbs, 0x7E, &.{0});
+    var s = tr.session(1);
+    tr.r.onStreamData(&s, 8, buf[0..fbs.seek], false);
+    const st = tr.conns[1].streams.getStream(8).?;
+    const p = try moq_msg.parseEnvelope(st.send.write_buffer.items);
+    try std.testing.expectEqual(moq_codes.ERR_NOT_SUPPORTED, (try moq_msg.decodeRequestError(p.env.payload)).error_code);
+    try std.testing.expect(st.send.fin_queued);
+    // Its slot goes when the requester closes its half.
+    tr.r.onStreamData(&s, 8, "", true);
+    try std.testing.expect(tr.r.clients[1].slotOf(8) == null);
+}
+
+test "a draft-22 SUBSCRIBE with FILL_PARAMETERS gets a fill stream" {
+    // Draft-22 has no joining FETCH: aiomoqt's join asks for a fill and
+    // waited out its timeout for one.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    setDraft(&tr, .draft_22);
+    _ = namedTrack(&tr);
+    try publishGroup(&tr, 2, 3, &.{ "a", "b" }, true);
+    try publishGroup(&tr, 6, 4, &.{"c"}, true);
+
+    try sendRequest(&tr, 1, 12, moq_msg.writeSubscribe, moq_msg.Subscribe{
+        .request_id = 12,
+        .track_namespace = test_ns,
+        .track_name = "t",
+        .fill = .{ .range = .{ .type = moq_msg.LocationFilter.RELATIVE_START, .start_group = 1 } },
+    });
+    // SUBSCRIBE_OK says where the subscription joined.
+    const p = try moq_msg.parseEnvelope(tr.conns[1].streams.getStream(12).?.send.write_buffer.items);
+    try std.testing.expectEqual(Location{ .group = 4, .object = 0 }, (try moq_msg.decodeSubscribeOk(p.env.payload, .draft_22)).largest.?);
+
+    // The fill came first, under the SUBSCRIBE's Request ID: just group 4.
+    const ss = tr.conns[1].streams.send_streams.get(3).?;
+    var fbs = io_compat.fixedBufferStream(@as([]const u8, ss.write_buffer.items));
+    try std.testing.expectEqual(@as(u64, 12), try moq_obj.readFetchStreamHeader(&fbs));
+    var items: [4]moq_obj.FetchItem = undefined;
+    const got = try fetched(&tr, 3, &items);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try expectFetched(got[0], 4, 0, "c");
+
+    // Without FILL_PARAMETERS, no fill: the first stream is a replayed group.
+    try sendRequest(&tr, 1, 16, moq_msg.writeSubscribe, moq_msg.Subscribe{ .request_id = 16, .track_namespace = test_ns, .track_name = "t" });
+    const first = tr.conns[1].streams.send_streams.get(15).?.write_buffer.items;
+    try std.testing.expect(first[0] != moq_codes.STREAM_FETCH);
+}
+
+test "a FETCH for what the relay doesn't hold goes to the publisher, across drafts" {
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    tr.r.clients[0].draft = .draft_17;
+    tr.r.clients[1].draft = .draft_18;
+    const t = namedTrack(&tr);
+    t.upstream_largest = .{ .group = 9, .object = 4 };
+
+    try sendRequest(&tr, 1, 8, moq_msg.writeFetch, moq_msg.Fetch{ .request_id = 8, .body = .{ .standalone = .{
+        .track_namespace = test_ns,
+        .track_name = "t",
+        .range = .{ .type = moq_msg.LocationFilter.ABSOLUTE_START, .start_group = 2 },
+    } } });
+    const f = tr.r.fetch_fwds[0];
+    try std.testing.expect(f.active and f.up_ci == 0);
+    const up = tr.conns[0].streams.getStream(f.up_sid).?.send.write_buffer.items;
+    const fp = try moq_msg.parseEnvelope(up);
+    var ns_buf: moq_msg.NamespaceBuf = undefined;
+    const sent = try moq_msg.decodeFetch(fp.env.payload, &ns_buf, .draft_17);
+    const r = sent.body.standalone.range.resolve(.{ .group = 9, .object = 4 }).?;
+    try std.testing.expectEqual(Location{ .group = 2, .object = 0 }, r.start);
+    try std.testing.expectEqual(Location{ .group = 9, .object = 4 }, r.end);
+
+    // The publisher answers, in draft-17's encoding.
+    var buf: [128]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    try moq_msg.writeFetchOk(&fbs, .{ .end = .{ .group = 9, .object = 4 } }, .draft_17);
+    var publisher = tr.session(0);
+    tr.r.onStreamData(&publisher, f.up_sid, buf[0..fbs.seek], false);
+    const down = tr.conns[1].streams.getStream(8).?;
+    const ok = try moq_msg.parseEnvelope(down.send.write_buffer.items);
+    try std.testing.expectEqual(Location{ .group = 9, .object = 4 }, (try moq_msg.decodeFetchOk(ok.env.payload, .draft_18)).end);
+
+    fbs.seek = 0;
+    try moq_obj.writeFetchStreamHeader(&fbs, sent.request_id);
+    var c = moq_obj.FetchCursor.init(.draft_17, false);
+    try moq_obj.writeFetchItem(&fbs, .{ .object = .{ .group = 2, .id = 0, .payload = "x" } }, &c);
+    try moq_obj.writeFetchItem(&fbs, .{ .object = .{ .group = 2, .id = 1, .payload = "y" } }, &c);
+    try moq_obj.writeFetchItem(&fbs, .{ .object = .{ .group = 9, .id = 4, .payload = "z" } }, &c);
+    // Split mid-object: the rest arrives with the FIN.
+    tr.r.onStreamData(&publisher, 2, buf[0 .. fbs.seek - 2], false);
+    tr.r.onStreamData(&publisher, 2, buf[fbs.seek - 2 .. fbs.seek], true);
+
+    var items: [4]moq_obj.FetchItem = undefined;
+    const got = try fetched(&tr, 3, &items);
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    try expectFetched(got[0], 2, 0, "x");
+    try expectFetched(got[1], 2, 1, "y");
+    try expectFetched(got[2], 9, 4, "z");
+    const out = tr.conns[1].streams.send_streams.get(3).?;
+    var hfbs = io_compat.fixedBufferStream(@as([]const u8, out.write_buffer.items));
+    try std.testing.expectEqual(@as(u64, 8), try moq_obj.readFetchStreamHeader(&hfbs));
+    try std.testing.expect(out.fin_queued);
+    try std.testing.expect(!tr.r.fetch_fwds[0].active);
+    try std.testing.expect(tr.r.clients[0].slotOf(2) == null);
 }

@@ -27,12 +27,21 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   subscriptions with PREFIX_OVERLAP.
 - `moq-test-client` runs the interop runner's `subscribe-namespace-lifecycle`,
   `publish-namespace-multi-publisher-retention` and `data-subgroup-basic`.
+- The MoQ relay answers FETCH in every draft (standalone, joining, and
+  draft-22's fills) from its cache or the track's publisher, and TRACK_STATUS.
+  SUBSCRIBE_OK carries LARGEST_OBJECT, and a request type it doesn't serve
+  gets REQUEST_ERROR NOT_SUPPORTED instead of no answer.
+- `moq.object.writeFetchItem` and `readFetchItem`, `LocationFilter.resolve`,
+  and `Subscribe.fill` for draft-22's FILL_PARAMETERS.
 - `moq.object.writeSubgroupObject` and `readSubgroupObject`, and
   `ClientSession.resetQuicStream` and `stopSendingQuicStream` for native-QUIC
   clients.
 
 ### Changed
 
+- `moq.message.writeFetchOk` takes the draft, `Fetch.Standalone` carries its
+  range as a `LocationFilter` (`range`) in place of `start` and `end`, and
+  `FetchOk.end` is inclusive in every draft, `WHOLE_GROUP` for a whole group.
 - A WebSocket's answers to frames that arrive together leave in one send,
   not a syscall each: pipelined echo runs 6× faster or more. In
   `onWsMessage`, `uncork` now sends with the rest of that read's answers.
