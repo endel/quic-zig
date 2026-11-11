@@ -12,6 +12,7 @@ const testing = std.testing;
 pub const Draft = enum(u8) {
     draft_17 = 17,
     draft_18 = 18,
+    draft_22 = 22,
 
     pub fn number(self: Draft) u8 {
         return @backingInt(self);
@@ -21,6 +22,7 @@ pub const Draft = enum(u8) {
         return switch (self) {
             .draft_17 => "moqt-17",
             .draft_18 => "moqt-18",
+            .draft_22 => "moqt-22",
         };
     }
 
@@ -44,7 +46,7 @@ pub const Draft = enum(u8) {
 // token and a mismatch fails the handshake, but over WebTransport this
 // list goes in WT-Available-Protocols, where the connection still succeeds
 // and only the MoQ on top of it goes quiet.
-pub const PREFERRED: []const Draft = &.{ .draft_18, .draft_17 };
+pub const PREFERRED: []const Draft = &.{ .draft_22, .draft_18, .draft_17 };
 
 /// Where the two drafts differ on the wire, in one place.
 ///
@@ -71,6 +73,14 @@ pub const Rules = struct {
     /// left the stream's close as the withdrawal; draft-19 (#1698) made a
     /// FIN mean only "nothing more to send", never a cancellation.
     fin_withdraws_request: bool,
+    /// draft-20 replaced the length-prefixed SUBSCRIPTION_FILTER with the
+    /// typed LOCATION_FILTER, keeping parameter type 0x21; draft-22 (#1913)
+    /// gave it an explicit Location Filter Type.
+    location_filter: bool,
+    /// The answer to PUBLISH carries FORWARD, absent meaning 1, so it
+    /// resumes a publication that started paused. draft-20 moved
+    /// subscription parameters to REQUEST_UPDATE, which alone resumes it.
+    publish_ok_sets_forward: bool,
 
     pub fn of(draft: Draft) Rules {
         return switch (draft) {
@@ -83,6 +93,8 @@ pub const Rules = struct {
                 .subgroup_first_object_bit = false,
                 .done_too_far_behind = 0x6,
                 .fin_withdraws_request = true,
+                .location_filter = false,
+                .publish_ok_sets_forward = true,
             },
             .draft_18 => .{
                 .required_request_id_delta = false,
@@ -93,6 +105,22 @@ pub const Rules = struct {
                 .subgroup_first_object_bit = true,
                 .done_too_far_behind = 0x5,
                 .fin_withdraws_request = true,
+                .location_filter = false,
+                .publish_ok_sets_forward = true,
+            },
+            // 19 to 21 are skipped: no peer registered with the runner
+            // speaks them.
+            .draft_22 => .{
+                .required_request_id_delta = false,
+                .subscribe_namespace_code = 0x50,
+                .publish_ok_is_own_message = false,
+                .subscribe_namespace_options = false,
+                .has_subscribe_tracks = true,
+                .subgroup_first_object_bit = true,
+                .done_too_far_behind = 0x5,
+                .fin_withdraws_request = false,
+                .location_filter = true,
+                .publish_ok_sets_forward = false,
             },
         };
     }
@@ -146,10 +174,23 @@ test "wire codes match the draft numbers" {
 test "alpn offer is newest-first and clamps to the buffer" {
     var buf: [4][]const u8 = undefined;
     const offer = alpnOffer(PREFERRED, &buf);
-    try testing.expectEqual(@as(usize, 2), offer.len);
-    try testing.expectEqualStrings("moqt-18", offer[0]);
-    try testing.expectEqualStrings("moqt-17", offer[1]);
+    try testing.expectEqual(@as(usize, 3), offer.len);
+    try testing.expectEqualStrings("moqt-22", offer[0]);
+    try testing.expectEqualStrings("moqt-18", offer[1]);
+    try testing.expectEqualStrings("moqt-17", offer[2]);
 
     var small: [1][]const u8 = undefined;
     try testing.expectEqual(@as(usize, 1), alpnOffer(PREFERRED, &small).len);
+}
+
+test "draft-22 is a row of its own" {
+    const r = Rules.of(.draft_22);
+    try testing.expectEqualStrings("moqt-22", Draft.draft_22.alpn());
+    try testing.expect(r.location_filter);
+    try testing.expect(!Rules.of(.draft_18).location_filter);
+    // draft-19 (#1698): a FIN says nothing more is coming, not "withdrawn".
+    try testing.expect(!r.fin_withdraws_request);
+    try testing.expectEqual(@as(u64, 0x50), r.subscribe_namespace_code);
+    try testing.expect(r.has_subscribe_tracks and r.subgroup_first_object_bit);
+    try testing.expectEqual(Draft.draft_22, PREFERRED[0]);
 }

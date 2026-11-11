@@ -1021,7 +1021,7 @@ const RelayHandler = struct {
             const found = self.findSub(ci, stream_id);
             if (parsed.env.type == ok_type) {
                 if (found) |f| if (!f.sub.answered) {
-                    const ok = moq_msg.decodePublishOk(parsed.env.payload) catch moq_msg.PublishOk{};
+                    const ok = moq_msg.decodePublishOk(parsed.env.payload, self.clients[ci].draft) catch moq_msg.PublishOk{};
                     f.sub.answered = true;
                     if (ok.forward) |fwd| f.sub.forward = fwd;
                     std.debug.print("[relay] PUBLISH accepted by client {d} alias={d}\n", .{ ci, f.sub.alias });
@@ -1428,7 +1428,7 @@ const RelayHandler = struct {
 
             if (t) |tr| switch (parsed.env.type) {
                 moq_codes.MSG_SUBSCRIBE_OK => if (tr.upstream_pending) {
-                    if (moq_msg.decodeSubscribeOk(parsed.env.payload)) |ok| {
+                    if (moq_msg.decodeSubscribeOk(parsed.env.payload, self.clients[ci].draft)) |ok| {
                         tr.upstream_pending = false;
                         tr.publisher_idx = ci;
                         tr.pub_alias = ok.track_alias;

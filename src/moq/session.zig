@@ -293,7 +293,7 @@ pub fn Session(comptime Transport: type) type {
                 } },
                 codes.MSG_SUBSCRIBE_OK => Event{ .subscribe_ok = .{
                     .stream_id = stream_id,
-                    .ok = try msg.decodeSubscribeOk(env.payload),
+                    .ok = try msg.decodeSubscribeOk(env.payload, self.draft),
                 } },
                 codes.MSG_PUBLISH => Event{ .publish = .{
                     .stream_id = stream_id,
