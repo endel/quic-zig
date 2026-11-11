@@ -26,10 +26,12 @@ can be a Docker image or just a public URL.
 | `VERBOSE` | `1` for diagnostics on stderr |
 
 CLI: `--relay URL`, `--test NAME`, `--list`, `--verbose`,
-`--tls-disable-verify`, `--draft 17|18`. Flags win over env.
+`--tls-disable-verify`, `--draft 17|18|22`. Flags win over env.
 
-The runner has no way to ask for a draft — a pair negotiates whatever it
-negotiates — so `--draft` is ours, for running the matrix at each.
+The client offers every draft it implements, newest first: in the QUIC ALPN
+list over native QUIC, in WT-Available-Protocols over WebTransport. It then
+speaks whichever the relay picked. The runner has no way to ask for a draft,
+so `--draft` is ours, for narrowing the offer to one.
 
 Output is **TAP version 14 on stdout** and nothing else:
 
@@ -61,8 +63,11 @@ both passes and failures.
 
 ## Test cases
 
-All seven are control-plane; there is no data-plane case yet. Namespace
-`moq-test/interop`, track `test-track`, both fixed by the spec.
+The first seven are control-plane, with namespace `moq-test/interop` and
+track `test-track` fixed by the spec. The last three have prose specs of their
+own under the runner's `docs/tests/` and report `test_spec_revision`; they run
+under a fresh 128-bit run id, so state another run left at the relay can't
+satisfy them.
 
 | Test | What it does | Passes when |
 |---|---|---|
@@ -73,9 +78,17 @@ All seven are control-plane; there is no data-plane case yet. Namespace
 | `rendezvous-timeout` | SUBSCRIBE `nonexistent/rendezvous` with `RENDEZVOUS_TIMEOUT` 500 ms | REQUEST_ERROR with code `TIMEOUT` |
 | `announce-subscribe` | publisher announces, then a second connection subscribes | SUBSCRIBE_OK |
 | `subscribe-before-announce` | subscriber first, publisher 500 ms later | SUBSCRIBE_OK **or** REQUEST_ERROR |
+| `subscribe-namespace-lifecycle` (rev 1) | SUBSCRIBE_NAMESPACE, then a second connection announces that namespace and withdraws it once seen | NAMESPACE, then NAMESPACE_DONE |
+| `publish-namespace-multi-publisher-retention` (rev 1) | two publishers announce one namespace; the duplicate withdraws; two late subscribers discover it; the first publisher withdraws | both late subscribers see NAMESPACE then NAMESPACE_DONE |
+| `data-subgroup-basic` (rev 2) | publisher announces a 3-field prefix and serves the canonical MoQT Test tuple beneath it; subscriber SUBSCRIBEs to the 19-field namespace with no FORWARD, priority or filter | exactly objects (0..2, 0..4), subgroup 0, priority 128, 64/32 bytes of `t`, then PUBLISH_DONE TRACK_ENDED |
 
-Timeouts 2 s, except `announce-subscribe` (3 s) and
-`subscribe-before-announce` (3.5 s).
+Timeouts 2 s, except `announce-subscribe` (3 s),
+`subscribe-before-announce` (3.5 s), the two namespace cases (8 s) and
+`data-subgroup-basic` (20 s: two 5 s setup phases, then 10 s to deliver).
+
+Our `data-subgroup-basic` publisher sends PUBLISH_DONE once its data streams
+are acknowledged rather than as soon as they are finished: imquic ends the
+subscription on PUBLISH_DONE and drops whatever is still in flight.
 
 The runner's own spec cites `RENDEZVOUS_TIMEOUT` as draft-18 §10.2.6, which
 reads as though draft-17 cannot run that case. It can: the parameter is
@@ -105,8 +118,9 @@ clients dial native QUIC at that port whatever the scheme says, so
 `apps/moq_relay.zig` serves both: ALPN `h3` is WebTransport, `moqt-18` and
 `moqt-17` native QUIC.
 
-Two clients (moqtopus, xquic-draft-18) refuse an `https://` URL outright and
-need a relay entry registered with `moqt://relay:4443`. See
+Two clients (moqtopus, xquic-draft-18) refuse an `https://` URL outright, so
+the registration lists both as `roles.relay.docker.endpoints`:
+`moqt://relay:4443` and `https://relay:4443`, one run each. See
 [`moq-interop-results.md`](moq-interop-results.md).
 
 ## URL schemes

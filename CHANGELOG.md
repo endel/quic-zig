@@ -19,6 +19,17 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - `Config.new_while_draining`: a draining server hands a new connection's
   first datagram to one still taking connections, rather than refusing it,
   so a reload beside it under `reuse_port` turns no one away.
+- **MoQ Transport draft-22**, beside 17 and 18: the relay serves each peer at
+  the draft it asks for, and `moq-test-client` offers all three, newest first.
+  `ClientConfig.alpns` lets a native-QUIC client offer several ALPNs.
+- The MoQ relay answers draft-18 SUBSCRIBE_TRACKS with a PUBLISH for every
+  matching track, present and future, and refuses overlapping namespace
+  subscriptions with PREFIX_OVERLAP.
+- `moq-test-client` runs the interop runner's `subscribe-namespace-lifecycle`,
+  `publish-namespace-multi-publisher-retention` and `data-subgroup-basic`.
+- `moq.object.writeSubgroupObject` and `readSubgroupObject`, and
+  `ClientSession.resetQuicStream` and `stopSendingQuicStream` for native-QUIC
+  clients.
 
 ### Changed
 
@@ -27,6 +38,23 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   `onWsMessage`, `uncork` now sends with the rest of that read's answers.
 - Built and tested with Zig 0.17.1. Nothing needed changing, and 0.17.0
   still builds it.
+- `moq.session.Event.namespace_done` carries the namespace suffix.
+
+### Fixed
+
+- The MoQ relay subscribed upstream for Largest Object whatever its
+  subscriber asked for, so a publisher could start past objects the
+  subscriber wanted. It now forwards the subscriber's filter, or none.
+- A namespace withdrawn by finishing its PUBLISH_NAMESPACE stream, as moq-net
+  does on drafts 17 and 18, is now withdrawn at the relay, and its
+  subscribers hear NAMESPACE_DONE.
+- The relay no longer drops a group or datagram that arrives before the
+  publisher's SUBSCRIBE_OK; it waits up to 2 s for the alias.
+- The MoQ relay answers every REQUEST_UPDATE, as both drafts require, and
+  resumes a publication that started paused once a subscriber wants objects.
+- NAMESPACE_DONE reaches subscribers even when another publisher holds a
+  shorter prefix of the namespace, and the relay's group cache no longer mixes
+  two groups that arrive at once.
 
 ## 0.6.0
 

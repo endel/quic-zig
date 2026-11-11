@@ -1,19 +1,20 @@
 {
   "_comment": [
-    "The entry to add to englishm/moq-interop-runner's implementations.json.",
-    "Not submitted: that means opening a PR against someone else's repository.",
-    "Validate with their implementations.schema.json before sending.",
+    "Our entry in englishm/moq-interop-runner's implementations.json",
+    "(registered by runner#127). Keep the two in step; validate with their",
+    "validate-registration.sh before sending a change.",
     "",
     "Both images are published by .github/workflows/docker.yml on every push",
-    "to main, and built locally by interop/moq-runner/build_image.sh. They",
-    "pass 7/7 against each other over a compose-style network."
+    "to main, and built locally by interop/moq-runner/build_image.sh. The",
+    "relay answers raw QUIC and WebTransport on one port, so it registers an",
+    "endpoint for each: moqt://-only clients (moqtopus, xquic) need the first."
   ],
   "quic-zig": {
     "name": "quic-zig",
     "organization": "Endel Dreyer",
     "repository": "https://github.com/endel/quic-zig",
     "draft_versions": ["draft-17", "draft-18"],
-    "notes": "QUIC, HTTP/3, WebTransport and MoQ from scratch in Zig. The relay is WebTransport; the client speaks both transports and selects its draft with --draft.",
+    "notes": "QUIC, HTTP/3, WebTransport and MoQ from scratch in Zig. The relay serves raw QUIC and WebTransport on one port, chosen by ALPN; the client speaks both transports and selects its draft with --draft.",
     "roles": {
       "client": {
         "docker": {
@@ -22,7 +23,11 @@
       },
       "relay": {
         "docker": {
-          "image": "ghcr.io/endel/quic-zig-moq-relay:latest"
+          "image": "ghcr.io/endel/quic-zig-moq-relay:latest",
+          "endpoints": [
+            { "url": "moqt://relay:4443", "transport": "quic" },
+            { "url": "https://relay:4443", "transport": "webtransport" }
+          ]
         }
       }
     }

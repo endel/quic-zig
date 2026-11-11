@@ -159,25 +159,42 @@ pub const ParamType = struct {
     pub const DELIVERY_TIMEOUT: u64 = 0x02;
     pub const AUTHORIZATION_TOKEN: u64 = 0x03;
     pub const RENDEZVOUS_TIMEOUT: u64 = 0x04;
+    pub const SUBGROUP_DELIVERY_TIMEOUT: u64 = 0x06;
     pub const EXPIRES: u64 = 0x08;
     pub const LARGEST_OBJECT: u64 = 0x09;
+    pub const FILL_TIMEOUT: u64 = 0x0A;
     pub const FORWARD: u64 = 0x10;
     pub const SUBSCRIBER_PRIORITY: u64 = 0x20;
+    /// draft-17/18's length-prefixed SUBSCRIPTION_FILTER, draft-22's typed
+    /// LOCATION_FILTER: one code point, two encodings.
     pub const SUBSCRIPTION_FILTER: u64 = 0x21;
+    pub const LOCATION_FILTER: u64 = 0x21;
     pub const GROUP_ORDER: u64 = 0x22;
+    // draft-22 only, from here.
+    pub const FILL_PARAMETERS: u64 = 0x23;
+    pub const SUBGROUP_FILTER: u64 = 0x25;
+    pub const OBJECTID_FILTER: u64 = 0x26;
+    pub const PRIORITY_FILTER: u64 = 0x27;
+    pub const OBJECT_PROPERTY_FILTER: u64 = 0x28;
+    pub const TRACK_PROPERTY_FILTER: u64 = 0x29;
     pub const NEW_GROUP_REQUEST: u64 = 0x32;
+    pub const TRACK_NAMESPACE_PREFIX: u64 = 0x34;
+    pub const INCLUDE_PROPERTIES: u64 = 0x35;
 };
 
-pub const ParamShape = enum { varint, uint8, location, length_prefixed };
+pub const ParamShape = enum { varint, uint8, location, length_prefixed, location_filter, namespace };
 
 /// Normative, not a convenience: §10.2 makes an unknown parameter type a
 /// session-fatal error, so a type listed in ParamType without a shape here
 /// ends every session that sends it. Add both or neither.
-pub fn paramShape(t: u64) ?ParamShape {
+pub fn paramShape(t: u64, draft: version.Draft) ?ParamShape {
+    const d22 = version.Rules.of(draft).location_filter;
     return switch (t) {
         ParamType.DELIVERY_TIMEOUT,
         ParamType.RENDEZVOUS_TIMEOUT,
+        ParamType.SUBGROUP_DELIVERY_TIMEOUT,
         ParamType.EXPIRES,
+        ParamType.FILL_TIMEOUT,
         ParamType.NEW_GROUP_REQUEST,
         => .varint,
         ParamType.FORWARD,
@@ -185,16 +202,69 @@ pub fn paramShape(t: u64) ?ParamShape {
         ParamType.GROUP_ORDER,
         => .uint8,
         ParamType.LARGEST_OBJECT => .location,
-        ParamType.AUTHORIZATION_TOKEN, ParamType.SUBSCRIPTION_FILTER => .length_prefixed,
+        ParamType.AUTHORIZATION_TOKEN => .length_prefixed,
+        ParamType.SUBSCRIPTION_FILTER => if (d22) .location_filter else .length_prefixed,
+        ParamType.TRACK_NAMESPACE_PREFIX => .namespace,
+        ParamType.FILL_PARAMETERS,
+        ParamType.SUBGROUP_FILTER,
+        ParamType.OBJECTID_FILTER,
+        ParamType.PRIORITY_FILTER,
+        ParamType.OBJECT_PROPERTY_FILTER,
+        ParamType.TRACK_PROPERTY_FILTER,
+        => if (d22) .length_prefixed else null,
+        ParamType.INCLUDE_PROPERTIES => if (d22) .uint8 else null,
         else => null,
     };
 }
+
+/// draft-22 §9.20.9: the Location Filter Type says which fields follow.
+pub const LocationFilter = struct {
+    pub const NONE: u64 = 0x00;
+    pub const RELATIVE_START: u64 = 0x01;
+    pub const ABSOLUTE_START: u64 = 0x02;
+    pub const ABSOLUTE_START_GROUP_END: u64 = 0x03;
+    pub const ABSOLUTE_RANGE: u64 = 0x04;
+    pub const NEXT_OBJECT: u64 = 0x05;
+
+    type: u64 = NONE,
+    start_group: u64 = 0,
+    start_object: u64 = 0,
+    end_group_delta: u64 = 0,
+    end_object: u64 = 0,
+
+    fn fieldCount(t: u64) ?usize {
+        return switch (t) {
+            NONE, NEXT_OBJECT => 0,
+            RELATIVE_START => 1,
+            ABSOLUTE_START => 2,
+            ABSOLUTE_START_GROUP_END => 3,
+            ABSOLUTE_RANGE => 4,
+            else => null,
+        };
+    }
+
+    fn write(self: LocationFilter, writer: anytype) !void {
+        try wire.writeVarInt(writer, self.type);
+        const fields = [_]u64{ self.start_group, self.start_object, self.end_group_delta, self.end_object };
+        for (fields[0 .. fieldCount(self.type) orelse return Error.MalformedMessage]) |v| try wire.writeVarInt(writer, v);
+    }
+
+    fn read(fbs: *io.FixedBufferStream([]const u8)) !LocationFilter {
+        var lf = LocationFilter{ .type = try wire.readVarInt(fbs) };
+        const n = fieldCount(lf.type) orelse return Error.ProtocolViolation;
+        const fields = [_]*u64{ &lf.start_group, &lf.start_object, &lf.end_group_delta, &lf.end_object };
+        for (fields[0..n]) |f| f.* = try wire.readVarInt(fbs);
+        return lf;
+    }
+};
 
 pub const ParamValue = union(enum) {
     varint: u64,
     uint8: u8,
     location: track.Location,
+    /// Length-prefixed values, and a TRACK_NAMESPACE_PREFIX as its raw tuple.
     bytes: []const u8,
+    location_filter: LocationFilter,
 };
 
 pub const Param = struct {
@@ -219,12 +289,13 @@ pub fn writeParams(writer: anytype, params: []const Param) !void {
                 try wire.writeVarInt(writer, l.object);
             },
             .bytes => |b| try wire.writeVarBytes(writer, b),
+            .location_filter => |lf| try lf.write(writer),
         }
     }
 }
 
 /// Reads a parameter list from the front of `fbs`, filling `out`.
-pub fn readParams(fbs: *io.FixedBufferStream([]const u8), out: []Param) ![]Param {
+pub fn readParams(fbs: *io.FixedBufferStream([]const u8), out: []Param, draft: version.Draft) ![]Param {
     const count = try wire.readVarInt(fbs);
     if (count > out.len) return Error.MalformedMessage;
     var prev: u64 = 0;
@@ -232,7 +303,7 @@ pub fn readParams(fbs: *io.FixedBufferStream([]const u8), out: []Param) ![]Param
         const delta = try wire.readVarInt(fbs);
         const t = if (i == 0) delta else std.math.add(u64, prev, delta) catch return Error.MalformedMessage;
         prev = t;
-        const shape = paramShape(t) orelse return Error.ProtocolViolation;
+        const shape = paramShape(t, draft) orelse return Error.ProtocolViolation;
         out[i] = .{
             .type = t,
             .value = switch (shape) {
@@ -243,6 +314,13 @@ pub fn readParams(fbs: *io.FixedBufferStream([]const u8), out: []Param) ![]Param
                     .object = try wire.readVarInt(fbs),
                 } },
                 .length_prefixed => .{ .bytes = try wire.readVarBytesZc(fbs) },
+                .location_filter => .{ .location_filter = try LocationFilter.read(fbs) },
+                .namespace => blk: {
+                    const start = fbs.seek;
+                    var scratch: NamespaceBuf = undefined;
+                    _ = wire.readTuple(fbs, &scratch) catch return Error.MalformedMessage;
+                    break :blk .{ .bytes = fbs.buffer[start..fbs.seek] };
+                },
             },
         };
     }
@@ -267,6 +345,11 @@ pub const DecodeOptions = struct {
 
 pub const Filter = struct {
     type: track.FilterType = .latest_object,
+    /// draft-22 Relative Start: groups before the next one to start at.
+    /// draft-18 can only say 0, which is its Next Group Start.
+    relative_groups: u64 = 0,
+    /// draft-22 Absolute Range's last object; draft-18 ends at the group.
+    end_object: ?u64 = null,
     /// Present for AbsoluteStart and AbsoluteRange.
     start: ?track.Location = null,
     /// Present for AbsoluteRange.
@@ -281,6 +364,38 @@ pub const Filter = struct {
         }
         if (self.end_group_delta) |d| try wire.writeVarInt(&fbs, d);
         return buf[0..fbs.seek];
+    }
+
+    /// draft-22's LOCATION_FILTER for this filter. Largest Object is
+    /// draft-18's name for what draft-22 calls Next Object.
+    fn toLocation(self: Filter) LocationFilter {
+        const at = self.start orelse track.Location{ .group = 0, .object = 0 };
+        return switch (self.type) {
+            .latest_object => .{ .type = LocationFilter.NEXT_OBJECT },
+            .next_group_start => .{ .type = LocationFilter.RELATIVE_START, .start_group = self.relative_groups },
+            .absolute_start => .{ .type = LocationFilter.ABSOLUTE_START, .start_group = at.group, .start_object = at.object },
+            .absolute_range => .{
+                .type = if (self.end_object != null) LocationFilter.ABSOLUTE_RANGE else LocationFilter.ABSOLUTE_START_GROUP_END,
+                .start_group = at.group,
+                .start_object = at.object,
+                .end_group_delta = self.end_group_delta orelse 0,
+                .end_object = self.end_object orelse 0,
+            },
+        };
+    }
+
+    /// The filter a LOCATION_FILTER describes; null for None, which is no
+    /// filter at all.
+    pub fn fromLocation(lf: LocationFilter) ?Filter {
+        const at = track.Location{ .group = lf.start_group, .object = lf.start_object };
+        return switch (lf.type) {
+            LocationFilter.NEXT_OBJECT => .{ .type = .latest_object },
+            LocationFilter.RELATIVE_START => .{ .type = .next_group_start, .relative_groups = lf.start_group },
+            LocationFilter.ABSOLUTE_START => .{ .type = .absolute_start, .start = at },
+            LocationFilter.ABSOLUTE_START_GROUP_END => .{ .type = .absolute_range, .start = at, .end_group_delta = lf.end_group_delta },
+            LocationFilter.ABSOLUTE_RANGE => .{ .type = .absolute_range, .start = at, .end_group_delta = lf.end_group_delta, .end_object = lf.end_object },
+            else => null,
+        };
     }
 
     fn decode(bytes: []const u8) !Filter {
@@ -307,6 +422,28 @@ pub const Filter = struct {
     }
 };
 
+/// The filter parameter in `draft`'s encoding. Null when there is no
+/// filter, or when draft-18 can't say it (a Relative Start further back than
+/// the next group): no filter is wider, and a relay may ask its publisher
+/// for more than it was asked. Absolute Range's end object, likewise, is
+/// dropped for the whole end group.
+fn filterParam(f: ?Filter, draft: version.Draft, buf: []u8) !?Param {
+    const filter = f orelse return null;
+    if (version.Rules.of(draft).location_filter) {
+        return .{ .type = ParamType.LOCATION_FILTER, .value = .{ .location_filter = filter.toLocation() } };
+    }
+    if (filter.type == .next_group_start and filter.relative_groups > 0) return null;
+    return .{ .type = ParamType.SUBSCRIPTION_FILTER, .value = .{ .bytes = try filter.encode(buf) } };
+}
+
+fn filterFromParam(v: ParamValue, opts: DecodeOptions) !?Filter {
+    return switch (v) {
+        .bytes => |b| try Filter.decodeWith(b, opts),
+        .location_filter => |lf| Filter.fromLocation(lf),
+        else => Error.MalformedMessage,
+    };
+}
+
 // REQUEST_OK / REQUEST_ERROR (§9.6, §9.7) ----------------------------------
 //
 // These travel on the per-request bidi stream; draft-17 carries no request
@@ -323,9 +460,9 @@ pub fn writeRequestOk(writer: anytype, r: RequestOk) !void {
     try writeEnvelope(writer, codes.MSG_REQUEST_OK, scratch[0..fbs.seek]);
 }
 
-pub fn decodeRequestOk(payload: []const u8, out: []Param) !RequestOk {
+pub fn decodeRequestOk(payload: []const u8, out: []Param, draft: version.Draft) !RequestOk {
     var fbs = io.fixedBufferStream(payload);
-    return .{ .params = try readParams(&fbs, out) };
+    return .{ .params = try readParams(&fbs, out, draft) };
 }
 
 pub const RequestError = struct {
@@ -368,7 +505,7 @@ pub const Subscribe = struct {
     /// waiting for a publisher to appear.
     rendezvous_timeout_ms: ?u64 = null,
 
-    fn buildParams(self: Subscribe, out: []Param, filter_buf: []u8) ![]Param {
+    fn buildParams(self: Subscribe, out: []Param, filter_buf: []u8, draft: version.Draft) ![]Param {
         var n: usize = 0;
         // Ascending Type order is required by §9.3.
         if (self.rendezvous_timeout_ms) |v| {
@@ -383,8 +520,8 @@ pub const Subscribe = struct {
             out[n] = .{ .type = ParamType.SUBSCRIBER_PRIORITY, .value = .{ .uint8 = v } };
             n += 1;
         }
-        if (self.filter) |f| {
-            out[n] = .{ .type = ParamType.SUBSCRIPTION_FILTER, .value = .{ .bytes = try f.encode(filter_buf) } };
+        if (try filterParam(self.filter, draft, filter_buf)) |fp| {
+            out[n] = fp;
             n += 1;
         }
         if (self.group_order) |v| {
@@ -406,7 +543,7 @@ pub const Subscribe = struct {
                 else => return Error.ProtocolViolation,
             },
             ParamType.SUBSCRIBER_PRIORITY => self.subscriber_priority = p.value.uint8,
-            ParamType.SUBSCRIPTION_FILTER => self.filter = try Filter.decodeWith(p.value.bytes, opts),
+            ParamType.SUBSCRIPTION_FILTER => self.filter = try filterFromParam(p.value, opts),
             ParamType.GROUP_ORDER => self.group_order = track.GroupOrder.fromInt(p.value.uint8) orelse
                 return Error.ProtocolViolation,
             else => {},
@@ -427,7 +564,7 @@ fn writeSubscribeLike(writer: anytype, msg_type: u64, s: Subscribe, draft: versi
 
     var params: [MAX_PARAMS]Param = undefined;
     var filter_buf: [32]u8 = undefined;
-    try writeParams(w, try s.buildParams(&params, &filter_buf));
+    try writeParams(w, try s.buildParams(&params, &filter_buf, draft));
 
     try writeEnvelope(writer, msg_type, scratch[0..fbs.seek]);
 }
@@ -448,7 +585,7 @@ fn decodeSubscribeLike(payload: []const u8, ns_buf: *NamespaceBuf, draft: versio
         .track_name = try wire.readVarBytesZc(&fbs),
     };
     var params: [MAX_PARAMS]Param = undefined;
-    try s.applyParams(try readParams(&fbs, &params), opts);
+    try s.applyParams(try readParams(&fbs, &params, draft), opts);
     return s;
 }
 
@@ -495,11 +632,11 @@ pub fn writeSubscribeOk(writer: anytype, s: SubscribeOk) !void {
     try writeEnvelope(writer, codes.MSG_SUBSCRIBE_OK, scratch[0..fbs.seek]);
 }
 
-pub fn decodeSubscribeOk(payload: []const u8) !SubscribeOk {
+pub fn decodeSubscribeOk(payload: []const u8, draft: version.Draft) !SubscribeOk {
     var fbs = io.fixedBufferStream(payload);
     var s = SubscribeOk{ .track_alias = try wire.readVarInt(&fbs) };
     var params: [MAX_PARAMS]Param = undefined;
-    const parsed = try readParams(&fbs, &params);
+    const parsed = try readParams(&fbs, &params, draft);
     if (findParam(parsed, ParamType.EXPIRES)) |v| s.expires_ms = v.varint;
     if (findParam(parsed, ParamType.LARGEST_OBJECT)) |v| s.largest = v.location;
     return s;
@@ -535,8 +672,8 @@ pub fn writeRequestUpdate(writer: anytype, u: RequestUpdate, draft: version.Draf
         params[n] = .{ .type = ParamType.SUBSCRIBER_PRIORITY, .value = .{ .uint8 = v } };
         n += 1;
     }
-    if (u.filter) |f| {
-        params[n] = .{ .type = ParamType.SUBSCRIPTION_FILTER, .value = .{ .bytes = try f.encode(&filter_buf) } };
+    if (try filterParam(u.filter, draft, &filter_buf)) |fp| {
+        params[n] = fp;
         n += 1;
     }
     try writeParams(w, params[0..n]);
@@ -553,10 +690,10 @@ pub fn decodeRequestUpdate(payload: []const u8, draft: version.Draft) !RequestUp
             0,
     };
     var params: [MAX_PARAMS]Param = undefined;
-    const parsed = try readParams(&fbs, &params);
+    const parsed = try readParams(&fbs, &params, draft);
     if (findParam(parsed, ParamType.FORWARD)) |v| u.forward = v.uint8 != 0;
     if (findParam(parsed, ParamType.SUBSCRIBER_PRIORITY)) |v| u.subscriber_priority = v.uint8;
-    if (findParam(parsed, ParamType.SUBSCRIPTION_FILTER)) |v| u.filter = try Filter.decode(v.bytes);
+    if (findParam(parsed, ParamType.SUBSCRIPTION_FILTER)) |v| u.filter = try filterFromParam(v, .{});
     return u;
 }
 
@@ -612,7 +749,7 @@ pub fn decodePublish(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.
         .track_alias = try wire.readVarInt(&fbs),
     };
     var params: [MAX_PARAMS]Param = undefined;
-    const parsed = try readParams(&fbs, &params);
+    const parsed = try readParams(&fbs, &params, draft);
     if (findParam(parsed, ParamType.LARGEST_OBJECT)) |v| p.largest = v.location;
     if (findParam(parsed, ParamType.FORWARD)) |v| p.forward = v.uint8 != 0;
     return p;
@@ -643,8 +780,8 @@ pub fn writePublishOk(writer: anytype, p: PublishOk, draft: version.Draft) !void
         params[n] = .{ .type = ParamType.SUBSCRIBER_PRIORITY, .value = .{ .uint8 = v } };
         n += 1;
     }
-    if (p.filter) |f| {
-        params[n] = .{ .type = ParamType.SUBSCRIPTION_FILTER, .value = .{ .bytes = try f.encode(&filter_buf) } };
+    if (try filterParam(p.filter, draft, &filter_buf)) |fp| {
+        params[n] = fp;
         n += 1;
     }
     try writeParams(&fbs, params[0..n]);
@@ -655,14 +792,14 @@ pub fn writePublishOk(writer: anytype, p: PublishOk, draft: version.Draft) !void
     try writeEnvelope(writer, msg_type, scratch[0..fbs.seek]);
 }
 
-pub fn decodePublishOk(payload: []const u8) !PublishOk {
+pub fn decodePublishOk(payload: []const u8, draft: version.Draft) !PublishOk {
     var fbs = io.fixedBufferStream(payload);
     var params: [MAX_PARAMS]Param = undefined;
-    const parsed = try readParams(&fbs, &params);
+    const parsed = try readParams(&fbs, &params, draft);
     var p = PublishOk{};
     if (findParam(parsed, ParamType.FORWARD)) |v| p.forward = v.uint8 != 0;
     if (findParam(parsed, ParamType.SUBSCRIBER_PRIORITY)) |v| p.subscriber_priority = v.uint8;
-    if (findParam(parsed, ParamType.SUBSCRIPTION_FILTER)) |v| p.filter = try Filter.decode(v.bytes);
+    if (findParam(parsed, ParamType.SUBSCRIPTION_FILTER)) |v| p.filter = try filterFromParam(v, .{});
     return p;
 }
 
@@ -813,7 +950,7 @@ pub fn decodeFetch(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Dr
     };
 
     var params: [MAX_PARAMS]Param = undefined;
-    const parsed = try readParams(&fbs, &params);
+    const parsed = try readParams(&fbs, &params, draft);
     if (findParam(parsed, ParamType.SUBSCRIBER_PRIORITY)) |v| f.subscriber_priority = v.uint8;
     if (findParam(parsed, ParamType.GROUP_ORDER)) |v| {
         f.group_order = track.GroupOrder.fromInt(v.uint8) orelse return Error.ProtocolViolation;
@@ -847,14 +984,14 @@ pub fn writeFetchOk(writer: anytype, f: FetchOk) !void {
     try writeEnvelope(writer, codes.MSG_FETCH_OK, scratch[0..fbs.seek]);
 }
 
-pub fn decodeFetchOk(payload: []const u8) !FetchOk {
+pub fn decodeFetchOk(payload: []const u8, draft: version.Draft) !FetchOk {
     var fbs = io.fixedBufferStream(payload);
     var f = FetchOk{
         .end_of_track = (fbs.takeByte() catch return wire.Error.BufferTooShort) != 0,
         .end = .{ .group = try wire.readVarInt(&fbs), .object = try wire.readVarInt(&fbs) },
     };
     var params: [MAX_PARAMS]Param = undefined;
-    const parsed = try readParams(&fbs, &params);
+    const parsed = try readParams(&fbs, &params, draft);
     if (findParam(parsed, ParamType.EXPIRES)) |v| f.expires_ms = v.varint;
     return f;
 }
@@ -908,7 +1045,7 @@ pub fn decodePublishNamespace(payload: []const u8, ns_buf: *NamespaceBuf, draft:
         .track_namespace = wire.readNamespace(&fbs, ns_buf) catch return Error.MalformedMessage,
     };
     var params: [MAX_PARAMS]Param = undefined;
-    _ = try readParams(&fbs, &params);
+    _ = try readParams(&fbs, &params, draft);
     return p;
 }
 
@@ -987,7 +1124,7 @@ pub fn decodeSubscribeNamespace(payload: []const u8, ns_buf: *NamespaceBuf, draf
             .namespace,
     };
     var params: [MAX_PARAMS]Param = undefined;
-    const parsed = try readParams(&fbs, &params);
+    const parsed = try readParams(&fbs, &params, draft);
     if (findParam(parsed, ParamType.FORWARD)) |v| s.forward = v.uint8 != 0;
     return s;
 }
@@ -1128,7 +1265,7 @@ test "message parameters are count-prefixed and delta-ordered" {
 
     var rfbs = io.fixedBufferStream(@as([]const u8, buf[0..fbs.seek]));
     var out: [MAX_PARAMS]Param = undefined;
-    const back = try readParams(&rfbs, &out);
+    const back = try readParams(&rfbs, &out, .draft_18);
     try testing.expectEqual(@as(usize, 3), back.len);
     try testing.expectEqual(ParamType.GROUP_ORDER, back[2].type);
     try testing.expectEqual(@as(u8, 2), back[2].value.uint8);
@@ -1150,7 +1287,7 @@ test "readParams rejects an unknown type" {
     const bytes = [_]u8{ 0x01, 0x7e, 0x00 };
     var fbs = io.fixedBufferStream(@as([]const u8, &bytes));
     var out: [MAX_PARAMS]Param = undefined;
-    try testing.expectError(Error.ProtocolViolation, readParams(&fbs, &out));
+    try testing.expectError(Error.ProtocolViolation, readParams(&fbs, &out, .draft_18));
 }
 
 test "SUBSCRIBE has the request id and delta §9.8 requires" {
@@ -1232,7 +1369,7 @@ test "SUBSCRIBE_OK round-trip with expiry and largest object" {
     });
     const p = try parseEnvelope(buf[0..fbs.seek]);
     try testing.expectEqual(codes.MSG_SUBSCRIBE_OK, p.env.type);
-    const s = try decodeSubscribeOk(p.env.payload);
+    const s = try decodeSubscribeOk(p.env.payload, .draft_17);
     try testing.expectEqual(@as(u64, 42), s.track_alias);
     try testing.expectEqual(@as(u64, 1000), s.expires_ms.?);
     try testing.expectEqual(@as(u64, 7), s.largest.?.group);
@@ -1241,7 +1378,7 @@ test "SUBSCRIBE_OK round-trip with expiry and largest object" {
     var fbs2 = io.fixedBufferStream(&buf2);
     try writeSubscribeOk(&fbs2, .{ .track_alias = 1 });
     const p2 = try parseEnvelope(buf2[0..fbs2.seek]);
-    const s2 = try decodeSubscribeOk(p2.env.payload);
+    const s2 = try decodeSubscribeOk(p2.env.payload, .draft_17);
     try testing.expectEqual(@as(?u64, null), s2.expires_ms);
     try testing.expectEqual(@as(?track.Location, null), s2.largest);
 }
@@ -1257,7 +1394,7 @@ test "REQUEST_OK round-trip with parameters" {
     const p = try parseEnvelope(buf[0..fbs.seek]);
     try testing.expectEqual(codes.MSG_REQUEST_OK, p.env.type);
     var out: [MAX_PARAMS]Param = undefined;
-    const r = try decodeRequestOk(p.env.payload, &out);
+    const r = try decodeRequestOk(p.env.payload, &out, .draft_17);
     try testing.expectEqual(@as(usize, 2), r.params.len);
     try testing.expectEqual(@as(u64, 9), r.params[0].value.varint);
     try testing.expectEqual(@as(u64, 5), r.params[1].value.location.object);
@@ -1309,7 +1446,7 @@ test "PUBLISH_OK is parameters only" {
     var fbs = io.fixedBufferStream(&buf);
     try writePublishOk(&fbs, .{ .forward = true, .subscriber_priority = 9 }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
-    const ok = try decodePublishOk(p.env.payload);
+    const ok = try decodePublishOk(p.env.payload, .draft_17);
     try testing.expect(ok.forward.?);
     try testing.expectEqual(@as(u8, 9), ok.subscriber_priority.?);
 
@@ -1381,7 +1518,7 @@ test "FETCH_OK round-trip" {
         .expires_ms = 30,
     });
     const p = try parseEnvelope(buf[0..fbs.seek]);
-    const f = try decodeFetchOk(p.env.payload);
+    const f = try decodeFetchOk(p.env.payload, .draft_17);
     try testing.expect(f.end_of_track);
     try testing.expectEqual(@as(u64, 12), f.end.group);
     try testing.expectEqual(@as(u64, 30), f.expires_ms.?);
@@ -1661,4 +1798,93 @@ test "draft-18 request messages round-trip" {
     const ru = try decodeRequestUpdate((try parseEnvelope(buf[0..f.seek])).env.payload, .draft_18);
     try testing.expectEqual(@as(u64, 7), ru.request_id);
     try testing.expectEqual(@as(u8, 9), ru.subscriber_priority.?);
+}
+
+/// The parameter block of a SUBSCRIBE written with only `filter` set.
+fn filterParamBytes(f: ?Filter, draft: version.Draft, out: []u8) ![]const u8 {
+    var buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const ns = [_][]const u8{"n"};
+    try writeSubscribe(&fbs, .{
+        .track_namespace = &ns,
+        .track_name = "t",
+        .forward = null,
+        .subscriber_priority = null,
+        .group_order = null,
+        .filter = f,
+    }, draft);
+    const env = (try parseEnvelope(buf[0..fbs.seek])).env;
+    // request id (1), namespace 1×"n" (3), name "t" (2): then the parameters.
+    const params = env.payload[6..];
+    @memcpy(out[0..params.len], params);
+    return out[0..params.len];
+}
+
+test "draft-22 SUBSCRIBE carries LOCATION_FILTER, typed, not length-prefixed" {
+    // draft-22 §9.20.9: Parameter Type 0x21, Location Filter Type, then
+    // StartGroup, StartObject, EndGroupDelta, EndObject as the type says.
+    var out: [64]u8 = undefined;
+    const range: Filter = .{ .type = .absolute_range, .start = .{ .group = 5, .object = 1 }, .end_group_delta = 2 };
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x21, 0x03, 0x05, 0x01, 0x02 }, try filterParamBytes(range, .draft_22, &out));
+    // draft-18's SUBSCRIPTION_FILTER: the same 0x21, length-prefixed.
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x21, 0x04, 0x04, 0x05, 0x01, 0x02 }, try filterParamBytes(range, .draft_18, &out));
+
+    const cases = [_]struct { f: Filter, wire: []const u8 }{
+        .{ .f = .{ .type = .latest_object }, .wire = &.{ 0x01, 0x21, 0x05 } }, // Next Object
+        .{ .f = .{ .type = .next_group_start }, .wire = &.{ 0x01, 0x21, 0x01, 0x00 } }, // Relative Start, 0 back
+        .{ .f = .{ .type = .next_group_start, .relative_groups = 3 }, .wire = &.{ 0x01, 0x21, 0x01, 0x03 } },
+        .{ .f = .{ .type = .absolute_start, .start = .{ .group = 7, .object = 0 } }, .wire = &.{ 0x01, 0x21, 0x02, 0x07, 0x00 } },
+        .{ .f = .{ .type = .absolute_range, .start = .{ .group = 1, .object = 2 }, .end_group_delta = 3, .end_object = 4 }, .wire = &.{ 0x01, 0x21, 0x04, 0x01, 0x02, 0x03, 0x04 } },
+    };
+    for (cases) |c| {
+        try testing.expectEqualSlices(u8, c.wire, try filterParamBytes(c.f, .draft_22, &out));
+        var fbs = io.fixedBufferStream(c.wire);
+        var params: [MAX_PARAMS]Param = undefined;
+        const back = try readParams(&fbs, &params, .draft_22);
+        try testing.expectEqual(c.f, Filter.fromLocation(back[0].value.location_filter).?);
+    }
+
+    // Type 0x00 is "no filter"; 0x06 and up are a protocol violation.
+    var none = io.fixedBufferStream(@as([]const u8, &.{ 0x01, 0x21, 0x00 }));
+    var params: [MAX_PARAMS]Param = undefined;
+    try testing.expectEqual(@as(?Filter, null), Filter.fromLocation((try readParams(&none, &params, .draft_22))[0].value.location_filter));
+    var bad = io.fixedBufferStream(@as([]const u8, &.{ 0x01, 0x21, 0x06 }));
+    try testing.expectError(Error.ProtocolViolation, readParams(&bad, &params, .draft_22));
+}
+
+test "a filter draft-18 can't say is widened, not refused" {
+    // A relay hands a draft-22 subscriber's filter to a draft-18 publisher.
+    var out: [64]u8 = undefined;
+    // Relative Start further back than the next group: unfiltered.
+    try testing.expectEqualSlices(u8, &.{0x00}, try filterParamBytes(.{ .type = .next_group_start, .relative_groups = 2 }, .draft_18, &out));
+    // An end object: the whole end group.
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x21, 0x04, 0x04, 0x01, 0x02, 0x03 }, try filterParamBytes(.{ .type = .absolute_range, .start = .{ .group = 1, .object = 2 }, .end_group_delta = 3, .end_object = 4 }, .draft_18, &out));
+}
+
+test "draft-22 parameters a receiver has to know" {
+    // FILL_PARAMETERS (0x23, length-prefixed) and INCLUDE_PROPERTIES (0x35,
+    // uint8) are draft-22's; draft-18 has neither, and an unknown type ends
+    // the session.
+    const bytes = [_]u8{ 0x02, 0x23, 0x02, 0xaa, 0xbb, 0x12, 0x01 };
+    var params: [MAX_PARAMS]Param = undefined;
+    var fbs = io.fixedBufferStream(@as([]const u8, &bytes));
+    const got = try readParams(&fbs, &params, .draft_22);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, got[0].value.bytes);
+    try testing.expectEqual(@as(u64, 0x35), got[1].type);
+    fbs = io.fixedBufferStream(@as([]const u8, &bytes));
+    try testing.expectError(Error.ProtocolViolation, readParams(&fbs, &params, .draft_18));
+}
+
+test "draft-18 parameters we did not know" {
+    // SUBGROUP_DELIVERY_TIMEOUT 0x06 and FILL_TIMEOUT 0x0A (varints), and
+    // TRACK_NAMESPACE_PREFIX 0x34 (a namespace): all in draft-18 §10.2.
+    const bytes = [_]u8{ 0x03, 0x06, 0x05, 0x04, 0x07, 0x2a, 0x02, 0x01, 0x61, 0x01, 0x62 };
+    var params: [MAX_PARAMS]Param = undefined;
+    var fbs = io.fixedBufferStream(@as([]const u8, &bytes));
+    const got = try readParams(&fbs, &params, .draft_18);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqual(@as(u64, 7), got[1].value.varint);
+    try testing.expectEqualSlices(u8, &.{ 0x02, 0x01, 0x61, 0x01, 0x62 }, got[2].value.bytes);
+    try testing.expectEqual(@as(usize, bytes.len), fbs.seek);
 }

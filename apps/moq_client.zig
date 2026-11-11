@@ -164,7 +164,7 @@ const MoqClientHandler = struct {
         const parsed = moq_msg.parseEnvelope(data) catch return;
         switch (parsed.env.type) {
             moq_codes.MSG_SUBSCRIBE_OK => {
-                const ok = moq_msg.decodeSubscribeOk(parsed.env.payload) catch return;
+                const ok = moq_msg.decodeSubscribeOk(parsed.env.payload, self.draft) catch return;
                 if (self.trackByBidi(stream_id)) |ts| {
                     ts.alias = ok.track_alias;
                     std.debug.print("[MoQ] SUBSCRIBE_OK alias={d} track=\"{s}\"\n", .{ ok.track_alias, ts.name });
@@ -375,6 +375,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 draft = switch (std.fmt.parseInt(u8, v, 10) catch 0) {
                     17 => .draft_17,
                     18 => .draft_18,
+                    22 => .draft_22,
                     else => moq_version.DEFAULT,
                 };
             }

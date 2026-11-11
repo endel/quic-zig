@@ -3188,6 +3188,9 @@ pub const ClientConfig = struct {
 
     // TLS ALPN override (when null, derived from handler protocol: "h3" for h3/webtransport)
     alpn: ?[]const u8 = null,
+    /// Several ALPNs to offer, most preferred first; wins over `alpn` when
+    /// non-empty. The server's pick is `conn.negotiatedAlpn()`.
+    alpns: []const []const u8 = &.{},
 
     // TLS verification
     /// Where the trust anchors come from. The server's chain must end at one,
@@ -3343,6 +3346,22 @@ pub const ClientSession = struct {
         } else if (self.conn.streams.send_streams.get(stream_id)) |ss| {
             ss.close();
         }
+    }
+
+    /// RESET_STREAM on a native QUIC stream's sending half.
+    pub fn resetQuicStream(self: *ClientSession, stream_id: u64, error_code: u64) void {
+        defer self.wake();
+        if (self.conn.streams.getStream(stream_id)) |stream| {
+            stream.send.reset(error_code);
+        } else if (self.conn.streams.send_streams.get(stream_id)) |ss| {
+            ss.reset(error_code);
+        }
+    }
+
+    /// STOP_SENDING on a native QUIC stream's receiving half.
+    pub fn stopSendingQuicStream(self: *ClientSession, stream_id: u64, error_code: u64) void {
+        defer self.wake();
+        if (self.conn.streams.getStream(stream_id)) |stream| stream.recv.stopSending(error_code);
     }
 
     pub fn readStream(self: *ClientSession, stream_id: u64) ?[]const u8 {
@@ -3671,9 +3690,11 @@ pub fn Client(comptime Handler: type) type {
             var owned_alpn: ?[][]const u8 = null;
             var owned_ca: ?*Certificate.Bundle = null;
             const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
-                const alpn = try alloc.alloc([]const u8, 1);
+                const alpn = try alloc.alloc([]const u8, @max(config.alpns.len, 1));
                 owned_alpn = alpn;
-                alpn[0] = if (config.alpn) |a| a else switch (Handler.protocol) {
+                if (config.alpns.len > 0) {
+                    @memcpy(alpn, config.alpns);
+                } else alpn[0] = if (config.alpn) |a| a else switch (Handler.protocol) {
                     .h3, .webtransport => "h3",
                     .quic, .h0 => "h3", // default; override via config.alpn for custom protocols
                 };

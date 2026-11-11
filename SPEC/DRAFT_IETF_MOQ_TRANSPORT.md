@@ -184,12 +184,12 @@ Invalid datagram types: `0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F` (STATUS
 | Wire primitives (`src/moq/wire.zig`, `message_codes.zig`) | done; leading-ones varint, KV list, tuples |
 | Control messages (`src/moq/message.zig`) | all 18 types encode **and** decode, matched to the §9 figures |
 | Message parameters (§9.3) | one codec with the type→shape table; unknown types are a protocol violation, as the draft requires |
-| Object framing (`src/moq/object.zig`) | subgroup headers (all id-modes and priority variants), datagram objects, fetch stream headers |
+| Object framing (`src/moq/object.zig`) | subgroup headers (all id-modes and priority variants), subgroup object records (ID delta, properties, status), datagram objects, fetch stream headers |
 | Session (`src/moq/session.zig`) | SETUP + request-stream state machine, generic over the transport; reassembles split messages and drains coalesced ones |
 | Publisher / Subscriber | `moq-client` subscribes or `--mode publish`; `moq-server` publishes |
-| Relay (`moq-relay`) | both transports on one port; pub/sub fanout with alias remapping, SUBSCRIBE routed to the namespace's publisher and answered once it answers, namespace discovery, rendezvous timeouts, datagrams, FORWARD and REQUEST_UPDATE, PUBLISH_DONE on publisher loss, a per-track group cache, withdrawal by request-stream reset |
+| Relay (`moq-relay`) | both transports on one port; pub/sub fanout with alias remapping, SUBSCRIBE routed to the namespace's publisher with the subscriber's own filter and answered once it answers, namespace discovery (SUBSCRIBE_NAMESPACE) and track discovery (SUBSCRIBE_TRACKS, answered with PUBLISH), PREFIX_OVERLAP, rendezvous timeouts, datagrams, FORWARD and REQUEST_UPDATE, PUBLISH_DONE on publisher loss, a per-track group cache, a data stream or datagram that beats its alias held for 2 s, withdrawal by reset or (drafts 17, 18) FIN |
 | Browser | `interop/browser/moq.html` and `moq_video.html`, driven end to end by `tools/moq_browser_test.mjs` |
-| Interop test client | `moq-test-client`, 7 cases, TAP 14, containerised |
+| Interop test client | `moq-test-client`, 10 cases (the runner's seven, both namespace-discovery cases and `data-subgroup-basic`), TAP 14, containerised |
 | Datagram objects | done — `moq-client --mode publish --datagrams`, relayed with alias remapping |
 | FETCH | codec done; no runtime request/response flow |
 | AUTHORIZATION_TOKEN | decoded at the KV level and discarded; no policy engine |
@@ -238,6 +238,13 @@ Appendix A.1 and its §10/§11 tables.
   takes the draft: on draft-17 the bit does not exist and is never set.
 - Sections renumber: control messages §9 → §10, data streams §10 → §11.
 
+One rule both drafts share and later ones reverse: with PUBLISH_NAMESPACE_DONE
+gone, a requester's **FIN on a PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE or
+SUBSCRIBE_TRACKS stream withdraws it** (`fin_withdraws_request`). §3.3.2 says
+SHOULD reset, §6.1 allows either for namespace subscriptions, and moq-net,
+moq-rs, libquicr and quiche all treat the FIN as a withdrawal. draft-19 (#1698)
+makes a FIN mean only "nothing more to send".
+
 Values the draft makes session-fatal are decoded as
 `message.Error.ProtocolViolation` rather than `MalformedMessage`, and both
 relays answer them by closing the session with `PROTOCOL_VIOLATION`
@@ -261,9 +268,43 @@ Known and deliberately not implemented:
   GOAWAY on request streams, and mandatory-to-understand track
   properties. None are exercised by the interop runner's cases.
 
-draft-19 and draft-20 also exist, and -19 reverted some of the above
-(Request ID removed from GOAWAY again, `PUBLISH_BLOCKED` renamed
-`PUBLISH_SKIPPED`). Adding one is another row in `Rules`.
+## Where draft-22 differs
+
+draft-22 is the third row in `version.Rules`, offered first (`moqt-22`) on
+both transports; 19 to 21 are skipped, since no peer registered with the
+interop runner speaks them. Diffing the two drafts' message figures and
+code-point tables, rather than trusting the changelog, gives a short list:
+
+- **SUBSCRIPTION_FILTER becomes LOCATION_FILTER**, same parameter type 0x21
+  but no longer length-prefixed: a Location Filter Type, then 0–4 varints it
+  selects (`message.LocationFilter`). draft-18's Largest Object is draft-22's
+  Next Object (0x05); Next Group Start is Relative Start with StartGroup 0.
+  `Filter` carries what only draft-22 can say (a Relative Start further
+  back, an Absolute Range's end object); toward a draft-18 peer it widens,
+  to no filter or to the whole end group.
+- **New Message Parameters** a receiver must know, since an unknown one is a
+  PROTOCOL_VIOLATION: FILL_PARAMETERS (0x23) and the five range filters
+  (0x25–0x29), length-prefixed, and INCLUDE_PROPERTIES (0x35), a uint8.
+  `paramShape` takes the draft. Three draft-18 parameters were missing and
+  are now known on both: SUBGROUP_DELIVERY_TIMEOUT (0x06), FILL_TIMEOUT
+  (0x0A), TRACK_NAMESPACE_PREFIX (0x34).
+- **A FIN is not a withdrawal** (draft-19, #1698): `fin_withdraws_request`
+  is false, so only a reset cancels a request.
+- GOAWAY loses the Request ID we never wrote; PUBLISH_BLOCKED (0xF) is
+  renamed PUBLISH_SKIPPED with the same shape; SUBSCRIPTION_ENDED and
+  VERSION_NEGOTIATION_FAILED are gone, TOO_MANY_REQUEST_UPDATES is new.
+
+Unchanged on the wire: SETUP, the request and response messages the runner
+exercises, the subgroup header (now described as type flags, same bits),
+object fields, datagram types, and the error codes the tests check.
+
+Not implemented for draft-22: FETCH's new shape (no Fetch Type; the range
+rides LOCATION_FILTER) and fill streams, PUBLISH_STATE_NOTIFY (0x22), range
+filters beyond decoding them, MAX_FILTER_RANGES and MAX_REQUEST_UPDATES. The
+relay has no FETCH on any draft yet.
+
+draft-23 (2 Nov 2026) makes the control-message length a varint and
+REQUEST_OK replaces FETCH_OK; no runner peer speaks it yet.
 
 ## Video demo architecture
 
@@ -285,4 +326,7 @@ The one-stream-per-group design is what allowed scaling past ~1000 frames per su
 - FETCH request/response flow is codec-only.
 - The relay reads moxygen's private SUBSCRIBE filter type 250 (LargestGroup) as Largest Object rather than closing the session; the codec's default is still the PROTOCOL_VIOLATION §5.1.2 asks for.
 - The relay's own upstream subscription is not told FORWARD=0 when no subscriber wants objects; they are dropped at the relay instead.
+- The upstream SUBSCRIBE carries the first downstream subscriber's filter. Later subscribers share that subscription whatever their own filter; the relay forwards what arrives rather than filtering per subscriber.
+- SUBSCRIBE_TRACKS is offered only tracks the relay has a publisher for, never PUBLISH_BLOCKED; FORWARD on the request is copied into each PUBLISH.
+- The group cache follows one stream at a time: when a newer group's stream opens while an older one is still arriving, the older group is not cached.
 - The earlier note that moq-rs interop was blocked by their auth config is stale: `demo/relay/localhost.toml` sets `auth.public = ""`, and with it the interop client reaches 5/7 against them.
