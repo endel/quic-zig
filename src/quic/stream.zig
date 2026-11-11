@@ -766,6 +766,8 @@ pub const SendStream = struct {
     /// send side stops, but that field carries local intent too — only this one
     /// says the peer asked. WebTransport reports it as a distinct event.
     peer_stop_sending: ?u64 = null,
+    /// The event loop has told its handler about `peer_stop_sending`.
+    stop_sending_reported: bool = false,
 
     /// The connection's; null for a stream built outside a StreamsMap.
     ledger: ?*SendLedger = null,

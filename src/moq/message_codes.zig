@@ -150,5 +150,7 @@ pub const DONE_GOING_AWAY: u64 = 0x4;
 pub const DONE_EXPIRED: u64 = 0x5;
 
 // Data stream reset codes (draft-17 §10.4.3, draft-18 §3.3.3).
+pub const STREAM_RESET_INTERNAL_ERROR: u64 = 0x0;
+pub const STREAM_RESET_CANCELLED: u64 = 0x1;
 /// The subscription outran the publisher's resource limits and is ending.
 pub const STREAM_RESET_TOO_FAR_BEHIND: u64 = 0x5;

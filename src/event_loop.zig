@@ -2864,6 +2864,12 @@ pub fn Server(comptime Handler: type) type {
                 };
                 // A peer's uni stream has no send side left to wait on.
                 if ((rs.finished or rs.reset_err != null) and !stream_mod.isBidi(stream_id)) conn.streams.releaseRecvStream(stream_id);
+                // STOP_SENDING on a bidi stream: how a peer that has already
+                // sent its FIN cancels a request (MoQT draft-22 §6.4.2.3).
+                if (conn.streams.getStream(stream_id)) |st| if (st.send.peer_stop_sending) |code| if (!st.send.stop_sending_reported) {
+                    st.send.stop_sending_reported = true;
+                    if (@hasDecl(Handler, "onStopSending")) self.handler.onStopSending(&session, 0, stream_id, @truncate(code));
+                };
             }
         }
 
@@ -3361,7 +3367,7 @@ pub const ClientSession = struct {
     /// STOP_SENDING on a native QUIC stream's receiving half.
     pub fn stopSendingQuicStream(self: *ClientSession, stream_id: u64, error_code: u64) void {
         defer self.wake();
-        if (self.conn.streams.getStream(stream_id)) |stream| stream.recv.stopSending(error_code);
+        if (self.conn.streams.getRecvStream(stream_id)) |rs| rs.stopSending(error_code);
     }
 
     pub fn readStream(self: *ClientSession, stream_id: u64) ?[]const u8 {
@@ -8009,6 +8015,8 @@ const QuicCounter = struct {
     datagrams: u32 = 0,
     data: usize = 0,
     fins: u32 = 0,
+    stops: u32 = 0,
+    stop_code: u32 = 0,
 
     pub fn onDatagram(self: *@This(), _: *Session, _: u64, _: []const u8) void {
         self.datagrams += 1;
@@ -8016,6 +8024,10 @@ const QuicCounter = struct {
     pub fn onStreamData(self: *@This(), _: *Session, _: u64, data: []const u8, fin: bool) void {
         self.data += data.len;
         if (fin) self.fins += 1;
+    }
+    pub fn onStopSending(self: *@This(), _: *Session, _: u64, _: u64, code: u32) void {
+        self.stops += 1;
+        self.stop_code = code;
     }
 };
 
@@ -8053,6 +8065,28 @@ test "e2e: raw-QUIC datagrams and stream data reach a handler with nothing else 
     try runUntilCount(&e2e.loop, &h.data, 3, 3000);
     cs.closeQuicStream(id);
     try runUntilCount(&e2e.loop, &h.fins, 1, 3000);
+}
+
+test "e2e: a raw-QUIC peer's STOP_SENDING reaches the handler, once" {
+    // Only WebTransport reported it, so a native-QUIC MoQT peer that had
+    // sent its FIN could not cancel its request (draft-22 §6.4.2.3).
+    var client_handler = QuicIdleClient{};
+    var h = QuicCounter{};
+    var e2e: E2e(QuicCounter, QuicIdleClient) = undefined;
+    try e2e.init(29690, &h, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, QuicIdleClient.ready, 10_000);
+    var cs = e2e.client.clientSession();
+    const id = try cs.openStream();
+    try cs.writeStream(id, "req");
+    cs.closeQuicStream(id);
+    try runUntilCount(&e2e.loop, &h.fins, 1, 3000);
+    cs.stopSendingQuicStream(id, 9);
+    try runUntilCount(&e2e.loop, &h.stops, 1, 3000);
+    try testing.expectEqual(@as(u32, 9), h.stop_code);
+    try runFor(&e2e.loop, 100);
+    try testing.expectEqual(@as(u32, 1), h.stops);
 }
 
 /// `runUntil` over two loops at once.
