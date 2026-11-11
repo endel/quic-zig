@@ -699,7 +699,7 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                 var fbs = io_compat.fixedBufferStream(@as([]const u8, ds.buf[0..ds.len]));
                 const parsed = moq_obj.readSubgroupHeader(&fbs, self.draft) catch |e| {
                     if (e == moq_wire.Error.BufferTooShort and !fin) return;
-                    return self.fail("bad subgroup header: {t}", .{e});
+                    return self.fail("bad subgroup header: {t} (stream {d} starts {x})", .{ e, ds.id, ds.buf[0..@min(ds.len, 12)] });
                 };
                 ds.header = parsed.header;
                 pos = fbs.seek;

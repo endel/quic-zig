@@ -4664,3 +4664,34 @@ test "WT integration: a server delivers ordinary HTTP/3 requests alongside sessi
     try setup.h3.sendResponse(4, &.{.{ .name = ":status", .value = "200" }}, "ok");
     try testing.expect(setup.wt.getSession(0) != null);
 }
+
+test "WT: the peer's QPACK streams arriving after the session are not WebTransport data" {
+    // imquic opens its QPACK streams late, once a session is up. The
+    // encoder stream's type byte (0x02) reached the application as the
+    // first byte of a WebTransport uni stream.
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initClient();
+    defer setup.deinit();
+
+    // Server-initiated uni streams: 3 is its control stream.
+    try (try setup.quic_conn.streams.getOrCreateRecvStream(7)).handleStreamFrame(0, &.{0x02}, false);
+    try (try setup.quic_conn.streams.getOrCreateRecvStream(11)).handleStreamFrame(0, &.{0x03}, false);
+
+    for (0..8) |_| {
+        const ev = try setup.wt.poll() orelse continue;
+        switch (ev) {
+            .stream_data => |sd| {
+                defer if (sd.data.len > 0) testing.allocator.free(sd.data);
+                std.debug.print("surfaced stream {d}: {x}\n", .{ sd.stream_id, sd.data });
+                return error.QpackStreamSurfaced;
+            },
+            .uni_stream => |us| {
+                std.debug.print("surfaced uni stream {d}\n", .{us.stream_id});
+                return error.QpackStreamSurfaced;
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(?u64, 7), setup.h3.peer_qpack_enc_stream_id);
+    try testing.expectEqual(@as(?u64, 11), setup.h3.peer_qpack_dec_stream_id);
+}
