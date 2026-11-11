@@ -81,6 +81,14 @@ pub const Rules = struct {
     /// resumes a publication that started paused. draft-20 moved
     /// subscription parameters to REQUEST_UPDATE, which alone resumes it.
     publish_ok_sets_forward: bool,
+    /// draft-18 sends a fetch object's Group and Object IDs as deltas from
+    /// the prior object's; draft-17 sends them whole.
+    fetch_id_deltas: bool,
+    /// draft-22 (#1673, #1809) dropped joining FETCH and its Fetch Type,
+    /// and carries the range in LOCATION_FILTER with an inclusive end.
+    /// Before, the end was "the last Object plus 1, or 0 for the whole
+    /// Group", in FETCH and FETCH_OK alike.
+    fetch_range_in_filter: bool,
 
     pub fn of(draft: Draft) Rules {
         return switch (draft) {
@@ -95,6 +103,8 @@ pub const Rules = struct {
                 .fin_withdraws_request = true,
                 .location_filter = false,
                 .publish_ok_sets_forward = true,
+                .fetch_id_deltas = false,
+                .fetch_range_in_filter = false,
             },
             .draft_18 => .{
                 .required_request_id_delta = false,
@@ -107,6 +117,8 @@ pub const Rules = struct {
                 .fin_withdraws_request = true,
                 .location_filter = false,
                 .publish_ok_sets_forward = true,
+                .fetch_id_deltas = true,
+                .fetch_range_in_filter = false,
             },
             // 19 to 21 are skipped: no peer registered with the runner
             // speaks them.
@@ -121,6 +133,8 @@ pub const Rules = struct {
                 .fin_withdraws_request = false,
                 .location_filter = true,
                 .publish_ok_sets_forward = false,
+                .fetch_id_deltas = true,
+                .fetch_range_in_filter = true,
             },
         };
     }

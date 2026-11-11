@@ -1745,8 +1745,7 @@ fn seedMoqMessage(buf: []u8, rand: std.Random, draft: moq_version.Draft) ?usize 
             .body = .{ .standalone = .{
                 .track_namespace = &ns,
                 .track_name = "video",
-                .start = .{ .group = 0, .object = 0 },
-                .end = .{ .group = 1, .object = 1 },
+                .range = .{ .type = moq_msg.LocationFilter.ABSOLUTE_RANGE, .end_group_delta = 1, .end_object = 1 },
             } },
             .subscriber_priority = 1,
             .group_order = .ascending,

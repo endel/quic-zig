@@ -249,6 +249,61 @@ pub const LocationFilter = struct {
         for (fields[0 .. fieldCount(self.type) orelse return Error.MalformedMessage]) |v| try wire.writeVarInt(writer, v);
     }
 
+    /// The Locations it spans, for a publisher whose Largest Object is
+    /// `largest` (null before any). The end is inclusive, and an object of
+    /// `WHOLE_GROUP` runs to the end of its group. Null when the range is
+    /// empty: nothing published yet, or a start past Largest Object.
+    pub fn resolve(self: LocationFilter, largest: ?track.Location) ?struct { start: track.Location, end: track.Location } {
+        const l = largest orelse return null;
+        const start: track.Location = switch (self.type) {
+            NONE => .{ .group = 0, .object = 0 },
+            RELATIVE_START => .{ .group = (l.group +| 1) -| self.start_group, .object = 0 },
+            NEXT_OBJECT => return null, // nothing published at or after it yet
+            else => .{ .group = self.start_group, .object = self.start_object },
+        };
+        const end_group = self.start_group +| self.end_group_delta;
+        const end: track.Location = switch (self.type) {
+            ABSOLUTE_START_GROUP_END => .{ .group = end_group, .object = WHOLE_GROUP },
+            ABSOLUTE_RANGE => .{ .group = end_group, .object = self.end_object },
+            else => l,
+        };
+        const clamped = if (end.order(l) == .gt) l else end;
+        if (start.order(clamped) == .gt) return null;
+        return .{ .start = start, .end = clamped };
+    }
+
+    /// Drafts 17 and 18's Standalone Start and End Location.
+    fn fromStartEnd(start: track.Location, end: track.Location) !LocationFilter {
+        if (end.group < start.group) return Error.ProtocolViolation;
+        var lf = LocationFilter{
+            .start_group = start.group,
+            .start_object = start.object,
+            .end_group_delta = end.group - start.group,
+        };
+        if (end.object == 0) {
+            lf.type = ABSOLUTE_START_GROUP_END;
+        } else {
+            lf.type = ABSOLUTE_RANGE;
+            lf.end_object = end.object - 1;
+        }
+        return lf;
+    }
+
+    /// The reverse, for the forms that have one: what reaches Largest
+    /// Object ends at the last group a varint can name.
+    fn toStartEnd(self: LocationFilter) !struct { start: track.Location, end: track.Location } {
+        const start: track.Location = .{ .group = self.start_group, .object = self.start_object };
+        const end_group = std.math.add(u64, self.start_group, self.end_group_delta) catch return Error.MalformedMessage;
+        return switch (self.type) {
+            NONE => .{ .start = .{ .group = 0, .object = 0 }, .end = .{ .group = std.math.maxInt(u64), .object = 0 } },
+            ABSOLUTE_START => .{ .start = start, .end = .{ .group = std.math.maxInt(u64), .object = 0 } },
+            ABSOLUTE_START_GROUP_END => .{ .start = start, .end = .{ .group = end_group, .object = 0 } },
+            ABSOLUTE_RANGE => .{ .start = start, .end = .{ .group = end_group, .object = self.end_object + 1 } },
+            // Relative to a Largest Object only the publisher knows.
+            else => Error.MalformedMessage,
+        };
+    }
+
     fn read(fbs: *io.FixedBufferStream([]const u8)) !LocationFilter {
         var lf = LocationFilter{ .type = try wire.readVarInt(fbs) };
         const n = fieldCount(lf.type) orelse return Error.ProtocolViolation;
@@ -368,7 +423,7 @@ pub const Filter = struct {
 
     /// draft-22's LOCATION_FILTER for this filter. Largest Object is
     /// draft-18's name for what draft-22 calls Next Object.
-    fn toLocation(self: Filter) LocationFilter {
+    pub fn toLocation(self: Filter) LocationFilter {
         const at = self.start orelse track.Location{ .group = 0, .object = 0 };
         return switch (self.type) {
             .latest_object => .{ .type = LocationFilter.NEXT_OBJECT },
@@ -504,8 +559,53 @@ pub const Subscribe = struct {
     /// §9.3.4, draft-17: how long the relay should hold a subscription
     /// waiting for a publisher to appear.
     rendezvous_timeout_ms: ?u64 = null,
+    /// draft-22 §3.4: FILL_PARAMETERS, asking for a fill fetch stream.
+    /// Earlier drafts' joining FETCH did this job.
+    fill: ?Fill = null,
 
-    fn buildParams(self: Subscribe, out: []Param, filter_buf: []u8, draft: version.Draft) ![]Param {
+    /// The parameters FILL_PARAMETERS carried; what it leaves out it takes
+    /// from the subscription.
+    pub const Fill = struct {
+        /// Null: the subscription's Location filter, or the whole track.
+        range: ?LocationFilter = null,
+        group_order: ?track.GroupOrder = null,
+
+        fn encode(self: Fill, buf: []u8) ![]const u8 {
+            var fbs = io.fixedBufferStream(buf);
+            var ps: [2]Param = undefined;
+            var n: usize = 0;
+            if (self.range) |r| {
+                ps[n] = .{ .type = ParamType.LOCATION_FILTER, .value = .{ .location_filter = r } };
+                n += 1;
+            }
+            if (self.group_order) |v| {
+                ps[n] = .{ .type = ParamType.GROUP_ORDER, .value = .{ .uint8 = @backingInt(v) } };
+                n += 1;
+            }
+            try writeParams(&fbs, ps[0..n]);
+            return buf[0..fbs.seek];
+        }
+
+        /// A counted parameter block, as a message's own (§9.20.15).
+        fn decode(bytes: []const u8, draft: version.Draft) !Fill {
+            var f = Fill{};
+            if (bytes.len == 0) return f;
+            var fbs = io.fixedBufferStream(bytes);
+            var ps: [MAX_PARAMS]Param = undefined;
+            for (try readParams(&fbs, &ps, draft)) |p| switch (p.type) {
+                ParamType.LOCATION_FILTER => f.range = p.value.location_filter,
+                ParamType.GROUP_ORDER => f.group_order = track.GroupOrder.fromInt(p.value.uint8) orelse
+                    return Error.ProtocolViolation,
+                // Table 7: the rest may appear and are not ours to act on.
+                ParamType.FILL_TIMEOUT, ParamType.SUBSCRIBER_PRIORITY, 0x25, 0x26, 0x27, 0x28 => {},
+                else => return Error.ProtocolViolation,
+            };
+            if (fbs.seek != bytes.len) return Error.ProtocolViolation;
+            return f;
+        }
+    };
+
+    fn buildParams(self: Subscribe, out: []Param, filter_buf: []u8, fill_buf: []u8, draft: version.Draft) ![]Param {
         var n: usize = 0;
         // Ascending Type order is required by §9.3.
         if (self.rendezvous_timeout_ms) |v| {
@@ -528,6 +628,10 @@ pub const Subscribe = struct {
             out[n] = .{ .type = ParamType.GROUP_ORDER, .value = .{ .uint8 = @backingInt(v) } };
             n += 1;
         }
+        if (self.fill) |f| if (version.Rules.of(draft).fetch_range_in_filter) {
+            out[n] = .{ .type = ParamType.FILL_PARAMETERS, .value = .{ .bytes = try f.encode(fill_buf) } };
+            n += 1;
+        };
         return out[0..n];
     }
 
@@ -564,7 +668,8 @@ fn writeSubscribeLike(writer: anytype, msg_type: u64, s: Subscribe, draft: versi
 
     var params: [MAX_PARAMS]Param = undefined;
     var filter_buf: [32]u8 = undefined;
-    try writeParams(w, try s.buildParams(&params, &filter_buf, draft));
+    var fill_buf: [64]u8 = undefined;
+    try writeParams(w, try s.buildParams(&params, &filter_buf, &fill_buf, draft));
 
     try writeEnvelope(writer, msg_type, scratch[0..fbs.seek]);
 }
@@ -585,7 +690,11 @@ fn decodeSubscribeLike(payload: []const u8, ns_buf: *NamespaceBuf, draft: versio
         .track_name = try wire.readVarBytesZc(&fbs),
     };
     var params: [MAX_PARAMS]Param = undefined;
-    try s.applyParams(try readParams(&fbs, &params, draft), opts);
+    const parsed = try readParams(&fbs, &params, draft);
+    try s.applyParams(parsed, opts);
+    if (version.Rules.of(draft).fetch_range_in_filter) if (findParam(parsed, ParamType.FILL_PARAMETERS)) |v| {
+        s.fill = try Subscribe.Fill.decode(v.bytes, draft);
+    };
     return s;
 }
 
@@ -852,8 +961,10 @@ pub const Fetch = struct {
     pub const Standalone = struct {
         track_namespace: []const []const u8,
         track_name: []const u8,
-        start: track.Location,
-        end: track.Location,
+        /// draft-22's form, which says everything the older Start and End
+        /// fields could: their range maps to Absolute Start with Group End,
+        /// or Absolute Range. Use `resolve` for the Locations.
+        range: LocationFilter = .{},
     };
     /// Both joining forms carry the same two fields; the tag says whether
     /// Joining Start is relative to the subscription or absolute.
@@ -880,24 +991,38 @@ pub fn writeFetch(writer: anytype, f: Fetch, draft: version.Draft) !void {
     if (version.Rules.of(draft).required_request_id_delta) {
         try wire.writeVarInt(w, f.required_request_id_delta);
     }
-    try wire.writeVarInt(w, @backingInt(std.meta.activeTag(f.body)));
-    switch (f.body) {
-        .standalone => |s| {
-            try wire.writeTuple(w, s.track_namespace);
-            try wire.writeVarBytes(w, s.track_name);
-            try wire.writeVarInt(w, s.start.group);
-            try wire.writeVarInt(w, s.start.object);
-            try wire.writeVarInt(w, s.end.group);
-            try wire.writeVarInt(w, s.end.object);
-        },
-        .relative_joining, .absolute_joining => |j| {
-            try wire.writeVarInt(w, j.joining_request_id);
-            try wire.writeVarInt(w, j.joining_start);
-        },
-    }
-
+    const in_filter = version.Rules.of(draft).fetch_range_in_filter;
     var params: [MAX_PARAMS]Param = undefined;
     var n: usize = 0;
+    if (in_filter) {
+        const s = switch (f.body) {
+            .standalone => |s| s,
+            .relative_joining, .absolute_joining => return Error.MalformedMessage,
+        };
+        try wire.writeTuple(w, s.track_namespace);
+        try wire.writeVarBytes(w, s.track_name);
+        if (s.range.type != LocationFilter.NONE) {
+            params[n] = .{ .type = ParamType.LOCATION_FILTER, .value = .{ .location_filter = s.range } };
+            n += 1;
+        }
+    } else {
+        try wire.writeVarInt(w, @backingInt(std.meta.activeTag(f.body)));
+        switch (f.body) {
+            .standalone => |s| {
+                try wire.writeTuple(w, s.track_namespace);
+                try wire.writeVarBytes(w, s.track_name);
+                const ends = try s.range.toStartEnd();
+                try wire.writeVarInt(w, ends.start.group);
+                try wire.writeVarInt(w, ends.start.object);
+                try wire.writeVarInt(w, ends.end.group);
+                try wire.writeVarInt(w, ends.end.object);
+            },
+            .relative_joining, .absolute_joining => |j| {
+                try wire.writeVarInt(w, j.joining_request_id);
+                try wire.writeVarInt(w, j.joining_start);
+            },
+        }
+    }
     if (f.subscriber_priority) |v| {
         params[n] = .{ .type = ParamType.SUBSCRIBER_PRIORITY, .value = .{ .uint8 = v } };
         n += 1;
@@ -918,7 +1043,11 @@ pub fn decodeFetch(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Dr
         try wire.readVarInt(&fbs)
     else
         0;
-    const kind = FetchType.fromInt(try wire.readVarInt(&fbs)) orelse return Error.MalformedMessage;
+    const in_filter = version.Rules.of(draft).fetch_range_in_filter;
+    const kind: FetchType = if (in_filter)
+        .standalone
+    else
+        FetchType.fromInt(try wire.readVarInt(&fbs)) orelse return Error.MalformedMessage;
 
     var f: Fetch = switch (kind) {
         .standalone => .{
@@ -927,8 +1056,10 @@ pub fn decodeFetch(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Dr
             .body = .{ .standalone = .{
                 .track_namespace = wire.readNamespace(&fbs, ns_buf) catch return Error.MalformedMessage,
                 .track_name = try wire.readVarBytesZc(&fbs),
-                .start = .{ .group = try wire.readVarInt(&fbs), .object = try wire.readVarInt(&fbs) },
-                .end = .{ .group = try wire.readVarInt(&fbs), .object = try wire.readVarInt(&fbs) },
+                .range = if (in_filter) .{} else try LocationFilter.fromStartEnd(
+                    .{ .group = try wire.readVarInt(&fbs), .object = try wire.readVarInt(&fbs) },
+                    .{ .group = try wire.readVarInt(&fbs), .object = try wire.readVarInt(&fbs) },
+                ),
             } },
         },
         .relative_joining => .{
@@ -955,6 +1086,9 @@ pub fn decodeFetch(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Dr
     if (findParam(parsed, ParamType.GROUP_ORDER)) |v| {
         f.group_order = track.GroupOrder.fromInt(v.uint8) orelse return Error.ProtocolViolation;
     }
+    if (in_filter) if (findParam(parsed, ParamType.LOCATION_FILTER)) |v| {
+        f.body.standalone.range = v.location_filter;
+    };
     return f;
 }
 
@@ -962,17 +1096,24 @@ pub fn decodeFetch(payload: []const u8, ns_buf: *NamespaceBuf, draft: version.Dr
 
 pub const FetchOk = struct {
     end_of_track: bool = false,
+    /// The last Location the response covers, inclusive; an object of
+    /// `WHOLE_GROUP` covers its group to the end.
     end: track.Location = .{ .group = 0, .object = 0 },
     expires_ms: ?u64 = null,
 };
 
-pub fn writeFetchOk(writer: anytype, f: FetchOk) !void {
+/// An inclusive end's object meaning "to the end of the group", which
+/// drafts 17 and 18 write as an End Location object of 0.
+pub const WHOLE_GROUP: u64 = std.math.maxInt(u64);
+
+pub fn writeFetchOk(writer: anytype, f: FetchOk, draft: version.Draft) !void {
     var scratch: [MAX_PAYLOAD_LEN]u8 = undefined;
     var fbs = io.fixedBufferStream(&scratch);
     const w = &fbs;
     try w.writeByte(@intFromBool(f.end_of_track));
-    try wire.writeVarInt(w, f.end.group);
-    try wire.writeVarInt(w, f.end.object);
+    const end = if (version.Rules.of(draft).fetch_range_in_filter) f.end else exclusiveEnd(f.end);
+    try wire.writeVarInt(w, end.group);
+    try wire.writeVarInt(w, end.object);
 
     var params: [MAX_PARAMS]Param = undefined;
     var n: usize = 0;
@@ -990,10 +1131,21 @@ pub fn decodeFetchOk(payload: []const u8, draft: version.Draft) !FetchOk {
         .end_of_track = (fbs.takeByte() catch return wire.Error.BufferTooShort) != 0,
         .end = .{ .group = try wire.readVarInt(&fbs), .object = try wire.readVarInt(&fbs) },
     };
+    if (!version.Rules.of(draft).fetch_range_in_filter) f.end = inclusiveEnd(f.end);
     var params: [MAX_PARAMS]Param = undefined;
     const parsed = try readParams(&fbs, &params, draft);
     if (findParam(parsed, ParamType.EXPIRES)) |v| f.expires_ms = v.varint;
     return f;
+}
+
+/// Drafts 17 and 18 end a range at "the last Object plus 1, or 0 for the
+/// whole Group".
+fn exclusiveEnd(end: track.Location) track.Location {
+    return .{ .group = end.group, .object = if (end.object == WHOLE_GROUP) 0 else end.object + 1 };
+}
+
+fn inclusiveEnd(end: track.Location) track.Location {
+    return .{ .group = end.group, .object = if (end.object == 0) WHOLE_GROUP else end.object - 1 };
 }
 
 // TRACK_STATUS (0x0D, §9.16) -----------------------------------------------
@@ -1477,21 +1629,88 @@ test "standalone FETCH round-trip" {
         .body = .{ .standalone = .{
             .track_namespace = &ns,
             .track_name = "video",
-            .start = .{ .group = 1, .object = 2 },
-            .end = .{ .group = 9, .object = 0 },
+            .range = .{ .type = LocationFilter.ABSOLUTE_START_GROUP_END, .start_group = 1, .start_object = 2, .end_group_delta = 8 },
         } },
         .subscriber_priority = 3,
         .group_order = .ascending,
     }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
+    // Start {1, 2}, End {9, 0}: the whole of group 9.
+    try testing.expect(std.mem.endsWith(u8, p.env.payload[0 .. p.env.payload.len - 5], &.{ 1, 2, 9, 0 }));
     var ns_buf: NamespaceBuf = undefined;
     const f = try decodeFetch(p.env.payload, &ns_buf, .draft_17);
     try testing.expectEqual(@as(u64, 2), f.request_id);
     try testing.expectEqualStrings("video", f.body.standalone.track_name);
-    try testing.expectEqual(@as(u64, 1), f.body.standalone.start.group);
-    try testing.expectEqual(@as(u64, 9), f.body.standalone.end.group);
+    const r = f.body.standalone.range.resolve(.{ .group = 20, .object = 0 }).?;
+    try testing.expectEqual(track.Location{ .group = 1, .object = 2 }, r.start);
+    try testing.expectEqual(track.Location{ .group = 9, .object = WHOLE_GROUP }, r.end);
     try testing.expectEqual(@as(u8, 3), f.subscriber_priority.?);
     try testing.expectEqual(track.GroupOrder.ascending, f.group_order.?);
+}
+
+test "draft-18 FETCH ends one past its last object" {
+    var buf: [128]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const ns = [_][]const u8{"moq"};
+    // End {4, 3}: objects up to and including {4, 2}.
+    var payload: [64]u8 = undefined;
+    var pw = io.fixedBufferStream(&payload);
+    try wire.writeVarInt(&pw, 7); // Request ID
+    try wire.writeVarInt(&pw, @backingInt(FetchType.standalone));
+    try wire.writeTuple(&pw, &ns);
+    try wire.writeVarBytes(&pw, "v");
+    for ([_]u64{ 4, 0, 4, 3 }) |v| try wire.writeVarInt(&pw, v);
+    try writeParams(&pw, &.{});
+    var ns_buf: NamespaceBuf = undefined;
+    const f = try decodeFetch(payload[0..pw.seek], &ns_buf, .draft_18);
+    const r = f.body.standalone.range.resolve(.{ .group = 9, .object = 0 }).?;
+    try testing.expectEqual(track.Location{ .group = 4, .object = 2 }, r.end);
+
+    // And back out the same way.
+    try writeFetch(&fbs, f, .draft_18);
+    const p = try parseEnvelope(buf[0..fbs.seek]);
+    try testing.expectEqualSlices(u8, payload[0..pw.seek], p.env.payload);
+
+    // An End before the Start is refused.
+    payload[pw.seek - 3] = 3;
+    try testing.expectError(Error.ProtocolViolation, decodeFetch(payload[0..pw.seek], &ns_buf, .draft_18));
+}
+
+test "draft-22 FETCH carries its range in LOCATION_FILTER and has no joining form" {
+    var buf: [128]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const ns = [_][]const u8{"moq"};
+    const range: LocationFilter = .{ .type = LocationFilter.ABSOLUTE_RANGE, .start_group = 3, .start_object = 1, .end_group_delta = 2, .end_object = 4 };
+    try writeFetch(&fbs, .{
+        .request_id = 4,
+        .body = .{ .standalone = .{ .track_namespace = &ns, .track_name = "v", .range = range } },
+    }, .draft_22);
+    const p = try parseEnvelope(buf[0..fbs.seek]);
+    // Request ID, then the namespace tuple: no Fetch Type.
+    try testing.expectEqualSlices(u8, &.{ 4, 1, 3, 'm', 'o', 'q', 1, 'v' }, p.env.payload[0..8]);
+    var ns_buf: NamespaceBuf = undefined;
+    const f = try decodeFetch(p.env.payload, &ns_buf, .draft_22);
+    try testing.expectEqual(range, f.body.standalone.range);
+    const r = range.resolve(.{ .group = 9, .object = 0 }).?;
+    try testing.expectEqual(track.Location{ .group = 5, .object = 4 }, r.end);
+
+    fbs.seek = 0;
+    try testing.expectError(Error.MalformedMessage, writeFetch(&fbs, .{
+        .body = .{ .relative_joining = .{ .joining_request_id = 0, .joining_start = 1 } },
+    }, .draft_22));
+}
+
+test "a fetch range stops at Largest Object, and is empty past it" {
+    const largest: track.Location = .{ .group = 5, .object = 3 };
+    const all: LocationFilter = .{};
+    const r = all.resolve(largest).?;
+    try testing.expectEqual(track.Location{ .group = 0, .object = 0 }, r.start);
+    try testing.expectEqual(largest, r.end);
+    const rel: LocationFilter = .{ .type = LocationFilter.RELATIVE_START, .start_group = 2 };
+    try testing.expectEqual(track.Location{ .group = 4, .object = 0 }, rel.resolve(largest).?.start);
+    const late: LocationFilter = .{ .type = LocationFilter.ABSOLUTE_START, .start_group = 6 };
+    try testing.expectEqual(null, late.resolve(largest));
+    try testing.expectEqual(null, all.resolve(null));
 }
 
 test "joining FETCH round-trip" {
@@ -1516,12 +1735,21 @@ test "FETCH_OK round-trip" {
         .end_of_track = true,
         .end = .{ .group = 12, .object = 4 },
         .expires_ms = 30,
-    });
+    }, .draft_17);
     const p = try parseEnvelope(buf[0..fbs.seek]);
+    // On the wire draft-17 says one past the last object.
+    try testing.expectEqualSlices(u8, &.{ 1, 12, 5 }, p.env.payload[0..3]);
     const f = try decodeFetchOk(p.env.payload, .draft_17);
     try testing.expect(f.end_of_track);
-    try testing.expectEqual(@as(u64, 12), f.end.group);
+    try testing.expectEqual(track.Location{ .group = 12, .object = 4 }, f.end);
     try testing.expectEqual(@as(u64, 30), f.expires_ms.?);
+
+    for ([_]version.Draft{ .draft_18, .draft_22 }) |d| {
+        fbs.seek = 0;
+        try writeFetchOk(&fbs, .{ .end = .{ .group = 3, .object = WHOLE_GROUP } }, d);
+        const q = try parseEnvelope(buf[0..fbs.seek]);
+        try testing.expectEqual(track.Location{ .group = 3, .object = WHOLE_GROUP }, (try decodeFetchOk(q.env.payload, d)).end);
+    }
 }
 
 test "TRACK_STATUS has the SUBSCRIBE shape under its own type" {
@@ -1887,4 +2115,42 @@ test "draft-18 parameters we did not know" {
     try testing.expectEqual(@as(u64, 7), got[1].value.varint);
     try testing.expectEqualSlices(u8, &.{ 0x02, 0x01, 0x61, 0x01, 0x62 }, got[2].value.bytes);
     try testing.expectEqual(@as(usize, bytes.len), fbs.seek);
+}
+
+test "draft-22 SUBSCRIBE carries FILL_PARAMETERS as a counted parameter block" {
+    var buf: [128]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const ns = [_][]const u8{"moq"};
+    const join: LocationFilter = .{ .type = LocationFilter.RELATIVE_START, .start_group = 1 };
+    try writeSubscribe(&fbs, .{
+        .request_id = 2,
+        .track_namespace = &ns,
+        .track_name = "v",
+        .fill = .{ .range = join },
+    }, .draft_22);
+    const p = try parseEnvelope(buf[0..fbs.seek]);
+    // As aiomoqt writes it: Length, one parameter, LOCATION_FILTER Relative
+    // Start 1.
+    try testing.expect(std.mem.endsWith(u8, p.env.payload, &.{ 4, 1, 0x21, 0x01, 1 }));
+    var ns_buf: NamespaceBuf = undefined;
+    const s = try decodeSubscribe(p.env.payload, &ns_buf, .draft_22);
+    try testing.expectEqual(join, s.fill.?.range.?);
+
+    // Zero-length: a fill of the subscription's own range.
+    fbs.seek = 0;
+    try writeSubscribe(&fbs, .{ .track_namespace = &ns, .track_name = "v", .fill = .{} }, .draft_22);
+    const q = try parseEnvelope(buf[0..fbs.seek]);
+    const s2 = try decodeSubscribe(q.env.payload, &ns_buf, .draft_22);
+    try testing.expectEqual(@as(?LocationFilter, null), s2.fill.?.range);
+
+    // Draft-18 has no fill; its joining FETCH did that.
+    fbs.seek = 0;
+    try writeSubscribe(&fbs, .{ .track_namespace = &ns, .track_name = "v", .fill = .{ .range = join } }, .draft_18);
+    const r = try parseEnvelope(buf[0..fbs.seek]);
+    try testing.expectEqual(@as(?Subscribe.Fill, null), (try decodeSubscribe(r.env.payload, &ns_buf, .draft_18)).fill);
+}
+
+test "FILL_PARAMETERS refuses a parameter Table 7 doesn't allow" {
+    // FORWARD (0x10) inside a fill.
+    try testing.expectError(Error.ProtocolViolation, Subscribe.Fill.decode(&.{ 1, 0x10, 1 }, .draft_22));
 }

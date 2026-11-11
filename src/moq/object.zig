@@ -265,6 +265,221 @@ pub fn readFetchStreamHeader(fbs: *io.FixedBufferStream([]const u8)) !track.Requ
     return try wire.readVarInt(reader);
 }
 
+/// One object on a FETCH stream (§11.4.1).
+pub const FetchObject = struct {
+    group: track.GroupId,
+    /// Null for an object that was sent as a datagram.
+    subgroup: ?u64 = 0,
+    id: track.ObjectId,
+    publisher_priority: track.Priority = 128,
+    /// The raw KV bytes; null leaves the field off the wire.
+    properties: ?[]const u8 = null,
+    payload: []const u8 = &.{},
+};
+
+/// What an End of Range says about the Locations it closes (Table 8).
+pub const FetchRangeKind = enum(u64) {
+    does_not_exist = 0x8C,
+    unknown = 0x10C,
+    timed_out = 0x20C,
+};
+
+pub const FetchItem = union(enum) {
+    object: FetchObject,
+    /// Every Location after the prior item, up to and including this one.
+    end_of_range: struct { kind: FetchRangeKind, at: track.Location },
+};
+
+const FETCH_SUBGROUP_MASK: u64 = 0x03;
+const FETCH_OBJECT_ID: u64 = 0x04;
+const FETCH_GROUP_ID: u64 = 0x08;
+const FETCH_PRIORITY: u64 = 0x10;
+const FETCH_PROPERTIES: u64 = 0x20;
+const FETCH_DATAGRAM: u64 = 0x40;
+
+/// The prior item on one FETCH stream, which the next is encoded against.
+pub const FetchCursor = struct {
+    deltas: bool,
+    descending: bool = false,
+    at: ?track.Location = null,
+    /// From the last actual object: an End of Range carries neither.
+    subgroup: ?u64 = null,
+    priority: ?track.Priority = null,
+
+    pub fn init(draft: version.Draft, descending: bool) FetchCursor {
+        return .{ .deltas = version.Rules.of(draft).fetch_id_deltas, .descending = descending };
+    }
+
+    const Ids = struct { flags: u64, group: ?u64 = null, object: ?u64 = null };
+
+    fn encodeIds(self: *const FetchCursor, at: track.Location) !Ids {
+        const all: Ids = .{ .flags = FETCH_GROUP_ID | FETCH_OBJECT_ID, .group = at.group, .object = at.object };
+        const p = self.at orelse return all;
+        if (!self.deltas) {
+            if (at.group != p.group) return all;
+            if (at.object <= p.object) return Error.InvalidObjectHeader;
+            if (at.object == p.object + 1) return .{ .flags = 0 };
+            return .{ .flags = FETCH_OBJECT_ID, .object = at.object };
+        }
+        if (at.group != p.group) {
+            const step = if (self.descending) std.math.sub(u64, p.group, at.group) else std.math.sub(u64, at.group, p.group);
+            const s = step catch return Error.InvalidObjectHeader;
+            return .{ .flags = FETCH_GROUP_ID | FETCH_OBJECT_ID, .group = s - 1, .object = at.object };
+        }
+        if (at.object <= p.object) return Error.InvalidObjectHeader;
+        if (at.object == p.object + 1) return .{ .flags = 0 };
+        return .{ .flags = FETCH_OBJECT_ID, .object = at.object - p.object };
+    }
+
+    fn decodeIds(self: *const FetchCursor, group: ?u64, object: ?u64) !track.Location {
+        const p = self.at orelse {
+            // §11.4.1.1: the first item carries both, as absolute values.
+            return .{ .group = group orelse return Error.InvalidObjectHeader, .object = object orelse return Error.InvalidObjectHeader };
+        };
+        const overflow = Error.InvalidObjectHeader;
+        if (!self.deltas) return .{
+            .group = group orelse p.group,
+            .object = object orelse (std.math.add(u64, p.object, 1) catch return overflow),
+        };
+        if (group) |d| {
+            const step = std.math.add(u64, d, 1) catch return overflow;
+            const g = if (self.descending) std.math.sub(u64, p.group, step) else std.math.add(u64, p.group, step);
+            return .{
+                .group = g catch return overflow,
+                .object = object orelse (std.math.add(u64, p.object, 1) catch return overflow),
+            };
+        }
+        return .{
+            .group = p.group,
+            .object = std.math.add(u64, p.object, object orelse 1) catch return overflow,
+        };
+    }
+};
+
+pub fn writeFetchItem(writer: anytype, item: FetchItem, c: *FetchCursor) !void {
+    try writeFetchItemHead(writer, item, c);
+    switch (item) {
+        .object => |o| try writer.writeAll(o.payload),
+        .end_of_range => {},
+    }
+}
+
+/// All of the item but an object's payload bytes, which the caller sends
+/// next: a relay can hand them on from its cache without a copy.
+pub fn writeFetchItemHead(writer: anytype, item: FetchItem, c: *FetchCursor) !void {
+    switch (item) {
+        .end_of_range => |r| {
+            // Its Group ID Delta always moves on a group, so a range can't
+            // end inside the prior object's.
+            if (c.deltas) if (c.at) |p| if (r.at.group == p.group) return Error.InvalidObjectHeader;
+            const ids = try c.encodeIds(r.at);
+            try wire.writeVarInt(writer, @backingInt(r.kind));
+            // Both fields are on the wire: the kind's value has both bits.
+            try wire.writeVarInt(writer, ids.group orelse 0);
+            try wire.writeVarInt(writer, ids.object orelse r.at.object);
+            c.at = r.at;
+        },
+        .object => |o| {
+            const at: track.Location = .{ .group = o.group, .object = o.id };
+            const ids = try c.encodeIds(at);
+            var flags = ids.flags;
+            var subgroup_field: ?u64 = null;
+            if (o.subgroup) |sg| {
+                if (sg == 0) {} else if (c.subgroup != null and c.subgroup.? == sg) {
+                    flags |= 0x01;
+                } else if (c.subgroup != null and c.subgroup.? +% 1 == sg) {
+                    flags |= 0x02;
+                } else {
+                    flags |= 0x03;
+                    subgroup_field = sg;
+                }
+            } else flags |= FETCH_DATAGRAM;
+            const new_priority = c.priority == null or c.priority.? != o.publisher_priority;
+            if (new_priority) flags |= FETCH_PRIORITY;
+            if (o.properties != null) flags |= FETCH_PROPERTIES;
+
+            try wire.writeVarInt(writer, flags);
+            if (ids.group) |g| try wire.writeVarInt(writer, g);
+            if (subgroup_field) |sg| try wire.writeVarInt(writer, sg);
+            if (ids.object) |v| try wire.writeVarInt(writer, v);
+            if (new_priority) try writer.writeByte(o.publisher_priority);
+            if (o.properties) |p| {
+                try wire.writeVarInt(writer, p.len);
+                try writer.writeAll(p);
+            }
+            try wire.writeVarInt(writer, o.payload.len);
+            c.at = at;
+            c.subgroup = o.subgroup;
+            c.priority = o.publisher_priority;
+        },
+    }
+}
+
+pub const ReadFetchItem = struct { item: FetchItem, consumed: usize };
+
+/// Reads the item at the front of `data`, or null while it is still
+/// arriving; `c` moves on only past a whole item.
+pub fn readFetchItem(data: []const u8, c: *FetchCursor) !?ReadFetchItem {
+    var fbs = io.fixedBufferStream(data);
+    const flags = wire.readVarInt(&fbs) catch |e| return partialFetch(e);
+    if (flags >= 128) {
+        const kind: FetchRangeKind = switch (flags) {
+            0x8C => .does_not_exist,
+            0x10C => .unknown,
+            0x20C => .timed_out,
+            else => return Error.InvalidObjectHeader,
+        };
+        const g = wire.readVarInt(&fbs) catch |e| return partialFetch(e);
+        const o = wire.readVarInt(&fbs) catch |e| return partialFetch(e);
+        const at = try c.decodeIds(g, o);
+        c.at = at;
+        return .{ .item = .{ .end_of_range = .{ .kind = kind, .at = at } }, .consumed = fbs.seek };
+    }
+    const group: ?u64 = if (flags & FETCH_GROUP_ID != 0) wire.readVarInt(&fbs) catch |e| return partialFetch(e) else null;
+    var subgroup: ?u64 = null;
+    if (flags & FETCH_DATAGRAM == 0) switch (flags & FETCH_SUBGROUP_MASK) {
+        0 => subgroup = 0,
+        1 => subgroup = c.subgroup orelse return Error.InvalidObjectHeader,
+        2 => subgroup = std.math.add(u64, c.subgroup orelse return Error.InvalidObjectHeader, 1) catch return Error.InvalidObjectHeader,
+        else => subgroup = wire.readVarInt(&fbs) catch |e| return partialFetch(e),
+    };
+    const object: ?u64 = if (flags & FETCH_OBJECT_ID != 0) wire.readVarInt(&fbs) catch |e| return partialFetch(e) else null;
+    const priority: track.Priority = if (flags & FETCH_PRIORITY != 0)
+        fbs.takeByte() catch return null
+    else
+        c.priority orelse return Error.InvalidObjectHeader;
+    var properties: ?[]const u8 = null;
+    if (flags & FETCH_PROPERTIES != 0) {
+        const len = wire.readVarInt(&fbs) catch |e| return partialFetch(e);
+        if (len > data.len - fbs.seek) return null;
+        properties = data[fbs.seek..][0..@intCast(len)];
+        fbs.seek += @intCast(len);
+    }
+    const payload_len = wire.readVarInt(&fbs) catch |e| return partialFetch(e);
+    if (payload_len > data.len - fbs.seek) return null;
+    const payload = data[fbs.seek..][0..@intCast(payload_len)];
+
+    const at = try c.decodeIds(group, object);
+    c.at = at;
+    c.subgroup = subgroup;
+    c.priority = priority;
+    return .{
+        .item = .{ .object = .{
+            .group = at.group,
+            .subgroup = subgroup,
+            .id = at.object,
+            .publisher_priority = priority,
+            .properties = properties,
+            .payload = payload,
+        } },
+        .consumed = fbs.seek + payload.len,
+    };
+}
+
+fn partialFetch(e: anyerror) !?ReadFetchItem {
+    return if (e == wire.Error.BufferTooShort) null else e;
+}
+
 // Tests
 
 test "subgroup header round-trip — explicit subgroup with priority" {
@@ -464,4 +679,84 @@ test "a subgroup object that has not all arrived reads as null" {
     const r = (try readSubgroupObject(whole, null, true)).?;
     try testing.expectEqualSlices(u8, &.{ 0x02, 0x07 }, r.object.properties);
     try testing.expectEqualStrings("xyz", r.object.payload);
+}
+
+fn fetchRoundTrip(draft: version.Draft, descending: bool, items: []const FetchItem) !void {
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    var wc = FetchCursor.init(draft, descending);
+    for (items) |it| try writeFetchItem(&fbs, it, &wc);
+
+    var rc = FetchCursor.init(draft, descending);
+    var data: []const u8 = buf[0..fbs.seek];
+    for (items) |want| {
+        const r = (try readFetchItem(data, &rc)) orelse return error.TestUnexpectedResult;
+        switch (want) {
+            .end_of_range => |w| {
+                try testing.expectEqual(w.kind, r.item.end_of_range.kind);
+                try testing.expectEqual(w.at, r.item.end_of_range.at);
+            },
+            .object => |w| {
+                const o = r.item.object;
+                try testing.expectEqual(w.group, o.group);
+                try testing.expectEqual(w.subgroup, o.subgroup);
+                try testing.expectEqual(w.id, o.id);
+                try testing.expectEqual(w.publisher_priority, o.publisher_priority);
+                try testing.expectEqual(w.properties == null, o.properties == null);
+                try testing.expectEqualSlices(u8, w.payload, o.payload);
+            },
+        }
+        data = data[r.consumed..];
+    }
+    try testing.expectEqual(@as(usize, 0), data.len);
+}
+
+test "fetch objects round-trip in every draft's encoding" {
+    const items = [_]FetchItem{
+        .{ .end_of_range = .{ .kind = .unknown, .at = .{ .group = 2, .object = 9 } } },
+        .{ .object = .{ .group = 3, .subgroup = 0, .id = 0, .payload = "a" } },
+        .{ .object = .{ .group = 3, .subgroup = 0, .id = 1, .payload = "b" } },
+        .{ .object = .{ .group = 3, .subgroup = 0, .id = 4, .publisher_priority = 7, .payload = "" } },
+        .{ .object = .{ .group = 3, .subgroup = 1, .id = 5, .properties = "\x02\x01", .payload = "c" } },
+        .{ .object = .{ .group = 5, .subgroup = 9, .id = 0, .payload = "d" } },
+        .{ .object = .{ .group = 6, .subgroup = null, .id = 2, .payload = "e" } },
+    };
+    for ([_]version.Draft{ .draft_17, .draft_18, .draft_22 }) |d| try fetchRoundTrip(d, false, &items);
+}
+
+test "draft-18 fetch objects carry IDs as deltas" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    var c = FetchCursor.init(.draft_18, false);
+    try writeFetchItem(&fbs, .{ .object = .{ .group = 4, .id = 2, .payload = "" } }, &c);
+    try writeFetchItem(&fbs, .{ .object = .{ .group = 4, .id = 3, .payload = "" } }, &c);
+    try writeFetchItem(&fbs, .{ .object = .{ .group = 7, .id = 1, .payload = "" } }, &c);
+    try testing.expectEqualSlices(u8, &.{
+        0x1C, 4, 2, 128, 0, // first: both IDs whole, priority
+        0x00, 0, // same group, next ID: no fields at all
+        0x0C, 2, 1, 0, // group 4 + 2 + 1, object 1 whole
+    }, buf[0..fbs.seek]);
+}
+
+test "descending fetch groups step down" {
+    const items = [_]FetchItem{
+        .{ .object = .{ .group = 9, .id = 0, .payload = "x" } },
+        .{ .object = .{ .group = 9, .id = 1, .payload = "y" } },
+        .{ .object = .{ .group = 4, .id = 0, .payload = "z" } },
+    };
+    try fetchRoundTrip(.draft_18, true, &items);
+    try fetchRoundTrip(.draft_22, true, &items);
+}
+
+test "a fetch item referencing a prior object it doesn't have is refused" {
+    var c = FetchCursor.init(.draft_18, false);
+    // 0x01: the prior object's subgroup, on the first object.
+    try testing.expectError(Error.InvalidObjectHeader, readFetchItem(&.{ 0x1D, 0, 0, 128, 0 }, &c));
+    // No Group ID on the first object.
+    try testing.expectError(Error.InvalidObjectHeader, readFetchItem(&.{ 0x14, 0, 128, 0 }, &c));
+    // An End of Range value that isn't one.
+    try testing.expectError(Error.InvalidObjectHeader, readFetchItem(&.{ 0x40, 0x8D, 0, 0 }, &c));
+    // Half an object.
+    try testing.expectEqual(@as(?ReadFetchItem, null), try readFetchItem(&.{ 0x1C, 4, 2, 128, 3, 'a' }, &c));
+    try testing.expectEqual(@as(?track.Location, null), c.at);
 }
