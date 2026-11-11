@@ -653,7 +653,7 @@ details, and [moq-interop.md](moq-interop.md) for the interop runner.
 | Relay: SUBSCRIBE routed to the namespace's publisher with the subscriber's filter; FORWARD, REQUEST_UPDATE; withdrawal by reset or (17/18) FIN | ✅ Done |
 | Relay: SUBSCRIBE_TRACKS answered with PUBLISH; PREFIX_OVERLAP; early data streams and datagrams held for their alias | ✅ Done |
 | WebTransport browser client/server + protocol negotiation | ✅ Done |
-| Interop test client (10 cases incl. namespace discovery and `data-subgroup-basic`, TAP 14, containerised) | ✅ Done |
+| Interop test client (18 cases incl. namespace discovery, `data-subgroup-basic` and eight more MoQT Test tuples, TAP 14, containerised) | ✅ Done |
 | Datagram objects, relayed with alias remapping | ✅ Done |
 | FETCH (standalone, joining, draft-22 fills) and TRACK_STATUS, from the relay's cache or its publisher | ✅ Done — aiomoqt `fetch` and `join` pass at drafts 18 and 22 |
 | draft-18, alongside draft-17 | ✅ Done — chosen by ALPN, per peer |

@@ -27,6 +27,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   subscriptions with PREFIX_OVERLAP.
 - `moq-test-client` runs the interop runner's `subscribe-namespace-lifecycle`,
   `publish-namespace-multi-publisher-retention` and `data-subgroup-basic`.
+- `moq-test-client` runs eight more data-plane cases from MoQT Test tuples:
+  a subgroup per object, two subgroups per group, datagrams, End of Group
+  markers, extensions, increments and FORWARD=0.
 - The MoQ relay ranks its streams by subscriber and publisher priority and
   group order, enforces SUBGROUP_DELIVERY_TIMEOUT and OBJECT_DELIVERY_TIMEOUT,
   passes NEW_GROUP_REQUEST upstream, and on SIGTERM sends its clients GOAWAY
