@@ -1730,6 +1730,8 @@ pub const StreamsMap = struct {
     /// and RFC 9218 priority. Two tiers:
     ///   Tier 1: streams with send_order set — sorted descending (higher = more urgent).
     ///   Tier 2: streams without send_order — RFC 9218 urgency-based scheduling.
+    /// A stream without a send order counts as 0, the W3C API's default: tier
+    /// 2 goes between the positive send orders and the rest.
     /// Non-incremental streams at the chosen urgency go one at a time, lowest
     /// stream ID first (RFC 9218 §4); the next few follow the scheduled set,
     /// in ID order, as backfill. The packer draws from `out` in order and a
@@ -1816,10 +1818,19 @@ pub const StreamsMap = struct {
         }
         if (urgency_count > 0) self.rr_index +%= 1;
 
-        // Append tier 2 after tier 1, then the backfill.
-        var total = @min(ordered_count + urgency_count, MAX_SCHEDULABLE);
-        for (ordered_count..total) |i| {
-            out[i] = urgency_buf[i - ordered_count];
+        // Tier 2 and its backfill go after the positive send orders, ahead
+        // of the rest.
+        const positive = for (out[0..ordered_count], 0..) |s, i| {
+            if (s.send.send_order.? <= 0) break i;
+        } else ordered_count;
+        var behind: [MAX_SCHEDULABLE]*Stream = undefined;
+        const behind_count = ordered_count - positive;
+        @memcpy(behind[0..behind_count], out[positive..ordered_count]);
+        var total = positive;
+        for (urgency_buf[0..urgency_count]) |s| {
+            if (total >= MAX_SCHEDULABLE) break;
+            out[total] = s;
+            total += 1;
         }
         if (sequential_count > 1) {
             for (sequential_buf[1..sequential_count]) |s| {
@@ -1828,11 +1839,16 @@ pub const StreamsMap = struct {
                 total += 1;
             }
         }
+        for (behind[0..behind_count]) |s| {
+            if (total >= MAX_SCHEDULABLE) break;
+            out[total] = s;
+            total += 1;
+        }
         return total;
     }
 
     /// Select uni send streams to send data on, sorted by send_order (higher first).
-    /// Streams without send_order are appended after ordered ones.
+    /// A stream without one counts as 0, the W3C API's default.
     pub fn getScheduledUniStreams(self: *StreamsMap, out: *[MAX_SCHEDULABLE]*SendStream) usize {
         var ordered_count: usize = 0;
         var unordered_count: usize = 0;
@@ -1860,10 +1876,23 @@ pub const StreamsMap = struct {
             sortSendStreamsBySendOrder(out[0..ordered_count]);
         }
 
-        // Append unordered after ordered
-        const total = @min(ordered_count + unordered_count, MAX_SCHEDULABLE);
-        for (ordered_count..total) |i| {
-            out[i] = unordered_buf[i - ordered_count];
+        // Unordered ones go between the positive send orders and the rest.
+        const positive = for (out[0..ordered_count], 0..) |s, i| {
+            if (s.send_order.? <= 0) break i;
+        } else ordered_count;
+        var behind: [MAX_SCHEDULABLE]*SendStream = undefined;
+        const behind_count = ordered_count - positive;
+        @memcpy(behind[0..behind_count], out[positive..ordered_count]);
+        var total = positive;
+        for (unordered_buf[0..unordered_count]) |s| {
+            if (total >= MAX_SCHEDULABLE) break;
+            out[total] = s;
+            total += 1;
+        }
+        for (behind[0..behind_count]) |s| {
+            if (total >= MAX_SCHEDULABLE) break;
+            out[total] = s;
+            total += 1;
         }
         return total;
     }
@@ -3223,6 +3252,39 @@ test "StreamsMap: setSendOrder dynamically changes scheduling" {
     count = sm.getScheduledStreams(&out);
     try testing.expectEqual(@as(u64, 0), out[0].stream_id);
     try testing.expectEqual(@as(u64, 4), out[1].stream_id);
+}
+
+test "StreamsMap: a stream without a send order counts as 0, ahead of a negative one" {
+    // As in the W3C WebTransport API, whose sendOrder defaults to 0. Any
+    // send order went ahead of none, so a relay that ranked its data
+    // streams below its control streams starved them instead.
+    var sm = StreamsMap.init(testing.allocator, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s0 = try sm.openBidiStream();
+    const s4 = try sm.openBidiStream();
+    const s8 = try sm.openBidiStream();
+    try s0.send.writeData("behind");
+    s0.send.send_order = -1;
+    try s4.send.writeData("default");
+    try s8.send.writeData("ahead");
+    s8.send.send_order = 1;
+    var out: [StreamsMap.MAX_SCHEDULABLE]*Stream = undefined;
+    try testing.expectEqual(@as(usize, 3), sm.getScheduledStreams(&out));
+    try testing.expectEqual(@as(u64, 8), out[0].stream_id);
+    try testing.expectEqual(@as(u64, 4), out[1].stream_id);
+    try testing.expectEqual(@as(u64, 0), out[2].stream_id);
+
+    const uni_a = try sm.openUniStream();
+    const uni_b = try sm.openUniStream();
+    try uni_a.writeData("behind");
+    uni_a.send_order = -7;
+    try uni_b.writeData("default");
+    var uni_out: [StreamsMap.MAX_SCHEDULABLE]*SendStream = undefined;
+    try testing.expectEqual(@as(usize, 2), sm.getScheduledUniStreams(&uni_out));
+    try testing.expectEqual(uni_b.stream_id, uni_out[0].stream_id);
+    try testing.expectEqual(uni_a.stream_id, uni_out[1].stream_id);
 }
 
 // ── Stream disposal ────────────────────────────────────────────────────
