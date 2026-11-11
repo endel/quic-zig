@@ -66,6 +66,11 @@ pub const Rules = struct {
     subgroup_first_object_bit: bool,
     /// PUBLISH_DONE's TOO_FAR_BEHIND, which draft-18 swapped with EXPIRED.
     done_too_far_behind: u64,
+    /// A requester's FIN withdraws a PUBLISH_NAMESPACE or ends a namespace
+    /// subscription. Drafts 17 and 18 dropped PUBLISH_NAMESPACE_DONE and
+    /// left the stream's close as the withdrawal; draft-19 (#1698) made a
+    /// FIN mean only "nothing more to send", never a cancellation.
+    fin_withdraws_request: bool,
 
     pub fn of(draft: Draft) Rules {
         return switch (draft) {
@@ -77,6 +82,7 @@ pub const Rules = struct {
                 .has_subscribe_tracks = false,
                 .subgroup_first_object_bit = false,
                 .done_too_far_behind = 0x6,
+                .fin_withdraws_request = true,
             },
             .draft_18 => .{
                 .required_request_id_delta = false,
@@ -86,6 +92,7 @@ pub const Rules = struct {
                 .has_subscribe_tracks = true,
                 .subgroup_first_object_bit = true,
                 .done_too_far_behind = 0x5,
+                .fin_withdraws_request = true,
             },
         };
     }
