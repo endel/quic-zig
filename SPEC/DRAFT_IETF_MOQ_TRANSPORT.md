@@ -268,14 +268,43 @@ Known and deliberately not implemented:
   GOAWAY on request streams, and mandatory-to-understand track
   properties. None are exercised by the interop runner's cases.
 
-Drafts 19 to 23 also exist. As of November 2026, fourteen of the runner's
-registered implementations speak draft-22, and relay.moqtail.dev refuses a
-CONNECT that offers only `moqt-18`. The changes 18 → 22 are listed in
-draft-23's Appendix A.2–A.5: range filters, several subscriptions per track,
-fill streams in place of joining FETCH, LOCATION_FILTER with an explicit type,
-type-flag bitfields on data streams, PUBLISH_STATE_NOTIFY and
-INCLUDE_PROPERTIES. draft-23 then makes the control-message length a varint.
-Adding one is another row in `Rules`.
+## Where draft-22 differs
+
+draft-22 is the third row in `version.Rules`, offered first (`moqt-22`) on
+both transports; 19 to 21 are skipped, since no peer registered with the
+interop runner speaks them. Diffing the two drafts' message figures and
+code-point tables, rather than trusting the changelog, gives a short list:
+
+- **SUBSCRIPTION_FILTER becomes LOCATION_FILTER**, same parameter type 0x21
+  but no longer length-prefixed: a Location Filter Type, then 0–4 varints it
+  selects (`message.LocationFilter`). draft-18's Largest Object is draft-22's
+  Next Object (0x05); Next Group Start is Relative Start with StartGroup 0.
+  `Filter` carries what only draft-22 can say (a Relative Start further
+  back, an Absolute Range's end object); toward a draft-18 peer it widens,
+  to no filter or to the whole end group.
+- **New Message Parameters** a receiver must know, since an unknown one is a
+  PROTOCOL_VIOLATION: FILL_PARAMETERS (0x23) and the five range filters
+  (0x25–0x29), length-prefixed, and INCLUDE_PROPERTIES (0x35), a uint8.
+  `paramShape` takes the draft. Three draft-18 parameters were missing and
+  are now known on both: SUBGROUP_DELIVERY_TIMEOUT (0x06), FILL_TIMEOUT
+  (0x0A), TRACK_NAMESPACE_PREFIX (0x34).
+- **A FIN is not a withdrawal** (draft-19, #1698): `fin_withdraws_request`
+  is false, so only a reset cancels a request.
+- GOAWAY loses the Request ID we never wrote; PUBLISH_BLOCKED (0xF) is
+  renamed PUBLISH_SKIPPED with the same shape; SUBSCRIPTION_ENDED and
+  VERSION_NEGOTIATION_FAILED are gone, TOO_MANY_REQUEST_UPDATES is new.
+
+Unchanged on the wire: SETUP, the request and response messages the runner
+exercises, the subgroup header (now described as type flags, same bits),
+object fields, datagram types, and the error codes the tests check.
+
+Not implemented for draft-22: FETCH's new shape (no Fetch Type; the range
+rides LOCATION_FILTER) and fill streams, PUBLISH_STATE_NOTIFY (0x22), range
+filters beyond decoding them, MAX_FILTER_RANGES and MAX_REQUEST_UPDATES. The
+relay has no FETCH on any draft yet.
+
+draft-23 (2 Nov 2026) makes the control-message length a varint and
+REQUEST_OK replaces FETCH_OK; no runner peer speaks it yet.
 
 ## Video demo architecture
 

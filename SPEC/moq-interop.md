@@ -26,10 +26,12 @@ can be a Docker image or just a public URL.
 | `VERBOSE` | `1` for diagnostics on stderr |
 
 CLI: `--relay URL`, `--test NAME`, `--list`, `--verbose`,
-`--tls-disable-verify`, `--draft 17|18`. Flags win over env.
+`--tls-disable-verify`, `--draft 17|18|22`. Flags win over env.
 
-The runner has no way to ask for a draft — a pair negotiates whatever it
-negotiates — so `--draft` is ours, for running the matrix at each.
+The client offers every draft it implements, newest first: in the QUIC ALPN
+list over native QUIC, in WT-Available-Protocols over WebTransport. It then
+speaks whichever the relay picked. The runner has no way to ask for a draft,
+so `--draft` is ours, for narrowing the offer to one.
 
 Output is **TAP version 14 on stdout** and nothing else:
 

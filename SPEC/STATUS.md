@@ -632,10 +632,10 @@ lives in [`src/sys/windows.zig`](../src/sys/windows.zig).
 | WebTransport | 22 | 1 | 2 | 88% |
 | RFC 6455 (WebSocket, server) | 6 | 0 | 2 | 75% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
-| MoQ Transport (draft-17, -18) | 17 | 2 | 0 | see below |
+| MoQ Transport (draft-17, -18, -22) | 18 | 2 | 0 | see below |
 | moq-lite (draft-05) | 6 | 2 | 1 | see below |
 
-### MoQ Transport (draft-ietf-moq-transport-17 and -18)
+### MoQ Transport (draft-ietf-moq-transport-17, -18 and -22)
 
 See [DRAFT_IETF_MOQ_TRANSPORT.md](DRAFT_IETF_MOQ_TRANSPORT.md) for
 details, and [moq-interop.md](moq-interop.md) for the interop runner.
@@ -657,6 +657,7 @@ details, and [moq-interop.md](moq-interop.md) for the interop runner.
 | Datagram objects, relayed with alias remapping | ✅ Done |
 | FETCH request/response runtime | ⚠ Codec only |
 | draft-18, alongside draft-17 | ✅ Done — chosen by ALPN, per peer |
+| draft-22 (LOCATION_FILTER, new parameters, FIN semantics, resuming paused publications) | ✅ Done — FETCH's new shape and fill streams not yet |
 | Interop: our relay, both transports, both drafts | ✅ 7/7 each |
 | Interop: our relay against every registered draft-18 client | ✅ all pass (23 Sep 2026) |
 | Interop: moq-relay v0.14.16 (both transports, both drafts) | ⚠ 6/7 — their non-standard error code |

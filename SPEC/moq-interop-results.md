@@ -28,6 +28,40 @@ Test cases and their pass criteria are the moq-interop-runner's:
 
 <!-- Everything below is written by hand; the generator keeps it. -->
 
+## draft-22 (2026-11-11, local and public)
+
+The client offers 22, 18 and 17, newest first, and every relay below picked
+the newest it shares. All 10 cases unless noted.
+
+| Relay | Draft | Result |
+|---|---|---|
+| moq-ng (Cloudflare), public, both transports | 22 | 10/10 |
+| moqtail `relay.moqtail.dev` (443), public | 22 | 10/10 |
+| imquic, public raw QUIC; docker | 22 | 10/10 |
+| aiomoqt-relay, docker both transports; public raw QUIC | 22 | 10/10 |
+| moqlivemock, docker | 22 | 10/10 |
+| moq-dev-rs `cdn.moq.dev`, stitcher-moq, public | 22 | 8–9/10: `rendezvous-timeout` answered DOES_NOT_EXIST |
+| red5, public | 22 | `rendezvous-timeout` as above; multi-publisher retention fails over raw QUIC only, cause not established |
+| moq-rs-draft-18, docker | 18 | 10/10, offering 22 first |
+
+Our relay at draft-22, through the runner's harness: aiomoqt 20/20, imquic,
+moqlivemock, stitcher-moq and moxygen pass every case they run on both
+endpoints, and 18-only clients still get 18. moq-dev-rs fails
+`subscribe-namespace-lifecycle` at 22: the moq-net it pins (0.3.15) withdraws
+by FIN, which draft-22 says is not a cancellation. moq-net `main` now resets
+instead, so that cell recovers when the runner bumps the client.
+
+Three things draft-22 needed that the figures alone don't show, all found
+by those peers: a relay must resume a PUBLISH that arrived paused with
+REQUEST_UPDATE (aiomoqt got no objects), every REQUEST_UPDATE needs an answer
+(draft-18 asked for that too), and a status object such as End of Track
+is not a data object (moq-dev-rs and stitcher-moq send one).
+
+Not reachable from here on this date: moqt-nr's draft-22 endpoint (no
+Version Negotiation reply on 4443) and moqtail's 8244. Over WebTransport,
+session setup to aiomoqt-relay's public endpoint alone takes 1.8 s from here,
+so its 2 s and 3 s cases time out on latency.
+
 ## The nightly of 2026-11-11, and what it took (local)
 
 [Report](https://englishm.github.io/moq-interop-runner/results/2026-11-11_001512/report.html):
