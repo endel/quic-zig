@@ -31,23 +31,28 @@ const relay_test = @import("relay_test.zig");
 
 pub const std_options: std.Options = .{ .log_level = .err };
 
-// A connection lingers in draining after its session closes, so a relay
-// that also serves a test suite needs headroom over its concurrent peers.
-const MAX_CLIENTS: usize = 32;
-const MAX_TRACKS: usize = 32;
-// A closed connection holds its slot until QUIC finishes draining, so
-// these bound concurrent-plus-draining peers, not concurrent ones.
-const MAX_SUBS_PER_TRACK: usize = 32;
-const MAX_STREAMS_PER_CLIENT: usize = 64;
-const MAX_NAMESPACES: usize = 32;
-const MAX_PENDING_SUBS: usize = 16;
-const MAX_NAMESPACE_SUBS: usize = 16;
+// The tables hold small fixed records; what grows with traffic is allocated
+// on demand. A closed connection holds its slot until QUIC finishes
+// draining, so these bound concurrent-plus-draining peers.
+const MAX_CLIENTS: usize = cm.ConnectionManager.DEFAULT_MAX_CONNECTIONS;
+const MAX_TRACKS: usize = 1024;
+const MAX_SUBS_PER_TRACK: usize = 1024;
+/// Above the 100 bidi and 100 uni streams a peer may hold open at once.
+const MAX_STREAMS_PER_CLIENT: usize = 512;
+const MAX_NAMESPACES: usize = 1024;
+const MAX_PENDING_SUBS: usize = 256;
+const MAX_NAMESPACE_SUBS: usize = 256;
 const MAX_STATUS_FWDS: usize = 16;
 const MAX_FETCH_FWDS: usize = 16;
 const DUMP_HEAD_BYTES: usize = 48; // of an undecodable message, for the log
-const STREAM_BUF_SIZE: usize = 65_536; // VP8 keyframes typically ≤ 16 KB
+/// What one stream may have waiting: past this it is refused, not cut short.
+/// A control message is at most 64 KiB; a data stream waits only while its
+/// alias is unknown.
+const MAX_STREAM_BUF: usize = 1024 * 1024;
 const N_CACHED_GROUPS: usize = 2; // number of completed groups retained per track
-const CACHE_GROUP_SIZE: usize = 256 * 1024; // 256 KB of object payload per group
+/// A group past this many bytes is forwarded but not cached: a cache cut
+/// mid-object would hand late subscribers a broken stream.
+const CACHE_GROUP_SIZE: usize = 1024 * 1024;
 /// Unsent bytes on one output stream past which its subscriber is too far
 /// behind to go on queueing for (§9.3.3): it loses the subscription.
 const MAX_OUT_BACKLOG: usize = 1024 * 1024;
@@ -84,12 +89,35 @@ const CachedGroup = struct {
         .end_of_group = true,
         .per_object_properties = false,
     },
-    payload: [CACHE_GROUP_SIZE]u8 = undefined,
-    payload_len: usize = 0,
+    payload: std.ArrayListUnmanaged(u8) = .empty,
+    /// It outgrew CACHE_GROUP_SIZE, or memory ran out: not to be cached.
+    overflowed: bool = false,
 
+    fn bytes(self: *const CachedGroup) []const u8 {
+        return self.payload.items;
+    }
+
+    fn append(self: *CachedGroup, alloc: std.mem.Allocator, data: []const u8) void {
+        if (self.overflowed) return;
+        if (self.payload.items.len + data.len > CACHE_GROUP_SIZE) {
+            self.overflowed = true;
+            return;
+        }
+        self.payload.appendSlice(alloc, data) catch {
+            self.overflowed = true;
+        };
+    }
+
+    /// Empties it for the next group, keeping its buffer.
     fn reset(self: *CachedGroup) void {
         self.valid = false;
-        self.payload_len = 0;
+        self.overflowed = false;
+        self.payload.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *CachedGroup, alloc: std.mem.Allocator) void {
+        self.payload.deinit(alloc);
+        self.* = .{};
     }
 };
 
@@ -103,7 +131,7 @@ const CachedObjects = struct {
     /// Null past the last whole object: a group is cut short at
     /// CACHE_GROUP_SIZE, and the live one is still arriving.
     fn next(self: *CachedObjects) ?moq_obj.SubgroupObject {
-        const data = self.g.payload[self.pos..self.g.payload_len];
+        const data = self.g.bytes()[self.pos..];
         const r = (moq_obj.readSubgroupObject(data, self.prev, self.g.hdr.per_object_properties) catch return null) orelse return null;
         self.pos += r.consumed;
         self.prev = r.object.id;
@@ -165,7 +193,8 @@ const Track = struct {
     /// Moves on whenever the slot's publication changes, reuse included: a
     /// data stream feeds the cache only while the one it began in stands.
     gen: u32 = 0,
-    subs: [MAX_SUBS_PER_TRACK]Sub = @splat(.{}),
+    /// Grown on demand up to MAX_SUBS_PER_TRACK; the first `sub_count` live.
+    subs: []Sub = &.{},
     sub_count: usize = 0,
 
     // Completed groups cached for late subscribers.
@@ -180,6 +209,16 @@ const Track = struct {
     fn ownsLive(self: *const Track, ci: usize, sid: u64) bool {
         const o = self.live_owner orelse return false;
         return o.ci == ci and o.sid == sid;
+    }
+
+    /// Room for one more subscriber; false at MAX_SUBS_PER_TRACK. Moves
+    /// `subs`, so no *Sub outlives it.
+    fn reserveSub(self: *Track, alloc: std.mem.Allocator) bool {
+        if (self.sub_count < self.subs.len) return true;
+        if (self.subs.len >= MAX_SUBS_PER_TRACK) return false;
+        const n = @min(MAX_SUBS_PER_TRACK, @max(4, self.subs.len * 2));
+        self.subs = alloc.realloc(self.subs, n) catch return false;
+        return true;
     }
 
     fn removeSub(self: *Track, si: usize) void {
@@ -203,7 +242,7 @@ const Track = struct {
     // replaying it hands the next subscriber content from a session that has
     // already ended. moq-rs's test client catches this as
     // `publish-track-subscribe` receiving `publish-track-only`'s payload.
-    fn dropPublisherState(self: *Track) void {
+    fn dropPublisherState(self: *Track, alloc: std.mem.Allocator) void {
         self.gen +%= 1;
         self.publisher_idx = null;
         self.pub_alias = 0;
@@ -212,23 +251,33 @@ const Track = struct {
         self.upstream_largest = null;
         self.upstream_idx = null;
         self.upstream_pending = false;
-        for (&self.cached) |*g| g.valid = false;
+        for (&self.cached) |*g| g.deinit(alloc);
         self.next_cache_idx = 0;
-        self.live = .{};
+        self.live.deinit(alloc);
         self.live_owner = null;
     }
 
-    // Store a completed group; oldest entry is overwritten.
-    fn cacheGroup(self: *Track, src: *const CachedGroup) void {
-        self.cached[self.next_cache_idx] = src.*;
-        self.cached[self.next_cache_idx].valid = true;
+    fn deinit(self: *Track, alloc: std.mem.Allocator) void {
+        self.dropPublisherState(alloc);
+        alloc.free(self.subs);
+        self.subs = &.{};
+        self.sub_count = 0;
+    }
+
+    /// The live group, finished, takes the oldest cache entry's place.
+    fn cacheLive(self: *Track, alloc: std.mem.Allocator) void {
+        const slot = &self.cached[self.next_cache_idx];
+        slot.deinit(alloc);
+        slot.* = self.live;
+        slot.valid = true;
+        self.live = .{};
         self.next_cache_idx = (self.next_cache_idx + 1) % N_CACHED_GROUPS;
     }
 
     /// The cached groups and the one arriving, lowest group first.
     fn heldGroups(self: *const Track, out: *[N_CACHED_GROUPS + 1]*const CachedGroup) []*const CachedGroup {
         var n = self.cachedInOrder(out[0..N_CACHED_GROUPS]);
-        if (self.live_owner != null and self.live.payload_len > 0) {
+        if (self.live_owner != null and !self.live.overflowed and self.live.bytes().len > 0) {
             out[n] = &self.live;
             n += 1;
         }
@@ -306,7 +355,8 @@ const Link = struct {
     }
     fn stopSending(self: *Link, stream_id: u64, code: u64) void {
         if (self.raw) {
-            if (self.s.entry.conn.streams.getStream(stream_id)) |st| st.recv.stopSending(code);
+            // A peer's uni stream has only a receive half, not in getStream.
+            if (self.s.entry.conn.streams.getRecvStream(stream_id)) |rs| rs.stopSending(code);
             self.s.entry.wake();
         } else self.s.stopSending(stream_id, @truncate(code));
     }
@@ -340,70 +390,97 @@ const Client = struct {
     next_alias: u64 = 1,
     /// Requests the relay originates: odd, as the server's are.
     next_request_id: u64 = 1,
-    stream_ids: [MAX_STREAMS_PER_CLIENT]u64 = @splat(std.math.maxInt(u64)),
-    stream_roles: [MAX_STREAMS_PER_CLIENT]StreamRole = @splat(.unknown),
-    stream_bufs: [MAX_STREAMS_PER_CLIENT]StreamBuf = @splat(.{}),
-    fwd_states: [MAX_STREAMS_PER_CLIENT]FwdState = @splat(.{}),
+    /// Set by findOrCreateClient; a slot nobody set up allocates nothing.
+    alloc: std.mem.Allocator = std.mem.Allocator.failing,
+    /// The streams the relay keeps state for, up to MAX_STREAMS_PER_CLIENT.
+    streams: std.AutoArrayHashMapUnmanaged(u64, *StreamSlot) = .empty,
 
-    fn slotOf(self: *const Client, sid: u64) ?usize {
-        return std.mem.indexOfScalar(u64, &self.stream_ids, sid);
+    fn slotOf(self: *const Client, sid: u64) ?*StreamSlot {
+        return self.streams.get(sid);
     }
 
-    fn findOrAddSlot(self: *Client, sid: u64) ?usize {
-        for (self.stream_ids[0..], 0..) |id, i| {
-            if (id == sid) return i;
-        }
-        for (self.stream_ids[0..], 0..) |id, i| {
-            if (id == std.math.maxInt(u64)) {
-                self.stream_ids[i] = sid;
-                return i;
-            }
-        }
-        return null;
+    /// Null when the client already has MAX_STREAMS_PER_CLIENT, or memory
+    /// ran out: the caller refuses the stream.
+    fn findOrAddSlot(self: *Client, sid: u64) ?*StreamSlot {
+        if (self.streams.get(sid)) |sl| return sl;
+        if (self.streams.count() >= MAX_STREAMS_PER_CLIENT) return null;
+        const sl = self.alloc.create(StreamSlot) catch return null;
+        sl.* = .{};
+        self.streams.put(self.alloc, sid, sl) catch {
+            self.alloc.destroy(sl);
+            return null;
+        };
+        return sl;
     }
 
     fn setRole(self: *Client, sid: u64, role: StreamRole) void {
-        if (self.findOrAddSlot(sid)) |i| self.stream_roles[i] = role;
+        if (self.findOrAddSlot(sid)) |sl| sl.role = role;
     }
     fn getRole(self: *Client, sid: u64) StreamRole {
-        if (self.findOrAddSlot(sid)) |i| return self.stream_roles[i];
-        return .unknown;
+        return if (self.streams.get(sid)) |sl| sl.role else .unknown;
     }
     fn buffer(self: *Client, sid: u64) ?*StreamBuf {
-        if (self.findOrAddSlot(sid)) |i| return &self.stream_bufs[i];
-        return null;
+        return if (self.findOrAddSlot(sid)) |sl| &sl.buf else null;
     }
     fn fwdState(self: *Client, sid: u64) ?*FwdState {
-        if (self.findOrAddSlot(sid)) |i| return &self.fwd_states[i];
-        return null;
+        return if (self.findOrAddSlot(sid)) |sl| &sl.fwd else null;
     }
     fn clearSlot(self: *Client, sid: u64) void {
-        for (self.stream_ids[0..], 0..) |id, i| {
-            if (id == sid) {
-                self.stream_ids[i] = std.math.maxInt(u64);
-                self.stream_roles[i] = .unknown;
-                self.stream_bufs[i].len = 0;
-                self.fwd_states[i] = .{};
-                return;
-            }
+        const kv = self.streams.fetchSwapRemove(sid) orelse return;
+        kv.value.deinit(self.alloc);
+        self.alloc.destroy(kv.value);
+    }
+
+    fn deinit(self: *Client) void {
+        for (self.streams.values()) |sl| {
+            sl.deinit(self.alloc);
+            self.alloc.destroy(sl);
         }
+        self.streams.deinit(self.alloc);
+        self.* = .{};
     }
 };
 
-const StreamBuf = struct {
-    data: [STREAM_BUF_SIZE]u8 = undefined,
-    len: usize = 0,
+/// What the relay keeps for one of a client's streams.
+const StreamSlot = struct {
+    role: StreamRole = .unknown,
+    buf: StreamBuf = .{},
+    fwd: FwdState = .{},
+    /// The peer has sent its FIN.
+    fin_seen: bool = false,
 
-    fn append(self: *StreamBuf, bytes: []const u8) void {
-        const n = @min(bytes.len, self.data.len - self.len);
-        @memcpy(self.data[self.len .. self.len + n], bytes[0..n]);
-        self.len += n;
+    fn deinit(self: *StreamSlot, alloc: std.mem.Allocator) void {
+        self.buf.deinit(alloc);
+        alloc.free(self.fwd.outs);
+    }
+};
+
+/// A stream's bytes not yet dealt with, growing with them up to
+/// MAX_STREAM_BUF.
+const StreamBuf = struct {
+    data: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn append(self: *StreamBuf, alloc: std.mem.Allocator, bytes: []const u8) error{ StreamTooLarge, OutOfMemory }!void {
+        if (self.data.items.len + bytes.len > MAX_STREAM_BUF) return error.StreamTooLarge;
+        try self.data.appendSlice(alloc, bytes);
     }
     fn reset(self: *StreamBuf) void {
-        self.len = 0;
+        self.data.clearRetainingCapacity();
     }
     fn slice(self: *const StreamBuf) []const u8 {
-        return self.data[0..self.len];
+        return self.data.items;
+    }
+    fn len(self: *const StreamBuf) usize {
+        return self.data.items.len;
+    }
+    /// Drops the first `n` bytes, which have been dealt with.
+    fn consume(self: *StreamBuf, n: usize) void {
+        const rest = self.data.items[n..];
+        std.mem.copyForwards(u8, self.data.items[0..rest.len], rest);
+        self.data.items.len = rest.len;
+    }
+    fn deinit(self: *StreamBuf, alloc: std.mem.Allocator) void {
+        self.data.deinit(alloc);
     }
 };
 
@@ -416,13 +493,27 @@ const FwdState = struct {
     forwarded_pos: usize = 0, // byte offset in publisher stream (after subgroup header)
     track_idx: ?usize = null,
     track_gen: u32 = 0,
-    out_stream_ids: [MAX_SUBS_PER_TRACK]u64 = @splat(0),
-    out_sub_idx: [MAX_SUBS_PER_TRACK]usize = @splat(0),
+    /// The subscribers' streams this one feeds, grown on demand; the first
+    /// `out_count` are live.
+    outs: []Out = &.{},
     out_count: usize = 0,
     /// Set while the header names an alias nothing has established yet.
     held_since_ns: i128 = 0,
     /// The peer finished the stream while it was held.
     fin_seen: bool = false,
+
+    const Out = struct { sid: u64, sub_ci: usize };
+
+    fn reserveOut(self: *FwdState, alloc: std.mem.Allocator) bool {
+        if (self.out_count < self.outs.len) return true;
+        self.outs = alloc.realloc(self.outs, @max(4, self.outs.len * 2)) catch return false;
+        return true;
+    }
+
+    fn removeOut(self: *FwdState, i: usize) void {
+        self.out_count -= 1;
+        self.outs[i] = self.outs[self.out_count];
+    }
 };
 
 /// A namespace a client advertised with PUBLISH_NAMESPACE. A track under
@@ -534,6 +625,9 @@ const RelayHandler = struct {
     /// wakes on peer traffic.
     pub const poll_interval_ms: u64 = 50;
 
+    /// Everything that grows with traffic: stream buffers, caches,
+    /// subscriber lists. Must reuse what it is given back (no arena).
+    alloc: std.mem.Allocator = std.mem.Allocator.failing,
     clients: [MAX_CLIENTS]Client = @splat(.{}),
     tracks: [MAX_TRACKS]Track = @splat(.{}),
     track_count: usize = 0,
@@ -544,6 +638,11 @@ const RelayHandler = struct {
     held_dgrams: [MAX_HELD_DATAGRAMS]HeldDatagram = @splat(.{}),
     status_fwds: [MAX_STATUS_FWDS]StatusFwd = @splat(.{}),
     fetch_fwds: [MAX_FETCH_FWDS]FetchFwd = @splat(.{}),
+
+    pub fn deinit(self: *RelayHandler) void {
+        for (&self.clients) |*c| c.deinit();
+        for (&self.tracks) |*t| t.deinit(self.alloc);
+    }
 
     /// A WebTransport client is its one session.
     pub fn onSessionClosed(self: *RelayHandler, session: *event_loop.Session, _: u64, _: u32, _: []const u8) void {
@@ -615,20 +714,19 @@ const RelayHandler = struct {
         // reused, and its stream ids would name a newcomer's streams.
         for (&self.clients) |*c| {
             if (!c.active) continue;
-            for (&c.fwd_states) |*fs| {
+            for (c.streams.values()) |sl| {
+                const fs = &sl.fwd;
                 var i: usize = 0;
                 while (i < fs.out_count) {
-                    if (fs.out_sub_idx[i] != ci) {
+                    if (fs.outs[i].sub_ci != ci) {
                         i += 1;
                         continue;
                     }
-                    fs.out_count -= 1;
-                    fs.out_sub_idx[i] = fs.out_sub_idx[fs.out_count];
-                    fs.out_stream_ids[i] = fs.out_stream_ids[fs.out_count];
+                    fs.removeOut(i);
                 }
             }
         }
-        self.clients[ci] = .{};
+        self.clients[ci].deinit();
     }
 
     fn findOrCreateClient(self: *RelayHandler, entry: *cm.ConnEntry) ?usize {
@@ -637,7 +735,7 @@ const RelayHandler = struct {
         }
         for (&self.clients, 0..) |*c, i| {
             if (!c.active) {
-                c.* = .{ .active = true, .entry = entry };
+                c.* = .{ .active = true, .entry = entry, .alloc = self.alloc };
                 return i;
             }
         }
@@ -755,8 +853,9 @@ const RelayHandler = struct {
         const ci = self.findOrCreateClient(session.entry) orelse return;
 
         if (data.len > 0) {
-            const buf = self.clients[ci].buffer(stream_id) orelse return;
-            buf.append(data);
+            const buf = self.clients[ci].buffer(stream_id) orelse
+                return self.refuseStream(ci, stream_id, "stream table full");
+            buf.append(self.alloc, data) catch |e| return self.refuseStream(ci, stream_id, @errorName(e));
         }
 
         // Native QUIC has no onBidiStream: a client-opened bidi stream is a
@@ -782,6 +881,7 @@ const RelayHandler = struct {
         // Reclaim slot when stream is done — data streams close after each object.
         if (fin) {
             const c = &self.clients[ci];
+            if (c.slotOf(stream_id)) |sl| sl.fin_seen = true;
             switch (c.getRole(stream_id)) {
                 .upstream => {
                     self.upstreamFinished(ci, stream_id);
@@ -804,6 +904,24 @@ const RelayHandler = struct {
         }
     }
 
+    /// A stream the relay can't keep state for is refused where the peer
+    /// can see it, never dropped or cut short. Past a broken control stream
+    /// the session can't go on.
+    fn refuseStream(self: *RelayHandler, ci: usize, stream_id: u64, why: []const u8) void {
+        std.debug.print("[relay] client {d} stream {d} refused: {s}\n", .{ ci, stream_id, why });
+        var l = self.link(ci) orelse return;
+        const c = &self.clients[ci];
+        if (c.getRole(stream_id) == .control) return l.closeWithError(moq_codes.SESSION_INTERNAL_ERROR, "control stream too large");
+        self.abandonForward(ci, stream_id, moq_codes.STREAM_RESET_INTERNAL_ERROR);
+        l.stopSending(stream_id, moq_codes.STREAM_RESET_INTERNAL_ERROR);
+        // A bidi stream the peer opened has our half too.
+        if (stream_id & 0x2 == 0) l.reset(stream_id, moq_codes.STREAM_RESET_INTERNAL_ERROR);
+        if (c.slotOf(stream_id)) |sl| {
+            sl.buf.reset();
+            sl.role = .answered;
+        }
+    }
+
     /// A finished stream whose header names an alias nothing has established
     /// yet keeps its bytes: the publisher's answer that does may be right
     /// behind it (§11.4.2). Returns whether it was held.
@@ -818,13 +936,22 @@ const RelayHandler = struct {
     /// was waiting on it.
     fn retryHeld(self: *RelayHandler, ci: usize) void {
         const c = &self.clients[ci];
-        for (0..MAX_STREAMS_PER_CLIENT) |i| {
-            const fs = &c.fwd_states[i];
-            if (c.stream_roles[i] != .data or fs.header_parsed or fs.held_since_ns == 0) continue;
-            const sid = c.stream_ids[i];
-            const fin = fs.fin_seen;
-            self.tryForwardData(ci, sid, fin);
-            if (fin and fs.header_parsed) c.clearSlot(sid);
+        // Clearing a slot moves the last one into its place, so `i` only
+        // advances past slots that stay.
+        var i: usize = 0;
+        while (i < c.streams.count()) {
+            const sl = c.streams.values()[i];
+            const sid = c.streams.keys()[i];
+            const fs = &sl.fwd;
+            if (sl.role == .data and !fs.header_parsed and fs.held_since_ns != 0) {
+                const fin = fs.fin_seen;
+                self.tryForwardData(ci, sid, fin);
+                if (fin and fs.header_parsed) {
+                    c.clearSlot(sid);
+                    continue;
+                }
+            }
+            i += 1;
         }
         for (&self.held_dgrams) |*d| {
             if (!d.active or d.client_idx != ci) continue;
@@ -838,11 +965,17 @@ const RelayHandler = struct {
         }
         for (&self.clients, 0..) |*c, ci| {
             if (!c.active) continue;
-            for (0..MAX_STREAMS_PER_CLIENT) |i| {
-                const fs = &c.fwd_states[i];
-                if (c.stream_roles[i] != .data or fs.header_parsed or fs.held_since_ns == 0) continue;
-                if (now - fs.held_since_ns < HELD_STREAM_MS * std.time.ns_per_ms) continue;
-                const sid = c.stream_ids[i];
+            var i: usize = 0;
+            while (i < c.streams.count()) {
+                const sl = c.streams.values()[i];
+                const fs = &sl.fwd;
+                const expired = sl.role == .data and !fs.header_parsed and fs.held_since_ns != 0 and
+                    now - fs.held_since_ns >= HELD_STREAM_MS * std.time.ns_per_ms;
+                if (!expired) {
+                    i += 1;
+                    continue;
+                }
+                const sid = c.streams.keys()[i];
                 if (!fs.fin_seen) {
                     if (self.link(ci)) |l_| {
                         var l = l_;
@@ -883,7 +1016,7 @@ const RelayHandler = struct {
         // object data (subgroup streams).
         _ = session;
         const buf = self.clients[ci].buffer(stream_id) orelse return;
-        if (buf.len < 3) return;
+        if (buf.len() < 3) return;
 
         // Peek at the type varint to distinguish SETUP from a subgroup header.
         // SETUP (0x2F00) is a 2-byte varint; subgroup stream types are single
@@ -908,9 +1041,7 @@ const RelayHandler = struct {
                 self.clients[ci].setRole(stream_id, .control);
                 self.clients[ci].setup_received = true;
                 std.debug.print("[relay] client {d} SETUP received\n", .{ci});
-                const remaining = buf.slice()[parsed.consumed..];
-                std.mem.copyForwards(u8, &buf.data, remaining);
-                buf.len = remaining.len;
+                buf.consume(parsed.consumed);
                 return;
             } else |_| return; // need more data
         }
@@ -923,12 +1054,10 @@ const RelayHandler = struct {
     fn tryParseRequest(self: *RelayHandler, ci: usize, session: *event_loop.Session, stream_id: u64) void {
         const buf = self.clients[ci].buffer(stream_id) orelse return;
         // A peer may coalesce a request with the update that follows it.
-        while (buf.len >= 3) {
+        while (buf.len() >= 3) {
             const parsed = moq_msg.parseEnvelope(buf.slice()) catch return;
             self.handleRequest(ci, session, stream_id, parsed.env);
-            const remaining = buf.slice()[parsed.consumed..];
-            std.mem.copyForwards(u8, &buf.data, remaining);
-            buf.len = remaining.len;
+            buf.consume(parsed.consumed);
         }
     }
 
@@ -1000,7 +1129,7 @@ const RelayHandler = struct {
         l.finish(stream_id);
         // A slot the peer's own FIN already freed stays freed.
         const c = &self.clients[ci];
-        if (c.slotOf(stream_id)) |i| c.stream_roles[i] = .answered;
+        if (c.slotOf(stream_id)) |sl| sl.role = .answered;
     }
 
     /// §9.11 FETCH, answered from the groups the relay holds. Drafts 17 and
@@ -1301,9 +1430,7 @@ const RelayHandler = struct {
             },
             else => {},
         }
-        const remaining = buf.slice()[parsed.consumed..];
-        std.mem.copyForwards(u8, &buf.data, remaining);
-        buf.len = remaining.len;
+        buf.consume(parsed.consumed);
     }
 
     /// The publisher's FETCH stream, passed to the requester under its own
@@ -1329,9 +1456,7 @@ const RelayHandler = struct {
             dl.send(out, hdr[0..hfbs.seek]) catch {};
             f.up_data = stream_id;
             f.out = out;
-            const remaining = buf.slice()[fbs.seek..];
-            std.mem.copyForwards(u8, &buf.data, remaining);
-            buf.len = remaining.len;
+            buf.consume(fbs.seek);
             break :blk f;
         };
         var dl = self.link(f.down_ci) orelse return;
@@ -1339,7 +1464,7 @@ const RelayHandler = struct {
         var pos: usize = 0;
         if (f.up_cursor.deltas == f.down_cursor.deltas) {
             dl.send(out, buf.slice()) catch {};
-            pos = buf.len;
+            pos = buf.len();
         } else while (moq_obj.readFetchItem(buf.slice()[pos..], &f.up_cursor) catch null) |r| {
             var head: [1024]u8 = undefined;
             var hfbs = io_compat.fixedBufferStream(&head);
@@ -1348,9 +1473,7 @@ const RelayHandler = struct {
             if (r.item == .object) dl.send(out, r.item.object.payload) catch {};
             pos += r.consumed;
         }
-        const remaining = buf.slice()[pos..];
-        std.mem.copyForwards(u8, &buf.data, remaining);
-        buf.len = remaining.len;
+        buf.consume(pos);
         if (fin) {
             dl.finish(out);
             self.finishAnswered(ci, f.up_sid);
@@ -1543,7 +1666,7 @@ const RelayHandler = struct {
     /// The relay publishes `t` to the watcher on a bidi stream of its own,
     /// and forwards nothing until the watcher accepts.
     fn offerPublish(self: *RelayHandler, t: *Track, w: *const NamespaceSub) void {
-        if (t.sub_count >= MAX_SUBS_PER_TRACK) return;
+        if (!t.reserveSub(self.alloc)) return;
         const ci = w.client_idx;
         var l = self.link(ci) orelse return;
         const c = &self.clients[ci];
@@ -1606,9 +1729,7 @@ const RelayHandler = struct {
             } else {
                 std.debug.print("[relay] offer client {d} type=0x{x}\n", .{ ci, parsed.env.type });
             }
-            const remaining = buf.slice()[parsed.consumed..];
-            std.mem.copyForwards(u8, &buf.data, remaining);
-            buf.len = remaining.len;
+            buf.consume(parsed.consumed);
         }
     }
 
@@ -1820,6 +1941,7 @@ const RelayHandler = struct {
             break :blk self.track_count - 1;
         };
         const t = &self.tracks[idx];
+        t.deinit(self.alloc);
         t.* = .{ .active = true, .gen = t.gen +% 1 };
         @memcpy(t.namespace_buf[0..ns_key.len], ns_key);
         t.namespace_len = ns_key.len;
@@ -1859,6 +1981,41 @@ const RelayHandler = struct {
             if (c.active and c.entry == session.entry) break i;
         } else return;
         self.abandonForward(ci, stream_id, code);
+        self.requestCancelled(ci, stream_id);
+        self.clients[ci].clearSlot(stream_id);
+    }
+
+    /// A peer that stops reading a stream cancels the request on it, as a
+    /// reset does: draft-22 §6.4.2.3 leaves only this to a requester that
+    /// has already sent its FIN. On a stream the relay feeds it objects
+    /// through, it wants no more of them.
+    pub fn onStopSending(self: *RelayHandler, session: *event_loop.Session, _: u64, stream_id: u64, _: u32) void {
+        const ci = for (&self.clients, 0..) |*c, i| {
+            if (c.active and c.entry == session.entry) break i;
+        } else return;
+        for (&self.clients) |*c| {
+            if (!c.active) continue;
+            for (c.streams.values()) |sl| {
+                const fs = &sl.fwd;
+                for (fs.outs[0..fs.out_count], 0..) |o, i| {
+                    if (o.sub_ci == ci and o.sid == stream_id) {
+                        fs.removeOut(i);
+                        break;
+                    }
+                }
+            }
+        }
+        self.requestCancelled(ci, stream_id);
+        // What the peer still sends on it is ignored until its FIN.
+        const c = &self.clients[ci];
+        if (c.slotOf(stream_id)) |sl| {
+            if (sl.fin_seen) return c.clearSlot(stream_id);
+            sl.buf.reset();
+            sl.role = .answered;
+        }
+    }
+
+    fn requestCancelled(self: *RelayHandler, ci: usize, stream_id: u64) void {
         self.requestWithdrawn(ci, stream_id);
         for (&self.status_fwds) |*f| {
             if (!f.active) continue;
@@ -1870,7 +2027,6 @@ const RelayHandler = struct {
             if (f.up_ci == ci and (f.up_sid == stream_id or f.up_data == stream_id)) self.fetchFailed(f);
             if (f.down_ci == ci and f.down_sid == stream_id) self.cancelFetchFwd(f);
         }
-        self.clients[ci].clearSlot(stream_id);
     }
 
     /// A publisher's data stream reset mid-group: reset what it fed, and
@@ -1878,9 +2034,11 @@ const RelayHandler = struct {
     fn abandonForward(self: *RelayHandler, ci: usize, stream_id: u64, code: u64) void {
         const c = &self.clients[ci];
         const slot = c.slotOf(stream_id) orelse return;
-        if (c.stream_roles[slot] != .data) return;
-        const fs = &c.fwd_states[slot];
-        for (fs.out_stream_ids[0..fs.out_count], fs.out_sub_idx[0..fs.out_count]) |out, sub_ci| {
+        if (slot.role != .data) return;
+        const fs = &slot.fwd;
+        for (fs.outs[0..fs.out_count]) |o| {
+            const out = o.sid;
+            const sub_ci = o.sub_ci;
             var l = self.link(sub_ci) orelse continue;
             l.reset(out, code);
         }
@@ -1976,7 +2134,7 @@ const RelayHandler = struct {
             }
             self.clients[owner].clearSlot(sid);
         }
-        t.dropPublisherState();
+        t.dropPublisherState(self.alloc);
         t.active = false;
     }
 
@@ -1995,7 +2153,7 @@ const RelayHandler = struct {
             } else |_| {}
             t.removeSub(si);
         }
-        t.dropPublisherState();
+        t.dropPublisherState(self.alloc);
         t.reapIfIdle();
     }
 
@@ -2047,9 +2205,7 @@ const RelayHandler = struct {
                 else => std.debug.print("[relay] upstream client {d} type=0x{x}\n", .{ ci, parsed.env.type }),
             };
 
-            const remaining = buf.slice()[parsed.consumed..];
-            std.mem.copyForwards(u8, &buf.data, remaining);
-            buf.len = remaining.len;
+            buf.consume(parsed.consumed);
         }
     }
 
@@ -2110,7 +2266,9 @@ const RelayHandler = struct {
                 if (owner != ci) _ = self.subscribeUpstream(t, owner, filter);
             }
         }
-        if (t.sub_count < MAX_SUBS_PER_TRACK) {
+        if (!t.reserveSub(self.alloc)) {
+            self.sendToClientError(ci, stream_id, moq_codes.ERR_EXCESSIVE_LOAD, "too many subscribers");
+        } else {
             const alias = self.clients[ci].next_alias;
             self.clients[ci].next_alias += 1;
             t.subs[t.sub_count] = .{
@@ -2166,9 +2324,9 @@ const RelayHandler = struct {
         std.debug.print("[relay] client {d} too far behind; subscription dropped\n", .{sub_ci});
         for (&self.clients) |*c| {
             if (!c.active) continue;
-            for (&c.fwd_states) |*fs| {
-                const ti = fs.track_idx orelse continue;
-                if (&self.tracks[ti] == t) self.resetOutputs(fs, sub_ci);
+            for (c.streams.values()) |sl| {
+                const ti = sl.fwd.track_idx orelse continue;
+                if (&self.tracks[ti] == t) self.resetOutputs(&sl.fwd, sub_ci);
             }
         }
         if (t.sub_count == 0 and t.upstream_idx != null) self.unsubscribeUpstream(t);
@@ -2178,17 +2336,15 @@ const RelayHandler = struct {
     fn resetOutputs(self: *RelayHandler, fs: *FwdState, sub_ci: usize) void {
         var i: usize = 0;
         while (i < fs.out_count) {
-            if (fs.out_sub_idx[i] != sub_ci) {
+            if (fs.outs[i].sub_ci != sub_ci) {
                 i += 1;
                 continue;
             }
             if (self.link(sub_ci)) |l_| {
                 var l = l_;
-                l.reset(fs.out_stream_ids[i], moq_codes.STREAM_RESET_TOO_FAR_BEHIND);
+                l.reset(fs.outs[i].sid, moq_codes.STREAM_RESET_TOO_FAR_BEHIND);
             }
-            fs.out_count -= 1;
-            fs.out_sub_idx[i] = fs.out_sub_idx[fs.out_count];
-            fs.out_stream_ids[i] = fs.out_stream_ids[fs.out_count];
+            fs.removeOut(i);
         }
     }
 
@@ -2216,7 +2372,7 @@ const RelayHandler = struct {
             var hdr_fbs = io_compat.fixedBufferStream(&hdr_buf);
             moq_obj.writeSubgroupHeader(&hdr_fbs, out_hdr, self.clients[sub_ci].draft) catch continue;
             l.send(out, hdr_buf[0..hdr_fbs.seek]) catch continue;
-            l.send(out, cg.payload[0..cg.payload_len]) catch {};
+            l.send(out, cg.bytes()) catch {};
             l.finish(out);
         }
         if (n > 0) std.debug.print("[relay] Replayed {d} cached groups to client {d}\n", .{ n, sub_ci });
@@ -2252,7 +2408,7 @@ const RelayHandler = struct {
         // closes is too late: it may still be connected, and the next
         // subscriber would be replayed the previous broadcast's groups.
         if (t.publisher_idx) |prev| {
-            if (prev != ci) t.dropPublisherState();
+            if (prev != ci) t.dropPublisherState(self.alloc);
         }
         t.publisher_idx = ci;
         t.pub_alias = pub_msg.track_alias;
@@ -2337,7 +2493,7 @@ const RelayHandler = struct {
             } else |_| {}
         }
         t.sub_count = 0;
-        t.dropPublisherState();
+        t.dropPublisherState(self.alloc);
         t.active = false;
     }
 
@@ -2352,7 +2508,7 @@ const RelayHandler = struct {
 
         // First: parse the header and open sub-streams once per input stream.
         if (!fs.header_parsed) {
-            if (buf.len < 3) return; // need more bytes
+            if (buf.len() < 3) return; // need more bytes
             var fbs = io_compat.fixedBufferStream(@as([]const u8, buf.slice()));
             const parsed = moq_obj.readSubgroupHeader(&fbs, self.clients[ci].draft) catch return; // need more bytes or bad
             const h = parsed.header;
@@ -2386,6 +2542,7 @@ const RelayHandler = struct {
                 if (!sub.forward or !sub.answered) continue;
                 const sub_ci = sub.client_idx;
                 var l = self.link(sub_ci) orelse continue;
+                if (!fs.reserveOut(self.alloc)) continue;
 
                 const out = l.openUni() catch |e| {
                     std.debug.print("[relay] openUniStream failed for sub {d}: {}\n", .{ sub_ci, e });
@@ -2402,8 +2559,7 @@ const RelayHandler = struct {
                 moq_obj.writeSubgroupHeader(&hdr_fbs, out_hdr, self.clients[sub_ci].draft) catch continue;
                 l.send(out, hdr_buf[0..hdr_fbs.seek]) catch continue;
 
-                fs.out_stream_ids[fs.out_count] = out;
-                fs.out_sub_idx[fs.out_count] = sub_ci;
+                fs.outs[fs.out_count] = .{ .sid = out, .sub_ci = sub_ci };
                 fs.out_count += 1;
             }
             std.debug.print("[relay] stream from client {d} → {d} subs (group={d})\n", .{ ci, fs.out_count, h.group });
@@ -2413,33 +2569,28 @@ const RelayHandler = struct {
         }
 
         // Forward any newly arrived bytes AND append them to the live cache.
-        if (fs.forwarded_pos < buf.len) {
+        if (fs.forwarded_pos < buf.len()) {
             const chunk = buf.slice()[fs.forwarded_pos..];
             // Append to live cache (so late subscribers can catch up later).
             if (self.fwdTrack(fs)) |t| if (t.ownsLive(ci, stream_id)) {
-                const free = t.live.payload.len - t.live.payload_len;
-                const copy_n = @min(chunk.len, free);
-                if (copy_n > 0) {
-                    @memcpy(t.live.payload[t.live.payload_len .. t.live.payload_len + copy_n], chunk[0..copy_n]);
-                    t.live.payload_len += copy_n;
-                }
+                t.live.append(self.alloc, chunk);
             };
             // Forward to currently-attached subscribers.
             var slow: [MAX_SUBS_PER_TRACK]usize = undefined;
             var n_slow: usize = 0;
             for (0..fs.out_count) |i| {
-                const sub_ci = fs.out_sub_idx[i];
+                const sub_ci = fs.outs[i].sub_ci;
                 var l = self.link(sub_ci) orelse continue;
-                if ((l.s.streamBufferedBytes(fs.out_stream_ids[i]) orelse 0) + chunk.len > MAX_OUT_BACKLOG) {
+                if ((l.s.streamBufferedBytes(fs.outs[i].sid) orelse 0) + chunk.len > MAX_OUT_BACKLOG) {
                     slow[n_slow] = sub_ci;
                     n_slow += 1;
                     continue;
                 }
-                l.send(fs.out_stream_ids[i], chunk) catch |e| {
+                l.send(fs.outs[i].sid, chunk) catch |e| {
                     std.debug.print("[relay] fwd chunk to sub {d}: {}\n", .{ sub_ci, e });
                 };
             }
-            fs.forwarded_pos = buf.len;
+            fs.forwarded_pos = buf.len();
             for (slow[0..n_slow]) |sub_ci| {
                 if (self.fwdTrack(fs)) |t| self.dropSlowSubscriber(t, sub_ci) else self.resetOutputs(fs, sub_ci);
             }
@@ -2448,27 +2599,27 @@ const RelayHandler = struct {
         // On FIN: close all sub-streams and commit the live cache.
         if (fin) {
             for (0..fs.out_count) |i| {
-                const sub_ci = fs.out_sub_idx[i];
+                const sub_ci = fs.outs[i].sub_ci;
                 var l = self.link(sub_ci) orelse continue;
-                l.finish(fs.out_stream_ids[i]);
+                l.finish(fs.outs[i].sid);
             }
             if (self.fwdTrack(fs)) |t| if (t.ownsLive(ci, stream_id)) {
-                if (t.live.payload_len > 0) {
-                    t.cacheGroup(&t.live);
-                    std.debug.print("[relay] cached group {d} for track {d} ({d} bytes)\n", .{
-                        t.live.hdr.group, fs.track_idx.?, t.live.payload_len,
-                    });
+                const group = t.live.hdr.group;
+                if (t.live.overflowed) {
+                    std.debug.print("[relay] group {d} for track {d} too large to cache\n", .{ group, fs.track_idx.? });
+                    t.live.reset();
+                } else if (t.live.bytes().len > 0) {
+                    const len = t.live.bytes().len;
+                    t.cacheLive(self.alloc);
+                    std.debug.print("[relay] cached group {d} for track {d} ({d} bytes)\n", .{ group, fs.track_idx.?, len });
                 }
-                t.live.reset();
                 t.live_owner = null;
             };
         }
 
         // Compact the buffer: once we've forwarded bytes, we can drop them.
         if (fs.forwarded_pos > 0) {
-            const remaining = buf.slice()[fs.forwarded_pos..];
-            std.mem.copyForwards(u8, &buf.data, remaining);
-            buf.len = remaining.len;
+            buf.consume(fs.forwarded_pos);
             fs.forwarded_pos = 0;
         }
     }
@@ -2561,7 +2712,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("\n\n", .{});
 
     const handler = try alloc.create(RelayHandler);
-    handler.* = RelayHandler{};
+    handler.* = .{ .alloc = alloc };
     var server = try event_loop.Server(RelayHandler).init(alloc, handler, .{
         .address = "0.0.0.0",
         .port = port,
@@ -2585,25 +2736,24 @@ test "a subscriber leaving takes its outputs with it" {
     // be its own streams for another track.
     const r = try std.testing.allocator.create(RelayHandler);
     defer std.testing.allocator.destroy(r);
-    r.* = .{};
+    r.* = .{ .alloc = std.testing.allocator };
+    defer r.deinit();
     var entries: [3]cm.ConnEntry = undefined;
-    for (0..3) |i| r.clients[i] = .{ .active = true, .entry = &entries[i] };
+    for (0..3) |i| r.clients[i] = .{ .active = true, .entry = &entries[i], .alloc = r.alloc };
     const fs = r.clients[0].fwdState(3).?;
-    fs.* = .{ .active = true, .out_count = 2 };
-    fs.out_sub_idx[0] = 1;
-    fs.out_stream_ids[0] = 7;
-    fs.out_sub_idx[1] = 2;
-    fs.out_stream_ids[1] = 11;
+    for ([_]FwdState.Out{ .{ .sid = 7, .sub_ci = 1 }, .{ .sid = 11, .sub_ci = 2 } }) |o| {
+        try std.testing.expect(fs.reserveOut(r.alloc));
+        fs.outs[fs.out_count] = o;
+        fs.out_count += 1;
+    }
 
     var gone: event_loop.Session = .{ .entry = &entries[1] };
     r.onSessionClosed(&gone, 0, 0, "");
     try std.testing.expectEqual(@as(usize, 1), fs.out_count);
-    try std.testing.expectEqual(@as(usize, 2), fs.out_sub_idx[0]);
-    try std.testing.expectEqual(@as(u64, 11), fs.out_stream_ids[0]);
+    try std.testing.expectEqual(@as(usize, 2), fs.outs[0].sub_ci);
+    try std.testing.expectEqual(@as(u64, 11), fs.outs[0].sid);
 }
 
-/// Native-QUIC client 0 publishes track 0 under alias 5 from its request
-/// stream 0; client 1 subscribes to it from its request stream 4.
 /// The Location just before `at`, when nothing sent so far on a FETCH
 /// stream accounts for what lies between `prev`, or the range's start, and
 /// it: the relay doesn't hold those Locations, so it can't say they don't
@@ -2617,6 +2767,21 @@ fn unknownBefore(prev: ?Location, start: Location, at: Location) ?Location {
     return .{ .group = at.group - 1, .object = moq_msg.WHOLE_GROUP };
 }
 
+/// Native-QUIC client 0 publishes track 0 under alias 5 from its request
+/// stream 0; client 1 subscribes to it from its request stream 4.
+/// Makes `t` a fresh track with the one subscriber `sub`.
+fn testSub(r: *RelayHandler, t: *Track, sub: Sub) !void {
+    if (!t.reserveSub(r.alloc)) return error.OutOfMemory;
+    t.subs[t.sub_count] = sub;
+    t.sub_count += 1;
+}
+
+fn resetTrack(r: *RelayHandler, t: *Track, sub: Sub) !void {
+    t.deinit(r.alloc);
+    t.* = .{ .active = true };
+    try testSub(r, t, sub);
+}
+
 const TestRelay = struct {
     r: *RelayHandler,
     conns: [2]*connection_mod.Connection,
@@ -2624,22 +2789,23 @@ const TestRelay = struct {
 
     fn init(self: *TestRelay) !void {
         self.r = try std.testing.allocator.create(RelayHandler);
-        self.r.* = .{};
+        self.r.* = .{ .alloc = std.testing.allocator };
         for (0..2) |i| {
             self.conns[i] = try relay_test.conn();
             self.entries[i] = .{ .conn = self.conns[i], .raw_quic = true };
-            self.r.clients[i] = .{ .active = true, .entry = &self.entries[i], .raw = true };
+            self.r.clients[i] = .{ .active = true, .entry = &self.entries[i], .raw = true, .alloc = self.r.alloc };
         }
         _ = try self.conns[1].streams.getOrCreateStream(4);
         const t = &self.r.tracks[0];
-        t.* = .{ .active = true, .publisher_idx = 0, .pub_alias = 5, .pub_stream_id = 0, .sub_count = 1 };
-        t.subs[0] = .{ .client_idx = 1, .alias = 9, .stream_id = 4 };
+        t.* = .{ .active = true, .publisher_idx = 0, .pub_alias = 5, .pub_stream_id = 0 };
+        try testSub(self.r, t, .{ .client_idx = 1, .alias = 9, .stream_id = 4 });
         self.r.track_count = 1;
         self.r.clients[0].setRole(0, .request);
         self.r.clients[1].setRole(4, .request);
     }
 
     fn deinit(self: *TestRelay) void {
+        self.r.deinit();
         for (self.conns) |c| relay_test.free(c);
         std.testing.allocator.destroy(self.r);
     }
@@ -2697,34 +2863,32 @@ test "an upstream subscription gives its stream slot back when it ends" {
     var buf: [256]u8 = undefined;
 
     // Refused.
-    t.dropPublisherState();
+    t.dropPublisherState(r.alloc);
     t.subs[0].answered = false;
     try std.testing.expect(r.subscribeUpstream(t, 0, null));
     const refused = t.pub_stream_id.?;
     var fbs = io_compat.fixedBufferStream(&buf);
     try moq_msg.writeRequestError(&fbs, .{ .error_code = moq_codes.ERR_DOES_NOT_EXIST, .reason = "" });
     r.onStreamData(&publisher, refused, buf[0..fbs.seek], false);
-    try std.testing.expectEqual(@as(?usize, null), r.clients[0].slotOf(refused));
+    try std.testing.expect(r.clients[0].slotOf(refused) == null);
     try std.testing.expect(tr.conns[0].streams.getStream(refused).?.send.fin_queued);
 
     // Answered, then done.
-    t.* = .{ .active = true, .sub_count = 1 };
-    t.subs[0] = .{ .client_idx = 1, .alias = 9, .stream_id = 4, .answered = false };
+    try resetTrack(r, t, .{ .client_idx = 1, .alias = 9, .stream_id = 4, .answered = false });
     try std.testing.expect(r.subscribeUpstream(t, 0, null));
     const done = t.pub_stream_id.?;
     fbs = io_compat.fixedBufferStream(&buf);
     try moq_msg.writeSubscribeOk(&fbs, .{ .track_alias = 5 });
     try moq_msg.writePublishDone(&fbs, .{ .status_code = moq_codes.DONE_TRACK_ENDED, .stream_count = 0, .reason = "" });
     r.onStreamData(&publisher, done, buf[0..fbs.seek], false);
-    try std.testing.expectEqual(@as(?usize, null), r.clients[0].slotOf(done));
+    try std.testing.expect(r.clients[0].slotOf(done) == null);
 
     // Finished by the publisher with nothing more to say.
-    t.* = .{ .active = true, .sub_count = 1 };
-    t.subs[0] = .{ .client_idx = 1, .alias = 9, .stream_id = 4, .answered = false };
+    try resetTrack(r, t, .{ .client_idx = 1, .alias = 9, .stream_id = 4, .answered = false });
     try std.testing.expect(r.subscribeUpstream(t, 0, null));
     const finished = t.pub_stream_id.?;
     r.onStreamData(&publisher, finished, "", true);
-    try std.testing.expectEqual(@as(?usize, null), r.clients[0].slotOf(finished));
+    try std.testing.expect(r.clients[0].slotOf(finished) == null);
 }
 
 test "a track with no publisher and no subscribers gives its slot back" {
@@ -2744,8 +2908,7 @@ test "a track with no publisher and no subscribers gives its slot back" {
     try std.testing.expect(!t.active);
 
     // Waiting on a publisher that never came, until its subscriber left.
-    t.* = .{ .active = true, .sub_count = 1 };
-    t.subs[0] = .{ .client_idx = 1, .alias = 9, .stream_id = 4 };
+    try resetTrack(r, t, .{ .client_idx = 1, .alias = 9, .stream_id = 4 });
     var subscriber = tr.session(1);
     r.onStreamReset(&subscriber, 0, 4, 0);
     try std.testing.expect(!t.active);
@@ -2770,7 +2933,7 @@ test "a group outliving its track caches nothing into the track that took the sl
 
     r.onStreamData(&publisher, 2, "late bytes", true);
     for (r.tracks[0].cached) |g| try std.testing.expect(!g.valid);
-    try std.testing.expectEqual(@as(usize, 0), r.tracks[0].live.payload_len);
+    try std.testing.expectEqual(@as(usize, 0), r.tracks[0].live.bytes().len);
 }
 
 test "a subscriber that can't keep up is dropped, not queued for" {
@@ -2807,8 +2970,7 @@ test "resubscribing can't make the relay queue replays without end" {
     t.sub_count = 0;
     for (&t.cached) |*g| {
         g.valid = true;
-        g.payload_len = CACHE_GROUP_SIZE;
-        @memset(&g.payload, 'c');
+        try g.payload.appendNTimes(r.alloc, 'c', CACHE_GROUP_SIZE);
     }
     var subscriber = tr.session(1);
     for (0..20) |i| {
@@ -2990,7 +3152,7 @@ test "a group that beats its SUBSCRIBE_OK is held, not dropped" {
     defer tr.deinit();
     const r = tr.r;
     const t = &r.tracks[0];
-    t.dropPublisherState();
+    t.dropPublisherState(r.alloc);
     t.subs[0].answered = false;
     try std.testing.expect(r.subscribeUpstream(t, 0, null));
     const upstream = t.pub_stream_id.?;
@@ -3016,7 +3178,7 @@ test "a group that beats its SUBSCRIBE_OK is held, not dropped" {
     const out = tr.conns[1].streams.send_streams.get(3) orelse return error.GroupDropped;
     try std.testing.expect(std.mem.endsWith(u8, out.write_buffer.items, "object"));
     try std.testing.expect(out.fin_queued);
-    try std.testing.expectEqual(@as(?usize, null), r.clients[0].slotOf(2));
+    try std.testing.expect(r.clients[0].slotOf(2) == null);
 }
 
 test "a held group whose alias never comes is let go" {
@@ -3040,7 +3202,7 @@ test "a held group whose alias never comes is let go" {
 
     r.clients[0].fwdState(2).?.held_since_ns -= HELD_STREAM_MS * std.time.ns_per_ms + 1;
     r.onPollComplete(&publisher);
-    try std.testing.expectEqual(@as(?usize, null), r.clients[0].slotOf(2));
+    try std.testing.expect(r.clients[0].slotOf(2) == null);
 }
 
 test "the upstream SUBSCRIBE carries the subscriber's filter, absence included" {
@@ -3052,6 +3214,7 @@ test "the upstream SUBSCRIBE carries the subscriber's filter, absence included" 
     try tr.init();
     defer tr.deinit();
     setDraft(&tr, .draft_18);
+    tr.r.tracks[0].deinit(tr.r.alloc);
     tr.r.tracks[0] = .{};
     tr.r.track_count = 0;
     const ns: []const []const u8 = &.{ "moq-test", "dp" };
@@ -3127,7 +3290,7 @@ test "two groups in flight at once don't share a cache entry" {
     for (r.tracks[0].cached) |g| {
         if (!g.valid) continue;
         const want: []const u8 = if (g.hdr.group == 1) "object-more" else "second";
-        try std.testing.expectEqualStrings(want, g.payload[0..g.payload_len]);
+        try std.testing.expectEqualStrings(want, g.bytes());
     }
 }
 
@@ -3142,7 +3305,7 @@ test "a datagram that beats its SUBSCRIBE_OK is held, not dropped" {
     const r = tr.r;
     tr.conns[1].datagrams_enabled = true;
     const t = &r.tracks[0];
-    t.dropPublisherState();
+    t.dropPublisherState(r.alloc);
     t.subs[0].answered = false;
     try std.testing.expect(r.subscribeUpstream(t, 0, null));
     const upstream = t.pub_stream_id.?;
@@ -3206,6 +3369,7 @@ test "a paused draft-22 publication is resumed for a subscriber that wants objec
         try tr.init();
         defer tr.deinit();
         setDraft(&tr, d);
+        tr.r.tracks[0].deinit(tr.r.alloc);
         tr.r.tracks[0] = .{};
         tr.r.track_count = 0;
         const ns: []const []const u8 = &.{ "moq-test", "paused" };
@@ -3524,4 +3688,101 @@ test "a FETCH for what the relay doesn't hold goes to the publisher, across draf
     try std.testing.expect(out.fin_queued);
     try std.testing.expect(!tr.r.fetch_fwds[0].active);
     try std.testing.expect(tr.r.clients[0].slotOf(2) == null);
+}
+
+test "a stream past the client's table is refused, not dropped where the peer can't tell" {
+    // Past 64 streams the bytes went nowhere, and a stream that found a
+    // slot later was read from the middle.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    const c = &tr.r.clients[0];
+    var sid: u64 = 100;
+    while (c.streams.count() < MAX_STREAMS_PER_CLIENT) : (sid += 4) c.setRole(sid, .answered);
+
+    const extra: u64 = 2;
+    const st = try tr.conns[0].streams.getOrCreateRecvStream(extra);
+    var publisher = tr.session(0);
+    tr.r.onStreamData(&publisher, extra, "\x10\x05\x01", false);
+    try std.testing.expectEqual(@as(?u64, moq_codes.STREAM_RESET_INTERNAL_ERROR), st.stop_sending_err);
+    try std.testing.expect(c.slotOf(extra) == null);
+}
+
+test "a stream that outgrows its buffer is refused, not cut short" {
+    // A held data stream past 64 KiB lost the rest silently, and forwarded
+    // what was left as if it were whole.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    var buf: [64]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    // Alias 77: nothing has established it, so the stream is held.
+    try moq_obj.writeSubgroupHeader(&fbs, .{
+        .track_alias = 77,
+        .group = 1,
+        .subgroup = 0,
+        .publisher_priority = 128,
+        .end_of_group = false,
+        .per_object_properties = false,
+    }, .draft_17);
+    const st = try tr.conns[0].streams.getOrCreateRecvStream(2);
+    var publisher = tr.session(0);
+    tr.r.onStreamData(&publisher, 2, buf[0..fbs.seek], false);
+    const chunk: [64 * 1024]u8 = @splat('x');
+    for (0..MAX_STREAM_BUF / chunk.len) |_| tr.r.onStreamData(&publisher, 2, &chunk, false);
+    try std.testing.expectEqual(@as(?u64, moq_codes.STREAM_RESET_INTERNAL_ERROR), st.stop_sending_err);
+    // What comes after is ignored, and the slot goes with the FIN.
+    try std.testing.expectEqual(StreamRole.answered, tr.r.clients[0].getRole(2));
+    tr.r.onStreamData(&publisher, 2, "more", true);
+    try std.testing.expect(tr.r.clients[0].slotOf(2) == null);
+}
+
+test "a group too large to cache is forwarded but not cached" {
+    // The cache cut groups at 256 KiB, mid-object, and replayed the cut
+    // group to late subscribers as if it were whole.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    const t = &tr.r.tracks[0];
+    try tr.openGroup(2);
+    var publisher = tr.session(0);
+    const chunk: [64 * 1024]u8 = @splat('x');
+    for (0..CACHE_GROUP_SIZE / chunk.len + 1) |_| tr.r.onStreamData(&publisher, 2, &chunk, false);
+    tr.r.onStreamData(&publisher, 2, "", true);
+    for (t.cached) |g| try std.testing.expect(!g.valid);
+    try std.testing.expectEqual(@as(usize, 0), t.live.bytes().len);
+}
+
+test "a native-QUIC client's STOP_SENDING reaches the peer's uni streams" {
+    // getStream finds only bidi streams, so moq-test-client's cancel of a
+    // subgroup stream it no longer wanted was never sent.
+    const c = try relay_test.conn();
+    defer relay_test.free(c);
+    const rs = try c.streams.getOrCreateRecvStream(2);
+    var cs: event_loop.ClientSession = .{ .conn = c };
+    cs.stopSendingQuicStream(2, 7);
+    try std.testing.expectEqual(@as(?u64, 7), rs.stop_sending_err);
+}
+
+test "a draft-22 requester that has sent its FIN withdraws with STOP_SENDING" {
+    // Draft-22 §6.4.2.3: a FIN is not a cancellation, STOP_SENDING is. The
+    // relay had no onStopSending, so the namespace outlived its withdrawal.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    setDraft(&tr, .draft_22);
+    const ns: []const []const u8 = &.{ "moq-test", "lc" };
+    try sendRequest(&tr, 1, 8, moq_msg.writeSubscribeNamespace, moq_msg.SubscribeNamespace{ .track_namespace_prefix = ns });
+    try sendRequest(&tr, 0, 8, moq_msg.writePublishNamespace, moq_msg.PublishNamespace{ .track_namespace = ns });
+    var publisher = tr.session(0);
+    tr.r.onStreamData(&publisher, 8, "", true);
+    // A FIN alone leaves it standing.
+    try std.testing.expect(tr.r.namespaceAnnounced("moq-test/lc/"));
+
+    tr.r.onStopSending(&publisher, 0, 8, 0);
+    try std.testing.expect(!tr.r.namespaceAnnounced("moq-test/lc/"));
+    var types: [4]u64 = undefined;
+    try std.testing.expectEqualSlices(u64, &.{ moq_codes.MSG_REQUEST_OK, moq_codes.MSG_NAMESPACE, moq_codes.MSG_NAMESPACE_DONE }, sentTypes(tr.conns[1], 8, &types));
+    // Both halves are closed: nothing of the stream is kept.
+    try std.testing.expect(tr.r.clients[0].slotOf(8) == null);
 }

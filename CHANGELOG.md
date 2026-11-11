@@ -39,6 +39,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Changed
 
+- The MoQ relay allocates as traffic needs: it starts at 7 MB resident instead
+  of 318 MB, and its binary is 8.7 MB instead of 177 MB. It takes 256
+  clients, 1024 tracks and 1024 subscribers per track.
 - `moq.message.writeFetchOk` takes the draft, `Fetch.Standalone` carries its
   range as a `LocationFilter` (`range`) in place of `start` and `end`, and
   `FetchOk.end` is inclusive in every draft, `WHOLE_GROUP` for a whole group.
@@ -51,6 +54,15 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A native-QUIC handler now gets `onStopSending` for a bidi stream, as a
+  WebTransport one does, and `ClientSession.stopSendingQuicStream` reaches a
+  peer's uni streams. The MoQ relay takes a STOP_SENDING as a cancelled
+  request, which is how a draft-22 peer that has sent its FIN withdraws:
+  moq-dev-rs's `subscribe-namespace-lifecycle` passes at draft-22.
+- The MoQ relay refuses a stream it can't keep state for, with STOP_SENDING,
+  rather than dropping its bytes or cutting them short. It used to lose a
+  client's streams past 64 and a held stream past 64 KiB, and cached groups
+  cut mid-object at 256 KiB.
 - The MoQ relay subscribed upstream for Largest Object whatever its
   subscriber asked for, so a publisher could start past objects the
   subscriber wanted. It now forwards the subscriber's filter, or none.

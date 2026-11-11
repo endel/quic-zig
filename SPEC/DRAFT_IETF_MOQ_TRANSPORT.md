@@ -187,7 +187,7 @@ Invalid datagram types: `0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F` (STATUS
 | Object framing (`src/moq/object.zig`) | subgroup headers (all id-modes and priority variants), subgroup object records (ID delta, properties, status), datagram objects, fetch streams (headers, objects in draft-17's absolute and later drafts' delta encoding, End of Range) |
 | Session (`src/moq/session.zig`) | SETUP + request-stream state machine, generic over the transport; reassembles split messages and drains coalesced ones |
 | Publisher / Subscriber | `moq-client` subscribes or `--mode publish`; `moq-server` publishes |
-| Relay (`moq-relay`) | both transports on one port; pub/sub fanout with alias remapping, SUBSCRIBE routed to the namespace's publisher with the subscriber's own filter and answered once it answers, namespace discovery (SUBSCRIBE_NAMESPACE) and track discovery (SUBSCRIBE_TRACKS, answered with PUBLISH), PREFIX_OVERLAP, rendezvous timeouts, datagrams, FORWARD and REQUEST_UPDATE, PUBLISH_DONE on publisher loss, a per-track group cache, FETCH (standalone, joining, draft-22 fills) from that cache or the publisher, TRACK_STATUS, LARGEST_OBJECT in SUBSCRIBE_OK, REQUEST_ERROR NOT_SUPPORTED for anything else, a data stream or datagram that beats its alias held for 2 s, withdrawal by reset or (drafts 17, 18) FIN |
+| Relay (`moq-relay`) | both transports on one port; pub/sub fanout with alias remapping, SUBSCRIBE routed to the namespace's publisher with the subscriber's own filter and answered once it answers, namespace discovery (SUBSCRIBE_NAMESPACE) and track discovery (SUBSCRIBE_TRACKS, answered with PUBLISH), PREFIX_OVERLAP, rendezvous timeouts, datagrams, FORWARD and REQUEST_UPDATE, PUBLISH_DONE on publisher loss, a per-track group cache, FETCH (standalone, joining, draft-22 fills) from that cache or the publisher, TRACK_STATUS, LARGEST_OBJECT in SUBSCRIBE_OK, REQUEST_ERROR NOT_SUPPORTED for anything else, a data stream or datagram that beats its alias held for 2 s, withdrawal by reset, STOP_SENDING, or (drafts 17, 18) FIN |
 | Browser | `interop/browser/moq.html` and `moq_video.html`, driven end to end by `tools/moq_browser_test.mjs` |
 | Interop test client | `moq-test-client`, 10 cases (the runner's seven, both namespace-discovery cases and `data-subgroup-basic`), TAP 14, containerised |
 | Datagram objects | done — `moq-client --mode publish --datagrams`, relayed with alias remapping |
@@ -334,6 +334,13 @@ The one-stream-per-group design is what allowed scaling past ~1000 frames per su
 - No AUTHORIZATION_TOKEN policy engine — wire-level decode only.
 - VP8 video is in the demo app only; MoQ core treats object payloads as opaque bytes (as the spec intends: the media codec is not part of MoQ).
 - moq-lite is implemented separately — see [DRAFT_LCURLEY_MOQ_LITE_05.md](DRAFT_LCURLEY_MOQ_LITE_05.md). It is a different wire format, not a profile of this one.
+- The relay's limits: 256 clients (the event loop's connection cap), 1024
+  tracks, namespaces and subscribers per track, 512 streams per client
+  (above the 100 + 100 a peer may hold open), 1 MiB waiting on one stream,
+  1 MiB per cached group. Past any of them a request gets EXCESSIVE_LOAD or
+  a stream STOP_SENDING; nothing is dropped where the peer can't see it. A
+  group too large to cache is still forwarded. There is no relay-wide cache
+  budget yet.
 - The relay's FETCH is served from a cache of two finished groups and the
   one arriving. Within a range it holds the start of, a gap it can't vouch
   for is sent as End of Unknown Range, never left for a FIN to call absent;
