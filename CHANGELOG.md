@@ -27,6 +27,10 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   subscriptions with PREFIX_OVERLAP.
 - `moq-test-client` runs the interop runner's `subscribe-namespace-lifecycle`,
   `publish-namespace-multi-publisher-retention` and `data-subgroup-basic`.
+- The MoQ relay ranks its streams by subscriber and publisher priority and
+  group order, enforces SUBGROUP_DELIVERY_TIMEOUT and OBJECT_DELIVERY_TIMEOUT,
+  passes NEW_GROUP_REQUEST upstream, and on SIGTERM sends its clients GOAWAY
+  before stopping.
 - The MoQ relay answers FETCH in every draft (standalone, joining, and
   draft-22's fills) from its cache or the track's publisher, and TRACK_STATUS.
   SUBSCRIBE_OK carries LARGEST_OBJECT, and a request type it doesn't serve
@@ -39,6 +43,12 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Changed
 
+- A WebTransport or QUIC stream without a send order now ranks as 0, the
+  W3C API's default: behind positive send orders, ahead of negative ones.
+  Before, any stream with a send order went ahead of every stream without.
+- The MoQ relay gives each subscriber only what its filter passes. A
+  Largest Object subscriber is no longer replayed the groups the relay
+  holds; the demo pages now ask for Absolute Start {0, 0} to get them.
 - The MoQ relay allocates as traffic needs: it starts at 7 MB resident instead
   of 318 MB, and its binary is 8.7 MB instead of 177 MB. It takes 256
   clients, 1024 tracks and 1024 subscribers per track.
