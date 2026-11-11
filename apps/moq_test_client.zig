@@ -368,7 +368,7 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                 if (wt_protocol.decodeItem(raw, &scratch)) |v| {
                     self.setNegotiated(v);
                     // The peer's choice decides the wire format from here.
-                    if (moq_version.Draft.fromAlpn(v)) |d| self.draft = d;
+                    if (moq_version.Draft.fromAlpn(v)) |d| self.useDraft(d);
                 } else |_| {}
             } else {
                 // No WT-Protocol means the server ignored the offer, which
@@ -418,10 +418,18 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             @memcpy(self.negotiated[0..self.negotiated_len], v[0..self.negotiated_len]);
         }
 
+        /// Raw QUIC negotiates the MoQT version with the QUIC ALPN: the
+        /// server picked one of ours, and the wire format follows it.
         fn setNegotiatedFromAlpn(self: *Self) void {
-            // Raw QUIC negotiates the MoQT version with the QUIC ALPN, which
-            // is what we asked for; record it so the YAML block can report it.
+            const cs = self.cur orelse return;
+            const alpn = cs.conn.negotiatedAlpn();
+            if (moq_version.Draft.fromAlpn(alpn)) |d| self.useDraft(d);
             self.setNegotiated(self.draft.alpn());
+        }
+
+        fn useDraft(self: *Self, d: moq_version.Draft) void {
+            self.draft = d;
+            self.sess.draft = d;
         }
 
         pub fn negotiatedSlice(self: *const Self) []const u8 {
@@ -771,9 +779,9 @@ const Target = struct {
     ipv6: bool = false,
     tls_disable_verify: bool = false,
     verbose: bool = false,
-    /// One draft per run. The runner has no way to ask for a version, so
-    /// this is a flag rather than something it controls.
-    draft: moq_version.Draft = moq_version.DEFAULT,
+    /// Offered newest first; the peer picks. `--draft` narrows it to one,
+    /// for running a matrix at each.
+    drafts: []const moq_version.Draft = moq_version.PREFERRED,
     /// `host:port`, for the raw-QUIC SETUP's AUTHORITY.
     authority: [280]u8 = undefined,
     authority_len: usize = 0,
@@ -870,14 +878,14 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             }
         };
 
-        fn makeConfig(target: *const Target, connect_headers: []const qpack.Header) event_loop.ClientConfig {
+        fn makeConfig(target: *const Target, connect_headers: []const qpack.Header, alpns: []const []const u8) event_loop.ClientConfig {
             return .{
                 .address = target.addressSlice(),
                 .port = target.locator.port,
                 .server_name = moq_url.bareHost(target.locator.host),
                 .path = target.locator.path,
                 .ipv6 = target.ipv6,
-                .alpn = if (proto == .quic) target.draft.alpn() else null,
+                .alpns = if (proto == .quic) alpns else &.{},
                 .skip_cert_verify = target.tls_disable_verify,
                 .connect_headers = connect_headers,
             };
@@ -893,8 +901,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             // ALPN carries the same information.
             var offer_buf: [128]u8 = undefined;
             var alpn_buf: [4][]const u8 = undefined;
-            const one = [_]moq_version.Draft{target.draft};
-            const alpns = moq_version.alpnOffer(&one, &alpn_buf);
+            const alpns = moq_version.alpnOffer(target.drafts, &alpn_buf);
             const offer = wt_protocol.encodeList(alpns, &offer_buf) catch "";
             const connect_headers = [_]qpack.Header{
                 .{ .name = wt_protocol.HEADER_AVAILABLE, .value = offer },
@@ -994,7 +1001,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
 
             for (legs[0..leg_count]) |*l| {
                 l.peer.verbose = target.verbose;
-                l.peer.draft = target.draft;
+                l.peer.draft = target.drafts[0];
                 l.peer.prepare(target);
             }
             defer for (legs[0..leg_count]) |*l| l.deinit();
@@ -1005,7 +1012,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             while (nowMs() < deadline and !done) {
                 for (legs[0..leg_count], 0..) |*l, i| {
                     if (!l.started and nowMs() - start >= l.start_at_ms and canStart(case, i, legs)) {
-                        l.client = C.init(alloc, &l.peer, makeConfig(target, cfg_headers)) catch |e| {
+                        l.client = C.init(alloc, &l.peer, makeConfig(target, cfg_headers, alpns)) catch |e| {
                             result.outcome = .fail;
                             result.setMsg("connect failed: {t}", .{e});
                             return;
@@ -1242,12 +1249,16 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             if (dp.overflow > 0) return result.setMsg("{d} more objects than the scenario sends", .{dp.objects_len + dp.overflow});
 
             var seen: [DP_GROUPS][DP_PER_GROUP]bool = @splat(@splat(false));
+            var data: usize = 0;
             for (dp.objects[0..dp.objects_len]) |o| {
+                // Status objects (End of Group, End of Track) aren't data
+                // objects; the data-plane conventions leave their placement open.
+                if (o.status != 0) continue;
+                data += 1;
                 if (o.group >= DP_GROUPS or o.id >= DP_PER_GROUP) return result.setMsg("unexpected object ({d}, {d})", .{ o.group, o.id });
                 const slot = &seen[@intCast(o.group)][@intCast(o.id)];
                 if (slot.*) return result.setMsg("duplicate object ({d}, {d})", .{ o.group, o.id });
                 slot.* = true;
-                if (o.status != 0) return result.setMsg("object ({d}, {d}) has status {d}", .{ o.group, o.id, o.status });
                 if (o.subgroup != 0) return result.setMsg("object ({d}, {d}) on subgroup {d}", .{ o.group, o.id, o.subgroup });
                 if (o.priority != DP_PRIORITY) return result.setMsg("object ({d}, {d}) priority {d}", .{ o.group, o.id, o.priority });
                 if (o.len != dpSize(o.id)) return result.setMsg("object ({d}, {d}) is {d} bytes, expected {d}", .{ o.group, o.id, o.len, dpSize(o.id) });
@@ -1264,7 +1275,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             if (!dp.got_done) return result.setMsg("all objects arrived but no PUBLISH_DONE", .{});
             if (dp.done_status != moq_codes.DONE_TRACK_ENDED) return result.setMsg("PUBLISH_DONE status {d}, expected TRACK_ENDED", .{dp.done_status});
             result.outcome = .pass;
-            result.setMsg("{d} objects, PUBLISH_DONE TRACK_ENDED, Stream Count {d}", .{ dp.objects_len, dp.done_count });
+            result.setMsg("{d} objects, PUBLISH_DONE TRACK_ENDED, Stream Count {d}", .{ data, dp.done_count });
         }
     };
 }
@@ -1328,7 +1339,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var list = false;
     var verbose = envFlag("VERBOSE");
     var tls_disable_verify = envFlag("TLS_DISABLE_VERIFY");
-    var draft: moq_version.Draft = moq_version.DEFAULT;
+    var only_draft: [1]moq_version.Draft = undefined;
+    var drafts: []const moq_version.Draft = moq_version.PREFERRED;
 
     var args = sys.argsIterator(init.args);
     _ = args.next();
@@ -1344,20 +1356,22 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         } else if (std.mem.eql(u8, arg, "--draft")) {
             if (args.next()) |v| {
                 const n = std.fmt.parseInt(u8, v, 10) catch 0;
-                draft = switch (n) {
+                only_draft[0] = switch (n) {
                     17 => .draft_17,
                     18 => .draft_18,
+                    22 => .draft_22,
                     else => {
-                        std.debug.print("unknown draft: {s} (17 or 18)\n", .{v});
+                        std.debug.print("unknown draft: {s} (17, 18 or 22)\n", .{v});
                         return 127;
                     },
                 };
+                drafts = &only_draft;
             }
         } else if (std.mem.eql(u8, arg, "--tls-disable-verify")) {
             tls_disable_verify = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             out("moq-test-client [--relay URL] [--test NAME] [--list] [--verbose]\n" ++
-                "                [--tls-disable-verify] [--draft 17|18]\n", .{});
+                "                [--tls-disable-verify] [--draft 17|18|22]\n", .{});
             return 0;
         }
     }
@@ -1395,7 +1409,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         },
         .tls_disable_verify = tls_disable_verify,
         .verbose = verbose,
-        .draft = draft,
+        .drafts = drafts,
     };
     if (std.fmt.bufPrint(&target.authority, "{s}:{d}", .{ target.locator.host, target.locator.port })) |a| {
         target.authority_len = a.len;
@@ -1409,7 +1423,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     out("TAP version 14\n", .{});
     out("# moq-test-client v{s}\n", .{VERSION});
     out("# Relay: {s}\n", .{relay_url});
-    out("# Draft: draft-{d}\n", .{draft.number()});
+    for (drafts, 0..) |d, i| out("{s}draft-{d}", .{ if (i == 0) "# Offered: " else ", ", d.number() });
+    out("\n", .{});
     out("1..{d}\n", .{selected_len});
 
     var failures: usize = 0;
