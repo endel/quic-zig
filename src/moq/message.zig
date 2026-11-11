@@ -562,6 +562,13 @@ pub const Subscribe = struct {
     /// draft-22 §3.4: FILL_PARAMETERS, asking for a fill fetch stream.
     /// Earlier drafts' joining FETCH did this job.
     fill: ?Fill = null,
+    /// §5.2 OBJECT_DELIVERY_TIMEOUT (0x02; draft-17's DELIVERY_TIMEOUT) and
+    /// SUBGROUP_DELIVERY_TIMEOUT (0x06), in milliseconds; 0 is none.
+    object_timeout_ms: ?u64 = null,
+    subgroup_timeout_ms: ?u64 = null,
+    /// NEW_GROUP_REQUEST (0x32): the largest Group the subscriber knows,
+    /// plus 1, or 0 for none.
+    new_group_request: ?u64 = null,
 
     /// The parameters FILL_PARAMETERS carried; what it leaves out it takes
     /// from the subscription.
@@ -608,8 +615,16 @@ pub const Subscribe = struct {
     fn buildParams(self: Subscribe, out: []Param, filter_buf: []u8, fill_buf: []u8, draft: version.Draft) ![]Param {
         var n: usize = 0;
         // Ascending Type order is required by §9.3.
+        if (self.object_timeout_ms) |v| {
+            out[n] = .{ .type = ParamType.DELIVERY_TIMEOUT, .value = .{ .varint = v } };
+            n += 1;
+        }
         if (self.rendezvous_timeout_ms) |v| {
             out[n] = .{ .type = ParamType.RENDEZVOUS_TIMEOUT, .value = .{ .varint = v } };
+            n += 1;
+        }
+        if (self.subgroup_timeout_ms) |v| {
+            out[n] = .{ .type = ParamType.SUBGROUP_DELIVERY_TIMEOUT, .value = .{ .varint = v } };
             n += 1;
         }
         if (self.forward) |v| {
@@ -632,6 +647,10 @@ pub const Subscribe = struct {
             out[n] = .{ .type = ParamType.FILL_PARAMETERS, .value = .{ .bytes = try f.encode(fill_buf) } };
             n += 1;
         };
+        if (self.new_group_request) |v| if (paramShape(ParamType.NEW_GROUP_REQUEST, draft) != null) {
+            out[n] = .{ .type = ParamType.NEW_GROUP_REQUEST, .value = .{ .varint = v } };
+            n += 1;
+        };
         return out[0..n];
     }
 
@@ -642,6 +661,9 @@ pub const Subscribe = struct {
         self.group_order = null;
         for (params) |p| switch (p.type) {
             ParamType.RENDEZVOUS_TIMEOUT => self.rendezvous_timeout_ms = p.value.varint,
+            ParamType.DELIVERY_TIMEOUT => self.object_timeout_ms = p.value.varint,
+            ParamType.SUBGROUP_DELIVERY_TIMEOUT => self.subgroup_timeout_ms = p.value.varint,
+            ParamType.NEW_GROUP_REQUEST => self.new_group_request = p.value.varint,
             ParamType.FORWARD => self.forward = switch (p.value.uint8) {
                 0, 1 => p.value.uint8 == 1,
                 else => return Error.ProtocolViolation,
@@ -2153,4 +2175,28 @@ test "draft-22 SUBSCRIBE carries FILL_PARAMETERS as a counted parameter block" {
 test "FILL_PARAMETERS refuses a parameter Table 7 doesn't allow" {
     // FORWARD (0x10) inside a fill.
     try testing.expectError(Error.ProtocolViolation, Subscribe.Fill.decode(&.{ 1, 0x10, 1 }, .draft_22));
+}
+
+test "SUBSCRIBE carries the delivery timeouts and NEW_GROUP_REQUEST" {
+    var buf: [128]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const ns = [_][]const u8{"moq"};
+    for ([_]version.Draft{ .draft_18, .draft_22 }) |d| {
+        fbs.seek = 0;
+        try writeSubscribe(&fbs, .{
+            .track_namespace = &ns,
+            .track_name = "v",
+            .object_timeout_ms = 300,
+            .subgroup_timeout_ms = 900,
+            .rendezvous_timeout_ms = 50,
+            .new_group_request = 7,
+        }, d);
+        const p = try parseEnvelope(buf[0..fbs.seek]);
+        var ns_buf: NamespaceBuf = undefined;
+        const s = try decodeSubscribe(p.env.payload, &ns_buf, d);
+        try testing.expectEqual(@as(?u64, 300), s.object_timeout_ms);
+        try testing.expectEqual(@as(?u64, 900), s.subgroup_timeout_ms);
+        try testing.expectEqual(@as(?u64, 50), s.rendezvous_timeout_ms);
+        try testing.expectEqual(@as(?u64, 7), s.new_group_request);
+    }
 }
