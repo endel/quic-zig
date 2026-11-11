@@ -28,6 +28,70 @@ Test cases and their pass criteria are the moq-interop-runner's:
 
 <!-- Everything below is written by hand; the generator keeps it. -->
 
+## The nightly of 2026-11-11, and what it took (local)
+
+[Report](https://englishm.github.io/moq-interop-runner/results/2026-11-11_001512/report.html):
+our relay 100/113, our client 200/238. Every failure was triaged against the
+same client or relay paired with someone else. The relay-side ones had recurred
+nightly since at least 28 Oct.
+
+**Ours, fixed** (each with a failing relay test first):
+
+| Cell | Cause |
+|---|---|
+| moqtopus → us 0/6, xquic-draft-18 → us (exit 127) | registered with `https://` only; both clients dial `moqt://`. The registration now lists both endpoints |
+| aiomoqt `namespace-discovery` | SUBSCRIBE_TRACKS (0x51) was encode-only; the relay logged "request type=0x51" and never answered |
+| moq-dev-rs `subscribe-namespace-lifecycle` | moq-net withdraws a PUBLISH_NAMESPACE by finishing its stream; only a reset counted |
+| moq-rs-draft-18 `data-subgroup-basic`, missing (0,0) | the upstream SUBSCRIBE asked for Largest Object (the codec's default) when the subscriber had sent no filter, which §10.2.9 makes unfiltered. The publisher had (0,0) and started after it. Eleven of fifteen relays fail this cell the same way |
+| moq-rs-draft-18 `moq-test-datagram`, missing (0,0) (raw QUIC, intermittent) | a datagram overtook the publisher's SUBSCRIBE_OK and its alias was unknown; held for up to 2 s now, like streams |
+
+Found on the way: NAMESPACE_DONE was withheld when another publisher held a
+shorter prefix of the namespace, and the per-track group cache mixed two
+groups arriving at once.
+
+Our relay, rebuilt from this tree, against every draft-18 client image on both
+registered endpoints, through the runner's harness:
+
+| Client | `moqt://relay:4443` | `https://relay:4443` |
+|---|---|---|
+| aiomoqt | 20/20 | 20/20 |
+| moq-rs-draft-18 | 18/18 | 18/18 |
+| moq-dev-rs | 6/6 + 2 skip | 6/6 + 2 skip |
+| imquic, moqx, moxygen | 7/7 | 7/7 |
+| moqlivemock, moq5, moq-playa | 6/6 | 6/6 |
+| stitcher-moq | 5/5 + 2 skip | 5/5 + 2 skip |
+| xquic-draft-18 | 6/6 | refuses `https://` |
+| moqtopus | 6/6 | refuses `https://` |
+| moq-dev-js | 0/8, speaks WebTransport only | 8/8 |
+| quic-zig | 10/10 | 10/10 |
+
+moqtopus (msquic) and moq-dev-js (Bun) crash under amd64 emulation on an
+Apple-silicon Mac, so the whole table was rerun natively on an x86-64 Linux
+host with the same images: identical, plus those two rows. Each client
+that can't use one transport fails it here as it does against aiomoqt-relay's
+two docker endpoints in the nightly.
+
+**The client's three new cases** against third-party relay images, after two
+bugs of ours that only those relays showed: the second PUBLISH_NAMESPACE reused
+Request ID 0 (moq-rs and aiomoqt close the session), and a native-QUIC reset
+sat unsent because nothing woke the connection.
+
+| Relay | lifecycle | multi-publisher retention | data-subgroup-basic |
+|---|---|---|---|
+| moq-rs-draft-18, moqlivemock, imquic, aiomoqt (both transports), ours | ✅ | ✅ | ✅ |
+| quiche-moq | ✅ | ✅ | ❌ PUBLISH_DONE GOING_AWAY for an upstream TRACK_ENDED (aiomoqt sees it too) |
+| xquic-draft-18 | ❌ no SUBSCRIBE_NAMESPACE | ❌ same | ❌ no prefix routing |
+
+imquic ends a subscription on PUBLISH_DONE and drops what is still in flight,
+so our publisher sends it once its data is acknowledged.
+
+**Peer-side, unchanged:** `rendezvous-timeout` answered with DOES_NOT_EXIST
+(moq-dev-rs, stitcher-moq, quiche-moq, xquic-draft-18); libquicr's SUBSCRIBE_OK
+for unknown tracks; quiche-moq's public WebTransport endpoint being down;
+imquic's public WebTransport endpoint at draft-18 since 10 Nov; and
+relay.moqtail.dev, registered as draft-18, now running draft-22 and refusing any
+CONNECT that offers only `moqt-18`.
+
 ## Our relay against every registered client (2026-09-23)
 
 Through the runner's own harness (`make test RELAY_IMAGE=… CLIENT_IMAGE=…`),

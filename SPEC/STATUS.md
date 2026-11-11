@@ -632,7 +632,7 @@ lives in [`src/sys/windows.zig`](../src/sys/windows.zig).
 | WebTransport | 22 | 1 | 2 | 88% |
 | RFC 6455 (WebSocket, server) | 6 | 0 | 2 | 75% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
-| MoQ Transport (draft-17, -18) | 15 | 1 | 0 | see below |
+| MoQ Transport (draft-17, -18) | 17 | 2 | 0 | see below |
 | moq-lite (draft-05) | 6 | 2 | 1 | see below |
 
 ### MoQ Transport (draft-ietf-moq-transport-17 and -18)
@@ -650,9 +650,10 @@ details, and [moq-interop.md](moq-interop.md) for the interop runner.
 | Subscribe / publish flows (raw QUIC) | ✅ Done |
 | Relay: fanout, namespace registry, rendezvous timeouts, PUBLISH_DONE | ✅ Done |
 | Relay: WebTransport and native QUIC on one port, chosen by ALPN | ✅ Done |
-| Relay: SUBSCRIBE routed to the namespace's publisher; FORWARD, REQUEST_UPDATE; withdrawal by reset | ✅ Done |
+| Relay: SUBSCRIBE routed to the namespace's publisher with the subscriber's filter; FORWARD, REQUEST_UPDATE; withdrawal by reset or (17/18) FIN | ✅ Done |
+| Relay: SUBSCRIBE_TRACKS answered with PUBLISH; PREFIX_OVERLAP; early data streams and datagrams held for their alias | ✅ Done |
 | WebTransport browser client/server + protocol negotiation | ✅ Done |
-| Interop test client (7 cases, TAP 14, containerised) | ✅ Done |
+| Interop test client (10 cases incl. namespace discovery and `data-subgroup-basic`, TAP 14, containerised) | ✅ Done |
 | Datagram objects, relayed with alias remapping | ✅ Done |
 | FETCH request/response runtime | ⚠ Codec only |
 | draft-18, alongside draft-17 | ✅ Done — chosen by ALPN, per peer |
