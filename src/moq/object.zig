@@ -121,6 +121,63 @@ pub fn readSubgroupHeader(fbs: *io.FixedBufferStream([]const u8), draft: version
     };
 }
 
+/// One object on a subgroup stream (§11.4.2, draft-17 §10.4.2 alike).
+/// Properties are kept as the raw KV bytes; nothing here interprets them.
+pub const SubgroupObject = struct {
+    id: track.ObjectId,
+    properties: []const u8 = &.{},
+    /// Only on the wire when the payload is empty; 0 is Normal.
+    status: u64 = 0,
+    payload: []const u8 = &.{},
+};
+
+/// `prev` is the previous object's ID on this stream, null for the first:
+/// the wire carries `id - prev - 1`, so a run of consecutive IDs is all 0s.
+pub fn writeSubgroupObject(writer: anytype, o: SubgroupObject, prev: ?track.ObjectId, with_properties: bool) !void {
+    const delta = if (prev) |p| blk: {
+        if (o.id <= p) return Error.InvalidObjectHeader;
+        break :blk o.id - p - 1;
+    } else o.id;
+    try wire.writeVarInt(writer, delta);
+    if (with_properties) {
+        try wire.writeVarInt(writer, o.properties.len);
+        try writer.writeAll(o.properties);
+    }
+    try wire.writeVarInt(writer, o.payload.len);
+    if (o.payload.len == 0) try wire.writeVarInt(writer, o.status);
+    try writer.writeAll(o.payload);
+}
+
+pub const ReadObject = struct { object: SubgroupObject, consumed: usize };
+
+/// Reads the object at the front of `data`, or null while it is still
+/// arriving. `with_properties` is the header's PROPERTIES bit.
+pub fn readSubgroupObject(data: []const u8, prev: ?track.ObjectId, with_properties: bool) !?ReadObject {
+    var fbs = io.fixedBufferStream(data);
+    const delta = wire.readVarInt(&fbs) catch |e| return partial(e);
+    const id = if (prev) |p| std.math.add(u64, p, delta +| 1) catch return Error.InvalidObjectHeader else delta;
+    var properties: []const u8 = &.{};
+    if (with_properties) {
+        const len = wire.readVarInt(&fbs) catch |e| return partial(e);
+        if (len > data.len - fbs.seek) return null;
+        properties = data[fbs.seek..][0..@intCast(len)];
+        fbs.seek += @intCast(len);
+    }
+    const payload_len = wire.readVarInt(&fbs) catch |e| return partial(e);
+    var status: u64 = 0;
+    if (payload_len == 0) status = wire.readVarInt(&fbs) catch |e| return partial(e);
+    if (payload_len > data.len - fbs.seek) return null;
+    const payload = data[fbs.seek..][0..@intCast(payload_len)];
+    return .{
+        .object = .{ .id = id, .properties = properties, .status = status, .payload = payload },
+        .consumed = fbs.seek + payload.len,
+    };
+}
+
+fn partial(e: anyerror) !?ReadObject {
+    return if (e == wire.Error.BufferTooShort) null else e;
+}
+
 // ---------------- Datagram objects ----------------
 
 pub const DatagramObject = struct {
@@ -363,4 +420,48 @@ test "draft-18 accepts the FIRST_OBJECT bit that draft-17 rejects" {
     const parsed = try readSubgroupHeader(&r18, .draft_18);
     try testing.expectEqual(@as(u64, 7), parsed.header.track_alias);
     try testing.expectEqual(@as(u64, 3), parsed.header.group);
+}
+
+test "subgroup objects carry the ID as a delta from the one before" {
+    // §11.4.2: "a Subgroup of sequential Object IDs starting at 0 will have
+    // 0 for all Object ID Delta values".
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try writeSubgroupObject(&fbs, .{ .id = 0, .payload = "ab" }, null, false);
+    try writeSubgroupObject(&fbs, .{ .id = 1, .payload = "c" }, 0, false);
+    try writeSubgroupObject(&fbs, .{ .id = 5, .status = 3 }, 1, false);
+    try testing.expectEqualSlices(u8, &.{
+        0x00, 0x02, 'a', 'b', // delta 0 → id 0
+        0x00, 0x01, 'c', // delta 0 → id 1
+        0x03, 0x00, 0x03, // delta 3 → id 5, empty, END_OF_GROUP status
+    }, buf[0..fbs.seek]);
+
+    var data: []const u8 = buf[0..fbs.seek];
+    var prev: ?track.ObjectId = null;
+    const want = [_]struct { id: u64, payload: []const u8, status: u64 }{
+        .{ .id = 0, .payload = "ab", .status = 0 },
+        .{ .id = 1, .payload = "c", .status = 0 },
+        .{ .id = 5, .payload = "", .status = 3 },
+    };
+    for (want) |w| {
+        const r = (try readSubgroupObject(data, prev, false)).?;
+        try testing.expectEqual(w.id, r.object.id);
+        try testing.expectEqualStrings(w.payload, r.object.payload);
+        try testing.expectEqual(w.status, r.object.status);
+        prev = r.object.id;
+        data = data[r.consumed..];
+    }
+    try testing.expectEqual(@as(usize, 0), data.len);
+}
+
+test "a subgroup object that has not all arrived reads as null" {
+    var buf: [32]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try writeSubgroupObject(&fbs, .{ .id = 0, .properties = &.{ 0x02, 0x07 }, .payload = "xyz" }, null, true);
+    const whole = buf[0..fbs.seek];
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x02, 0x02, 0x07, 0x03, 'x', 'y', 'z' }, whole);
+    for (0..whole.len) |n| try testing.expectEqual(@as(?ReadObject, null), try readSubgroupObject(whole[0..n], null, true));
+    const r = (try readSubgroupObject(whole, null, true)).?;
+    try testing.expectEqualSlices(u8, &.{ 0x02, 0x07 }, r.object.properties);
+    try testing.expectEqualStrings("xyz", r.object.payload);
 }

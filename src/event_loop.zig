@@ -3345,6 +3345,22 @@ pub const ClientSession = struct {
         }
     }
 
+    /// RESET_STREAM on a native QUIC stream's sending half.
+    pub fn resetQuicStream(self: *ClientSession, stream_id: u64, error_code: u64) void {
+        defer self.wake();
+        if (self.conn.streams.getStream(stream_id)) |stream| {
+            stream.send.reset(error_code);
+        } else if (self.conn.streams.send_streams.get(stream_id)) |ss| {
+            ss.reset(error_code);
+        }
+    }
+
+    /// STOP_SENDING on a native QUIC stream's receiving half.
+    pub fn stopSendingQuicStream(self: *ClientSession, stream_id: u64, error_code: u64) void {
+        defer self.wake();
+        if (self.conn.streams.getStream(stream_id)) |stream| stream.recv.stopSending(error_code);
+    }
+
     pub fn readStream(self: *ClientSession, stream_id: u64) ?[]const u8 {
         if (self.conn.streams.getStream(stream_id)) |stream| {
             return stream.recv.read();

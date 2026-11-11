@@ -77,7 +77,7 @@ pub const Event = union(enum) {
     subscribe_ok: struct { stream_id: u64, ok: msg.SubscribeOk },
     publish: struct { stream_id: u64, publish: msg.Publish },
     namespace: struct { stream_id: u64, namespace: msg.Namespace },
-    namespace_done: struct { stream_id: u64 },
+    namespace_done: struct { stream_id: u64, namespace: msg.Namespace },
     goaway: struct { stream_id: u64, goaway: msg.Goaway },
     publish_done: struct { stream_id: u64, done: msg.PublishDone },
     /// A message we decode but have no specific event for, and anything on
@@ -303,7 +303,10 @@ pub fn Session(comptime Transport: type) type {
                     .stream_id = stream_id,
                     .namespace = try msg.decodeNamespace(env.payload, ns_buf),
                 } },
-                codes.MSG_NAMESPACE_DONE => Event{ .namespace_done = .{ .stream_id = stream_id } },
+                codes.MSG_NAMESPACE_DONE => Event{ .namespace_done = .{
+                    .stream_id = stream_id,
+                    .namespace = try msg.decodeNamespaceDone(env.payload, ns_buf),
+                } },
                 codes.MSG_GOAWAY => Event{ .goaway = .{
                     .stream_id = stream_id,
                     .goaway = try msg.decodeGoaway(env.payload),
