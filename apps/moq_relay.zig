@@ -1,4 +1,4 @@
-// MoQ Transport relay, draft-17 and draft-18, over WebTransport and native
+// MoQ Transport relay, drafts 17, 18 and 22, over WebTransport and native
 // QUIC on one port: a connection's ALPN picks — `h3` is WebTransport, with
 // the MoQT version chosen by WT-Protocol; `moqt-NN` is native QUIC.
 //
@@ -115,6 +115,8 @@ const Track = struct {
     upstream_idx: ?usize = null,
     /// SUBSCRIBE sent upstream, no answer yet.
     upstream_pending: bool = false,
+    /// Its PUBLISH said FORWARD=0 and nothing has resumed it yet.
+    pub_paused: bool = false,
     active: bool = false,
     /// Moves on whenever the slot's publication changes, reuse included: a
     /// data stream feeds the cache only while the one it began in stands.
@@ -162,6 +164,7 @@ const Track = struct {
         self.publisher_idx = null;
         self.pub_alias = 0;
         self.pub_stream_id = null;
+        self.pub_paused = false;
         self.upstream_idx = null;
         self.upstream_pending = false;
         for (&self.cached) |*g| g.valid = false;
@@ -796,16 +799,23 @@ const RelayHandler = struct {
                 std.debug.print("[relay] client {d} SUBSCRIBE_TRACKS before draft-18\n", .{ci});
             },
             moq_codes.MSG_REQUEST_UPDATE => self.handleRequestUpdate(ci, stream_id, env.payload),
+            // A publisher answering the REQUEST_UPDATE that resumed it.
+            moq_codes.MSG_REQUEST_OK, moq_codes.MSG_REQUEST_ERROR => {},
             else => std.debug.print("[relay] client {d} request type=0x{x}\n", .{ ci, env.type }),
         }
     }
 
     /// §9.10: an update rides the stream of the subscription it changes.
+    /// Every update gets exactly one answer (draft-18 §10.10, draft-22 §9.5).
     fn handleRequestUpdate(self: *RelayHandler, ci: usize, stream_id: u64, payload: []const u8) void {
         const u = moq_msg.decodeRequestUpdate(payload, self.clients[ci].draft) catch |e| {
             std.debug.print("[relay] undecodable REQUEST_UPDATE client={d}: {t}\n", .{ ci, e });
+            self.sendToClientError(ci, stream_id, moq_codes.ERR_MALFORMED_TRACK, "undecodable REQUEST_UPDATE");
             return;
         };
+        var buf: [64]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&buf);
+        if (moq_msg.writeRequestOk(&fbs, .{})) |_| self.sendToClient(ci, stream_id, buf[0..fbs.seek]) else |_| {}
         const fwd = u.forward orelse return;
         for (self.tracks[0..self.track_count]) |*t| {
             if (!t.active) continue;
@@ -814,6 +824,7 @@ const RelayHandler = struct {
                 sub.forward = fwd;
                 std.debug.print("[relay] REQUEST_UPDATE client={d} forward={}\n", .{ ci, fwd });
             }
+            if (fwd) self.resumeIfWanted(t);
         }
     }
 
@@ -1026,6 +1037,7 @@ const RelayHandler = struct {
                     if (ok.forward) |fwd| f.sub.forward = fwd;
                     std.debug.print("[relay] PUBLISH accepted by client {d} alias={d}\n", .{ ci, f.sub.alias });
                     self.replayCachedGroups(f.track, f.sub);
+                    self.resumeIfWanted(f.track);
                 };
             } else if (parsed.env.type == moq_codes.MSG_REQUEST_ERROR) {
                 std.debug.print("[relay] PUBLISH refused by client {d}\n", .{ci});
@@ -1534,6 +1546,7 @@ const RelayHandler = struct {
             // Replay any cached groups to this new subscriber so it starts
             // playback immediately instead of waiting for the next keyframe.
             self.replayCachedGroups(t, &t.subs[t.sub_count - 1]);
+            self.resumeIfWanted(t);
         }
     }
 
@@ -1654,6 +1667,10 @@ const RelayHandler = struct {
         t.publisher_idx = ci;
         t.pub_alias = pub_msg.track_alias;
         t.pub_stream_id = stream_id;
+        // Our answer resumes it where it can carry FORWARD; otherwise it
+        // stays paused until someone wants its objects.
+        t.pub_paused = !(pub_msg.forward orelse true) and
+            !moq_version.Rules.of(self.clients[ci].draft).publish_ok_sets_forward;
         // A PUBLISH means this namespace exists here, so a later SUBSCRIBE
         // under it is legitimate even if the publisher never announced.
         _ = self.registerNamespace(ci, stream_id, ns_key[0..ns_len], true);
@@ -1668,7 +1685,28 @@ const RelayHandler = struct {
         // the SUBSCRIBE it sent, not a PUBLISH as well.
         self.resolvePending(ns_key[0..ns_len]);
         self.offerToWatchers(t);
+        self.resumeIfWanted(t);
         self.retryHeld(ci);
+    }
+
+    /// draft-22 §7.2: with a subscriber that isn't paused, a paused
+    /// publication is resumed with REQUEST_UPDATE on its PUBLISH stream.
+    fn resumeIfWanted(self: *RelayHandler, t: *Track) void {
+        if (!t.pub_paused) return;
+        const wanted = for (t.subs[0..t.sub_count]) |sub| {
+            if (sub.forward and sub.answered) break true;
+        } else false;
+        if (!wanted) return;
+        const publisher = t.publisher_idx orelse return;
+        const sid = t.pub_stream_id orelse return;
+        const c = &self.clients[publisher];
+        var buf: [64]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&buf);
+        moq_msg.writeRequestUpdate(&fbs, .{ .request_id = c.next_request_id, .forward = true }, c.draft) catch return;
+        c.next_request_id += 2;
+        self.sendToClient(publisher, sid, buf[0..fbs.seek]);
+        t.pub_paused = false;
+        std.debug.print("[relay] REQUEST_UPDATE forward=1 → publisher client {d}\n", .{publisher});
     }
 
     /// §10.11: the upstream publication has ended. Each downstream
@@ -1897,7 +1935,7 @@ const RelayHandler = struct {
 
 // h3 first: a browser offers only that, and a MoQ client offering both is
 // happy either way.
-const ALPNS = [_][]const u8{ "h3", "moqt-18", "moqt-17" };
+const ALPNS = [_][]const u8{ "h3", "moqt-22", "moqt-18", "moqt-17" };
 
 pub fn main(init: std.process.Init.Minimal) !void {
     // A server outlives its streams, so it needs an allocator that reuses what
@@ -1926,7 +1964,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var cert_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(cert_der, &cert_hash, .{});
 
-    std.debug.print("\n=== MoQ Relay (draft-17/18, WebTransport + QUIC) ===\n", .{});
+    std.debug.print("\n=== MoQ Relay (drafts 17, 18, 22; WebTransport + QUIC) ===\n", .{});
     std.debug.print("Certificate SHA-256: ", .{});
     for (cert_hash) |byte| std.debug.print("{x:0>2}", .{byte});
     std.debug.print("\n\n", .{});
@@ -2523,4 +2561,69 @@ test "a datagram that beats its SUBSCRIBE_OK is held, not dropped" {
     try moq_msg.writeSubscribeOk(&fbs, .{ .track_alias = 5 });
     r.onStreamData(&publisher, upstream, buf[0..fbs.seek], false);
     try std.testing.expectEqual(@as(usize, 1), tr.conns[1].datagram_send_queue.count);
+}
+
+test "a FIN on a draft-22 PUBLISH_NAMESPACE withdraws nothing" {
+    // draft-19 (#1698): a requester MAY finish its side once it has nothing
+    // more to send; only a reset cancels.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    setDraft(&tr, .draft_22);
+    const ns: []const []const u8 = &.{ "moq-test", "fin" };
+    try sendRequest(&tr, 0, 8, moq_msg.writePublishNamespace, moq_msg.PublishNamespace{ .track_namespace = ns });
+    var publisher = tr.session(0);
+    tr.r.onStreamData(&publisher, 8, "", true);
+    try std.testing.expect(tr.r.namespaceAnnounced("moq-test/fin/"));
+    tr.r.onStreamReset(&publisher, 0, 8, 0);
+    try std.testing.expect(!tr.r.namespaceAnnounced("moq-test/fin/"));
+}
+
+test "a REQUEST_UPDATE is answered" {
+    // draft-18 §10.10 and draft-22 §9.5: exactly one REQUEST_OK or
+    // REQUEST_ERROR per update. The relay applied FORWARD and said nothing.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    setDraft(&tr, .draft_18);
+    try sendRequest(&tr, 1, 4, moq_msg.writeRequestUpdate, moq_msg.RequestUpdate{ .forward = false });
+    var types: [4]u64 = undefined;
+    try std.testing.expectEqualSlices(u64, &.{moq_codes.MSG_REQUEST_OK}, sentTypes(tr.conns[1], 4, &types));
+    try std.testing.expect(!tr.r.tracks[0].subs[0].forward);
+}
+
+test "a paused draft-22 publication is resumed for a subscriber that wants objects" {
+    // draft-22 §7.2: PUBLISH with FORWARD=0 starts paused, and only a
+    // REQUEST_UPDATE resumes it; draft-18's PUBLISH_OK did that by carrying
+    // FORWARD (absent meaning 1). aiomoqt's publish-track-subscribe got no
+    // objects at 22.
+    for ([_]moq_version.Draft{ .draft_22, .draft_18 }) |d| {
+        var tr: TestRelay = undefined;
+        try tr.init();
+        defer tr.deinit();
+        setDraft(&tr, d);
+        tr.r.tracks[0] = .{};
+        tr.r.track_count = 0;
+        const ns: []const []const u8 = &.{ "moq-test", "paused" };
+        try sendRequest(&tr, 0, 8, moq_msg.writePublish, moq_msg.Publish{
+            .track_namespace = ns,
+            .track_name = "t",
+            .track_alias = 3,
+            .forward = false,
+        });
+        try sendRequest(&tr, 1, 12, moq_msg.writeSubscribe, moq_msg.Subscribe{ .track_namespace = ns, .track_name = "t" });
+        var types: [4]u64 = undefined;
+        const want: []const u64 = if (d == .draft_22)
+            &.{ moq_codes.MSG_REQUEST_OK, moq_codes.MSG_REQUEST_UPDATE }
+        else
+            &.{moq_codes.MSG_REQUEST_OK};
+        try std.testing.expectEqualSlices(u64, want, sentTypes(tr.conns[0], 8, &types));
+        if (d != .draft_22) continue;
+        const st = tr.conns[0].streams.getStream(8).?;
+        const first = try moq_msg.parseEnvelope(st.send.write_buffer.items);
+        const second = try moq_msg.parseEnvelope(st.send.write_buffer.items[first.consumed..]);
+        const u = try moq_msg.decodeRequestUpdate(second.env.payload, .draft_22);
+        try std.testing.expectEqual(@as(?bool, true), u.forward);
+        try std.testing.expectEqual(@as(u64, 1), u.request_id & 1); // a server's request id
+    }
 }
