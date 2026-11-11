@@ -570,80 +570,86 @@ pub const PacketPacker = struct {
             // Connection-level flow control budget for this packet
             var conn_budget: u64 = if (self.conn_flow_ctrl) |cfc| cfc.sendWindowSize() else std.math.maxInt(u64);
 
-            // Bidirectional streams — scheduled by RFC 9218 priority
+            // Bidirectional streams by RFC 9218 priority, and unidirectional
+            // ones likewise; whichever is more urgent goes first, requests
+            // on a tie. HTTP/3's control and QPACK streams (urgency 0) so
+            // lead the requests that depend on their SETTINGS.
             var sched_buf: [stream_mod.StreamsMap.MAX_SCHEDULABLE]*stream_mod.Stream = undefined;
             const sched_count = streams.getScheduledStreams(&sched_buf);
-            for (sched_buf[0..sched_count]) |s| {
-                if (fbs.seek + AEAD_TAG_LEN + 16 >= stream_max) break;
-                const retransmitting = s.send.hasRetransmitData();
-                if (conn_budget == 0 and !retransmitting) continue;
-                if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
-                const remaining = stream_max - fbs.seek - AEAD_TAG_LEN;
-                const header_overhead = streamFrameHeaderOverhead(s.send.stream_id, s.send.send_offset, remaining);
-                if (remaining <= header_overhead) break;
-                const max_stream_data = if (retransmitting)
-                    remaining - header_overhead
-                else
-                    @min(remaining - header_overhead, conn_budget);
-                const prev_send_offset = s.send.send_offset;
-                if (s.send.popStreamFrame(max_stream_data)) |stream_frame| {
-                    try stream_frame.write(writer);
-                    ack_eliciting = true;
-                    if (stream_frame.stream.fin) streams.closeIfDone(s);
-                    // Only count NEW data against connection flow control (not retransmissions)
-                    const new_bytes = s.send.send_offset - prev_send_offset;
-                    if (new_bytes > 0) {
-                        conn_budget -= @min(conn_budget, new_bytes);
-                        if (self.conn_flow_ctrl) |cfc| cfc.base.addBytesSent(new_bytes);
-                    }
-                    // Record for retransmission tracking
-                    stream_frame_infos[stream_frame_info_count] = .{
-                        .stream_id = stream_frame.stream.stream_id,
-                        .offset = stream_frame.stream.offset,
-                        .length = stream_frame.stream.length,
-                        .fin = stream_frame.stream.fin,
-                    };
-                    stream_frame_info_count += 1;
-                }
-            }
-
-            // Unidirectional send streams (priority-scheduled)
             var uni_sched_buf: [stream_mod.StreamsMap.MAX_SCHEDULABLE]*stream_mod.SendStream = undefined;
             const uni_sched_count = streams.getScheduledUniStreams(&uni_sched_buf);
-            if (uni_sched_count > 0) {
-                for (uni_sched_buf[0..uni_sched_count]) |s| {
-                    if (fbs.seek + AEAD_TAG_LEN + 16 >= stream_max) break;
-                    const retransmitting = s.hasRetransmitData();
-                    if (conn_budget == 0 and !retransmitting) continue;
-                    if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
-                    const remaining_uni = stream_max - fbs.seek - AEAD_TAG_LEN;
-                    const uni_header_overhead = streamFrameHeaderOverhead(s.stream_id, s.send_offset, remaining_uni);
-                    if (remaining_uni <= uni_header_overhead) break;
-                    const max_stream_data = if (retransmitting)
-                        remaining_uni - uni_header_overhead
-                    else
-                        @min(remaining_uni - uni_header_overhead, conn_budget);
-                    const prev_uni_offset = s.send_offset;
-                    if (s.popStreamFrame(max_stream_data)) |stream_frame| {
-                        try stream_frame.write(writer);
-                        ack_eliciting = true;
-                        // Only count NEW data against connection flow control
-                        const new_bytes_uni = s.send_offset - prev_uni_offset;
-                        if (new_bytes_uni > 0) {
-                            conn_budget -= @min(conn_budget, new_bytes_uni);
-                            if (self.conn_flow_ctrl) |cfc| cfc.base.addBytesSent(new_bytes_uni);
+            const uni_first = uni_sched_count > 0 and
+                (sched_count == 0 or uni_sched_buf[0].urgency < sched_buf[0].send.urgency);
+            for ([_]bool{ uni_first, !uni_first }) |uni_pass| {
+                if (!uni_pass) {
+                    for (sched_buf[0..sched_count]) |s| {
+                        if (fbs.seek + AEAD_TAG_LEN + 16 >= stream_max) break;
+                        const retransmitting = s.send.hasRetransmitData();
+                        if (conn_budget == 0 and !retransmitting) continue;
+                        if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
+                        const remaining = stream_max - fbs.seek - AEAD_TAG_LEN;
+                        const header_overhead = streamFrameHeaderOverhead(s.send.stream_id, s.send.send_offset, remaining);
+                        if (remaining <= header_overhead) break;
+                        const max_stream_data = if (retransmitting)
+                            remaining - header_overhead
+                        else
+                            @min(remaining - header_overhead, conn_budget);
+                        const prev_send_offset = s.send.send_offset;
+                        if (s.send.popStreamFrame(max_stream_data)) |stream_frame| {
+                            try stream_frame.write(writer);
+                            ack_eliciting = true;
+                            if (stream_frame.stream.fin) streams.closeIfDone(s);
+                            // Only count NEW data against connection flow control (not retransmissions)
+                            const new_bytes = s.send.send_offset - prev_send_offset;
+                            if (new_bytes > 0) {
+                                conn_budget -= @min(conn_budget, new_bytes);
+                                if (self.conn_flow_ctrl) |cfc| cfc.base.addBytesSent(new_bytes);
+                            }
+                            // Record for retransmission tracking
+                            stream_frame_infos[stream_frame_info_count] = .{
+                                .stream_id = stream_frame.stream.stream_id,
+                                .offset = stream_frame.stream.offset,
+                                .length = stream_frame.stream.length,
+                                .fin = stream_frame.stream.fin,
+                            };
+                            stream_frame_info_count += 1;
                         }
-                        // Record for retransmission tracking
-                        stream_frame_infos[stream_frame_info_count] = .{
-                            .stream_id = stream_frame.stream.stream_id,
-                            .offset = stream_frame.stream.offset,
-                            .length = stream_frame.stream.length,
-                            .fin = stream_frame.stream.fin,
-                        };
-                        stream_frame_info_count += 1;
+                    }
+                } else {
+                    for (uni_sched_buf[0..uni_sched_count]) |s| {
+                        if (fbs.seek + AEAD_TAG_LEN + 16 >= stream_max) break;
+                        const retransmitting = s.hasRetransmitData();
+                        if (conn_budget == 0 and !retransmitting) continue;
+                        if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
+                        const remaining_uni = stream_max - fbs.seek - AEAD_TAG_LEN;
+                        const uni_header_overhead = streamFrameHeaderOverhead(s.stream_id, s.send_offset, remaining_uni);
+                        if (remaining_uni <= uni_header_overhead) break;
+                        const max_stream_data = if (retransmitting)
+                            remaining_uni - uni_header_overhead
+                        else
+                            @min(remaining_uni - uni_header_overhead, conn_budget);
+                        const prev_uni_offset = s.send_offset;
+                        if (s.popStreamFrame(max_stream_data)) |stream_frame| {
+                            try stream_frame.write(writer);
+                            ack_eliciting = true;
+                            // Only count NEW data against connection flow control
+                            const new_bytes_uni = s.send_offset - prev_uni_offset;
+                            if (new_bytes_uni > 0) {
+                                conn_budget -= @min(conn_budget, new_bytes_uni);
+                                if (self.conn_flow_ctrl) |cfc| cfc.base.addBytesSent(new_bytes_uni);
+                            }
+                            // Record for retransmission tracking
+                            stream_frame_infos[stream_frame_info_count] = .{
+                                .stream_id = stream_frame.stream.stream_id,
+                                .offset = stream_frame.stream.offset,
+                                .length = stream_frame.stream.length,
+                                .fin = stream_frame.stream.fin,
+                            };
+                            stream_frame_info_count += 1;
+                        }
                     }
                 }
-            } // send_streams.count() > 0
+            }
 
             if (sched_count == 0 and uni_sched_count == 0) {
                 if (streams.send_ledger) |l| l.send_due = false;
@@ -1862,4 +1868,40 @@ test "PacketPacker: streams are walked only while one may have something to send
     w.send.queueRetransmit(0, 3, false);
     try testing.expect(try rig.pack(&out, 1000) > 0);
     try testing.expect(!w.send.hasRetransmitData());
+}
+
+test "PacketPacker: a more urgent unidirectional stream goes ahead of requests" {
+    // Bidirectional streams were always packed first, so an HTTP/3 client's
+    // SETTINGS and QPACK streams followed its CONNECT in the same packet.
+    // imquic answers the CONNECT before it reads on, and took the streams
+    // behind it for WebTransport ones.
+    for ([_]u3{ 0, 3 }) |uni_urgency| {
+        const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+        var packer = PacketPacker.init(testing.allocator, false, &[_]u8{0x01}, dcid, 0x00000001);
+        var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+        defer pkt_handler.deinit();
+        var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+        defer crypto_mgr.deinit();
+        var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+        defer streams.deinit();
+        var pending_frames = frame_mod.PendingFrameQueue{};
+        streams.setMaxStreams(10, 10);
+        streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+
+        const req = try streams.openBidiStream();
+        try req.send.writeData("CONNECT");
+        const ctrl = try streams.openUniStream();
+        ctrl.urgency = uni_urgency;
+        try ctrl.writeData("SETTINGS");
+
+        var out_buf: [1500]u8 = undefined;
+        _ = try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out_buf);
+        const app_idx = @backingInt(ack_handler.EncLevel.application);
+        var it = pkt_handler.sent[app_idx].sent_packets.iterator();
+        const sf = it.next().?.getStreamFrames();
+        try testing.expectEqual(@as(usize, 2), sf.len);
+        // Urgency 0 beats the request's default 3; a tie keeps requests first.
+        const first: u64 = if (uni_urgency < req.send.urgency) ctrl.stream_id else req.send.stream_id;
+        try testing.expectEqual(first, sf[0].stream_id);
+    }
 }

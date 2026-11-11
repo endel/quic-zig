@@ -299,8 +299,12 @@ pub const H3Connection = struct {
         // Open control stream (type 0x00)
         // All three are written through pointers kept for the connection's
         // life, so a peer's STOP_SENDING must not get them reclaimed.
+        // Urgency 0, RFC 9218's highest: they lead any request in a packet,
+        // as browsers send them. imquic misreads them as WebTransport
+        // streams when they follow the CONNECT it has just answered.
         const ctrl = try self.quic_conn.openUniStream();
         ctrl.pinned = true;
+        ctrl.urgency = 0;
         self.local_control_stream = ctrl;
         // Write stream type
         var type_buf: [8]u8 = undefined;
@@ -328,6 +332,7 @@ pub const H3Connection = struct {
         // Open QPACK encoder stream (type 0x02) — empty for static-only
         const enc = try self.quic_conn.openUniStream();
         enc.pinned = true;
+        enc.urgency = 0;
         self.local_qpack_enc_stream = enc;
         type_fbs = io.fixedBufferStream(&type_buf);
         try h3_frame.writeUniStreamType(&type_fbs, .qpack_encoder);
@@ -336,6 +341,7 @@ pub const H3Connection = struct {
         // Open QPACK decoder stream (type 0x03) — empty for static-only
         const dec = try self.quic_conn.openUniStream();
         dec.pinned = true;
+        dec.urgency = 0;
         self.local_qpack_dec_stream = dec;
         type_fbs = io.fixedBufferStream(&type_buf);
         try h3_frame.writeUniStreamType(&type_fbs, .qpack_decoder);
@@ -3818,4 +3824,17 @@ test "H3 client: a response past the limit cancels its request, not the connecti
     const stream = quic_conn.streams.getStream(sid).?;
     try testing.expectEqual(@as(?u64, @backingInt(H3Error.excessive_load)), stream.recv.stop_sending_err);
     try testing.expect((try h3.poll()) == null);
+}
+
+test "H3: our control and QPACK streams outrank requests" {
+    // Packed behind a CONNECT, they reached imquic after it had switched the
+    // connection to WebTransport, which took them for WebTransport streams.
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    try h3.initConnection();
+    for ([_]?*stream_mod.SendStream{ h3.local_control_stream, h3.local_qpack_enc_stream, h3.local_qpack_dec_stream }) |s| {
+        try testing.expectEqual(@as(u3, 0), s.?.urgency);
+    }
 }
