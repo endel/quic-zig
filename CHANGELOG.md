@@ -72,6 +72,10 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   `@fails-components/webtransport` clients rejected `closed` with "Opening
   handshake failed" when the GOAWAY was read first, which failed every
   moq-playa test against the MoQ relay over WebTransport.
+- `moq-test-client`'s namespace cases withdraw a publisher only once the relay
+  has answered it. Against a relay that tells subscribers first,
+  `subscribe-namespace-lifecycle` failed about one run in ten with "publisher
+  never got REQUEST_OK".
 - A native-QUIC handler now gets `onStopSending` for a bidi stream, as a
   WebTransport one does, and `ClientSession.stopSendingQuicStream` reaches a
   peer's uni streams. The MoQ relay takes a STOP_SENDING as a cancelled

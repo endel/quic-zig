@@ -1027,6 +1027,12 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             }
         }
 
+        /// Every request it sent has had its answer. A second one refused
+        /// fails the leg, so only its REQUEST_OK counts.
+        pub fn answered(self: *const Self) bool {
+            return (self.got_request_ok or self.got_request_error) and (self.extra_sid == null or self.got_extra_ok);
+        }
+
         /// Cancels a still-open announcement or subscription, so a relay that
         /// is slow to notice the close does not carry it into the next test.
         pub fn withdraw(self: *Self, cs: *event_loop.ClientSession) void {
@@ -1391,20 +1397,22 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             };
         }
 
-        /// The withdrawals and data the scenario drives between ticks.
+        /// The withdrawals and data the scenario drives between ticks. A
+        /// publisher withdraws only once answered: a relay may tell
+        /// subscribers before it acks the publisher.
         fn advance(case: TestCase, legs: []Leg) void {
             const a = &legs[0].peer;
             switch (case) {
                 .subscribe_namespace_lifecycle => {
                     const p = &legs[1];
-                    if (!p.peer.cancelled and a.nsIndex(false, "") != null) p.withdraw();
+                    if (!p.peer.cancelled and p.peer.answered() and a.nsIndex(false, "") != null) p.withdraw();
                 },
                 .publish_namespace_multi_publisher_retention => {
                     // The duplicate withdraws once the observer has seen
                     // both of its namespaces; the first publisher once
                     // both late subscribers found what it kept alive.
-                    if (!legs[2].peer.cancelled and a.nsIndex(false, "sync/") != null) legs[2].withdraw();
-                    if (!legs[1].peer.cancelled and
+                    if (!legs[2].peer.cancelled and legs[2].peer.answered() and a.nsIndex(false, "sync/") != null) legs[2].withdraw();
+                    if (!legs[1].peer.cancelled and legs[1].peer.answered() and
                         legs[3].peer.nsIndex(false, "shared/") != null and
                         legs[4].peer.nsIndex(false, "shared/") != null) legs[1].withdraw();
                 },
