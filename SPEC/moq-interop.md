@@ -82,13 +82,34 @@ satisfy them.
 | `publish-namespace-multi-publisher-retention` (rev 1) | two publishers announce one namespace; the duplicate withdraws; two late subscribers discover it; the first publisher withdraws | both late subscribers see NAMESPACE then NAMESPACE_DONE |
 | `data-subgroup-basic` (rev 2) | publisher announces a 3-field prefix and serves the canonical MoQT Test tuple beneath it; subscriber SUBSCRIBEs to the 19-field namespace with no FORWARD, priority or filter | exactly objects (0..2, 0..4), subgroup 0, priority 128, 64/32 bytes of `t`, then PUBLISH_DONE TRACK_ENDED |
 
+Eight more data-plane cases are our client's own. They run the tuples of
+moq-rs-draft-18's moq-test-client scenarios (aiomoqt runs them as
+`moq-test-*`) under the runner's publisher-first flow and its suite's
+Publisher Priority 128, so they are named `data-*` instead:
+
+| Case | Tuple's point |
+|---|---|
+| `data-subgroup-per-group-eog` | End of Group status objects |
+| `data-subgroup-per-object` | a stream, and a subgroup, per object |
+| `data-two-subgroups-eog` | two subgroups per group, by object parity, with End of Group |
+| `data-datagram`, `data-datagram-eog` | datagrams, and End of Group as a status datagram |
+| `data-extensions` | an integer and a variable test extension on every object |
+| `data-increments` | groups 10, 17, 24 and objects 3, 5, 7 |
+| `data-forward-zero` | the subscriber asks for FORWARD=0: no objects, Stream Count 0 |
+
+Each checks every object once, on its subgroup or as a datagram, with its
+size, payload, priority and extensions, the End of Group markers, and
+PUBLISH_DONE TRACK_ENDED with the exact Stream Count.
+
 Timeouts 2 s, except `announce-subscribe` (3 s),
 `subscribe-before-announce` (3.5 s), the two namespace cases (8 s) and
-`data-subgroup-basic` (20 s: two 5 s setup phases, then 10 s to deliver).
+the data cases (20 s: two 5 s setup phases, then 10 s to deliver).
 
-Our `data-subgroup-basic` publisher sends PUBLISH_DONE once its data streams
-are acknowledged rather than as soon as they are finished: imquic ends the
-subscription on PUBLISH_DONE and drops whatever is still in flight.
+Our data publisher starts once the subscriber has its SUBSCRIBE_OK, as
+aiomoqt's does, and sends PUBLISH_DONE once what it sent is acknowledged
+(its streams' FINs, or for datagrams everything in flight) rather than
+as soon as it is finished: imquic ends the subscription on PUBLISH_DONE and
+drops whatever is still in flight.
 
 The runner's own spec cites `RENDEZVOUS_TIMEOUT` as draft-18 §10.2.6, which
 reads as though draft-17 cannot run that case. It can: the parameter is
@@ -202,9 +223,11 @@ every remaining failure: [`moq-interop-results.md`](moq-interop-results.md).
 of 2048 to 4096 bits, PKCS#1 or PKCS#8). The runner generates P-256
 deliberately: browsers pin a certificate by hash only when it is ECDSA.
 
-Both drafts are implemented, so `draft_versions` would be
-`["draft-17", "draft-18"]`. draft-18 is the runner's `current_target` and
-pairs with most of its eighteen relays; draft-17 with four.
+`draft_versions` is `["draft-17", "draft-18", "draft-22"]`. draft-18 is the
+runner's `current_target`; a pair runs only on a shared draft, so without
+draft-22 the relays and clients that speak nothing else (moq-go, moqtail,
+moqt-nr-draft-22, red5-moq-relay, moqxr) never met ours. moq-go passes every
+case both ways at draft-22 (12 Nov 2026).
 
 ## Known blockers
 

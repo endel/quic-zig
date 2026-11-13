@@ -445,7 +445,7 @@ cross-impl byte-exact UTF-8 header check.
 | — | H3_ID_ERROR validation | ✅ Done | Invalid session IDs (not client-initiated bidi) close connection |
 | — | H3_MESSAGE_ERROR post-close | ✅ Done | Bytes after a received WT_CLOSE_SESSION, a truncated or malformed capsule, or a close reason past 1024 bytes or not UTF-8, reset the CONNECT stream. Unknown capsule types are dropped |
 | — | Session termination by the CONNECT stream (§6) | ✅ Done | A bare FIN is a close with code 0 and is answered with a FIN; a RESET_STREAM or STOP_SENDING ends the session as `abrupt`. Reasons sent are cut at a UTF-8 boundary; nothing but the capsule and FIN follows our close. A terminated session takes no new stream or datagram (`error.SessionGone`), and all its streams are reset, a FIN already sent included. A connection's end reports each session once, by its id. `SPEC/DRAFT_IETF_WEBTRANS_HTTP3_13.md` |
-| — | Connection close after the last session | ✅ Done | GOAWAY, then CONNECTION_CLOSE(H3_NO_ERROR) once the peer has ended its CONNECT streams and acked ours, or 3 PTO; `wt_close_after_sessions`. Chrome leaves such a connection silently |
+| — | Connection close after the last session | ✅ Done | GOAWAY once the peer has acked the end of its sessions, then CONNECTION_CLOSE(H3_NO_ERROR) once it has ended its CONNECT streams and acked the GOAWAY, or 3 PTO; `wt_close_after_sessions`. Chrome leaves such a connection silently |
 | — | Application-protocol negotiation | ✅ Done | draft-13 §3.3 `WT-Available-Protocols` / `WT-Protocol`, RFC 8941 structured fields (`src/webtransport/protocol.zig`). The older `sec-webtransport-protocol` spelling survives only in the interop apps |
 | — | Session prioritization | ✅ Done | Priority header on CONNECT parsed by H3 layer, PRIORITY_UPDATE frames supported |
 | — | GOAWAY → session interaction | ✅ Done | A GOAWAY or a WT_DRAIN_SESSION drains a session, reported once per session whichever came. `Server.drain` / `Session.drainConnection` send both, the GOAWAY once each session's 200 is acked |
@@ -653,11 +653,11 @@ details, and [moq-interop.md](moq-interop.md) for the interop runner.
 | Relay: SUBSCRIBE routed to the namespace's publisher with the subscriber's filter; FORWARD, REQUEST_UPDATE; withdrawal by reset or (17/18) FIN | ✅ Done |
 | Relay: SUBSCRIBE_TRACKS answered with PUBLISH; PREFIX_OVERLAP; early data streams and datagrams held for their alias | ✅ Done |
 | WebTransport browser client/server + protocol negotiation | ✅ Done |
-| Interop test client (10 cases incl. namespace discovery and `data-subgroup-basic`, TAP 14, containerised) | ✅ Done |
+| Interop test client (18 cases incl. namespace discovery, `data-subgroup-basic` and eight more MoQT Test tuples, TAP 14, containerised) | ✅ Done |
 | Datagram objects, relayed with alias remapping | ✅ Done |
-| FETCH request/response runtime | ⚠ Codec only |
+| FETCH (standalone, joining, draft-22 fills) and TRACK_STATUS, from the relay's cache or its publisher | ✅ Done — aiomoqt `fetch` and `join` pass at drafts 18 and 22 |
 | draft-18, alongside draft-17 | ✅ Done — chosen by ALPN, per peer |
-| draft-22 (LOCATION_FILTER, new parameters, FIN semantics, resuming paused publications) | ✅ Done — FETCH's new shape and fill streams not yet |
+| draft-22 (LOCATION_FILTER, new parameters, FIN semantics, resuming paused publications, FETCH's new shape, fills) | ✅ Done — PUBLISH_STATE_NOTIFY not yet |
 | Interop: our relay, both transports, both drafts | ✅ 7/7 each |
 | Interop: our relay against every registered draft-18 client | ✅ all pass (23 Sep 2026) |
 | Interop: moq-relay v0.14.16 (both transports, both drafts) | ⚠ 6/7 — their non-standard error code |

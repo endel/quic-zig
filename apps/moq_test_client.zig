@@ -27,6 +27,7 @@ const wt_protocol = quic.webtransport_protocol;
 const moq_msg = quic.moq.message;
 const moq_codes = quic.moq.message_codes;
 const moq_obj = quic.moq.object;
+const moq_track = quic.moq.track;
 const moq_wire = quic.moq.wire;
 const moq_session = quic.moq.session;
 const moq_url = quic.moq.url;
@@ -55,6 +56,14 @@ const TestCase = enum {
     subscribe_namespace_lifecycle,
     publish_namespace_multi_publisher_retention,
     data_subgroup_basic,
+    data_subgroup_per_group_eog,
+    data_subgroup_per_object,
+    data_two_subgroups_eog,
+    data_datagram,
+    data_datagram_eog,
+    data_extensions,
+    data_increments,
+    data_forward_zero,
 
     fn name(self: TestCase) []const u8 {
         return switch (self) {
@@ -68,6 +77,14 @@ const TestCase = enum {
             .subscribe_namespace_lifecycle => "subscribe-namespace-lifecycle",
             .publish_namespace_multi_publisher_retention => "publish-namespace-multi-publisher-retention",
             .data_subgroup_basic => "data-subgroup-basic",
+            .data_subgroup_per_group_eog => "data-subgroup-per-group-eog",
+            .data_subgroup_per_object => "data-subgroup-per-object",
+            .data_two_subgroups_eog => "data-two-subgroups-eog",
+            .data_datagram => "data-datagram",
+            .data_datagram_eog => "data-datagram-eog",
+            .data_extensions => "data-extensions",
+            .data_increments => "data-increments",
+            .data_forward_zero => "data-forward-zero",
         };
     }
 
@@ -87,9 +104,13 @@ const TestCase = enum {
             .subscribe_namespace_lifecycle => 8000,
             .publish_namespace_multi_publisher_retention => 8000,
             // Two 5 s setup phases, then 10 s to deliver and drain.
-            .data_subgroup_basic => 20000,
-            else => 2000,
+            else => if (self.isData()) 20000 else 2000,
         };
+    }
+
+    /// A publisher, a subscriber and a MoQT Test tuple between them.
+    fn isData(self: TestCase) bool {
+        return @backingInt(self) >= @backingInt(TestCase.data_subgroup_basic);
     }
 
     /// For cases with a prose spec of their own (docs/tests in the runner).
@@ -145,21 +166,154 @@ const NsEvent = struct {
     }
 };
 
-// data-subgroup-basic's canonical MoQT Test tuple. The tuple is what a
-// publisher generates from, so these constants restate it for the checks.
-const DP_TUPLE = [_][]const u8{ "moq-test-00", "0", "0", "0", "2", "4", "5", "64", "32", "2", "1", "1", "0", "-1", "-1", "0" };
+// ─────────────────────────────────────────────────────────────────────
+// Data plane: MoQT Test tuples
+//
+// A track's namespace ends in a 16-field MoQT Test tuple (draft-afrind-
+// moq-test), and the publisher generates from it, so the subscriber knows
+// what to expect. Publisher Priority is the runner data-plane suite's 128,
+// not MoQT Test's own 200 + group % 2.
+// ─────────────────────────────────────────────────────────────────────
+
 const DP_TRACK = "track";
-const DP_GROUPS: usize = 3;
-const DP_PER_GROUP: usize = 5;
-const DP_OBJECTS = DP_GROUPS * DP_PER_GROUP;
-const DP_INTERVAL_MS: i64 = 2;
 const DP_PRIORITY: u8 = 128;
 const DP_ALIAS: u64 = 1;
 const DP_PAYLOAD: [64]u8 = @splat('t');
+/// After PUBLISH_DONE, datagrams can still trail it, and with Forward
+/// State 0 an object arriving now still fails the case.
+const DP_GRACE_MS: i64 = 250;
 
-fn dpSize(object: u64) usize {
-    return if (object == 0) 64 else 32;
-}
+/// The 15 numbers after "moq-test-00".
+const Tuple = struct {
+    fp: u2,
+    start_group: u64,
+    start_object: u64,
+    last_group: u64,
+    last_object: u64,
+    per_group: u64,
+    size0: usize,
+    size_gt0: usize,
+    freq_ms: i64,
+    g_inc: u64,
+    o_inc: u64,
+    markers: bool,
+    int_ext: i64,
+    var_ext: i64,
+
+    fn parse(f: *const [16][]const u8) Tuple {
+        const n = struct {
+            fn u(s: []const u8) u64 {
+                return std.fmt.parseInt(u64, s, 10) catch 0;
+            }
+            fn i(s: []const u8) i64 {
+                return std.fmt.parseInt(i64, s, 10) catch -1;
+            }
+        };
+        return .{
+            .fp = @intCast(@min(n.u(f[1]), 3)),
+            .start_group = n.u(f[2]),
+            .start_object = n.u(f[3]),
+            .last_group = n.u(f[4]),
+            .last_object = n.u(f[5]),
+            .per_group = n.u(f[6]),
+            .size0 = @intCast(@min(n.u(f[7]), DP_PAYLOAD.len)),
+            .size_gt0 = @intCast(@min(n.u(f[8]), DP_PAYLOAD.len)),
+            .freq_ms = @intCast(n.u(f[9])),
+            .g_inc = @max(n.u(f[10]), 1),
+            .o_inc = @max(n.u(f[11]), 1),
+            .markers = n.u(f[12]) != 0,
+            .int_ext = n.i(f[13]),
+            .var_ext = n.i(f[14]),
+        };
+    }
+
+    fn groups(self: Tuple) u64 {
+        return (self.last_group - self.start_group) / self.g_inc + 1;
+    }
+    fn objects(self: Tuple) u64 {
+        return (self.last_object - self.start_object) / self.o_inc + 1;
+    }
+    fn group(self: Tuple, gi: u64) u64 {
+        return self.start_group + gi * self.g_inc;
+    }
+    fn object(self: Tuple, oi: u64) u64 {
+        return self.start_object + oi * self.o_inc;
+    }
+    /// The index of group `g`, or null if the tuple never sends it.
+    fn groupIndex(self: Tuple, g: u64) ?u64 {
+        if (g < self.start_group or g > self.last_group or (g - self.start_group) % self.g_inc != 0) return null;
+        return (g - self.start_group) / self.g_inc;
+    }
+    fn objectIndex(self: Tuple, o: u64) ?u64 {
+        if (o < self.start_object or o > self.last_object or (o - self.start_object) % self.o_inc != 0) return null;
+        return (o - self.start_object) / self.o_inc;
+    }
+    /// With markers on, a group's last object is its End of Group.
+    fn isMarker(self: Tuple, o: u64) bool {
+        return self.markers and o == self.object(self.objects() - 1);
+    }
+    fn size(self: Tuple, o: u64) usize {
+        return if (o == self.start_object) self.size0 else self.size_gt0;
+    }
+    /// Null for a datagram.
+    fn subgroupOf(self: Tuple, o: u64) ?u64 {
+        return switch (self.fp) {
+            0 => 0,
+            1 => o,
+            2 => o % 2,
+            3 => null,
+        };
+    }
+    /// Whether forwarding preference 2 uses both subgroups in a group.
+    fn bothSubgroups(self: Tuple) bool {
+        return self.per_group > 1 and self.o_inc % 2 == 1;
+    }
+    fn streams(self: Tuple) u64 {
+        return switch (self.fp) {
+            0 => self.groups(),
+            1 => self.groups() * self.objects(),
+            2 => self.groups() * @as(u64, if (self.bothSubgroups()) 2 else 1),
+            3 => 0,
+        };
+    }
+    /// The test extensions' property types, as the wire carries them.
+    fn extKeys(self: Tuple) [2]?u64 {
+        return .{
+            if (self.int_ext >= 0) @as(u64, @intCast(self.int_ext)) * 2 else null,
+            if (self.var_ext >= 0) @as(u64, @intCast(self.var_ext)) * 2 + 1 else null,
+        };
+    }
+};
+
+/// One data-plane case: its tuple, and whether its subscriber asks for
+/// Forward State 0.
+const Scenario = struct {
+    tuple: [15][]const u8,
+    forward_zero: bool = false,
+
+    fn of(case: TestCase) Scenario {
+        return switch (case) {
+            // The runner's, revision 2.
+            .data_subgroup_basic => .{ .tuple = .{ "0", "0", "0", "2", "4", "5", "64", "32", "2", "1", "1", "0", "-1", "-1", "0" } },
+            // moq-rs-draft-18's moq-test-client scenarios, as aiomoqt runs
+            // them, under the runner's publisher-first flow.
+            .data_subgroup_per_group_eog => .{ .tuple = .{ "0", "0", "0", "2", "5", "5", "64", "32", "2", "1", "1", "1", "-1", "-1", "0" } },
+            .data_subgroup_per_object => .{ .tuple = .{ "1", "0", "0", "1", "3", "4", "64", "32", "2", "1", "1", "0", "-1", "-1", "0" } },
+            .data_two_subgroups_eog => .{ .tuple = .{ "2", "0", "0", "2", "6", "6", "64", "32", "2", "1", "1", "1", "-1", "-1", "0" } },
+            .data_datagram => .{ .tuple = .{ "3", "0", "0", "2", "4", "5", "64", "32", "20", "1", "1", "0", "-1", "-1", "0" } },
+            .data_datagram_eog => .{ .tuple = .{ "3", "0", "0", "2", "5", "5", "64", "32", "20", "1", "1", "1", "-1", "-1", "0" } },
+            .data_extensions => .{ .tuple = .{ "0", "0", "0", "2", "5", "5", "64", "32", "2", "1", "1", "1", "1", "2", "0" } },
+            .data_increments => .{ .tuple = .{ "0", "10", "3", "24", "7", "3", "40", "24", "2", "7", "2", "0", "-1", "-1", "0" } },
+            .data_forward_zero => .{ .tuple = .{ "0", "0", "0", "1", "2", "3", "64", "32", "2", "1", "1", "0", "-1", "-1", "0" }, .forward_zero = true },
+            else => unreachable,
+        };
+    }
+
+    /// The namespace tail: "moq-test-00" and the tuple.
+    fn fields(self: *const Scenario) [16][]const u8 {
+        return .{"moq-test-00"} ++ self.tuple;
+    }
+};
 
 /// One subgroup stream as the subscriber reads it.
 const DataStream = struct {
@@ -174,32 +328,44 @@ const DataStream = struct {
 const ReceivedObject = struct {
     alias: u64,
     group: u64,
-    subgroup: u64,
+    /// Null for a datagram.
+    subgroup: ?u64,
     id: u64,
     priority: u8,
     status: u64,
     len: usize,
     bytes_ok: bool,
+    /// A datagram with the End of Group type bit, which MoQT Test never sets.
+    dgram_eog: bool = false,
+    /// The first two property types it carried.
+    ext_keys: [2]?u64 = .{ null, null },
 };
 
-/// Shared by both legs of data-subgroup-basic: the publisher's generator
+/// Shared by both legs of a data-plane case: the publisher's generator
 /// state and what the subscriber received.
 const DataPlane = struct {
     full_ns: []const []const u8,
+    tuple: Tuple,
+    forward_zero: bool = false,
 
     gen_stream: ?u64 = null,
     upstream_ns_ok: bool = false,
     upstream_seen: bool = false,
     gen_start_ms: i64 = 0,
-    next: usize = 0,
-    out: u64 = 0,
-    out_ids: [DP_GROUPS]u64 = undefined,
+    /// The upstream SUBSCRIBE said FORWARD=0: nothing is generated.
+    gen_paused: bool = false,
+    next: u64 = 0,
+    /// The open stream of each subgroup a group uses (two at most) and
+    /// the last object written on it.
+    out: [2]?u64 = .{ null, null },
+    out_prev: [2]?u64 = .{ null, null },
+    out_ids: [32]u64 = undefined,
     streams_opened: u64 = 0,
     last_object_ms: i64 = 0,
     done_sent: bool = false,
 
-    streams: [8]DataStream = @splat(.{}),
-    objects: [2 * DP_OBJECTS]ReceivedObject = undefined,
+    streams: [16]DataStream = @splat(.{}),
+    objects: [64]ReceivedObject = undefined,
     objects_len: usize = 0,
     overflow: usize = 0,
     streams_finished: u64 = 0,
@@ -207,14 +373,38 @@ const DataPlane = struct {
     got_done: bool = false,
     done_status: u64 = 0,
     done_count: u64 = 0,
+    done_at_ms: i64 = 0,
 
     /// PUBLISH_DONE's count is exact unless it is the unknown sentinel.
     fn drained(self: *const DataPlane) bool {
         if (!self.got_done) return false;
         if (self.done_count >= (1 << 62) - 1) return false;
-        return self.streams_finished >= self.done_count;
+        if (self.streams_finished < self.done_count) return false;
+        const grace = self.tuple.fp == 3 or self.forward_zero;
+        return !grace or nowMs() >= self.done_at_ms + DP_GRACE_MS;
+    }
+
+    fn record(self: *DataPlane, o: ReceivedObject) void {
+        if (self.objects_len == self.objects.len) {
+            self.overflow += 1;
+            return;
+        }
+        self.objects[self.objects_len] = o;
+        self.objects_len += 1;
     }
 };
+
+/// The property types in a KV list, the first two.
+fn propertyKeys(props: []const u8) [2]?u64 {
+    var keys: [2]?u64 = .{ null, null };
+    var it = moq_wire.KvIterator.init(props);
+    var i: usize = 0;
+    while (i < keys.len) : (i += 1) {
+        const kv = (it.next() catch break) orelse break;
+        keys[i] = kv.key;
+    }
+    return keys;
+}
 
 fn nowMs() i64 {
     return @intCast(@divFloor(sys.nanoTimestamp(), 1_000_000));
@@ -282,6 +472,8 @@ fn Peer(comptime proto: event_loop.Protocol) type {
         /// The data-plane stimulus: no FORWARD, SUBSCRIBER_PRIORITY or
         /// SUBSCRIPTION_FILTER, so the subscription is unfiltered.
         bare_subscribe: bool = false,
+        /// SUBSCRIBE with FORWARD=0: it wants the subscription, no objects.
+        forward_zero: bool = false,
 
         /// .publisher announces this, and `extra_publish_ns` on a second
         /// request of its own when set.
@@ -519,6 +711,7 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                 .publish_done => |r| if (self.isOurRequest(r.stream_id)) {
                     if (self.dp) |dp| {
                         dp.got_done = true;
+                        dp.done_at_ms = nowMs();
                         dp.done_status = r.done.status_code;
                         dp.done_count = r.done.stream_count;
                     }
@@ -544,7 +737,7 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                     .track_namespace = self.subscribe_namespace,
                     .track_name = self.subscribe_track,
                     .rendezvous_timeout_ms = self.rendezvous_timeout_ms,
-                    .forward = if (self.bare_subscribe) null else true,
+                    .forward = if (self.forward_zero) false else if (self.bare_subscribe) null else true,
                     .subscriber_priority = if (self.bare_subscribe) null else 128,
                     .filter = if (self.bare_subscribe) null else .{},
                 }, self.draft) catch return,
@@ -610,12 +803,13 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             self.write(sid, buf[0..fbs.seek]) catch return;
             dp.upstream_ns_ok = true;
             dp.gen_stream = sid;
-            dp.gen_start_ms = nowMs();
+            dp.gen_paused = !(sub.forward orelse true);
             self.served_subscribe = true;
         }
 
-        /// Sends whatever objects are due, one subgroup stream per group,
-        /// then PUBLISH_DONE with the exact Stream Count.
+        /// Sends whatever objects are due, as the tuple's forwarding
+        /// preference lays them out, then PUBLISH_DONE with the exact Stream
+        /// Count. Paused (FORWARD=0 upstream), it sends nothing.
         pub fn pumpData(self: *Self, cs: *event_loop.ClientSession) void {
             const dp = self.dp orelse return;
             const sid = dp.gen_stream orelse return;
@@ -623,33 +817,49 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             self.cur = cs;
             defer self.cur = null;
 
+            const t = dp.tuple;
+            const per = t.objects();
+            const total: u64 = if (dp.gen_paused) 0 else t.groups() * per;
             const now = nowMs();
-            while (dp.next < DP_OBJECTS and now >= dp.gen_start_ms + @as(i64, @intCast(dp.next)) * DP_INTERVAL_MS) {
-                const g: u64 = dp.next / DP_PER_GROUP;
-                const o: u64 = dp.next % DP_PER_GROUP;
-                var buf: [128]u8 = undefined;
-                var fbs = io_compat.fixedBufferStream(&buf);
-                if (o == 0) {
-                    dp.out = self.openUni() catch |e| return self.fail("could not open a data stream: {t}", .{e});
-                    dp.out_ids[@intCast(dp.streams_opened)] = dp.out;
-                    dp.streams_opened += 1;
-                    moq_obj.writeSubgroupHeader(&fbs, .{
-                        .track_alias = DP_ALIAS,
-                        .group = g,
-                        .subgroup = 0,
-                        .publisher_priority = DP_PRIORITY,
-                        .end_of_group = false,
-                        .per_object_properties = false,
-                        .first_object = true,
-                    }, self.draft) catch return;
+            if (dp.gen_start_ms == 0) dp.gen_start_ms = now;
+            while (dp.next < total and now >= dp.gen_start_ms + @as(i64, @intCast(dp.next)) * t.freq_ms) {
+                const g = t.group(dp.next / per);
+                const oi = dp.next % per;
+                const o = t.object(oi);
+                const last = oi == per - 1;
+                if (t.fp == 3) {
+                    self.sendTupleDatagram(dp, g, o) catch |e| return self.fail("datagram write failed: {t}", .{e});
+                } else {
+                    // The streams this object needs, opened as their group,
+                    // or object, begins.
+                    if (oi == 0 or t.fp == 1) {
+                        for (0..2) |k| {
+                            const opens = switch (t.fp) {
+                                0 => k == 0,
+                                1 => k == 0,
+                                2 => t.start_object % 2 == k or t.bothSubgroups(),
+                                3 => unreachable,
+                            };
+                            if (!opens) continue;
+                            const sg: u64 = if (t.fp == 1) o else k;
+                            self.openTupleStream(dp, k, g, sg) catch |e| return self.fail("could not open a data stream: {t}", .{e});
+                        }
+                    }
+                    const k: usize = if (t.fp == 2) @intCast(o % 2) else 0;
+                    self.writeTupleObject(dp, k, o) catch |e| return self.fail("data write failed: {t}", .{e});
+                    // A marker ends its stream; the rest end with the group,
+                    // or the object when each has its own.
+                    if (t.isMarker(o) or last or t.fp == 1) {
+                        for (&dp.out) |*open| if (open.*) |id| {
+                            self.finish(id);
+                            open.* = null;
+                        };
+                    }
                 }
-                moq_obj.writeSubgroupObject(&fbs, .{ .id = o, .payload = DP_PAYLOAD[0..dpSize(o)] }, if (o == 0) null else o - 1, false) catch return;
-                self.write(dp.out, buf[0..fbs.seek]) catch |e| return self.fail("data write failed: {t}", .{e});
-                if (o == DP_PER_GROUP - 1) self.finish(dp.out);
                 dp.next += 1;
                 dp.last_object_ms = now;
             }
-            if (dp.next < DP_OBJECTS) return;
+            if (dp.next < total) return;
             // A relay that ends the subscription on PUBLISH_DONE drops what
             // is still in flight (imquic does), so it waits for the data to
             // be acknowledged, though never long.
@@ -667,7 +877,90 @@ fn Peer(comptime proto: event_loop.Protocol) type {
             dp.done_sent = true;
         }
 
+        fn openTupleStream(self: *Self, dp: *DataPlane, k: usize, g: u64, sg: u64) !void {
+            const id = try self.openUni();
+            if (dp.streams_opened == dp.out_ids.len) return error.TooManyStreams;
+            dp.out_ids[@intCast(dp.streams_opened)] = id;
+            dp.streams_opened += 1;
+            dp.out[k] = id;
+            dp.out_prev[k] = null;
+            var buf: [64]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&buf);
+            try moq_obj.writeSubgroupHeader(&fbs, .{
+                .track_alias = DP_ALIAS,
+                .group = g,
+                .subgroup = sg,
+                .publisher_priority = DP_PRIORITY,
+                .end_of_group = false,
+                .per_object_properties = dp.tuple.int_ext >= 0 or dp.tuple.var_ext >= 0,
+                .first_object = true,
+            }, self.draft);
+            try self.write(id, buf[0..fbs.seek]);
+        }
+
+        /// The tuple's object `o`, or its End of Group marker, on stream `k`.
+        fn writeTupleObject(self: *Self, dp: *DataPlane, k: usize, o: u64) !void {
+            const t = dp.tuple;
+            const id = dp.out[k] orelse return error.NoStream;
+            var props_buf: [64]u8 = undefined;
+            const marker = t.isMarker(o);
+            // Extensions on a status object are illegal.
+            const props = if (marker) "" else try tupleProperties(t, &props_buf);
+            var buf: [160]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&buf);
+            try moq_obj.writeSubgroupObject(&fbs, .{
+                .id = o,
+                .properties = props,
+                .status = if (marker) @backingInt(moq_track.ObjectStatus.end_of_group) else 0,
+                .payload = if (marker) "" else DP_PAYLOAD[0..t.size(o)],
+            }, dp.out_prev[k], t.int_ext >= 0 or t.var_ext >= 0);
+            try self.write(id, buf[0..fbs.seek]);
+            dp.out_prev[k] = o;
+        }
+
+        fn sendTupleDatagram(self: *Self, dp: *DataPlane, g: u64, o: u64) !void {
+            const t = dp.tuple;
+            var buf: [128]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&buf);
+            try moq_obj.writeDatagramObject(&fbs, .{
+                .track_alias = DP_ALIAS,
+                .group = g,
+                .object = o,
+                .publisher_priority = DP_PRIORITY,
+                .end_of_group = false,
+                .body = if (t.isMarker(o)) .{ .status = .end_of_group } else .{ .payload = DP_PAYLOAD[0..t.size(o)] },
+            });
+            const cs = self.cur orelse return error.NotConnected;
+            try cs.sendDatagram(self.wt_session_id, buf[0..fbs.seek]);
+        }
+
         // --- data plane: subscriber ---
+
+        pub fn onDatagram(self: *Self, _: *event_loop.ClientSession, _: u64, data: []const u8) void {
+            const dp = self.dp orelse return;
+            if (self.role != .subscriber) return;
+            const d = moq_obj.readDatagramObject(data) catch |e| return self.fail("bad object datagram: {t}", .{e});
+            dp.record(.{
+                .alias = d.track_alias,
+                .group = d.group,
+                .subgroup = null,
+                .id = d.object orelse 0,
+                .priority = d.publisher_priority orelse DP_PRIORITY,
+                .status = switch (d.body) {
+                    .status => |st| @backingInt(st),
+                    .payload => 0,
+                },
+                .len = switch (d.body) {
+                    .payload => |pl| pl.len,
+                    .status => 0,
+                },
+                .bytes_ok = switch (d.body) {
+                    .payload => |pl| std.mem.allEqual(u8, pl, 't'),
+                    .status => true,
+                },
+                .dgram_eog = d.end_of_group,
+            });
+        }
 
         /// A peer-opened uni stream that isn't the control stream carries
         /// objects, which the control session must not see.
@@ -713,11 +1006,7 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                 if (ds.first == null) ds.first = o.id;
                 ds.prev = o.id;
                 pos += read.consumed;
-                if (dp.objects_len == dp.objects.len) {
-                    dp.overflow += 1;
-                    continue;
-                }
-                dp.objects[dp.objects_len] = .{
+                dp.record(.{
                     .alias = h.track_alias,
                     .group = h.group,
                     .subgroup = h.subgroup orelse ds.first.?,
@@ -726,8 +1015,8 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                     .status = o.status,
                     .len = o.payload.len,
                     .bytes_ok = std.mem.allEqual(u8, o.payload, 't'),
-                };
-                dp.objects_len += 1;
+                    .ext_keys = propertyKeys(o.properties),
+                });
             }
             std.mem.copyForwards(u8, ds.buf[0 .. ds.len - pos], ds.buf[pos..ds.len]);
             ds.len -= pos;
@@ -736,6 +1025,12 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                 if (ds.len != 0) self.fail("stream {d} ended mid-object", .{ds.id});
                 dp.streams_finished += 1;
             }
+        }
+
+        /// Every request it sent has had its answer. A second one refused
+        /// fails the leg, so only its REQUEST_OK counts.
+        pub fn answered(self: *const Self) bool {
+            return (self.got_request_ok or self.got_request_error) and (self.extra_sid == null or self.got_extra_ok);
         }
 
         /// Cancels a still-open announcement or subscription, so a relay that
@@ -752,11 +1047,55 @@ fn Peer(comptime proto: event_loop.Protocol) type {
     };
 }
 
+/// How a connection ended before SETUP, from its CONNECTION_CLOSE, either
+/// side's. A CRYPTO_ERROR names its TLS alert (RFC 9001 §4.8).
+fn setCloseMsg(result: *Result, e: *const quic.connection.ConnectionError) void {
+    const r = e.reason()[0..@min(e.reason().len, 64)];
+    const sep: []const u8 = if (r.len > 0) ": " else "";
+    const reason = std.zig.fmtString(r); // the peer's bytes, inside a YAML string
+    if (!e.is_app and e.code >= 0x100 and e.code <= 0x1ff) {
+        const alert: std.crypto.tls.Alert.Description = @enumFromInt(@as(u8, @intCast(e.code - 0x100)));
+        const name = std.enums.tagName(std.crypto.tls.Alert.Description, alert) orelse "unknown";
+        return result.setMsg("connection closed before SETUP: TLS alert {d} {s}{s}{f}", .{ e.code - 0x100, name, sep, reason });
+    }
+    const kind = if (e.is_app) "application" else "transport";
+    result.setMsg("connection closed before SETUP: {s} error 0x{x}{s}{f}", .{ kind, e.code, sep, reason });
+}
+
+/// The test extensions for one object: the integer one a random varint,
+/// the variable one 1 to 20 zero bytes, in ascending type order.
+fn tupleProperties(t: Tuple, buf: []u8) ![]const u8 {
+    var entries: [2]moq_wire.KvEntry = undefined;
+    var n: usize = 0;
+    var rnd: [5]u8 = undefined;
+    sys.randomBytes(&rnd);
+    const zeros: [20]u8 = @splat(0);
+    const keys = t.extKeys();
+    if (keys[0]) |k| {
+        entries[n] = .{ .key = k, .value = .{ .varint = std.mem.readInt(u32, rnd[0..4], .little) } };
+        n += 1;
+    }
+    if (keys[1]) |k| {
+        entries[n] = .{ .key = k, .value = .{ .bytes = zeros[0 .. 1 + rnd[4] % 20] } };
+        n += 1;
+    }
+    if (n == 2 and entries[0].key > entries[1].key) std.mem.swap(moq_wire.KvEntry, &entries[0], &entries[1]);
+    var fbs = io_compat.fixedBufferStream(buf);
+    try moq_wire.encodeKvList(&fbs, entries[0..n]);
+    return buf[0..fbs.seek];
+}
+
 /// Every data stream we opened has had its FIN acknowledged. A fully
 /// acknowledged uni stream is freed, so one that is gone counts too.
 fn dataAcked(cs: *event_loop.ClientSession, dp: *const DataPlane) bool {
     for (dp.out_ids[0..@intCast(dp.streams_opened)]) |id| {
         if (cs.conn.streams.send_streams.get(id)) |ss| if (!ss.fin_acked) return false;
+    }
+    // Datagrams have no FIN to wait on: everything sent acknowledged (or
+    // lost) instead, or a relay that ends the subscription on PUBLISH_DONE
+    // drops the last of them.
+    if (dp.tuple.fp == 3) {
+        if (cs.conn.datagram_send_queue.count > 0 or cs.conn.pkt_handler.bytes_in_flight > 0) return false;
     }
     return true;
 }
@@ -932,9 +1271,15 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             const rt_prefix = [_][]const u8{ "moq-test", "multi-publisher-retention", run_id };
             const rt_shared = rt_prefix ++ [_][]const u8{"shared"};
             const rt_sync = rt_prefix ++ [_][]const u8{"sync"};
-            const dp_prefix = [_][]const u8{ "moq-test", "data-subgroup-basic", run_id };
-            const dp_full = dp_prefix ++ DP_TUPLE;
-            var dp: DataPlane = .{ .full_ns = &dp_full };
+            const scenario: ?Scenario = if (case.isData()) Scenario.of(case) else null;
+            const dp_prefix = [_][]const u8{ "moq-test", case.name(), run_id };
+            const dp_fields = if (scenario) |sc| sc.fields() else @as([16][]const u8, @splat(""));
+            const dp_full = dp_prefix ++ dp_fields;
+            var dp: DataPlane = .{
+                .full_ns = &dp_full,
+                .tuple = Tuple.parse(&dp_fields),
+                .forward_zero = if (scenario) |sc| sc.forward_zero else false,
+            };
 
             switch (case) {
                 .setup_only => legs[0].peer.role = .idle,
@@ -986,7 +1331,16 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                     }
                     leg_count = 5;
                 },
-                .data_subgroup_basic => {
+                .data_subgroup_basic,
+                .data_subgroup_per_group_eog,
+                .data_subgroup_per_object,
+                .data_two_subgroups_eog,
+                .data_datagram,
+                .data_datagram_eog,
+                .data_extensions,
+                .data_increments,
+                .data_forward_zero,
+                => {
                     legs[0].peer.role = .publisher;
                     legs[0].peer.publish_ns = &dp_prefix;
                     legs[0].peer.dp = &dp;
@@ -994,6 +1348,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                     legs[1].peer.subscribe_namespace = &dp_full;
                     legs[1].peer.subscribe_track = DP_TRACK;
                     legs[1].peer.bare_subscribe = true;
+                    legs[1].peer.forward_zero = dp.forward_zero;
                     legs[1].peer.dp = &dp;
                     leg_count = 2;
                 },
@@ -1035,6 +1390,16 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                     return;
                 }
             }
+            // A connection that ended before SETUP: say how, not only that
+            // nothing came.
+            for (legs[0..leg_count]) |*l| {
+                if (l.peer.sess.setup_received) continue;
+                const c = &(l.client orelse continue);
+                const e = &(c.conn.local_err orelse continue);
+                result.outcome = .fail;
+                setCloseMsg(result, e);
+                return;
+            }
             judge(case, legs[0..leg_count], result);
         }
 
@@ -1045,7 +1410,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             return switch (case) {
                 // The subscriber only starts once the publisher's
                 // announcement has been acknowledged.
-                .announce_subscribe, .data_subgroup_basic => i == 0 or a.got_request_ok,
+                .announce_subscribe, .data_subgroup_basic, .data_subgroup_per_group_eog, .data_subgroup_per_object, .data_two_subgroups_eog, .data_datagram, .data_datagram_eog, .data_extensions, .data_increments, .data_forward_zero => i == 0 or a.got_request_ok,
                 .subscribe_namespace_lifecycle => i == 0 or a.got_request_ok,
                 .publish_namespace_multi_publisher_retention => switch (i) {
                     0 => true,
@@ -1057,24 +1422,29 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             };
         }
 
-        /// The withdrawals and data the scenario drives between ticks.
+        /// The withdrawals and data the scenario drives between ticks. A
+        /// publisher withdraws only once answered: a relay may tell
+        /// subscribers before it acks the publisher.
         fn advance(case: TestCase, legs: []Leg) void {
             const a = &legs[0].peer;
             switch (case) {
                 .subscribe_namespace_lifecycle => {
                     const p = &legs[1];
-                    if (!p.peer.cancelled and a.nsIndex(false, "") != null) p.withdraw();
+                    if (!p.peer.cancelled and p.peer.answered() and a.nsIndex(false, "") != null) p.withdraw();
                 },
                 .publish_namespace_multi_publisher_retention => {
                     // The duplicate withdraws once the observer has seen
                     // both of its namespaces; the first publisher once
                     // both late subscribers found what it kept alive.
-                    if (!legs[2].peer.cancelled and a.nsIndex(false, "sync/") != null) legs[2].withdraw();
-                    if (!legs[1].peer.cancelled and
+                    if (!legs[2].peer.cancelled and legs[2].peer.answered() and a.nsIndex(false, "sync/") != null) legs[2].withdraw();
+                    if (!legs[1].peer.cancelled and legs[1].peer.answered() and
                         legs[3].peer.nsIndex(false, "shared/") != null and
                         legs[4].peer.nsIndex(false, "shared/") != null) legs[1].withdraw();
                 },
-                .data_subgroup_basic => legs[0].pump(),
+                // Generation waits for the subscriber's SUBSCRIBE_OK, as
+                // aiomoqt's does: a relay drops datagrams for a downstream
+                // subscription it has not finished setting up.
+                .data_subgroup_basic, .data_subgroup_per_group_eog, .data_subgroup_per_object, .data_two_subgroups_eog, .data_datagram, .data_datagram_eog, .data_extensions, .data_increments, .data_forward_zero => if (legs[1].peer.got_subscribe_ok) legs[0].pump(),
                 else => {},
             }
         }
@@ -1094,7 +1464,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                 .subscribe_namespace_lifecycle => a.got_request_error or a.nsIndex(true, "") != null,
                 .publish_namespace_multi_publisher_retention => a.got_request_error or
                     (legs[3].peer.nsIndex(true, "shared/") != null and legs[4].peer.nsIndex(true, "shared/") != null),
-                .data_subgroup_basic => legs[1].peer.got_request_error or legs[1].peer.dp.?.drained(),
+                .data_subgroup_basic, .data_subgroup_per_group_eog, .data_subgroup_per_object, .data_two_subgroups_eog, .data_datagram, .data_datagram_eog, .data_extensions, .data_increments, .data_forward_zero => legs[1].peer.got_request_error or legs[1].peer.dp.?.drained(),
             };
         }
 
@@ -1195,7 +1565,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                 },
                 .subscribe_namespace_lifecycle => judgeLifecycle(legs, result),
                 .publish_namespace_multi_publisher_retention => judgeRetention(legs, result),
-                .data_subgroup_basic => judgeData(legs, result),
+                .data_subgroup_basic, .data_subgroup_per_group_eog, .data_subgroup_per_object, .data_two_subgroups_eog, .data_datagram, .data_datagram_eog, .data_extensions, .data_increments, .data_forward_zero => judgeData(legs, result),
             }
         }
 
@@ -1237,9 +1607,15 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             result.outcome = .pass;
         }
 
+        /// What the relay delivered against what the tuple generates: each
+        /// object once, on its subgroup or as a datagram, with its size,
+        /// payload, priority and extensions; End of Group where markers
+        /// are on; PUBLISH_DONE TRACK_ENDED with the exact Stream Count.
+        /// Forward State 0: nothing at all, and Stream Count 0.
         fn judgeData(legs: []Leg, result: *Result) void {
             const sub = &legs[1].peer;
             const dp = sub.dp.?;
+            const t = dp.tuple;
             result.outcome = .fail;
             if (!legs[0].peer.got_request_ok) return result.setMsg("publisher never got REQUEST_OK", .{});
             if (sub.got_request_error) return result.setMsg("SUBSCRIBE rejected: code={d}", .{sub.error_code});
@@ -1247,33 +1623,56 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             if (!dp.upstream_ns_ok) return result.setMsg("upstream SUBSCRIBE did not carry the 19-field namespace", .{});
             if (!sub.got_subscribe_ok) return result.setMsg("no SUBSCRIBE_OK downstream", .{});
             if (dp.overflow > 0) return result.setMsg("{d} more objects than the scenario sends", .{dp.objects_len + dp.overflow});
+            if (dp.forward_zero and dp.objects_len > 0) return result.setMsg("{d} object(s) delivered with Forward State 0", .{dp.objects_len});
 
-            var seen: [DP_GROUPS][DP_PER_GROUP]bool = @splat(@splat(false));
+            var seen: [8][16]bool = @splat(@splat(false));
+            var seen_eog: [8]bool = @splat(false);
             var data: usize = 0;
+            const want_keys = t.extKeys();
             for (dp.objects[0..dp.objects_len]) |o| {
-                // Status objects (End of Group, End of Track) aren't data
-                // objects; the data-plane conventions leave their placement open.
-                if (o.status != 0) continue;
-                data += 1;
-                if (o.group >= DP_GROUPS or o.id >= DP_PER_GROUP) return result.setMsg("unexpected object ({d}, {d})", .{ o.group, o.id });
-                const slot = &seen[@intCast(o.group)][@intCast(o.id)];
+                const gi = t.groupIndex(o.group) orelse return result.setMsg("unexpected object ({d}, {d})", .{ o.group, o.id });
+                const oi = t.objectIndex(o.id) orelse return result.setMsg("unexpected object ({d}, {d})", .{ o.group, o.id });
+                if (gi >= seen.len or oi >= seen[0].len) return result.setMsg("object ({d}, {d}) outside the scenario", .{ o.group, o.id });
+                const want_sg = t.subgroupOf(o.id);
+                if (want_sg == null and o.subgroup != null) return result.setMsg("object ({d}, {d}) on a stream, expected a datagram", .{ o.group, o.id });
+                if (want_sg != null and o.subgroup == null) return result.setMsg("object ({d}, {d}) as a datagram, expected subgroup {d}", .{ o.group, o.id, want_sg.? });
+                if (want_sg) |w| if (o.subgroup.? != w) return result.setMsg("object ({d}, {d}) on subgroup {d}, expected {d}", .{ o.group, o.id, o.subgroup.?, w });
+                if (o.priority != DP_PRIORITY) return result.setMsg("object ({d}, {d}) priority {d}", .{ o.group, o.id, o.priority });
+                if (o.dgram_eog) return result.setMsg("datagram ({d}, {d}) sets the End of Group type bit", .{ o.group, o.id });
+                if (dp.sub_alias) |al| if (o.alias != al) return result.setMsg("object ({d}, {d}) on alias {d}, SUBSCRIBE_OK said {d}", .{ o.group, o.id, o.alias, al });
+                if (o.status == @backingInt(moq_track.ObjectStatus.end_of_group)) {
+                    if (!t.isMarker(o.id)) return result.setMsg("unexpected End of Group at ({d}, {d})", .{ o.group, o.id });
+                    seen_eog[@intCast(gi)] = true;
+                    continue;
+                }
+                if (o.status != 0) return result.setMsg("object ({d}, {d}) with status {d}", .{ o.group, o.id, o.status });
+                if (t.isMarker(o.id)) return result.setMsg("object ({d}, {d}) where End of Group belongs", .{ o.group, o.id });
+                const slot = &seen[@intCast(gi)][@intCast(oi)];
                 if (slot.*) return result.setMsg("duplicate object ({d}, {d})", .{ o.group, o.id });
                 slot.* = true;
-                if (o.subgroup != 0) return result.setMsg("object ({d}, {d}) on subgroup {d}", .{ o.group, o.id, o.subgroup });
-                if (o.priority != DP_PRIORITY) return result.setMsg("object ({d}, {d}) priority {d}", .{ o.group, o.id, o.priority });
-                if (o.len != dpSize(o.id)) return result.setMsg("object ({d}, {d}) is {d} bytes, expected {d}", .{ o.group, o.id, o.len, dpSize(o.id) });
+                data += 1;
+                if (o.len != t.size(o.id)) return result.setMsg("object ({d}, {d}) is {d} bytes, expected {d}", .{ o.group, o.id, o.len, t.size(o.id) });
                 if (!o.bytes_ok) return result.setMsg("object ({d}, {d}) payload corrupt", .{ o.group, o.id });
-                if (dp.sub_alias) |al| if (o.alias != al) return result.setMsg("object ({d}, {d}) on alias {d}, SUBSCRIBE_OK said {d}", .{ o.group, o.id, o.alias, al });
+                if (!std.meta.eql(o.ext_keys, want_keys)) return result.setMsg("object ({d}, {d}) extensions {?d}/{?d}, expected {?d}/{?d}", .{ o.group, o.id, o.ext_keys[0], o.ext_keys[1], want_keys[0], want_keys[1] });
             }
-            var missing: usize = 0;
-            var first: ?[2]usize = null;
-            for (seen, 0..) |row, g| for (row, 0..) |got, o| if (!got) {
-                missing += 1;
-                if (first == null) first = .{ g, o };
-            };
-            if (first) |f| return result.setMsg("missing {d} objects, first ({d}, {d})", .{ missing, f[0], f[1] });
-            if (!dp.got_done) return result.setMsg("all objects arrived but no PUBLISH_DONE", .{});
+            if (!dp.forward_zero) {
+                var missing: usize = 0;
+                var first: ?[2]u64 = null;
+                for (0..@intCast(t.groups())) |gi| for (0..@intCast(t.objects())) |oi| {
+                    const o = t.object(oi);
+                    if (t.isMarker(o) or seen[gi][oi]) continue;
+                    missing += 1;
+                    if (first == null) first = .{ t.group(gi), o };
+                };
+                if (first) |f| return result.setMsg("missing {d} objects, first ({d}, {d})", .{ missing, f[0], f[1] });
+                if (t.markers) for (0..@intCast(t.groups())) |gi| {
+                    if (!seen_eog[gi]) return result.setMsg("missing End of Group in group {d}", .{t.group(gi)});
+                };
+            }
+            if (!dp.got_done) return result.setMsg("{d} objects but no PUBLISH_DONE", .{data});
             if (dp.done_status != moq_codes.DONE_TRACK_ENDED) return result.setMsg("PUBLISH_DONE status {d}, expected TRACK_ENDED", .{dp.done_status});
+            const streams: u64 = if (dp.forward_zero) 0 else t.streams();
+            if (dp.done_count != streams) return result.setMsg("PUBLISH_DONE Stream Count {d}, expected {d}", .{ dp.done_count, streams });
             result.outcome = .pass;
             result.setMsg("{d} objects, PUBLISH_DONE TRACK_ENDED, Stream Count {d}", .{ data, dp.done_count });
         }

@@ -184,14 +184,14 @@ Invalid datagram types: `0x22, 0x23, 0x26, 0x27, 0x2A, 0x2B, 0x2E, 0x2F` (STATUS
 | Wire primitives (`src/moq/wire.zig`, `message_codes.zig`) | done; leading-ones varint, KV list, tuples |
 | Control messages (`src/moq/message.zig`) | all 18 types encode **and** decode, matched to the §9 figures |
 | Message parameters (§9.3) | one codec with the type→shape table; unknown types are a protocol violation, as the draft requires |
-| Object framing (`src/moq/object.zig`) | subgroup headers (all id-modes and priority variants), subgroup object records (ID delta, properties, status), datagram objects, fetch stream headers |
+| Object framing (`src/moq/object.zig`) | subgroup headers (all id-modes and priority variants), subgroup object records (ID delta, properties, status), datagram objects, fetch streams (headers, objects in draft-17's absolute and later drafts' delta encoding, End of Range) |
 | Session (`src/moq/session.zig`) | SETUP + request-stream state machine, generic over the transport; reassembles split messages and drains coalesced ones |
 | Publisher / Subscriber | `moq-client` subscribes or `--mode publish`; `moq-server` publishes |
-| Relay (`moq-relay`) | both transports on one port; pub/sub fanout with alias remapping, SUBSCRIBE routed to the namespace's publisher with the subscriber's own filter and answered once it answers, namespace discovery (SUBSCRIBE_NAMESPACE) and track discovery (SUBSCRIBE_TRACKS, answered with PUBLISH), PREFIX_OVERLAP, rendezvous timeouts, datagrams, FORWARD and REQUEST_UPDATE, PUBLISH_DONE on publisher loss, a per-track group cache, a data stream or datagram that beats its alias held for 2 s, withdrawal by reset or (drafts 17, 18) FIN |
+| Relay (`moq-relay`) | both transports on one port; pub/sub fanout with alias remapping, SUBSCRIBE routed to the namespace's publisher with the subscriber's own filter and answered once it answers, namespace discovery (SUBSCRIBE_NAMESPACE) and track discovery (SUBSCRIBE_TRACKS, answered with PUBLISH), PREFIX_OVERLAP, rendezvous timeouts, datagrams, FORWARD and REQUEST_UPDATE, PUBLISH_DONE on publisher loss, a per-track group cache, FETCH (standalone, joining, draft-22 fills) from that cache or the publisher, TRACK_STATUS, LARGEST_OBJECT in SUBSCRIBE_OK, REQUEST_ERROR NOT_SUPPORTED for anything else, a data stream or datagram that beats its alias held for 2 s, withdrawal by reset, STOP_SENDING, or (drafts 17, 18) FIN |
 | Browser | `interop/browser/moq.html` and `moq_video.html`, driven end to end by `tools/moq_browser_test.mjs` |
-| Interop test client | `moq-test-client`, 10 cases (the runner's seven, both namespace-discovery cases and `data-subgroup-basic`), TAP 14, containerised |
+| Interop test client | `moq-test-client`, 18 cases (the runner's seven, both namespace-discovery cases, `data-subgroup-basic`, and eight MoQT Test tuples of our own: subgroups, datagrams, End of Group, extensions, increments, FORWARD=0), TAP 14, containerised |
 | Datagram objects | done — `moq-client --mode publish --datagrams`, relayed with alias remapping |
-| FETCH | codec done; no runtime request/response flow |
+| FETCH | relay answers from its cache when that holds the start of the range, and passes the FETCH to the track's publisher when it doesn't; in each draft's shape (see below) |
 | AUTHORIZATION_TOKEN | decoded at the KV level and discarded; no policy engine |
 | draft-18 | done — see below for what it changes, and what of it is skipped |
 
@@ -298,10 +298,21 @@ Unchanged on the wire: SETUP, the request and response messages the runner
 exercises, the subgroup header (now described as type flags, same bits),
 object fields, datagram types, and the error codes the tests check.
 
-Not implemented for draft-22: FETCH's new shape (no Fetch Type; the range
-rides LOCATION_FILTER) and fill streams, PUBLISH_STATE_NOTIFY (0x22), range
-filters beyond decoding them, MAX_FILTER_RANGES and MAX_REQUEST_UPDATES. The
-relay has no FETCH on any draft yet.
+FETCH in each draft: draft-17 writes a fetch object's Group and Object IDs
+whole, 18 and 22 as deltas from the prior object's. Drafts 17 and 18 end a
+range at "the last Object plus 1, or 0 for the whole Group", in FETCH and
+FETCH_OK alike; draft-22 drops the Fetch Type and its joining forms, carries
+the range in LOCATION_FILTER with an inclusive end, and asks for a joining
+range with FILL_PARAMETERS on the SUBSCRIBE instead. `Fetch.Standalone.range`
+holds draft-22's typed filter for every draft, since it can say everything
+the older Start and End could; `LocationFilter.resolve` turns it into
+Locations against a Largest Object. FILL_PARAMETERS is a length, then a
+counted parameter block, as aiomoqt writes it; the draft says only "encoded
+as if they were Parameters for a separate message".
+
+Not implemented for draft-22: PUBLISH_STATE_NOTIFY (0x22), range filters
+beyond decoding them, MAX_FILTER_RANGES, MAX_REQUEST_UPDATES, and fills
+opened by REQUEST_UPDATE.
 
 draft-23 (2 Nov 2026) makes the control-message length a varint and
 REQUEST_OK replaces FETCH_OK; no runner peer speaks it yet.
@@ -323,10 +334,28 @@ The one-stream-per-group design is what allowed scaling past ~1000 frames per su
 - No AUTHORIZATION_TOKEN policy engine — wire-level decode only.
 - VP8 video is in the demo app only; MoQ core treats object payloads as opaque bytes (as the spec intends: the media codec is not part of MoQ).
 - moq-lite is implemented separately — see [DRAFT_LCURLEY_MOQ_LITE_05.md](DRAFT_LCURLEY_MOQ_LITE_05.md). It is a different wire format, not a profile of this one.
-- FETCH request/response flow is codec-only.
+- The relay's limits: 256 clients (the event loop's connection cap), 1024
+  tracks, namespaces and subscribers per track, 512 streams per client
+  (above the 100 + 100 a peer may hold open), 1 MiB waiting on one stream,
+  1 MiB per cached group. Past any of them a request gets EXCESSIVE_LOAD or
+  a stream STOP_SENDING; nothing is dropped where the peer can't see it. A
+  group too large to cache is still forwarded. There is no relay-wide cache
+  budget yet.
+- The relay's FETCH is served from a cache of two finished groups and the
+  one arriving. Within a range it holds the start of, a gap it can't vouch
+  for is sent as End of Unknown Range, never left for a FIN to call absent;
+  descending FETCHes skip that. A range starting before the cache goes to
+  the publisher whole, not split between cache and upstream. A fill is served
+  only from the cache.
+- TRACK_STATUS for a track the relay has no state for is passed to its
+  namespace's publisher; LARGEST_OBJECT is the larger of what the publisher
+  reported and what the relay has received, as §9.20.17 asks.
 - The relay reads moxygen's private SUBSCRIBE filter type 250 (LargestGroup) as Largest Object rather than closing the session; the codec's default is still the PROTOCOL_VIOLATION §5.1.2 asks for.
 - The relay's own upstream subscription is not told FORWARD=0 when no subscriber wants objects; they are dropped at the relay instead.
-- The upstream SUBSCRIBE carries the first downstream subscriber's filter. Later subscribers share that subscription whatever their own filter; the relay forwards what arrives rather than filtering per subscriber.
+- The upstream SUBSCRIBE carries the first downstream subscriber's filter and NEW_GROUP_REQUEST. Each subscriber then gets only what its own filter passes: whole groups on live streams, and object by object when the relay replays its cache. A live stream that opens inside a subscriber's start group is forwarded whole, and a draft-22 Absolute Range's end object is not cut on live streams. A subscriber past its range's end gets PUBLISH_DONE (SUBSCRIPTION_ENDED).
+- Output streams are ranked by subscriber priority, then publisher priority, then group in the subscription's group order, as negative send orders: below every stream without one, so control and request streams are never queued behind objects. FETCH and fill streams have none, so they go ahead of live data.
+- SUBGROUP_DELIVERY_TIMEOUT resets an output stream not all acknowledged in time after its publisher's FIN; OBJECT_DELIVERY_TIMEOUT is checked when a held stream or datagram is released, the one point the relay waits before handing data to QUIC. Only the subscriber's values are used: the publisher's Track and Object Properties are not read. Neither timeout is forwarded upstream (§9.20.4).
+- SIGTERM or SIGINT drains: GOAWAY on every client's control stream, then the relay stops once they have gone or after 5 s; a second signal stops it at once. A GOAWAY from a peer is ignored.
 - SUBSCRIBE_TRACKS is offered only tracks the relay has a publisher for, never PUBLISH_BLOCKED; FORWARD on the request is copied into each PUBLISH.
 - The group cache follows one stream at a time: when a newer group's stream opens while an older one is still arriving, the older group is not cached.
 - The earlier note that moq-rs interop was blocked by their auth config is stale: `demo/relay/localhost.toml` sets `auth.public = ""`, and with it the interop client reaches 5/7 against them.

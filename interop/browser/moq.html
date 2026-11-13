@@ -239,8 +239,9 @@ function buildSubscribe(nsParts, trackName) {
   const p1 = concat(moqVarintEncode(0x10 - 0x04), new Uint8Array([1]));
   // 0x20 SUBSCRIBER_PRIORITY (uint8)
   const p2 = concat(moqVarintEncode(0x20 - 0x10), new Uint8Array([128]));
-  // 0x21 SUBSCRIPTION_FILTER (length-prefixed; latest object)
-  const ft = moqVarintEncode(0x02);
+  // 0x21 SUBSCRIPTION_FILTER (length-prefixed): AbsoluteStart {0, 0}, so
+  // the relay replays the groups it holds and playback starts at once.
+  const ft = concat(moqVarintEncode(0x03), moqVarintEncode(0), moqVarintEncode(0));
   const p3 = concat(moqVarintEncode(1), moqVarintEncode(ft.length), ft);
   // 0x22 GROUP_ORDER (uint8, 1 = ascending)
   const p4 = concat(moqVarintEncode(1), new Uint8Array([1]));

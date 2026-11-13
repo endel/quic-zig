@@ -173,11 +173,15 @@ the connection dropped 30.0 s later, on the server's idle timeout.
 
 With `Config.wt_close_after_sessions` (on), a connection that carried a session,
 has none left connecting or established, and has no HTTP/3 request open is
-closed: a server sends GOAWAY naming the next request it has not seen
-(RFC 9114 §5.2), so a client that pools knows what to retry elsewhere, then
-CONNECTION_CLOSE with `H3_NO_ERROR` once the peer has ended every CONNECT
-stream and acked our capsules, FINs and the GOAWAY (§6's SHOULD), or after
-3 PTO, as RFC 9000 §10.2 bounds a closing period. The same Chrome run now drops
+closed: once the peer has acked the end of its sessions, a server sends
+GOAWAY naming the next request it has not seen (RFC 9114 §5.2), so a client
+that pools knows what to retry elsewhere, then CONNECTION_CLOSE with
+`H3_NO_ERROR` once the peer has ended every CONNECT stream and acked the
+GOAWAY too (§6's SHOULD), or after 3 PTO, as RFC 9000 §10.2 bounds a closing
+period. The GOAWAY waits because our control stream outranks the CONNECT
+streams: sent beside a session's end, it is read first, and
+`@fails-components/webtransport` (moq-playa's stack) then takes the session as
+draining and rejects its `closed` with "Opening handshake failed". The same Chrome run now drops
 the connection 0.18 s after the session. The client does the same, without the
 GOAWAY, as Firefox does. Off suits a client known to pool sessions with plain
 requests; the connection then idles out.

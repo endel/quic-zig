@@ -2864,6 +2864,12 @@ pub fn Server(comptime Handler: type) type {
                 };
                 // A peer's uni stream has no send side left to wait on.
                 if ((rs.finished or rs.reset_err != null) and !stream_mod.isBidi(stream_id)) conn.streams.releaseRecvStream(stream_id);
+                // STOP_SENDING on a bidi stream: how a peer that has already
+                // sent its FIN cancels a request (MoQT draft-22 §6.4.2.3).
+                if (conn.streams.getStream(stream_id)) |st| if (st.send.peer_stop_sending) |code| if (!st.send.stop_sending_reported) {
+                    st.send.stop_sending_reported = true;
+                    if (@hasDecl(Handler, "onStopSending")) self.handler.onStopSending(&session, 0, stream_id, @truncate(code));
+                };
             }
         }
 
@@ -3361,7 +3367,7 @@ pub const ClientSession = struct {
     /// STOP_SENDING on a native QUIC stream's receiving half.
     pub fn stopSendingQuicStream(self: *ClientSession, stream_id: u64, error_code: u64) void {
         defer self.wake();
-        if (self.conn.streams.getStream(stream_id)) |stream| stream.recv.stopSending(error_code);
+        if (self.conn.streams.getRecvStream(stream_id)) |rs| rs.stopSending(error_code);
     }
 
     pub fn readStream(self: *ClientSession, stream_id: u64) ?[]const u8 {
@@ -6987,7 +6993,6 @@ const WtCloseServer = struct {
     seen_at_conn_close: u32 = 0,
     /// How that connection ended: its CONNECTION_CLOSE code, either way.
     conn_close_code: ?u64 = null,
-    goaway_sent: bool = false,
 
     pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
         session.acceptSession(session_id) catch unreachable;
@@ -7003,7 +7008,6 @@ const WtCloseServer = struct {
         self.conns_closed += 1;
         self.seen_at_conn_close = self.seen.count;
         if (session.entry.conn.local_err) |e| self.conn_close_code = e.code;
-        if (session.entry.h3_conn) |h| self.goaway_sent = h.local_goaway_id != null;
     }
 };
 
@@ -7207,11 +7211,11 @@ test "e2e: a peer that leaves silently once its session is over is closed in a f
     try silentlyGone(29531, &sh, &e2e.loop);
 
     // The idle timeout is 30 s; waiting out the ack of our FIN and GOAWAY
-    // is bounded by 3 PTO, and the closing period by 3 more.
+    // is bounded by 3 PTO, and the closing period by 3 more. The GOAWAY
+    // waits on that ack, so a peer gone this fast may never get one.
     const began = sys.nanoTimestamp();
     try runUntilCount(&e2e.loop, &sh.conns_closed, 1, 5000);
     try testing.expect(sys.nanoTimestamp() - began < 3 * std.time.ns_per_s);
-    try testing.expect(sh.goaway_sent);
     try testing.expectEqual(h3_no_error, sh.conn_close_code.?);
     try testing.expectEqual(@as(usize, 1), e2e.server.conn_mgr.connectionCount()); // the idle client's
 }
@@ -8009,6 +8013,8 @@ const QuicCounter = struct {
     datagrams: u32 = 0,
     data: usize = 0,
     fins: u32 = 0,
+    stops: u32 = 0,
+    stop_code: u32 = 0,
 
     pub fn onDatagram(self: *@This(), _: *Session, _: u64, _: []const u8) void {
         self.datagrams += 1;
@@ -8016,6 +8022,10 @@ const QuicCounter = struct {
     pub fn onStreamData(self: *@This(), _: *Session, _: u64, data: []const u8, fin: bool) void {
         self.data += data.len;
         if (fin) self.fins += 1;
+    }
+    pub fn onStopSending(self: *@This(), _: *Session, _: u64, _: u64, code: u32) void {
+        self.stops += 1;
+        self.stop_code = code;
     }
 };
 
@@ -8053,6 +8063,28 @@ test "e2e: raw-QUIC datagrams and stream data reach a handler with nothing else 
     try runUntilCount(&e2e.loop, &h.data, 3, 3000);
     cs.closeQuicStream(id);
     try runUntilCount(&e2e.loop, &h.fins, 1, 3000);
+}
+
+test "e2e: a raw-QUIC peer's STOP_SENDING reaches the handler, once" {
+    // Only WebTransport reported it, so a native-QUIC MoQT peer that had
+    // sent its FIN could not cancel its request (draft-22 §6.4.2.3).
+    var client_handler = QuicIdleClient{};
+    var h = QuicCounter{};
+    var e2e: E2e(QuicCounter, QuicIdleClient) = undefined;
+    try e2e.init(29690, &h, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, QuicIdleClient.ready, 10_000);
+    var cs = e2e.client.clientSession();
+    const id = try cs.openStream();
+    try cs.writeStream(id, "req");
+    cs.closeQuicStream(id);
+    try runUntilCount(&e2e.loop, &h.fins, 1, 3000);
+    cs.stopSendingQuicStream(id, 9);
+    try runUntilCount(&e2e.loop, &h.stops, 1, 3000);
+    try testing.expectEqual(@as(u32, 9), h.stop_code);
+    try runFor(&e2e.loop, 100);
+    try testing.expectEqual(@as(u32, 1), h.stops);
 }
 
 /// `runUntil` over two loops at once.

@@ -27,12 +27,40 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
   subscriptions with PREFIX_OVERLAP.
 - `moq-test-client` runs the interop runner's `subscribe-namespace-lifecycle`,
   `publish-namespace-multi-publisher-retention` and `data-subgroup-basic`.
+- `moq-test-client` runs eight more data-plane cases from MoQT Test tuples:
+  a subgroup per object, two subgroups per group, datagrams, End of Group
+  markers, extensions, increments and FORWARD=0.
+- The MoQ relay ranks its streams by subscriber and publisher priority and
+  group order, enforces SUBGROUP_DELIVERY_TIMEOUT and OBJECT_DELIVERY_TIMEOUT,
+  passes NEW_GROUP_REQUEST upstream, and on SIGTERM sends its clients GOAWAY
+  before stopping.
+- The MoQ relay answers FETCH in every draft (standalone, joining, and
+  draft-22's fills) from its cache or the track's publisher, and TRACK_STATUS.
+  SUBSCRIBE_OK carries LARGEST_OBJECT, and a request type it doesn't serve
+  gets REQUEST_ERROR NOT_SUPPORTED instead of no answer.
+- `moq.object.writeFetchItem` and `readFetchItem`, `LocationFilter.resolve`,
+  and `Subscribe.fill` for draft-22's FILL_PARAMETERS.
 - `moq.object.writeSubgroupObject` and `readSubgroupObject`, and
   `ClientSession.resetQuicStream` and `stopSendingQuicStream` for native-QUIC
   clients.
 
 ### Changed
 
+- `moq-test-client` says how a connection ended before SETUP, naming the TLS
+  alert of a failed handshake (`TLS alert 120 no_application_protocol` for a
+  relay that has moved to another draft), where it said "no connection".
+- A WebTransport or QUIC stream without a send order now ranks as 0, the
+  W3C API's default: behind positive send orders, ahead of negative ones.
+  Before, any stream with a send order went ahead of every stream without.
+- The MoQ relay gives each subscriber only what its filter passes. A
+  Largest Object subscriber is no longer replayed the groups the relay
+  holds; the demo pages now ask for Absolute Start {0, 0} to get them.
+- The MoQ relay allocates as traffic needs: it starts at 7 MB resident instead
+  of 318 MB, and its binary is 8.7 MB instead of 177 MB. It takes 256
+  clients, 1024 tracks and 1024 subscribers per track.
+- `moq.message.writeFetchOk` takes the draft, `Fetch.Standalone` carries its
+  range as a `LocationFilter` (`range`) in place of `start` and `end`, and
+  `FetchOk.end` is inclusive in every draft, `WHOLE_GROUP` for a whole group.
 - A WebSocket's answers to frames that arrive together leave in one send,
   not a syscall each: pipelined echo runs 6× faster or more. In
   `onWsMessage`, `uncork` now sends with the rest of that read's answers.
@@ -42,6 +70,24 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A WebTransport server closing a connection after its last session now sends
+  its GOAWAY after the session's end rather than beside it.
+  `@fails-components/webtransport` clients rejected `closed` with "Opening
+  handshake failed" when the GOAWAY was read first, which failed every
+  moq-playa test against the MoQ relay over WebTransport.
+- `moq-test-client`'s namespace cases withdraw a publisher only once the relay
+  has answered it. Against a relay that tells subscribers first,
+  `subscribe-namespace-lifecycle` failed about one run in ten with "publisher
+  never got REQUEST_OK".
+- A native-QUIC handler now gets `onStopSending` for a bidi stream, as a
+  WebTransport one does, and `ClientSession.stopSendingQuicStream` reaches a
+  peer's uni streams. The MoQ relay takes a STOP_SENDING as a cancelled
+  request, which is how a draft-22 peer that has sent its FIN withdraws:
+  moq-dev-rs's `subscribe-namespace-lifecycle` passes at draft-22.
+- The MoQ relay refuses a stream it can't keep state for, with STOP_SENDING,
+  rather than dropping its bytes or cutting them short. It used to lose a
+  client's streams past 64 and a held stream past 64 KiB, and cached groups
+  cut mid-object at 256 KiB.
 - The MoQ relay subscribed upstream for Largest Object whatever its
   subscriber asked for, so a publisher could start past objects the
   subscriber wanted. It now forwards the subscriber's filter, or none.
