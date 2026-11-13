@@ -67,6 +67,11 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Fixed
 
+- A WebTransport server closing a connection after its last session now sends
+  its GOAWAY after the session's end rather than beside it.
+  `@fails-components/webtransport` clients rejected `closed` with "Opening
+  handshake failed" when the GOAWAY was read first, which failed every
+  moq-playa test against the MoQ relay over WebTransport.
 - A native-QUIC handler now gets `onStopSending` for a bidi stream, as a
   WebTransport one does, and `ClientSession.stopSendingQuicStream` reaches a
   peer's uni streams. The MoQ relay takes a STOP_SENDING as a cancelled

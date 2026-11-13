@@ -935,13 +935,17 @@ pub const WebTransportConnection = struct {
     /// Nothing in draft-16 ends such a connection, and a browser gives each
     /// session one of its own: Chrome lets it go without a CONNECTION_CLOSE
     /// once its FIN is acked, which leaves the server holding it until the
-    /// idle timeout. A server first sends GOAWAY naming the next request it
-    /// has not seen (RFC 9114 §5.2), so a client that pools knows what to
-    /// retry elsewhere. CONNECTION_CLOSE, H3_NO_ERROR, then waits for what
-    /// it would discard (§6's SHOULD): the peer's end of every CONNECT
-    /// stream, and the ack of our own capsules, FINs and that GOAWAY. That
-    /// wait is bounded at 3 PTO, as RFC 9000 §10.2 bounds a closing period:
-    /// a peer that left silently answers nothing.
+    /// idle timeout. A server sends GOAWAY naming the next request it has
+    /// not seen (RFC 9114 §5.2), so a client that pools knows what to retry
+    /// elsewhere, but only once the peer has acked the end of its sessions:
+    /// our control stream outranks the CONNECT streams, so a GOAWAY sent
+    /// beside them is read first, and a client takes the session as drained
+    /// rather than closed (@fails-components/webtransport then rejects
+    /// `closed` as a failed handshake). CONNECTION_CLOSE, H3_NO_ERROR, then
+    /// waits for what it would discard (§6's SHOULD): the peer's end of
+    /// every CONNECT stream, and the ack of our own capsules, FINs and that
+    /// GOAWAY. The whole wait is bounded at 3 PTO, as RFC 9000 §10.2 bounds
+    /// a closing period: a peer that left silently answers nothing.
     pub fn closeIfUnused(self: *WebTransportConnection) void {
         const quic = self.quic;
         if (!quic.isEstablished()) return;
@@ -951,14 +955,16 @@ pub const WebTransportConnection = struct {
         }
         const no_error = @backingInt(h3_conn.H3Error.no_error);
         if (quic.close_deadline == null) {
-            if (self.is_server and self.h3.local_goaway_id == null) {
-                const next = if (quic.streams.highest_peer_bidi_stream_id) |id| id + 4 else 0;
-                self.h3.sendGoaway(next) catch {};
-            }
             quic.closeBy(sys.nanoTimestamp() + 3 * quic.pkt_handler.rtt_stats.pto(), no_error);
         }
+        if (!quic.sendsSettled()) return;
+        if (self.is_server and self.h3.local_goaway_id == null) {
+            const next = if (quic.streams.highest_peer_bidi_stream_id) |id| id + 4 else 0;
+            self.h3.sendGoaway(next) catch {};
+            return; // closes once the GOAWAY is acked too
+        }
         for (self.sessions) |s| if (s.occupied) return; // a CONNECT stream the peer hasn't ended
-        if (quic.sendsSettled()) quic.close(no_error, "");
+        quic.close(no_error, "");
     }
 
     /// A session still connecting or established.
@@ -3210,13 +3216,21 @@ test "WT: a connection whose last session is over closes once the peer has the e
                 _ = try setup.wt.poll(); // its FIN came with the capsule
             }
             setup.wt.closeIfUnused();
-            // A server says first what it will not take (RFC 9114 §5.2).
-            try testing.expectEqual(if (server) @as(?u64, 4) else null, setup.h3.local_goaway_id);
             try testing.expect(setup.quic_conn.close_deadline != null);
-            // Not before our capsule, FIN and GOAWAY are acked.
+            // Not while the end of the session is unacked: sent beside it,
+            // the GOAWAY can be read first, and the session seen to drain.
+            try testing.expectEqual(@as(?u64, null), setup.h3.local_goaway_id);
             try testing.expect(setup.quic_conn.isEstablished());
             try ackEverything(&setup.quic_conn);
             setup.wt.closeIfUnused();
+            if (server) {
+                // A server says what it will not take (RFC 9114 §5.2),
+                // and closes once that is acked too.
+                try testing.expectEqual(@as(?u64, 4), setup.h3.local_goaway_id);
+                try testing.expect(setup.quic_conn.isEstablished());
+                try ackEverything(&setup.quic_conn);
+                setup.wt.closeIfUnused();
+            }
             try testing.expectEqual(quic_connection.State.closing, setup.quic_conn.state);
             try testing.expectEqual(@as(u64, h3_no_error), setup.quic_conn.local_err.?.code);
         }

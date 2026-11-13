@@ -6993,7 +6993,6 @@ const WtCloseServer = struct {
     seen_at_conn_close: u32 = 0,
     /// How that connection ended: its CONNECTION_CLOSE code, either way.
     conn_close_code: ?u64 = null,
-    goaway_sent: bool = false,
 
     pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
         session.acceptSession(session_id) catch unreachable;
@@ -7009,7 +7008,6 @@ const WtCloseServer = struct {
         self.conns_closed += 1;
         self.seen_at_conn_close = self.seen.count;
         if (session.entry.conn.local_err) |e| self.conn_close_code = e.code;
-        if (session.entry.h3_conn) |h| self.goaway_sent = h.local_goaway_id != null;
     }
 };
 
@@ -7213,11 +7211,11 @@ test "e2e: a peer that leaves silently once its session is over is closed in a f
     try silentlyGone(29531, &sh, &e2e.loop);
 
     // The idle timeout is 30 s; waiting out the ack of our FIN and GOAWAY
-    // is bounded by 3 PTO, and the closing period by 3 more.
+    // is bounded by 3 PTO, and the closing period by 3 more. The GOAWAY
+    // waits on that ack, so a peer gone this fast may never get one.
     const began = sys.nanoTimestamp();
     try runUntilCount(&e2e.loop, &sh.conns_closed, 1, 5000);
     try testing.expect(sys.nanoTimestamp() - began < 3 * std.time.ns_per_s);
-    try testing.expect(sh.goaway_sent);
     try testing.expectEqual(h3_no_error, sh.conn_close_code.?);
     try testing.expectEqual(@as(usize, 1), e2e.server.conn_mgr.connectionCount()); // the idle client's
 }
