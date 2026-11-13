@@ -3009,9 +3009,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer server.deinit();
     handler.server = ServerCtl.of(@TypeOf(server), &server);
     drain_target = &server;
-    const act: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.posix.sigemptyset(), .flags = 0 };
-    std.posix.sigaction(.TERM, &act, null);
-    std.posix.sigaction(.INT, &act, null);
+    if (@import("builtin").os.tag != .windows) { // no POSIX signals: Ctrl+C ends it outright
+        const act: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.posix.sigemptyset(), .flags = 0 };
+        std.posix.sigaction(.TERM, &act, null);
+        std.posix.sigaction(.INT, &act, null);
+    }
 
     std.debug.print("Listening on https://0.0.0.0:{d}\n", .{port});
     std.debug.print("Video demo: https://127.0.0.1:{d}/moq_video.html\n", .{port});
