@@ -46,6 +46,9 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 
 ### Changed
 
+- `moq-test-client` says how a connection ended before SETUP, naming the TLS
+  alert of a failed handshake (`TLS alert 120 no_application_protocol` for a
+  relay that has moved to another draft), where it said "no connection".
 - A WebTransport or QUIC stream without a send order now ranks as 0, the
   W3C API's default: behind positive send orders, ahead of negative ones.
   Before, any stream with a send order went ahead of every stream without.

@@ -1047,6 +1047,21 @@ fn Peer(comptime proto: event_loop.Protocol) type {
     };
 }
 
+/// How a connection ended before SETUP, from its CONNECTION_CLOSE, either
+/// side's. A CRYPTO_ERROR names its TLS alert (RFC 9001 §4.8).
+fn setCloseMsg(result: *Result, e: *const quic.connection.ConnectionError) void {
+    const r = e.reason()[0..@min(e.reason().len, 64)];
+    const sep: []const u8 = if (r.len > 0) ": " else "";
+    const reason = std.zig.fmtString(r); // the peer's bytes, inside a YAML string
+    if (!e.is_app and e.code >= 0x100 and e.code <= 0x1ff) {
+        const alert: std.crypto.tls.Alert.Description = @enumFromInt(@as(u8, @intCast(e.code - 0x100)));
+        const name = std.enums.tagName(std.crypto.tls.Alert.Description, alert) orelse "unknown";
+        return result.setMsg("connection closed before SETUP: TLS alert {d} {s}{s}{f}", .{ e.code - 0x100, name, sep, reason });
+    }
+    const kind = if (e.is_app) "application" else "transport";
+    result.setMsg("connection closed before SETUP: {s} error 0x{x}{s}{f}", .{ kind, e.code, sep, reason });
+}
+
 /// The test extensions for one object: the integer one a random varint,
 /// the variable one 1 to 20 zero bytes, in ascending type order.
 fn tupleProperties(t: Tuple, buf: []u8) ![]const u8 {
@@ -1374,6 +1389,16 @@ fn Runner(comptime proto: event_loop.Protocol) type {
                     result.setMsg("{s}", .{l.peer.fail_reason[0..l.peer.fail_reason_len]});
                     return;
                 }
+            }
+            // A connection that ended before SETUP: say how, not only that
+            // nothing came.
+            for (legs[0..leg_count]) |*l| {
+                if (l.peer.sess.setup_received) continue;
+                const c = &(l.client orelse continue);
+                const e = &(c.conn.local_err orelse continue);
+                result.outcome = .fail;
+                setCloseMsg(result, e);
+                return;
             }
             judge(case, legs[0..leg_count], result);
         }
