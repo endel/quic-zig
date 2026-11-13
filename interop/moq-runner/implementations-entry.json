@@ -13,7 +13,7 @@
     "name": "quic-zig",
     "organization": "Endel Dreyer",
     "repository": "https://github.com/endel/quic-zig",
-    "draft_versions": ["draft-17", "draft-18"],
+    "draft_versions": ["draft-17", "draft-18", "draft-22"],
     "notes": "QUIC, HTTP/3, WebTransport and MoQ from scratch in Zig. The relay serves raw QUIC and WebTransport on one port, chosen by ALPN; the client speaks both transports and selects its draft with --draft.",
     "roles": {
       "client": {

@@ -223,9 +223,11 @@ every remaining failure: [`moq-interop-results.md`](moq-interop-results.md).
 of 2048 to 4096 bits, PKCS#1 or PKCS#8). The runner generates P-256
 deliberately: browsers pin a certificate by hash only when it is ECDSA.
 
-Both drafts are implemented, so `draft_versions` would be
-`["draft-17", "draft-18"]`. draft-18 is the runner's `current_target` and
-pairs with most of its eighteen relays; draft-17 with four.
+`draft_versions` is `["draft-17", "draft-18", "draft-22"]`. draft-18 is the
+runner's `current_target`; a pair runs only on a shared draft, so without
+draft-22 the relays and clients that speak nothing else (moq-go, moqtail,
+moqt-nr-draft-22, red5-moq-relay, moqxr) never met ours. moq-go passes every
+case both ways at draft-22 (12 Nov 2026).
 
 ## Known blockers
 
