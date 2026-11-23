@@ -846,7 +846,11 @@ fn Peer(comptime proto: event_loop.Protocol) type {
                         }
                     }
                     const k: usize = if (t.fp == 2) @intCast(o % 2) else 0;
-                    self.writeTupleObject(dp, k, o) catch |e| return self.fail("data write failed: {t}", .{e});
+                    self.writeTupleObject(dp, k, o) catch |e| return switch (e) {
+                        // Our send streams only vanish when the peer stops them.
+                        error.StreamNotFound => self.fail("relay stopped the data stream before object ({d}, {d})", .{ g, o }),
+                        else => self.fail("data write failed: {t}", .{e}),
+                    };
                     // A marker ends its stream; the rest end with the group,
                     // or the object when each has its own.
                     if (t.isMarker(o) or last or t.fp == 1) {
@@ -1453,6 +1457,7 @@ fn Runner(comptime proto: event_loop.Protocol) type {
         /// does not burn its whole timeout.
         fn complete(case: TestCase, legs: []Leg) bool {
             for (legs) |*l| if (l.peer.failed) return true;
+            if (refusedPublisher(case, legs) != null) return true;
             const a = &legs[0].peer;
             return switch (case) {
                 .setup_only => a.sess.setup_received,
@@ -1468,8 +1473,21 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             };
         }
 
+        /// A publisher whose announcement was refused where the case is about
+        /// routing what it publishes: nothing is left to observe.
+        fn refusedPublisher(case: TestCase, legs: []Leg) ?*const P {
+            if (legs.len < 2 or case == .subscribe_before_announce) return null;
+            for (legs) |*l| if (l.peer.role == .publisher and l.peer.got_request_error) return &l.peer;
+            return null;
+        }
+
         fn judge(case: TestCase, legs: []Leg, result: *Result) void {
             const a = &legs[0].peer;
+            if (refusedPublisher(case, legs)) |p| {
+                result.outcome = .fail;
+                result.setMsg("PUBLISH_NAMESPACE rejected: code={d} {s}", .{ p.error_code, p.error_reason[0..p.error_reason_len] });
+                return;
+            }
             switch (case) {
                 .setup_only => {
                     if (!a.sess.setup_sent) {
@@ -1840,4 +1858,32 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
 
     return if (failures == 0) 0 else 1;
+}
+
+test "a refused announcement ends a case that needs it, and says why" {
+    // A relay that refused PUBLISH_NAMESPACE left each routing and data case
+    // to wait out its deadline, up to 20 s apiece: against oracle-relay the
+    // runner killed the client after 13 cases. And the report said only
+    // "publisher never got REQUEST_OK".
+    const R = Runner(.quic);
+    var legs: [2]R.Leg = .{ .{}, .{} };
+    var dp: DataPlane = .{ .full_ns = &.{}, .tuple = Tuple.parse(&Scenario.of(.data_subgroup_basic).fields()) };
+    legs[0].peer.role = .publisher;
+    legs[0].peer.got_request_error = true;
+    legs[0].peer.error_code = 1;
+    legs[1].peer.role = .subscriber;
+    legs[1].peer.dp = &dp;
+    for ([_]TestCase{ .announce_subscribe, .data_subgroup_basic }) |case| {
+        try std.testing.expect(R.complete(case, &legs));
+        var r: Result = .{};
+        R.judge(case, &legs, &r);
+        try std.testing.expectEqual(.fail, r.outcome);
+        try std.testing.expectEqualStrings("PUBLISH_NAMESPACE rejected: code=1 ", r.message());
+    }
+    // Where the subscriber's answer is the whole point, it still decides.
+    var sba: [2]R.Leg = .{ .{}, .{} };
+    sba[0].peer.role = .subscriber;
+    sba[1].peer.role = .publisher;
+    sba[1].peer.got_request_error = true;
+    try std.testing.expect(!R.complete(.subscribe_before_announce, &sba));
 }
