@@ -28,8 +28,10 @@ pub const ParamId = enum(u64) {
     initial_source_connection_id = 0x0f,
     retry_source_connection_id = 0x10,
     version_information = 0x11, // RFC 9368
+    reset_stream_at = 0x1d, // draft-ietf-quic-reliable-stream-reset-08 (provisional)
     max_datagram_frame_size = 0x20,
     min_ack_delay = 0xff04de1b, // draft-ietf-quic-ack-frequency (provisional)
+    reset_stream_at_legacy = 0x17f7586d2cb571, // the same, drafts 06 and 07
     _,
 };
 
@@ -113,6 +115,9 @@ pub const TransportParams = struct {
     initial_source_connection_id: ?ConnectionId = null,
     retry_source_connection_id: ?ConnectionId = null,
     max_datagram_frame_size: ?u64 = null,
+
+    /// draft-ietf-quic-reliable-stream-reset §3: takes RESET_STREAM_AT.
+    reset_stream_at: bool = false,
 
     // draft-ietf-quic-ack-frequency: minimum ACK delay in microseconds.
     // null = does not support ACK frequency extension.
@@ -244,6 +249,13 @@ pub const TransportParams = struct {
             try Helper.writeParam(writer, .min_ack_delay, delay);
         }
 
+        // Both codepoints while peers still ship the drafts-06/07 one, as
+        // quic-go does.
+        if (self.reset_stream_at) {
+            try Helper.writeParamEmpty(writer, .reset_stream_at);
+            try Helper.writeParamEmpty(writer, .reset_stream_at_legacy);
+        }
+
         // RFC 9000 §18.1: Transport parameter greasing — send a reserved parameter
         // with ID of form 31*N+27 so peers learn to ignore unknown parameters.
         {
@@ -287,6 +299,7 @@ pub const TransportParams = struct {
         // 0x00-0x11 and 0x20, bar min_ack_delay's.
         var seen = std.bit_set.Static(0x21).empty;
         var seen_min_ack_delay = false;
+        var seen_reset_stream_at_legacy = false;
 
         while (fbs.seek < data.len) {
             const param_id = try packet.readVarInt(reader);
@@ -302,7 +315,11 @@ pub const TransportParams = struct {
             if (param_id == @backingInt(ParamId.min_ack_delay)) {
                 if (seen_min_ack_delay) return error.TransportParameterError;
                 seen_min_ack_delay = true;
+            } else if (param_id == @backingInt(ParamId.reset_stream_at_legacy)) {
+                if (seen_reset_stream_at_legacy) return error.TransportParameterError;
+                seen_reset_stream_at_legacy = true;
             } else if (param_id <= @backingInt(ParamId.version_information) or
+                param_id == @backingInt(ParamId.reset_stream_at) or
                 param_id == @backingInt(ParamId.max_datagram_frame_size))
             {
                 if (seen.isSet(@intCast(param_id))) return error.TransportParameterError;
@@ -341,6 +358,10 @@ pub const TransportParams = struct {
                 @backingInt(ParamId.retry_source_connection_id) => params.retry_source_connection_id = try readCid(value),
                 @backingInt(ParamId.max_datagram_frame_size) => params.max_datagram_frame_size = try readVarIntParam(value),
                 @backingInt(ParamId.min_ack_delay) => params.min_ack_delay = try readVarIntParam(value),
+                @backingInt(ParamId.reset_stream_at), @backingInt(ParamId.reset_stream_at_legacy) => {
+                    if (value.len != 0) return error.TransportParameterError;
+                    params.reset_stream_at = true;
+                },
                 @backingInt(ParamId.version_information) => {
                     // A malformed one is skipped, as before; up to 8 versions kept.
                     if (value.len >= 4 and value.len % 4 == 0) {
@@ -602,4 +623,32 @@ test "transport parameter longer than the buffer is rejected" {
     // id=0x00 (original_destination_connection_id), len=16383, 2 bytes present.
     const params = [_]u8{ 0x00, 0x7f, 0xff, 0xaa, 0xbb };
     try std.testing.expectError(error.TransportParameterError, TransportParams.decode(&params));
+}
+
+test "reset_stream_at goes out on both codepoints and is read from either" {
+    // xquic knows only 0x1d; quic-go 0.59 and webtransport-go images built
+    // on it know only the drafts-06/07 codepoint.
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try (TransportParams{ .reset_stream_at = true }).encode(&fbs);
+    var r = io.fixedBufferStream(fbs.buffered());
+    var found: u2 = 0;
+    while (r.seek < fbs.buffered().len) {
+        const id = try packet.readVarInt(&r);
+        const len = try packet.readVarInt(&r);
+        r.seek += @intCast(len);
+        if (id == @backingInt(ParamId.reset_stream_at) and len == 0) found |= 1;
+        if (id == @backingInt(ParamId.reset_stream_at_legacy) and len == 0) found |= 2;
+    }
+    try testing.expectEqual(@as(u2, 3), found);
+
+    for ([_]ParamId{ .reset_stream_at, .reset_stream_at_legacy }) |id| {
+        var one: [16]u8 = undefined;
+        var w = io.fixedBufferStream(&one);
+        try packet.writeVarInt(&w, @backingInt(id));
+        try packet.writeVarInt(&w, 0);
+        try testing.expect((try TransportParams.decode(w.buffered())).reset_stream_at);
+    }
+    // §3: it carries no value.
+    try testing.expectError(error.TransportParameterError, TransportParams.decode(&.{ 0x1d, 0x01, 0x00 }));
 }

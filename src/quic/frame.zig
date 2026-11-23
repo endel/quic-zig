@@ -21,6 +21,10 @@ pub const FrameError = error{
     FrameEncodingError,
 };
 
+/// RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset §4), parsed as a
+/// `reset_stream` with a Reliable Size.
+pub const RESET_STREAM_AT: u64 = 0x24;
+
 pub const FrameType = enum(u64) {
     padding = 0x00,
     ping = 0x01,
@@ -164,6 +168,9 @@ pub const Frame = union(FrameType) {
         stream_id: u64,
         error_code: u64,
         final_size: u64,
+        /// RESET_STREAM_AT's (draft-ietf-quic-reliable-stream-reset §4): the
+        /// bytes still delivered. Zero is a plain RESET_STREAM.
+        reliable_size: u64 = 0,
     },
 
     stop_sending: struct {
@@ -363,6 +370,22 @@ pub const Frame = union(FrameType) {
                     .error_code = try packet.readVarInt(reader),
                     .final_size = try packet.readVarInt(reader),
                 },
+            },
+
+            // reset_stream_at: §4, a Reliable Size past the Final Size is
+            // FRAME_ENCODING_ERROR
+            RESET_STREAM_AT => blk: {
+                const stream_id = try packet.readVarInt(reader);
+                const error_code = try packet.readVarInt(reader);
+                const final_size = try packet.readVarInt(reader);
+                const reliable_size = try packet.readVarInt(reader);
+                if (reliable_size > final_size) return error.FrameEncodingError;
+                break :blk .{ .reset_stream = .{
+                    .stream_id = stream_id,
+                    .error_code = error_code,
+                    .final_size = final_size,
+                    .reliable_size = reliable_size,
+                } };
             },
 
             // stop_sending
@@ -588,10 +611,11 @@ pub const Frame = union(FrameType) {
             },
 
             .reset_stream => |rs| {
-                try packet.writeVarInt(writer, 0x04);
+                try packet.writeVarInt(writer, if (rs.reliable_size > 0) RESET_STREAM_AT else 0x04);
                 try packet.writeVarInt(writer, rs.stream_id);
                 try packet.writeVarInt(writer, rs.error_code);
                 try packet.writeVarInt(writer, rs.final_size);
+                if (rs.reliable_size > 0) try packet.writeVarInt(writer, rs.reliable_size);
             },
 
             .stop_sending => |ss| {
@@ -829,6 +853,7 @@ pub const PendingControlFrame = union(enum) {
         stream_id: u64,
         error_code: u64,
         final_size: u64,
+        reliable_size: u64 = 0,
     },
     stop_sending: struct {
         stream_id: u64,
@@ -892,7 +917,7 @@ pub const PendingControlFrame = union(enum) {
             .streams_blocked_uni => |max| .{ .streams_blocked_uni = max },
             .data_blocked => |limit| .{ .data_blocked = limit },
             .stream_data_blocked => |sdb| .{ .stream_data_blocked = .{ .stream_id = sdb.stream_id, .limit = sdb.limit } },
-            .reset_stream => |rs| .{ .reset_stream = .{ .stream_id = rs.stream_id, .error_code = rs.error_code, .final_size = rs.final_size } },
+            .reset_stream => |rs| .{ .reset_stream = .{ .stream_id = rs.stream_id, .error_code = rs.error_code, .final_size = rs.final_size, .reliable_size = rs.reliable_size } },
             .stop_sending => |ss| .{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = ss.error_code } },
             .ack_frequency => |af| .{ .ack_frequency = .{
                 .sequence_number = af.sequence_number,
@@ -1724,4 +1749,24 @@ test "PendingFrameQueue: full refuses new frames but always admits CONNECTION_CL
     const f = q.pop().?;
     q.requeue(f);
     try std.testing.expectEqual(@as(usize, @import("limits.zig").pending_frames), q.len);
+}
+
+test "RESET_STREAM_AT carries its Reliable Size, which can't pass the Final Size" {
+    // draft-ietf-quic-reliable-stream-reset §4.
+    var buf: [32]u8 = undefined;
+    var w = io.fixedBufferStream(&buf);
+    const at: Frame = .{ .reset_stream = .{ .stream_id = 6, .error_code = 2, .final_size = 9, .reliable_size = 3 } };
+    try at.write(&w);
+    try std.testing.expectEqual(@as(u8, 0x24), w.buffered()[0]);
+    const back = (try Frame.parse(w.buffered())).reset_stream;
+    try std.testing.expectEqual(@as(u64, 3), back.reliable_size);
+    try std.testing.expectEqual(@as(u64, 9), back.final_size);
+
+    // Nothing reliable is a plain RESET_STREAM.
+    w.seek = 0;
+    try (Frame{ .reset_stream = .{ .stream_id = 6, .error_code = 2, .final_size = 9 } }).write(&w);
+    try std.testing.expectEqual(@as(u8, 0x04), w.buffered()[0]);
+
+    var past = [_]u8{ 0x24, 6, 2, 9, 10 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&past));
 }

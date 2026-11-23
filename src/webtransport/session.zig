@@ -802,19 +802,31 @@ pub const WebTransportConnection = struct {
         const h3_code = appErrorCodeToH3(error_code);
         if (self.quic.streams.getStream(stream_id)) |stream| {
             if (!stream.send.fin_sent) {
-                stream.send.reset(h3_code);
+                self.resetDataStream(&stream.send, self.wt_bidi_streams.get(stream_id), h3_code);
             }
             stream.recv.stopSending(h3_code);
             return;
         }
         if (self.quic.streams.send_streams.get(stream_id)) |send_stream| {
             if (!send_stream.fin_sent) {
-                send_stream.reset(h3_code);
+                self.resetDataStream(send_stream, self.wt_uni_streams.get(stream_id), h3_code);
             }
         }
         if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
             recv_stream.stopSending(h3_code);
         }
+    }
+
+    /// Resets the send side of a data stream of `session_id`. One we opened
+    /// goes as RESET_STREAM_AT covering its header when the peer takes it,
+    /// so the peer can still tell which session it was for (draft-16 §4.4).
+    fn resetDataStream(self: *WebTransportConnection, ss: *stream_mod.SendStream, session_id: ?u64, code: u64) void {
+        var reliable: u64 = 0;
+        if (session_id) |sid| if (stream_mod.isLocal(ss.stream_id, self.is_server) and self.quic.peerTakesResetStreamAt()) {
+            const ty = if (stream_mod.isBidi(ss.stream_id)) WT_BIDI_STREAM_TYPE else WT_UNI_STREAM_TYPE;
+            reliable = packet.varIntLength(ty) + packet.varIntLength(sid);
+        };
+        ss.resetAt(code, reliable);
     }
 
     /// Stop receiving on a WT stream (sends STOP_SENDING to peer).
@@ -1010,7 +1022,7 @@ pub const WebTransportConnection = struct {
             for (batch[0..n]) |sid| {
                 _ = self.wt_bidi_streams.remove(sid);
                 if (self.quic.streams.getStream(sid)) |st| {
-                    abortSend(&st.send);
+                    self.abortSend(&st.send, session_id);
                     abortRecv(&st.recv);
                     self.gone_streams.put(self.allocator, sid, {}) catch {};
                 }
@@ -1032,7 +1044,7 @@ pub const WebTransportConnection = struct {
             for (batch[0..n]) |sid| {
                 _ = self.wt_uni_streams.remove(sid);
                 if (self.quic.streams.send_streams.get(sid)) |send_stream| {
-                    abortSend(send_stream);
+                    self.abortSend(send_stream, session_id);
                     self.gone_streams.put(self.allocator, sid, {}) catch {};
                 }
                 if (self.quic.streams.recv_streams.get(sid)) |recv_stream| {
@@ -1046,10 +1058,10 @@ pub const WebTransportConnection = struct {
 
     /// RESET_STREAM, unless the peer has acked every byte and the FIN
     /// (RFC 9000 §3.1 "Data Recvd"), when there is nothing left to abandon.
-    fn abortSend(ss: *stream_mod.SendStream) void {
+    fn abortSend(self: *WebTransportConnection, ss: *stream_mod.SendStream, session_id: u64) void {
         if (ss.reset_err != null) return;
         if (ss.fin_acked and !ss.hasUnackedData()) return;
-        ss.reset(WEBTRANSPORT_SESSION_GONE);
+        self.resetDataStream(ss, session_id, WEBTRANSPORT_SESSION_GONE);
     }
 
     /// STOP_SENDING, unless the peer has nothing more to send: it reset the
@@ -4708,4 +4720,28 @@ test "WT: the peer's QPACK streams arriving after the session are not WebTranspo
     }
     try testing.expectEqual(@as(?u64, 7), setup.h3.peer_qpack_enc_stream_id);
     try testing.expectEqual(@as(?u64, 11), setup.h3.peer_qpack_dec_stream_id);
+}
+
+test "WT: resetting a stream we opened still delivers its header (RESET_STREAM_AT)" {
+    // draft-ietf-webtrans-http3-16 §4.4: a plain RESET_STREAM can lose the
+    // header that tells the peer which session the stream belonged to.
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    if (setup.quic_conn.peer_params) |*p| p.reset_stream_at = true else setup.quic_conn.peer_params = .{ .reset_stream_at = true };
+
+    const uni = try setup.wt.openUniStream(session_id, null);
+    const ss = setup.quic_conn.streams.send_streams.get(uni).?;
+    const header: u64 = packet.varIntLength(WT_UNI_STREAM_TYPE) + packet.varIntLength(session_id);
+    ss.send_offset = header;
+    setup.wt.resetStream(uni, 42);
+    try ss.onAck(0, header, false);
+    try testing.expectEqual(@as(?u64, appErrorCodeToH3(42)), ss.reset_err);
+    try testing.expectEqual(header, ss.reliable_size);
+
+    // A peer that doesn't take RESET_STREAM_AT gets a plain reset.
+    if (setup.quic_conn.peer_params) |*p| p.reset_stream_at = false;
+    const bidi = try setup.wt.openBidiStream(session_id, null);
+    setup.wt.resetStream(bidi, 42);
+    try testing.expectEqual(@as(u64, 0), setup.quic_conn.streams.getStream(bidi).?.send.reliable_size);
 }

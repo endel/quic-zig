@@ -1067,6 +1067,7 @@ pub const Connection = struct {
             .initial_max_streams_bidi = config.initial_max_streams_bidi,
             .initial_max_streams_uni = config.initial_max_streams_uni,
             .max_datagram_frame_size = config.max_datagram_frame_size,
+            .reset_stream_at = true,
             .max_ack_delay = config.max_ack_delay,
             .min_ack_delay = minAckDelayUs(config.max_ack_delay),
             // Server's preferred address (RFC 9000 §9.6) — only for servers, must not coexist with disable_active_migration
@@ -1849,6 +1850,11 @@ pub const Connection = struct {
             self.closeWithTransportError(@backingInt(TransportError.flow_control_error), @backingInt(FrameType.reset_stream), "RESET_STREAM exceeds stream flow control");
             return error.FlowControlError;
         }
+        // draft-ietf-quic-reliable-stream-reset §5.2: the code can't change.
+        if (err == error.StreamStateError) {
+            self.closeWithTransportError(@backingInt(TransportError.stream_state_error), frame_mod.RESET_STREAM_AT, "RESET_STREAM_AT changed the error code");
+            return error.ProtocolViolation;
+        }
         self.closeWithTransportError(@backingInt(TransportError.final_size_error), @backingInt(FrameType.reset_stream), "RESET_STREAM final_size mismatch");
         return error.ProtocolViolation;
     }
@@ -2256,7 +2262,7 @@ pub const Connection = struct {
                     }
                 }
                 if (self.streams.getStream(rs.stream_id)) |s| {
-                    s.recv.handleResetStream(rs.error_code, rs.final_size) catch |err| return self.rejectResetStream(err);
+                    s.recv.handleResetStreamAt(rs.error_code, rs.final_size, rs.reliable_size) catch |err| return self.rejectResetStream(err);
                     // RFC 9000 §4.5: the final size counts once; the credit
                     // comes back when queueFlowControlUpdates harvests it.
                     try self.chargeConnWindow(&s.recv, rs.final_size, .reset_stream);
@@ -2266,7 +2272,7 @@ pub const Connection = struct {
                     // against connection flow control when it sent the data, so
                     // we have to release that credit here or the connection
                     // stalls at the window even though the bytes never arrived.
-                    s.handleResetStream(rs.error_code, rs.final_size) catch |err| return self.rejectResetStream(err);
+                    s.handleResetStreamAt(rs.error_code, rs.final_size, rs.reliable_size) catch |err| return self.rejectResetStream(err);
                     try self.chargeConnWindow(s, rs.final_size, .reset_stream);
                     if (!s.closed_counted) {
                         s.closed_counted = true;
@@ -3224,6 +3230,7 @@ pub const Connection = struct {
                 .stream_id = ss.stream_id,
                 .error_code = ss.reset_err.?,
                 .final_size = ss.send_offset,
+                .reliable_size = if (self.peerTakesResetStreamAt()) ss.reliable_size else 0,
             } });
             if (!ss.reset_stream_sent) self.framesStillDue();
         }
@@ -3511,7 +3518,7 @@ pub const Connection = struct {
                 .streams_blocked_bidi => |l| if (self.streams.max_bidi_streams == l) .{ .streams_blocked_bidi = l } else continue,
                 .streams_blocked_uni => |l| if (self.streams.max_uni_streams == l) .{ .streams_blocked_uni = l } else continue,
                 // Rebuilt from the record: a reset uni stream is already gone.
-                .reset_stream => |r| .{ .reset_stream = .{ .stream_id = r.stream_id, .error_code = r.error_code, .final_size = r.final_size } },
+                .reset_stream => |r| .{ .reset_stream = .{ .stream_id = r.stream_id, .error_code = r.error_code, .final_size = r.final_size, .reliable_size = r.reliable_size } },
                 .stop_sending => |ss| blk: {
                     const rs = self.streams.getRecvStream(ss.stream_id) orelse continue;
                     // Data Recvd or Reset Recvd: the request is moot.
@@ -4473,6 +4480,13 @@ pub const Connection = struct {
         return self.datagram_send_queue.queueLen();
     }
 
+    /// Whether the peer takes RESET_STREAM_AT, so a reset can still deliver
+    /// the start of a stream (draft-ietf-quic-reliable-stream-reset §3).
+    pub fn peerTakesResetStreamAt(self: *const Connection) bool {
+        const pp = self.peer_params orelse return false;
+        return pp.reset_stream_at;
+    }
+
     /// The largest datagram `sendDatagram` takes now: what an otherwise empty
     /// 1-RTT packet holds at the current packet size and DCID, within the
     /// peer's max_datagram_frame_size and `DatagramQueue.MAX_DATAGRAM_SIZE`.
@@ -5129,6 +5143,7 @@ pub fn connectInto(
         .initial_max_streams_bidi = config.initial_max_streams_bidi,
         .initial_max_streams_uni = config.initial_max_streams_uni,
         .max_datagram_frame_size = config.max_datagram_frame_size,
+        .reset_stream_at = true,
         .max_ack_delay = config.max_ack_delay,
         .min_ack_delay = minAckDelayUs(config.max_ack_delay),
         .initial_source_connection_id = .init(&scid),
@@ -8398,4 +8413,59 @@ test "client anti-deadlock: once its Initial is acknowledged, one padded probe p
     }
     try std.testing.expect(bursts >= 2);
     try std.testing.expect(total <= 16);
+}
+
+test "both ends advertise reset_stream_at" {
+    // WebTransport draft-16 §3.1 has both send it; xquic refused our server
+    // without it (WT_REQUIREMENTS_NOT_MET) before sending a CONNECT.
+    var conn = try connect(std.testing.allocator, "example.com", .{}, null, null);
+    defer conn.deinit();
+    try std.testing.expect(conn.local_params.reset_stream_at);
+}
+
+test "a RESET_STREAM_AT is read up to its Reliable Size before the reset shows" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxIncomingStreams(10, 10);
+    var head = "ab".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 2, .offset = 0, .length = head.len, .data = &head, .fin = false } }, .application, 0);
+    try conn.processFrame(&.{ .reset_stream = .{ .stream_id = 2, .error_code = 3, .final_size = 9, .reliable_size = 4 } }, .application, 0);
+    const rs = conn.streams.getRecvStream(2).?;
+    try std.testing.expect(rs.reset_err == null);
+    const a = rs.read().?;
+    std.testing.allocator.free(a);
+
+    var tail = "cd".*;
+    try conn.processFrame(&.{ .stream = .{ .stream_id = 2, .offset = 2, .length = tail.len, .data = &tail, .fin = false } }, .application, 0);
+    const b = rs.read().?;
+    std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(?u64, 3), rs.reset_err);
+}
+
+/// The Reliable Size of the reset queued for `stream_id`. Drains the queue.
+fn queuedReliableSize(conn: *Connection, stream_id: u64) ?u64 {
+    var out: ?u64 = null;
+    while (conn.pending_frames.pop()) |f| switch (f) {
+        .reset_stream => |rs| if (rs.stream_id == stream_id) {
+            out = rs.reliable_size;
+        },
+        else => {},
+    };
+    return out;
+}
+
+test "a reset keeps its Reliable Size only for a peer that takes RESET_STREAM_AT" {
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    for ([_]bool{ false, true }) |takes| {
+        conn.peer_params = .{ .reset_stream_at = takes };
+        const s = try conn.streams.openBidiStream();
+        try s.send.writeData("hdr");
+        s.send.send_offset = 3;
+        try s.send.onAck(0, 3, false);
+        s.send.resetAt(4, 3);
+        conn.queueFlowControlUpdates();
+        try std.testing.expectEqual(@as(?u64, if (takes) 3 else 0), queuedReliableSize(&conn, s.stream_id));
+    }
 }

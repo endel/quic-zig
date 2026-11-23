@@ -431,6 +431,16 @@ pub const FrameSorter = struct {
         }
         return false;
     }
+
+    /// Where the bytes that have arrived without a gap end, read or not.
+    pub fn contiguousEnd(self: *const FrameSorter) u64 {
+        var end = self.read_pos;
+        for (self.chunks.items) |c| {
+            if (c.offset > end) break;
+            end = @max(end, c.end());
+        }
+        return end;
+    }
 };
 
 /// Fraction of receive window that triggers a MAX_STREAM_DATA update.
@@ -446,6 +456,10 @@ pub const ReceiveStream = struct {
 
     /// Error code from RESET_STREAM.
     reset_err: ?u64 = null,
+
+    /// A RESET_STREAM_AT not yet in effect: its first `reliable` bytes are
+    /// still delivered, and `reset_err` set once they have been read.
+    reset_at: ?struct { err: u64, reliable: u64 } = null,
 
     /// Error code for STOP_SENDING frame to send to peer.
     stop_sending_err: ?u64 = null,
@@ -524,6 +538,13 @@ pub const ReceiveStream = struct {
     /// Handle a RESET_STREAM frame.
     /// Returns FinalSizeError if final_size conflicts with known data.
     pub fn handleResetStream(self: *ReceiveStream, error_code: u64, final_size: u64) !void {
+        return self.handleResetStreamAt(error_code, final_size, 0);
+    }
+
+    /// Handle a RESET_STREAM_AT frame (draft-ietf-quic-reliable-stream-reset):
+    /// a reset that still delivers the first `reliable_size` bytes. It takes
+    /// effect once those are read, and at once when they already were.
+    pub fn handleResetStreamAt(self: *ReceiveStream, error_code: u64, final_size: u64, reliable_size: u64) !void {
         // RFC 9000 §4.5: final size cannot change once known
         if (self.sorter.fin_offset) |existing| {
             if (existing != final_size) return error.FinalSizeError;
@@ -531,9 +552,22 @@ pub const ReceiveStream = struct {
         // RFC 9000 §4.5: final size cannot be less than data already received
         if (final_size < self.sorter.highestReceived()) return error.FinalSizeError;
         if (final_size > self.receive_window) return error.FlowControlError;
+        // §5.2: a repeat may lower the Reliable Size, and changes nothing else.
+        if (self.reset_at) |p| if (p.err != error_code) return error.StreamStateError;
+        if (self.reset_err != null) return;
 
-        self.reset_err = error_code;
         self.sorter.fin_offset = final_size;
+        const reliable = if (self.reset_at) |p| @min(p.reliable, reliable_size) else reliable_size;
+        if (reliable > self.bytes_read) {
+            self.reset_at = .{ .err = error_code, .reliable = reliable };
+            return;
+        }
+        self.resetNow(error_code);
+    }
+
+    fn resetNow(self: *ReceiveStream, error_code: u64) void {
+        self.reset_at = null;
+        self.reset_err = error_code;
         // Never read now, and its connection credit is handed back at once.
         self.sorter.discard();
         self.creditDue();
@@ -554,6 +588,8 @@ pub const ReceiveStream = struct {
         if (data) |d| {
             self.bytes_read += d.len;
             self.creditDue();
+            // §5: what arrived past the Reliable Size may go up too.
+            if (self.reset_at) |p| if (self.bytes_read >= p.reliable) self.resetNow(p.err);
         } else if (self.sorter.isComplete()) {
             self.finished = true;
         }
@@ -565,6 +601,13 @@ pub const ReceiveStream = struct {
     /// the retransmission filling it still has to find the stream.
     pub fn allReceived(self: *const ReceiveStream) bool {
         return self.finished or (self.reset_err == null and self.sorter.isFullyReceived());
+    }
+
+    /// A RESET_STREAM_AT is pending and every byte it still delivers has
+    /// arrived: like a FIN with nothing missing, the peer sends no more.
+    pub fn reliablyReceived(self: *const ReceiveStream) bool {
+        const p = self.reset_at orelse return false;
+        return self.sorter.contiguousEnd() >= p.reliable;
     }
 
     /// Bytes the consumer has read and let go of.
@@ -775,6 +818,12 @@ pub const SendStream = struct {
     /// Whether a RESET_STREAM frame has been queued for sending.
     reset_stream_sent: bool = false,
 
+    /// The Reliable Size the reset carries: RESET_STREAM_AT when non-zero.
+    reliable_size: u64 = 0,
+
+    /// A resetAt() waiting for its first `reliable` bytes to be acknowledged.
+    reset_pending: ?struct { err: u64, reliable: u64 } = null,
+
     /// Never reclaimed, whatever its state. For streams a protocol layer
     /// writes through a pointer it keeps for the whole connection: H3's
     /// control and QPACK streams, which a peer's STOP_SENDING would otherwise
@@ -818,7 +867,7 @@ pub const SendStream = struct {
     /// Write data to the stream. Buffers it for later sending. Dropped once the
     /// stream is reset: RFC 9000 §3.1 lets nothing follow RESET_STREAM.
     pub fn writeData(self: *SendStream, data: []const u8) !void {
-        if (self.reset_err != null) return;
+        if (self.reset_err != null or self.reset_pending != null) return;
         // Reuse the acked prefix before growing, so streaming that fits the
         // current capacity never reallocates.
         if (self.write_buffer.items.len + data.len > self.write_buffer.capacity) {
@@ -973,17 +1022,36 @@ pub const SendStream = struct {
         }
         self.trimRetransmitRangesBelow(self.ack_offset);
         self.send_offset = @max(self.send_offset, self.ack_offset);
+        if (self.reset_pending) |p| if (self.ack_offset >= p.reliable) self.resetReliably(p.err, p.reliable);
         self.compactAcked();
     }
 
     /// Cancel the stream with an error code (sends RESET_STREAM).
     pub fn reset(self: *SendStream, error_code: u64) void {
+        self.resetReliably(error_code, 0);
+    }
+
+    /// Reset, still delivering the first `reliable` bytes (RESET_STREAM_AT,
+    /// draft-ietf-quic-reliable-stream-reset §5). Those are guaranteed by
+    /// holding the reset back until the peer has acknowledged them, which
+    /// spares the send paths a partly reset stream; nothing more is taken
+    /// meanwhile. The Reliable Size goes out only to a peer that takes it.
+    pub fn resetAt(self: *SendStream, error_code: u64, reliable: u64) void {
+        if (self.reset_err != null) return;
+        const r = @min(reliable, self.write_offset);
+        if (self.ack_offset >= r) return self.resetReliably(error_code, r);
+        self.reset_pending = .{ .err = error_code, .reliable = r };
+    }
+
+    fn resetReliably(self: *SendStream, error_code: u64, reliable: u64) void {
         // The unsent tail will never spend connection credit: RESET_STREAM
         // names send_offset as the final size.
         if (self.reset_err == null) {
             if (self.ledger) |l| l.committed -= self.write_offset - self.send_offset;
         }
+        self.reset_pending = null;
         self.reset_err = error_code;
+        self.reliable_size = reliable;
         self.framesDue();
     }
 
@@ -1328,7 +1396,8 @@ pub const Stream = struct {
     /// Neither direction carries anything more: the peer's data all arrived
     /// or it reset, and our FIN went out or we reset.
     fn bothSidesDone(self: *const Stream) bool {
-        const recv_done = self.recv.reset_err != null or (self.recv.fin_received and self.recv.allReceived());
+        const recv_done = self.recv.reset_err != null or self.recv.reliablyReceived() or
+            (self.recv.fin_received and self.recv.allReceived());
         return recv_done and (self.send.fin_sent or self.send.reset_err != null);
     }
 };
@@ -4074,4 +4143,73 @@ test "FrameSorter: chunk slots from a reordering burst are released once drained
 
     try testing.expectEqual(@as(u64, 2 * n), sorter.read_pos);
     try testing.expectEqual(@as(usize, 0), sorter.chunks.capacity);
+}
+
+test "ReceiveStream: a RESET_STREAM_AT shows only once its Reliable Size is read" {
+    // draft-ietf-quic-reliable-stream-reset §5: WebTransport needs the
+    // stream header that names the session even from a reset stream.
+    var rs = ReceiveStream.init(testing.allocator, 0);
+    defer rs.deinit();
+    try rs.handleStreamFrame(0, "ab", false);
+    try rs.handleResetStreamAt(7, 10, 5);
+    try testing.expect(rs.reset_err == null);
+    const first = rs.read().?;
+    try testing.expectEqualStrings("ab", first);
+    testing.allocator.free(first);
+    try testing.expect(rs.reset_err == null);
+
+    try rs.handleStreamFrame(2, "cde", false);
+    const rest = rs.read().?;
+    try testing.expectEqualStrings("cde", rest);
+    testing.allocator.free(rest);
+    try testing.expectEqual(@as(?u64, 7), rs.reset_err);
+    try testing.expect(rs.read() == null);
+    try testing.expect(!rs.finished);
+}
+
+test "ReceiveStream: a later RESET_STREAM_AT may lower the Reliable Size, never raise it or change the code" {
+    var rs = ReceiveStream.init(testing.allocator, 0);
+    defer rs.deinit();
+    try rs.handleStreamFrame(0, "abc", false);
+    const d = rs.read().?;
+    testing.allocator.free(d);
+    try rs.handleResetStreamAt(7, 10, 8);
+    // §5.2: a larger one, reordered, is ignored.
+    try rs.handleResetStreamAt(7, 10, 9);
+    try testing.expect(rs.reset_err == null);
+    try testing.expectError(error.StreamStateError, rs.handleResetStreamAt(8, 10, 2));
+    // Lowered below what was read, the reset takes effect at once.
+    try rs.handleResetStreamAt(7, 10, 2);
+    try testing.expectEqual(@as(?u64, 7), rs.reset_err);
+    try testing.expectError(error.FinalSizeError, rs.handleResetStreamAt(7, 11, 0));
+}
+
+test "SendStream: resetAt waits for its Reliable Size to be acknowledged" {
+    // §5: the sender guarantees those bytes; holding the reset back until
+    // they are acked is how this one does.
+    var ss = SendStream.init(testing.allocator, 2);
+    defer ss.deinit();
+    try ss.writeData("hdr" ++ "payload");
+    ss.send_offset = 10;
+    ss.resetAt(9, 3);
+    try testing.expect(ss.reset_err == null);
+    // Nothing more is taken once the application has reset it.
+    try ss.writeData("late");
+    try testing.expectEqual(@as(u64, 10), ss.write_offset);
+
+    try ss.onAck(0, 3, false);
+    try testing.expectEqual(@as(?u64, 9), ss.reset_err);
+    try testing.expectEqual(@as(u64, 3), ss.reliable_size);
+
+    // Already acknowledged: at once. A plain reset delivers nothing.
+    var acked = SendStream.init(testing.allocator, 6);
+    defer acked.deinit();
+    try acked.writeData("hdr");
+    acked.send_offset = 3;
+    try acked.onAck(0, 3, false);
+    acked.resetAt(4, 3);
+    try testing.expectEqual(@as(?u64, 4), acked.reset_err);
+    try testing.expectEqual(@as(u64, 3), acked.reliable_size);
+    acked.reset(5);
+    try testing.expectEqual(@as(u64, 0), acked.reliable_size);
 }

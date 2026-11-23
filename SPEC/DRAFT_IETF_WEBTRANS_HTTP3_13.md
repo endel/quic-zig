@@ -92,11 +92,25 @@ binds before QUIC's would be a new way for an application to stall.
 re-sends the grant rather than waiting for the window to slide — the grant was
 lost or crossed in flight.
 
+## RESET_STREAM_AT (§4.3; draft-16 §3.1, §4.4)
+
+Both ends send the `reset_stream_at` transport parameter, as draft-16 §3.1
+asks of a client and a server alike; xquic refused our server without it,
+with WT_REQUIREMENTS_NOT_MET, before sending its CONNECT. Resetting a data
+stream we opened, by the application or because its session ended, goes as
+RESET_STREAM_AT whose Reliable Size covers the stream's header, so the peer
+can still tell which session it was for. A stream the peer opened carries no
+header from us and is reset plainly. The reset waits for the header to be
+acknowledged, which it nearly always already is.
+
+§5.3's note still stands: the two ends cannot agree on which streams are open,
+which is why our stream limit counts opens rather than closures, and does not
+need to. Details: `SPEC/STATUS.md`, Reliable Stream Reset.
+
 ## Not implemented
 
 | Item | Note |
 | --- | --- |
-| `RESET_STREAM_AT` reliable reset (§4.3) | The draft makes it a MUST for resetting a WT data stream, so both ends agree the header arrived. `TODO.md` I5. Without it, §5.3's note stands: the two ends cannot agree on which streams are open — which is why our stream limit counts opens rather than closures, and does not need to. |
 | `WT_MAX_STREAM_DATA` / `WT_STREAM_DATA_BLOCKED` | §5.4 prohibits them — receipt should be a session error. We ignore them instead. |
 | Flow control across an intermediary (§5.6.1) | We are not an intermediary. |
 | 0-RTT limit retention (§3.2) | No 0-RTT on the WebTransport path. |

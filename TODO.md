@@ -144,7 +144,7 @@ Results tracked in [`bench/throughput-results.md`](bench/throughput-results.md).
   X25519), but a client offering only AES-256-GCM fails. AES-256 needs SHA-384
   through the QUIC key schedule, which is SHA-256 throughout. The client now
   verifies P-384 certificates.
-- [ ] **I5. RESET_STREAM_AT reliable reset (M/L)** — needed by WebTransport draft-13.
+- [x] **I5. RESET_STREAM_AT reliable reset (M/L)** — needed by WebTransport draft-13. Done Nov 2026: `SPEC/STATUS.md`, Reliable Stream Reset.
 - [ ] **I6. Proactive key-update cadence (S)** — rotate every ~100k pkts (`crypto.zig:788`).
 - [ ] **I7. STREAMS_BLOCKED never emitted (S)** — `stream.zig:899-923`.
 - [ ] **I8. IP_PKTINFO missing (M)** — wildcard-bound multihomed source-addr bug

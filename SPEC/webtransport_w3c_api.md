@@ -142,8 +142,8 @@ parsed all of them, but two things were wrong:
   the short version is that the credit travels as a capsule per session rather
   than as the §5.5 SETTINGS, which Safari answers by refusing the session.
 
-What remains open: `RESET_STREAM_AT` reliable reset (`TODO.md` I5), the other
-draft-13 dependency.
+`RESET_STREAM_AT`, the other draft-13 dependency, is implemented too; see
+[STATUS.md](STATUS.md), Reliable Stream Reset.
 
 ## Two bugs underneath this that browsers could not have shown us
 

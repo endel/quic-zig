@@ -454,15 +454,15 @@ cross-impl byte-exact UTF-8 header check.
 | — | Send backpressure | ✅ Done | `sendCapacity` / `streamSendCapacity` report the peer's remaining credit — QUIC MAX_DATA and MAX_STREAM_DATA, narrowed by WT_MAX_DATA where it binds. `notifyWritable` asks for one `writable` event (`onWritable`) when it rises. Advisory, like a browser `WritableStream`: a write past it is buffered |
 | — | Session flow control (§5.3-§5.6) | ✅ Done | `WT_MAX_STREAMS` / `WT_MAX_DATA` and their `*_BLOCKED` partners, granted per session and raised as the peer spends them. Binds only when both endpoints sent the draft-13 `WT_MAX_SESSIONS` above one (§5.1), which is what keeps it invisible to Chrome and quic-go. This is what lets Safari 26.4 open a client-initiated stream |
 | — | draft-13 §5.5 initial credits in SETTINGS | ⚠️ Partial | `WT_INITIAL_MAX_DATA` / `_STREAMS_BIDI` / `_STREAMS_UNI` serialize and are configurable, but are **not advertised by default**: Safari 26.4 refuses the session outright when it sees them. The same credit reaches every peer as a capsule instead — `SPEC/DRAFT_IETF_WEBTRANS_HTTP3_13.md` |
-| — | RESET_STREAM_AT reliable reset | ❌ Missing | Needed by draft-13; `TODO.md` I5 |
+| — | RESET_STREAM_AT reliable reset | ✅ Done | A reset of a data stream we opened covers its header (draft-16 §4.4), a session's end included; see Reliable Stream Reset below. xquic refused our server without the transport parameter |
 
-### Summary — WebTransport: 22 done, 1 partial, 2 missing
+### Summary — WebTransport: 23 done, 1 partial, 1 missing
 
 | Status | Count |
 |--------|-------|
-| ✅ Done | 22 |
+| ✅ Done | 23 |
 | ⚠️ Partial | 1 |
-| ❌ Missing | 2 |
+| ❌ Missing | 1 |
 
 Conformance against three browsers and our own client:
 `SPEC/webtransport_conformance.md`. What of draft-13 is implemented, and the
@@ -563,6 +563,24 @@ https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/
 
 ---
 
+## Reliable Stream Reset (draft-ietf-quic-reliable-stream-reset-08)
+
+An active Internet-Draft. The transport parameter's codepoint (0x1d) is
+provisional; the drafts-06/07 one (0x17f7586d2cb571) is still sent and read,
+as quic-go does, since webtransport-go images built on quic-go 0.59 know only it.
+
+| § | Section | Status | Notes |
+|---|---------|--------|-------|
+| 3 | reset_stream_at transport parameter | ✅ Done | Always advertised, client and server, on both codepoints; a value is TRANSPORT_PARAMETER_ERROR |
+| 4 | RESET_STREAM_AT frame (0x24) | ✅ Done | Parsed as a RESET_STREAM with a Reliable Size; one past the Final Size is FRAME_ENCODING_ERROR. Written only to a peer that advertised the parameter, and only when the Reliable Size is not zero |
+| 5 | Resetting streams | ✅ Done | Received: the reset takes effect once the Reliable Size has been read, so every consumer (raw QUIC, H3, WebTransport) sees the data, then the reset. Sent: `SendStream.resetAt` holds the reset back until those bytes are acknowledged, which spares the send paths a partly reset stream (§3.2 lets a reset be withheld) |
+| 5.2 | Multiple RESET_STREAM_AT | ✅ Done | A lower Reliable Size takes effect, a higher one is ignored, a changed error code is STREAM_STATE_ERROR and a changed Final Size FINAL_SIZE_ERROR |
+| 3 | 0-RTT | — | Not remembered across resumption: a 0-RTT reset goes out as a plain RESET_STREAM |
+
+### Summary — Reliable Stream Reset: ✅ Complete (4/4)
+
+---
+
 ## Multipath QUIC (draft-ietf-quic-multipath)
 
 **Status: Not implemented.** The draft is still evolving and no major QUIC implementation
@@ -629,9 +647,10 @@ lives in [`src/sys/windows.zig`](../src/sys/windows.zig).
 | RFC 9221 (QUIC DG) | 3 | 0 | 0 | 100% |
 | RFC 9368 (Version Neg) | 3 | 0 | 0 | 100% |
 | RFC 9369 (QUIC v2) | 7 | 0 | 0 | 100% |
-| WebTransport | 22 | 1 | 2 | 88% |
+| WebTransport | 23 | 1 | 1 | 92% |
 | RFC 6455 (WebSocket, server) | 6 | 0 | 2 | 75% |
 | ACK Frequency | 7 | 0 | 0 | 100% |
+| Reliable Stream Reset | 4 | 0 | 0 | 100% |
 | MoQ Transport (draft-17, -18, -22) | 18 | 2 | 0 | see below |
 | moq-lite (draft-05) | 6 | 2 | 1 | see below |
 
