@@ -229,6 +229,25 @@ draft-22 the relays and clients that speak nothing else (moq-go, moqtail,
 moqt-nr-draft-22, red5-moq-relay, moqxr) never met ours. moq-go passes every
 case both ways at draft-22 (12 Nov 2026).
 
+## Open decisions
+
+- **Properties a relay adds (deferred, 23 Nov 2026).** moq-dev-rs and
+  stitcher, both moq-net at draft-22, add a TIMESTAMP property (0x10, from
+  LOC) to every object. The data cases compare each object's first two
+  property types exactly (`propertyKeys` in `apps/moq_test_client.zig`), so
+  those relays fail every basic data case, up to 15 points.
+
+  Draft-22 contradicts itself: §8.4 forbids a relay to add a property it
+  supports unless that property's rules allow it, while §7.1 and §11.2 say
+  properties may be added as objects cross the network. The runner's
+  data-plane README judges which objects arrive, not their properties.
+
+  The option: ignore properties we didn't send in the basic cases, and still
+  fail one that was dropped or changed. moq-dev-rs also drops our properties
+  2 and 5 in `data-extensions`, which is theirs whatever we decide. Relaxing
+  would likely not flip many cells: those relays then fail on End of Group
+  on every datagram, renumbered groups, and refusing FORWARD=0.
+
 ## Known blockers
 
 - **(Cleared) `cdn.moq.dev` is reachable.** A full moq-lite session runs over
