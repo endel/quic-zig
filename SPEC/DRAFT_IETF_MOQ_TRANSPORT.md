@@ -345,8 +345,10 @@ The one-stream-per-group design is what allowed scaling past ~1000 frames per su
   one arriving. Within a range it holds the start of, a gap it can't vouch
   for is sent as End of Unknown Range, never left for a FIN to call absent;
   descending FETCHes skip that. A range starting before the cache goes to
-  the publisher whole, not split between cache and upstream. A fill is served
-  only from the cache.
+  the publisher whole, not split between cache and upstream. So does a fill
+  (§7.6): its answer goes down the fill stream under the SUBSCRIBE's Request
+  ID, the publisher's FETCH_OK stays upstream, and a refusal resets the fill
+  stream after its header (§3.4.1).
 - TRACK_STATUS for a track the relay has no state for is passed to its
   namespace's publisher; LARGEST_OBJECT is the larger of what the publisher
   reported and what the relay has received, as §9.20.17 asks.
@@ -358,4 +360,5 @@ The one-stream-per-group design is what allowed scaling past ~1000 frames per su
 - SIGTERM or SIGINT drains: GOAWAY on every client's control stream, then the relay stops once they have gone or after 5 s; a second signal stops it at once. A GOAWAY from a peer is ignored.
 - SUBSCRIBE_TRACKS is offered only tracks the relay has a publisher for, never PUBLISH_BLOCKED; FORWARD on the request is copied into each PUBLISH.
 - The group cache follows one stream at a time: when a newer group's stream opens while an older one is still arriving, the older group is not cached.
+- A subscriber answered while a group is arriving is fed the rest of it, the objects its filter passes, as each completes in the cache: the stream's raw bytes name objects by their distance from ones it never saw. Its stream is reset if the cache stops covering the group, when a newer group's stream takes the cache over or the group outgrows it. Other subgroups already in flight are not joined.
 - The earlier note that moq-rs interop was blocked by their auth config is stale: `demo/relay/localhost.toml` sets `auth.public = ""`, and with it the interop client reaches 5/7 against them.
