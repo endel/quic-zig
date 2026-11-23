@@ -569,6 +569,7 @@ const StreamSlot = struct {
     fn deinit(self: *StreamSlot, alloc: std.mem.Allocator) void {
         self.buf.deinit(alloc);
         alloc.free(self.fwd.outs);
+        self.fwd.resyncs.deinit(alloc);
     }
 };
 
@@ -618,21 +619,23 @@ const FwdState = struct {
     held_since_ns: i128 = 0,
     /// The peer finished the stream while it was held.
     fin_seen: bool = false,
+    /// The outputs still catching up, kept apart: they are few and brief,
+    /// and `outs` is walked for every chunk.
+    resyncs: std.ArrayListUnmanaged(Resync) = .empty,
 
-    /// `timeout_ms`: its subscriber's SUBGROUP_DELIVERY_TIMEOUT.
-    const Out = struct { sid: u64, sub_ci: usize, timeout_ms: u64 = 0, resync: ?Resync = null };
+    /// `timeout_ms`: its subscriber's SUBGROUP_DELIVERY_TIMEOUT. `resyncing`:
+    /// written from its entry in `resyncs`, not sent the stream's bytes.
+    const Out = struct { sid: u64, sub_ci: usize, timeout_ms: u64 = 0, resyncing: bool = false };
 
     /// An output opened after the group's stream had begun. The bytes that
     /// follow name each object by its distance from the one before, which
     /// this subscriber never saw, so it is written whole objects from the
-    /// live cache instead, as each completes.
+    /// live cache until it has caught up, and takes the bytes from then on.
     const Resync = struct {
-        /// Where the next object starts in the live cache, and the one before it.
-        pos: usize = 0,
-        prev: ?u64 = null,
-        /// The group's first object: a header that leaves the subgroup
-        /// implicit names it by that.
-        first: ?u64 = null,
+        ci: usize,
+        sid: u64,
+        /// How far it has read the live cache.
+        it: CachedObjects,
         /// The last object written, which the next is written against.
         sent: ?u64 = null,
         hdr_sent: bool = false,
@@ -640,6 +643,17 @@ const FwdState = struct {
         alias: u64,
         start: Location,
         end: ?Location,
+
+        /// The live group's header, naming its subgroup outright unless the
+        /// stream starts at the subgroup's first object.
+        fn sendHeader(self: *Resync, l: *Link, live: moq_obj.SubgroupHeader, draft: moq_version.Draft, from_start: bool) void {
+            var h = live;
+            if (!from_start) {
+                h.subgroup = self.it.subgroup();
+                h.first_object = false;
+            }
+            self.hdr_sent = sendSubgroupHeader(l, self.sid, h, self.alias, draft);
+        }
     };
 
     fn reserveOut(self: *FwdState, alloc: std.mem.Allocator) bool {
@@ -1444,7 +1458,7 @@ const RelayHandler = struct {
             while (it.next()) |o| {
                 if (o.status != 0) continue; // a status, not an object to fetch
                 const at: Location = .{ .group = g.hdr.group, .object = o.id };
-                if (at.order(start) == .lt or at.order(end) == .gt) continue;
+                if (!within(start, end, at)) continue;
                 fbs.seek = 0;
                 if (!descending) if (unknownBefore(c.at, start, at)) |gap| {
                     moq_obj.writeFetchItemHead(&fbs, .{ .end_of_range = .{ .kind = .unknown, .at = gap } }, &c) catch {};
@@ -1959,7 +1973,7 @@ const RelayHandler = struct {
                     f.sub.answered = true;
                     if (ok.forward) |fwd| f.sub.forward = fwd;
                     std.debug.print("[relay] PUBLISH accepted by client {d} alias={d}\n", .{ ci, f.sub.alias });
-                    self.replayCachedGroups(f.track, f.sub);
+                    self.startDelivery(f.track, f.sub);
                     self.resumeIfWanted(f.track);
                 };
             } else if (parsed.env.type == moq_codes.MSG_REQUEST_ERROR) {
@@ -2291,13 +2305,6 @@ const RelayHandler = struct {
 
     /// The track a data stream feeds, while it still carries the publication
     /// the stream began in.
-    /// The track whose live cache this stream still fills whole: what a
-    /// resyncing output is written from.
-    fn liveOf(self: *RelayHandler, fs: *FwdState, ci: usize, stream_id: u64) ?*const Track {
-        const t = self.fwdTrack(fs) orelse return null;
-        return if (t.ownsLive(ci, stream_id) and !t.live.overflowed) t else null;
-    }
-
     fn fwdTrack(self: *RelayHandler, fs: *FwdState) ?*Track {
         const ti = fs.track_idx orelse return null;
         const t = &self.tracks[ti];
@@ -2430,8 +2437,7 @@ const RelayHandler = struct {
                             sub.joined_at = tr.largest();
                             sub.setRange();
                             self.sendSubscribeOk(sub);
-                            self.openFill(tr, sub);
-                            self.joinLiveGroup(tr, sub);
+                            self.startDelivery(tr, sub);
                         }
                         self.retryHeld(ci);
                     } else |e| {
@@ -2549,11 +2555,7 @@ const RelayHandler = struct {
                 ci, alias, ti, t.sub_count, t.publisher_idx,
             });
 
-            self.openFill(t, sub);
-            // Replay any cached groups to this new subscriber so it starts
-            // playback immediately instead of waiting for the next keyframe.
-            self.replayCachedGroups(t, sub);
-            self.joinLiveGroup(t, sub);
+            self.startDelivery(t, sub);
             self.resumeIfWanted(t);
         }
     }
@@ -2608,7 +2610,30 @@ const RelayHandler = struct {
         }
     }
 
-    // Replay every cached complete group to a freshly-subscribed subscriber.
+    /// What a subscriber is owed once it can take objects: its fill, the
+    /// cached groups, so it starts playback without waiting for the next
+    /// keyframe, and the rest of the group in flight.
+    fn startDelivery(self: *RelayHandler, t: *Track, sub: *Sub) void {
+        self.openFill(t, sub);
+        self.replayCachedGroups(t, sub);
+        self.joinLiveGroup(t, sub);
+    }
+
+    /// A stream to `sub` for the group `hdr` heads, fed from `fs`. Counted at
+    /// the open, not after the header: PUBLISH_DONE's Stream Count has to
+    /// cover every stream the subscriber sees.
+    fn openOut(self: *RelayHandler, fs: *FwdState, l: *Link, sub: *Sub, hdr: moq_obj.SubgroupHeader) ?*FwdState.Out {
+        if (!fs.reserveOut(self.alloc)) return null;
+        const out = l.openUniOrdered(sub.sendOrder(hdr.publisher_priority, hdr.group)) catch |e| {
+            std.debug.print("[relay] openUniStream failed for sub {d}: {}\n", .{ sub.client_idx, e });
+            return null;
+        };
+        sub.streams += 1;
+        fs.outs[fs.out_count] = .{ .sid = out, .sub_ci = sub.client_idx, .timeout_ms = sub.subgroup_timeout_ms };
+        fs.out_count += 1;
+        return &fs.outs[fs.out_count - 1];
+    }
+
     /// A subscriber answered while a group arrives is fed the rest of it
     /// rather than left to wait for the next group's stream: a Next Object
     /// join starts inside the group in flight.
@@ -2617,55 +2642,85 @@ const RelayHandler = struct {
         const owner = t.live_owner orelse return;
         if (t.live.overflowed or !sub.wantsGroup(t.live.hdr.group)) return;
         const fs = self.clients[owner.ci].fwdState(owner.sid) orelse return;
-        if (!fs.header_parsed or !fs.reserveOut(self.alloc)) return;
+        if (!fs.header_parsed) return;
         var l = self.link(sub.client_idx) orelse return;
-        const out = l.openUniOrdered(sub.sendOrder(t.live.hdr.publisher_priority, t.live.hdr.group)) catch return;
-        sub.streams += 1;
-        fs.outs[fs.out_count] = .{
-            .sid = out,
-            .sub_ci = sub.client_idx,
-            .timeout_ms = sub.subgroup_timeout_ms,
-            .resync = .{ .alias = sub.alias, .start = sub.start, .end = sub.end },
+        const o = self.openOut(fs, &l, sub, t.live.hdr) orelse return;
+        o.resyncing = true;
+        fs.resyncs.append(self.alloc, .{
+            .ci = sub.client_idx,
+            .sid = o.sid,
+            .it = .{ .g = &t.live },
+            .alias = sub.alias,
+            .start = sub.start,
+            .end = sub.end,
+        }) catch {
+            l.reset(o.sid, moq_codes.STREAM_RESET_INTERNAL_ERROR);
+            fs.removeOut(fs.out_count - 1);
+            return;
         };
-        fs.out_count += 1;
-        self.feedResync(t, &l, &fs.outs[fs.out_count - 1], false);
+        self.feedResyncs(fs, owner.ci, owner.sid, false);
     }
 
-    /// Writes a resyncing output what the live cache has completed since it
-    /// last looked, its header going ahead of the first object it wants, or
-    /// of the FIN when there is none.
-    fn feedResync(self: *RelayHandler, t: *const Track, l: *Link, o: *FwdState.Out, fin: bool) void {
-        const rs = &o.resync.?;
+    /// Writes each catching-up output of a stream what the live cache has
+    /// completed since it last looked; hands back to plain forwarding those
+    /// that have caught up, and resets those the cache stopped covering: a
+    /// newer group's stream took it over, or the group outgrew it.
+    fn feedResyncs(self: *RelayHandler, fs: *FwdState, ci: usize, stream_id: u64, fin: bool) void {
+        const t = self.fwdTrack(fs);
+        const live: ?*const Track = if (t) |tr| (if (tr.ownsLive(ci, stream_id) and !tr.live.overflowed) tr else null) else null;
+        var i: usize = 0;
+        while (i < fs.resyncs.items.len) {
+            const rs = &fs.resyncs.items[i];
+            const oi = for (fs.outs[0..fs.out_count], 0..) |o, k| {
+                if (o.resyncing and o.sid == rs.sid and o.sub_ci == rs.ci) break k;
+            } else {
+                _ = fs.resyncs.swapRemove(i); // its subscriber went
+                continue;
+            };
+            var l = self.link(rs.ci) orelse {
+                i += 1;
+                continue;
+            };
+            const tr = live orelse {
+                l.reset(rs.sid, moq_codes.STREAM_RESET_INTERNAL_ERROR);
+                fs.removeOut(oi);
+                _ = fs.resyncs.swapRemove(i);
+                continue;
+            };
+            if (feedResync(tr, &l, rs, self.clients[rs.ci].draft, fin)) {
+                fs.outs[oi].resyncing = false;
+                _ = fs.resyncs.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Writes one catching-up output the objects it wants that the live
+    /// cache has completed. True once it has caught up, its last object the
+    /// stream's last whole one: the bytes from there on name objects from
+    /// it, so the output can take them as they come.
+    fn feedResync(t: *const Track, l: *Link, rs: *FwdState.Resync, draft: moq_version.Draft, fin: bool) bool {
         const hdr = t.live.hdr;
-        var it = CachedObjects{ .g = &t.live, .pos = rs.pos, .prev = rs.prev };
-        const w: LinkWriter = .{ .l = l, .sid = o.sid };
-        while (it.next()) |obj| {
-            if (rs.first == null) rs.first = obj.id;
+        const w: LinkWriter = .{ .l = l, .sid = rs.sid };
+        while (rs.it.next()) |obj| {
             if (!within(rs.start, rs.end, .{ .group = hdr.group, .object = obj.id })) continue;
-            if (!rs.hdr_sent) self.writeResyncHeader(l, o, hdr, obj.id);
-            moq_obj.writeSubgroupObject(w, obj, rs.sent, hdr.per_object_properties) catch break;
+            if (!rs.hdr_sent) rs.sendHeader(l, hdr, draft, obj.id == rs.it.first);
+            moq_obj.writeSubgroupObject(w, obj, rs.sent, hdr.per_object_properties) catch return false;
             rs.sent = obj.id;
         }
-        rs.pos = it.pos;
-        rs.prev = it.prev;
-        if (fin and !rs.hdr_sent) self.writeResyncHeader(l, o, hdr, null);
+        const next: Location = .{ .group = hdr.group, .object = if (rs.it.prev) |p| p + 1 else 0 };
+        const rest_wanted = next.order(rs.start) != .lt and (if (rs.end) |e| e.group > hdr.group else true);
+        if (rs.sent == rs.it.prev and rest_wanted) {
+            if (!rs.hdr_sent) rs.sendHeader(l, hdr, draft, rs.it.first == null);
+            l.send(rs.sid, t.live.bytes()[rs.it.pos..]) catch {};
+            return true;
+        }
+        if (fin and !rs.hdr_sent) rs.sendHeader(l, hdr, draft, rs.it.first == null);
+        return false;
     }
 
-    /// The live group's header, naming its subgroup outright: the stream may
-    /// not start at the subgroup's first object.
-    fn writeResyncHeader(self: *RelayHandler, l: *Link, o: *FwdState.Out, live: moq_obj.SubgroupHeader, first_written: ?u64) void {
-        const rs = &o.resync.?;
-        var h = live;
-        h.track_alias = rs.alias;
-        h.subgroup = live.subgroup orelse rs.first orelse 0;
-        h.first_object = live.first_object and first_written != null and first_written == rs.first;
-        var buf: [128]u8 = undefined;
-        var fbs = io_compat.fixedBufferStream(&buf);
-        moq_obj.writeSubgroupHeader(&fbs, h, self.clients[o.sub_ci].draft) catch return;
-        l.send(o.sid, buf[0..fbs.seek]) catch return;
-        rs.hdr_sent = true;
-    }
-
+    // Replay every cached complete group to a freshly-subscribed subscriber.
     // Each cached group is sent as a fresh uni stream on the subscriber's WT
     // session with the subscriber's track alias remapped.
     fn replayCachedGroups(self: *RelayHandler, t: *const Track, sub: *Sub) void {
@@ -2693,16 +2748,12 @@ const RelayHandler = struct {
             sub.streams += 1;
             replayed += 1;
             var out_hdr = cg.hdr;
-            out_hdr.track_alias = sub.alias;
             if (!whole) {
                 // Objects drop out of the front: name the subgroup outright.
                 out_hdr.subgroup = it.subgroup();
                 out_hdr.first_object = false;
             }
-            var hdr_buf: [128]u8 = undefined;
-            var hdr_fbs = io_compat.fixedBufferStream(&hdr_buf);
-            moq_obj.writeSubgroupHeader(&hdr_fbs, out_hdr, self.clients[sub_ci].draft) catch continue;
-            l.send(out, hdr_buf[0..hdr_fbs.seek]) catch continue;
+            if (!sendSubgroupHeader(&l, out, out_hdr, sub.alias, self.clients[sub_ci].draft)) continue;
             if (whole) {
                 l.send(out, cg.bytes()) catch {};
             } else {
@@ -2916,29 +2967,11 @@ const RelayHandler = struct {
                     }
                     continue;
                 }
-                const sub_ci = sub.client_idx;
-                var l = self.link(sub_ci) orelse continue;
-                if (!fs.reserveOut(self.alloc)) continue;
+                var l = self.link(sub.client_idx) orelse continue;
                 // Waiting for its alias outran the object timeout it asked for.
                 if (held_ns > 0 and sub.expiredAfter(held_ns)) continue;
-
-                const out = l.openUniOrdered(sub.sendOrder(h.publisher_priority, h.group)) catch |e| {
-                    std.debug.print("[relay] openUniStream failed for sub {d}: {}\n", .{ sub_ci, e });
-                    continue;
-                };
-                // Counted at the open, not after the header: PUBLISH_DONE's
-                // Stream Count has to cover every stream the subscriber sees.
-                sub.streams += 1;
-
-                var out_hdr = h;
-                out_hdr.track_alias = sub.alias;
-                var hdr_buf: [128]u8 = undefined;
-                var hdr_fbs = io_compat.fixedBufferStream(&hdr_buf);
-                moq_obj.writeSubgroupHeader(&hdr_fbs, out_hdr, self.clients[sub_ci].draft) catch continue;
-                l.send(out, hdr_buf[0..hdr_fbs.seek]) catch continue;
-
-                fs.outs[fs.out_count] = .{ .sid = out, .sub_ci = sub_ci, .timeout_ms = sub.subgroup_timeout_ms };
-                fs.out_count += 1;
+                const o = self.openOut(fs, &l, sub, h) orelse continue;
+                if (!sendSubgroupHeader(&l, o.sid, h, sub.alias, self.clients[sub.client_idx].draft)) fs.removeOut(fs.out_count - 1);
             }
             std.debug.print("[relay] stream from client {d} → {d} subs (group={d})\n", .{ ci, fs.out_count, h.group });
             for (ended[0..n_ended]) |e| self.endSubscription(t, e.ci, e.sid, moq_codes.DONE_SUBSCRIPTION_ENDED, "end of range");
@@ -2957,8 +2990,6 @@ const RelayHandler = struct {
             // Forward to currently-attached subscribers.
             var slow: [MAX_SUBS_PER_TRACK]usize = undefined;
             var n_slow: usize = 0;
-            var lost: [MAX_SUBS_PER_TRACK]usize = undefined;
-            var n_lost: usize = 0;
             for (0..fs.out_count) |i| {
                 const sub_ci = fs.outs[i].sub_ci;
                 var l = self.link(sub_ci) orelse continue;
@@ -2967,43 +2998,27 @@ const RelayHandler = struct {
                     n_slow += 1;
                     continue;
                 }
-                if (fs.outs[i].resync != null) {
-                    if (self.liveOf(fs, ci, stream_id)) |t| {
-                        self.feedResync(t, &l, &fs.outs[i], false);
-                    } else {
-                        l.reset(fs.outs[i].sid, moq_codes.STREAM_RESET_INTERNAL_ERROR);
-                        lost[n_lost] = i;
-                        n_lost += 1;
-                    }
-                    continue;
-                }
+                if (fs.outs[i].resyncing) continue;
                 l.send(fs.outs[i].sid, chunk) catch |e| {
                     std.debug.print("[relay] fwd chunk to sub {d}: {}\n", .{ sub_ci, e });
                 };
             }
             fs.forwarded_pos = buf.len();
-            // Highest first, so the swap-removal keeps the rest in place.
-            while (n_lost > 0) {
-                n_lost -= 1;
-                fs.removeOut(lost[n_lost]);
-            }
             for (slow[0..n_slow]) |sub_ci| {
                 if (self.fwdTrack(fs)) |t| self.dropSlowSubscriber(t, sub_ci) else self.resetOutputs(fs, sub_ci);
             }
+            if (fs.resyncs.items.len > 0) self.feedResyncs(fs, ci, stream_id, false);
         }
 
         // On FIN: close all sub-streams and commit the live cache.
         if (fin) {
             const now = sys.nanoTimestamp();
-            for (fs.outs[0..fs.out_count]) |*o| {
+            if (fs.resyncs.items.len > 0) {
+                self.feedResyncs(fs, ci, stream_id, true);
+                fs.resyncs.clearRetainingCapacity();
+            }
+            for (fs.outs[0..fs.out_count]) |o| {
                 var l = self.link(o.sub_ci) orelse continue;
-                if (o.resync != null) {
-                    const t = self.liveOf(fs, ci, stream_id) orelse {
-                        l.reset(o.sid, moq_codes.STREAM_RESET_INTERNAL_ERROR);
-                        continue;
-                    };
-                    self.feedResync(t, &l, o, true);
-                }
                 l.finish(o.sid);
                 // §5.2: the subgroup is all published; it has this long to be
                 // all acknowledged.
@@ -3183,16 +3198,27 @@ test "a subscriber leaving takes its outputs with it" {
     try std.testing.expectEqual(@as(u64, 11), fs.outs[0].sid);
 }
 
-/// The Location just before `at`, when nothing sent so far on a FETCH
-/// stream accounts for what lies between `prev`, or the range's start, and
-/// it: the relay doesn't hold those Locations, so it can't say they don't
-/// exist.
 /// Whether `at` falls in [start, end], an open end reaching on for ever.
 fn within(start: Location, end: ?Location, at: Location) bool {
     if (at.order(start) == .lt) return false;
     return if (end) |e| at.order(e) != .gt else true;
 }
 
+/// `hdr` on a subscriber's stream, under its alias.
+fn sendSubgroupHeader(l: *Link, sid: u64, hdr: moq_obj.SubgroupHeader, alias: u64, draft: moq_version.Draft) bool {
+    var h = hdr;
+    h.track_alias = alias;
+    var buf: [128]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    moq_obj.writeSubgroupHeader(&fbs, h, draft) catch return false;
+    l.send(sid, buf[0..fbs.seek]) catch return false;
+    return true;
+}
+
+/// The Location just before `at`, when nothing sent so far on a FETCH
+/// stream accounts for what lies between `prev`, or the range's start, and
+/// it: the relay doesn't hold those Locations, so it can't say they don't
+/// exist.
 fn unknownBefore(prev: ?Location, start: Location, at: Location) ?Location {
     if (prev) |p| {
         if (at.group == p.group) return null;
@@ -4375,22 +4401,6 @@ test "a draft-22 requester that has sent its FIN withdraws with STOP_SENDING" {
     try std.testing.expect(tr.r.clients[0].slotOf(8) == null);
 }
 
-/// Client 1's uni stream `sid` as a subgroup stream: its group and IDs.
-fn replayedIds(tr: *TestRelay, sid: u64, out: []u64) !struct { group: u64, ids: []u64 } {
-    const ss = tr.conns[1].streams.send_streams.get(sid) orelse return error.NoOutput;
-    var fbs = io_compat.fixedBufferStream(@as([]const u8, ss.write_buffer.items));
-    const h = try moq_obj.readSubgroupHeader(&fbs, tr.r.clients[1].draft);
-    var data = ss.write_buffer.items[fbs.seek..];
-    var prev: ?u64 = null;
-    var n: usize = 0;
-    while (try moq_obj.readSubgroupObject(data, prev, h.header.per_object_properties)) |r| : (n += 1) {
-        out[n] = r.object.id;
-        prev = r.object.id;
-        data = data[r.consumed..];
-    }
-    return .{ .group = h.header.group, .ids = out[0..n] };
-}
-
 test "a subscriber is replayed only what its filter lets through" {
     // Every new subscriber was replayed the cached groups whatever it asked
     // for, though objects before Largest Object "do not pass the Largest
@@ -4415,11 +4425,12 @@ test "a subscriber is replayed only what its filter lets through" {
         .filter = .{ .type = .absolute_start, .start = .{ .group = 3, .object = 1 } },
     });
     var ids: [8]u64 = undefined;
-    const g3 = try replayedIds(&tr, 3, &ids);
-    try std.testing.expectEqual(@as(u64, 3), g3.group);
-    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, g3.ids);
-    const g4 = try replayedIds(&tr, 7, &ids);
-    try std.testing.expectEqualSlices(u64, &.{ 0, 1 }, g4.ids);
+    var payloads: [8][]const u8 = undefined;
+    const g3 = try relayedObjects(&tr, 3, &ids, &payloads);
+    try std.testing.expectEqual(@as(u64, 3), g3.hdr.group);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, ids[0..g3.n]);
+    const g4 = try relayedObjects(&tr, 7, &ids, &payloads);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1 }, ids[0..g4.n]);
 
     // Absolute Range ending at group 4: group 5 ends the subscription.
     try sendRequest(&tr, 1, 16, moq_msg.writeSubscribe, moq_msg.Subscribe{

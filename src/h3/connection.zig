@@ -520,7 +520,7 @@ pub const H3Connection = struct {
     /// The send side of a request stream the response can still be written to.
     fn responseStream(self: *H3Connection, stream_id: u64) !*stream_mod.SendStream {
         const stream = self.quic_conn.streams.getStream(stream_id) orelse return error.StreamNotFound;
-        if (stream.send.reset_err != null) return error.StreamReset;
+        if (stream.send.resetRequested()) return error.StreamReset;
         if (stream.send.fin_queued) return error.StreamFinished;
         return &stream.send;
     }

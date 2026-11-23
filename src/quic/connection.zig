@@ -3518,7 +3518,7 @@ pub const Connection = struct {
                 .streams_blocked_bidi => |l| if (self.streams.max_bidi_streams == l) .{ .streams_blocked_bidi = l } else continue,
                 .streams_blocked_uni => |l| if (self.streams.max_uni_streams == l) .{ .streams_blocked_uni = l } else continue,
                 // Rebuilt from the record: a reset uni stream is already gone.
-                .reset_stream => |r| .{ .reset_stream = .{ .stream_id = r.stream_id, .error_code = r.error_code, .final_size = r.final_size, .reliable_size = r.reliable_size } },
+                .reset_stream => |r| .{ .reset_stream = r },
                 .stop_sending => |ss| blk: {
                     const rs = self.streams.getRecvStream(ss.stream_id) orelse continue;
                     // Data Recvd or Reset Recvd: the request is moot.
@@ -6709,7 +6709,7 @@ test "CRYPTO past the buffer ceiling closes the connection" {
 }
 
 /// What the control-frame queue held for one stream. Drains the queue.
-const PendingForStream = struct { reset_final_size: ?u64 = null, blocked_limit: ?u64 = null };
+const PendingForStream = struct { reset_final_size: ?u64 = null, reset_reliable_size: ?u64 = null, blocked_limit: ?u64 = null };
 
 fn drainPendingFor(conn: *Connection, stream_id: u64) PendingForStream {
     var out: PendingForStream = .{};
@@ -6717,6 +6717,7 @@ fn drainPendingFor(conn: *Connection, stream_id: u64) PendingForStream {
         switch (f) {
             .reset_stream => |rs| if (rs.stream_id == stream_id) {
                 out.reset_final_size = rs.final_size;
+                out.reset_reliable_size = rs.reliable_size;
             },
             .stream_data_blocked => |sdb| if (sdb.stream_id == stream_id) {
                 out.blocked_limit = sdb.limit;
@@ -8442,18 +8443,6 @@ test "a RESET_STREAM_AT is read up to its Reliable Size before the reset shows" 
     try std.testing.expectEqual(@as(?u64, 3), rs.reset_err);
 }
 
-/// The Reliable Size of the reset queued for `stream_id`. Drains the queue.
-fn queuedReliableSize(conn: *Connection, stream_id: u64) ?u64 {
-    var out: ?u64 = null;
-    while (conn.pending_frames.pop()) |f| switch (f) {
-        .reset_stream => |rs| if (rs.stream_id == stream_id) {
-            out = rs.reliable_size;
-        },
-        else => {},
-    };
-    return out;
-}
-
 test "a reset keeps its Reliable Size only for a peer that takes RESET_STREAM_AT" {
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
@@ -8466,6 +8455,6 @@ test "a reset keeps its Reliable Size only for a peer that takes RESET_STREAM_AT
         try s.send.onAck(0, 3, false);
         s.send.resetAt(4, 3);
         conn.queueFlowControlUpdates();
-        try std.testing.expectEqual(@as(?u64, if (takes) 3 else 0), queuedReliableSize(&conn, s.stream_id));
+        try std.testing.expectEqual(@as(?u64, if (takes) 3 else 0), drainPendingFor(&conn, s.stream_id).reset_reliable_size);
     }
 }

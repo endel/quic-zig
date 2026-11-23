@@ -1059,7 +1059,7 @@ pub const WebTransportConnection = struct {
     /// RESET_STREAM, unless the peer has acked every byte and the FIN
     /// (RFC 9000 §3.1 "Data Recvd"), when there is nothing left to abandon.
     fn abortSend(self: *WebTransportConnection, ss: *stream_mod.SendStream, session_id: u64) void {
-        if (ss.reset_err != null) return;
+        if (ss.resetRequested()) return;
         if (ss.fin_acked and !ss.hasUnackedData()) return;
         self.resetDataStream(ss, session_id, WEBTRANSPORT_SESSION_GONE);
     }
@@ -1939,7 +1939,7 @@ pub const WebTransportConnection = struct {
         if (sess.state != .active and sess.state != .connecting) return null;
         const stream_id = w.stream_id orelse return self.sendCapacity(w.session_id);
         const ss = self.quic.streams.getSendStream(stream_id) orelse return null;
-        if (ss.reset_err != null or ss.fin_queued) return null;
+        if (ss.resetRequested() or ss.fin_queued) return null;
         return self.streamSendCapacity(stream_id);
     }
 

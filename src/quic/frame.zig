@@ -25,6 +25,16 @@ pub const FrameError = error{
 /// `reset_stream` with a Reliable Size.
 pub const RESET_STREAM_AT: u64 = 0x24;
 
+/// RESET_STREAM, and RESET_STREAM_AT when `reliable_size` is not zero: one
+/// type wherever a reset is parsed, queued or recorded for loss.
+pub const ResetStream = struct {
+    stream_id: u64,
+    error_code: u64,
+    final_size: u64,
+    /// The bytes still delivered (§4).
+    reliable_size: u64 = 0,
+};
+
 pub const FrameType = enum(u64) {
     padding = 0x00,
     ping = 0x01,
@@ -164,14 +174,7 @@ pub const Frame = union(FrameType) {
         ecn_ce: u64,
     },
 
-    reset_stream: struct {
-        stream_id: u64,
-        error_code: u64,
-        final_size: u64,
-        /// RESET_STREAM_AT's (draft-ietf-quic-reliable-stream-reset §4): the
-        /// bytes still delivered. Zero is a plain RESET_STREAM.
-        reliable_size: u64 = 0,
-    },
+    reset_stream: ResetStream,
 
     stop_sending: struct {
         stream_id: u64,
@@ -363,29 +366,19 @@ pub const Frame = union(FrameType) {
                 }
             },
 
-            // reset_stream
-            0x04 => .{
-                .reset_stream = .{
+            // reset_stream, and reset_stream_at: §4, a Reliable Size past the
+            // Final Size is FRAME_ENCODING_ERROR
+            0x04, RESET_STREAM_AT => blk: {
+                var rs: ResetStream = .{
                     .stream_id = try packet.readVarInt(reader),
                     .error_code = try packet.readVarInt(reader),
                     .final_size = try packet.readVarInt(reader),
-                },
-            },
-
-            // reset_stream_at: §4, a Reliable Size past the Final Size is
-            // FRAME_ENCODING_ERROR
-            RESET_STREAM_AT => blk: {
-                const stream_id = try packet.readVarInt(reader);
-                const error_code = try packet.readVarInt(reader);
-                const final_size = try packet.readVarInt(reader);
-                const reliable_size = try packet.readVarInt(reader);
-                if (reliable_size > final_size) return error.FrameEncodingError;
-                break :blk .{ .reset_stream = .{
-                    .stream_id = stream_id,
-                    .error_code = error_code,
-                    .final_size = final_size,
-                    .reliable_size = reliable_size,
-                } };
+                };
+                if (frame_type == RESET_STREAM_AT) {
+                    rs.reliable_size = try packet.readVarInt(reader);
+                    if (rs.reliable_size > rs.final_size) return error.FrameEncodingError;
+                }
+                break :blk .{ .reset_stream = rs };
             },
 
             // stop_sending
@@ -849,12 +842,7 @@ pub const PendingControlFrame = union(enum) {
         token_buf: [92]u8 = @splat(0),
         token_len: u8 = 0,
     },
-    reset_stream: struct {
-        stream_id: u64,
-        error_code: u64,
-        final_size: u64,
-        reliable_size: u64 = 0,
-    },
+    reset_stream: ResetStream,
     stop_sending: struct {
         stream_id: u64,
         error_code: u64,
@@ -917,7 +905,7 @@ pub const PendingControlFrame = union(enum) {
             .streams_blocked_uni => |max| .{ .streams_blocked_uni = max },
             .data_blocked => |limit| .{ .data_blocked = limit },
             .stream_data_blocked => |sdb| .{ .stream_data_blocked = .{ .stream_id = sdb.stream_id, .limit = sdb.limit } },
-            .reset_stream => |rs| .{ .reset_stream = .{ .stream_id = rs.stream_id, .error_code = rs.error_code, .final_size = rs.final_size, .reliable_size = rs.reliable_size } },
+            .reset_stream => |rs| .{ .reset_stream = rs },
             .stop_sending => |ss| .{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = ss.error_code } },
             .ack_frequency => |af| .{ .ack_frequency = .{
                 .sequence_number = af.sequence_number,

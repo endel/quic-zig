@@ -821,8 +821,9 @@ pub const SendStream = struct {
     /// The Reliable Size the reset carries: RESET_STREAM_AT when non-zero.
     reliable_size: u64 = 0,
 
-    /// A resetAt() waiting for its first `reliable` bytes to be acknowledged.
-    reset_pending: ?struct { err: u64, reliable: u64 } = null,
+    /// The error code of a resetAt() waiting for its `reliable_size` bytes
+    /// to be acknowledged.
+    reset_pending: ?u64 = null,
 
     /// Never reclaimed, whatever its state. For streams a protocol layer
     /// writes through a pointer it keeps for the whole connection: H3's
@@ -867,7 +868,7 @@ pub const SendStream = struct {
     /// Write data to the stream. Buffers it for later sending. Dropped once the
     /// stream is reset: RFC 9000 §3.1 lets nothing follow RESET_STREAM.
     pub fn writeData(self: *SendStream, data: []const u8) !void {
-        if (self.reset_err != null or self.reset_pending != null) return;
+        if (self.resetRequested()) return;
         // Reuse the acked prefix before growing, so streaming that fits the
         // current capacity never reallocates.
         if (self.write_buffer.items.len + data.len > self.write_buffer.capacity) {
@@ -1022,28 +1023,36 @@ pub const SendStream = struct {
         }
         self.trimRetransmitRangesBelow(self.ack_offset);
         self.send_offset = @max(self.send_offset, self.ack_offset);
-        if (self.reset_pending) |p| if (self.ack_offset >= p.reliable) self.resetReliably(p.err, p.reliable);
+        if (self.reset_pending) |err| if (self.ack_offset >= self.reliable_size) self.resetNow(err);
         self.compactAcked();
     }
 
     /// Cancel the stream with an error code (sends RESET_STREAM).
     pub fn reset(self: *SendStream, error_code: u64) void {
-        self.resetReliably(error_code, 0);
+        self.reliable_size = 0;
+        self.resetNow(error_code);
     }
 
     /// Reset, still delivering the first `reliable` bytes (RESET_STREAM_AT,
     /// draft-ietf-quic-reliable-stream-reset §5). Those are guaranteed by
     /// holding the reset back until the peer has acknowledged them, which
     /// spares the send paths a partly reset stream; nothing more is taken
-    /// meanwhile. The Reliable Size goes out only to a peer that takes it.
+    /// meanwhile. The connection writes the Reliable Size only to a peer that
+    /// advertised reset_stream_at; asking for one without, a caller only
+    /// delays its reset.
     pub fn resetAt(self: *SendStream, error_code: u64, reliable: u64) void {
-        if (self.reset_err != null) return;
-        const r = @min(reliable, self.write_offset);
-        if (self.ack_offset >= r) return self.resetReliably(error_code, r);
-        self.reset_pending = .{ .err = error_code, .reliable = r };
+        if (self.resetRequested()) return;
+        self.reliable_size = @min(reliable, self.write_offset);
+        if (self.ack_offset >= self.reliable_size) return self.resetNow(error_code);
+        self.reset_pending = error_code;
     }
 
-    fn resetReliably(self: *SendStream, error_code: u64, reliable: u64) void {
+    /// Reset, or a reset waiting on its Reliable Size: nothing more goes in.
+    pub fn resetRequested(self: *const SendStream) bool {
+        return self.reset_err != null or self.reset_pending != null;
+    }
+
+    fn resetNow(self: *SendStream, error_code: u64) void {
         // The unsent tail will never spend connection credit: RESET_STREAM
         // names send_offset as the final size.
         if (self.reset_err == null) {
@@ -1051,7 +1060,6 @@ pub const SendStream = struct {
         }
         self.reset_pending = null;
         self.reset_err = error_code;
-        self.reliable_size = reliable;
         self.framesDue();
     }
 
@@ -1070,7 +1078,7 @@ pub const SendStream = struct {
     /// Bytes MAX_STREAM_DATA still admits past what is already written. Zero
     /// once the stream is reset or its FIN is queued: nothing more can go.
     pub fn sendCredit(self: *const SendStream) u64 {
-        if (self.reset_err != null or self.fin_queued) return 0;
+        if (self.resetRequested() or self.fin_queued) return 0;
         return self.send_window -| self.write_offset;
     }
 
