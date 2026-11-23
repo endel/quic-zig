@@ -414,6 +414,13 @@ const Track = struct {
         return null;
     }
 
+    /// Whether the cache reaches back to `start`; what it holds from there
+    /// on is taken as whole.
+    fn holdsFrom(self: *const Track, start: Location) bool {
+        const h = self.firstHeld() orelse return false;
+        return h.order(start) != .gt;
+    }
+
     // Iterate cached groups from oldest to newest.
     fn cachedInOrder(self: *const Track, out: *[N_CACHED_GROUPS]*const CachedGroup) usize {
         var count: usize = 0;
@@ -703,6 +710,9 @@ const FetchFwd = struct {
     out: ?u64 = null,
     /// FETCH_OK or REQUEST_ERROR passed down.
     answered: bool = false,
+    /// A subscription's fill (§3.4.1): neither answer goes down, and a
+    /// failure is the fill stream reset.
+    fill: bool = false,
     /// Fetch objects are re-encoded only between drafts that write them
     /// differently.
     up_cursor: moq_obj.FetchCursor = .{ .deltas = true },
@@ -1371,9 +1381,7 @@ const RelayHandler = struct {
         const descending = (f.group_order orelse .ascending) == .descending;
         // §10.12.3 (draft-18): what the cache doesn't hold, the relay asks
         // upstream for rather than guess at.
-        const held = t.firstHeld();
-        const covered = if (held) |h| h.order(start) != .gt else false;
-        if (!covered and self.forwardFetch(t, ci, stream_id, f.request_id, start, end, descending)) return;
+        if (!t.holdsFrom(start) and self.forwardFetch(t, ci, stream_id, f.request_id, start, end, descending, false)) return;
 
         var l = self.link(ci) orelse return;
         if (l.s.sendBufferedBytes() > MAX_SUB_BACKLOG) return self.failRequest(ci, stream_id, moq_codes.ERR_EXCESSIVE_LOAD, "subscriber backlog");
@@ -1543,8 +1551,9 @@ const RelayHandler = struct {
     }
 
     /// Passes a FETCH the relay can't answer from its cache to the track's
-    /// publisher, as an absolute range it can't misread.
-    fn forwardFetch(self: *RelayHandler, t: *const Track, ci: usize, stream_id: u64, request_id: u64, start: Location, end: Location, descending: bool) bool {
+    /// publisher, as an absolute range it can't misread. A `fill` answers
+    /// the subscription on `stream_id` instead of a FETCH request there.
+    fn forwardFetch(self: *RelayHandler, t: *const Track, ci: usize, stream_id: u64, request_id: u64, start: Location, end: Location, descending: bool, fill: bool) bool {
         const owner = t.publisher_idx orelse return false;
         if (owner == ci) return false;
         const slot = for (&self.fetch_fwds) |*f| {
@@ -1586,6 +1595,7 @@ const RelayHandler = struct {
             .down_ci = ci,
             .down_sid = stream_id,
             .down_request_id = request_id,
+            .fill = fill,
             .up_cursor = moq_obj.FetchCursor.init(self.clients[owner].draft, descending),
             .down_cursor = moq_obj.FetchCursor.init(self.clients[ci].draft, descending),
         };
@@ -1611,18 +1621,24 @@ const RelayHandler = struct {
         switch (parsed.env.type) {
             moq_codes.MSG_FETCH_OK => {
                 const ok = moq_msg.decodeFetchOk(parsed.env.payload, self.clients[ci].draft) catch return self.fetchFailed(f);
-                moq_msg.writeFetchOk(&fbs, ok, self.clients[f.down_ci].draft) catch return self.fetchFailed(f);
-                self.sendToClient(f.down_ci, f.down_sid, out[0..fbs.seek]);
-                self.finishAnswered(f.down_ci, f.down_sid);
+                if (!f.fill) {
+                    moq_msg.writeFetchOk(&fbs, ok, self.clients[f.down_ci].draft) catch return self.fetchFailed(f);
+                    self.sendToClient(f.down_ci, f.down_sid, out[0..fbs.seek]);
+                    self.finishAnswered(f.down_ci, f.down_sid);
+                }
                 f.answered = true;
             },
             moq_codes.MSG_REQUEST_ERROR => {
                 const e = moq_msg.decodeRequestError(parsed.env.payload) catch return self.fetchFailed(f);
-                moq_msg.writeRequestError(&fbs, e) catch return self.fetchFailed(f);
-                self.sendToClient(f.down_ci, f.down_sid, out[0..fbs.seek]);
-                self.finishAnswered(f.down_ci, f.down_sid);
                 self.finishAnswered(ci, stream_id);
-                f.active = false;
+                if (f.fill) {
+                    self.fetchFailed(f);
+                } else {
+                    moq_msg.writeRequestError(&fbs, e) catch return self.fetchFailed(f);
+                    self.sendToClient(f.down_ci, f.down_sid, out[0..fbs.seek]);
+                    self.finishAnswered(f.down_ci, f.down_sid);
+                    f.active = false;
+                }
             },
             else => {},
         }
@@ -1644,14 +1660,8 @@ const RelayHandler = struct {
             const f = for (&self.fetch_fwds) |*f| {
                 if (f.active and f.up_ci == ci and f.up_request_id == rid and f.up_data == null) break f;
             } else return self.refuseFetchStream(ci, stream_id);
-            var dl = self.link(f.down_ci) orelse return self.refuseFetchStream(ci, stream_id);
-            const out = dl.openUni() catch return self.refuseFetchStream(ci, stream_id);
-            var hdr: [16]u8 = undefined;
-            var hfbs = io_compat.fixedBufferStream(&hdr);
-            moq_obj.writeFetchStreamHeader(&hfbs, f.down_request_id) catch {};
-            dl.send(out, hdr[0..hfbs.seek]) catch {};
+            _ = self.openFetchOut(f) orelse return self.refuseFetchStream(ci, stream_id);
             f.up_data = stream_id;
-            f.out = out;
             buf.consume(fbs.seek);
             break :blk f;
         };
@@ -1686,20 +1696,37 @@ const RelayHandler = struct {
         self.clients[ci].setRole(stream_id, .answered);
     }
 
+    /// Our FETCH stream to the requester, its header written under the
+    /// requester's Request ID.
+    fn openFetchOut(self: *RelayHandler, f: *FetchFwd) ?u64 {
+        var dl = self.link(f.down_ci) orelse return null;
+        const out = dl.openUni() catch return null;
+        var hdr: [16]u8 = undefined;
+        var hfbs = io_compat.fixedBufferStream(&hdr);
+        moq_obj.writeFetchStreamHeader(&hfbs, f.down_request_id) catch {};
+        dl.send(out, hdr[0..hfbs.seek]) catch {};
+        f.out = out;
+        return out;
+    }
+
     /// The publisher is gone, or ended our FETCH without an answer: the
-    /// requester hears so, on whichever stream still can.
+    /// requester hears so, on whichever stream still can. A fill has only
+    /// its stream, opened to be reset if need be (§3.4.1).
     fn fetchFailed(self: *RelayHandler, f: *FetchFwd) void {
         f.active = false;
-        if (!f.answered) return self.failRequest(f.down_ci, f.down_sid, moq_codes.ERR_INTERNAL_ERROR, "publisher gave no answer");
-        if (f.out) |out| if (self.link(f.down_ci)) |l_| {
-            var l = l_;
-            l.reset(out, moq_codes.ERR_INTERNAL_ERROR);
-        };
+        if (!f.answered and !f.fill) return self.failRequest(f.down_ci, f.down_sid, moq_codes.ERR_INTERNAL_ERROR, "publisher gave no answer");
+        const out = f.out orelse (if (f.fill) self.openFetchOut(f) else null) orelse return;
+        var l = self.link(f.down_ci) orelse return;
+        l.reset(out, moq_codes.STREAM_RESET_INTERNAL_ERROR);
     }
 
     /// The requester went away or cancelled: so does our FETCH.
     fn cancelFetchFwd(self: *RelayHandler, f: *FetchFwd) void {
         f.active = false;
+        if (f.out) |out| if (self.link(f.down_ci)) |dl_| {
+            var dl = dl_;
+            dl.reset(out, moq_codes.STREAM_RESET_CANCELLED);
+        };
         var l = self.link(f.up_ci) orelse return;
         l.reset(f.up_sid, 0x1);
         if (f.up_data) |d| l.stopSending(d, 0x1);
@@ -2219,7 +2246,7 @@ const RelayHandler = struct {
         for (&self.fetch_fwds) |*f| {
             if (!f.active) continue;
             if (f.up_ci == ci and (f.up_sid == stream_id or f.up_data == stream_id)) self.fetchFailed(f);
-            if (f.down_ci == ci and f.down_sid == stream_id) self.cancelFetchFwd(f);
+            if (f.down_ci == ci and (f.down_sid == stream_id or f.out == stream_id)) self.cancelFetchFwd(f);
         }
     }
 
@@ -2436,15 +2463,17 @@ const RelayHandler = struct {
 
     /// draft-22 §3.4: a SUBSCRIBE with FILL_PARAMETERS gets its fill range as
     /// a FETCH response under the SUBSCRIBE's Request ID; an empty range
-    /// opens no stream, and nor does a paused subscription.
+    /// opens no stream, and nor does a paused subscription. What the cache
+    /// doesn't reach back to is fetched upstream (§7.6).
     fn openFill(self: *RelayHandler, t: *const Track, sub: *Sub) void {
         const fill = sub.fill orelse return;
         sub.fill = null;
         if (!sub.forward) return;
         const range = fill.range orelse if (sub.filter) |f| f.toLocation() else moq_msg.LocationFilter{};
         const r = range.resolve(sub.joined_at) orelse return;
-        var l = self.link(sub.client_idx) orelse return;
         const descending = (fill.group_order orelse .ascending) == .descending;
+        if (!t.holdsFrom(r.start) and self.forwardFetch(t, sub.client_idx, sub.stream_id, sub.request_id, r.start, r.end, descending, true)) return;
+        var l = self.link(sub.client_idx) orelse return;
         const n = self.serveFetch(&l, self.clients[sub.client_idx].draft, t, sub.request_id, r.start, r.end, descending);
         std.debug.print("[relay] fill client={d} {d}/{d}..{d}/{d}: {d} objects\n", .{ sub.client_idx, r.start.group, r.start.object, r.end.group, r.end.object, n });
     }
@@ -3922,6 +3951,102 @@ test "a draft-22 SUBSCRIBE with FILL_PARAMETERS gets a fill stream" {
     const before = tr.conns[1].streams.send_streams.count();
     try sendRequest(&tr, 1, 16, moq_msg.writeSubscribe, moq_msg.Subscribe{ .request_id = 16, .track_namespace = test_ns, .track_name = "t" });
     try std.testing.expectEqual(before, tr.conns[1].streams.send_streams.count());
+}
+
+/// Client 1 subscribes with a fill to `ns`/`name`, published by client 0,
+/// and the publisher answers having already produced `largest`.
+fn coldFill(tr: *TestRelay, name: []const u8, largest: Location) !*Track {
+    setDraft(tr, .draft_22);
+    tr.r.tracks[0].deinit(tr.r.alloc);
+    tr.r.tracks[0] = .{};
+    tr.r.track_count = 0;
+    const ns: []const []const u8 = &.{ "moq-test", "media" };
+    try sendRequest(tr, 0, 8, moq_msg.writePublishNamespace, moq_msg.PublishNamespace{ .track_namespace = ns });
+    try sendRequest(tr, 1, 12, moq_msg.writeSubscribe, moq_msg.Subscribe{
+        .request_id = 12,
+        .track_namespace = ns,
+        .track_name = name,
+        .filter = .{ .type = .latest_object },
+        .fill = .{ .range = .{ .type = moq_msg.LocationFilter.RELATIVE_START, .start_group = 1 } },
+    });
+    const t = &tr.r.tracks[tr.r.findTrack("moq-test/media/", name).?];
+    var buf: [64]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    try moq_msg.writeSubscribeOk(&fbs, .{ .track_alias = 5, .largest = largest });
+    var publisher = tr.session(0);
+    tr.r.onStreamData(&publisher, t.pub_stream_id.?, buf[0..fbs.seek], false);
+    return t;
+}
+
+test "a fill the relay can't serve from its cache is fetched from the publisher" {
+    // §7.6: a relay serves a fill from its cache and fetches what is missing
+    // upstream. It answered from an empty cache instead, so the first
+    // subscriber on a track heard "unknown up to Largest" and never got the
+    // head of the group: moq-net's media clients saw their catalog group
+    // arrive empty.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    _ = try coldFill(&tr, "catalog", .{ .group = 0, .object = 0 });
+
+    const f = tr.r.fetch_fwds[0];
+    try std.testing.expect(f.active and f.up_ci == 0);
+    try std.testing.expect(tr.conns[1].streams.send_streams.get(3) == null);
+    const fp = try moq_msg.parseEnvelope(tr.conns[0].streams.getStream(f.up_sid).?.send.write_buffer.items);
+    var ns_buf: moq_msg.NamespaceBuf = undefined;
+    const sent = try moq_msg.decodeFetch(fp.env.payload, &ns_buf, .draft_22);
+    const r = sent.body.standalone.range.resolve(.{ .group = 0, .object = 0 }).?;
+    try std.testing.expectEqual(Location{ .group = 0, .object = 0 }, r.start);
+    try std.testing.expectEqual(Location{ .group = 0, .object = 0 }, r.end);
+
+    var buf: [128]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    try moq_msg.writeFetchOk(&fbs, .{ .end = .{ .group = 0, .object = 0 } }, .draft_22);
+    var publisher = tr.session(0);
+    tr.r.onStreamData(&publisher, f.up_sid, buf[0..fbs.seek], false);
+    fbs.seek = 0;
+    try moq_obj.writeFetchStreamHeader(&fbs, sent.request_id);
+    var c = moq_obj.FetchCursor.init(.draft_22, false);
+    try moq_obj.writeFetchItem(&fbs, .{ .object = .{ .group = 0, .id = 0, .payload = "catalog" } }, &c);
+    tr.r.onStreamData(&publisher, 2, buf[0..fbs.seek], true);
+
+    // The fill stream carries the SUBSCRIBE's Request ID; FETCH_OK stays
+    // upstream, since a fill has none.
+    var items: [2]moq_obj.FetchItem = undefined;
+    const got = try fetched(&tr, 3, &items);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try expectFetched(got[0], 0, 0, "catalog");
+    const out = tr.conns[1].streams.send_streams.get(3).?;
+    var hfbs = io_compat.fixedBufferStream(@as([]const u8, out.write_buffer.items));
+    try std.testing.expectEqual(@as(u64, 12), try moq_obj.readFetchStreamHeader(&hfbs));
+    try std.testing.expect(out.fin_queued);
+    var types: [4]u64 = undefined;
+    try std.testing.expectEqualSlices(u64, &.{moq_codes.MSG_SUBSCRIBE_OK}, sentTypes(tr.conns[1], 12, &types));
+}
+
+test "a fill the publisher refuses is a reset fill stream, and the subscription stays" {
+    // §3.4.1: a fill has no REQUEST_ERROR of its own.
+    var tr: TestRelay = undefined;
+    try tr.init();
+    defer tr.deinit();
+    const t = try coldFill(&tr, "video", .{ .group = 3, .object = 2 });
+    const f = tr.r.fetch_fwds[0];
+    try std.testing.expect(f.active);
+
+    var buf: [64]u8 = undefined;
+    var fbs = io_compat.fixedBufferStream(&buf);
+    try moq_msg.writeRequestError(&fbs, .{ .error_code = moq_codes.ERR_INTERNAL_ERROR, .reason = "" });
+    var publisher = tr.session(0);
+    tr.r.onStreamData(&publisher, f.up_sid, buf[0..fbs.seek], false);
+
+    const out = tr.conns[1].streams.send_streams.get(3) orelse return error.NoFillStream;
+    var hfbs = io_compat.fixedBufferStream(@as([]const u8, out.write_buffer.items));
+    try std.testing.expectEqual(@as(u64, 12), try moq_obj.readFetchStreamHeader(&hfbs));
+    try std.testing.expect(out.reset_err != null);
+    var types: [4]u64 = undefined;
+    try std.testing.expectEqualSlices(u64, &.{moq_codes.MSG_SUBSCRIBE_OK}, sentTypes(tr.conns[1], 12, &types));
+    try std.testing.expectEqual(@as(usize, 1), t.sub_count);
+    try std.testing.expect(!tr.r.fetch_fwds[0].active);
 }
 
 test "a FETCH for what the relay doesn't hold goes to the publisher, across drafts" {
