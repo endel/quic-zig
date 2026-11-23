@@ -60,7 +60,9 @@ pub const MAX_CONTROL_FRAMES_PER_PACKET: usize = 4;
 /// A control frame RFC 9000 13.3 has us repeat when its packet is lost. Flow
 /// control credit is recorded by kind only: on loss the current value is sent,
 /// never the stale one. RESET_STREAM keeps everything, because a reset uni
-/// stream is freed as soon as the frame is queued.
+/// stream is freed as soon as the frame is queued. A RESET_STREAM_AT keeps
+/// only its stream, which waits for this frame's ACK: a fourth word here
+/// would be paid by every packet sent.
 pub const SentControlFrame = union(enum) {
     max_data: void,
     max_stream_data: u64,
@@ -70,7 +72,8 @@ pub const SentControlFrame = union(enum) {
     stream_data_blocked: struct { stream_id: u64, limit: u64 },
     streams_blocked_bidi: u64,
     streams_blocked_uni: u64,
-    reset_stream: frame_mod.ResetStream,
+    reset_stream: struct { stream_id: u64, error_code: u64, final_size: u64 },
+    reset_stream_at: u64,
     stop_sending: struct { stream_id: u64, error_code: u64 },
     new_connection_id: u64,
     retire_connection_id: u64,
@@ -89,7 +92,10 @@ pub const SentControlFrame = union(enum) {
             .stream_data_blocked => |b| .{ .stream_data_blocked = .{ .stream_id = b.stream_id, .limit = b.limit } },
             .streams_blocked_bidi => |l| .{ .streams_blocked_bidi = l },
             .streams_blocked_uni => |l| .{ .streams_blocked_uni = l },
-            .reset_stream => |r| .{ .reset_stream = r },
+            .reset_stream => |r| if (r.reliable_size == 0)
+                .{ .reset_stream = .{ .stream_id = r.stream_id, .error_code = r.error_code, .final_size = r.final_size } }
+            else
+                .{ .reset_stream_at = r.stream_id },
             .stop_sending => |ss| .{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = ss.error_code } },
             .new_connection_id => |n| .{ .new_connection_id = n.seq_num },
             .retire_connection_id => |seq| .{ .retire_connection_id = seq },

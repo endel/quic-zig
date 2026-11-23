@@ -1730,7 +1730,7 @@ pub fn Server(comptime Handler: type) type {
             while (it.next()) |s| {
                 const send = &s.*.send;
                 if (send.hasUnackedData()) return;
-                if (send.reset_err != null and !send.reset_stream_sent) return;
+                if (send.reset_err != null and !send.resetSettled()) return;
             }
             conn.close(@backingInt(h3.H3Error.no_error), "");
         }

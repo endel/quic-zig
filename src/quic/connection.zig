@@ -1961,6 +1961,7 @@ pub const Connection = struct {
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent, now);
                     for (pkt.getControlFrames()) |cf| switch (cf) {
                         .retire_connection_id => |seq| self.onRetireCidAcked(seq),
+                        .reset_stream_at => |id| self.onResetAtAcked(id),
                         else => {},
                     };
 
@@ -2102,6 +2103,7 @@ pub const Connection = struct {
                     self.cc.onPacketAcked(pkt.size, pkt.time_sent, now);
                     for (pkt.getControlFrames()) |cf| switch (cf) {
                         .retire_connection_id => |seq| self.onRetireCidAcked(seq),
+                        .reset_stream_at => |id| self.onResetAtAcked(id),
                         else => {},
                     };
 
@@ -3226,12 +3228,14 @@ pub const Connection = struct {
             // What went out, not what was written: buffered bytes were never
             // sent and may lie past the peer's window (RFC 9000 §4.5).
             // Marked sent only once queued; a full queue is retried next pass.
+            const reliable = if (self.peerTakesResetStreamAt()) ss.reliable_size else 0;
             ss.reset_stream_sent = self.pending_frames.tryPush(.{ .reset_stream = .{
                 .stream_id = ss.stream_id,
                 .error_code = ss.reset_err.?,
                 .final_size = ss.send_offset,
-                .reliable_size = if (self.peerTakesResetStreamAt()) ss.reliable_size else 0,
+                .reliable_size = reliable,
             } });
+            ss.reset_at_unacked = ss.reset_stream_sent and reliable > 0;
             if (!ss.reset_stream_sent) self.framesStillDue();
         }
     }
@@ -3484,6 +3488,17 @@ pub const Connection = struct {
         self.pushReliable(.{ .retire_connection_id = seq });
     }
 
+    /// A RESET_STREAM_AT is acknowledged: its stream has nothing left to resend.
+    fn onResetAtAcked(self: *Connection, stream_id: u64) void {
+        if (self.streams.getStream(stream_id)) |s| {
+            s.send.reset_at_unacked = false;
+            self.streams.disposeIfSettled(s);
+        } else if (self.streams.send_streams.get(stream_id)) |ss| {
+            ss.reset_at_unacked = false;
+            self.streams.disposeUniIfSettled(ss);
+        }
+    }
+
     fn onRetireCidAcked(self: *Connection, seq: u64) void {
         if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq)) |i| {
             _ = self.retiring_cids.swapRemove(i);
@@ -3518,7 +3533,16 @@ pub const Connection = struct {
                 .streams_blocked_bidi => |l| if (self.streams.max_bidi_streams == l) .{ .streams_blocked_bidi = l } else continue,
                 .streams_blocked_uni => |l| if (self.streams.max_uni_streams == l) .{ .streams_blocked_uni = l } else continue,
                 // Rebuilt from the record: a reset uni stream is already gone.
-                .reset_stream => |r| .{ .reset_stream = r },
+                .reset_stream => |r| .{ .reset_stream = .{ .stream_id = r.stream_id, .error_code = r.error_code, .final_size = r.final_size } },
+                .reset_stream_at => |id| blk: {
+                    const ss = self.streams.getSendStream(id) orelse continue;
+                    break :blk .{ .reset_stream = .{
+                        .stream_id = id,
+                        .error_code = ss.reset_err.?,
+                        .final_size = ss.send_offset,
+                        .reliable_size = ss.reliable_size,
+                    } };
+                },
                 .stop_sending => |ss| blk: {
                     const rs = self.streams.getRecvStream(ss.stream_id) orelse continue;
                     // Data Recvd or Reset Recvd: the request is moot.
@@ -4254,7 +4278,7 @@ pub const Connection = struct {
     }
 
     fn sendSettled(ss: *const stream_mod.SendStream) bool {
-        if (ss.reset_err != null) return ss.reset_stream_sent;
+        if (ss.reset_err != null) return ss.resetSettled();
         return !ss.hasUnackedData();
     }
 
@@ -8457,4 +8481,37 @@ test "a reset keeps its Reliable Size only for a peer that takes RESET_STREAM_AT
         conn.queueFlowControlUpdates();
         try std.testing.expectEqual(@as(?u64, if (takes) 3 else 0), drainPendingFor(&conn, s.stream_id).reset_reliable_size);
     }
+}
+
+test "a RESET_STREAM_AT's stream waits for its ACK, and a loss resends it whole" {
+    // Recorded by stream id alone, to keep every sent packet's record small.
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.streams.setMaxStreams(10, 10);
+    conn.peer_params = .{ .reset_stream_at = true };
+    const ss = try conn.streams.openUniStream();
+    const id = ss.stream_id;
+    try ss.writeData("hdr" ++ "body");
+    ss.send_offset = 7;
+    try ss.onAck(0, 3, false);
+    ss.resetAt(4, 3);
+    conn.queueFlowControlUpdates();
+    const sent = while (conn.pending_frames.pop()) |f| {
+        if (f == .reset_stream) break f;
+    } else return error.NoReset;
+    try std.testing.expect(!ss.isDisposable());
+
+    var pkt: ack_handler.SentPacket = .{ .pn = 0, .size = 0, .time_sent = 0, .ack_eliciting = true, .in_flight = true, .enc_level = .application };
+    pkt.control_frames[0] = ack_handler.SentControlFrame.from(sent).?;
+    pkt.control_frame_count = 1;
+    try std.testing.expectEqual(@as(u64, id), pkt.control_frames[0].reset_stream_at);
+    while (conn.pending_frames.pop()) |_| {}
+    conn.requeueLostControlFrames(&pkt);
+    const again = conn.pending_frames.pop().?.reset_stream;
+    try std.testing.expectEqual(@as(u64, 3), again.reliable_size);
+    try std.testing.expectEqual(@as(u64, 7), again.final_size);
+    try std.testing.expectEqual(@as(u64, 4), again.error_code);
+
+    conn.onResetAtAcked(id);
+    try std.testing.expect(ss.isDisposable());
 }

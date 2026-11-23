@@ -229,6 +229,7 @@ pub const QlogWriter = struct {
             .streams_blocked_bidi => |l| w.frame("\"streams_blocked\",\"stream_type\":\"bidirectional\",\"limit\":{d}", .{l}),
             .streams_blocked_uni => |l| w.frame("\"streams_blocked\",\"stream_type\":\"unidirectional\",\"limit\":{d}", .{l}),
             .reset_stream => |r| w.frame("\"reset_stream\",\"stream_id\":{d},\"error_code\":{d},\"final_size\":{d}", .{ r.stream_id, r.error_code, r.final_size }),
+            .reset_stream_at => |id| w.frame("\"reset_stream_at\",\"stream_id\":{d}", .{id}),
             .stop_sending => |ss| w.frame("\"stop_sending\",\"stream_id\":{d},\"error_code\":{d}", .{ ss.stream_id, ss.error_code }),
             .new_connection_id => |seq| w.frame("\"new_connection_id\",\"sequence_number\":{d}", .{seq}),
             .retire_connection_id => |seq| w.frame("\"retire_connection_id\",\"sequence_number\":{d}", .{seq}),

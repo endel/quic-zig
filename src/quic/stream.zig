@@ -825,6 +825,10 @@ pub const SendStream = struct {
     /// to be acknowledged.
     reset_pending: ?u64 = null,
 
+    /// A RESET_STREAM_AT went out and is not acknowledged yet: its loss is
+    /// resent from this stream, which stays until then.
+    reset_at_unacked: bool = false,
+
     /// Never reclaimed, whatever its state. For streams a protocol layer
     /// writes through a pointer it keeps for the whole connection: H3's
     /// control and QPACK streams, which a peer's STOP_SENDING would otherwise
@@ -1204,8 +1208,13 @@ pub const SendStream = struct {
     /// on their receive half; see `Stream.isDisposable`.
     pub fn isDisposable(self: *const SendStream) bool {
         if (self.pinned) return false;
-        if (self.reset_err != null) return self.reset_stream_sent;
+        if (self.reset_err != null) return self.resetSettled();
         return self.fin_acked and self.ack_offset >= self.write_offset;
+    }
+
+    /// Its reset is queued, and needs nothing more from the stream.
+    pub fn resetSettled(self: *const SendStream) bool {
+        return self.reset_stream_sent and !self.reset_at_unacked;
     }
 
     /// Pop a STREAM frame with at most max_len bytes of payload.
@@ -1397,7 +1406,7 @@ pub const Stream = struct {
     pub fn isDisposable(self: *const Stream) bool {
         if (!self.closed_for_gc) return false;
         // A queued RESET_STREAM carries all it needs; see SendStream.isDisposable.
-        if (self.send.reset_err != null) return self.send.reset_stream_sent;
+        if (self.send.reset_err != null) return self.send.resetSettled();
         return self.send.retransmit_count == 0 and !self.send.hasUnackedData();
     }
 
