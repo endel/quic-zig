@@ -1473,12 +1473,16 @@ fn Runner(comptime proto: event_loop.Protocol) type {
             };
         }
 
-        /// A publisher whose announcement was refused where the case is about
-        /// routing what it publishes: nothing is left to observe.
+        /// The publisher a case routes for, if its announcement was refused:
+        /// nothing is left to observe. Other cases judge a refusal
+        /// themselves, and retention's duplicate publisher may be refused.
         fn refusedPublisher(case: TestCase, legs: []Leg) ?*const P {
-            if (legs.len < 2 or case == .subscribe_before_announce) return null;
-            for (legs) |*l| if (l.peer.role == .publisher and l.peer.got_request_error) return &l.peer;
-            return null;
+            const i: usize = if (case.isData() or case == .announce_subscribe) 0 else switch (case) {
+                .subscribe_namespace_lifecycle, .publish_namespace_multi_publisher_retention => 1,
+                else => return null,
+            };
+            const p = &legs[i].peer;
+            return if (p.got_request_error) p else null;
         }
 
         fn judge(case: TestCase, legs: []Leg, result: *Result) void {
@@ -1886,4 +1890,13 @@ test "a refused announcement ends a case that needs it, and says why" {
     sba[1].peer.role = .publisher;
     sba[1].peer.got_request_error = true;
     try std.testing.expect(!R.complete(.subscribe_before_announce, &sba));
+
+    // Retention's duplicate publisher may be refused (imquic and moq-rs do):
+    // the first publisher still carries the case. Its refusal ends it.
+    var rt: [5]R.Leg = @splat(.{});
+    for (rt[1..3]) |*l| l.peer.role = .publisher;
+    rt[2].peer.got_request_error = true;
+    try std.testing.expect(!R.complete(.publish_namespace_multi_publisher_retention, &rt));
+    rt[1].peer.got_request_error = true;
+    try std.testing.expect(R.complete(.publish_namespace_multi_publisher_retention, &rt));
 }
