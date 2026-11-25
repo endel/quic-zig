@@ -67,8 +67,18 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - Built and tested with Zig 0.17.1. Nothing needed changing, and 0.17.0
   still builds it.
 - `moq.session.Event.namespace_done` carries the namespace suffix.
+- On Windows the HTTP/1.1 listener waits for a socket to be readable and
+  reads into one 256 KiB buffer per thread, as on Linux, where it kept a
+  16 KiB read posted per socket. An idle connection holds 2.6 KB instead of
+  18.6, a message larger than 16 KiB arrives in one read rather than one
+  per 16 KiB, and `http1.sharedReadBuffer()` returns that buffer there too.
 
 ### Fixed
+
+- `xev_backend.PortWatch` no longer reorders a tick's completions: it took
+  the first packet off the port and posted it back, behind any that came
+  meanwhile, so the earliest event of a tick ran last. It now waits on the
+  port without taking anything.
 
 - A WebTransport server closing a connection after its last session now sends
   its GOAWAY after the session's end rather than beside it.
