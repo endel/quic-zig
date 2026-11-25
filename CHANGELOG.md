@@ -78,7 +78,8 @@ Notable changes to quic-zig. Versions follow [semantic versioning](https://semve
 - `xev_backend.PortWatch` no longer reorders a tick's completions: it took
   the first packet off the port and posted it back, behind any that came
   meanwhile, so the earliest event of a tick ran last. It now waits on the
-  port without taking anything.
+  port without taking anything, and `start` returns `error.Unsupported`
+  where the port can't be waited on.
 
 - A WebTransport server closing a connection after its last session now sends
   its GOAWAY after the session's end rather than beside it.

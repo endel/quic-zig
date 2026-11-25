@@ -26,9 +26,21 @@ pub fn forgetPollResult(c: *xev.Completion) void {
 
 /// Queue the removal of `target` from `loop`, unless it is already off it.
 pub fn cancelCompletion(loop: *xev.Loop, target: *xev.Completion, c: *xev.Completion) void {
-    if (target.state() == .dead) return;
-    c.* = .{ .op = .{ .cancel = .{ .c = target } } };
+    _ = cancelCompletionThen(loop, target, c, null, xev.noopCallback);
+}
+
+/// `cancelCompletion`, calling `callback` once the cancel is done. Whether
+/// one was queued.
+///
+/// A cancelled completion isn't always called back: one added this tick is
+/// dropped before it reaches the kernel, and epoll drops an active one too.
+/// Whatever tracks `target` with a flag its callback clears must look at
+/// `target.state()` from `callback` as well.
+pub fn cancelCompletionThen(loop: *xev.Loop, target: *xev.Completion, c: *xev.Completion, userdata: ?*anyopaque, callback: xev.Callback) bool {
+    if (target.state() == .dead) return false;
+    c.* = .{ .op = .{ .cancel = .{ .c = target } }, .userdata = userdata, .callback = callback };
     loop.add(c);
+    return true;
 }
 
 // Running a loop from a host's own (Node's libuv, in netcode-io): watch
@@ -51,18 +63,16 @@ pub fn pollFd(loop: *const xev.Loop) std.posix.fd_t {
 ///
 /// A completion port is signaled while it holds packets, and a wait on it
 /// takes none: they stay where they are, in the order they came, for the
-/// loop to collect. Windows doesn't document that, so where a wait on the
-/// port fails the thread takes a packet and posts it back instead, as
-/// Electron does with libuv's port; that puts the packet behind any that
-/// came meanwhile, so the earliest event of a tick can run last.
+/// loop to collect. Windows doesn't document that; `start` fails where the
+/// port can't be waited on. (Taking a packet and posting it back, as
+/// Electron does with libuv's port, puts it behind any that came meanwhile,
+/// so a tick's earliest event would run last.)
 pub const PortWatch = struct {
     const windows = std.os.windows;
     const infinite: u32 = 0xFFFFFFFF;
     const wait_object_0: u32 = 0;
-    const wait_timeout: u32 = 258;
+    const wait_failed: u32 = 0xFFFFFFFF;
 
-    extern "kernel32" fn GetQueuedCompletionStatus(port: windows.HANDLE, bytes: *u32, key: *usize, overlapped: *?*anyopaque, ms: u32) callconv(.winapi) i32;
-    extern "kernel32" fn PostQueuedCompletionStatus(port: windows.HANDLE, bytes: u32, key: usize, overlapped: ?*anyopaque) callconv(.winapi) i32;
     extern "kernel32" fn CreateEventW(attrs: ?*anyopaque, manual: i32, initial: i32, name: ?[*:0]const u16) callconv(.winapi) ?windows.HANDLE;
     extern "kernel32" fn SetEvent(event: windows.HANDLE) callconv(.winapi) i32;
     extern "kernel32" fn WaitForSingleObject(handle: windows.HANDLE, ms: u32) callconv(.winapi) u32;
@@ -75,28 +85,16 @@ pub const PortWatch = struct {
     rearmed: windows.HANDLE,
     /// Set by `stop`. First in every wait, so it wins over the others.
     stopped: windows.HANDLE,
-    /// The port can be waited on; else packets are taken and posted back.
-    waitable: bool,
     thread: std.Thread,
 
     /// `self` must stay put until `stop`.
     pub fn start(self: *PortWatch, loop: *const xev.Loop, wake: *const fn (?*anyopaque) void, ctx: ?*anyopaque) !void {
+        if (WaitForSingleObject(loop.iocp_handle, 0) == wait_failed) return error.Unsupported;
         const rearmed = CreateEventW(null, 0, 0, null) orelse return error.SystemResources;
         errdefer _ = CloseHandle(rearmed);
         const stopped = CreateEventW(null, 1, 0, null) orelse return error.SystemResources;
         errdefer _ = CloseHandle(stopped);
-        self.* = .{
-            .port = loop.iocp_handle,
-            .wake = wake,
-            .ctx = ctx,
-            .rearmed = rearmed,
-            .stopped = stopped,
-            .waitable = switch (WaitForSingleObject(loop.iocp_handle, 0)) {
-                wait_object_0, wait_timeout => true,
-                else => false,
-            },
-            .thread = undefined,
-        };
+        self.* = .{ .port = loop.iocp_handle, .wake = wake, .ctx = ctx, .rearmed = rearmed, .stopped = stopped, .thread = undefined };
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -107,21 +105,13 @@ pub const PortWatch = struct {
     /// Returns with the thread gone, so no `wake` follows.
     pub fn stop(self: *PortWatch) void {
         _ = SetEvent(self.stopped);
-        // Key 0, no overlapped: if the loop takes it, it reads as a wakeup.
-        if (!self.waitable) _ = PostQueuedCompletionStatus(self.port, 0, 0, null);
         self.thread.join();
         _ = CloseHandle(self.rearmed);
         _ = CloseHandle(self.stopped);
     }
 
     fn run(self: *PortWatch) void {
-        while (true) {
-            if (self.waitable) {
-                if (!self.waitFor(self.port)) return;
-            } else {
-                self.takeAndPutBack();
-                if (WaitForSingleObject(self.stopped, 0) == wait_object_0) return;
-            }
+        while (self.waitFor(self.port)) {
             self.wake(self.ctx);
             if (!self.waitFor(self.rearmed)) return;
         }
@@ -131,15 +121,6 @@ pub const PortWatch = struct {
     fn waitFor(self: *PortWatch, handle: windows.HANDLE) bool {
         const handles = [2]windows.HANDLE{ self.stopped, handle };
         return WaitForMultipleObjects(handles.len, &handles, 0, infinite) == wait_object_0 + 1;
-    }
-
-    fn takeAndPutBack(self: *PortWatch) void {
-        var bytes: u32 = 0;
-        var key: usize = 0;
-        var overlapped: ?*anyopaque = null;
-        const ok = GetQueuedCompletionStatus(self.port, &bytes, &key, &overlapped, infinite);
-        // A failed I/O comes back as false with its overlapped set.
-        if (ok != 0 or overlapped != null) _ = PostQueuedCompletionStatus(self.port, bytes, key, overlapped);
     }
 };
 
@@ -207,9 +188,13 @@ test "PortWatch wakes for packets and leaves them in the order they came" {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
     const port = loop.iocp_handle;
-    // Before the watch starts, so it can't take the first ahead of the second.
-    try testing.expect(PortWatch.PostQueuedCompletionStatus(port, 1, 0, null) != 0);
-    try testing.expect(PortWatch.PostQueuedCompletionStatus(port, 2, 0, null) != 0);
+    const k32 = struct {
+        extern "kernel32" fn GetQueuedCompletionStatus(iocp: std.os.windows.HANDLE, bytes: *u32, key: *usize, overlapped: *?*anyopaque, ms: u32) callconv(.winapi) i32;
+        extern "kernel32" fn PostQueuedCompletionStatus(iocp: std.os.windows.HANDLE, bytes: u32, key: usize, overlapped: ?*anyopaque) callconv(.winapi) i32;
+    };
+    // Both there when it first wakes.
+    try testing.expect(k32.PostQueuedCompletionStatus(port, 1, 0, null) != 0);
+    try testing.expect(k32.PostQueuedCompletionStatus(port, 2, 0, null) != 0);
 
     var woken: std.atomic.Value(u32) = .init(0);
     var watch: PortWatch = undefined;
@@ -225,13 +210,13 @@ test "PortWatch wakes for packets and leaves them in the order they came" {
         var bytes: u32 = 0;
         var key: usize = 0;
         var overlapped: ?*anyopaque = null;
-        try testing.expect(PortWatch.GetQueuedCompletionStatus(port, &bytes, &key, &overlapped, 0) != 0);
+        try testing.expect(k32.GetQueuedCompletionStatus(port, &bytes, &key, &overlapped, 0) != 0);
         try testing.expectEqual(want, bytes);
     }
     // Nothing more until it's rearmed, and then only for a new packet.
     try testing.expectEqual(1, woken.load(.acquire));
     watch.rearm();
-    try testing.expect(PortWatch.PostQueuedCompletionStatus(port, 3, 0, null) != 0);
+    try testing.expect(k32.PostQueuedCompletionStatus(port, 3, 0, null) != 0);
     while (woken.load(.acquire) == 1) std.Thread.yield() catch {};
     try testing.expectEqual(2, woken.load(.acquire));
 }

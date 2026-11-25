@@ -411,13 +411,7 @@ pub const Server = struct {
     fn closeListener(self: *Server) void {
         if (!self.listening) return;
         self.listening = false;
-        if (!self.started or self.poll_c.state() == .dead) return self.closeListenFd();
-        self.poll_cancel_c = .{
-            .op = .{ .cancel = .{ .c = &self.poll_c } },
-            .userdata = self,
-            .callback = onListenerCancelled,
-        };
-        self.loop.add(&self.poll_cancel_c);
+        if (!self.started or !xev_backend.cancelCompletionThen(self.loop, &self.poll_c, &self.poll_cancel_c, self, onListenerCancelled)) self.closeListenFd();
     }
 
     fn onListenerCancelled(ud: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, _: xev.Result) xev.CallbackAction {

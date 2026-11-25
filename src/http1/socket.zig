@@ -22,7 +22,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const xev = @import("../xev_backend.zig").xev;
+const xev_backend = @import("../xev_backend.zig");
+const xev = xev_backend.xev;
 const timers = @import("timers.zig");
 const sys = @import("../sys.zig");
 
@@ -103,9 +104,6 @@ pub fn Socket(comptime Owner: type) type {
         drained: u64 = 0,
 
         state: State = .open,
-        /// `abort`'s cancel of a read poll, until libxev is done with it.
-        cancel_c: if (polls_for_reads) xev.Completion else void = if (polls_for_reads) .{} else {},
-        cancelling: bool = false,
         fd_closed: bool = false,
         /// Allocated apart from the owner: inline, it would push the owner's
         /// fields onto a second page that every connection then touches.
@@ -175,14 +173,11 @@ pub fn Socket(comptime Owner: type) type {
         fn onReadable(ud: ?*Self, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, r: xev.PollError!xev.PollEvent) xev.CallbackAction {
             const self = ud.?;
             _ = r catch return self.readEnded();
-            if (self.state == .closing or self.state == .closed) return self.readEnded();
-            // Paused, or leaving the loop: the bytes stay with the kernel,
-            // holding the peer back, until reading starts again.
-            if ((self.read_paused or self.parked) and self.state != .lingering) return self.afterRead(&.{});
+            if (self.state == .closing or self.state == .closed or self.readHeld()) return self.afterRead(&.{});
             const buf = threadReadBuf() orelse return self.readEnded();
             const n = sys.recvfrom(self.tcp.fd, buf, 0, null, null) catch |err| switch (err) {
                 // Readiness that a read before this took.
-                error.WouldBlock => return self.afterRead(buf[0..0]),
+                error.WouldBlock => return self.afterRead(&.{}),
                 else => return self.readEnded(),
             };
             if (n == 0) return self.readEnded();
@@ -212,12 +207,18 @@ pub fn Socket(comptime Owner: type) type {
                 self.maybeFinishClose();
                 return .disarm;
             }
-            if ((self.read_paused or self.parked) and self.state != .lingering) {
+            if (self.readHeld()) {
                 self.reading = false;
                 self.maybeParked();
                 return .disarm;
             }
             return .rearm;
+        }
+
+        /// Paused, or leaving the loop: the bytes stay with the kernel,
+        /// holding the peer back, until reading starts again.
+        fn readHeld(self: *const Self) bool {
+            return (self.read_paused or self.parked) and self.state != .lingering;
         }
 
         /// Queue bytes for sending. Dropped silently once the socket is
@@ -364,6 +365,7 @@ pub fn Socket(comptime Owner: type) type {
             const self = ud.?;
             self.writing = false;
             if (self.state == .closing or self.state == .closed) {
+                if (comptime polls_for_reads) self.cancelRead();
                 self.maybeFinishClose();
                 return .disarm;
             }
@@ -447,28 +449,19 @@ pub fn Socket(comptime Owner: type) type {
         }
 
         /// A shutdown ends a read in flight, but not a readiness poll: AFD
-        /// reports the peer's FIN or reset, not our own.
+        /// reports the peer's FIN or reset, not our own. The cancel borrows
+        /// `write_c`, which a closing socket doesn't write with again; with
+        /// a write in flight, `onWrite` starts it once the write is done.
+        /// A poll whose callback is running (dead) returns without rearming.
         fn cancelRead(self: *Self) void {
-            // Dead: its callback is running, and returns without rearming.
-            if (!self.reading or self.cancelling or self.read_c.state() == .dead) return;
-            self.cancelling = true;
-            self.cancel_c = .{
-                .op = .{ .cancel = .{ .c = &self.read_c } },
-                .userdata = self,
-                .callback = onReadCancelled,
-            };
-            self.loop.add(&self.cancel_c);
+            if (self.writing) return;
+            _ = xev_backend.cancelCompletionThen(self.loop, &self.read_c, &self.write_c, self, onReadCancelled);
         }
 
         fn onReadCancelled(ud: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, _: xev.Result) xev.CallbackAction {
             const self: *Self = @ptrCast(@alignCast(ud.?));
-            self.cancelling = false;
-            // A poll queued in this tick hadn't reached the kernel: libxev
-            // runs cancels first, and drops it without calling back.
-            if (self.reading and self.read_c.state() == .dead) {
-                self.reading = false;
-                self.maybeParked();
-            }
+            // Dropped without its callback: it was added this tick.
+            if (self.read_c.state() == .dead) self.reading = false;
             self.maybeFinishClose();
             return .disarm;
         }
@@ -483,8 +476,9 @@ pub fn Socket(comptime Owner: type) type {
 
         fn maybeFinishClose(self: *Self) void {
             if (self.state != .closing) return;
-            // `cancel_c` too: libxev holds it until its callback.
-            if (self.reading or self.writing or self.cancelling) return;
+            if (self.reading or self.writing) return;
+            // `cancelRead`'s, which libxev holds until its callback.
+            if (polls_for_reads and self.write_c.state() != .dead) return;
             self.state = .closed;
             // The fd is closed from the deferred callback, not here: this
             // may run inside a completion's callback, and libxev's epoll
@@ -572,10 +566,9 @@ fn setNoSigpipe(fd: std.posix.socket_t) void {
 
 test "sharedReadBuffer: the thread's one read buffer, only where reads share it" {
     if (shared_read_buf) {
-        // Where it's allocated by the thread's first read, it's there after.
-        if (lazy_read_buf and sharedReadBuffer() == null) _ = threadReadBuf().?;
-        try std.testing.expectEqual(@as(usize, read_buffer_size), sharedReadBuffer().?.len);
-        try std.testing.expectEqual(@intFromPtr(threadReadBuf().?), @intFromPtr(sharedReadBuffer().?.ptr));
+        // What the thread's reads use (on Windows, allocated by the first).
+        const buf = threadReadBuf().?;
+        try std.testing.expectEqual(@as([]u8, buf), sharedReadBuffer().?);
     } else {
         try std.testing.expect(sharedReadBuffer() == null);
     }
