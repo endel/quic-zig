@@ -61,6 +61,17 @@ pub fn h3ToAppErrorCode(h3_code: u64) ?u32 {
     return @intCast(code);
 }
 
+/// The Extended CONNECT upgrade token for a server with these SETTINGS:
+/// "webtransport-h3" (draft-15 §3.1) only for one that offers draft-15 on and
+/// not draft-13, which this implements. Draft-16 §7.1 would take the highest
+/// common draft, but moxygen sends WT_ENABLED and answers "webtransport-h3"
+/// with 400, while every server we have seen that also offers draft-13
+/// accepts "webtransport".
+fn upgradeToken(peer: h3_frame.Settings) []const u8 {
+    const draft13 = (peer.wt_max_sessions_v13 orelse 0) > 0;
+    return if (peer.wt_enabled and !draft13) "webtransport-h3" else "webtransport";
+}
+
 /// A capsule with a longer payload than this is skipped rather than buffered:
 /// the peer chooses Length, and holding on to whatever it names would let it
 /// name 2^62. The largest we parse is WT_CLOSE_SESSION, whose reason §6 caps at
@@ -397,20 +408,20 @@ pub const WebTransportConnection = struct {
         return self.h3.peer_settings.webtransport_max_sessions orelse 1;
     }
 
-    /// Client: initiate a WebTransport session via Extended CONNECT.
+    /// `connectWithHeaders` with no extra headers.
     pub fn connect(self: *WebTransportConnection, authority: []const u8, path: []const u8) !u64 {
-        // Enforce peer's session limit
-        if (self.active_session_count >= self.peerMaxSessions()) return error.TooManySessions;
-        const session_id = try self.h3.sendConnectRequest("webtransport", authority, path);
-        _ = self.allocateSession(session_id, .connecting) orelse return error.TooManySessions;
-        self.active_session_count += 1;
-        return session_id;
+        return self.connectWithHeaders(authority, path, &.{});
     }
 
-    /// Client: initiate a WebTransport session with extra headers (e.g. sec-webtransport-protocol).
+    /// Client: initiate a WebTransport session via Extended CONNECT, with
+    /// extra headers (e.g. wt-available-protocols).
+    ///
+    /// Call it once the server's SETTINGS are in (draft-13 §7.1): they pick
+    /// the upgrade token, and a strict draft-16 server resets a CONNECT that
+    /// names the wrong one. Before them it sends "webtransport".
     pub fn connectWithHeaders(self: *WebTransportConnection, authority: []const u8, path: []const u8, extra_headers: []const qpack.Header) !u64 {
         if (self.active_session_count >= self.peerMaxSessions()) return error.TooManySessions;
-        const session_id = try self.h3.sendConnectRequestWithHeaders("webtransport", authority, path, extra_headers);
+        const session_id = try self.h3.sendConnectRequestWithHeaders(upgradeToken(self.h3.peer_settings), authority, path, extra_headers);
         _ = self.allocateSession(session_id, .connecting) orelse return error.TooManySessions;
         self.active_session_count += 1;
         return session_id;
@@ -2731,6 +2742,19 @@ test "WT: a CONNECT behind the peer's SETTINGS comes out of the same poll" {
     const ev = (try wt.poll()) orelse return error.ExpectedConnectRequest;
     try testing.expect(ev == .connect_request);
     try testing.expect(h3.peer_settings_received);
+}
+
+test "WT: the CONNECT's upgrade token follows the draft the server's SETTINGS offer" {
+    const cases = [_]struct { peer: h3_frame.Settings, token: []const u8 }{
+        // Before SETTINGS, and the draft-07 servers (moq-rs, moq-dev-rs).
+        .{ .peer = .{}, .token = "webtransport" },
+        .{ .peer = .{ .enable_webtransport = true, .webtransport_max_sessions = 1 }, .token = "webtransport" },
+        // WT_ENABLED alone is draft-15 on: xquic resets a CONNECT with the old token.
+        .{ .peer = .{ .enable_webtransport = true, .wt_enabled = true, .webtransport_max_sessions = 1 }, .token = "webtransport-h3" },
+        // Draft-13 offered too: moxygen answers webtransport-h3 with 400.
+        .{ .peer = .{ .enable_webtransport = true, .wt_enabled = true, .webtransport_max_sessions = 1, .wt_max_sessions_v13 = 1 }, .token = "webtransport" },
+    };
+    for (cases) |c| try testing.expectEqualStrings(c.token, upgradeToken(c.peer));
 }
 
 test "WT integration: webtransport-h3 opens a session too" {

@@ -114,6 +114,9 @@ pub const Settings = struct {
     enable_connect_protocol: bool = false,
     h3_datagram: bool = false,
     enable_webtransport: bool = false,
+    /// Parsed only: the peer sent SETTINGS_WT_ENABLED (draft-15 on). Writing
+    /// `enable_webtransport` emits this codepoint too.
+    wt_enabled: bool = false,
     webtransport_max_sessions: ?u64 = null,
     /// draft-13 renamed this codepoint. Set independently of the legacy field
     /// so a peer can be served one draft, the other, or both.
@@ -260,7 +263,11 @@ pub fn parse(data: []const u8) !struct { frame: H3Frame, consumed: usize } {
                         .qpack_blocked_streams => settings.qpack_blocked_streams = value,
                         .enable_connect_protocol => settings.enable_connect_protocol = (value != 0),
                         .h3_datagram => settings.h3_datagram = (value != 0),
-                        .enable_webtransport, .wt_enabled => settings.enable_webtransport = (value != 0),
+                        .enable_webtransport => settings.enable_webtransport = (value != 0),
+                        .wt_enabled => {
+                            settings.wt_enabled = (value != 0);
+                            settings.enable_webtransport = settings.wt_enabled;
+                        },
                         .webtransport_max_sessions, .wt_max_sessions_v13 => {
                             settings.webtransport_max_sessions = value;
                             if (id == .wt_max_sessions_v13) settings.wt_max_sessions_v13 = value;
@@ -699,6 +706,19 @@ test "H3Frame: write and parse SETTINGS with WebTransport fields" {
     try testing.expect(result.frame.settings.h3_datagram);
     try testing.expect(result.frame.settings.enable_webtransport);
     try testing.expectEqual(@as(u64, 1), result.frame.settings.webtransport_max_sessions.?);
+}
+
+test "H3Frame: SETTINGS_WT_ENABLED is told apart from the draft-06 enable setting" {
+    // As bytes: our encoder writes both codepoints together.
+    const cases = [_]struct { bytes: []const u8, wt_enabled: bool }{
+        .{ .bytes = &.{ 0x04, 0x05, 0xab, 0x60, 0x37, 0x42, 0x01 }, .wt_enabled = false }, // 0x2b603742
+        .{ .bytes = &.{ 0x04, 0x05, 0xac, 0x7c, 0xf0, 0x00, 0x01 }, .wt_enabled = true }, // 0x2c7cf000
+    };
+    for (cases) |c| {
+        const s = (try parse(c.bytes)).frame.settings;
+        try testing.expect(s.enable_webtransport);
+        try testing.expectEqual(c.wt_enabled, s.wt_enabled);
+    }
 }
 
 test "H3Frame: write and parse PRIORITY_UPDATE" {

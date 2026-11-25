@@ -107,6 +107,50 @@ acknowledged, which it nearly always already is.
 which is why our stream limit counts opens rather than closures, and does not
 need to. Details: `SPEC/STATUS.md`, Reliable Stream Reset.
 
+## The client's upgrade token (draft-15 §3.1, §3.2)
+
+Draft-15 renamed the CONNECT's `:protocol` to `webtransport-h3`, for a server
+whose SETTINGS carry `SETTINGS_WT_ENABLED` (0x2c7cf000); `webtransport` now
+names the HTTP/2 variant. The event loop's client sends its CONNECT once the
+server's SETTINGS are in, and sends `webtransport-h3` only to a server that
+offers draft-15 on and not draft-13 (no 0x14e9cd29). Anything that offers
+draft-13, older, or nothing yet gets `webtransport`.
+
+Servers disagree about this in practice:
+
+- xquic, configured for draft-16, resets a CONNECT that says `webtransport`.
+  That reset is all a client sees: no status. Its SETTINGS are WT_ENABLED and
+  the pre-draft-13 max sessions.
+- moxygen at fb.mvfst.net answers `webtransport-h3` with 400, though its
+  SETTINGS carry WT_ENABLED. They also offer draft-13.
+- moqx sends the same SETTINGS as moxygen and accepts either token.
+
+Draft-16 §7.1 takes the highest draft both ends offer, and our own SETTINGS
+carry WT_ENABLED, so by the letter moxygen should get `webtransport-h3`.
+Preferring draft-13 whenever the server offers it is the interop choice:
+every server seen offering it accepts `webtransport`.
+
+Other clients each send one fixed token (from their sources, Nov 2026):
+
+- webtransport-go sends WT_ENABLED and always `webtransport-h3`, and refuses a
+  server without WT_ENABLED. Its server accepts either token.
+- moq-dev's web-transport (quinn and quiche backends) sends only pre-draft-13
+  SETTINGS and always `webtransport`, and its server accepts nothing else.
+  Without WT_ENABLED from the client, xquic falls back to draft-07 and takes
+  `webtransport`.
+
+Both wait for the server's SETTINGS before sending the CONNECT.
+
+Our server accepts either token. `bench_wt` connects before the SETTINGS
+arrive, so it sends `webtransport`; it only talks to our server.
+
+The wait costs a round trip against our own server, which builds its HTTP/3
+layer, and sends its SETTINGS, only once the handshake is confirmed. A server
+that sends them as 0.5-RTT data costs nothing: quic-go's HTTP/3 server opens
+its control stream on a connection accepted before the handshake completes.
+web-transport and tokio-quiche build HTTP/3 after the handshake, as we do.
+Draft-13 §7.1 requires the wait either way.
+
 ## Not implemented
 
 | Item | Note |

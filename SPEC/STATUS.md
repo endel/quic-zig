@@ -430,7 +430,7 @@ cross-impl byte-exact UTF-8 header check.
 
 | § | Section | Status | Notes |
 |---|---------|--------|-------|
-| — | Extended CONNECT handshake | ✅ Done | RFC 9220 |
+| — | Extended CONNECT handshake | ✅ Done | RFC 9220. The client sends `webtransport-h3` to a server offering only draft-15 on, otherwise `webtransport`; see DRAFT_IETF_WEBTRANS_HTTP3_13.md |
 | — | WT SETTINGS negotiation | ✅ Done | ENABLE_WEBTRANSPORT + WT_MAX_SESSIONS, under both the pre-draft-13 and draft-13 (0x14e9cd29) codepoints |
 | — | Bidi streams (0x41 prefix) | ✅ Done | Type prefix + session ID |
 | — | Uni streams (0x54 prefix) | ✅ Done | Type prefix + session ID |

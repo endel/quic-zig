@@ -4194,13 +4194,6 @@ pub fn Client(comptime Handler: type) type {
                     wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, self.conn, false);
                     wtc.grants = self.wt_credits;
                     self.wt_conn = wtc;
-
-                    // Send Extended CONNECT to establish WebTransport session
-                    self.session_id = try wtc.connectWithHeaders(
-                        self.server_name,
-                        self.path,
-                        self.connect_headers,
-                    );
                 },
                 .h3 => {
                     const h3c = try self.allocator.create(h3.H3Connection);
@@ -4281,6 +4274,12 @@ pub fn Client(comptime Handler: type) type {
                     // Server-side only.
                     .connect_request, .request, .request_data, .request_end, .request_cancelled => {},
                 }
+            }
+
+            // The server's SETTINGS pick the CONNECT's upgrade token.
+            if (self.session_id == null and wtc.h3.peer_settings_received and self.conn.isEstablished()) {
+                self.session_id = wtc.connectWithHeaders(self.server_name, self.path, self.connect_headers) catch
+                    return self.conn.close(@backingInt(h3.H3Error.internal_error), "CONNECT failed");
             }
         }
 
