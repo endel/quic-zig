@@ -117,8 +117,9 @@ const EchoServer = struct {
 
     pub fn onHandover(self: *EchoServer, h: Handover) void {
         self.leaving = null;
-        _ = self.handed.fetchAdd(1, .monotonic);
         self.worker.group.workers[self.worker.other() - 1].push(.{ .handover = h });
+        // Queued before counted: whoever sees the count finds it in the queue.
+        _ = self.handed.fetchAdd(1, .release);
     }
 
     /// Delivered here after the handover was asked for: lost to the new server.
@@ -605,7 +606,7 @@ fn closedOnTwo(f: *Fixture) bool {
 }
 
 fn handedByOne(f: *Fixture) bool {
-    return f.group.workers[0].handler.handed.load(.monotonic) == 1;
+    return f.group.workers[0].handler.handed.load(.acquire) == 1;
 }
 
 test "handover: a client that closes while its connection is between servers is closed on the new one" {
