@@ -28,22 +28,38 @@ const sys = @import("../sys.zig");
 
 /// With epoll every socket on a thread reads into one buffer, so an idle
 /// connection doesn't hold one: epoll reads only just before running that
-/// read's callback. Other backends can read ahead and queue the callback
-/// (kqueue does), so there each socket keeps its own. Either way,
-/// `onSocketData` bytes are gone once the call returns.
-const shared_read_buf = xev.backend == .epoll;
+/// read's callback. On IOCP a read completes into memory it was given when
+/// it started, which an idle connection would hold for as long as it's
+/// idle; there a socket waits for readiness instead (`polls_for_reads`) and
+/// reads into the thread's buffer then, as uWS does on Windows. Kqueue can
+/// read ahead and queue the callback, so there each socket keeps its own.
+/// Either way, `onSocketData` bytes are gone once the call returns.
+const polls_for_reads = xev.backend == .iocp;
+const shared_read_buf = xev.backend == .epoll or polls_for_reads;
 /// Shared, it can be large: a 64 KiB message arrives in one read rather than
 /// four (uWS reads up to 512 KiB). Per socket, it is what an idle connection
 /// costs, so it stays small.
 pub const read_buffer_size = if (shared_read_buf) 256 * 1024 else 16 * 1024;
-threadlocal var thread_read_buf: [read_buffer_size]u8 = undefined;
+/// Windows gives every thread of the process a DLL's static TLS, Node's
+/// dozen and more: there the buffer is allocated by the first read on a
+/// thread, and kept.
+const lazy_read_buf = builtin.target.os.tag == .windows;
+threadlocal var thread_read_buf: if (lazy_read_buf) ?*[read_buffer_size]u8 else [read_buffer_size]u8 = if (lazy_read_buf) null else undefined;
 
 /// The buffer every socket on this thread reads into, or null where each
-/// has its own. `onSocketData` bytes inside it stay valid until the next
-/// read on the thread: a host can hand them on without copying, as long
-/// as it is done with them by then.
+/// has its own (or where none has read on this thread yet). `onSocketData`
+/// bytes inside it stay valid until the next read on the thread: a host can
+/// hand them on without copying, as long as it is done with them by then.
 pub fn sharedReadBuffer() ?[]u8 {
-    return if (shared_read_buf) &thread_read_buf else null;
+    if (comptime !shared_read_buf) return null;
+    if (comptime lazy_read_buf) return if (thread_read_buf) |b| b else null;
+    return &thread_read_buf;
+}
+
+fn threadReadBuf() ?*[read_buffer_size]u8 {
+    if (comptime !lazy_read_buf) return &thread_read_buf;
+    if (thread_read_buf == null) thread_read_buf = std.heap.page_allocator.create([read_buffer_size]u8) catch null;
+    return thread_read_buf;
 }
 /// A library can't ignore SIGPIPE for its host process: MSG_NOSIGNAL on
 /// Linux, SO_NOSIGPIPE on Darwin.
@@ -87,6 +103,9 @@ pub fn Socket(comptime Owner: type) type {
         drained: u64 = 0,
 
         state: State = .open,
+        /// `abort`'s cancel of a read poll, until libxev is done with it.
+        cancel_c: if (polls_for_reads) xev.Completion else void = if (polls_for_reads) .{} else {},
+        cancelling: bool = false,
         fd_closed: bool = false,
         /// Allocated apart from the owner: inline, it would push the owner's
         /// fields onto a second page that every connection then touches.
@@ -123,11 +142,15 @@ pub fn Socket(comptime Owner: type) type {
             if (self.reading or self.read_paused or self.held()) return;
             if (self.state == .closing or self.state == .closed) return;
             self.reading = true;
-            self.tcp.read(self.loop, &self.read_c, .{ .slice = self.readBuf() }, Self, self, onRead);
+            if (comptime polls_for_reads) {
+                self.tcp.poll(self.loop, &self.read_c, .read, Self, self, onReadable);
+            } else {
+                self.tcp.read(self.loop, &self.read_c, .{ .slice = self.readBuf() }, Self, self, onRead);
+            }
         }
 
         fn readBuf(self: *Self) *[read_buffer_size]u8 {
-            return if (shared_read_buf) &thread_read_buf else self.own_read_buf.?;
+            return if (shared_read_buf) threadReadBuf().? else self.own_read_buf.?;
         }
 
         pub fn pauseRead(self: *Self) void {
@@ -142,21 +165,48 @@ pub fn Socket(comptime Owner: type) type {
 
         fn onRead(ud: ?*Self, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.ReadBuffer, r: xev.ReadError!usize) xev.CallbackAction {
             const self = ud.?;
-            const n = r catch {
-                self.reading = false;
-                switch (self.state) {
-                    .open, .flushing => Owner.onSocketEof(self.owner),
-                    .lingering => self.abort(),
-                    .closing, .closed => {},
-                }
-                self.maybeFinishClose();
-                self.maybeParked();
-                return .disarm;
+            const n = r catch return self.readEnded();
+            return self.afterRead(self.readBuf()[0..n]);
+        }
+
+        /// `polls_for_reads`: the socket is readable, or failed, or `abort`
+        /// cancelled the poll. A closing socket isn't read: its fd may
+        /// already be another socket's.
+        fn onReadable(ud: ?*Self, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, r: xev.PollError!xev.PollEvent) xev.CallbackAction {
+            const self = ud.?;
+            _ = r catch return self.readEnded();
+            if (self.state == .closing or self.state == .closed) return self.readEnded();
+            // Paused, or leaving the loop: the bytes stay with the kernel,
+            // holding the peer back, until reading starts again.
+            if ((self.read_paused or self.parked) and self.state != .lingering) return self.afterRead(&.{});
+            const buf = threadReadBuf() orelse return self.readEnded();
+            const n = sys.recvfrom(self.tcp.fd, buf, 0, null, null) catch |err| switch (err) {
+                // Readiness that a read before this took.
+                error.WouldBlock => return self.afterRead(buf[0..0]),
+                else => return self.readEnded(),
             };
+            if (n == 0) return self.readEnded();
+            return self.afterRead(buf[0..n]);
+        }
+
+        /// EOF, or the read failed.
+        fn readEnded(self: *Self) xev.CallbackAction {
+            self.reading = false;
             switch (self.state) {
-                .open, .flushing => Owner.onSocketData(self.owner, self.readBuf()[0..n]),
-                .lingering, .closing, .closed => {},
+                .open, .flushing => Owner.onSocketEof(self.owner),
+                .lingering => self.abort(),
+                .closing, .closed => {},
             }
+            self.maybeFinishClose();
+            self.maybeParked();
+            return .disarm;
+        }
+
+        fn afterRead(self: *Self, data: []u8) xev.CallbackAction {
+            if (data.len > 0) switch (self.state) {
+                .open, .flushing => Owner.onSocketData(self.owner, data),
+                .lingering, .closing, .closed => {},
+            };
             if (self.state == .closing or self.state == .closed) {
                 self.reading = false;
                 self.maybeFinishClose();
@@ -392,7 +442,35 @@ pub fn Socket(comptime Owner: type) type {
             self.dropOutput();
             // Wakes any in-flight read or write so it completes promptly.
             sys.shutdown(self.tcp.fd, .both);
+            if (comptime polls_for_reads) self.cancelRead();
             self.maybeFinishClose();
+        }
+
+        /// A shutdown ends a read in flight, but not a readiness poll: AFD
+        /// reports the peer's FIN or reset, not our own.
+        fn cancelRead(self: *Self) void {
+            // Dead: its callback is running, and returns without rearming.
+            if (!self.reading or self.cancelling or self.read_c.state() == .dead) return;
+            self.cancelling = true;
+            self.cancel_c = .{
+                .op = .{ .cancel = .{ .c = &self.read_c } },
+                .userdata = self,
+                .callback = onReadCancelled,
+            };
+            self.loop.add(&self.cancel_c);
+        }
+
+        fn onReadCancelled(ud: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, _: xev.Result) xev.CallbackAction {
+            const self: *Self = @ptrCast(@alignCast(ud.?));
+            self.cancelling = false;
+            // A poll queued in this tick hadn't reached the kernel: libxev
+            // runs cancels first, and drops it without calling back.
+            if (self.reading and self.read_c.state() == .dead) {
+                self.reading = false;
+                self.maybeParked();
+            }
+            self.maybeFinishClose();
+            return .disarm;
         }
 
         fn dropOutput(self: *Self) void {
@@ -405,7 +483,8 @@ pub fn Socket(comptime Owner: type) type {
 
         fn maybeFinishClose(self: *Self) void {
             if (self.state != .closing) return;
-            if (self.reading or self.writing) return;
+            // `cancel_c` too: libxev holds it until its callback.
+            if (self.reading or self.writing or self.cancelling) return;
             self.state = .closed;
             // The fd is closed from the deferred callback, not here: this
             // may run inside a completion's callback, and libxev's epoll
@@ -493,7 +572,10 @@ fn setNoSigpipe(fd: std.posix.socket_t) void {
 
 test "sharedReadBuffer: the thread's one read buffer, only where reads share it" {
     if (shared_read_buf) {
+        // Where it's allocated by the thread's first read, it's there after.
+        if (lazy_read_buf and sharedReadBuffer() == null) _ = threadReadBuf().?;
         try std.testing.expectEqual(@as(usize, read_buffer_size), sharedReadBuffer().?.len);
+        try std.testing.expectEqual(@intFromPtr(threadReadBuf().?), @intFromPtr(sharedReadBuffer().?.ptr));
     } else {
         try std.testing.expect(sharedReadBuffer() == null);
     }
