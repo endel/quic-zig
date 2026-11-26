@@ -118,9 +118,9 @@ pub const PacketPacker = struct {
 
     /// A server's 1-RTT packets before its handshake is confirmed: 0.5-RTT
     /// data (RFC 9001 5.7), so ACK, CRYPTO and STREAM frames only. Control
-    /// frames wait, CONNECTION_CLOSE aside: a 1-RTT PING then would draw a
-    /// 1-RTT ACK instead of the Handshake Finished the server still needs.
-    /// Set by connection before packing.
+    /// frames, CONNECTION_CLOSE aside, wait for a peer the server has
+    /// confirmed; a PING then, for one, would draw a 1-RTT ACK instead of the
+    /// Handshake one the server still needs. Set by connection before packing.
     half_rtt: bool = false,
 
     pub fn init(

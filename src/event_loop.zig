@@ -2212,17 +2212,16 @@ pub fn Server(comptime Handler: type) type {
                 const poll = all or wantsPoll(entry);
 
                 // HTTP/3 goes up as soon as the server can send, so its
-                // SETTINGS leave with the handshake; its events and the
-                // handler wait for the handshake to complete.
+                // SETTINGS leave with the handshake.
                 if (!entry.h3_initialized) {
                     if (conn.isEstablished()) {
                         self.initProtocol(entry);
-                    } else if (entry.h3_conn == null and conn.canSendHalfRtt()) {
+                    } else if (conn.canSendHalfRtt()) {
                         self.buildH3(entry) catch |err| self.setupFailed(entry, err);
                     }
                 }
 
-                if (poll and (entry.h3_initialized or entry.h3_conn == null)) {
+                if (poll) {
                     // Cleared first: a handler asking for another poll gets one.
                     entry.needs_poll = false;
                     conn.app_frames = false;
@@ -2302,12 +2301,18 @@ pub fn Server(comptime Handler: type) type {
             entry.conn.close(@backingInt(code), "protocol setup failed");
         }
 
+        /// A native-QUIC protocol negotiated beside WebTransport, before
+        /// `buildLayers` records it in `entry.raw_quic`.
+        fn negotiatedRawQuic(entry: *const ConnEntry) bool {
+            return serves_raw_quic and !std.mem.eql(u8, entry.conn.negotiatedAlpn(), "h3");
+        }
+
         /// The HTTP/3 layer, SETTINGS sent; once the server can send, ahead
         /// of the rest of `buildLayers`. Not for raw QUIC.
         fn buildH3(self: *Self, entry: *ConnEntry) !void {
             if (comptime Handler.protocol != .h3 and Handler.protocol != .webtransport) return;
             if (entry.h3_conn != null) return;
-            if (serves_raw_quic and !std.mem.eql(u8, entry.conn.negotiatedAlpn(), "h3")) return;
+            if (negotiatedRawQuic(entry)) return;
             const h3c = try self.allocator.create(h3.H3Connection);
             h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
             entry.h3_conn = h3c;
@@ -2329,7 +2334,7 @@ pub fn Server(comptime Handler: type) type {
         /// A layer is the entry's as soon as it is built, so a failure part
         /// way leaves the caller everything to free.
         fn buildLayers(self: *Self, entry: *ConnEntry) !void {
-            if (serves_raw_quic and !std.mem.eql(u8, entry.conn.negotiatedAlpn(), "h3")) {
+            if (negotiatedRawQuic(entry)) {
                 entry.raw_quic = true;
                 return;
             }
@@ -2757,8 +2762,8 @@ pub fn Server(comptime Handler: type) type {
         }
 
         fn pollH3Events(self: *Self, entry: *ConnEntry) void {
-            if (entry.h3_conn == null) return;
-            const h3c = entry.h3_conn.?;
+            if (!entry.h3_initialized) return; // built early, for its SETTINGS: no handler yet
+            const h3c = entry.h3_conn orelse return;
             var session = Session{ .entry = entry };
 
             while (!entry.handing_over) {
@@ -6713,10 +6718,8 @@ test "e2e: a WebTransport server's SETTINGS leave with its handshake" {
         runUntil(&loop, &server, Server(WtTicker).isStopped, 5000) catch @panic("did not stop");
     }
 
-    const sock = try sys.udpSocket(posix.AF.INET, .{});
+    const sock = try bindUdp(try net.Address.parseIp4("127.0.0.1", 0), .{});
     defer sys.close(sock);
-    const any_port = try net.Address.parseIp4("127.0.0.1", 0);
-    try sys.bind(sock, &any_port.any, any_port.getOsSockLen());
     const server_addr = try net.Address.parseIp4("127.0.0.1", 29601);
     const c_addr = connection.sockaddrToStorage(&(try boundAddress(sock)).any);
     const s_addr = connection.sockaddrToStorage(&server_addr.any);
@@ -6735,9 +6738,10 @@ test "e2e: a WebTransport server's SETTINGS leave with its handshake" {
     var buf: [2048]u8 = undefined;
     const n = try client.send(&buf);
     _ = try sys.sendto(sock, buf[0..n], 0, &server_addr.any, server_addr.getOsSockLen());
-    // The server's first flight, and its PTO's repeats of it.
+    // The server's first flight, and its PTO's repeats of it. Its first
+    // unidirectional stream is the control stream.
     const until = sys.nanoTimestamp() + 300 * std.time.ns_per_ms;
-    while (sys.nanoTimestamp() < until) {
+    while (sys.nanoTimestamp() < until and !(client.isEstablished() and client.streams.getRecvStream(3) != null)) {
         try loop.run(.no_wait);
         while (sys.recvfrom(sock, &buf, 0, null, null)) |m| {
             client.handleDatagram(buf[0..m], .{ .to = c_addr, .from = s_addr, .datagram_size = m });
@@ -6746,13 +6750,12 @@ test "e2e: a WebTransport server's SETTINGS leave with its handshake" {
     }
     try testing.expect(client.isEstablished());
 
-    // Its first unidirectional stream: the control stream, SETTINGS first.
     const control = client.streams.getRecvStream(3) orelse return error.TestUnexpectedResult;
     const got = control.read() orelse return error.TestUnexpectedResult;
     defer alloc.free(got);
     try testing.expect(got.len >= 2);
-    try testing.expectEqual(@as(u8, 0x00), got[0]);
-    try testing.expectEqual(@as(u8, 0x04), got[1]);
+    try testing.expectEqual(@backingInt(h3_frame.UniStreamType.control), got[0]);
+    try testing.expectEqual(@backingInt(h3_frame.H3FrameType.settings), got[1]);
 }
 
 /// Ticks every 10 ms from `onPass` once `due_ns` is set, writing a datagram

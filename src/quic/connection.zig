@@ -2875,9 +2875,8 @@ pub const Connection = struct {
                         .application => {
                             self.installAppKeys(ik.open, ik.seal);
                             self.pending_replay_undecryptable = true;
-                            // A server has them from the ClientHello: its 0.5-RTT data goes
-                            // out under them.
-                            if (self.is_server) if (hs.peer_transport_params) |tp| try self.applyPeerParams(tp);
+                            // Ahead of `.complete`: a server's 0.5-RTT data goes out under them.
+                            if (hs.peer_transport_params) |tp| try self.applyPeerParams(tp);
                             if (self.qlog_writer) |*ql| {
                                 const now_ql: i64 = @intCast(sys.nanoTimestamp());
                                 ql.keyUpdated(now_ql, "tls", "server_1rtt_secret");
@@ -2974,7 +2973,6 @@ pub const Connection = struct {
                         std.log.debug("KeyUpdateManager initialized for 1-RTT key rotation", .{});
                     }
 
-                    if (!self.is_server) if (hs.peer_transport_params) |tp| try self.applyPeerParams(tp);
                     if (self.peer_params) |peer_tp| {
                         // draft-ietf-quic-ack-frequency, if the peer supports it
                         if (self.ack_freq_wanted) self.requestAckFrequency();
@@ -3579,7 +3577,6 @@ pub const Connection = struct {
         }
     }
 
-    /// Build and send outgoing packets.
     /// The 1-RTT seal, once there is one to use; see `halfRtt` for what a
     /// server may send under it before its handshake is confirmed.
     fn appSeal(self: *Connection) ?*const quic_crypto.Seal {
@@ -3588,10 +3585,17 @@ pub const Connection = struct {
     }
 
     /// A server whose handshake is not yet confirmed: its 1-RTT packets are
-    /// 0.5-RTT data, which HTTP/3's SETTINGS ride, and carry no probes or
-    /// control frames (`PacketPacker.half_rtt`).
+    /// 0.5-RTT data, which HTTP/3's SETTINGS ride, and carry no control
+    /// frames (`PacketPacker.half_rtt`) and no probes (`probeSeal`).
     fn halfRtt(self: *const Connection) bool {
         return self.is_server and !self.handshake_confirmed;
+    }
+
+    /// The seal for a 1-RTT packet built on its own, a PMTU probe or a bare
+    /// PING: none in 0.5-RTT, where a PING would draw a 1-RTT ACK instead of
+    /// the Handshake one the server still needs.
+    fn probeSeal(self: *Connection) ?*const quic_crypto.Seal {
+        return if (self.halfRtt()) null else self.appSeal();
     }
 
     /// A server with 1-RTT keys, its handshake not yet complete: stream data
@@ -3618,6 +3622,7 @@ pub const Connection = struct {
         return if (remaining < out_buf.len) out_buf[0..@intCast(remaining)] else out_buf;
     }
 
+    /// Build and send outgoing packets.
     pub fn send(self: *Connection, out_buf: []u8) !usize {
         return self.sendAt(out_buf, @intCast(sys.nanoTimestamp()));
     }
@@ -3628,6 +3633,7 @@ pub const Connection = struct {
         // Draining/terminated: do not send anything
         if (self.state == .draining or self.state == .terminated) return 0;
         self.packer.qlog_writer = if (self.qlog_writer) |*ql| ql else null;
+        self.packer.half_rtt = self.halfRtt();
 
         // Closing: retransmit saved close packet on each incoming packet (RFC 9000 §10.2.1)
         if (self.state == .closing) {
@@ -3649,10 +3655,7 @@ pub const Connection = struct {
 
             // First time: build close packet at best available encryption level
             self.packer.window_left = null;
-            const app_seal: ?*const quic_crypto.Seal = if (self.key_update) |*ku|
-                &ku.current_seal
-            else
-                self.levelSeal(2);
+            const app_seal = self.appSeal();
             const handshake_seal = self.levelSeal(1);
             const initial_seal = self.levelSeal(0);
 
@@ -3716,9 +3719,9 @@ pub const Connection = struct {
         // shouldProbe first: it is almost always false. A probe fills out_buf,
         // not the amplification budget below, so an unvalidated path gets none.
         if (self.mtu_discoverer.shouldProbe(now, self.pkt_handler.rtt_stats.smoothedRttOrDefault()) and
-            (!self.is_server or self.paths[self.active_path_idx].is_validated) and !self.halfRtt())
+            (!self.is_server or self.paths[self.active_path_idx].is_validated))
         {
-            if (self.appSeal()) |seal| {
+            if (self.probeSeal()) |seal| {
                 const probe_size: usize = self.mtu_discoverer.nextProbeSize();
                 if (out_buf.len >= probe_size) {
                     const result = try self.packer.packMtuProbe(
@@ -3780,7 +3783,6 @@ pub const Connection = struct {
 
         self.packer.conn_flow_ctrl = &self.conn_flow_ctrl;
         self.packer.ecn_mark = self.ecn_validator.shouldMark();
-        self.packer.half_rtt = self.halfRtt();
         // Once the peer was asked for fewer ACKs, the packet that fills the
         // window, or a probe, asks for one at once.
         self.packer.window_left = if (self.ack_freq_send_seq == 0)
@@ -3876,8 +3878,7 @@ pub const Connection = struct {
     /// a peer that never answers gets nothing more to hold, while the ACK a
     /// live one sends lets loss detection free the rest.
     fn sendBarePing(self: *Connection, out_buf: []u8, now: i64) !usize {
-        if (self.halfRtt()) return self.sendAckOnly(out_buf, now);
-        const seal = self.appSeal() orelse return self.sendAckOnly(out_buf, now);
+        const seal = self.probeSeal() orelse return self.sendAckOnly(out_buf, now);
         const send_buf = self.amplificationLimit(out_buf) orelse return 0;
         self.pto_probe_pending -|= 1;
         const n = try self.packer.packBarePing(send_buf, &self.pkt_handler, seal, now);
@@ -3899,7 +3900,6 @@ pub const Connection = struct {
         // much: a peer acknowledging nothing never brings it back down. To a
         // path not yet validated the 3x limit bounds them instead, and the
         // fresh window there is still full of the old path's packets.
-        self.packer.half_rtt = self.halfRtt();
         self.packer.urgent_allowed = !self.trackedFull() and
             (!self.paths[self.active_path_idx].is_validated or
                 self.pkt_handler.bytes_in_flight < self.cc.sendWindow() + 2 * self.cc.max_datagram_size);

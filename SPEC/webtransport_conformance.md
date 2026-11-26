@@ -252,8 +252,8 @@ exceeds 8 KB per datagram.
 
 ### What Technology Preview changes
 
-STP 27.0 differs from release 26.4 in three places, and only one of them is an
-improvement:
+STP 27.0 differs from release 26.4 in three places: one improvement, one
+regression, and one that was most likely our scenario's own race:
 
 - **`datagram-length-echo` is fixed.** 26.4 reports `maxDatagramSize` as the
   QUIC `max_datagram_frame_size` (65535) and then refuses to send one that
@@ -262,14 +262,13 @@ improvement:
   on a `WT_DRAIN_SESSION` capsule — every run of four — where release 26.4
   resolves it against the same server in every run. This is the one stable
   Preview gap, and the only one still marked `expect_fail`.
-- **`server-connection-close` half-regressed.** Preview rejects
+- **`server-connection-close` looked half-regressed.** Preview rejects
   `new WebTransport()` with a `WebTransportError` before the session is
   established, where 26.4 establishes it and reports the abrupt close — but
   only in three runs of five. Not marked, for the same reason as
-  `server-stop-sending` below. Most likely the scenario's own race, since
-  fixed; see *Flakiness* below. Not one to report.
+  `server-stop-sending` below; see *Flakiness* below for the race.
 
-Both regressions are worth reporting to WebKit alongside the
+The `server-drain` regression is worth reporting to WebKit alongside the
 `server-stop-sending` behaviour below.
 
 ### What the expected failures mean

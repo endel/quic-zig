@@ -353,8 +353,8 @@ const WptHandler = struct {
             };
         }
 
-        // Defer server-initiated actions so the 200 response is flushed first.
-        // Store deferred info in session_state (per-session, not shared).
+        // Server-initiated actions wait for the 200 to be flushed, or for
+        // the client. Deferred info lives in session_state, per session.
         switch (handler) {
             .server_close => {
                 const code_str = getQueryParam(path, "code") orelse "0";
@@ -370,9 +370,8 @@ const WptHandler = struct {
                 // Trigger a QUIC keepalive to ensure processConnections runs again soon
                 session.sendKeepAlive();
             },
-            // As WPT's handler: a stream for the client to write on, and the
-            // connection closed once it has (`onStreamData`). Closing a pass
-            // after the 200 instead raced the browser's `ready`.
+            // As WPT: close once the client writes on this stream
+            // (`onStreamData`); any sooner races the browser's `ready`.
             .server_connection_close => _ = session.openBidiStream(session_id, null) catch {},
             .server_drain => if (self.session_state.getPtr(keyFor(session, session_id))) |si| {
                 if (!si.drain_goaway) {

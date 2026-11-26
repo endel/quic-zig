@@ -1204,33 +1204,23 @@ test "handshake: a server's stream data leaves with its first flight, its contro
     // 1-RTT PING then would draw a 1-RTT ACK the server cannot read yet.
     sys.test_clock = 1_000 * std.time.ns_per_s;
     defer sys.test_clock = null;
-    const alloc = testing.allocator;
-    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, @splat(1), @splat(2));
-    defer mgr.deinit();
-    const client = try alloc.create(connection.Connection);
-    defer alloc.destroy(client);
-    try connection.connectInto(client, alloc, "localhost", .{}, clientTls(), null);
-    defer client.deinit();
-    client.paths[0].peer_addr = addr(4433);
-    client.paths[0].local_addr = addr(40000);
-
-    var buf: [MAX_DGRAM]u8 = undefined;
-    var resp: [MAX_DGRAM]u8 = undefined;
-    const n = try client.send(&buf);
-    _ = mgr.recvDatagram(buf[0..n], addr(40000), addr(4433), 0, &resp);
-    const sconn = mgr.entries.items[0].conn;
+    var h: HalfOpen = undefined;
+    try h.init(serverTls());
+    defer h.deinit();
+    const sconn = h.server();
     const s = try sconn.openUniStream();
     try s.writeData("settings");
+    var buf: [MAX_DGRAM]u8 = undefined;
     while (true) {
         const m = try sconn.send(&buf);
         if (m == 0) break;
-        client.handleDatagram(buf[0..m], .{ .to = addr(40000), .from = addr(4433), .datagram_size = m });
+        h.client.handleDatagram(buf[0..m], .{ .to = addr(40000), .from = addr(4433), .datagram_size = m });
     }
-    try testing.expect(client.isEstablished() and !sconn.isEstablished());
+    try testing.expect(h.client.isEstablished() and !sconn.isEstablished());
 
-    const r = client.streams.getRecvStream(s.stream_id) orelse return error.TestUnexpectedResult;
+    const r = h.client.streams.getRecvStream(s.stream_id) orelse return error.TestUnexpectedResult;
     const got = r.read() orelse return error.TestUnexpectedResult;
-    defer alloc.free(got);
+    defer testing.allocator.free(got);
     try testing.expectEqualStrings("settings", got);
 
     // The client's ACKs are lost. Its PTO resends the handshake, which
