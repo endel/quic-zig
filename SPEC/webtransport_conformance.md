@@ -266,7 +266,8 @@ improvement:
   `new WebTransport()` with a `WebTransportError` before the session is
   established, where 26.4 establishes it and reports the abrupt close — but
   only in three runs of five. Not marked, for the same reason as
-  `server-stop-sending` below.
+  `server-stop-sending` below. Most likely the scenario's own race, since
+  fixed; see *Flakiness* below. Not one to report.
 
 Both regressions are worth reporting to WebKit alongside the
 `server-stop-sending` behaviour below.
@@ -313,6 +314,15 @@ failed in one run of four on 26.4 and passed in the rest, and on Preview it goes
 the other way three runs in five. Treat a single Safari run as weak evidence, and
 prefer the Zig and Chrome columns when deciding whether something we changed is
 at fault.
+
+**`server-connection-close` raced `ready` until 26 Nov 2026.** Its server
+closed the connection one pass after the 200, so whether the browser resolved
+`ready` first was luck: Firefox 159 passed three runs of six. Once the server
+sent its SETTINGS with the handshake, which saves a round trip, it passed none.
+It now follows WPT's handler: the server opens a stream, the client writes on
+it, and only then does the server close. Firefox passes 8 runs of 8, Chrome 4 of
+4. Preview's "rejected before the session is established" above was most
+likely this race too, not WebKit's; Safari has not been re-run.
 
 **`server-stop-sending` is a race in the scenario, not only in Safari.** Firefox
 failed it once in three with `writes kept succeeding after STOP_SENDING`: the

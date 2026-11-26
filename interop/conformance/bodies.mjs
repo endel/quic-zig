@@ -81,6 +81,9 @@ export const BODIES = {
   'server-connection-close': `
     const wt = createWT(HANDLER);
     await wt.ready;
+    // As WPT: the server closes the connection once we write on its stream.
+    const { value: bidi } = await wt.incomingBidirectionalStreams.getReader().read();
+    bidi.writable.getWriter().write(new Uint8Array([65])).catch(() => {});
     // An abrupt QUIC close is an error, not a clean close: 'closed' must
     // reject. Resolving would mean we mistook a crash for a goodbye.
     try {

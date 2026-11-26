@@ -258,10 +258,6 @@ const WptHandler = struct {
                 .server_close => {
                     session.closeSessionWithError(sid, info_ptr.deferred_code, info_ptr.getDeferredReason()) catch {};
                 },
-                .server_connection_close => {
-                    _ = session.openBidiStream(sid, null) catch {};
-                    session.closeConnection();
-                },
                 .server_drain => {
                     // Drain, not close: the session stays usable and the peer's
                     // `draining` promise resolves.
@@ -374,7 +370,11 @@ const WptHandler = struct {
                 // Trigger a QUIC keepalive to ensure processConnections runs again soon
                 session.sendKeepAlive();
             },
-            .server_connection_close, .server_drain => if (self.session_state.getPtr(keyFor(session, session_id))) |si| {
+            // As WPT's handler: a stream for the client to write on, and the
+            // connection closed once it has (`onStreamData`). Closing a pass
+            // after the 200 instead raced the browser's `ready`.
+            .server_connection_close => _ = session.openBidiStream(session_id, null) catch {},
+            .server_drain => if (self.session_state.getPtr(keyFor(session, session_id))) |si| {
                 if (!si.drain_goaway) {
                     si.deferred_ticks = 1;
                     session.sendKeepAlive();
@@ -602,6 +602,7 @@ const WptHandler = struct {
                 // Close session on first data
                 session.closeSession(session_id);
             },
+            .server_connection_close => session.closeConnection(),
             .stop_sending => {
                 // Refuse the rest of what the client is sending. Its writable
                 // side should reject carrying this code.

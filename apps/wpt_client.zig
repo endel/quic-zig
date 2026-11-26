@@ -329,6 +329,13 @@ const Runner = struct {
         session.closeStream(id);
     }
 
+    /// The server's stream in `server-connection-close`: writing on it is
+    /// what makes the server close the connection, as in WPT.
+    pub fn onBidiStream(self: *Runner, session: *event_loop.ClientSession, _: u64, stream_id: u64) void {
+        if (self.scenario != .server_connection_close) return;
+        session.sendStreamData(stream_id, "A") catch |e| self.fail("sendStreamData: {any}", .{e});
+    }
+
     pub fn onStreamData(
         self: *Runner,
         _: *event_loop.ClientSession,
