@@ -277,7 +277,10 @@ sees the stream).
 ### §6.2.1 Control Streams — ✅ Done
 
 - Local control stream opened in `initConnection()` with type byte then
-  an immediate SETTINGS frame.
+  an immediate SETTINGS frame. `event_loop.Server` builds the layer once
+  the connection has 1-RTT keys (`Connection.canSendHalfRtt`), so they
+  leave as 0.5-RTT data with the handshake flight; it reads no events and
+  calls no handler until the handshake completes.
 - Peer control stream identified by `identifyPeerUniStreams()` on the
   first read; remaining bytes after the type byte are buffered for
   SETTINGS parsing.

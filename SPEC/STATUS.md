@@ -318,7 +318,7 @@
 | 6 | Stream Mapping and Usage | | |
 | 6.1 | Bidirectional Streams | ✅ Done | Request/response streams |
 | 6.2 | Unidirectional Streams | ✅ Done | Control + QPACK encoder/decoder |
-| 6.2.1 | Control Streams | ✅ Done | SETTINGS sent on open |
+| 6.2.1 | Control Streams | ✅ Done | SETTINGS sent on open; a server opens it as 0.5-RTT data, with its handshake flight |
 | 6.2.2 | Push Streams | ❌ N/A | Deprecated with Server Push |
 | 7 | HTTP Framing Layer | | |
 | 7.1 | Frame Layout | ✅ Done | Varint type + length. DATA is streamed as it arrives, unknown frames skipped as they arrive, HEADERS and control frames capped — nothing is buffered whole on a peer's say-so |

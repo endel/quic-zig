@@ -928,6 +928,7 @@ fn beginDrain(entry: *ConnEntry, now: i64) void {
     const conn = entry.conn;
     if (conn.state == .closing or conn.state == .draining or conn.isClosed()) return;
     // Still handshaking, it gets GOAWAY(0) once it can; raw QUIC has none.
+    if (!entry.h3_initialized) return;
     const h3c = entry.h3_conn orelse return;
     if (h3c.shutdown_state != .active or entry.drain_goaway_due != null) return;
     drainSessions(entry);
@@ -2210,12 +2211,18 @@ pub fn Server(comptime Handler: type) type {
                 const conn = entry.conn;
                 const poll = all or wantsPoll(entry);
 
-                // Initialize protocol layer once handshake completes
-                if (conn.isEstablished() and !entry.h3_initialized) {
-                    self.initProtocol(entry);
+                // HTTP/3 goes up as soon as the server can send, so its
+                // SETTINGS leave with the handshake; its events and the
+                // handler wait for the handshake to complete.
+                if (!entry.h3_initialized) {
+                    if (conn.isEstablished()) {
+                        self.initProtocol(entry);
+                    } else if (entry.h3_conn == null and conn.canSendHalfRtt()) {
+                        self.buildH3(entry) catch |err| self.setupFailed(entry, err);
+                    }
                 }
 
-                if (poll) {
+                if (poll and (entry.h3_initialized or entry.h3_conn == null)) {
                     // Cleared first: a handler asking for another poll gets one.
                     entry.needs_poll = false;
                     conn.app_frames = false;
@@ -2267,16 +2274,7 @@ pub fn Server(comptime Handler: type) type {
         }
 
         fn initProtocol(self: *Self, entry: *ConnEntry) void {
-            self.buildLayers(entry) catch |err| {
-                // Left half-built, the next pass would build another over it.
-                connection_manager.destroyProtocols(self.allocator, entry.wt_conn, entry.h3_conn, entry.h0_conn);
-                entry.wt_conn = null;
-                entry.h3_conn = null;
-                entry.h0_conn = null;
-                const code: h3.H3Error = if (err == error.StreamLimitError) .general_protocol_error else .internal_error;
-                entry.conn.close(@backingInt(code), "protocol setup failed");
-                return;
-            };
+            self.buildLayers(entry) catch |err| return self.setupFailed(entry, err);
 
             entry.wake_fn = wakeFromEntry;
             entry.repoll_fn = repollFromEntry;
@@ -2294,6 +2292,40 @@ pub fn Server(comptime Handler: type) type {
             };
         }
 
+        fn setupFailed(self: *Self, entry: *ConnEntry, err: anyerror) void {
+            // Left half-built, the next pass would build another over it.
+            connection_manager.destroyProtocols(self.allocator, entry.wt_conn, entry.h3_conn, entry.h0_conn);
+            entry.wt_conn = null;
+            entry.h3_conn = null;
+            entry.h0_conn = null;
+            const code: h3.H3Error = if (err == error.StreamLimitError) .general_protocol_error else .internal_error;
+            entry.conn.close(@backingInt(code), "protocol setup failed");
+        }
+
+        /// The HTTP/3 layer, SETTINGS sent; once the server can send, ahead
+        /// of the rest of `buildLayers`. Not for raw QUIC.
+        fn buildH3(self: *Self, entry: *ConnEntry) !void {
+            if (comptime Handler.protocol != .h3 and Handler.protocol != .webtransport) return;
+            if (entry.h3_conn != null) return;
+            if (serves_raw_quic and !std.mem.eql(u8, entry.conn.negotiatedAlpn(), "h3")) return;
+            const h3c = try self.allocator.create(h3.H3Connection);
+            h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
+            entry.h3_conn = h3c;
+            h3c.qpack_scratch = &self.qpack_scratch;
+            h3c.headers_buf = &self.qpack_headers;
+            if (Handler.protocol == .webtransport) h3c.local_settings = .{
+                .enable_connect_protocol = true,
+                .h3_datagram = true,
+                .enable_webtransport = self.wt_settings.legacy,
+                .webtransport_max_sessions = if (self.wt_settings.legacy) self.wt_settings.max_sessions else null,
+                .wt_max_sessions_v13 = self.wt_settings.max_sessions,
+                .wt_initial_max_data = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_data),
+                .wt_initial_max_streams_bidi = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_bidi),
+                .wt_initial_max_streams_uni = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_uni),
+            };
+            try h3c.initConnection();
+        }
+
         /// A layer is the entry's as soon as it is built, so a failure part
         /// way leaves the caller everything to free.
         fn buildLayers(self: *Self, entry: *ConnEntry) !void {
@@ -2303,23 +2335,8 @@ pub fn Server(comptime Handler: type) type {
             }
             switch (Handler.protocol) {
                 .webtransport => {
-                    const h3c = try self.allocator.create(h3.H3Connection);
-                    h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
-                    entry.h3_conn = h3c;
-                    h3c.qpack_scratch = &self.qpack_scratch;
-                    h3c.headers_buf = &self.qpack_headers;
-                    h3c.local_settings = .{
-                        .enable_connect_protocol = true,
-                        .h3_datagram = true,
-                        .enable_webtransport = self.wt_settings.legacy,
-                        .webtransport_max_sessions = if (self.wt_settings.legacy) self.wt_settings.max_sessions else null,
-                        .wt_max_sessions_v13 = self.wt_settings.max_sessions,
-                        .wt_initial_max_data = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_data),
-                        .wt_initial_max_streams_bidi = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_bidi),
-                        .wt_initial_max_streams_uni = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_uni),
-                    };
-                    try h3c.initConnection();
-
+                    try self.buildH3(entry);
+                    const h3c = entry.h3_conn.?;
                     const wtc = try self.allocator.create(wt.WebTransportConnection);
                     wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, entry.conn, true);
                     wtc.grants = self.wt_settings.credits;
@@ -2334,14 +2351,7 @@ pub fn Server(comptime Handler: type) type {
                         entry.datagram_handler_ctx = @ptrCast(self.handler);
                     }
                 },
-                .h3 => {
-                    const h3c = try self.allocator.create(h3.H3Connection);
-                    h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
-                    entry.h3_conn = h3c;
-                    h3c.qpack_scratch = &self.qpack_scratch;
-                    h3c.headers_buf = &self.qpack_headers;
-                    try h3c.initConnection();
-                },
+                .h3 => try self.buildH3(entry),
                 .h0 => {
                     const h0c = try self.allocator.create(h0.H0Connection);
                     h0c.* = h0.H0Connection.init(self.allocator, entry.conn, true);
@@ -6686,6 +6696,63 @@ test "e2e: writes alone do not poll a WebTransport connection for events" {
     try runFor(&e2e.loop, 100); // and their ACKs land
     try testing.expect(client_handler.datagrams > 0);
     try testing.expectEqual(polls, e2e.server.polls);
+}
+
+test "e2e: a WebTransport server's SETTINGS leave with its handshake" {
+    // As 0.5-RTT data, so a client that waits for them before its CONNECT
+    // (draft-13 7.1) sends it with its Finished. This one never sends that.
+    const alloc = testing.allocator;
+    var handler = WtTicker{};
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var server = try Server(WtTicker).init(alloc, &handler, .{ .port = 29601, .tls_config = makeTestTlsConfig(), .loop = &loop });
+    defer server.deinit();
+    server.start();
+    defer {
+        server.stop();
+        runUntil(&loop, &server, Server(WtTicker).isStopped, 5000) catch @panic("did not stop");
+    }
+
+    const sock = try sys.udpSocket(posix.AF.INET, .{});
+    defer sys.close(sock);
+    const any_port = try net.Address.parseIp4("127.0.0.1", 0);
+    try sys.bind(sock, &any_port.any, any_port.getOsSockLen());
+    const server_addr = try net.Address.parseIp4("127.0.0.1", 29601);
+    const c_addr = connection.sockaddrToStorage(&(try boundAddress(sock)).any);
+    const s_addr = connection.sockaddrToStorage(&server_addr.any);
+    var client: connection.Connection = undefined;
+    try connection.connectInto(&client, alloc, "localhost", .{}, .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &.{"h3"},
+        .server_name = "localhost",
+        .skip_cert_verify = true,
+    }, null);
+    defer client.deinit();
+    client.paths[0].peer_addr = s_addr;
+    client.paths[0].local_addr = c_addr;
+
+    var buf: [2048]u8 = undefined;
+    const n = try client.send(&buf);
+    _ = try sys.sendto(sock, buf[0..n], 0, &server_addr.any, server_addr.getOsSockLen());
+    // The server's first flight, and its PTO's repeats of it.
+    const until = sys.nanoTimestamp() + 300 * std.time.ns_per_ms;
+    while (sys.nanoTimestamp() < until) {
+        try loop.run(.no_wait);
+        while (sys.recvfrom(sock, &buf, 0, null, null)) |m| {
+            client.handleDatagram(buf[0..m], .{ .to = c_addr, .from = s_addr, .datagram_size = m });
+        } else |_| {}
+        sys.sleepNs(50 * std.time.ns_per_us);
+    }
+    try testing.expect(client.isEstablished());
+
+    // Its first unidirectional stream: the control stream, SETTINGS first.
+    const control = client.streams.getRecvStream(3) orelse return error.TestUnexpectedResult;
+    const got = control.read() orelse return error.TestUnexpectedResult;
+    defer alloc.free(got);
+    try testing.expect(got.len >= 2);
+    try testing.expectEqual(@as(u8, 0x00), got[0]);
+    try testing.expectEqual(@as(u8, 0x04), got[1]);
 }
 
 /// Ticks every 10 ms from `onPass` once `due_ns` is set, writing a datagram

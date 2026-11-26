@@ -144,12 +144,13 @@ Both wait for the server's SETTINGS before sending the CONNECT.
 Our server accepts either token. `bench_wt` connects before the SETTINGS
 arrive, so it sends `webtransport`; it only talks to our server.
 
-The wait costs a round trip against our own server, which builds its HTTP/3
-layer, and sends its SETTINGS, only once the handshake is confirmed. A server
-that sends them as 0.5-RTT data costs nothing: quic-go's HTTP/3 server opens
-its control stream on a connection accepted before the handshake completes.
-web-transport and tokio-quiche build HTTP/3 after the handshake, as we do.
-Draft-13 §7.1 requires the wait either way.
+Draft-13 §7.1 requires the wait. It costs nothing against a server that sends
+its SETTINGS as 0.5-RTT data, with its handshake flight, and a round trip
+against one that sends them after the handshake (web-transport, tokio-quiche).
+Our server builds its HTTP/3 layer as soon as it has 1-RTT keys, as quic-go's
+does; its WebTransport layer, events and handler still wait for the handshake.
+At 100 ms RTT that took session setup from about 310 ms to 210 ms, for our
+client and for webtransport-go's alike.
 
 ## Not implemented
 
