@@ -1198,6 +1198,53 @@ test "handshake: the server holds 1-RTT packets until the client's Finished" {
     try testing.expectEqual(mgr.recv_time.?, sconn.last_packet_received_time);
 }
 
+test "handshake: a server's stream data leaves with its first flight, its control frames after the Finished" {
+    // 0.5-RTT (RFC 9001 5.7): HTTP/3's SETTINGS reach a client waiting on
+    // them for its CONNECT with the handshake, not a round trip later. A
+    // 1-RTT PING then would draw a 1-RTT ACK the server cannot read yet.
+    sys.test_clock = 1_000 * std.time.ns_per_s;
+    defer sys.test_clock = null;
+    const alloc = testing.allocator;
+    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, @splat(1), @splat(2));
+    defer mgr.deinit();
+    const client = try alloc.create(connection.Connection);
+    defer alloc.destroy(client);
+    try connection.connectInto(client, alloc, "localhost", .{}, clientTls(), null);
+    defer client.deinit();
+    client.paths[0].peer_addr = addr(4433);
+    client.paths[0].local_addr = addr(40000);
+
+    var buf: [MAX_DGRAM]u8 = undefined;
+    var resp: [MAX_DGRAM]u8 = undefined;
+    const n = try client.send(&buf);
+    _ = mgr.recvDatagram(buf[0..n], addr(40000), addr(4433), 0, &resp);
+    const sconn = mgr.entries.items[0].conn;
+    const s = try sconn.openUniStream();
+    try s.writeData("settings");
+    while (true) {
+        const m = try sconn.send(&buf);
+        if (m == 0) break;
+        client.handleDatagram(buf[0..m], .{ .to = addr(40000), .from = addr(4433), .datagram_size = m });
+    }
+    try testing.expect(client.isEstablished() and !sconn.isEstablished());
+
+    const r = client.streams.getRecvStream(s.stream_id) orelse return error.TestUnexpectedResult;
+    const got = r.read() orelse return error.TestUnexpectedResult;
+    defer alloc.free(got);
+    try testing.expectEqualStrings("settings", got);
+
+    // The client's ACKs are lost. Its PTO resends the handshake, which
+    // leaves the PING pushed with it no room below 1-RTT, so it waits.
+    while (sconn.pkt_handler.pto_count == 0) {
+        sys.test_clock = sconn.nextTimeoutNs() orelse return error.TestUnexpectedResult;
+        _ = try sconn.fireTimers();
+    }
+    while (try sconn.send(&buf) > 0) {}
+    var pings: usize = 0;
+    for (sconn.pending_frames.queued()) |f| pings += @intFromBool(f == .ping);
+    try testing.expectEqual(@as(usize, 1), pings);
+}
+
 /// Sends `data` on a new stream from `sender`, runs the pair until quiet, and
 /// says whether `receiver` read all of it.
 fn sendAndRead(p: *Pair, sender: *connection.Connection, receiver: *connection.Connection, data: []const u8) !bool {

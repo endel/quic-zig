@@ -2875,6 +2875,9 @@ pub const Connection = struct {
                         .application => {
                             self.installAppKeys(ik.open, ik.seal);
                             self.pending_replay_undecryptable = true;
+                            // A server has them from the ClientHello: its 0.5-RTT data goes
+                            // out under them.
+                            if (self.is_server) if (hs.peer_transport_params) |tp| try self.applyPeerParams(tp);
                             if (self.qlog_writer) |*ql| {
                                 const now_ql: i64 = @intCast(sys.nanoTimestamp());
                                 ql.keyUpdated(now_ql, "tls", "server_1rtt_secret");
@@ -2971,62 +2974,8 @@ pub const Connection = struct {
                         std.log.debug("KeyUpdateManager initialized for 1-RTT key rotation", .{});
                     }
 
-                    // Store peer transport parameters and apply stream limits
-                    if (hs.peer_transport_params) |peer_tp| {
-                        self.peer_params = peer_tp;
-
-                        try self.validatePeerTransportParams(&peer_tp);
-
-                        self.streams.setMaxStreams(
-                            peer_tp.initial_max_streams_bidi,
-                            peer_tp.initial_max_streams_uni,
-                        );
-                        self.streams.setPeerInitialMaxStreamData(
-                            peer_tp.initial_max_stream_data_bidi_local,
-                            peer_tp.initial_max_stream_data_bidi_remote,
-                            peer_tp.initial_max_stream_data_uni,
-                        );
-                        self.conn_flow_ctrl.base.send_window = peer_tp.initial_max_data;
-
-                        // Enable DATAGRAM support if both sides advertise max_datagram_frame_size
-                        if (peer_tp.max_datagram_frame_size != null and self.local_params.max_datagram_frame_size != null) {
-                            self.datagrams_enabled = true;
-                            std.log.debug("DATAGRAM support enabled (peer max_dgram={d}, local max_dgram={d})", .{
-                                peer_tp.max_datagram_frame_size.?,
-                                self.local_params.max_datagram_frame_size.?,
-                            });
-                        }
-
-                        // Negotiate idle timeout: use min of local and peer when both non-zero (RFC 9000 §10.1)
-                        if (peer_tp.max_idle_timeout > 0 and self.local_params.max_idle_timeout > 0) {
-                            const effective_ms = @min(peer_tp.max_idle_timeout, self.local_params.max_idle_timeout);
-                            self.idle_timeout_ns = idleTimeoutNs(effective_ms);
-                        } else if (peer_tp.max_idle_timeout > 0) {
-                            self.idle_timeout_ns = idleTimeoutNs(peer_tp.max_idle_timeout);
-                        }
-                        // else: keep local timeout (already set)
-
-                        // Recompute keep-alive interval after idle timeout negotiation
-                        if (self.keep_alive_interval_ns > 0) {
-                            self.keep_alive_interval_ns = @min(self.keep_alive_interval_ns, @divTrunc(self.idle_timeout_ns, 2));
-                        }
-
-                        // Apply peer's max_ack_delay to RTT stats (RFC 9002 §5.3)
-                        self.pkt_handler.rtt_stats.max_ack_delay = @as(i64, @intCast(peer_tp.max_ack_delay)) * 1_000_000;
-
-                        // Store peer's stateless reset token for initial CID (RFC 9000 §10.3.1)
-                        // Server sends this in transport params; client stores it for detection
-                        if (peer_tp.stateless_reset_token) |token| {
-                            self.peer_cid_pool.addPeerCid(0, self.dcid[0..self.dcid_len], token);
-                            std.log.debug("stored peer stateless reset token from transport params", .{});
-                        }
-
-                        std.log.debug("applied peer transport params: max_bidi={d}, max_uni={d}, max_data={d}", .{
-                            peer_tp.initial_max_streams_bidi,
-                            peer_tp.initial_max_streams_uni,
-                            peer_tp.initial_max_data,
-                        });
-
+                    if (!self.is_server) if (hs.peer_transport_params) |tp| try self.applyPeerParams(tp);
+                    if (self.peer_params) |peer_tp| {
                         // draft-ietf-quic-ack-frequency, if the peer supports it
                         if (self.ack_freq_wanted) self.requestAckFrequency();
 
@@ -3103,6 +3052,64 @@ pub const Connection = struct {
                 ._continue => continue,
             }
         }
+    }
+
+    /// Store the peer's transport parameters and apply what they set: stream
+    /// and flow-control limits, DATAGRAM, the idle timeout, max_ack_delay.
+    fn applyPeerParams(self: *Connection, peer_tp: transport_params.TransportParams) !void {
+        self.peer_params = peer_tp;
+
+        try self.validatePeerTransportParams(&peer_tp);
+
+        self.streams.setMaxStreams(
+            peer_tp.initial_max_streams_bidi,
+            peer_tp.initial_max_streams_uni,
+        );
+        self.streams.setPeerInitialMaxStreamData(
+            peer_tp.initial_max_stream_data_bidi_local,
+            peer_tp.initial_max_stream_data_bidi_remote,
+            peer_tp.initial_max_stream_data_uni,
+        );
+        self.conn_flow_ctrl.base.send_window = peer_tp.initial_max_data;
+
+        // Enable DATAGRAM support if both sides advertise max_datagram_frame_size
+        if (peer_tp.max_datagram_frame_size != null and self.local_params.max_datagram_frame_size != null) {
+            self.datagrams_enabled = true;
+            std.log.debug("DATAGRAM support enabled (peer max_dgram={d}, local max_dgram={d})", .{
+                peer_tp.max_datagram_frame_size.?,
+                self.local_params.max_datagram_frame_size.?,
+            });
+        }
+
+        // Negotiate idle timeout: use min of local and peer when both non-zero (RFC 9000 §10.1)
+        if (peer_tp.max_idle_timeout > 0 and self.local_params.max_idle_timeout > 0) {
+            const effective_ms = @min(peer_tp.max_idle_timeout, self.local_params.max_idle_timeout);
+            self.idle_timeout_ns = idleTimeoutNs(effective_ms);
+        } else if (peer_tp.max_idle_timeout > 0) {
+            self.idle_timeout_ns = idleTimeoutNs(peer_tp.max_idle_timeout);
+        }
+        // else: keep local timeout (already set)
+
+        // Recompute keep-alive interval after idle timeout negotiation
+        if (self.keep_alive_interval_ns > 0) {
+            self.keep_alive_interval_ns = @min(self.keep_alive_interval_ns, @divTrunc(self.idle_timeout_ns, 2));
+        }
+
+        // Apply peer's max_ack_delay to RTT stats (RFC 9002 §5.3)
+        self.pkt_handler.rtt_stats.max_ack_delay = @as(i64, @intCast(peer_tp.max_ack_delay)) * 1_000_000;
+
+        // Store peer's stateless reset token for initial CID (RFC 9000 §10.3.1)
+        // Server sends this in transport params; client stores it for detection
+        if (peer_tp.stateless_reset_token) |token| {
+            self.peer_cid_pool.addPeerCid(0, self.dcid[0..self.dcid_len], token);
+            std.log.debug("stored peer stateless reset token from transport params", .{});
+        }
+
+        std.log.debug("applied peer transport params: max_bidi={d}, max_uni={d}, max_data={d}", .{
+            peer_tp.initial_max_streams_bidi,
+            peer_tp.initial_max_streams_uni,
+            peer_tp.initial_max_data,
+        });
     }
 
     /// Install handshake-level encryption keys.
@@ -3573,13 +3580,25 @@ pub const Connection = struct {
     }
 
     /// Build and send outgoing packets.
-    /// The 1-RTT seal, once there is one to use. A server holds it back until
-    /// the handshake is confirmed: a 1-RTT PING before then draws a 1-RTT ACK
-    /// instead of the Handshake Finished it still needs retransmitted.
+    /// The 1-RTT seal, once there is one to use; see `halfRtt` for what a
+    /// server may send under it before its handshake is confirmed.
     fn appSeal(self: *Connection) ?*const quic_crypto.Seal {
-        if (self.is_server and !self.handshake_confirmed) return null;
         if (self.key_update) |*ku| return &ku.current_seal;
         return self.levelSeal(2);
+    }
+
+    /// A server whose handshake is not yet confirmed: its 1-RTT packets are
+    /// 0.5-RTT data, which HTTP/3's SETTINGS ride, and carry no probes or
+    /// control frames (`PacketPacker.half_rtt`).
+    fn halfRtt(self: *const Connection) bool {
+        return self.is_server and !self.handshake_confirmed;
+    }
+
+    /// A server with 1-RTT keys, its handshake not yet complete: stream data
+    /// written now leaves as 0.5-RTT data (RFC 9001 5.7), ahead of the
+    /// client's Finished.
+    pub fn canSendHalfRtt(self: *const Connection) bool {
+        return self.is_server and self.state == .handshake and self.pkt_num_spaces[2].crypto_seal != null;
     }
 
     fn levelSeal(self: *Connection, space_idx: usize) ?*const quic_crypto.Seal {
@@ -3697,7 +3716,7 @@ pub const Connection = struct {
         // shouldProbe first: it is almost always false. A probe fills out_buf,
         // not the amplification budget below, so an unvalidated path gets none.
         if (self.mtu_discoverer.shouldProbe(now, self.pkt_handler.rtt_stats.smoothedRttOrDefault()) and
-            (!self.is_server or self.paths[self.active_path_idx].is_validated))
+            (!self.is_server or self.paths[self.active_path_idx].is_validated) and !self.halfRtt())
         {
             if (self.appSeal()) |seal| {
                 const probe_size: usize = self.mtu_discoverer.nextProbeSize();
@@ -3761,6 +3780,7 @@ pub const Connection = struct {
 
         self.packer.conn_flow_ctrl = &self.conn_flow_ctrl;
         self.packer.ecn_mark = self.ecn_validator.shouldMark();
+        self.packer.half_rtt = self.halfRtt();
         // Once the peer was asked for fewer ACKs, the packet that fills the
         // window, or a probe, asks for one at once.
         self.packer.window_left = if (self.ack_freq_send_seq == 0)
@@ -3856,6 +3876,7 @@ pub const Connection = struct {
     /// a peer that never answers gets nothing more to hold, while the ACK a
     /// live one sends lets loss detection free the rest.
     fn sendBarePing(self: *Connection, out_buf: []u8, now: i64) !usize {
+        if (self.halfRtt()) return self.sendAckOnly(out_buf, now);
         const seal = self.appSeal() orelse return self.sendAckOnly(out_buf, now);
         const send_buf = self.amplificationLimit(out_buf) orelse return 0;
         self.pto_probe_pending -|= 1;
@@ -3878,6 +3899,7 @@ pub const Connection = struct {
         // much: a peer acknowledging nothing never brings it back down. To a
         // path not yet validated the 3x limit bounds them instead, and the
         // fresh window there is still full of the old path's packets.
+        self.packer.half_rtt = self.halfRtt();
         self.packer.urgent_allowed = !self.trackedFull() and
             (!self.paths[self.active_path_idx].is_validated or
                 self.pkt_handler.bytes_in_flight < self.cc.sendWindow() + 2 * self.cc.max_datagram_size);

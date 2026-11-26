@@ -116,6 +116,13 @@ pub const PacketPacker = struct {
     /// packing.
     window_left: ?u64 = null,
 
+    /// A server's 1-RTT packets before its handshake is confirmed: 0.5-RTT
+    /// data (RFC 9001 5.7), so ACK, CRYPTO and STREAM frames only. Control
+    /// frames wait, CONNECTION_CLOSE aside: a 1-RTT PING then would draw a
+    /// 1-RTT ACK instead of the Handshake Finished the server still needs.
+    /// Set by connection before packing.
+    half_rtt: bool = false,
+
     pub fn init(
         allocator: Allocator,
         is_server: bool,
@@ -514,6 +521,10 @@ pub const PacketPacker = struct {
                 var remaining = pending_frames.len;
                 while (remaining > 0) : (remaining -= 1) {
                     const pcf = pending_frames.pop() orelse break;
+                    if (self.half_rtt and pcf != .connection_close) {
+                        pending_frames.requeue(pcf);
+                        continue;
+                    }
                     const is_urgent_control = self.urgent_allowed and switch (pcf) {
                         .path_challenge, .path_response => true,
                         .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni => true,

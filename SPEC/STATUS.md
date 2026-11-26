@@ -210,7 +210,7 @@
 | 5.4.2 | Header Protection Sample | ✅ Done | |
 | 5.5 | Receiving Protected Packets | ✅ Done | |
 | 5.6 | Use of 0-RTT Keys | ✅ Done | Early key install + 0-RTT packing |
-| 5.7 | Receiving Out-of-Order Protected Packets | ✅ Done | Packet number window |
+| 5.7 | Receiving Out-of-Order Protected Packets | ✅ Done | Packet number window. A server holds the client's 1-RTT packets until its handshake completes, and sends 0.5-RTT data once it has 1-RTT keys, under the client's transport parameters from the ClientHello: ACK (of 0-RTT only), CRYPTO and STREAM frames. Control frames, PINGs and PMTU probes wait for the handshake, since a 1-RTT PING draws a 1-RTT ACK instead of the Handshake one the server needs. HTTP/3's SETTINGS go out this way |
 | 5.8 | Retry Packet Integrity | ✅ Done | AES-128-GCM tag verification |
 | 6 | Key Update | ✅ Done | 3-generation keys, phase bit, 2^23 limit |
 | 6.1 | Initiating a Key Update | ✅ Done | Proactive at confidentiality limit; old read keys kept until a packet opens with the new ones |
